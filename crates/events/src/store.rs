@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::error::{EventsError, Result};
 use crate::model::{
-    DEFAULT_MAX_ATTEMPTS, DELIVERY_COLUMNS, Delivery, DeliveryJob, ENDPOINT_COLUMNS, EVENT_COLUMNS,
-    EndpointChanges, Event, NewEndpoint, NewEvent, WebhookEndpoint,
+    DEFAULT_EVENT_RETENTION_DAYS, DEFAULT_MAX_ATTEMPTS, DELIVERY_COLUMNS, Delivery, DeliveryJob,
+    ENDPOINT_COLUMNS, EVENT_COLUMNS, EndpointChanges, Event, NewEndpoint, NewEvent, RetentionRun,
+    RetentionStatus, SweepReport, WebhookEndpoint,
 };
 
 /// Record one event inside an existing transaction.
@@ -685,6 +686,261 @@ pub async fn list_events(pool: &PgPool, filter: &EventFilter) -> Result<EventPag
     Ok(EventPage {
         events: rows,
         has_more,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// Read one organization's window, or the platform default when it has never set one.
+///
+/// `coalesce($2, $1)` rather than a plain read: the column is `not null default 30`, so a
+/// `None` here can only mean the organization row does not exist yet, and answering with the
+/// documented default is what lets the screen render before the first organization does.
+pub async fn retention_window(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<i32> {
+    let days: i32 = sqlx::query_scalar(
+        "select coalesce((select event_retention_days from organizations where id = $1), $2)",
+    )
+    .bind(organization_id)
+    .bind(DEFAULT_EVENT_RETENTION_DAYS)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(days)
+}
+
+/// Set one organization's window.
+///
+/// The write is refused by the **store** rather than only by the API, because the store is also
+/// reached by a future import and by an operator's own SQL: a check constraint that holds the
+/// range makes the rule true everywhere instead of true in one handler. The check constraint on
+/// the column is the backstop; this read-back is what the caller returns to the screen.
+pub async fn set_retention_window(
+    pool: &PgPool,
+    organization_id: Uuid,
+    days: i32,
+) -> Result<i32> {
+    let stored: i32 = sqlx::query_scalar(
+        "update organizations set event_retention_days = $2, updated_at = now() \
+         where id = $1 returning event_retention_days",
+    )
+    .bind(organization_id)
+    .bind(days)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(EventsError::OrganizationNotFound(organization_id))?;
+
+    Ok(stored)
+}
+
+/// How much of one organization's history is on the bus, and how much of it is due.
+///
+/// Two counts in one statement, because the screen shows both and two round trips could be
+/// answered by two different instants — the panel would then draw "3,412 events, 12 due" where
+/// the 12 came from a moment after the 3,412, which is a pair of numbers that cannot both be
+/// true.
+///
+/// `due` counts only events that **could** be swept, so it is the same predicate the sweep
+/// itself uses: an event pinned by a pending delivery is counted in `events` and never in
+/// `due`, and a screen that said "12 due" while the sweeper removes 0 would be lying.
+pub async fn retention_counts(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<(i64, i64)> {
+    let row: (i64, i64) = sqlx::query_as(
+        "select count(*) as total, \
+                count(*) filter (where e.created_at < now() - make_interval(days => o.window) \
+                                  and not exists (select 1 from webhook_deliveries d \
+                                                  where d.event_id = e.id and d.status = 'pending')) \
+         as due \
+         from events e \
+         cross join (select coalesce((select event_retention_days from organizations where id = $1), $2) \
+                     as window) o \
+         where ($1::uuid is null or e.organization_id = $1)",
+    )
+    .bind(organization_id)
+    .bind(DEFAULT_EVENT_RETENTION_DAYS)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// How much history this organization keeps, and the last sweep that ran against it.
+pub async fn retention_status(pool: &PgPool, organization_id: Option<Uuid>) -> Result<RetentionStatus> {
+    let window_days = retention_window(pool, organization_id).await?;
+    let (events, due) = retention_counts(pool, organization_id).await?;
+
+    let last_run = sqlx::query_as::<_, RetentionRun>(
+        "select id, organization_id, started_at, finished_at, window_days, cutoff, \
+                events_deleted, deliveries_deleted, error \
+         from event_retention_runs \
+         where organization_id is not distinct from $1 and finished_at is not null \
+         order by started_at desc limit 1",
+    )
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(RetentionStatus {
+        organization_id,
+        window_days,
+        last_run,
+        events,
+        due,
+    })
+}
+
+/// The last sweeps of one organization, newest first.
+pub async fn list_retention_runs(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<RetentionRun>> {
+    let runs = sqlx::query_as::<_, RetentionRun>(
+        "select id, organization_id, started_at, finished_at, window_days, cutoff, \
+                events_deleted, deliveries_deleted, error \
+         from event_retention_runs \
+         where organization_id is not distinct from $1 and finished_at is not null \
+         order by started_at desc limit $2",
+    )
+    .bind(organization_id)
+    .bind(limit.clamp(1, 50))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(runs)
+}
+
+/// Every organization that has events on the bus, with its window, oldest first.
+///
+/// The sweeper's work list. `oldest first` is deliberate: every instance of the API runs this
+/// worker, and an ordering that is stable across instances is what stops two of them from
+/// sweeping the same organization's head of the list on the same tick. Two runners racing is
+/// not a correctness problem — the delete is idempotent and the counts are each truthful about
+/// their own work — but it is wasted work, and a batch bound turns "wasted" into "the tail never
+/// gets reached".
+pub async fn organizations_with_events(pool: &PgPool, batch: i64) -> Result<Vec<(Option<Uuid>, i32)>> {
+    let rows = sqlx::query_as::<_, (Option<Uuid>, i32)>(
+        "select e.organization_id, \
+                coalesce((select event_retention_days from organizations o where o.id = e.organization_id), $2) \
+         from events e \
+         group by e.organization_id \
+         order by min(e.created_at) asc \
+         limit $1",
+    )
+    .bind(batch.clamp(1, 500))
+    .bind(DEFAULT_EVENT_RETENTION_DAYS)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Remove one organization's events that are older than its window, and log the run.
+///
+/// **The predicate is the whole design.** An event is swept only when it is past the window
+/// *and* it has no `pending` delivery:
+///
+/// ```text
+/// delete from events e
+///  where e.organization_id is not distinct from $1
+///    and e.created_at < $2
+///    and not exists (select 1 from webhook_deliveries d
+///                     where d.event_id = e.id and d.status = 'pending')
+/// ```
+///
+/// The obvious query — "delete old events, let `on delete cascade` take the deliveries" — is
+/// the bug the `not exists` exists to prevent. A `pending` row means the runner has not
+/// delivered it yet: `next_attempt_at` is in the future, or a runner that claimed it died, or
+/// the endpoint is disabled and the row has not been settled. Cascading that away deletes a
+/// fact a receiver is still owed, and the receiver's only symptom is that the delivery never
+/// arrived and nothing in the platform says why.
+///
+/// The delete and the run-log write share one transaction, so the log can never claim a sweep
+/// that did not happen. The counters come from the statements themselves rather than from a
+/// `count` before the delete: a count and a delete that disagree is a log that lies about its
+/// own run.
+pub async fn sweep_events(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    window_days: i32,
+) -> Result<SweepReport> {
+    let cutoff = now() - Duration::days(window_days as i64);
+    let mut tx = pool.begin().await?;
+
+    let run_id: Uuid = sqlx::query_scalar(
+        "insert into event_retention_runs (organization_id, window_days, cutoff) \
+         values ($1, $2, $3) returning id",
+    )
+    .bind(organization_id)
+    .bind(window_days)
+    .bind(cutoff)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // The deliveries are counted, not selected: the cascade does the deleting, and a number
+    // the log can carry is all the screen needs to say "the deliveries went with them".
+    let swept = sqlx::query(
+        "with due as ( \
+             select e.id from events e \
+             where e.organization_id is not distinct from $1 \
+               and e.created_at < $2 \
+               and not exists (select 1 from webhook_deliveries d \
+                                where d.event_id = e.id and d.status = 'pending') \
+         ) \
+         delete from webhook_deliveries d using due where d.event_id = due.id",
+    )
+    .bind(organization_id)
+    .bind(cutoff)
+    .execute(&mut *tx)
+    .await?;
+    // `rows_affected` is a `u64` in this sqlx version and the report carries `i64`, so the
+    // conversion saturates rather than wraps: a sweep that removed more than `i64::MAX` rows
+    // is not reachable, and a wrapped negative count on a run log is a number nobody can
+    // explain. Saturation is the honest answer and the branch is unreachable either way.
+    let deliveries_deleted = i64::try_from(swept.rows_affected()).unwrap_or(i64::MAX);
+
+    // The deliveries of *settled* rows only — the `pending` ones were excluded above, so this
+    // count is what the cascade will actually remove and the two statements cannot disagree.
+    let events_deleted = sqlx::query(
+        "delete from events e \
+         where e.organization_id is not distinct from $1 \
+           and e.created_at < $2 \
+           and not exists (select 1 from webhook_deliveries d \
+                            where d.event_id = e.id and d.status = 'pending')",
+    )
+    .bind(organization_id)
+    .bind(cutoff)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let events_deleted = i64::try_from(events_deleted).unwrap_or(i64::MAX);
+
+    let finished_at: OffsetDateTime = sqlx::query_scalar(
+        "update event_retention_runs set finished_at = now(), events_deleted = $2, \
+                deliveries_deleted = $3 where id = $1 returning finished_at",
+    )
+    .bind(run_id)
+    .bind(i32::try_from(events_deleted).unwrap_or(i32::MAX))
+    .bind(i32::try_from(deliveries_deleted).unwrap_or(i32::MAX))
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(SweepReport {
+        run_id,
+        organization_id,
+        window_days,
+        cutoff,
+        events_deleted,
+        deliveries_deleted,
+        finished_at,
     })
 }
 

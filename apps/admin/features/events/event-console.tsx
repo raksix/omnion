@@ -36,6 +36,7 @@ import {
   CircleDot,
   Copy,
   Filter,
+  History as HistoryIcon,
   ListTree,
   RefreshCw,
   Radio,
@@ -52,6 +53,8 @@ import type {
   EventFilters,
   EventRow,
 } from "@/lib/types";
+
+import { RetentionPanel } from "./retention-panel";
 
 /** How many rows one page carries. Also the minimum: the API clamps to 1..200. */
 const PAGE = 25;
@@ -89,11 +92,12 @@ function filtersFrom(params: URLSearchParams): EventFilters {
   return filters;
 }
 
-type Tab = "feed" | "catalogue";
+type Tab = "feed" | "catalogue" | "retention";
 
 /** Read the tab and the window out of the query string. */
 function viewFrom(params: URLSearchParams): { tab: Tab; window: string } {
-  const tab = params.get("tab") === "catalogue" ? "catalogue" : "feed";
+  const raw = params.get("tab");
+  const tab: Tab = raw === "catalogue" ? "catalogue" : raw === "retention" ? "retention" : "feed";
   return { tab, window: params.get("window") ?? "" };
 }
 
@@ -265,6 +269,19 @@ export function EventConsole() {
   };
 
   const payloadText = (row: EventRow) => JSON.stringify(row.payload, null, 2);
+  // Memoised per row id: the tree is walked on every render of the expanded panel, and a
+  // payload walk that rebuilds 40 nodes on every keystroke in the filter box is the kind of
+  // thing a long feed makes visible.
+  const treeCache = useRef(new Map<number, PathNode[]>());
+  const pathNodes = (row: EventRow): PathNode[] => {
+    const cached = treeCache.current.get(row.id);
+    if (cached) return cached;
+    // The path is rooted at `payload`, because that is the name a receiver sees: the envelope
+    // wraps the event, and `payload.page_id` is what the person's own code will say.
+    const built = toPathNodes(row.payload, "payload", 0);
+    treeCache.current.set(row.id, built);
+    return built;
+  };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLTableSectionElement>) => {
     if (event.key === "/" && searchInput.current) {
@@ -311,6 +328,10 @@ export function EventConsole() {
           [
             { id: "feed", label: "Feed", icon: Activity },
             { id: "catalogue", label: "Catalogue", icon: ListTree },
+            // `History` is aliased because the identifier is also a DOM global, and the
+            // component this file imports would then be typed as whichever of the two the
+            // checker resolved first — a shadowing bug that only shows up on the icon type.
+            { id: "retention", label: "Retention", icon: HistoryIcon },
           ] as const
         ).map((entry) => {
           const Icon = entry.icon;
@@ -597,6 +618,23 @@ export function EventConsole() {
                                   >
                                     {payloadText(row)}
                                   </pre>
+                                  {pathNodes(row).length > 0 ? (
+                                    <div
+                                      data-event-paths={row.id}
+                                      className="flex flex-col gap-1.5 rounded-lg border border-line bg-surface p-3"
+                                    >
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="text-[12px] font-medium">Keys</span>
+                                        <span className="text-[11.5px] text-muted">
+                                          Copy the path you would write in a receiver.
+                                        </span>
+                                      </div>
+                                      <PathTree
+                                        nodes={pathNodes(row)}
+                                        onCopy={(path) => void copy(path, `the path ${path}`)}
+                                      />
+                                    </div>
+                                  ) : null}
                                 </div>
                               </td>
                             </tr>
@@ -625,6 +663,22 @@ export function EventConsole() {
             </div>
           ) : null}
         </>
+      ) : tab === "retention" ? (
+        /* The retention tab is a sibling of the other two rather than a card inside the Feed,
+           because it answers a third question — not *what happened* and not *what could
+           happen*, but *what will be forgotten and when*. It is rendered here rather than
+           fetched alongside the feed, so an operator who only wants the policy does not pay
+           for a page of events to find it, and so the Feed's `load` — which resets the row
+           cursor and the expansion on every filter change — cannot wipe the panel's notice
+           after a sweep. */
+        <section
+          id="event-panel-retention"
+          role="tabpanel"
+          aria-labelledby="event-tab-retention"
+          className="flex flex-col gap-3"
+        >
+          <RetentionPanel />
+        </section>
       ) : (
         <section
           id="event-panel-catalogue"
@@ -779,14 +833,21 @@ export function EventConsole() {
 
       {/* The name menu is a `details` element rather than a custom popover: it opens with the
           keyboard, closes with Escape, and works without JavaScript focus management — three
-          things a hand-rolled dropdown has to re-implement and usually gets one of wrong. */}
-      <NameMenu
-        names={filterNames}
-        selected={filters.name ?? []}
-        query={nameQuery}
-        onQuery={setNameQuery}
-        onToggle={toggleName}
-      />
+          things a hand-rolled dropdown has to re-implement and usually gets one of wrong.
+
+          It is gated on the Feed tab on purpose. On the Retention tab it would be a control
+          that filters nothing: a dead menu is worse than an absent one, because a reader who
+          opens it and finds a list of names has been told the panel does something it does
+          not. */}
+      {tab === "feed" ? (
+        <NameMenu
+          names={filterNames}
+          selected={filters.name ?? []}
+          query={nameQuery}
+          onQuery={setNameQuery}
+          onToggle={toggleName}
+        />
+      ) : null}
     </div>
   );
 }
@@ -968,6 +1029,132 @@ function previewPayload(payload: unknown): string {
     .slice(0, 3)
     .map(([key, value]) => `${key}: ${formatValue(value)}`)
     .join(" · ");
+}
+
+/**
+ * The JSON path of a key, in the form a receiver actually writes: `payload.page_id`, and
+ * `payload.items[2].slug` for a nested one.
+ *
+ * Quoting is the whole difficulty. A key with a space, a dot or a bracket in it has to be
+ * written `["order.total"]` — an unquoted `payload.order.total` is *two* lookups and, worse,
+ * reads as a key that does not exist, so the copied path silently matches nothing in the
+ * receiver the reader is trying to debug.
+ */
+function jsonPath(path: string, key: string): string {
+  const bare = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key);
+  return `${path}[${bare ? key : JSON.stringify(key)}]`;
+}
+
+/** One node of the payload tree: a key, its path, its value and whatever it nests. */
+type PathNode = { key: string; path: string; value: unknown; children: PathNode[] };
+
+/**
+ * Flatten a payload into a copyable tree, stopping where nesting stops being useful.
+ *
+ * The depth cap is the honest part. A payload nested twenty levels deep is real, and a tree
+ * that renders all of it is a panel that pushes every other key off the screen. Four levels
+ * past the root covers every payload the platform emits today; a node past the cap says so in
+ * place of pretending the branch is a leaf.
+ */
+const MAX_PATH_DEPTH = 4;
+
+function toPathNodes(value: unknown, path: string, depth: number): PathNode[] {
+  if (value === null || typeof value !== "object") return [];
+  const entries = Object.entries(value as Record<string, unknown>);
+  return entries.map(([key, child]) => {
+    const childPath = jsonPath(path, key);
+    const atCap = depth >= MAX_PATH_DEPTH;
+    return {
+      key,
+      path: childPath,
+      value: child,
+      children: atCap ? [] : toPathNodes(child, childPath, depth + 1),
+    };
+  });
+}
+
+/** Rendered next to a value that is itself an object or array — say why there is no row. */
+function isBranch(value: unknown): boolean {
+  return value !== null && typeof value === "object";
+}
+
+/**
+ * The payload's keys as a tree, each with the path that reaches it and a copy button.
+ *
+ * This is the piece the inspector was missing. "Copy payload" hands over a wall of JSON and
+ * leaves the reader to find the one key they wanted and work out how the receiver spells it —
+ * which is exactly the moment somebody is debugging why a subscription "does not fire". A
+ * per-key copy gives them the token they are about to type into their own code.
+ *
+ * The value shown is the **truncated** preview, not the raw text, for the same reason: a
+ * payload field holding a description or a body would push the key off the row. The full text
+ * stays one button away, and the title attribute carries the untruncated value, so nothing
+ * is hidden from anybody who looks.
+ */
+function PathTree({
+  nodes,
+  onCopy,
+  depth = 0,
+}: {
+  nodes: PathNode[];
+  onCopy: (path: string) => void;
+  depth?: number;
+}) {
+  if (nodes.length === 0) return null;
+  return (
+    <ul className={depth === 0 ? "flex flex-col gap-0.5" : "mt-0.5 flex flex-col gap-0.5 pl-4"}>
+      {nodes.map((node) => {
+        const branch = isBranch(node.value);
+        // Past the cap the branch is still a branch; saying so beats rendering it as a leaf.
+        const truncated =
+          !branch && depth >= MAX_PATH_DEPTH && hasChildrenBelowCap(node.value);
+        return (
+          <li key={node.path} data-event-path={node.path}>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-[12px] text-ink">{node.key}</span>
+              <span className="truncate font-mono text-[11.5px] text-muted" title={titleValue(node.value)}>
+                {branch
+                  ? Array.isArray(node.value)
+                    ? `[${node.value.length} item${node.value.length === 1 ? "" : "s"}]`
+                    : `{${Object.keys(node.value as Record<string, unknown>).length} keys}`
+                  : formatValue(node.value)}
+                {truncated ? " …" : ""}
+              </span>
+              <button
+                type="button"
+                onClick={() => onCopy(node.path)}
+                data-event-copy-path={node.path}
+                title={`Copy the path ${node.path}`}
+                aria-label={`Copy the path ${node.path}`}
+                className="ml-auto rounded p-0.5 text-muted transition hover:text-ink"
+              >
+                <Copy className="size-3" aria-hidden />
+              </button>
+            </div>
+            <PathTree nodes={node.children} onCopy={onCopy} depth={depth + 1} />
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** The untruncated value, for the title attribute. */
+function titleValue(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+/**
+ * Whether a value hides keys the tree did not render.
+ *
+ * Only ever true at the depth cap, and it is the difference between a value that is `—` and a
+ * value whose children are one click away: a branch that renders as an empty row reads as
+ * "this key holds nothing", which is a different fact and a wrong one.
+ */
+function hasChildrenBelowCap(value: unknown): boolean {
+  return isBranch(value) && Object.keys(value as Record<string, unknown>).length > 0;
 }
 
 function formatValue(value: unknown): string {
