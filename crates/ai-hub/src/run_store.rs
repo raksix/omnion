@@ -44,7 +44,12 @@ use crate::error::{AiHubError, Result};
 // The `coalesce` is not decoration: `array_agg` over zero rows returns NULL, and a `Vec<String>`
 // field is not optional, so an agent with no tools would come back as a decode error rather than
 // an empty list. Every agent without tools would fail to load.
-const AGENT_COLUMNS: &str = "id, organization_id, site_id, key, name, description, system_prompt, \
+//
+// Public because the API's agent update writes the same projection back: a second copy of this
+// column list is one that can drift, and a drifted `returning` clause decodes into a struct that
+// no longer has the columns the struct has.
+#[doc(hidden)]
+pub const AGENT_COLUMNS: &str = "id, organization_id, site_id, key, name, description, system_prompt, \
      model_id, temperature::float8, max_steps, deadline_seconds, token_budget, \
      coalesce((select array_agg(value) from jsonb_array_elements_text(tools)), '{}') as tools, \
      coalesce((select array_agg(value) from jsonb_array_elements_text(approvals)), '{}') as approvals, \
@@ -444,6 +449,165 @@ pub async fn list_agents(pool: &PgPool, organization_id: Uuid) -> Result<Vec<Age
         .bind(organization_id)
         .fetch_all(pool)
         .await?)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The runner's three queries
+// ---------------------------------------------------------------------------------------------
+
+/// How long a claim is trusted before another process may take the run back.
+pub const HEARTBEAT_STALE_SECONDS: i64 = 120;
+
+/// Claim the next queued run, atomically, and mark it running.
+///
+/// `for update skip locked` is the whole mechanism, and it is a deliberate choice over "select
+/// one, then update it": the pair without `skip locked` is the classic double-claim race, and two
+/// API processes both running a two-tool agent is a bill nobody approved. `skip locked` makes the
+/// loser move to the next row instead of waiting for the winner's transaction, so a claim costs
+/// one statement and a contended claim costs nothing.
+///
+/// The `started_at` is set *here* rather than when the row was created, because the run does not
+/// begin when somebody pressed Run — it begins when a worker picked it up. A run queued behind
+/// three others has been waiting, and the list screen's "started" column is about the work.
+///
+/// Ordering is `started_at nulls first, id`, which is the queue order for rows that have never
+/// been claimed and stays stable for rows that have: a run that was requeued after a dead worker
+/// keeps the instant it first started, so it is retried before a run created later.
+pub async fn claim_next_run(pool: &PgPool) -> Result<Option<Run>> {
+    // The selection is one statement and the status change is another, inside one transaction,
+    // and both are `for update skip locked`.
+    //
+    // It began as a single `with candidate as (...) update ai_runs ... from candidate` statement,
+    // which is the tidier SQL and is a **runtime error**: with the CTE in the `from` clause, every
+    // bare column in the returning list resolves against both relations and PostgreSQL answers
+    // `column reference "id" is ambiguous` before the statement runs. The `select … for update
+    // skip locked` half is exactly the part that must not be a separate transaction — a claim
+    // that is not atomic is the double-claim this whole function exists to prevent — so the
+    // selection is still `skip locked`, just issued on its own and closed in the same
+    // transaction as the update.
+    let mut tx = pool.begin().await?;
+    // `fetch_optional`, not `fetch_one`: an empty queue is the *normal* state of a runner on an
+    // installation nobody has pressed Run on, and `fetch_one` turns it into `RowNotFound` — which
+    // the caller would have to read as "the claim failed" rather than "there was nothing to
+    // claim". A queue poll that logs an error whenever it finds no work is a queue poll that
+    // trains an operator to ignore its log.
+    let picked: Option<(Uuid,)> = sqlx::query_as(
+        "select id from ai_runs where status = 'queued' \
+         order by started_at asc nulls first, id \
+         for update skip locked limit 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((run_id,)) = picked else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    let sql = format!(
+        "update ai_runs set status = 'running', started_at = coalesce(started_at, now()), \
+         heartbeat_at = now() where id = $1 returning {RUN_COLUMNS}"
+    );
+    let run = sqlx::query_as::<_, Run>(&sql)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(run))
+}
+
+/// Claim one *specific* run, by id, atomically.
+///
+/// The streaming path needs this and the background runner does not: a client that pressed Run
+/// holds a run id it will show on screen, and a queue-position-based claim would start a
+/// *different* run than the one it is watching. The `and status = 'queued'` predicate is what
+/// makes the two racers safe — whichever gets there first moves the row to `running`, and the
+/// other's update matches zero rows and returns `None` instead of running the loop twice.
+pub async fn claim_run(pool: &PgPool, run_id: Uuid) -> Result<Option<Run>> {
+    let sql = format!(
+        "update ai_runs set status = 'running', started_at = coalesce(started_at, now()), \
+         heartbeat_at = now() where id = $1 and status = 'queued' returning {RUN_COLUMNS}"
+    );
+    Ok(sqlx::query_as::<_, Run>(&sql)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// The runner's sign of life. Called at every step boundary.
+///
+/// A separate statement rather than part of `begin_step` because the two answer different
+/// questions: the step row says what the run *did*, the heartbeat says a worker is still holding
+/// it. A run whose provider call takes ninety seconds writes no steps at all, and a reaper that
+/// only looked at steps would hand that run to a second worker while the first was still waiting
+/// on the socket.
+pub async fn heartbeat(pool: &PgPool, run_id: Uuid) -> Result<()> {
+    sqlx::query("update ai_runs set heartbeat_at = now() where id = $1")
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Hand runs whose worker died back to the queue.
+///
+/// A run is stale when its heartbeat is older than [`HEARTBEAT_STALE_SECONDS`] **and** it is
+/// still `running`. Both halves matter: requeueing a run that is `queued` would be a no-op that
+/// still takes the row lock, and requeueing a `completed` run would undo a result somebody is
+/// looking at. The threshold is deliberately several times the provider timeout, so a slow call is
+/// never mistaken for a dead worker.
+pub async fn requeue_stale(pool: &PgPool) -> Result<u64> {
+    let done = sqlx::query(
+        "update ai_runs set status = 'queued', heartbeat_at = null, resume_count = resume_count + 1 \
+         where status = 'running' \
+         and (heartbeat_at is null or heartbeat_at < now() - make_interval(secs => $1))",
+    )
+    .bind(HEARTBEAT_STALE_SECONDS as f64)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Park a run for a decision, keeping the step that asked.
+///
+/// The status is the run's own, not an inference: the approval inbox reads this state, the list
+/// screen's badge reads it, and a run that *looks* parked because its last step is an approval
+/// row is a run whose status and its trace disagree the moment a second run starts.
+pub async fn park_run(pool: &PgPool, run_id: Uuid, error: Option<&str>) -> Result<()> {
+    sqlx::query(
+        "update ai_runs set status = 'awaiting_approval', stop_reason = null, \
+         heartbeat_at = null, error = $2 where id = $1",
+    )
+    .bind(run_id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Put a finished or parked run back on the queue, for a resume or a decision.
+///
+/// `resume_count` is bumped here rather than at the moment the answer arrived, so the count is
+/// the number of times the run actually *re-ran* — which is the number the trace needs and the
+/// one an operator reading "resumed 4 times" is asking about.
+pub async fn requeue_run(pool: &PgPool, run_id: Uuid) -> Result<bool> {
+    let done = sqlx::query(
+        "update ai_runs set status = 'queued', resume_count = resume_count + 1, \
+         heartbeat_at = null, error = null \
+         where id = $1 and status in ('awaiting_approval', 'failed')",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// How many runs are queued — the runner's own saturation read, and the 503 the start endpoint
+/// answers when the queue is far deeper than the pool can ever drain.
+pub async fn queued_runs(pool: &PgPool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as("select count(*) from ai_runs where status = 'queued'")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
 }
 
 /// Remove an agent. Its runs survive with a null `agent_id` — the migration says why.
