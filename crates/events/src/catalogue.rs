@@ -282,6 +282,18 @@ catalogue! {
     "media.retention_applied", "media", Live,
     "A retention rule changed or removed items.",
     [("rule", String, req), ("affected", Integer, opt)];
+    // The hold pair is `Live` because both branches are emitted and `call_names` below reads
+    // them out of the computed call — the drift walk sees a computed name, not a hole. Before
+    // this tick `NewEvent::new(if input.hold { … } else { … })` was invisible to every gate, and
+    // the pair shipped unlisted: the bus recorded them, the picker never offered them.
+    "media.hold_placed", "media", Live,
+    "A legal hold was put on an item, so retention must leave it alone.",
+    [("media_id", Uuid, req), ("site_id", Uuid, opt), ("filename", String, opt),
+     ("reason", String, opt)];
+    "media.hold_released", "media", Reserved,
+    "A legal hold was lifted and the item became eligible for retention again.",
+    [("media_id", Uuid, req), ("site_id", Uuid, opt), ("filename", String, opt),
+     ("reason", String, opt)];
     "media.duplicate_merged", "media", Live,
     "A duplicate item was merged into the one that was kept.",
     [("kept_media_id", Uuid, req), ("merged_media_id", Uuid, req), ("affected", Integer, opt)];
@@ -326,9 +338,72 @@ catalogue! {
     "iam.user_provisioned", "identity", Live,
     "An account was created or updated by an identity provider.",
     [("user_id", Uuid, req), ("provider", String, req)];
+    "iam.user_deprovisioned", "identity", Reserved,
+    "An account a directory had provisioned was deactivated.",
+    [("user_id", Uuid, req), ("external_id", String, opt)];
     "iam.provider_connected", "identity", Live,
     "An identity provider was connected or disconnected.",
     [("provider", String, req), ("connected", Boolean, req)];
+    "iam.provider_enabled", "identity", Live,
+    "An identity provider was switched on, so its button appears on the sign-in page.",
+    [("provider_id", Uuid, req), ("slug", String, opt)];
+    "iam.provider_test_passed", "identity", Live,
+    "A connection test walked every step of a provider and reached the end.",
+    [("provider_id", Uuid, req), ("kind", String, opt), ("step", String, opt)];
+    "iam.provider_test_failed", "identity", Live,
+    "A connection test stopped at one step. `step` names it, so a subscriber learns which check refused.",
+    [("provider_id", Uuid, req), ("kind", String, opt), ("step", String, opt)];
+    "iam.provider_created", "identity", Reserved,
+    "A provider draft was created.",
+    [("provider_id", Uuid, req), ("kind", String, req)];
+    "iam.provider_updated", "identity", Reserved,
+    "A provider's settings changed. The payload names the changed fields, never their values.",
+    [("provider_id", Uuid, req), ("fields", Json, opt)];
+    "iam.provider_disabled", "identity", Reserved,
+    "A provider was switched off, so its button leaves the sign-in page.",
+    [("provider_id", Uuid, req), ("slug", String, opt)];
+    "iam.directory_sync_started", "identity", Reserved,
+    "A directory sweep began.",
+    [("provider_id", Uuid, req), ("run_id", Uuid, req)];
+    "iam.directory_sync_completed", "identity", Reserved,
+    "A directory sweep finished; the counts are in the payload.",
+    [("provider_id", Uuid, req), ("run_id", Uuid, req), ("status", String, opt)];
+    "iam.directory_sync_failed", "identity", Reserved,
+    "A directory sweep could not finish.",
+    [("provider_id", Uuid, req), ("run_id", Uuid, opt), ("reason", String, opt)];
+    "iam.sso_signin_succeeded", "identity", Reserved,
+    "A single sign-on round trip ended in a session. Claims values never appear in the payload.",
+    [("provider_id", Uuid, req), ("subject_id", Uuid, opt)];
+    "iam.sso_signin_failed", "identity", Reserved,
+    "A single sign-on round trip was refused. `reason` is a stable code, never a raw IdP response.",
+    [("provider_id", Uuid, opt), ("reason", String, opt)];
+    "iam.group_membership_synced", "identity", Reserved,
+    "A directory or SCIM write changed who belongs to a group, so the mapped role can now differ.",
+    [("group_id", Uuid, req), ("added", Integer, opt), ("removed", Integer, opt)];
+    "iam.provisioning_token_issued", "identity", Reserved,
+    "A SCIM provisioning token was minted. Its secret is never in the payload.",
+    [("token_id", Uuid, req), ("prefix", String, req), ("expires_at", Timestamp, opt)];
+    "iam.provisioning_token_revoked", "identity", Reserved,
+    "A SCIM provisioning token was revoked and no longer authenticates.",
+    [("token_id", Uuid, req), ("prefix", String, opt)];
+    "iam.provisioning.token_rotated", "identity", Live,
+    "A SCIM provisioning token was rotated: the old secret is refused from the next request on.",
+    [("old_token_id", Uuid, req), ("new_token_id", Uuid, req),
+     ("old_prefix", String, opt), ("new_prefix", String, opt)];
+    "iam.sync_retry_requested", "identity", Live,
+    "An operator asked to reprocess the subjects one sync run refused.",
+    [("provider_id", Uuid, req), ("retry_run_id", Uuid, req),
+     ("source_run_id", Uuid, req), ("subject_count", Integer, req)];
+    "iam.role_rule_matched", "identity", Live,
+    "A sign-in was given a role by an SSO role rule. `rule_position` is the `#N` the panel shows.",
+    [("subject_id", Uuid, req), ("provider_id", Uuid, opt), ("rule_position", Integer, req),
+     ("role_id", Uuid, req), ("scope_type", String, opt)];
+    "iam.role_permissions_changed", "identity", Reserved,
+    "A role's permission set changed, so cached rule results have to be dropped.",
+    [("role_id", Uuid, opt), ("action", String, opt)];
+    "iam.security_policy_changed", "identity", Reserved,
+    "The sign-in security policy changed and the sign-in path has to reload it.",
+    [("policy", String, opt), ("action", String, opt)];
     "iam.approval_requested", "identity", Live,
     "Somebody asked for access they do not have.",
     [("subject", String, req), ("permission", String, opt)];
