@@ -156,6 +156,20 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
+# Every rule belongs to a tenant, and a tenant is not something the wizard leaves behind: it
+# creates the owner account and stops there, so a freshly reset database has a platform account
+# whose organization list is EMPTY. The rule editor then refuses its own save with "Choose an
+# organization before saving a rule.", the list stays empty, and every depth note downstream
+# reads as a broken screen. The tenant picker does not even render (`organizations.length > 1`),
+# so there is nothing on the page to click -- this is a harness gap, not a product defect.
+#
+# `POST /onboarding/organization` exists for exactly this state and refuses once a tenant exists,
+# so this is idempotent: it fills the gap when it is there and is a no-op when it is not.
+step "ensuring the QA organization exists"
+node scripts/qa/ensure-organization.mjs --url "$API_URL" --admin "http://127.0.0.1:$ADMIN_PORT" || {
+  echo "[qa] the QA organization could not be created; rule screens will report empty"
+}
+
 step "browser walkthrough"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
 
