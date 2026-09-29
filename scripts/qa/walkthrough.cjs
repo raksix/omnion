@@ -7622,7 +7622,11 @@ async function main() {
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
+  if (inScope("analytics")) {
     report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  }
+  log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
   // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
   // path, and the three states. It runs after the analytics passes because it emits into the
@@ -7665,7 +7669,6 @@ async function main() {
   // database that grows a notification per pass is one whose counts stop meaning anything.
   report.notificationOutbox = await runNotificationOutboxDepth(page, report);
   log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
-  log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
