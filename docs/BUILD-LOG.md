@@ -5681,3 +5681,106 @@ stopped and the slice committed instead. **Next tick:** if the slot is free, run
 `bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
 then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
 visited and clicked.
+
+## 2026-09-29 — REQ-053 slice 3 · transfers and the low-stock alert inbox
+
+**What.**
+
+The slice closes the gap slice 2 closed from the other side: slice 1 shipped the `in_transit`
+location kind, the `transfer_out`/`transfer_in` movement kinds and the rule that a hand-written
+movement may not be a transfer — with **nothing able to produce any of the three**. A transfer
+is now a document (`inventory_transfers` + `inventory_transfer_lines`, `0138`) with the
+three-step lifecycle, and the alert **record** now exists beside the alert **event** slice 1
+emitted.
+
+**Proof.**
+
+* `cargo test -p omnion-api --test inventory_transfers` — **11 passed, 0 failed**
+* `cargo test -p omnion-module-inventory --lib` — **71 passed, 0 failed** (60 from slices 1–2, 11 new)
+* `pnpm --filter @omnion/admin typecheck` — clean
+* `0138` and `0140` applied to `omnion_qa_w4`; the in-transit location is backfilled for all 187
+  existing organizations **and** a brand-new organization gets it from the `0126` trigger.
+
+**A `date` column bound as text, which a build cannot see.**
+
+`scheduled_on` is `date` and the parameter arrives as a `String`, so the first transfer anybody
+wrote answered **500** from PostgreSQL. Nothing catches this: the code compiles, the typecheck
+passes, and the unit tests are green because none of them touches the insert. It took a walk
+through the real router to find, and the fix is a cast in the statement next to the shape check
+that already validates the format. The general form is worth stating: **a text parameter bound
+to a typed column is a runtime failure that no gate on this platform can see**, and the only
+gate that does see it is the one that goes through HTTP.
+
+**Two more the walks found, both of the same kind.**
+
+`outstanding` was a *method* on `TransferLine`, so it never crossed the wire — the screen's
+receive boxes and the walk's assertion both read `undefined`. The rule lived in three places
+and was correct in one. It is now a serialized field computed in `into_view`, for the same
+reason `on_hand_after` is on a movement: the number a person acts on should come from the server
+that owns the arithmetic, and a client-side `quantity − received_qty` is right until the rule
+changes.
+
+The third was mine rather than the code's: a walk that read the alert inbox before anything had
+swept it. The fix is the *assertion* — the operator sweeps, the reader reads, and the reader is
+refused the sweep two lines later. Sweeping as the reader would have tested the wrong power. The
+final sweep now asserts `raised == 0`, which is the idempotence claim; asserting only `OK`
+would have missed it.
+
+**A test that failed first and was right to.**
+
+The sweep's own unit test caught the sweep disagreeing with the model: my first version folded
+`min_threshold` and `reorder_point` with `greatest()` and used a strict `<`, so a shelf sitting
+**exactly on** its reorder point was `Ok` in the inbox and `Low` on the stock list. Two screens
+disagreeing about one shelf is the exact thing the shared `StockStatus::of` exists to prevent,
+and the fix is to call it rather than copy it. The test is now
+`the_alert_reads_the_badge_the_stock_list_already_draws` and it says in its own comment that it
+exists because it failed.
+
+**A gap on `main` worth naming, and the workaround that goes with it.**
+
+`6e7b920` (main) added the CSRF layer, which refuses every cookie-authenticated mutation without
+a token, but `POST /auth/login` still issues **only** the session cookie. A real browser
+therefore cannot write anything, and every write suite on the platform is red for the same
+reason — this is not an inventory defect and not mine to fix from a feature branch. The test
+harness computes the token instead: it is an HMAC of the session id, and the id is read through
+the platform's **own** `resolve_session` rather than by re-implementing `hash_token` (which is
+one-way, so a `where token_hash = $1` would silently find nothing). The harness asserts the
+cookie is *still absent*, and that assertion is the note that tells the next reader the
+workaround can be deleted. **Owner: `POST /auth/login` should set `omnion_csrf` via
+`omnion_security::csrf::token_cookie`.**
+
+**Migrations.** `0138_inventory_transfers_and_alerts.sql`, taken above the shared high-water
+(now main 0135, wave2 0139, wave5 0137). Mine are 0053, 0054, 0055, 0057, 0125, 0126, 0127,
+0138 and **0140**.
+
+**`0054_sales_number_sequences` is renumbered to 0140**, and the reason is a lesson worth more
+than the number. A merge brought in a **second** `0054` — `0054_security_posture`, which every
+other worktree also has — and sqlx answers a duplicate in the directory with
+`VersionMismatch(54)`. That error **reads exactly like a stale QA database**, so the reflex
+(`scripts/qa/reset-db.sh`, which my own ledger records as the fix for that symptom) did not
+help and cost a full test cycle. The general form: when a migration error and a fix for it are
+both already known, and the fix does not work, **the diagnosis was wrong** — not the fix, and
+not the environment. `ls database/migrations | awk -F_ '{print $1}' | sort | uniq -d` finds this
+in one second and belongs in the reflex.
+
+**The QA pass, at commit time, had not finished.** It was queued behind another writer's pass
+(slot `max 1 concurrent`) with the stack down. What the pass is *supposed* to evaluate, listed so
+the next tick can check its output against a list written before the answer existed:
+
+* `page-inventory-transfers` renders, and the **empty state says something**;
+* the create form opens and **neither picker offers the in-transit location**;
+* a transfer's detail stepper shows, and **its buttons agree with the status** — a dispatch
+  button on a received transfer is the affordance version of the bug the module refuses
+  server-side;
+* `page-inventory-alerts` renders, the sweep **reports a number**, and every alert row prints a
+  threshold;
+* the inventory module nav appears on all five screens.
+
+Until those land the screens are **built, typechecked and walked by the API suite, but not
+visually reviewed**, so the REQ stays `in-progress`.
+
+**Next.** Slice 4 — the stocktake session (freeze a scope, count, variance computed live, one
+`stocktake_variance` movement per deviation on close, and a variance report that reopens
+correctly). `stocktake_variance` is already a reason code in slice 1 and the reconciliation
+report is already a list of disagreements with both numbers — the shape a variance report
+reuses. Slice 5 is the sales-order reservation, which the `reserve`/`release` kinds exist for.
