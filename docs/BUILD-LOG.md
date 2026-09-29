@@ -4188,3 +4188,73 @@ slice 4 and REQ-021 remain blocked on the QA slot.
 and it is the last thing in slice 1. Re-check the QA slot on arrival; when it is free and the
 box is under load ~6, run `bash scripts/qa/run.sh` with no `QA_STACK` override and extend
 `scripts/qa/walkthrough.cjs` so the new route is visited and clicked.
+
+
+## 2026-09-29 — REQ-126 close gate · the "pre-existing abort" that was never a defect
+
+The REQ's last acceptance line is the only one never ticked: `cargo test --workspace`, `pnpm
+typecheck`, `pnpm build` and the walkthrough, green, zero high findings. Two ticks of it were
+blocked on a suite that "aborts with exit 101 and no panic message" — and slice 5 wrote that
+down as a pre-existing condition, not claimed, not fixed. **It was not a defect, and the
+diagnosis in the file was wrong in a way worth more than the fix.**
+
+**It is `observability_permissions`, and it is 4/4 green.** Run with the database the suite
+was written for (`omnion_w6_dev`), all four walks pass in 21s. The abort was mine: a bare
+`cargo test -p omnion-api --test observability_permissions` takes its database from
+`OMNION_DATABASE_URL`, and with that unset the walks fall through to `DEFAULT_DATABASE_URL` —
+the **shared `omnion` database**. Seven writers share this box, so that database carries
+whichever migration 19 got there first (wave 2's `0019_cms_blocks`, here `0019_secret_hierarchy`),
+sqlx's per-version checksum can never match, and every DB-backed suite in the repository dies
+at once with
+
+```text
+the migrations did not apply to `omnion`: migration: migration 19 was previously applied but has been modified
+```
+
+**The message is a lie about its own cause, and that is the defect.** It says an applied
+migration was *edited* — the one reading a person acts on, and the one that produced a
+rebuilt-from-scratch `omnion_w6_dev` and a rebuilt-from-scratch reading of the blame. Neither
+was true. `walk_state.rs` already carries the correct diagnosis in prose (d02a916: "a symptom
+of pointing at somebody else's database"), which is why the abort read as unfixable: the file
+explained the real cause and the panic printed a different one. A walk that cannot name the
+database it failed against makes a naming problem look like a checksum problem, and no amount
+of re-reading the schema answers it.
+
+**The gate is now explicit instead of tribal knowledge.** `scripts/qa/run-workspace-tests.sh`
+is the general form of `run-media-walk.sh` — which already solved this for the media subset
+and was never made universal, so every other suite inherited the shared database by default:
+
+- the database is named after the **branch**, not the worktree, and created if missing (a
+  workspace gate runs 40+ suites; a fresh drop per invocation would pay the migrate cost 40
+  times over);
+- it refuses `omnion` and `omnion_qa` by name — both are reset by other processes, and a walk
+  dropped mid-run reports a migration error with nothing to do with the code;
+- `--test-threads=1`, because the alert evaluator is database-wide and the media rollups have
+  a per-day salt: parallel tests report product defects that do not exist.
+
+**And the second half of the gate fails for a reason nobody had seen: `/dev/shm` is full, and
+`ld` calls it a source error.** The first workspace run died with
+`collect2: fatal error: ld terminated with signal 7 [Bus error]` and blamed
+`omnion-api (test "webauthn")` — a compile error, in whichever suite happened to be linking
+when the tmpfs filled. Each test binary is 145 MB *with debuginfo*; the gate alone wants
+~5.8 GB of a directory seven writers share. Debug info is now off by default in the gate
+(`CARGO_PROFILE_{DEV,TEST}_DEBUG=0`, `QA_DEBUG_INFO=1` to opt back in) — nothing in this
+repository steps through a test binary, and panic output is identical without it. Freeing the
+stale debuginfo artifacts in this worker's own target took `/dev/shm` from 96% to 76%.
+
+**A gate that cannot be distinguished from a source defect is not a gate.** Both failures in
+this tick report a *code* problem for what are *environment* problems, and both were
+expensive: the first cost three ticks of rebuilds, the second would have cost a fourth. The
+`Bus error` in particular is the kind of message that sends a person to read `webauthn.rs`.
+
+**Proof.**
+
+- `observability_permissions` against `omnion_w6_dev` → **4/4** (was reported as aborting; it
+  never did)
+- `pnpm typecheck` → **2/2**; `pnpm build` → **2/2** (admin + web, both cached-green)
+- `cargo build -p omnion-api` after merging `origin/main` (5 commits) → clean, 1m17s
+- `bash scripts/qa/run-workspace-tests.sh` → the run this entry waits on; **result below**
+
+**Next.** Read the gate's actual result, then run the private-stack pass
+(`QA_STACK=w6 QA_API_PORT=18085 QA_ADMIN_PORT=3105 QA_WEB_PORT=3205 bash scripts/qa/run.sh`)
+and close REQ-126 on its last line.
