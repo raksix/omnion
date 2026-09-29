@@ -47,6 +47,24 @@ pub const MAX_IGNORE_REASON: usize = 1000;
 /// Longest note an acknowledgement or a comment may carry.
 pub const MAX_NOTE: usize = 4000;
 
+/// Most CSP directives one header policy may hold (REQ-012, slice 2).
+///
+/// A policy is read and rewritten by a human, so the cap is about *legibility*: a list nobody
+/// will scroll through is a list nobody will audit. It is far above any real policy.
+pub const MAX_HEADER_ROWS: usize = 40;
+
+/// Longest a single header name or CSP directive name may be.
+pub const MAX_HEADER_NAME: usize = 64;
+
+/// Longest a single header value or CSP source may be.
+pub const MAX_HEADER_VALUE_LENGTH: usize = 2048;
+
+/// How many CSP sources one directive may carry.
+///
+/// Chrome, Firefox and Safari all document the same practical ceiling; a longer list is a policy
+/// nobody can hold in their head, so it is refused rather than silently truncated.
+pub const MAX_CSP_SOURCES: usize = 64;
+
 /// `true` when `value` is a state the platform knows.
 #[must_use]
 pub fn is_state(value: &str) -> bool {
@@ -123,7 +141,10 @@ mod tests {
     fn a_state_the_platform_does_not_know_is_not_a_state() {
         assert!(!is_state("ok"), "'ok' is not one of our words for it");
         assert!(!is_state(""), "an empty state is not a state");
-        assert!(is_state("unknown"), "unknown is a state — it is the honest one");
+        assert!(
+            is_state("unknown"),
+            "unknown is a state — it is the honest one"
+        );
     }
 
     #[test]
@@ -135,7 +156,11 @@ mod tests {
         sorted.sort_by_key(|s| severity_rank(s));
         assert_eq!(sorted, vec!["critical", "high", "medium", "low", "info"]);
         assert_eq!(severity_rank("critical"), 0);
-        assert_eq!(severity_rank("nonsense"), 99, "an unknown severity is never the worst");
+        assert_eq!(
+            severity_rank("nonsense"),
+            99,
+            "an unknown severity is never the worst"
+        );
     }
 
     #[test]

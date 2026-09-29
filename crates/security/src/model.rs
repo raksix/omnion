@@ -488,7 +488,10 @@ mod tests {
 
     #[test]
     fn a_component_and_title_cannot_collide_across_the_separator() {
-        assert_ne!(fingerprint_of(Some("a-b"), "c"), fingerprint_of(Some("a"), "b-c"));
+        assert_ne!(
+            fingerprint_of(Some("a-b"), "c"),
+            fingerprint_of(Some("a"), "b-c")
+        );
     }
 
     #[test]
@@ -562,8 +565,14 @@ mod tests {
             last_seen_at: now(),
             fingerprint: String::new(),
         };
-        assert!(finding.ignore_has_lapsed(now()), "an ignore past its date is not an ignore");
-        assert!(!finding.is_open(), "…but the row still says ignored, which the store keeps");
+        assert!(
+            finding.ignore_has_lapsed(now()),
+            "an ignore past its date is not an ignore"
+        );
+        assert!(
+            !finding.is_open(),
+            "…but the row still says ignored, which the store keeps"
+        );
 
         finding.status = "open".into();
         assert!(finding.is_open());
@@ -576,7 +585,10 @@ mod tests {
         assert!(is_slug("https_terminated"));
         assert!(!is_slug("MFA"), "upper case is not a slug");
         assert!(!is_slug("mfa enforced"), "a space is not a slug");
-        assert!(!is_slug("ab"), "two characters is too short for a readable key");
+        assert!(
+            !is_slug("ab"),
+            "two characters is too short for a readable key"
+        );
     }
 
     #[test]
@@ -586,7 +598,11 @@ mod tests {
         query.limit = 10_000;
         assert_eq!(query.effective_limit(), crate::vocabulary::MAX_PAGE);
         query.limit = 0;
-        assert_eq!(query.effective_limit(), 1, "a zero page is one row, not the whole table");
+        assert_eq!(
+            query.effective_limit(),
+            1,
+            "a zero page is one row, not the whole table"
+        );
     }
 
     #[test]
@@ -613,7 +629,10 @@ mod tests {
             run_id: Uuid::nil(),
             checked_at: now(),
         };
-        assert!(!result.is_deduction(), "an unanswered question is not a failure");
+        assert!(
+            !result.is_deduction(),
+            "an unanswered question is not a failure"
+        );
         result.state = "warn".into();
         assert!(result.is_deduction());
         result.state = "fail".into();

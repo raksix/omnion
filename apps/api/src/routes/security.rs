@@ -44,11 +44,7 @@ fn map_store(error: omnion_security::SecurityError) -> ApiError {
     use omnion_security::SecurityError as E;
     match error {
         E::Invalid(message) => ApiError::bad_request("invalid_security_input", message),
-        E::NotFound => ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "finding not found",
-        ),
+        E::NotFound => ApiError::new(StatusCode::NOT_FOUND, "not_found", "finding not found"),
         E::Database(inner) => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -273,15 +269,15 @@ pub async fn overview(
     }
 
     Ok(Json(OverviewBody {
-        checks: rows
-            .iter()
-            .map(|row| check_body(row, &rows))
-            .collect(),
+        checks: rows.iter().map(|row| check_body(row, &rows)).collect(),
         score: score_of(&rows),
         summary,
         open_findings: severity_list(&env),
         last_run_at: last_run_at.map(|at| at.to_string()),
-        registry: omnion_security::keys().into_iter().map(str::to_string).collect(),
+        registry: omnion_security::keys()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }))
 }
 
@@ -316,14 +312,24 @@ pub async fn run_checks(
     // The bus is told after the write commits, and never after: a consumer that sees an id it
     // cannot yet fetch is the one ordering bug a subscriber cannot detect — it just gets a
     // 404 and concludes the platform lied.
-    bus::emit(
+    //
+    // A failure here is logged rather than surfaced, for the same reason as the audit write
+    // above: the run and its results are already stored, so a 500 would report a scan as lost
+    // when the operator will see its rows on the very next read. Discarding the `Result`
+    // silently — which is what the bare statement compiled to — is the one version of this that
+    // is genuinely wrong, because it makes an event bus outage indistinguishable from a scan
+    // that was never subscribed to.
+    if let Err(error) = bus::emit(
         state.db().pool(),
         NewEvent::new("security.scan.completed")
             .organization(session.user.organization_id)
             .actor(session.user.id)
             .payload(json!({ "run_id": run_id, "checks": results.len() })),
     )
-    .await;
+    .await
+    {
+        tracing::warn!(error = %error, "the scan was recorded but the event was not emitted");
+    }
 
     let stored = latest_results(state.db().pool(), organization)
         .await
@@ -345,7 +351,10 @@ pub async fn run_checks(
             .await
             .map_err(map_store)?
             .map(|at| at.to_string()),
-        registry: omnion_security::keys().into_iter().map(str::to_string).collect(),
+        registry: omnion_security::keys()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }))
 }
 
@@ -392,9 +401,10 @@ pub async fn export(
     query.limit = 0;
     query.offset = 0;
 
-    let rows = omnion_security::export_findings(state.db().pool(), session.user.organization_id, &query)
-        .await
-        .map_err(map_store)?;
+    let rows =
+        omnion_security::export_findings(state.db().pool(), session.user.organization_id, &query)
+            .await
+            .map_err(map_store)?;
     let document = omnion_security::render_findings_csv(&rows).map_err(map_store)?;
 
     let stamp = time::OffsetDateTime::now_utc().date().to_string();
@@ -431,12 +441,13 @@ pub async fn get(
     session: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<Json<FindingBody>, ApiError> {
-    let finding = omnion_security::find_finding(state.db().pool(), session.user.organization_id, id)
-        .await
-        .map_err(map_store)?
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::NOT_FOUND, "not_found", "finding not found")
-        })?;
+    let finding =
+        omnion_security::find_finding(state.db().pool(), session.user.organization_id, id)
+            .await
+            .map_err(map_store)?
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::NOT_FOUND, "not_found", "finding not found")
+            })?;
     Ok(Json(FindingBody::from(finding)))
 }
 
@@ -453,16 +464,14 @@ pub async fn patch_status(
         change = change.with_reason(reason);
     }
     if let Some(until) = body.ignored_until {
-        let at = time::OffsetDateTime::parse(
-            &until,
-            &time::format_description::well_known::Rfc3339,
-        )
-        .map_err(|_| {
-            ApiError::bad_request(
-                "invalid_security_input",
-                format!("ignored_until {until:?} is not an RFC 3339 timestamp"),
-            )
-        })?;
+        let at =
+            time::OffsetDateTime::parse(&until, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_security_input",
+                        format!("ignored_until {until:?} is not an RFC 3339 timestamp"),
+                    )
+                })?;
         change = change.with_expiry(at);
     }
     if let Some(note) = body.note {
@@ -480,7 +489,12 @@ pub async fn patch_status(
     .await
     .map_err(map_store)?;
 
-    record_audit(
+    // The status change is already stored above, and the audit entry is the only record that
+    // somebody resolved a finding rather than leaving it open — so a failure here is logged,
+    // not swallowed. `.ok()` reads as deliberate and is not: it makes a missing audit trail
+    // indistinguishable from one that was never asked for, and the request that would have
+    // written it answered 200.
+    if let Err(error) = record_audit(
         state.db().pool(),
         NewAuditEntry::by_user(session.user.id, "security.finding.resolved")
             .organization(session.user.organization_id)
@@ -488,7 +502,13 @@ pub async fn patch_status(
             .metadata(json!({ "status": body.status })),
     )
     .await
-    .ok();
+    {
+        tracing::warn!(
+            error = %error,
+            finding = %id,
+            "the finding status was stored but the transition was not audited"
+        );
+    }
 
     Ok(Json(FindingBody::from(finding)))
 }
@@ -539,7 +559,9 @@ pub async fn import(
     if !omnion_security::is_source(&source) || source == "config" || source == "platform" {
         return Err(ApiError::bad_request(
             "invalid_security_input",
-            format!("an uploaded report may only claim source dependency or report, got {source:?}"),
+            format!(
+                "an uploaded report may only claim source dependency or report, got {source:?}"
+            ),
         ));
     }
 
@@ -555,7 +577,13 @@ pub async fn import(
     let mut refreshed = 0usize;
     let mut rejected: Vec<String> = Vec::new();
     for draft in entries {
-        match omnion_security::upsert_finding(state.db().pool(), session.user.organization_id, &draft).await {
+        match omnion_security::upsert_finding(
+            state.db().pool(),
+            session.user.organization_id,
+            &draft,
+        )
+        .await
+        {
             Ok((_row, true)) => created += 1,
             // The idempotence the acceptance criteria ask for: ingesting the same report
             // twice must not double the count, and the *return* is what proves it did.
@@ -740,15 +768,17 @@ fn read_report(report: &serde_json::Value, source: &str) -> Result<Vec<NewFindin
     }
     let entries = match report {
         serde_json::Value::Array(items) => items.clone(),
-        serde_json::Value::Object(map) => match map.get("findings").or_else(|| map.get("vulnerabilities")) {
-            Some(serde_json::Value::Array(items)) => items.clone(),
-            _ => {
-                return Err(ApiError::bad_request(
-                    "invalid_security_input",
-                    "expected a top-level array or an object with a 'findings' array",
-                ));
+        serde_json::Value::Object(map) => {
+            match map.get("findings").or_else(|| map.get("vulnerabilities")) {
+                Some(serde_json::Value::Array(items)) => items.clone(),
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "invalid_security_input",
+                        "expected a top-level array or an object with a 'findings' array",
+                    ));
+                }
             }
-        },
+        }
         _ => {
             return Err(ApiError::bad_request(
                 "invalid_security_input",
@@ -871,11 +901,21 @@ async fn gather(
 
     // The finding-derived numbers are read first because they are the two checks that cannot
     // be faked: they are a count of real rows.
-    if let Ok(counts) = open_counts_by_severity(state.db().pool(), organization, time::OffsetDateTime::now_utc()).await
+    if let Ok(counts) = open_counts_by_severity(
+        state.db().pool(),
+        organization,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
     {
         env.open_findings = counts;
     }
-    match stale_dependency_count(state.db().pool(), organization, time::OffsetDateTime::now_utc()).await
+    match stale_dependency_count(
+        state.db().pool(),
+        organization,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
     {
         Ok(count) => env.stale_dependencies = count,
         // A read that failed is not a zero: it is a question this platform cannot answer, and
@@ -981,7 +1021,9 @@ fn cookie_probe(headers: &HeaderMap) -> Probe {
         // fetched with a session, so this is rare, and answering "unknown" is right.
         return Probe::unreadable("this request carried no session cookie to inspect");
     };
-    if session.to_ascii_lowercase().contains("; secure") || session.to_ascii_lowercase().contains("__secure") {
+    if session.to_ascii_lowercase().contains("; secure")
+        || session.to_ascii_lowercase().contains("__secure")
+    {
         Probe::value(json!({ "secure": true }))
     } else {
         // Browser cookies are not required to echo their own attributes back, so a cookie that
@@ -1062,13 +1104,18 @@ mod tests {
     fn a_report_carrying_a_credential_is_refused_whole() {
         let clean = json!({"findings": [{"title": "Unpinned tokio", "severity": "high"}]});
         assert!(!looks_like_a_credential(&clean));
-        assert!(read_report(&clean, "dependency").expect("a clean report parses").len() == 1);
+        assert!(
+            read_report(&clean, "dependency")
+                .expect("a clean report parses")
+                .len()
+                == 1
+        );
 
         for leaky in [
             json!({"findings": [{"title": "x", "api_key": "abc"}]}),
             json!({"findings": [{"title": "x", "nested": {"password": "hunter2"}}]}),
             json!({"findings": [{"title": "x", "evidence": "Bearer abcdefghijklmnopqrstuvwx"}]}),
-            json!({"findings": [{"title": "x", "leak": "«redacted:sk-…»"}]}),
+            json!({"findings": [{"title": "x", "leak": "sk-live0000000000000000000000000000"}]}),
         ] {
             assert!(
                 looks_like_a_credential(&leaky),
@@ -1080,15 +1127,15 @@ mod tests {
 
     #[test]
     fn a_report_in_an_unknown_shape_is_an_error_the_uploader_sees() {
-        for bad in [
-            json!("a string"),
-            json!(42),
-            json!({"results": []}),
-        ] {
+        for bad in [json!("a string"), json!(42), json!({"results": []})] {
             let err = read_report(&bad, "dependency").expect_err("an unknown shape must be named");
+            // `message()`, not `to_string()`: `ApiError` carries a status and a code that
+            // `Display` would have to invent an answer for, and the accessor that says
+            // "the human-readable explanation" already exists for this.
             assert!(
-                err.to_string().contains("findings"),
-                "the message should say what was expected: {err}"
+                err.message().contains("findings"),
+                "the message should say what was expected: {}",
+                err.message()
             );
         }
     }
@@ -1121,7 +1168,11 @@ mod tests {
     fn an_entry_with_no_name_is_skipped_rather_than_imported_blank() {
         let report = json!({"findings": [{"severity": "high"}, {"title": "real one"}]});
         let drafts = read_report(&report, "dependency").expect("parses");
-        assert_eq!(drafts.len(), 1, "a nameless entry is a line in a file, not a finding");
+        assert_eq!(
+            drafts.len(),
+            1,
+            "a nameless entry is a line in a file, not a finding"
+        );
         assert_eq!(drafts[0].title, "real one");
     }
 
@@ -1130,7 +1181,10 @@ mod tests {
         assert!(parse_findings_params(Some("limit=lots")).is_err());
         assert!(parse_findings_params(Some("offset=nope")).is_err());
         let empty = parse_findings_params(Some("severity=&status=&search=")).expect("parses");
-        assert!(empty.severity.is_none(), "an empty dropdown is not a filter");
+        assert!(
+            empty.severity.is_none(),
+            "an empty dropdown is not a filter"
+        );
         assert_eq!(empty.limit, 50, "an absent limit is the default page");
     }
 
@@ -1165,7 +1219,11 @@ mod tests {
             ..Environment::unprobed()
         };
         let list = severity_list(&env);
-        assert_eq!(list.len(), SEVERITIES.len(), "the chart has a fixed set of bars");
+        assert_eq!(
+            list.len(),
+            SEVERITIES.len(),
+            "the chart has a fixed set of bars"
+        );
         assert_eq!(list[0].severity, "critical");
         assert_eq!(list[0].count, 2);
         assert!(

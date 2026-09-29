@@ -334,7 +334,11 @@ fn mfa(env: &Environment) -> CheckOutcome {
             }),
         };
     }
-    from_probe(env.mfa.as_ref(), "Multi-factor authentication", "iam.factors")
+    from_probe(
+        env.mfa.as_ref(),
+        "Multi-factor authentication",
+        "iam.factors",
+    )
 }
 
 fn https(env: &Environment) -> CheckOutcome {
@@ -342,7 +346,11 @@ fn https(env: &Environment) -> CheckOutcome {
 }
 
 fn secure_cookies(env: &Environment) -> CheckOutcome {
-    from_probe(env.secure_cookies.as_ref(), "Secure cookies", "deploy.cookies")
+    from_probe(
+        env.secure_cookies.as_ref(),
+        "Secure cookies",
+        "deploy.cookies",
+    )
 }
 
 fn database_encryption(env: &Environment) -> CheckOutcome {
@@ -362,8 +370,14 @@ fn csp(env: &Environment) -> CheckOutcome {
     let Probe::Value(value) = probe else {
         return from_probe(Some(probe), "Content security policy", "security.csp");
     };
-    let mode = value.get("mode").and_then(Value::as_str).unwrap_or("report_only");
-    let directives = value.get("directives").and_then(Value::as_array).map_or(0, Vec::len);
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("report_only");
+    let directives = value
+        .get("directives")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     if directives == 0 {
         return CheckOutcome {
             state: "fail".to_string(),
@@ -394,7 +408,11 @@ fn csp(env: &Environment) -> CheckOutcome {
 }
 
 fn rate_limiting(env: &Environment) -> CheckOutcome {
-    from_probe(env.rate_limiting.as_ref(), "Rate limiting", "security.rate_limits")
+    from_probe(
+        env.rate_limiting.as_ref(),
+        "Rate limiting",
+        "security.rate_limits",
+    )
 }
 
 fn ip_rules(env: &Environment) -> CheckOutcome {
@@ -577,7 +595,11 @@ mod tests {
             ("dependency_freshness", "unknown"),
             ("open_findings", "pass"),
         ];
-        assert_eq!(expected.len(), CHECKS.len(), "the map covers every registered check");
+        assert_eq!(
+            expected.len(),
+            CHECKS.len(),
+            "the map covers every registered check"
+        );
 
         let results = evaluate_all(&Environment::unprobed(), Uuid::nil());
         for (key, state) in expected {
@@ -585,7 +607,11 @@ mod tests {
                 .iter()
                 .find(|r| r.check_key == *key)
                 .unwrap_or_else(|| panic!("{key} produced no row"));
-            assert_eq!(&row.state, state, "{key} claimed {:?}, expected {state}", row.state);
+            assert_eq!(
+                &row.state, state,
+                "{key} claimed {:?}, expected {state}",
+                row.state
+            );
         }
         // And the rule the whole design turns on, stated so it cannot be quietly broken.
         assert!(
@@ -607,7 +633,11 @@ mod tests {
         for check in CHECKS {
             assert!(check.order > last, "{} is out of display order", check.key);
             last = check.order;
-            assert!(crate::model::is_slug(check.key), "{} is not a slug", check.key);
+            assert!(
+                crate::model::is_slug(check.key),
+                "{} is not a slug",
+                check.key
+            );
             assert!(!check.label.is_empty(), "{} has no label", check.key);
             assert!(
                 check.action_href.starts_with('/'),
@@ -631,8 +661,14 @@ mod tests {
             ..Environment::unprobed()
         };
         let results = evaluate_all(&env, Uuid::nil());
-        let mfa = results.iter().find(|r| r.check_key == "mfa_enforced").expect("mfa row");
-        assert_eq!(mfa.state, "fail", "an absent factor table is a fact we can state");
+        let mfa = results
+            .iter()
+            .find(|r| r.check_key == "mfa_enforced")
+            .expect("mfa row");
+        assert_eq!(
+            mfa.state, "fail",
+            "an absent factor table is a fact we can state"
+        );
     }
 
     #[test]
@@ -646,7 +682,10 @@ mod tests {
         };
         let report = evaluate_all(&base, Uuid::nil());
         assert_eq!(
-            report.iter().find(|r| r.check_key == "csp_configured").map(|r| r.state.as_str()),
+            report
+                .iter()
+                .find(|r| r.check_key == "csp_configured")
+                .map(|r| r.state.as_str()),
             Some("warn"),
             "a report-only policy is not an applied one"
         );
@@ -660,7 +699,10 @@ mod tests {
         };
         let applied = evaluate_all(&enforced, Uuid::nil());
         assert_eq!(
-            applied.iter().find(|r| r.check_key == "csp_configured").map(|r| r.state.as_str()),
+            applied
+                .iter()
+                .find(|r| r.check_key == "csp_configured")
+                .map(|r| r.state.as_str()),
             Some("pass")
         );
     }
@@ -675,26 +717,41 @@ mod tests {
             ..Environment::unprobed()
         };
         let results = evaluate_all(&env, Uuid::nil());
-        let csp = results.iter().find(|r| r.check_key == "csp_configured").expect("csp row");
+        let csp = results
+            .iter()
+            .find(|r| r.check_key == "csp_configured")
+            .expect("csp row");
         assert_eq!(csp.state, "fail");
     }
 
     #[test]
     fn a_backup_older_than_the_line_fails_and_the_line_is_the_one_the_detail_names() {
         let fresh = evaluate_all(
-            &Environment { last_backup_hours: Some(3), ..Environment::unprobed() },
+            &Environment {
+                last_backup_hours: Some(3),
+                ..Environment::unprobed()
+            },
             Uuid::nil(),
         );
         assert_eq!(
-            fresh.iter().find(|r| r.check_key == "backup_healthy").map(|r| r.state.as_str()),
+            fresh
+                .iter()
+                .find(|r| r.check_key == "backup_healthy")
+                .map(|r| r.state.as_str()),
             Some("pass")
         );
 
         let stale = evaluate_all(
-            &Environment { last_backup_hours: Some(96), ..Environment::unprobed() },
+            &Environment {
+                last_backup_hours: Some(96),
+                ..Environment::unprobed()
+            },
             Uuid::nil(),
         );
-        let row = stale.iter().find(|r| r.check_key == "backup_healthy").expect("backup row");
+        let row = stale
+            .iter()
+            .find(|r| r.check_key == "backup_healthy")
+            .expect("backup row");
         assert_eq!(row.state, "fail");
         assert_eq!(json_of(row.detail.clone(), "stale_after_hours"), 48);
     }
@@ -706,7 +763,10 @@ mod tests {
         // with no backups read as merely unverified.
         let no_backup = evaluate_all(&Environment::unprobed(), Uuid::nil());
         assert_eq!(
-            no_backup.iter().find(|r| r.check_key == "backup_healthy").map(|r| r.state.as_str()),
+            no_backup
+                .iter()
+                .find(|r| r.check_key == "backup_healthy")
+                .map(|r| r.state.as_str()),
             Some("fail")
         );
         assert_eq!(
@@ -725,31 +785,54 @@ mod tests {
             ..Environment::unprobed()
         };
         let rows = evaluate_all(&critical, Uuid::nil());
-        assert_eq!(rows.iter().find(|r| r.check_key == "open_findings").map(|r| r.state.as_str()), Some("fail"));
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.check_key == "open_findings")
+                .map(|r| r.state.as_str()),
+            Some("fail")
+        );
 
         let low = Environment {
             open_findings: BTreeMap::from([("low".to_string(), 4)]),
             ..Environment::unprobed()
         };
         let rows = evaluate_all(&low, Uuid::nil());
-        assert_eq!(rows.iter().find(|r| r.check_key == "open_findings").map(|r| r.state.as_str()), Some("warn"));
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.check_key == "open_findings")
+                .map(|r| r.state.as_str()),
+            Some("warn")
+        );
     }
 
     #[test]
     fn no_open_findings_is_a_pass() {
-        let env = Environment { open_findings: BTreeMap::new(), ..Environment::unprobed() };
+        let env = Environment {
+            open_findings: BTreeMap::new(),
+            ..Environment::unprobed()
+        };
         let rows = evaluate_all(&env, Uuid::nil());
-        assert_eq!(rows.iter().find(|r| r.check_key == "open_findings").map(|r| r.state.as_str()), Some("pass"));
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.check_key == "open_findings")
+                .map(|r| r.state.as_str()),
+            Some("pass")
+        );
     }
 
     #[test]
     fn an_unreadable_probe_is_unknown_with_its_reason_kept() {
         let env = Environment {
-            https: Some(Probe::unreadable("the proxy header is not set on this host")),
+            https: Some(Probe::unreadable(
+                "the proxy header is not set on this host",
+            )),
             ..Environment::unprobed()
         };
         let rows = evaluate_all(&env, Uuid::nil());
-        let row = rows.iter().find(|r| r.check_key == "https_terminated").expect("https row");
+        let row = rows
+            .iter()
+            .find(|r| r.check_key == "https_terminated")
+            .expect("https row");
         assert_eq!(row.state, "unknown");
         assert_eq!(
             json_of(row.detail.clone(), "reason"),
@@ -763,7 +846,10 @@ mod tests {
         // like a check that does not exist.
         let rows = to_overview(&[], &Environment::unprobed(), Uuid::nil());
         assert_eq!(rows.len(), CHECKS.len());
-        assert!(rows.iter().all(|r| r.checked_at == time::OffsetDateTime::UNIX_EPOCH));
+        assert!(
+            rows.iter()
+                .all(|r| r.checked_at == time::OffsetDateTime::UNIX_EPOCH)
+        );
         assert_eq!(unevaluated_state(), "unknown");
     }
 
@@ -783,8 +869,14 @@ mod tests {
             ..Environment::unprobed()
         };
         let rows = to_overview(std::slice::from_ref(&stored), &env, Uuid::nil());
-        let row = rows.iter().find(|r| r.check_key == "https_terminated").expect("row");
-        assert_eq!(row.state, "pass", "the stored result is what the panel showed last time");
+        let row = rows
+            .iter()
+            .find(|r| r.check_key == "https_terminated")
+            .expect("row");
+        assert_eq!(
+            row.state, "pass",
+            "the stored result is what the panel showed last time"
+        );
         assert_eq!(row.id, 7);
     }
 

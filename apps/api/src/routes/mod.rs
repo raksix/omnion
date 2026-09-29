@@ -100,12 +100,13 @@ pub mod observability_alerts;
 pub mod observability_traces;
 pub mod notifications;
 pub mod notifications_admin;
-pub mod security;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod scim;
 pub mod search;
+pub mod security;
+pub mod security_headers;
 pub mod secrets;
 pub mod secrets_audit;
 pub mod secrets_credentials;
@@ -723,7 +724,8 @@ pub fn router(state: AppState) -> Router {
     // again is not: a replay is an outbound request to somebody else's server, so it is
     // `webhooks.manage` and never `webhooks.read`. A read-only auditor must not be able to make
     // the platform POST to a third party by pressing a button.
-    let webhook_stats = get(webhooks::endpoint_stats).layer(guards::require(&state, "webhooks.read"));
+    let webhook_stats =
+        get(webhooks::endpoint_stats).layer(guards::require(&state, "webhooks.read"));
 
     let webhook_secret_rotate =
         post(webhooks::rotate_secret).layer(guards::require(&state, "webhooks.manage"));
@@ -735,8 +737,8 @@ pub fn router(state: AppState) -> Router {
     let webhook_redeliver_batch =
         post(webhooks::redeliver_many).layer(guards::require(&state, "webhooks.manage"));
 
-    let webhook_redeliver_one = post(webhooks::redeliver_one)
-        .layer(guards::require(&state, "webhooks.manage"));
+    let webhook_redeliver_one =
+        post(webhooks::redeliver_one).layer(guards::require(&state, "webhooks.manage"));
 
     let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
@@ -764,9 +766,7 @@ pub fn router(state: AppState) -> Router {
         // GET and the PATCH's layer answers the PATCH, and a caller holding only `events.read`
         // reaches the GET and is refused on the PATCH — which is exactly the split the two
         // powers are for.
-        .merge(
-            patch(webhooks::set_retention).layer(guards::require(&state, "webhooks.manage")),
-        );
+        .merge(patch(webhooks::set_retention).layer(guards::require(&state, "webhooks.manage")));
     let event_retention_sweep =
         post(webhooks::sweep_retention).layer(guards::require(&state, "webhooks.manage"));
 
@@ -967,13 +967,26 @@ pub fn router(state: AppState) -> Router {
             "/security/findings",
             get(security::list).layer(guards::require(&state, "security.read")),
         )
+        // Header policy (REQ-012, slice 2). Reading the policy is `security.read` — it is the
+        // same read the overview's CSP row already makes. Changing it is `security.manage`, the
+        // same power that dismisses a finding, because the two are the same decision: an
+        // operator who can weaken the response headers can also make the findings stop
+        // mattering. A deployment that split them would let an account that can only look
+        // quietly un-look.
+        .route(
+            "/security/headers",
+            get(security_headers::get).layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/headers",
+            put(security_headers::put).layer(guards::require(&state, "security.manage")),
+        )
         .route(
             "/security/findings/{id}",
             get(security::get)
                 .layer(guards::require(&state, "security.read"))
                 .merge(
-                    patch(security::patch_status)
-                        .layer(guards::require(&state, "security.manage")),
+                    patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
         )
         .route("/analytics/overview", get(analytics::overview))
@@ -1584,7 +1597,10 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
-        .route("/webhooks/{id}/deliveries/redeliver", webhook_redeliver_batch)
+        .route(
+            "/webhooks/{id}/deliveries/redeliver",
+            webhook_redeliver_batch,
+        )
         .route(
             "/webhooks/{id}/deliveries/{delivery_id}/redeliver",
             webhook_redeliver_one,
@@ -1604,6 +1620,15 @@ pub fn router(state: AppState) -> Router {
             page_revision_comments,
         );
 
+    // The header policy is applied to the WHOLE tree, `/healthz` included: a security header
+    // that is missing on the one endpoint a scanner probes is missing where it is read.
+    //
+    // The baseline installs here and `security_headers::put` replaces it in place after a save,
+    // so a saved policy applies to the next response rather than at the next restart. The saved
+    // document is read at boot by `main.rs` and handed in; a platform whose database is
+    // unreachable at boot still serves headers rather than serving none.
+    let header_layer = crate::headers_middleware::install(omnion_security::HeaderPolicy::default());
+
     Router::new()
         .route("/healthz", get(health::healthz))
         // `/livez` is the same handler under the name some platforms expect (REQ-126, slice 4).
@@ -1618,10 +1643,25 @@ pub fn router(state: AppState) -> Router {
         // `omnion_telemetry::metrics::FAMILIES`, and nothing else has a route into them.
         .route("/metrics", get(observability::metrics_exposition))
         .nest("/api/v1", v1)
+        // Three layers wrap the versioned tree, and the order is load-bearing. `.layer()` wraps
+        // what is already built, so the LAST call is the OUTERMOST.
+        //
+        // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
+        // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
+        // about the *request*, and it has to be reached only by a request that actually
+        // authenticated - which is what the guards having run first guarantees.
+        .layer(crate::headers_middleware::require_csrf(&state))
+        // The header policy covers the whole tree, the probes included: a security header that is
+        // missing on the one endpoint a scanner probes is missing where it is read.
+        .layer(header_layer.clone())
         // The request id, the trace and the one line per request (REQ-126 slice 1). Installed on
-        // the OUTER router, not on `v1`, so the probes are described too — a probe that fails is
+        // the OUTER router, not on `v1`, so the probes are described too - a probe that fails is
         // the first thing an operator looks for, and a line with no request id is one they cannot
         // join to anything.
+        //
+        // Outermost of the three, so a request REJECTED by the two layers above it still arrives
+        // with a request id and still lands in the log. A CSRF refusal with no request id is the
+        // one rejection an operator cannot correlate with the page that caused it.
         //
         // `from_fn_with_state` inline rather than behind a helper that returns an `impl Layer`:
         // `Router::layer` needs the layer's concrete service to be `Clone + Service<Request<Body>>`,
