@@ -5132,3 +5132,59 @@ decoy-root test is testing the real thing.
 REQ-065 closed. The live OIDC round trip against the stub IdP with a SCIM-provisioned subject
 (`115cce4`) remains the one half of the group-membership criterion that a unit test cannot
 close, and REQ-066 MFA/passkeys is the next request.
+
+## Tick 19 (continued) — slice 4 part 13, the sign-in binding that was the last thing unticked
+
+REQ-065's group-membership clause was ticked with the OIDC round trip explicitly *not claimed*,
+and this is the tick that claims it. `apps/api/tests/sso_live.rs` gained
+`a_scim_provisioned_account_is_granted_its_stored_group_on_a_live_sign_in`: a real OIDC code
+flow, by an account a connector created through `/scim/v2/Users`, whose token carries **no**
+group claim, where the only thing that can grant the role is a `group_members` row the connector
+wrote through `/scim/v2/Groups`.
+
+`groups: &[]` is the load-bearing line, and empty rather than merely different on purpose: a walk
+that asserted *another* group would still pass if the claim arm were the only one ever consulted.
+The role is read back from `role_bindings` and not from the response body, and the account count
+is compared before and after — a connector-provisioned account re-created on sign-in is a
+duplicate-directory bug, and a successful sign-in is exactly what would hide it.
+
+**Proof it is not vacuous.** Emptying the rule the walk installs turns the grant into `None`
+rather than into a default role:
+
+```
+assertion `left == right` failed: the sign-in granted the role its stored group maps to
+  left: None
+ right: Some("editor")
+```
+
+So the walk observes the binding rather than inheriting one. `run-media-walk.sh sso_live` →
+**4 passed, 0 failed** (58s).
+
+**Three pre-existing walks in that file were broken and are now green.** `main` added the CSRF
+layer on 2026-09-29 and this file was left behind: all three older walks made cookie-authenticated
+writes and were refused `403 csrf_failed`. Fixing it took three parts, and each names a different
+trap.
+
+* **The secret belongs in the fixture**, set before `Config::from_env` — the layer *refuses*
+  rather than skips when no secret is configured, which is the correct production behaviour (a
+  silent skip is worse than a visible refusal) and makes the failure land on a walk's first
+  provider POST with a message about CSRF that names neither the walk nor the fix.
+* **The token derives from the resolved session id**, not from the opaque cookie value, and the
+  platform hands it out as an `omnion_csrf` cookie on the same login response. The walk reads it
+  off that response **by name** — `TestResponse` kept only the *first* `Set-Cookie` header, so
+  login's second header was invisible and the walk concluded, from a `403`, that the platform was
+  misconfigured. `raw_set_cookies` is a `Vec` and the lookup is by name, so the two cookies can
+  swap places without breaking anything. Re-deriving the token in the test would have passed and
+  tested a second copy of the rule.
+* **The SCIM half needs none of it**, and that asymmetry is worth knowing: a provisioning token
+  is a bearer credential, not ambient authority, so the layer deliberately skips it.
+  `bearer_request` and `owner_write` are separate constructors for the same reason.
+
+`connect`, `publish` and `assert_untested_providers_stay_off` now take `&Session` rather than
+`&str`, so a new walk cannot reintroduce the bug by calling a helper with a bare cookie. The dead
+`owner_session()` was removed rather than left as a decoy.
+
+**Next tick:** the pass is still queued (`/tmp/w9-qa-tick19.log`, `QA_SLOTS=1`, held by w3's live
+pass — correct queueing, not a deadlock). When it lands, read `page-iam-provider-deletion-blocked`
+and `-reassigned`; `722ac57`'s assertions still have not executed, and REQ-065 does not close
+before they do. After that: REQ-066 MFA/passkeys and device trust.
