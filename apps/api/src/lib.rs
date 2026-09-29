@@ -10,6 +10,7 @@ pub mod auth;
 pub mod automation_runner;
 pub mod client_ip;
 pub mod cookies;
+pub mod crm_request_id;
 pub mod crm_autoresponder_runner;
 pub mod dto;
 pub mod error;

@@ -1625,5 +1625,11 @@ pub fn router(state: AppState) -> Router {
         // authenticated - which is what the guards having run first guarantees.
         .layer(crate::headers_middleware::require_csrf(&state))
         .layer(header_layer.clone())
+        // The CRM's request-id scope, INSIDE the CSRF and header layers: it opens around the
+        // handler only, so a request the CSRF layer refuses never opens a scope and never writes a
+        // trail line. Router-wide rather than per-handler on purpose — a route added tomorrow gets
+        // a correlated audit line without anybody remembering to wrap it, and forgetting is silent
+        // (the line is written, the id reads `null`).
+        .layer(crate::crm_request_id::CorrelateCrm)
         .with_state(state)
 }
