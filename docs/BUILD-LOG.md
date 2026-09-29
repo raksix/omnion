@@ -6471,3 +6471,66 @@ already; a third on ~4 GB of free RAM is not a result to trust. REQ-133 stays op
 REQ-118 slice 1a's acceptance 16. (b) REQ-133 slice 3 — the move with its dependency checker, the
 one slice with no external dependency. (c) REQ-133 slice 4's `transfer-ownership` and the limits
 tables, which 0164 never created.
+
+## Wave 4b / w8 tick 31 — REQ-133 slice 3: the move, and a harness bug that had stopped every pass
+
+**What.** `crates/workflows/src/move_workflow.rs` ships `plan_move` / `move_workflow`: one function
+for both, with `dry_run` running the identical detection and returning before the write. The report a
+dialog renders is therefore the report the move is decided on — two functions that "look alike" are
+how a preview and its outcome drift. Four commits: **`e389407`** store + gate, **`43d0381`** the route
+(`workflows.manage`, project capability checked on the source AND the target), **`f8be13f`** the dialog
+and the project screen that hosts it, **`6977719`** the walkthrough step that opens it.
+
+**The defect the gate found, and it is the seventh of this module's kind.** The first version exempted
+instance administrators from the *source*-archive guard. `ensure_run_allowed` — shipped by this same
+branch forty minutes earlier — refuses runs in an archived project for everybody, so an administrator
+could not start a run in an archived project but **could reorganise it**. "Archived means read-only" is
+a property of the state, not a permission; the way out is `/restore`, which exists and is audited. The
+test that caught it is `moving_out_of_an_archived_project_is_refused`, and the branch lesson is
+narrower than "add a test": **when two guards enforce the same word, compare their exemptions** —
+`ensure_run_allowed` has none and the move had one, so "archived" had two meanings within one tick.
+
+**What the report does NOT check, said out loud.** REQ-133 names seven dependency kinds. On this
+branch `credential_reference`, `sub_workflow_call`, `inbound_webhook_subscription`,
+`published_api_route` and `workflow_template` **cannot exist** — there is no `credentials` table and
+the action set is closed at six names. `MoveReport.unchecked` carries all five (plus
+`workflow_folder`) so the dialog says what it is not looking at. The alternative — a report with an
+empty dependency list — reads as "this workflow carries nothing", which is a claim the server never
+made, and `Dependency::refuses_move` returning `false` for all four real kinds is asserted as a unit
+test so the first kind that returns `true` has one obvious place to change.
+
+**Proof.**
+- `scripts/qa/run-workflow-move.sh` → **13/13**, and **proven to fail at 12/13** with the source-archive
+  guard deleted: that one assertion fails, the other twelve stay green.
+- `cargo test -p omnion-workflows --lib` → **52/52**. `run-project-isolation.sh` → 14/14.
+- `cargo test -p omnion-api --lib move_tests` → 2/2 (the whole lib is 251). `omnion-api` builds.
+- admin `tsc --noEmit` → exit 0. `node --check scripts/qa/walkthrough.cjs` → clean.
+
+**Harness-wide bug, one line, and it explains four ticks of "the slot is held".** `run.sh` invokes
+`scripts/qa/cargo-slot.sh` directly, and that file was committed on **main** as mode `100644` when the
+cargo semaphore landed. Every stack's pass died at that line with `Permission denied` — including mine,
+which is why six ticks of queueing produced a pass that had never walked a page. `d85e605` fixes the
+mode. **A gate that every writer runs is not tested by the writer who adds it**; the file was added
+in the same commit that made `run.sh` call it, and nothing on any branch executes `run.sh` in a CI
+step.
+
+**Two fixture defects of mine before any product defect, both the constraints working.** `users` has
+`display_name`, not `name` (42703, twelve tests in 0.11s), and a `completed` execution needs
+`finished_at` (`workflow_executions_finished_shape`, 23514). Both are column lists written from memory
+instead of read out of the migration — which is the same failure as the 23502 that made slice 1 green.
+
+**The write names the source project in its `where`.** A workflow that moved between the report and the
+move updates zero rows and answers `workflow_moved`; a check-then-write would have reported a success
+that changed nothing. Same shape as the archive guard's `for share` read, and the reason it is in the
+`where` rather than a comparison in Rust.
+
+**Not claimed.** The move dialog has **never been walked** — `walkthrough.cjs` gained the step after
+this pass started, and the pass is still walking the pages that existed when it began. The dialog is
+typechecked and its endpoint is gated; neither is an observation. Slice 4 (`transfer-ownership`,
+limits tables, the project audit screen) is untouched, and REQ-118's acceptance 16 is still waiting on
+the same pass.
+
+**Next.** (a) When this pass reports: read `moveDialogOpen` / `moveUncheckedIsExplained` /
+`moveReportRendered` out of the run, and fix whatever they show. (b) Slice 4's `transfer-ownership`
+and the limits tables, which 0164 never created. (c) REQ-118 slice 1a's acceptance 16 — the one line
+this branch's longest-standing open claim depends on.
