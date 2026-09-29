@@ -1296,3 +1296,49 @@ export type EventCatalogue = {
   reserved_count: number;
   max_subscriptions: number;
 };
+
+/** One sweep of the event bus's retention, as the run log records it. */
+export type RetentionRun = {
+  id: string;
+  /** `null` is the platform's own events. */
+  organization_id: string | null;
+  started_at: string;
+  finished_at: string | null;
+  /** The window that was applied, in days. */
+  window_days: number;
+  /** The instant older rows were swept. */
+  cutoff: string;
+  events_deleted: number;
+  /** Delivery rows removed with their events. */
+  deliveries_deleted: number;
+  error: string | null;
+};
+
+/**
+ * How much history this organization keeps, and the last sweeps that ran.
+ *
+ * `due` is deliberately the same predicate the sweeper uses — an event a receiver is still owed
+ * is history, not due — so a screen that says "12 due" is never contradicted by a sweep that
+ * removes nothing.
+ */
+export type RetentionStatus = {
+  organization_id: string | null;
+  window_days: number;
+  /** Shortest window the API accepts, so the input can be bounded by the server's own rule. */
+  min_days: number;
+  max_days: number;
+  events: number;
+  due: number;
+  last_run: RetentionRun | null;
+  recent_runs: RetentionRun[];
+};
+
+/** What a manual sweep removed. */
+export type SweepResult = {
+  organization_id: string | null;
+  window_days: number;
+  cutoff: string;
+  events_deleted: number;
+  deliveries_deleted: number;
+  run_id: string;
+};
