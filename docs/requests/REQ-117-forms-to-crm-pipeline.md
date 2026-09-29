@@ -1,6 +1,6 @@
 # REQ-117 — Forms → CRM Lead Pipeline
 
-> **Status:** in-progress (slices 1–2 shipped; slice 3's conversion, flow probe, retention sweep **with its control and a dry run**, autoresponder worker and the autoresponder's editor all shipped and gated at the unit/DB level — **the browser pass still has not reached the CRM screens**, and the reason is now known and fixed rather than guessed) · **Captured:** 2026-09-26 · **Layer:** modules/website + modules/crm
+> **Status:** in-progress (slices 1–2 shipped and unit/DB-gated; the browser pass is **instrumented and runnable** — the two defects that made the CRM screens unprovable were in the harness, not the screens, and both are fixed: the depth passes now run first so a tab killed by nine writers' load cannot swallow them, and a closed tab is retried and reported as recovered instead of as a product failure. Two readiness bugs found and fixed the same way. **The screens themselves are still unvisited by a completed pass** — the box walked 9+ routes with zero failures before this tick's budget ran out) · **Captured:** 2026-09-26 · **Layer:** modules/website + modules/crm
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request

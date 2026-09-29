@@ -4424,3 +4424,47 @@ third tick running.
 **Next.** Re-run with the slot waited for rather than skipped (`QA_SLOTS=1`), so the pass starts
 on a box that can hold a browser. The gates are decoupled, so nothing else can take the API down
 under it now.
+
+## 2026-09-29 — omnion-w8 tick 12 · the screens were never broken; the instrument was
+
+**What.** Two harness defects, both of which had been read as product failures for three ticks.
+The CRM depth passes ran *last* in the walkthrough's depth list, behind fifteen IAM and security
+passes, so on a box where Chrome is reaped under memory pressure they were the two that never
+executed — everything after a dead tab is an echo, and a report that counts the echo as a failure
+teaches the next tick to distrust the pass. They now run first, right after the route walk. And
+`Target page, context or browser has been closed` is now retried once on a fresh page, with the
+replacement *adopted* by the run so later passes inherit a live tab, and reported as
+`recoveredAfterClosedTab` rather than silently. Anything else that throws is still a finding.
+
+**Two readiness bugs, found by running the thing rather than reading it.** `wait_http` accepted
+any non-000 code, so a Next dev server still compiling its first route — which answers 500 —
+looked ready; the walkthrough walked in and printed `FATAL: admin panel unreachable ... responded
+500`, a product failure invented entirely by the check. The same panel answered 200 seconds later.
+The first fix required 2xx and immediately failed a *healthy* public renderer, which answers 404
+for `/` until the pass seeds the site. Both facts are true at once, and the rule that holds them
+together is "something answered", where only 000 (nothing bound) and 5xx (still compiling) mean it
+has not. Four cases, each run: 200 ready · 404 ready · 500 not ready · closed port not ready, and
+a timeout now names the last code it saw. The Next readiness windows go 150s → 300s, because
+rushing a first compile is what produced the false failure in the first place.
+
+**Also.** Merging main brought a test in `security.rs` calling `err.to_string()` on an `ApiError`,
+which has a code and a message and deliberately no `Display` impl. `cargo build` is green — the
+break is inside `#[cfg(test)]`, so it only appears in a test profile, and it read as "the whole
+crate is broken". Fixed to `err.message()`, the shape the other route tests already use. And this
+worktree had no `target/` at all with 1.3 GB free on `/mnt/apopic`, so the pass would have paid a
+six-minute rebuild inside its own wall clock; `target` is a symlink into `/dev/shm/w8-target`.
+
+**Proof.** `pnpm typecheck` 2/2 · `cargo build -p omnion-api` green (4 pre-existing warnings) ·
+`cargo test -p omnion-api --lib crm` 16 passed, 0 failed · the readiness check proven in four
+cases · the full pass then walked 9+ routes with **zero** `request-failed` / `console-error` /
+`click-error`. The linter's dozen "`async fn` is not permitted in Rust 2015" errors on this repo
+are its own missing edition, not the crate's: `cargo build` is the only authority.
+
+**Not proved, and not claimed.** The pass did not reach the CRM routes: the box is running about
+seven routes per eleven minutes under load 20 with 28–29 of 32 GB in use by other writers, so the
+walk needs about 75 minutes. The reorder means the CRM depth passes execute early the moment the
+walkthrough gets there, but a status line that says "the pass is running" is a claim about the
+future, and the next tick reads it as a fact.
+
+**Next.** Re-run the pass and let it reach `/crm/leads`, `/crm/settings/intake` and
+`/crm/settings/assignment`; the depth passes are already first in line.
