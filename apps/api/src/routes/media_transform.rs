@@ -320,6 +320,7 @@ pub async fn raw_with_preset(
     current: CurrentSession,
     Path(media_id): Path<Uuid>,
     Query(query): Query<RawQuery>,
+    headers: axum::http::HeaderMap,
 ) -> std::result::Result<AxumResponse, ApiError> {
     let media = file_in_scope(&state, &current, media_id).await?;
     // One gate, before every branch — the original, a cached derivative and a freshly built
@@ -327,6 +328,7 @@ pub async fn raw_with_preset(
     // file. Putting the check inside `serve_original` instead would leave the *cached* path
     // (the one a published page actually fetches, served with `max-age=31536000`) open.
     crate::routes::media::ensure_servable(&state, &current, &media).await?;
+    let range = crate::routes::media::range_header(&headers);
 
     let Some(requested) = query
         .preset
@@ -335,7 +337,7 @@ pub async fn raw_with_preset(
         .filter(|p| !p.is_empty())
     else {
         // No preset: the original bytes, through the same headers as before.
-        return serve_original(&state, &media).await;
+        return serve_original(&state, &media, range).await;
     };
 
     let name = match validate_preset_name(requested) {
@@ -348,7 +350,7 @@ pub async fn raw_with_preset(
                 preset = requested,
                 "unusable preset name, serving the original"
             );
-            return serve_original(&state, &media).await;
+            return serve_original(&state, &media, range).await;
         }
     };
 
@@ -364,7 +366,7 @@ pub async fn raw_with_preset(
                     preset = %name,
                     "unknown preset, serving the original"
                 );
-                return serve_original(&state, &media).await;
+                return serve_original(&state, &media, range).await;
             }
         };
 
@@ -441,13 +443,23 @@ async fn build_derivative(
 }
 
 /// The original bytes, with the same guard the un-preset route applies.
+///
+/// The `Range` header is honoured here rather than only on the bare `/raw` path, because a
+/// derivative and the original are the *same file* to a client: a page that asks for
+/// `?preset=card` because the preset was deleted must still be able to window what comes back,
+/// and a client that learns "ranges work only without a preset" stops asking for them.
 async fn serve_original(
     state: &AppState,
     media: &omnion_media::MediaFile,
+    range: Option<&str>,
 ) -> std::result::Result<AxumResponse, ApiError> {
-    let bytes = state.storage().get(&media.storage_key).await?;
     let plan = omnion_media::serve_plan(&media.content_type);
+    let (status, bytes) =
+        crate::routes::media::read_window(state, &media.storage_key, range, media.size()).await?;
+    let ranges = crate::routes::media::range_header_values(range, media.size(), &bytes)?;
+
     let mut response = AxumResponse::new(Body::from(bytes));
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
     headers.insert(
@@ -459,6 +471,7 @@ async fn serve_original(
     );
     headers.insert(header::CACHE_CONTROL, header_value("private, max-age=300")?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    crate::routes::media::apply_range_headers(headers, ranges)?;
     Ok(response)
 }
 
