@@ -16,20 +16,28 @@
 //!
 //! It is infrastructure, like `omnion-audit` and `omnion-events`: this crate knows what a
 //! finding *is*, not what a specific vulnerability in a specific dependency means. Slice 1 is
-//! posture and findings; the header policy, the limiter, the lockout and the IP rules are
-//! slices 2–4 and each is its own module.
+//! posture and findings; the header policy and the CSRF token are [`headers`] and [`csrf`]
+//! (slice 2), the limiter and the lockout slice 3 and the IP rules slice 4 — each its own
+//! module, because each answers a different question an operator will ask separately.
 
 #![forbid(unsafe_code)]
 
+pub mod csrf;
 pub mod csv;
 pub mod error;
+pub mod headers;
 pub mod model;
 pub mod posture;
 pub mod store;
 pub mod vocabulary;
 
+pub use csrf::{CSRF_COOKIE, CSRF_HEADER, derive_token as derive_csrf_token, tokens_match};
 pub use csv::{COLUMNS as EXPORT_COLUMNS, MAX_EXPORT_ROWS, render as render_findings_csv};
 pub use error::{Result, SecurityError};
+pub use headers::{
+    CSP_DIRECTIVES, CspDirective, CspMode, HeaderLine, HeaderPolicy, HstsPolicy, PostureFacts,
+    REFERRER_POLICIES, csp_header_name, is_effective_hsts,
+};
 pub use model::{
     BuiltFinding, CheckResult, Finding, FindingPage, FindingQuery, NewCheckResult, NewFinding,
     SeverityCount, StatusChange, fingerprint_of, is_slug,
@@ -44,6 +52,6 @@ pub use store::{
     stale_dependency_count, upsert_finding,
 };
 pub use vocabulary::{
-    FINDING_STATUSES, MAX_BULK_IDS, MAX_PAGE, SEVERITIES, SOURCES, STATES,
-    STATE_WHEN_UNEVALUATED, is_finding_status, is_severity, is_source, is_state, severity_rank,
+    FINDING_STATUSES, MAX_BULK_IDS, MAX_PAGE, SEVERITIES, SOURCES, STATE_WHEN_UNEVALUATED, STATES,
+    is_finding_status, is_severity, is_source, is_state, severity_rank,
 };
