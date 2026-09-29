@@ -12,6 +12,9 @@ import type {
   SecurityFindingStatus,
   SecurityImportReport,
   SecurityOverview,
+  HeaderPolicyDocument,
+  HeaderPolicySave,
+  HeaderPolicySaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -4605,5 +4608,35 @@ export function importSecurityReport(
   return request<SecurityImportReport>("/api/v1/security/findings/import", {
     method: "POST",
     body: JSON.stringify({ report, source }),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 2) — the header policy
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Read the stored header policy and what it currently renders to.
+ *
+ * `no-store` for the same reason the overview is: the screen's whole claim is that these are
+ * the lines the next response will carry, and a cached policy is a policy that may no longer be
+ * the one in force.
+ */
+export function fetchHeaderPolicy(): Promise<HeaderPolicyDocument> {
+  return request<HeaderPolicyDocument>("/api/v1/security/headers", { cache: "no-store" });
+}
+
+/**
+ * Save the header policy.
+ *
+ * `expected_document` is the document the form was opened with and is the compare-and-swap key:
+ * a form somebody else has since saved is **refused** rather than silently overwriting them.
+ * The client never pre-validates a directive — the server owns every rule here, and a second
+ * validator that disagreed with it would be a second place to be wrong.
+ */
+export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySaved> {
+  return request<HeaderPolicySaved>("/api/v1/security/headers", {
+    method: "PUT",
+    body: JSON.stringify(save),
   });
 }
