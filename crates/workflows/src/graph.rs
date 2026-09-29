@@ -1113,6 +1113,47 @@ pub fn find_cycle(graph: &Graph) -> Option<Vec<String>> {
 /// A node the projection cannot express is refused here, not skipped: silently dropping a
 /// node would leave a rule that runs and does not do what its canvas shows.
 pub fn project(graph: &Graph) -> Result<Vec<(String, StepDefinition)>> {
+    project_walk(graph).map(|walk| walk.steps)
+}
+
+/// One node of a graph, and what it contributes to a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalkedNode {
+    /// The node's id, as the canvas draws it.
+    pub node_id: String,
+    /// The step this node contributes, or `None` when it contributes none.
+    ///
+    /// `None` for a trigger (the run starts there rather than stepping through it), for a
+    /// note, and for any node type the registry marks inert. The distinction matters to
+    /// *Run from here*: a node with no step is not an error, it is a position.
+    pub step: Option<StepDefinition>,
+    /// The position this node's step occupies in the run, or `None` with no step.
+    ///
+    /// Counted over the *steps*, not over the nodes, and that is the point: a run's
+    /// `step_no` is dense (1, 2, 3…) while the walk has holes in it, and a planner that
+    /// numbered by node position would hand the engine a step list the stored numbering
+    /// disagrees with. Reading the number off the walk is what lets a skipped prefix keep
+    /// the position it would have had in a full run.
+    pub step_no: Option<i32>,
+}
+
+/// A whole graph walked in run order, with the runnable steps taken out of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Walk {
+    /// Every node the walk visited, in the order it was reached, triggers included.
+    pub nodes: Vec<WalkedNode>,
+    /// The runnable steps, in order, each with the node that produced it.
+    pub steps: Vec<(String, StepDefinition)>,
+}
+
+/// The graph's walk order, and the steps it projects to.
+///
+/// One traversal, two answers. *Run from here* needs the walk order because the node an
+/// operator clicks is often one that projects to no step — the end node, a note, a second
+/// trigger — and "start here" is a position in the walk, not a row in the step list.
+/// Deriving that from `project` alone is what would make those nodes unstartable, and
+/// deriving it from a second walk is what would let the two disagree about order.
+pub fn project_walk(graph: &Graph) -> Result<Walk> {
     let findings: Vec<Finding> = validate(graph)
         .into_iter()
         .filter(Finding::is_error)
@@ -1130,7 +1171,12 @@ pub fn project(graph: &Graph) -> Result<Vec<(String, StepDefinition)>> {
         .find(|node| is_trigger_type(&node.node_type))
         .ok_or_else(|| WorkflowError::invalid("graph_invalid", "the graph has no trigger"))?;
 
+    let mut nodes: Vec<WalkedNode> = Vec::new();
     let mut steps: Vec<(String, StepDefinition)> = Vec::new();
+    // The position the *next* step will take, counted over steps only. A trigger and an
+    // inert node hold no position, which is why `WalkedNode.step_no` is `Option`: the
+    // walk has holes in it and the run does not.
+    let mut step_no: i32 = 0;
     let mut current = trigger.id.clone();
     // The v0 engine has one branching step, so a graph walk follows the *true* edge and stops
     // at a false one. `visited` is what turns a loop the validator refused into a bounded
@@ -1154,9 +1200,21 @@ pub fn project(graph: &Graph) -> Result<Vec<(String, StepDefinition)>> {
         match find_node_type(&node.node_type) {
             // A trigger is where the run starts, not something the runner steps through, and
             // a note is decoration. Neither contributes a step.
-            Some(node_type) if node_type.inert || is_trigger_type(&node.node_type) => {}
+            Some(node_type) if node_type.inert || is_trigger_type(&node.node_type) => {
+                nodes.push(WalkedNode {
+                    node_id: node.id.clone(),
+                    step: None,
+                    step_no: None,
+                });
+            }
             Some(node_type) => {
                 let step = step_for(node, node_type, graph)?;
+                step_no += 1;
+                nodes.push(WalkedNode {
+                    node_id: node.id.clone(),
+                    step: Some(step.clone()),
+                    step_no: Some(step_no),
+                });
                 steps.push((node.id.clone(), step));
             }
             None => {
@@ -1181,7 +1239,7 @@ pub fn project(graph: &Graph) -> Result<Vec<(String, StepDefinition)>> {
             "the graph projects to no steps — nothing would run",
         ));
     }
-    Ok(steps)
+    Ok(Walk { nodes, steps })
 }
 
 /// Which output port the linear walk follows.

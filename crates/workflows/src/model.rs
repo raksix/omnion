@@ -243,6 +243,25 @@ pub enum StepStatus {
     Failed,
     /// The run was cancelled before (or while) this step ran.
     Cancelled,
+    /// The step did not run, because the run was started further down the graph
+    /// (*Run from here*, REQ-004 slice 3).
+    ///
+    /// A sixth state rather than a flag on `succeeded` or `pending`, and the reason is
+    /// visible in the three queries that consume step status:
+    ///
+    /// * `claim_due_step` reads `('pending', 'waiting')` — a skipped step is never claimed;
+    /// * `settle_execution` counts open work as `('pending','running','waiting')` and
+    ///   failures as `= 'failed'`, so a skipped step is closed and is not a failure, which
+    ///   is what lets a run whose prefix was skipped still settle `completed`;
+    /// * `retry_step_from` re-opens `('failed','cancelled','pending','waiting')` — a skipped
+    ///   prefix stays skipped when a run is retried, because re-running from a node must
+    ///   not silently re-run what the author asked to skip.
+    ///
+    /// So the new state needs no engine branch, and the invariant is the interesting part:
+    /// the *same* three queries that already existed were shaped so that one more terminal
+    /// state would be free. A state that had to be threaded through them would have been
+    /// the tell that the schema was not ready for it.
+    Skipped,
 }
 
 impl StepStatus {
@@ -256,6 +275,7 @@ impl StepStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
         }
     }
 
@@ -269,6 +289,7 @@ impl StepStatus {
             "succeeded" => Some(Self::Succeeded),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
+            "skipped" => Some(Self::Skipped),
             _ => None,
         }
     }
@@ -277,6 +298,15 @@ impl StepStatus {
     #[must_use]
     pub const fn is_open(self) -> bool {
         matches!(self, Self::Pending | Self::Running | Self::Waiting)
+    }
+
+    /// `true` when this step will never run again, whatever the engine does next.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Skipped
+        )
     }
 }
 
@@ -467,6 +497,15 @@ pub struct WorkflowExecution {
     /// a caller, and the read must not be able to fail on one of them.
     #[sqlx(default)]
     pub event_payload: Option<serde_json::Value>,
+    /// The graph node this run was started at, when it was started mid-graph
+    /// (*Run from here*, REQ-004 slice 3).
+    ///
+    /// `None` for every ordinary run — a manual run, a schedule and an event all start at
+    /// the trigger, and saying "the trigger" on each of those rows would be a field that
+    /// always holds the same answer. Its absence is the signal, and the trace renders
+    /// "started at the trigger" for it.
+    #[sqlx(default)]
+    pub started_from_node: Option<String>,
 }
 
 impl WorkflowExecution {
@@ -486,7 +525,7 @@ impl WorkflowExecution {
 /// Columns of `workflow_executions`, in the order [`WorkflowExecution`] expects.
 pub const EXECUTION_COLUMNS: &str = "id, workflow_id, organization_id, status, trigger_kind, \
      triggered_by, started_at, finished_at, error, approval_id, \
-     coalesce(event_payload, 'null'::jsonb) as event_payload";
+     coalesce(event_payload, 'null'::jsonb) as event_payload, started_from_node";
 
 /// One materialised step of a run.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -534,6 +573,22 @@ pub struct WorkflowStep {
     /// nothing to point at.
     #[sqlx(default)]
     pub approval_id: Option<Uuid>,
+    /// Why this step did not run, when it did not (REQ-004 slice 3).
+    ///
+    /// Set only on a `skipped` step, and the database refuses a skip without one: the
+    /// criterion asks for a trace that says *why*, and a reason stored in a code that a
+    /// reader has to know is not a reason.
+    #[sqlx(default)]
+    pub skip_reason: Option<String>,
+    /// The graph node this step came from, when the rule was started from a graph.
+    ///
+    /// `None` for a rule whose definition predates the builder: attributing such a step to
+    /// whichever node happens to sit at the same index would be a guess, and a wrong one.
+    #[sqlx(default)]
+    pub node_id: Option<String>,
+    /// The output port that carried into this step (`success`, `true`, `case_1`, …).
+    #[sqlx(default)]
+    pub branch: Option<String>,
 }
 
 impl WorkflowStep {
@@ -559,7 +614,7 @@ impl WorkflowStep {
 /// Columns of `workflow_steps`, in the order [`WorkflowStep`] expects.
 pub const STEP_COLUMNS: &str = "id, execution_id, step_no, name, kind, action, params, on_error, \
      timeout_ms, status, attempts, max_attempts, available_at, started_at, finished_at, output, \
-     error, ignored, approval_id";
+     error, ignored, approval_id, skip_reason, node_id, branch";
 
 #[cfg(test)]
 mod tests {

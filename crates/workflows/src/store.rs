@@ -67,9 +67,10 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.next_run_at)
         .bind(new.steps)
         // The graph the builder opens on, seeded rather than defaulted.
-        .bind(serde_json::to_value(starter).unwrap_or_else(|_| {
-            serde_json::json!({ "nodes": [], "edges": [] })
-        }))
+        .bind(
+            serde_json::to_value(starter)
+                .unwrap_or_else(|_| serde_json::json!({ "nodes": [], "edges": [] })),
+        )
         .bind(new.created_by)
         .fetch_one(pool)
         .await?;

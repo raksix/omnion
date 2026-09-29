@@ -30,6 +30,7 @@ pub mod graph_store;
 pub mod guard;
 pub mod handler;
 pub mod model;
+pub mod run_from;
 pub mod store;
 
 pub use approval::{APPROVAL_PERMISSION, ApprovalParams, Decision as ApprovalDecision};
