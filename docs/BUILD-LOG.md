@@ -5326,3 +5326,62 @@ HTTP level. The fix is a migration that relaxes the check for `status = 'rejecte
 **Next.** Slice 3's remaining depth: the REQ-064 form-editor card is the last screen, and the
 `rejected`-row constraint above is a real defect worth its own commit. A browser pass is still
 blocked — the QA slot is held by another writer's live pass and free RAM is ~200 MB of 32 G.
+
+---
+
+## 2026-09-29 · REQ-117 slice 3, the verdict row (a refusal is a row)
+
+**What shipped.** Migration `0159_crm_lead_verdict_rows.sql`, `scripts/qa/run-crm-verdict-rows.sh`
+(7 tests) and the intake gate's now two-sided assertion on the contactable check. The store needed
+no change: `capture` has inserted a `rejected` row with its reason since slice 1.
+
+**The defect.** `crm_leads_contactable_check` was
+`check (coalesce(email,'') <> '' or coalesce(phone,'') <> '')`, and the row the store inserts on the
+rejected branch is by construction a row with neither. So REQ-117 acceptance 5's row was refused by
+the database with `23514` and the visitor's form got a 500 instead of the sentence it should render.
+
+**Proof.**
+- `bash scripts/qa/run-crm-verdict-rows.sh` → **7 passed, 0 failed**.
+- **Proven to fail**: the same tests against a schema built *without* `0159` → **0 passed, 7 failed**,
+  the first failure quoting the production error verbatim —
+  `23514 … violates check constraint "crm_leads_contactable_check"` on the rejected insert.
+- `bash scripts/qa/run-crm-intake.sh` → **PASS**, now printing both halves
+  (`an open lead with no e-mail and no phone refused`, `a rejected row with no address is written = 1`).
+- Sibling gates unchanged: autoresponder 10 · binding-health 5 · dedupe 10 · claims 7 · convert 6 ·
+  assign 9+5 · sla 7+5. Module lib 159. 0 clippy in the files touched. admin `tsc --noEmit` clean.
+
+**The lesson worth keeping — a limitation written where a test should be.** Twenty ticks of green
+suite, and the reason is two comments. `crm_autoresponder.rs` said the rejected case is "unreachable
+through this fixture on purpose" because the constraint refuses such a row; `crm_binding_health.rs`
+said the health check's `Unknown` state "is not reachable through capture on this branch" for the
+same reason. Both were **true**, both named the exact constraint, and together they removed every
+reason to look for the cause. A note that explains why a test is missing is indistinguishable from a
+note that explains why a test is not needed, and the platform cannot tell you which one you wrote.
+The rule that came out of it: **when you write "unreachable on purpose", name the commit that would
+make it reachable.** These two now name `crm_verdict_rows.rs`.
+
+**The narrow boundary is the design.** `rejected`, `spam` and `duplicate` are verdicts; `converted`
+is not, because a converted lead carries a `contact_id` and a `deal_id` — its addressability was
+proven before it arrived there. And the *edit* is still refused: `patch_lead` computes the merged
+address pair and returns before the database sees it, so migration `0159` is the check narrowing and
+nothing else. The intake gate asserts both directions, because a fix that had simply dropped the
+constraint would pass a test that only checked the open-lead half.
+
+**Six properties the branch had no fixture for, all now tested.** A rejected row is not counted as
+unassigned open work. An unfilled *required target* names the field — a different sentence from "no
+address", and the only thing telling an operator whether the form or the visitor is at fault. A
+rejected row can be given an address by an edit and becomes work again, which is the entire argument
+for keeping it. The rejected branch finishes its claim, or a redelivery wedges for ever.
+
+**A fixture that reached the branch for the wrong reason.** `MappingEntry::required()` is on the
+mapping *line*; the source's `required_targets` list is validated at **save** time instead. The
+first version of that test set only the list, and the submission came back with "neither e-mail nor
+phone was submitted" — the right status for the wrong branch, on an assertion loose enough to accept
+it. The reason string is the whole content of a verdict row, so a test that does not name the branch
+is not testing it.
+
+**Next.** The REQ-064 form-editor card is the last screen of slice 3. A browser pass is still
+blocked: the QA slot is held by another writer's live pass (w6) and free RAM is ~1.6 GB of 32 G.
+
+**Commits.** `9e506bd` (the migration), `98218f1` (the gate and the 0/7), `9e75568` (the intake
+gate's two-sided assertion), `6a009b0` (retiring the two workarounds).
