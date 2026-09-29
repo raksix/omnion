@@ -9437,3 +9437,61 @@ is the only reason REQ-010, REQ-012 and REQ-013 stay open.
 change per suite now, and each one is a REQ that can then be closed on its browser pass rather
 than on the note that its suite was already red. (b) The `media` part of a backup run is the
 place to look next: it counts rows, and a backup that only counts is a manifest, not a backup.
+
+
+### Wave 3 / tick 25 — four notes read empty because four probes never reached the code (2026-09-29)
+
+**What.** Tick 24 fixed the write that six notes shared and stopped there, naming two probes as
+instrument defects and leaving them in place. This tick fixed them — and found a third and a
+fourth of the same shape while doing it. The pattern is worth stating once, because it is now
+the most productive thing in this REQ: **an EMPTY note is unmeasured, and an instrument defect
+produces an empty note, so every empty note is a probe question until proven otherwise.** Not
+one of the four was a product defect, and each looked like one.
+
+1. **`workflow-table` created a rule with `{name, description}`.** `WorkflowInput` deserializes
+   `trigger` and `steps` as required, so the create was refused `422` on a missing field before
+   any table code ran. The probe returned on `id: null` and every row below it read empty. The
+   trigger is structured (`{"kind":"manual"}`, never the bare string) and one task step is the
+   smallest definition the engine accepts. **The refusal message is now recorded** —
+   `StepDefinition` is `deny_unknown_fields`, so it names the field, and three ticks each
+   guessed at the payload instead of reading the one line that said which field was missing.
+2. **`validate-classes` built edges as `{source, source_port, target}`.** `Edge` requires an
+   `id` and refuses unknown fields, so all six cases were rejected at the deserializer and came
+   back `valid: null` with an empty `codes` list — which the note read as "the validator found
+   nothing", when the request had never reached the validator. Ids are now derived from the
+   endpoints, and the duplicate case carries two **different** ids for one port pair: identity
+   is the edge's own, the `(source, port, target)` triple is what the validator calls a
+   duplicate.
+3. **`run-from-here` clicked "the second card in draw order".** A rule is born from
+   `Graph::starter` as `[trigger, end]`, so the second card is *always* the end node — on every
+   rule, forever. The note read `canStart: "false"` with the reason "The end of the graph has
+   nothing after it to run", which is the product being **right**: an end node cannot start a
+   run and saying so is the stated-refusal half of its own criterion. Worse, `step-trace` read
+   its pills off a run that never started, so two notes died of one wrong click.
+4. **The control for #3 does not exist where the probe looked.** `RunFromHereControl` renders
+   inside the **inspector**, so it exists for the selected node only — asking the whole page
+   which nodes can start asks a question about a panel that draws one. The scan is now what a
+   user does: select each card, read its own answer, take the first node that says it can start
+   and is not the trigger (a run from the top is a whole run and proves nothing about a prefix
+   being skipped). Every per-card answer is recorded, so "no node on this graph can start" is a
+   finding with evidence behind it rather than a `null`.
+
+**Proof.** `omnion-workflows --lib` **139 ok**, `omnion-automation --lib` **115 ok**,
+`omnion-api --lib` **240 ok**, `apps/admin` `tsc --noEmit` **exit 0**. `walkthrough.cjs`
+parses clean under `bun build` (the only diagnostic is the unresolvable `playwright-core`
+import at line 29, after a full parse).
+
+**Not ticked, and the reason is unchanged.** The pass has not finished: `qa-slot.sh` has a live
+sibling holder (`qa-slot-holder 2287065-…`, 86 400 s window) and the box is at load 16 with
+**0 GB free** of 32. A third Chromium on a machine that is already swapping produces notes no
+reader could trust, so the pass is queued rather than forced. No acceptance box is ticked; the
+five notes behind these four probes are unmeasured, not red.
+
+**Next.** Read the pass in this order, because it is the order the dependency runs in:
+`workflow-table` (was `422`, so every row below it is new), then `validate-classes` (control
+clean + five `found: true`), then `cmd-s-writes-once` (cheapest and it gates the conflict
+notes), `two-tab-conflict` (`refused` / `reloadOffered` / `localNodesKept`, then
+`keep-mine.resolved`), `run-from-here` (`skipped > 0`, `reasonNamesNode`,
+`firstRunnableNo === firstSkippedNo + 1`) and `step-trace` (`panelFound`, `kind: "node"`,
+`stepsWithParams === stepsTotal > 0`). A note that still reads empty after this is a product
+defect, because the instrument behind it has been fixed and committed.
