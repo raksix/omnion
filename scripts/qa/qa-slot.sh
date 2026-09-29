@@ -44,15 +44,47 @@ reap() {
   grace="${QA_SLOT_REAP_GRACE:-120}"
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
-    pid="$(basename "$f")"
-    holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
+    # The place file is named `$$-<timestamp>`. The whole name is the holder file's key.
+    #
+    # What must NOT be tested is the pid in that name. `$$` here is *this script's* pid, and this
+    # script exits the moment it takes the place — so the owner recorded in the file is dead within
+    # milliseconds of a perfectly healthy pass. A reaper that tested it would delete the lock of a
+    # pass that is running, every writer on the box would start a Chromium pass at once, and the
+    # "one pass at a time" would be a fiction nobody was told about. run.sh is the process that
+    # actually owns the place, and it records its own pid beside the holder's; that pair is the
+    # only liveness signal here that means anything.
+    name="$(basename "$f")"
+    # The holder file is TWO lines (holder child, then owner), so `cat` would hand `kill -0` a
+    # two-line string, which never matches a pid and reports *every* place as dead. Reading each
+    # line separately is the difference between a reaper that reclaims exactly the dead places
+    # and one that clears the whole queue.
+    holder="$(sed -n 1p "${HOLDERDIR}/${name}" 2>/dev/null || echo '')"
+    # The owner's pid is the second line, written by run.sh — the process that actually holds the
+    # place.
+    owner="$(sed -n 2p "${HOLDERDIR}/${name}" 2>/dev/null || echo '')"
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$grace" ] || continue
+    # Two tests, and the owner is the one that matters. A holder is an ordinary orphan the moment
+    # its pass ends badly: run.sh releases the place on EXIT INT TERM, and none of those arrive on
+    # a SIGKILL, an OOM kill, or a box that simply loses the process. The holder then answers
+    # `kill -0` for ever, so a reaper that tests only the holder is blind to precisely the case it
+    # was written for — which is what happened: one writer's crashed pass held four others for
+    # their whole 30-minute timeout, each printing "waiting for a QA slot" and reporting nothing.
+    #
+    # A missing owner line is NOT grounds for a reclaim on its own: it is what a place looks like
+    # in the second between being created and run.sh writing the file down. The grace period
+    # covers that race, and nothing else.
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$f" "${HOLDERDIR}/${name}" 2>/dev/null || true
+      [ -n "$holder" ] && kill "$holder" 2>/dev/null
+      echo "[qa-slot] reclaimed a place whose pass is gone: ${name} (${age}s old, owner ${owner}, holder ${holder:-none})" >&2
+      continue
+    fi
     # No holder file at all, this long after the place appeared, means the pass died between
     # taking the place and writing the holder down.
     if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
-      rm -f "$f" "${HOLDERDIR}/${pid}" 2>/dev/null || true
-      echo "[qa-slot] reclaimed a stale place from ${pid} (${age}s old, holder ${holder:-none})" >&2
+      rm -f "$f" "${HOLDERDIR}/${name}" 2>/dev/null || true
+      echo "[qa-slot] reclaimed a stale place from ${name} (${age}s old, holder ${holder:-none})" >&2
     fi
   done
 }
@@ -83,7 +115,12 @@ while :; do
     # pipeline finish.
     while :; do sleep 30; done </dev/null >/dev/null 2>&1 &
     holder=$!
-    echo "$holder" > "${HOLDERDIR}/${mine##*/}"
+    # Two lines: the holder child, then the OWNER — the run.sh that is really holding this place.
+    # The owner is what a reaper must test, and it cannot be recovered from the place file: `$$`
+    # there is *this* script's pid, which exits immediately. Without this line a crashed pass
+    # (SIGKILL, OOM kill) leaves a holder that answers `kill -0` for ever, and every writer behind
+    # it waits out the full timeout behind a pass that is not coming.
+    printf '%s\n%s\n' "$holder" "${QA_SLOT_OWNER:-$$}" > "${HOLDERDIR}/${mine##*/}"
     echo "$holder"                                # stdout: the holder pid for run.sh
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
     exit 0

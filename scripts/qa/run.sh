@@ -60,7 +60,7 @@ wait_http() { # url, seconds
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" QA_SLOT_OWNER="$$" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # Free the place whenever this pass ends, however it ends.
