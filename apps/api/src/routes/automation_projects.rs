@@ -24,6 +24,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_permissions::{Decision, Scope, authorize};
+use omnion_workflows::limits;
 use omnion_workflows::projects::{
     self, NewProject, Project, ProjectCaller, ProjectMember, ProjectRole, ProjectStatus,
     ProjectSummary,
@@ -845,6 +846,267 @@ pub async fn move_workflow(
 /// Two sentences the panel depends on, kept as tests because the alternative is a substring
 /// assertion inside a walkthrough, and substring assertions are how a gate starts passing for the
 /// wrong reason.
+// ---------------------------------------------------------------------------------------------
+// Limits, usage and ownership transfer (REQ-133 slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// Body of `PUT /api/v1/projects/{id}/limits`.
+///
+/// **A limit of `0` means unlimited, and the hint below says so.** The API cannot make an operator
+/// guess: an empty-looking number that means "no automation" is the kind of field that is
+/// discovered by having a project stop working.
+#[derive(Debug, Deserialize)]
+pub struct SetLimitsInput {
+    /// Organization the project belongs to.
+    pub organization_id: Uuid,
+    /// Maximum workflows; `0` is unlimited.
+    #[serde(default)]
+    pub max_workflows: i32,
+    /// Maximum credentials; `0` is unlimited.
+    #[serde(default)]
+    pub max_credentials: i32,
+    /// Maximum runs per day; `0` is unlimited.
+    #[serde(default)]
+    pub max_runs_per_day: i32,
+    /// Maximum runs in flight; `0` is unlimited.
+    #[serde(default)]
+    pub max_concurrent_runs: i32,
+    /// Percent at which the screen warns.
+    #[serde(default = "default_warn_percent")]
+    pub warn_at_percent: i32,
+}
+
+/// The instance default a limits screen shows as its placeholder.
+///
+/// 80 is the REQ's own number, so the default and the specification cannot disagree.
+const fn default_warn_percent() -> i32 {
+    80
+}
+
+/// Query of `GET /api/v1/projects/{id}/usage`.
+#[derive(Debug, Deserialize)]
+pub struct ProjectUsageQuery {
+    /// Organization the project belongs to.
+    pub organization_id: Uuid,
+    /// How many days of series; clamped in the store to 1..=90.
+    #[serde(default = "default_usage_days")]
+    pub days: i32,
+}
+
+const fn default_usage_days() -> i32 {
+    30
+}
+
+/// `GET /api/v1/projects/{id}/limits` — the project's caps and today's counters.
+pub async fn get_limits(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<ProjectUsageQuery>,
+) -> Result<Json<LimitsBody>, ApiError> {
+    let organization_id = resolve_organization(&current, Some(input.organization_id))?;
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        project_id,
+        ProjectRole::can_read,
+        "read the project's limits",
+    )
+    .await?;
+    build_limits_body(&state, project_id, input.days).await
+}
+
+/// `PUT /api/v1/projects/{id}/limits` — replace the overrides.
+pub async fn put_limits(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<SetLimitsInput>,
+) -> Result<Json<LimitsBody>, ApiError> {
+    let organization_id = resolve_organization(&current, Some(input.organization_id))?;
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        project_id,
+        ProjectRole::can_administer,
+        "change the project's limits",
+    )
+    .await?;
+
+    limits::set_limits(
+        state.db().pool(),
+        project_id,
+        limits::LimitOverrides {
+            max_workflows: input.max_workflows,
+            max_credentials: input.max_credentials,
+            max_runs_per_day: input.max_runs_per_day,
+            max_concurrent_runs: input.max_concurrent_runs,
+            warn_at_percent: input.warn_at_percent,
+            updated_by: Some(current.user.id),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    build_limits_body(&state, project_id, default_usage_days()).await
+}
+
+/// The limits screen's whole payload: the caps, today's numbers, the series and the warnings.
+///
+/// **The warnings are computed here rather than left to the client.** "80 percent" is a rule the REQ
+/// states once and the store owns; a panel that re-implemented it would be a second copy of a
+/// threshold, and the copy that drifts is the one nobody tests.
+#[derive(Debug, Serialize)]
+pub struct LimitsBody {
+    /// The caps.
+    #[serde(flatten)]
+    pub limits: limits::Limits,
+    /// Today's counters.
+    pub today: limits::UsageDay,
+    /// Runs in flight right now.
+    pub concurrent_runs: i64,
+    /// How many workflows the project holds.
+    pub workflow_count: i64,
+    /// The daily series, oldest first.
+    pub series: Vec<limits::UsageDay>,
+    /// Per-limit warnings, keyed by the same names the request body uses.
+    pub warnings: serde_json::Value,
+}
+
+async fn build_limits_body(
+    state: &AppState,
+    project_id: Uuid,
+    days: i32,
+) -> Result<Json<LimitsBody>, ApiError> {
+    let pool = state.db().pool();
+    let limits = limits::read_limits(pool, project_id).await.map_err(ApiError::from)?;
+    let today = limits::usage_today(pool, project_id).await.map_err(ApiError::from)?;
+    let concurrent_runs = limits::concurrent_runs(pool, project_id)
+        .await
+        .map_err(ApiError::from)?;
+    let series = limits::usage_series(pool, project_id, days)
+        .await
+        .map_err(ApiError::from)?;
+    let workflow_count =
+        projects::workflow_count(pool, project_id).await.map_err(ApiError::from)?;
+
+    let mut warnings = serde_json::Map::new();
+    for (name, limit, current) in [
+        ("max_runs_per_day", limits.max_runs_per_day, i64::from(today.runs)),
+        ("max_concurrent_runs", limits.max_concurrent_runs, concurrent_runs),
+        ("max_workflows", limits.max_workflows, workflow_count),
+    ] {
+        // `max_credentials` has no counter on this branch: there is no `credentials` table, so a
+        // warning about it would be a number nobody can act on. It is absent rather than zero.
+        if limits::Limits::warns(limit, current, limits.warn_at_percent) {
+            warnings.insert(
+                name.to_string(),
+                json!({
+                    "current": current,
+                    "limit": limit,
+                    "warn_at_percent": limits.warn_at_percent,
+                    "exceeded": limits::Limits::exceeded(limit, current).is_some(),
+                }),
+            );
+        }
+    }
+
+    Ok(Json(LimitsBody {
+        limits,
+        today,
+        concurrent_runs,
+        workflow_count,
+        series,
+        warnings: serde_json::Value::Object(warnings),
+    }))
+}
+
+/// Body of `POST /api/v1/projects/{id}/transfer-ownership`.
+#[derive(Debug, Deserialize)]
+pub struct TransferOwnershipInput {
+    /// Organization the project belongs to.
+    pub organization_id: Uuid,
+    /// The account receiving the project.
+    pub to_user_id: Uuid,
+    /// The panel's two confirmations, both required.
+    ///
+    /// **Two fields rather than one boolean**, because the REQ asks for two confirmations and a
+    /// single flag cannot record that a second person saw a second sentence. They are checked
+    /// here, not in the client, so a hand-written request cannot skip one.
+    #[serde(default)]
+    pub confirm_owner: bool,
+    #[serde(default)]
+    pub confirm_audit: bool,
+}
+
+/// `POST /api/v1/projects/{id}/transfer-ownership`.
+///
+/// Answers the **previous** owner in the body, including `null`: a project whose owner was deleted
+/// has none, and the confirmation dialog says so rather than rendering an empty id.
+pub async fn transfer_ownership(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<TransferOwnershipInput>,
+) -> Result<Json<TransferOwnershipBody>, ApiError> {
+    let organization_id = resolve_organization(&current, Some(input.organization_id))?;
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        project_id,
+        ProjectRole::can_administer,
+        "transfer ownership of the project",
+    )
+    .await?;
+
+    if !input.confirm_owner || !input.confirm_audit {
+        return Err(ApiError::bad_request(
+            "ownership_transfer_unconfirmed",
+            "transferring ownership needs both confirmations: who receives it, and that it is audited",
+        ));
+    }
+
+    let previous = limits::transfer_ownership(
+        state.db().pool(),
+        project_id,
+        input.to_user_id,
+        Some(current.user.id),
+        organization_id,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    let project = projects::find_visible(
+        state.db().pool(),
+        organization_id,
+        project_id,
+        caller_for(&state, &current, organization_id).await,
+    )
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(not_found)?;
+
+    Ok(Json(TransferOwnershipBody {
+        previous_owner_user_id: previous,
+        owner_user_id: project.owner_user_id,
+        key: project.key,
+    }))
+}
+
+/// What a completed handover answers with.
+#[derive(Debug, Serialize)]
+pub struct TransferOwnershipBody {
+    /// Who owned it before, or `null` when it had no owner.
+    pub previous_owner_user_id: Option<Uuid>,
+    /// Who owns it now.
+    pub owner_user_id: Option<Uuid>,
+    /// The project's key, so the message can name it.
+    pub key: String,
+}
+
 #[cfg(test)]
 mod move_tests {
     use super::*;

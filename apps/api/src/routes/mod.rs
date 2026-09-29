@@ -185,6 +185,27 @@ fn automation_projects_surface(state: &AppState) -> Router<AppState> {
             post(automation_projects::move_workflow)
                 .layer(guards::require(state, "workflows.manage")),
         )
+        // Limits and usage. `projects.limits.manage` writes and `projects.read` reads, matching the
+        // REQ's table — an editor can see where the project stands, only an owner moves the caps.
+        .route(
+            "/projects/{id}/limits",
+            get(automation_projects::get_limits)
+                .layer(guards::require(state, "projects.read"))
+                .merge(
+                    put(automation_projects::put_limits)
+                        .layer(guards::require(state, "projects.limits.manage")),
+                ),
+        )
+        .route(
+            "/projects/{id}/usage",
+            get(automation_projects::get_limits)
+                .layer(guards::require(state, "projects.read")),
+        )
+        .route(
+            "/projects/{id}/transfer-ownership",
+            post(automation_projects::transfer_ownership)
+                .layer(guards::require(state, "projects.manage")),
+        )
         .route(
             "/projects/{id}/members",
             post(automation_projects::upsert_member)
