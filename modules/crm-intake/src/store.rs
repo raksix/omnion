@@ -893,13 +893,260 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
     );
 
     record_source_outcome(pool, source.id, true, None).await?;
-    finish_claim(pool, submission, &source, claim, lead.id).await;
+
+    // 6. Route it. **This call is the whole of slice 2's assignment chain, and it was missing
+    //    for twenty-four ticks.**
+    //
+    //    `assignment_store::claim_assignment`, `stamp_assignment` and `policy_for_source` were
+    //    exported, documented, unit-tested and gated — nine assertions in
+    //    `scripts/qa/run-crm-assignment.sh`, all green, all of them *calling the three
+    //    functions directly*. Not one of them could see that nothing on any installation
+    //    called them, because every one of them began at the function and never travelled
+    //    backwards up the road to find the submission.
+    //
+    //    The consequence was not subtle and not small: **a lead arriving through the capture
+    //    path was never assigned, never got an owner, and never got a response deadline.** An
+    //    operator creates a country rule, watches the simulator name the winner, and every lead
+    //    in the inbox reads `Unassigned` with no due time — while the SLA editor's reminder
+    //    ("Escalate to…") describes a breach that can never be detected, because
+    //    `first_response_due_at` is null on every row and `due_breaches` matches nothing.
+    //
+    //    That is the sixth time this crate has shipped a correct, unit-tested, REQ-named
+    //    function with no caller able to produce the state it describes. The lesson is now
+    //    stated in one place, and it is the *shape* rather than the instance: **a gate that
+    //    begins at the function proves the function.** The five previous misses were all
+    //    found by reading the caller out of the definition; this one survived them because
+    //    every gate in this crate starts mid-stack, which is exactly what makes them fast and
+    //    is exactly what makes them blind.
+    //
+    //    Ordering, and why each part is where it is:
+    //
+    //    * **After the verdict, never before.** A rejected or spam row is nobody's work: a
+    //      verdict that cannot be acted on must not land on somebody's desk. The claim is
+    //      taken after those two branches have already returned.
+    //    * **The returned lead is the *routed* lead, not the inserted one.** `stamp_assignment`
+    //      is a second `update`, so the row the caller sees has to be the one after it — an
+    //      inbox that reads `new` for a lead that was stamped `assigned` is the panel
+    //      disagreeing with itself.
+    //    * **Never fatal.** A lead nobody can reach must not be lost because the routing
+    //      chain had a bad day. Same rule as the binding-health check two steps above, and for
+    //      the same reason: a broken integration must never be the reason a business stops
+    //      taking enquiries.
+    let lead_id = lead.id;
+    let routed = route_captured_lead(pool, submission, &source, &mapped, lead).await;
+
+    finish_claim(pool, submission, &source, claim, lead_id).await;
     Ok(Captured {
-        lead,
+        lead: routed,
         verdict,
         spam,
         attribution,
     })
+}
+
+/// Run a freshly captured lead through the assignment chain, and hand back the row as it
+/// stands afterwards.
+///
+/// **This is the caller that was missing for twenty-four ticks.** Three exported,
+/// documented, unit-tested, gated functions — `claim_assignment`, `stamp_assignment`,
+/// `policy_for_source` — had exactly one production caller between them, and it was a *test*.
+/// The chain was correct at every step and had no road to the submission.
+///
+/// ## The three decisions, and the wrong answer to each
+///
+/// * **Which rules see this lead.** `AssignmentInput::from_lead_row` reads the *mapped*
+///   values, not the raw payload. The obvious version reads the payload, and then a source
+///   whose form calls the field `e_mail` conditions on nothing — the same two-names-one-value
+///   trap the attribution merge fell into, one slice earlier and in the same file. The mapped
+///   values are also what the lead row is written from, so the rule chain and the row cannot
+///   disagree about who the visitor is.
+///
+/// * **Which policy.** The source's own choice, else the organization's first active policy,
+///   else **no deadline** — `None` rather than a guess. A lead with no policy reads "no target
+///   set" in the inbox, which is true; inventing a 24-hour default would read as a promise
+///   the organization never made and would then be escalated against.
+///
+/// * **What to do when the chain fails.** Log and return the row as inserted. Not `?`. The
+///   lead is stored and the caller is owed its `202`; a routing chain that cannot evaluate
+///   because a rule table is momentarily unreadable must not be the reason a business stops
+///   taking enquiries. The cost of the failure is visible — the lead reads `Unassigned` with
+///   no due time, which is exactly what the operator needs to see to go and fix it.
+///
+/// ## Why the returned lead is the *stamped* one
+///
+/// `stamp_assignment` is a second `update`, and the `Lead` this function was handed was read
+/// before it. Returning the stale struct would leave `capture`'s caller holding a lead that
+/// says `new` while the row says `assigned` — and `capture`'s caller is the public endpoint,
+/// whose response is what the integration and the `crm.lead.received` event carry. So the row
+/// is re-read and the *stored* state is what travels. `stamp_assignment` returning nothing
+/// (it cannot: the lead was inserted one statement ago) would leave the fresh row as the
+/// fallback, which is why the re-read is `find_lead` and not a trust of the previous value.
+async fn route_captured_lead(
+    pool: &PgPool,
+    submission: &Submission,
+    source: &IntakeSource,
+    mapped: &MappedValues,
+    inserted: Lead,
+) -> Lead {
+    let organization_id = submission.organization_id;
+
+    // The row the evaluator reads is the row as stored, not a hand-built struct: the rule
+    // chain conditions on `country`, `region`, `product_interest`, `budget_band`, `source_id`
+    // and `source_name`, and five of those six live on the lead rather than the payload. A
+    // hand-built row would drift the first time a column is added.
+    let row = match find_lead(pool, organization_id, inserted.id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return inserted,
+        Err(error) => {
+            tracing::warn!(
+                lead_id = %inserted.id, organization_id = %organization_id, error = %error,
+                "the new lead could not be read back for routing; it stays unassigned"
+            );
+            return inserted;
+        }
+    };
+
+    let input = assignment_input(mapped, &row, source);
+
+    let outcome = match crate::assignment_store::claim_assignment(pool, organization_id, &input).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(
+                lead_id = %inserted.id, organization_id = %organization_id, error = %error,
+                "the assignment chain could not decide this lead; it stays unassigned"
+            );
+            return inserted;
+        }
+    };
+
+    // The policy lookup runs the same way: an organization with no `crm_sla_policies` row
+    // gets `None` and therefore no deadline, which is the documented default rather than a
+    // failure. Only an *error* is worth a line in the log.
+    let policy = match crate::assignment_store::policy_for_source(
+        pool,
+        organization_id,
+        Some(source.id),
+    )
+    .await
+    {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(
+                lead_id = %inserted.id, organization_id = %organization_id, error = %error,
+                "the SLA policy for this lead could not be read; it gets no deadline"
+            );
+            None
+        }
+    };
+
+    if let Err(error) = crate::assignment_store::stamp_assignment(
+        pool,
+        inserted.id,
+        &outcome,
+        policy.as_ref(),
+        submission.received_at,
+    )
+    .await
+    {
+        tracing::warn!(
+            lead_id = %inserted.id, organization_id = %organization_id, error = %error,
+            "the assignment could not be stamped on the new lead"
+        );
+        return inserted;
+    }
+
+    // The trail line, because a lead that changed hands is not something an audit may learn
+    // about from the inbox. The same event kind the hand-over route writes, so the detail
+    // timeline renders both from one branch — a new kind here would mean a new screen branch
+    // for a sentence the panel already knows how to say.
+    let _ = append_event(
+        pool,
+        inserted.id,
+        "assigned",
+        None,
+        serde_json::json!({
+            "source": "rule",
+            "rule_id": outcome.rule_id.map(|id| id.to_string()),
+            "rule_name": outcome.rule_name,
+            "owner_user_id": outcome.owner_user_id.map(|id| id.to_string()),
+            "target_kind": outcome.target_kind,
+            "sla_policy_id": policy.as_ref().map(|p| p.id.to_string()),
+            "first_response_due_at": policy
+                .as_ref()
+                .map(|p| due_at_preview(p, submission.received_at)),
+        }),
+    )
+    .await;
+
+    match find_lead(pool, organization_id, inserted.id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => inserted,
+        Err(_) => inserted,
+    }
+}
+
+/// Build the evaluator's input for a captured lead.
+///
+/// **The mapped values, and this is the whole reason the call site reads `mapped` and not
+/// `submission.payload`.** `crm_leads` has no `country`, `region`, `budget_band` or `language`
+/// column — the only place those answers exist is the submission, which is why the rule
+/// conditions are shaped like a payload and why the REQ's simulator takes one. Four of the
+/// eight condition keys are therefore only reachable from `mapped`, and every one of them is
+/// named by the *form's* field rather than by the CRM's: a source mapping `country` from a
+/// field called `land` stores `country`, and the rule chain must see `country`.
+///
+/// `source_id`, `source_name` and `has_email` are filled from the row and the source rather
+/// than from the payload, because the payload does not carry them and inventing a lookup for
+/// a value already in hand is how the first-touch merge ended up comparing two names.
+///
+/// `from_lead_row` is still the reader, and that is deliberate: it is the one function that
+/// knows the condition keys, so a seventh key added to the evaluator is read here too without
+/// this function being touched. Passing a payload jsonb straight into it would also work and
+/// would be wrong — a payload key and a mapped target that happen to share a name are the
+/// coincidence this branch has now been bitten by twice.
+fn assignment_input(mapped: &MappedValues, lead: &Lead, source: &IntakeSource) -> crate::assignment::AssignmentInput {
+    let mut row = serde_json::Map::new();
+    for key in ASSIGNMENT_CONDITION_KEYS {
+        if let Some(value) = mapped.get(key) {
+            row.insert((*key).to_string(), serde_json::Value::String(value.to_string()));
+        }
+    }
+    // The two keys that live on the row rather than the mapping.
+    if let Some(value) = lead.product_interest.as_deref() {
+        row.insert("product_interest".into(), serde_json::Value::String(value.to_owned()));
+    }
+    if let Some(value) = lead.email.as_deref() {
+        row.insert("email".into(), serde_json::Value::String(value.to_owned()));
+    }
+
+    let mut input = crate::assignment::AssignmentInput::from_lead_row(&serde_json::Value::Object(row));
+    input.source_id = Some(source.id);
+    input.source_name = Some(source.name.clone());
+    input.has_email = Some(lead.email.is_some());
+    input
+}
+
+/// The condition keys a mapping can supply, read from the mapped values rather than from the
+/// submission.
+///
+/// Listed rather than iterated over "every mapped key" on purpose: a mapping target the
+/// evaluator does not know is harmless, and a rule chain that conditions on a key the
+/// evaluator does not know would silently never match — so the reader is the evaluator's and
+/// this list only says *where to look*.
+const ASSIGNMENT_CONDITION_KEYS: [&str; 4] = ["country", "region", "budget_band", "language"];
+
+/// The deadline a policy would set, for the trail line only.
+///
+/// The real instant is written by `stamp_assignment`, which computes it with this same
+/// function inside the organization's window. The trail line therefore shows the deadline the
+/// row now carries, and a second arithmetic here would be a second answer to the same
+/// question — the shape this crate keeps meeting.
+fn due_at_preview(
+    policy: &crate::assignment::SlaPolicy,
+    received: time::OffsetDateTime,
+) -> String {
+    crate::assignment::due_at(policy, received).to_string()
 }
 
 /// Point the submission's claim at the lead this capture wrote.
