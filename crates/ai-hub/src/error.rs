@@ -64,6 +64,14 @@ pub enum AiHubError {
     /// the text under the field that caused it rather than answering with a generic 400.
     #[error("invalid run: {0}")]
     InvalidRun(String),
+    /// A workspace path or an upload breaks one of the workspace's own rules (REQ-099 slice 2).
+    ///
+    /// Its own code, not `InvalidAgent` or `InvalidRun`, because the fix lands in the Workspace
+    /// tab and a client that maps it onto the agent form shows a path refusal above the name
+    /// field — the one place the reader is not looking when the file picker refused a file.
+    /// The message always carries the limit that was broken, so the panel can print it.
+    #[error("invalid workspace file: {0}")]
+    InvalidFile(String),
     /// The request needs a capability the model does not claim.
     ///
     /// The refusal happens before any call leaves the process, so a caller that asked for a
@@ -128,6 +136,7 @@ impl AiHubError {
             Self::InvalidModel(_) => "invalid_model",
             Self::InvalidAgent(_) => "invalid_agent",
             Self::InvalidRun(_) => "invalid_run",
+            Self::InvalidFile(_) => "invalid_file",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",

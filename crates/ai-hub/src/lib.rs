@@ -35,6 +35,7 @@ pub mod routing_store;
 pub mod run_store;
 pub mod store;
 pub mod tools;
+pub mod workspace;
 
 pub use catalog::{
     CapabilityFilter, CatalogEntry, CatalogQuery, CatalogSort, LONG_CONTEXT_TOKENS,
