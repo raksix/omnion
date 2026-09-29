@@ -909,6 +909,17 @@ export function LeadDetail() {
                         Changed {String((event.detail.changed as string[]).join(", "))}
                       </span>
                     ) : null}
+                    {/* The request id (REQ-117, acceptance 17). It is shown, not just stored,
+                        because the reader of a trail line is the one who has to quote it: the id
+                        in the panel's error state and the id on this line are the same string,
+                        which is the only reason either is worth having. A line with none — a
+                        worker sweep, which belongs to no exchange — says so rather than showing
+                        an empty chip that reads as a broken lookup. */}
+                    {typeof event.detail?.request_id === "string" ? (
+                      <span className="text-[11.5px] text-muted" data-lead-trail-request-id>
+                        request <code className="font-mono">{event.detail.request_id}</code>
+                      </span>
+                    ) : null}
                   </li>
                 ))}
               </ol>
