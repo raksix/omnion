@@ -5128,3 +5128,47 @@ for it** — read the first error, not the one rustc prints last.
 merge: the private-stack pass
 (`QA_STACK=w6 QA_API_PORT=18085 QA_ADMIN_PORT=3105 QA_WEB_PORT=3205 bash scripts/qa/run.sh`) with
 the merged limiter and CSRF layers actually installed, and `omnion-telemetry` green under them.
+
+## Wave 6 — tick 19 (continued) — the merged limiter found two harness gaps that were not mine to blame on main
+
+**The limiter went live, and the first thing it did was refuse the tests.** `observability_permissions`
+died on `429 rate_limited ... 20 requests exceeds the ceiling of 10 in the 300-second window`
+inside a suite that never mentions rate limiting. The cause is structural rather than a mistake:
+**the limiter is a process-wide `OnceLock` and a test binary is a process**, so every walk in one
+`--test` target shares one budget, and the sign-in scope's shipped ceiling of ten per five minutes
+is a credential-stuffing number, not a test number. Three fixes, in the order they were tried:
+
+1. `RatePolicy::for_tests()` — the shipped document with every ceiling raised. **Not** a bypass
+   switch: the layer stays installed and stays enforced, because removing it would make every
+   suite that depends on a `429` assertion vacuous, and a limiter that quietly disappears in test
+   is a limiter nobody notices breaking.
+2. `walk_state::ensure_test_rate_limits`, called from `state_or_fail` **before** any walk builds a
+   router — the router installs whatever is already in the `OnceLock`, so the first walk to build
+   one would otherwise decide the budget for the whole binary.
+3. `walk_state::ensure_csrf_secret` moved into the harness for the same reason. It was previously
+   set **only** in `scripts/qa/run.sh` and `run-workspace-tests.sh`, so a bare
+`cargo test -p omnion-api --test observability_logs` — the command a developer runs to check one
+suite — failed on a missing `omnion_csrf` cookie for a reason that has nothing to do with the
+suite. `observability_logs.rs` builds its own state (it needs the `Db` handle to read rows back),
+so it also calls both helpers at its own construction point.
+
+**The second gap was parallelism, and it was proven rather than assumed.** `exporter_flush` failed
+with `exporter_not_found`, `the sweep flushed nothing` and `RowNotFound` — three symptoms no single
+test in the file can cause. `--test-threads=1` gave **5 passed, 0 failed**; the default parallel run
+gave 3/5. That is interference: five walks share one database and one exporter table and delete and
+create each other's rows. The lock already existed — `EVALUATOR_LOCK` in `walk_state`, taken by
+`observability_alerts.rs` — so this file now takes the same guard. After: **5 passed** in the
+default parallel run. **When a suite fails three different ways at once, suspect interference before
+suspecting the product, and prove it with a single-threaded run rather than reasoning about it.**
+
+**Proof.** `cargo test -p omnion-api --test observability_logs` → **3 passed** ·
+`--test observability_permissions` → **4 passed** · `--test observability_traces` → **8 passed** ·
+`--test observability_metrics` → **11 passed** · `--test exporter_flush` → **5 passed** ·
+`cargo test -p omnion-telemetry` → **179 passed**, 0 failed. `cargo build -p omnion-api` → exit 0 ·
+`pnpm typecheck` → exit 0.
+
+**Next tick.** The close gate, unchanged and still owed: the private-stack browser pass
+(`QA_STACK=w6 QA_API_PORT=18085 QA_ADMIN_PORT=3105 QA_WEB_PORT=3205 bash scripts/qa/run.sh`) with
+the limiter, CSRF and request log all live, `/observability/logs` in the walkthrough route table, and
+zero high findings caused by this REQ. It has not run since the merge, so REQ-126 stays
+`in-progress` and no slice is closed on tests alone.

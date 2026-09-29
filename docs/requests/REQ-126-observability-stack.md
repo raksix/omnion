@@ -1,6 +1,6 @@
 # REQ-126 — Observability Stack
 
-> **Status:** in-progress (close gate still NOT green — the browser pass has not run with the new `/observability/logs` screen; every Rust gate is) · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress (the Rust gates are green under the merged rate limiter, the CSRF layer and the request log; the close gate is still the browser pass, which has not run since the merge) · **Captured:** 2026-09-26 · **Layer:** infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request

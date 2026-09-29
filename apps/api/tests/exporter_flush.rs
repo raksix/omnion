@@ -365,6 +365,13 @@ async fn remove_exporter(state: &AppState, token: &str, id: Uuid) {
 /// to rule out.
 #[tokio::test]
 async fn a_request_s_line_reaches_a_configured_backend() {
+    // These five walks share ONE database and one exporter table, and cargo runs the tests in a
+    // binary in parallel. Without this guard they delete and create each other's exporter rows:
+    // the suite then fails on `exporter_not_found`, on a sweep that flushed nothing, and on a
+    // row that is simply gone — none of which is anything any of these five tests does. The
+    // same cause `observability_alerts.rs` documented when it hit this, so it takes the same
+    // guard rather than a second mechanism.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     reset_exporter_state(&state).await;
@@ -489,6 +496,13 @@ async fn a_request_s_line_reaches_a_configured_backend() {
 /// counted, and the number is persisted rather than reset by the next read.
 #[tokio::test]
 async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
+    // These five walks share ONE database and one exporter table, and cargo runs the tests in a
+    // binary in parallel. Without this guard they delete and create each other's exporter rows:
+    // the suite then fails on `exporter_not_found`, on a sweep that flushed nothing, and on a
+    // row that is simply gone — none of which is anything any of these five tests does. The
+    // same cause `observability_alerts.rs` documented when it hit this, so it takes the same
+    // guard rather than a second mechanism.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     reset_exporter_state(&state).await;
@@ -579,6 +593,13 @@ async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
 /// the row directly and never calls the create route.
 #[tokio::test]
 async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
+    // These five walks share ONE database and one exporter table, and cargo runs the tests in a
+    // binary in parallel. Without this guard they delete and create each other's exporter rows:
+    // the suite then fails on `exporter_not_found`, on a sweep that flushed nothing, and on a
+    // row that is simply gone — none of which is anything any of these five tests does. The
+    // same cause `observability_alerts.rs` documented when it hit this, so it takes the same
+    // guard rather than a second mechanism.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     reset_exporter_state(&state).await;
@@ -670,6 +691,13 @@ async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
 /// backlog an operator asked not to send is visible in the drop counter rather than vanishing.
 #[tokio::test]
 async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
+    // These five walks share ONE database and one exporter table, and cargo runs the tests in a
+    // binary in parallel. Without this guard they delete and create each other's exporter rows:
+    // the suite then fails on `exporter_not_found`, on a sweep that flushed nothing, and on a
+    // row that is simply gone — none of which is anything any of these five tests does. The
+    // same cause `observability_alerts.rs` documented when it hit this, so it takes the same
+    // guard rather than a second mechanism.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     reset_exporter_state(&state).await;
@@ -745,6 +773,13 @@ async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
 /// from one that is waiting for the wrong reason.
 #[tokio::test]
 async fn a_batch_interval_is_respected_between_flushes() {
+    // These five walks share ONE database and one exporter table, and cargo runs the tests in a
+    // binary in parallel. Without this guard they delete and create each other's exporter rows:
+    // the suite then fails on `exporter_not_found`, on a sweep that flushed nothing, and on a
+    // row that is simply gone — none of which is anything any of these five tests does. The
+    // same cause `observability_alerts.rs` documented when it hit this, so it takes the same
+    // guard rather than a second mechanism.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     reset_exporter_state(&state).await;

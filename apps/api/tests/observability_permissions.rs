@@ -792,15 +792,30 @@ fn authed(method: Method, uri: &str, body: Option<Value>, cookie: &str) -> Reque
 #[tokio::test]
 async fn the_preview_stays_read_only_for_an_account_with_manage() {
     let state = support::walk_state::state_or_fail().await;
-    let (_actor, _organization, cookie) = account_with(
+    let (actor, _organization, cookie) = account_with(
         &state,
         &["observability.read", "observability.manage"],
     )
     .await;
-    let before: i64 = sqlx::query_scalar("select count(*) from audit_log")
-        .fetch_one(state.db().pool())
-        .await
-        .expect("the count runs");
+    // Scoped to THIS actor, and that is the whole point of this assertion.
+    //
+    // The count used to be `select count(*) from audit_log` — every row any account in the
+    // database ever wrote — read once before the preview and once after. Cargo runs the tests in
+    // this binary in parallel, and the sibling walk `every_mutation_writes_its_own_audit_row`
+    // writes rows of its own in between, so the preview was charged for somebody else's write.
+    // The suite failed roughly one run in three and passed the other two, which is the worst shape
+    // a test can have: it teaches a reader that the preview sometimes writes an audit row, which is
+    // the exact defect the assertion exists to rule out.
+    //
+    // Counting only this actor's rows asks the question the test means to ask, and it stops
+    // depending on test scheduling — so a failure here is a real failure from now on.
+    let before: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where actor_user_id = $1",
+    )
+    .bind(actor)
+    .fetch_one(state.db().pool())
+    .await
+    .expect("the count runs");
     let response = call(
         &state,
         authed(
@@ -812,10 +827,13 @@ async fn the_preview_stays_read_only_for_an_account_with_manage() {
     )
     .await;
     assert_eq!(response.status, StatusCode::OK, "{}", response.body);
-    let after: i64 = sqlx::query_scalar("select count(*) from audit_log")
-        .fetch_one(state.db().pool())
-        .await
-        .expect("the count runs");
+    let after: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where actor_user_id = $1",
+    )
+    .bind(actor)
+    .fetch_one(state.db().pool())
+    .await
+    .expect("the count runs");
     assert_eq!(
         after, before,
         "the preview is an evaluation, not a mutation, and must leave no audit row"

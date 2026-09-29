@@ -141,11 +141,63 @@ fn database_name(url: &str) -> Option<String> {
         .then(|| name.to_owned())
 }
 
+/// A CSRF secret for the walks, defaulted rather than required.
+///
+/// The API's CSRF layer REFUSES cookie-authenticated writes when `OMNION_CSRF_SECRET` is unset,
+/// which is the right production behaviour — a platform that silently drops CSRF protection is
+/// worse than one that visibly refuses writes. The consequence for a walk is that sign-in mints
+/// no `omnion_csrf` cookie at all, so every suite that signs in and then POSTs dies on a
+/// `403 csrf_unavailable` or on a missing cookie, and neither failure names its real cause.
+///
+/// Setting it here rather than in `scripts/qa/run.sh` and `scripts/qa/run-workspace-tests.sh`
+/// alone is the point: those two wrappers are the only place it used to be set, so a bare
+/// `cargo test -p omnion-api --test observability_logs` — the command a developer runs to check
+/// one suite — failed for a reason that has nothing to do with the suite. The default is a
+/// disposable value for a disposable database and is not a credential for anything; an operator
+/// that exports the variable still gets theirs.
+///
+/// # Safety
+///
+/// `set_var` is `unsafe` in edition 2024 and this is a process-wide environment variable that
+/// every test in the binary reads. It is set to a constant, so a race can only ever write the
+/// same value the reader expects. The walk files already use this exact guard for
+/// `OMNION_DATABASE_URL`.
+pub fn ensure_csrf_secret() {
+    if std::env::var("OMNION_CSRF_SECRET").is_ok_and(|value| !value.trim().is_empty()) {
+        return;
+    }
+    // SAFETY: see the note above — the value is a constant, so ordering between tests cannot
+    // produce a different answer than the one a reader expects.
+    unsafe {
+        std::env::set_var(
+            "OMNION_CSRF_SECRET",
+            "qa-walk-csrf-secret-not-a-credential",
+        );
+    }
+}
+
+/// Install a rate-limit document a whole test binary can spend.
+///
+/// Called from the same place as the CSRF default, and for the same reason: the router installs
+/// whatever limiter is already in the process-wide `OnceLock`, so the FIRST walk to build a
+/// router decides the budget for every other walk in that binary. With the shipped defaults the
+/// sign-in scope allows ten requests per five minutes, eleven walks exhaust it, and the
+/// eleventh fails on a `429` inside a test that never mentions rate limiting.
+pub fn ensure_test_rate_limits(state: &omnion_api::state::AppState) {
+    let _ = omnion_api::rate_limit_middleware::install(
+        omnion_api::rate_limit_middleware::RateLimiter::new(
+            state,
+            omnion_security::RatePolicy::for_tests(),
+        ),
+    );
+}
+
 /// Build the state for a walk, or fail.
 ///
 /// Panics on anything that is not "the environment is absent", and — unlike the six copies this
 /// replaces — it never reports a skipped walk as a passed test.
 pub async fn state_or_fail() -> AppState {
+    ensure_csrf_secret();
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => skip(&format!(
@@ -193,13 +245,19 @@ pub async fn state_or_fail() -> AppState {
     let redis = RedisClient::new(&config.redis.url).expect("a redis url");
     let storage = Storage::from_config(&StorageConfig::default())
         .expect("the default storage configuration is valid");
-    AppState::new(
+    let state = AppState::new(
         BuildInfo::new("omnion-api", env!("CARGO_PKG_VERSION")),
         config,
         db,
         redis,
         storage,
-    )
+    );
+    // Installed AFTER the state exists and BEFORE any walk builds a router, because the router
+    // installs whatever limiter is already in the `OnceLock` — so this call is the difference
+    // between a binary whose walks share a spendable budget and one where the eleventh walk
+    // fails on a `429` it never asked for.
+    ensure_test_rate_limits(&state);
+    state
 }
 
 /// Print a loud banner and end the process, rather than returning a `None` the caller turns into

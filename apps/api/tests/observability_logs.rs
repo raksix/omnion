@@ -27,6 +27,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+mod support;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_core::config::Config;
@@ -112,6 +113,15 @@ fn test_storage() -> omnion_storage::Storage {
 }
 
 async fn live_state() -> Option<(AppState, Db)> {
+    // This file builds its own state rather than going through `walk_state::state_or_fail`,
+    // because it also needs the `Db` handle to read rows back out of PostgreSQL. That makes it
+    // the one observability suite the shared harness's CSRF default does not reach, and it is
+    // exactly the suite that asserts the sign-in sets a CSRF cookie beside the session cookie.
+    //
+    // Without the secret the API mints no `omnion_csrf` cookie at all — the layer refuses rather
+    // than skips when `OMNION_CSRF_SECRET` is unset, which is correct for a deployment and
+    // means the assertion below would fail for a reason unrelated to what it is testing.
+    support::walk_state::ensure_csrf_secret();
     let config = Config::from_env().expect("environment must be valid");
     let db = match Db::connect(&config.database).await {
         Ok(db) => db,
@@ -132,6 +142,11 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
+    // See `walk_state::ensure_test_rate_limits`: the router installs whatever limiter is already
+    // in the process-wide `OnceLock`, so a walk that does not set one here inherits the shipped
+    // sign-in ceiling of ten per five minutes — and this file's three walks between them sign in
+    // more than that, so the last one would fail on a `429` it never asked for.
+    support::walk_state::ensure_test_rate_limits(&state);
     Some((state, db))
 }
 
