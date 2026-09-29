@@ -4804,3 +4804,67 @@ says so.
 because REQ-064's forms module is not on this branch, and the walkthrough drives intake through
 it. When the slot frees, read the pass's *summary* rather than its tail and drive the CRM depth
 steps.
+
+## Wave 4b / w8 tick 17 — the pass never built its own fixture, and every failure it reported was its own
+
+The previous tick's log ended with three CRM screens failing and the slot blamed. The slot was
+red herring. All three were one harness defect wearing three masks, and the reason it survived
+sixteen ticks is that **each of its symptoms reads as a product fault**.
+
+**1. The wizard was detected by the address bar.** `runWizard` read `page.url()` and logged
+"installation already exists" on anything that was not `/setup`. But `proxy.ts` sends an
+anonymous visitor at `/` to `/login`, and `/login` only continues to `/setup` after a
+`GET /onboarding` round trip inside a `useEffect`. A fixed 900 ms sample therefore reads
+"not in setup" on a fresh database — the redirect is API-bound, so a fast machine is not
+faster. The pass then walked a database with **no owner, no organization and no site**, and
+every organization-scoped route answered `400 no_organization`. The fix asks the system that
+holds the state: `GET /api/v1/onboarding` → `needs_setup`.
+
+**2. Nothing asserted the pass had a tenant.** With no organization, the failures pointed at
+the CRM, the media library and analytics, and never at the pass. The assertion now runs
+*before* the first product verdict and stops the run when it fails, because a pass that cannot
+build its own fixture has nothing to say about the feature. That sentence is the whole cost:
+three ticks were spent reading product bugs that were one `if`.
+
+**3. The QA API had no `OMNION_CSRF_SECRET`**, so the middleware refused every
+cookie-authenticated mutation — `403 csrf_unavailable` — and the IAM depth pass reported a role
+it "could not create". The env set belongs next to the database URL in `run.sh`, with the other
+required configuration, not in a document.
+
+Two smaller repairs, both found by reading the same log:
+
+- `rules.find` ran on whatever the guarded rules route answered. A refusal is `{"error": …}`,
+  so `.find` threw a `TypeError` that aborted the whole assignment depth pass **with no step
+  recorded** — the worst of both answers. The cursor comparison also accepted `null === null`
+  as proof the simulator moved nothing; two unreadable cursors prove nothing. Both now name the
+  status code.
+- A missing site was interpolated into `where site_id = ''` — a Postgres type error reported
+  under the word "skipped". It is a missing fixture and now says so.
+
+**Proof.**
+
+    cargo test -p omnion-module-crm-intake --lib    143 passed
+    scripts/qa/run-crm-assign.sh                    14/14  (crm_assign 9 + crm_bulk 5)
+    scripts/qa/run-crm-claims.sh                    7/7
+    scripts/qa/run-crm-dedupe.sh                    10/10
+    scripts/qa/run-crm-convert.sh                   6/6
+    scripts/qa/probe-wizard-detection.sh           4/4
+    apps/admin tsc --noEmit                         clean
+    node --check scripts/qa/walkthrough.cjs         clean
+    bash -n scripts/qa/run.sh                       clean
+
+`cargo test -p omnion-module-crm-intake` on its own is **red by design**: its `--test crm_*`
+binaries need `DATABASE_URL` from their gate scripts, each of which owns a disposable database
+and refuses to run against the pass's. Run the gate, not the bare package — and note that the
+package-level gate looks exactly like a regression, which is its own small trap.
+
+**Not proved.** A full browser pass has still not completed on this branch: the slot has been
+held by live passes of other writers for the whole tick, so the CRM screens remain un-walked.
+The status line says so. What *is* proved is that the harness can now build its own fixture
+(`probe-wizard-detection.sh`, 4/4) and that it will refuse to judge a feature against a
+database it failed to set up — which is the defect's inverse, and the part that makes the next
+pass's result mean something.
+
+**Next.** Re-run the CRM pass when the slot frees, and read the *summary* rather than the tail.
+Then REQ-117's remaining slice-3 depth: the REQ-064 form-editor card, metrics on the inbox, and
+the `request id` half of the audit line that the API has no field for yet.
