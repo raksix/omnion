@@ -1086,6 +1086,67 @@ async function runBackups(page, report) {
   );
   note({ step: "verify", verificationRan, verdict: verdictText });
 
+  // The restore preview, opened and read. A new panel that never appears in the walkthrough
+  // inventory is an untested screen, and the rule is that the harness is extended rather
+  // than the screen exempted — so this clicks the button, runs the preview against the real
+  // destination, and asserts the three things the panel exists to say: the price, the
+  // warnings, and the confirm phrase.
+  await page.click('[data-testid="backup-restore-preview"]').catch(() => {});
+  await page.waitForSelector('[data-testid="restore-preview"]', { timeout: 8000 }).catch(() => {});
+  const previewOpen = (await page.locator('[data-testid="restore-preview"]').count()) > 0;
+  note({ step: "restore-preview-open", previewOpen });
+
+  // Collapsed by default: the panel must not render its tables unprompted, or every run
+  // detail page grows five tables an operator did not ask for.
+  const previewIdle = (await page.locator('[data-testid="restore-preview-idle"]').count()) > 0;
+  note({ step: "restore-preview-idle", previewIdle });
+
+  await page.click('[data-testid="restore-preview-load"]').catch(() => {});
+  await page
+    .waitForSelector('[data-testid="restore-preview-dropped"]', { timeout: 30000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  const priceText = await page
+    .locator('[data-testid="restore-preview-dropped"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const warnings = await page
+    .locator('[data-testid="restore-preview-warnings"] [data-testid^="restore-warning-"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const partRowsPreview = await page
+    .locator('[data-testid="restore-part-row"]')
+    .allInnerTexts()
+    .catch(() => []);
+  // Every part the run produced is in the preview's own table, with a mode. A panel that
+  // lists only the available ones would hide exactly the part an operator most needs to
+  // know about.
+  const previewNames = partRowsPreview.map((text) => text.split("\n")[0].trim());
+  note({
+    step: "restore-preview",
+    priced: priceText.length > 0,
+    price: priceText.join(" | "),
+    warningCount: warnings.length,
+    warnings,
+    partCount: partRowsPreview.length,
+    allFiveOffered: partNames.every((name) => previewNames.includes(name)),
+    rows: partRowsPreview,
+  });
+
+  // The confirm phrase, if the run is restorable. Empty is a legitimate answer for an
+  // unrestorable run, so both are recorded rather than one being required.
+  const phraseVisible = await page
+    .locator('[data-testid="restore-confirm-input"]')
+    .count();
+  const notRestorable = await page
+    .locator('[data-testid="restore-preview-not-restorable"]')
+    .count();
+  note({
+    step: "restore-confirm",
+    phraseFieldOffered: phraseVisible > 0,
+    notRestorable: notRestorable > 0,
+  });
+
   // The list shows the run, and its state pill is the run's own state.
   await page.waitForTimeout(500);
   const rows = await page.locator('[data-testid="backup-row"]').count();
