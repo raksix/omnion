@@ -4885,3 +4885,79 @@ one of them is the actual security fix:
 tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
 referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
 real to report, which is why those two rows are the most useful thing this tick left behind.
+
+## 2026-09-29 · Wave 5 · tick 22 — the merge brought three defects that were not mine, and the gate found all three
+
+**What.** `git fetch` showed `origin/main` 21 commits ahead, so the tick began with the merge
+this branch had owed for four ticks. `0caa8c6`. Three conflicts: `apps/admin/lib/api.ts` and
+`apps/api/src/main.rs` were both **import lists that had grown on each side**, so both resolved
+to the union; `docs/BUILD-LOG.md` is append-only, and the splice was verified by **multiset**
+rather than by line count (`Counter(merged)` against `Counter(ours)` and `Counter(theirs)`,
+0 missing each) — 4887 lines from 4660 + 3486 against a 3259-line base.
+
+**Then the gates found three defects, and only one of them is CDN.**
+
+- **`394d769` — `ApiError` was `Debug` but not `Display`, so `cargo check --lib --tests` did
+  not compile at all.** `routes/security.rs:1090` formats a refusal into an assertion message.
+  The production binary builds, which is why only the **lib test** profile ever found it — the
+  exact trap this ledger has recorded before. `Display` prints `message`, not the struct:
+  reusing `Debug` would dump `status` and `details` into every failure that merely names a
+  refusal.
+- **`6280a2a` — one test of 224 asserted that `"«redacted:sk-…»"` is a credential.** It is 15
+  characters and does not begin with a token prefix, so `looks_like_a_credential` correctly
+  declined and the test failed. **The fixture was wrong, not the matcher.** The matcher demands
+  a long-enough token-shaped string precisely so it does not refuse ordinary prose, and a marker
+  that says a secret was *removed* is the safest thing a scanner can upload. Refusing it would
+  reject exactly the reports the check exists to admit. The leaky fixture is now a real `sk-`
+  key, and the redaction case is kept as its own assertion **in the direction it was reaching
+  for**: three markers must not trip the matcher, and each must still parse to one finding.
+- **`e09d51d` — merging main put main's `0054_security_posture.sql` beside my
+  `0054_cdn_purge_queue.sql`.** sqlx resolves migrations by their leading number alone, so the
+  second never runs and the API refuses to boot with `migration 54 was previously applied but has
+  been modified` — which is what killed the first two attempts at the pass. `0120` is free in
+  main, but *next free integer* is the same defect waiting for the next merge, so both move
+  above main's high-water: **`0136`, `0137`**. The suite database persists between runs, so it
+  had to be dropped as well (`drop database omnion_qa_w5`, 0 connections) — renumbering without
+  dropping it produces a phantom `VersionMissing` instead.
+
+**And one more, found by reading the pass rather than its output.**
+
+- **`71d55cb` — a scoped pass still ran nine depth passes it had excluded.** `QA_ONLY` narrows
+  the route list and everything that goes through `runDepthPass`, which checks `inScope`. Nine
+  passes were called with a bare `await` instead, so the pass scoped to
+  `cdn,events,webhooks` spent its time in **`search-depth`**, `command-center` and `palette`
+  and never reached `/cdn/purges`. This is the same defect `1aa8930` fixed one layer up:
+  narrowing routes but not passes means the scope describes the report's **heading** and not its
+  contents, and on a busy box the excluded work is exactly what starves the included work. All
+  nine now go through `runDepthPass`, which also hands them the try/catch a bare `await` lacked
+  — a pass that throws is recorded as a finding under its own name instead of ending the run
+  with no `summary.json`. The passkey walk's scope name is `iam-passkeys`, the name it records
+  itself under, so `QA_ONLY=passkeys` still matches. `runWizard` is deliberately left bare: it
+  is the first-run onboarding walk and has to see a fresh database.
+
+**Proof.**
+
+- `cargo test -p omnion-api --lib` → **224 passed, 0 failed** (was: 223 passed, 1 failed, and
+  before the `Display` fix: did not compile).
+- `cargo test -p omnion-cdn --quiet` → **110 passed, 0 failed** (unchanged by the merge).
+- `pnpm typecheck` → **2/2 tasks, 0 errors** (5 packages in scope).
+- `cargo check -p omnion-api --lib --tests --message-format=short` → **0 errors**; every line it
+  prints is a pre-existing warning.
+- The API booted on the renamed migrations: `/healthz` **200**, admin **307**.
+
+**The pass itself: partial, and stopped by the box rather than by the code.** It reached **361
+clicks** across ten routes, and **every one reported a real element count** — `cdn-overview` 30,
+`cdn-rules` 30, `cdn-settings` 41, `events` 36, `events-catalogue` 36, `events-retention` 36,
+`webhooks` 36, `webhooks-new` 41, `analytics-events` 42, `cdn-purge-console` 1. The tick-21
+observation that `/cdn/purges` "rendered 0 elements" is **not reproduced**, and the routes it was
+compared against all rendered. It then sat at 361 clicks for twenty minutes: load **29**, 50
+Chrome processes, `MemAvailable` 3 G, and my own `walkthrough.cjs` at **0 % CPU with 21 s of CPU
+time in 20 minutes** — blocked, not computing. I killed my pass and only my pass
+(`kill 161704`); the pass was not killed by a shared pm2 daemon, and no sibling's run was
+touched. `no summary.json` was written, so **REQ-011 is not closed** and its two screen boxes
+stay unticked.
+
+**Next.** Run the pass again on the fixed harness with a genuinely quiet box — `load` well under
+20, `MemAvailable` over 8 G, no other pass on 3104 — and read `/cdn/purges` specifically. Both
+unticked REQ-011 boxes and REQ-005's single box are one clean pass away. After that: REQ-017
+(sandbox/staging).
