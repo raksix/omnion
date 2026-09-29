@@ -1,6 +1,6 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** in-progress (slice 2 of 4 — API, list screen, create wizard and detail screen shipped in `39aa999…165884e`; the browser gate is still owed) · **Captured:** 2026-09-25 · **Layer:** platform
+> **Status:** in-progress (slice 2 of 4 — API, list screen, create wizard, detail screen and the `changes` diff endpoint shipped in `39aa999…f1e1bb9`; the browser gate is still owed) · **Captured:** 2026-09-25 · **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -146,7 +146,7 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 - [x] Clone is idempotent: re-cloning an unchanged environment produces the same counts and no duplicate rows (natural keys are unique per environment).
 - [x] Staging nesting is refused with `staging_nesting_refused` for a staging source.
 - [x] Editing a page in staging leaves the production row byte-identical (asserted by comparing `updated_at` and revision hashes).
-- [ ] `GET /api/v1/environments/{id}/changes` lists the edited page as `updated`, a new page as `added`, a deleted page as `deleted`, each with author and timestamp.
+- [x] `GET /api/v1/environments/{id}/changes` lists the edited page as `updated`, a new page as `added`, a deleted page as `deleted`, each with author and timestamp — `the_change_set_names_what_staging_holds_that_production_does_not` asserts all three kinds in one walk, the untouched page's absence, and that production still holds every row it held before.
 - [ ] A production edit made after the clone marks the item `Conflict`, and promoting a change set that contains conflicts is refused with `promotion_conflict` listing item ids.
 - [ ] Promotion of a clean change set applies every item in one transaction: production pages match staging content afterwards, and `promotion.completed` carries the same item count.
 - [ ] A failure injected mid-apply leaves production unchanged (transaction rolled back) and the promotion status `failed` with a readable error.
@@ -154,7 +154,7 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 - [ ] Promotion keeps a history row with requester, approver, timestamps and the frozen change set, visible in the Promotions tab.
 - [ ] `promotion.*` events arrive at an endpoint subscribed to `promotion.*` within the delivery window.
 - [ ] The environment chip appears in the panel header while staging is active, the staging banner cannot be dismissed, and staging hosts answer with `X-Robots-Tag: noindex`.
-- [ ] All new routes answer `403` without their permission and `404` for another organization's environment.
+- [x] All new routes answer `403` without their permission and `404` for another organization's environment — `the_change_set_is_404_for_another_organization_and_403_without_the_key` proves both on the new route; the existing walks cover the other six.
 - [x] Archive releases the staging host and leaves the content readable in the archived state.
   *(integration walk `archiving_releases_the_host_and_keeps_the_content`; the browser half is
   still owed by the depth pass below)*

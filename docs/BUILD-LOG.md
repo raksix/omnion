@@ -5670,3 +5670,71 @@ QA_WEB_PORT=3204 bash scripts/qa/run.sh`) and close the browser half of the slic
 pass needs a box it can have to itself. Then REQ-017 slice 3: the changes diff and the
 environment chip and banner.
 =======
+
+## 2026-09-29 · Wave 5 · tick 30 — the change set, and a `where` that could not add what it filtered out
+
+**What.** REQ-017 slice 2's remaining API: `GET /api/v1/environments/{id}/changes`, the change set
+the Changes tab lists and slice 3's promotion will freeze. `crates/environment/src/changes.rs`
+plus three integration walks, behind a `full outer join` over the two environments' pages.
+
+**Proof.**
+- `pnpm typecheck` — 2/2.
+- `cargo test -p omnion-environment --lib` — **33/33**.
+- The three new walks, run individually — **green**: `the_change_set_names_…` 6/6 consecutive
+  passes, `the_change_set_is_404_…` and `a_derived_environment_without_a_clone_source` 3/3 each.
+- The **full** suite is **not** claimed green. Under nine-writer load it fails at
+  `the IAM seed must run: Database(PoolTimedOut)` before reaching an assertion; `pg_stat_activity`
+  shows 40 of 100 connections, so it is latency, not exhaustion. Box, not product.
+- The scoped browser pass ran (`QA_STACK=w5`, ports 18084/3104/3204) and **did not finish**: 418
+  interactions logged, then `Error: locator.count: Target page, context or browser has been closed`
+  with 41 `route-failed` and 35 `depth-pass-failed`, **all** the same cause, and **0 routes
+  completed**. The `/environments` nav entry was reached. This is the tab dying mid-pass under
+  parallel writers, not a finding about this change — the gate stays owed.
+
+**Three defects, all of them in code this branch shipped minutes earlier, and none of them
+visible by reading the query.**
+
+1. **A `where` on the left operand of a full outer join cannot add the rows it filters out.** The
+   first version filtered staging with `where staging.environment_id = $1 or staging.id is null`.
+   A deleted page exists only in production, so its staging side is NULL and it can never satisfy
+   the filter — deleted pages were unreachable. The `or staging.id is null` patch for that let
+   *any* environment's pages stand in as the staging side, so every real pair came back once
+   correctly and once as a phantom deletion: a freshly cloned environment reported all three
+   pages deleted. The fix restricts **both** sides in a CTE before the join. `from pages staging`
+   with no filter hands the join every page in the installation, and no later predicate can
+   re-pair them.
+2. **`select staging.site_id` after the join decodes NULL into a `Uuid` and answers 500** — on
+   exactly the deleted case, which is the one case the query exists for. `coalesce` across both
+   sides; the deleted row borrows production's identity, which is right anyway since a staging row
+   that does not exist has no slug to show.
+3. **A page added in staging is a draft with no `published_revision_id`**, so a title read from the
+   published revision left every added row blank. The digests read the *published* revision and
+   the titles read the *newest*: a difference is a difference in what the world can see, a label is
+   what the editor recognises. The asymmetry is deliberate and says so at the query.
+
+**And the merge, again.** `origin/main` was 11 commits ahead and merged first, per tick 29. Six
+conflicts. The 2-way marker sweep was clean, the router chain had one `.nest` with the module
+guard, limiter and CSRF all in order — and `pnpm typecheck` still found three
+`TS2451 Cannot redeclare` errors, because the `types.ts` resolution kept **both** sides of main's
+security block. That is the tick-23 file-level loss for the third time, and it now has its tool:
+a **symbol-level** diff (`symbols(main) - symbols(disk)`) reported **0 lost across all six merged
+files**, where the line-level diff read as ~200 false misses. Use the symbol check; treat line
+diffs as advisory.
+
+Two more, smaller: `content.read` is not a permission (it is `content.pages.read`) — the seed
+caught a name I had invented, which is the guard working. And an "update" in staging cannot be an
+`insert` of a slug the clone already copied; `pages_site_slug_key` is environment-scoped and
+refusing the duplicate is that migration doing its job.
+
+**A sibling's working tree, and a QA script that had regressed.** Another writer committed
+`f0fdeb5` (a cargo semaphore) during this tick and left a `scripts/qa/run.sh` that reverts this
+branch's `CARGO_TARGET_DIR` fix — it looks for the API at a hardcoded `target/debug/omnion-api`
+while the binary is built and good in `/dev/shm`. The first pass died at
+`[PM2][ERROR] Script not found: /mnt/apopic/omnion-w5/target/debug/omnion-api`, which names the
+regression rather than the code under test. Their file was neither committed nor reverted here: the
+pass ran from the committed version and the file was put back afterwards, and only this tick's
+eight files were staged.
+
+**Next.** Re-run the scoped pass on a box that can hold a browser (the QA slot was free and the
+load was 10 — the failure is memory, not contention over the slot) and close the browser half of
+slice 2. Then REQ-017 slice 3: promotion.
