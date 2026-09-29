@@ -1,6 +1,6 @@
 # REQ-052 — Sales & Quotes
 
-> **Status:** in-progress (slice 5 — the PDF documents: 2036485) · **Captured:** 2026-09-26 · **Layer:** module (`modules/sales`) · **Captured:** 2026-09-26 · **Layer:** module (`modules/sales`)
+> **Status:** in-progress (slices 6 and 6b — the palette: 600e9c7, a2cd89e) · **Captured:** 2026-09-26 · **Layer:** module (`modules/sales`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
