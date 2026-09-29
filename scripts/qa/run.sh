@@ -39,8 +39,39 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
+
+# The connection URL the API is started with.
+#
+# **The password is read from the environment, never written into this file.** The line used
+# to carry a literal `***` where the password goes, which arrived through a tool that masks
+# credential-shaped output on the way to the screen and then had the masked text pasted back
+# into the file — the exact trap the memory notes describe, and it is a *committed* one, on
+# `main`, so every writer's pass was starting an API with a wrong password. The symptom was
+# "the API did not answer" with `password authentication failed` in the log, and it pointed at
+# the database rather than at the harness for the same reason the stale-binary bug did.
+#
+# Resolution order: an explicit `OMNION_DATABASE_URL` (the owner's own), the project's `.env`
+# when it has one, and finally the documented development default. A file that has to carry a
+# secret to start a test stack is a file whose secret ends up in a public repository.
+qa_db_url() {
+  if [ -n "${OMNION_DATABASE_URL:-}" ]; then
+    # Rewrite only the database name, so a caller's own credentials and host are respected.
+    printf '%s\n' "${OMNION_DATABASE_URL%/*}/$QA_DB_NAME"
+    return
+  fi
+  if [ -f "$ROOT/.env" ] && grep -q '^OMNION_DATABASE_URL=' "$ROOT/.env"; then
+    local configured
+    configured="$(grep '^OMNION_DATABASE_URL=' "$ROOT/.env" | head -1 | cut -d= -f2-)"
+    printf '%s\n' "${configured%/*}/$QA_DB_NAME"
+    return
+  fi
+  # The development container's own credentials. Not a secret: it is the published local
+  # Postgres in `docker-compose.yml`, bound to loopback, and it exists to be thrown away.
+  printf 'postgres://omnion:omnion@127.0.0.1:5433/%s\n' "$QA_DB_NAME"
+}
 
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
@@ -95,28 +126,37 @@ step "API on :$API_PORT (database omnion_qa)"
 #
 # **The target directory is `$CARGO_TARGET_DIR` when it is set, never a hardcoded
 # `target/debug`.** The box is loaded enough that the parallel writers all point cargo at
-# `/dev/shm/<writer>-target` (a 32 GB tmpfs), and this script read the hardcoded path in three
-# places — the staleness check, the `cargo build` and the `pm2 start`. The result was the worst
-# kind of harness bug: `cargo build` compiled the current tree into the tmpfs, the staleness
-# check compared migration times against a *different*, three-hours-older binary in
-# `target/debug`, and pm2 started that one. The pass then reported a router panic from code that
-# no longer existed in the tree, and "the API did not answer" was the honest summary of a harness
-# testing the wrong build. One variable, used three times, is the whole fix.
+# `/dev/shm/<writer>-target` (a 32 GB tmpfs), and this script used to read the hardcoded path in
+# three places — the staleness check, the `cargo build` and the `pm2 start`. The result was the
+# worst kind of harness bug: `cargo build` compiled the current tree into the tmpfs, the staleness
+# check compared migration timestamps against a *different*, three-hours-older binary in
+# `target/debug`, judged it fresh, skipped the build, and pm2 started that one. The pass then
+# reported a router panic from code that no longer exists in the tree, and "the API did not
+# answer" was the honest summary of a harness testing the wrong build. One variable, used three
+# times, is the whole fix — and the `pm2 restart` branch matters as much as the `pm2 start` one:
+# a restart re-executes the binary path pm2 recorded at *start* time, so a process left over
+# from a pass that ran before the fix keeps panicking on a route that has since been corrected.
+# That is why the process is deleted and started rather than restarted.
 API_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/omnion-api"
 if [ ! -x "$API_BIN" ] \
    || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
-  cargo build -p omnion-api
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
+# Delete-then-start, never restart. `pm2 restart` re-executes the path pm2 recorded when the
+# process was first started, so a process left over from an earlier pass keeps running the
+# binary that existed then — which is how this file was fixed, the pass ran, and the API still
+# panicked on a route that had been corrected two hours earlier.
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  pm2 restart "$API_NAME" >/dev/null
-else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
-  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-  OMNION_PORT="$API_PORT" \
-  OMNION_ENV=development \
-    pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
+  pm2 delete "$API_NAME" >/dev/null
 fi
+OMNION_DATABASE_URL="$(qa_db_url)" \
+OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+OMNION_PORT="$API_PORT" \
+OMNION_ENV=development \
+  pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
@@ -140,19 +180,11 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough${QA_ONLY:+ (scope: $QA_ONLY)}"
-# QA_ONLY narrows the pass to one area's depth passes (`--only=ai`, `--only=media`, …). It is the
-# tool for a writer whose request is a handful of screens on a box that cannot carry a full pass
-# in one sitting: the wizard, the sign-in, the roll-up and the refusal gate still run, so a scoped
-# report is a real report rather than a lighter one.
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" ${QA_ONLY:+--only="$QA_ONLY"}
+step "browser walkthrough"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
 
-if [ -z "${QA_ONLY:-}" ]; then
-  step "vision review"
-  node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
-else
-  step "vision review (skipped — scoped pass)"
-fi
+step "vision review"
+node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
 
 step "summary"
 node -e '
