@@ -341,6 +341,66 @@ pub struct ProviderEnabledBody {
     pub gate_passed: bool,
 }
 
+/// The body of a bulk action over a selection of providers.
+#[derive(Debug, Deserialize)]
+pub struct BulkProvidersBody {
+    /// The action to apply to every id. `enable` and `disable` are the only two, and they are
+    /// the two the panel offers — there is no bulk delete and no bulk test, because a delete
+    /// needs the affected count per provider and a test is a round trip a person has to watch.
+    pub action: String,
+    /// The providers to act on.
+    pub ids: Vec<Uuid>,
+}
+
+/// What one bulk action did to one provider.
+///
+/// A bulk action is not one answer: switching three providers on and having the gate refuse two
+/// of them is the ordinary case, not an error, and a single `200 { enabled: 1 }` would leave
+/// the operator believing all three are live. So the answer is a row per requested id, and a
+/// refusal is a **row with a code**, not a hole in the list — a missing id is indistinguishable
+/// from one that was never sent.
+#[derive(Debug, Serialize)]
+pub struct BulkProviderRow {
+    /// The provider the row is about.
+    pub id: Uuid,
+    /// Its slug, so the panel names the connector rather than an id.
+    pub slug: String,
+    /// Its state after the action, or `null` when the action was refused.
+    pub enabled: Option<bool>,
+    /// The stable code when the row was refused, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The sentence a refusal explains itself with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// The answer of a bulk action.
+#[derive(Debug, Serialize)]
+pub struct BulkProvidersBodyOut {
+    /// The action that was applied, echoed so a panel that queued two cannot mix their rows.
+    pub action: String,
+    /// One row per requested id, in the order the ids arrived.
+    pub results: Vec<BulkProviderRow>,
+    /// How many rows changed a stored state.
+    pub applied: i64,
+    /// How many rows were refused, each with its own reason in `results`.
+    pub refused: i64,
+    /// Ids that named no provider this caller may see.
+    ///
+    /// Reported apart from `results` because they are a *different* failure: a provider in
+    /// another tenant is not refused for the gate, it simply does not exist for this caller, and
+    /// folding it into `refused` with `provider_not_found` would suggest the gate was the reason.
+    pub missing: Vec<Uuid>,
+}
+
+/// How many providers one bulk request may carry.
+///
+/// A refusal rather than a silent truncation, for the reason the reassign batch has one: a panel
+/// that asked for 5,000 and quietly did 500 reports a success, and the operator who read it
+/// believes 4,500 directories are still live for people to sign in with.
+const MAX_BULK_PROVIDERS: usize = 200;
+
 /// How many accounts one provider deletion would reassign, read before anything is removed.
 #[derive(Debug, Serialize)]
 pub struct ImpactBody {
@@ -1158,6 +1218,182 @@ async fn set_enabled(
         id: updated.id,
         enabled: true,
         gate_passed: updated.last_test_ok == Some(true),
+    }))
+}
+
+/// Apply one action to a selection of providers.
+///
+/// **Why a batch at all**, when `POST /{id}/enable` and `/{id}/disable` already exist: the
+/// ordinary case is an operator who has just inherited an installation with nine directories
+/// connected and needs them all *off* this afternoon, or a migration that has to be reversed
+/// in one move. Nine round trips with nine spinners is not a refusal, it is just a worse tool.
+///
+/// **Why it is not a loop over the single verbs.** Three reasons, and each one is a claim the
+/// walk has to be able to fail on:
+///
+/// 1. **A partial success is the normal answer, not an error.** Switching four providers on
+///    when two have never passed a test does three things and refuses one. Answering `200` with
+///    a count would leave the operator believing four are live, and the two that are not are
+///    the ones nobody is looking at. So a refusal is a **row with a code**, in the same list as
+///    the successes, in the order the ids arrived.
+/// 2. **The gate is asked per row, and the rows are independent.** One provider being untested
+///    must not stop the other three, or the operator cannot turn off a broken directory without
+///    first fixing the four that are fine.
+/// 3. **A missing id is not a refused id.** A provider in another tenant does not exist for this
+///    caller; reporting it in `results` with the gate's code would blame the gate for a
+///    tenancy decision. It gets its own list.
+///
+/// The audit and the events are written per row rather than once for the batch: an operator
+/// reading the trail for one directory must find that directory, and a single "bulk enabled 3"
+/// line is a trail that answers none of the questions anybody actually asks of it.
+pub async fn bulk_update_providers(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<BulkProvidersBody>,
+) -> Result<Json<BulkProvidersBodyOut>, ApiError> {
+    let action = body.action.trim().to_ascii_lowercase();
+    if action != "enable" && action != "disable" {
+        return Err(ApiError::bad_request(
+            "unknown_bulk_action",
+            format!(
+                "the only bulk actions are `enable` and `disable`; `{action}` is not one of them"
+            ),
+        ));
+    }
+    let enabled = action == "enable";
+
+    // A duplicate id in one request is a panel bug, not a request to do the work twice. The
+    // rows are deduplicated *preserving first-seen order* so the answer still lines up with what
+    // the operator ticked, and so a repeated id cannot produce two audit rows for one change.
+    let mut ids: Vec<Uuid> = Vec::with_capacity(body.ids.len());
+    for id in body.ids {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "no_providers",
+            "select at least one provider",
+        ));
+    }
+    if ids.len() > MAX_BULK_PROVIDERS {
+        return Err(ApiError::bad_request(
+            "too_many_providers",
+            format!(
+                "a bulk action carries at most {MAX_BULK_PROVIDERS} providers; this one asked for \
+                 {}",
+                ids.len()
+            ),
+        )
+        .with_details(json!({ "requested": ids.len(), "limit": MAX_BULK_PROVIDERS })));
+    }
+
+    let mut results = Vec::with_capacity(ids.len());
+    let mut applied = 0i64;
+    let mut refused = 0i64;
+    let mut missing = Vec::new();
+
+    for id in ids {
+        // A provider this caller may not see is reported apart, and *not* as a gate refusal.
+        let provider = match providers::find_provider(state.db().pool(), id).await? {
+            Some(provider) => {
+                if resolve_organization(&current, Some(provider.organization_id)).is_err() {
+                    missing.push(id);
+                    continue;
+                }
+                provider
+            }
+            None => {
+                missing.push(id);
+                continue;
+            }
+        };
+
+        if enabled {
+            if let Err(error) = providers::enable_gate(&provider) {
+                refused += 1;
+                results.push(BulkProviderRow {
+                    id: provider.id,
+                    slug: provider.slug.clone(),
+                    enabled: None,
+                    error: Some("provider_not_ready".to_owned()),
+                    message: Some(error.to_string()),
+                });
+                continue;
+            }
+        }
+
+        // Idempotent on purpose, and for the same reason the single verb is: a re-tick of a
+        // bulk action is a person asking the same question twice, not two changes.
+        let changed = provider.enabled != enabled;
+        if changed {
+            let updated = providers::update_provider(
+                state.db().pool(),
+                id,
+                ProviderChanges {
+                    enabled: Some(enabled),
+                    ..ProviderChanges::default()
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "provider_not_found",
+                    "no such provider",
+                )
+            })?;
+
+            record(
+                &state,
+                NewAuditEntry::by_user(current.user.id, "iam.provider_enabled")
+                    .target("auth_provider", updated.id.to_string())
+                    .metadata(json!({
+                        "slug": updated.slug,
+                        "enabled": enabled,
+                        // The batch is named so a trail of nine rows for nine directories can be
+                        // told apart from nine separate decisions.
+                        "bulk": true,
+                    }))
+                    .ip_address(address.as_text())
+                    .organization(Some(updated.organization_id)),
+            )
+            .await?;
+
+            emit(
+                &state,
+                NewEvent::new("iam.provider_enabled")
+                    .organization(Some(updated.organization_id))
+                    .actor(Some(current.user.id))
+                    .payload(json!({
+                        "provider_id": updated.id,
+                        "slug": updated.slug,
+                        "bulk": true,
+                    })),
+            )
+            .await;
+        }
+
+        if changed {
+            applied += 1;
+        }
+        results.push(BulkProviderRow {
+            id: provider.id,
+            slug: provider.slug.clone(),
+            enabled: Some(enabled),
+            error: None,
+            message: None,
+        });
+    }
+
+    Ok(Json(BulkProvidersBodyOut {
+        action,
+        results,
+        applied,
+        refused,
+        missing,
     }))
 }
 

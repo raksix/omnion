@@ -314,6 +314,14 @@ pub fn router(state: AppState) -> Router {
     let iam_provider_events = get(iam_providers::list_provider_events)
         .layer(guards::require(&state, "iam.providers.read"));
 
+    // Bulk enable/disable (REQ-065, slice 4 part 11). One guard, the same `manage` the single
+    // verbs sit behind: a batch is not a cheaper way to do something the caller could not do one
+    // at a time, and the moment it is, the batch is the privilege escalation. It is a *separate
+    // route* rather than a `POST /{id}` with a list, because a list in the path is a shape a
+    // router and an audit log both have to be able to read.
+    let iam_providers_bulk = post(iam_providers::bulk_update_providers)
+        .layer(guards::require(&state, "iam.providers.manage"));
+
     // The sync ledger (REQ-065, slice 4 part 2). Reading a run and its failures is `read`; asking
     // for a retry is `manage`, because a retry re-walks a live directory and writes a run row
     // an operator will later read as evidence that somebody asked.
@@ -1227,6 +1235,11 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers/{id}/enable", iam_provider_enable)
         .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
+        // The batch sits at `/iam/providers/bulk`, NOT `/iam/providers/{id}/bulk`: axum matches
+        // static segments before `{id}`, so the two can share a prefix — but only because the
+        // batch is registered on a literal path. Folding the ids into the path instead would
+        // give the router a second pattern that looks like a provider id and is not.
+        .route("/iam/providers/bulk", iam_providers_bulk)
         .route("/iam/providers/{id}/sync-runs", iam_provider_sync_runs)
         .route("/iam/providers/{id}/sync-runs/{run_id}", iam_provider_sync_run)
         .route(
