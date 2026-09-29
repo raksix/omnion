@@ -3233,3 +3233,62 @@ same reason a success rate must not be gameable: a person who stopped the run st
 with its SSE stream, the run list and the trace screen. `ai_agents`/`ai_runs`/`ai_run_steps` want
 migrations **past** main's high-water (0051 at last fetch, re-read at commit time), not the tight
 next number.
+
+### 2026-09-29 · omnion-w7 · REQ-099 slice 1, the run store and a duplicate migration caught
+
+**The merge came first, and it was not clean.** `git merge origin/main` produced two conflicts,
+both in files a previous tick had resolved by taking "ours" wholesale. The BUILD-LOG had 22
+sections against main's 55: **30 entries belonging to other writers (REQ-006, REQ-007, REQ-010,
+REQ-021, REQ-032) had been silently dropped from this branch** and never restored. Rebuilt as
+main's file plus my `###` sections, verified by a multiset check — every main section present,
+every one of mine present, zero lines lost either way. `scripts/qa/walkthrough.cjs` had the same
+shape; the one hunk was main's event-console pass, kept.
+
+**A duplicate migration version, caught by reading `git ls-tree` instead of guessing.** main
+shipped `0052_webhook_delivery_ops.sql` while this branch already had
+`0052_ai_route_decisions.sql`. Two files claiming one version is the sqlx `VersionMismatch` that
+kills a whole suite before a single assertion runs. Renumbered this branch's four AI migrations to
+`0058`–`0061` and updated the REQ-098 prose naming them.
+
+**The gate URL in the state file was missing its password, and nobody noticed for a tick.**
+`OMNION_DATABASE_URL=postgres://omnion@127.0.0.1:5433/…` fails authentication, so every DB test
+in this branch had been *skipping* while reporting `ok`. The correct form is
+`postgres://omnion:omnion@127.0.0.1:5433/…`. Thirteen tests that read `13 passed` were twelve
+silences.
+
+**A test that fails for the wrong reason is worse than no test.** The migration checker asserted
+"this INSERT errored" and two cases were green on a *missing foreign key* rather than on the rule
+under test. Rewritten to assert on the constraint name postgres names. Then one case it was
+supposed to catch did not fire at all: a `running` run could carry `stop_reason = max_steps`,
+claiming an ending that has not happened. Added `ai_runs_reason_implies_finished`.
+
+**Two cost bugs the tests caught and the compiler could not.** The run's `cost_micros` was both
+incremented per step *and* recomputed by `finish_run` — a three-step run reported 13 599 micros
+for 3 600 of work. And `finish_run` never wrote the cost at all, so the column was always zero
+until something else touched it. The increment is gone; the cost is recomputed from the steps,
+which also makes closing a run twice idempotent.
+
+**A `Drop` impl cannot await, and a detached teardown races the binary's exit.** The first
+version of the integration harness created a throwaway database per test and never removed it,
+on the theory that a panicking test should leave evidence. Thirteen tests leaked 133 databases;
+the shared PostgreSQL went into recovery, and *other writers'* suites began skipping with
+"pool timed out". `dispose` is now explicit and awaited, and one clean run leaves zero behind.
+
+**sqlx and PostgreSQL disagree about types in four places, each found by running the code.** A
+raw `insert` sends placeholders untyped, so every nullable uuid needs `::uuid` and `temperature`
+needs `::numeric` — and putting a cast on the wrong slot fails with "cannot cast double precision
+to uuid". `numeric` does not decode into `f64`. `jsonb` does not decode into `Vec<String>` and
+has no cast to `text[]`, so it is expanded through `jsonb_array_elements_text` — with a
+`coalesce`, because `array_agg` over zero rows is NULL and every agent without tools would have
+failed to load. And `sum()` returns `bigint`, so the totals need `::int`.
+
+**Proof this tick.** `cargo test --workspace`: the only failing target is
+`-p omnion-api --test automation`, 3 tests, all `evaluated: 2, right: 1`. **Proved pre-existing
+on `origin/main`** by checking out main and re-running with none of this branch's code: identical
+3 failures. It is w3's wave, not this one. `omnion-ai-hub` 197 unit tests green.
+`apps/api/tests/ai_agent_runs.rs` 13/13, zero skips, zero leaked databases.
+`scripts/qa/agent-migration-checks.py` 27/27 rules, each asserted by constraint name.
+
+**Next.** The rest of REQ-099 slice 1: the provider call and tool execution, the runner's
+claim/heartbeat/requeue, `POST /ai/agents/{id}/runs` with SSE, the run list and the trace screen.
+

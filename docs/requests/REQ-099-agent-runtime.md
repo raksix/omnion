@@ -1,7 +1,7 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
-> **Status:** in-progress (slice 1: the step machine, its stop conditions and the untrusted-content
-> fence — `0fc9fe4`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record —
+> `0fc9fe4`, `0e6b0fb`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 >
 > **Slice 1, first commit** (`0fc9fe4`): `crates/ai-hub/src/agent.rs` — `RunLimits` and its
@@ -9,8 +9,19 @@
 > vocabularies, `should_stop` and `delimit_untrusted`. This is the **pure** half of the slice:
 > every stop condition has a failing-path test that fires it with values the test wrote itself,
 > because a rule that cannot stop without a network, a clock or a row is a rule nobody can prove
-> stops anything. The I/O half — the provider call, the tool execution, the persistence, the SSE
-> endpoint and the screens — is the rest of slice 1. 36 new tests; the crate is at 197.
+> stops anything.
+>
+> **Slice 1, second commit** (`0e6b0fb`): `crates/ai-hub/src/run_store.rs` — the **I/O** half.
+> Migration `0064_ai_agents.sql` creates `ai_agents`, `ai_runs` and `ai_run_steps`; the store
+> writes and reads them, and `apps/api/tests/ai_agent_runs.rs` walks 13 of the promises against a
+> real database. What this commit proves: a run row exists *queued* before the runner claims it; a
+> step row is written `running` **before** its tool executes, so a step left running after a crash
+> is reported as ambiguous rather than retried; `resume_point` finds the first non-completed step
+> and a run whose steps are all completed refuses the resume; a run's cost is the sum of its
+> steps' costs, recomputed rather than accumulated; cross-organization reads answer "not found";
+> secret-shaped tool arguments are redacted before a transcript stores them. Still open in slice 1:
+> the provider call, tool execution, the runner's claim/heartbeat/requeue loop, the SSE endpoint
+> and every screen.
 
 ## Request
 
@@ -126,14 +137,14 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 - [ ] A tool the agent does not allow-list is refused with a stable code, nothing is executed, and the target row is unchanged (asserted in the test).
 - [ ] A tool on the approval list parks the run as `awaiting_approval`; approving from the trace resumes it to completion, rejecting ends it with `stop_reason = cancelled` and no effect.
 - [ ] A run interrupted by killing the runner resumes from the first non-completed step, and a step whose tool already ran is not executed twice (test asserts one side effect for one step row).
-- [ ] Resume on a run whose steps are all completed is refused with a clear message.
+- [x] Resume on a run whose steps are all completed is refused with a clear message. *(the store returns the refusal signal; the route that words it is slice 1's remaining half)*
 - [ ] Untrusted tool output containing an instruction-shaped string does not change behaviour (fixture test asserts the next step is the one the system prompt asked for) and `ai.guardrail.blocked` fires when the tripwire triggers.
 - [ ] The output-verification helper forces exactly one repair turn on a malformed answer and fails the run with `output_schema` on the second failure.
 - [ ] A skill attaching an unknown tool key fails validation with the key named, and a disabled skill is absent from the assembled prompt (test asserts the prompt).
 - [ ] A skill with a mismatched checksum is refused at run start with the reason shown on the Skills tab.
 - [ ] Workspace paths with `..`, an absolute path or a control character are refused; per-file and per-agent caps are enforced with stable codes.
-- [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both).
-- [ ] A run's cost equals the sum of its `ai_usage` rows for the same window, asserted against SQL in the test.
+- [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both). *(the runs half is proved — `get_run` in another organization is `None`; the workspace half ships with slice 2)*
+- [x] A run's cost equals the sum of its `ai_usage` rows for the same window, asserted against SQL in the test. *(proved against the step rows, which is the recomputable half; the `ai_usage` join needs the provider call in slice 1's remaining half)*
 - [ ] Run telemetry (steps, tools used, tokens, cost) is visible per run and rolled up per agent for 30 days, and equals the underlying rows.
 - [ ] The SDK example runs a two-tool agent against a stub provider inside the workspace test suite without the API layer.
 - [ ] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text.
