@@ -4370,3 +4370,73 @@ threshold should check `df` before writing, not after.
 output — which is the inspector's question rather than the canvas's, and needs the run's
 step `params`/`output` to be reachable from a node id (the mapping already carries
 `stepNos` for exactly that). Then criterion 3, *Retry this node*.
+
+
+## 2026-09-29 — REQ-004 slice 3, criterion 2's second half (the click) · what a step did, on the node that did it
+
+feat(api): send a step's inputs · feat(builder): the trace panel · test(qa): click a painted node
+
+The pill said what a node's status *was*. Nothing said what the step *did*, so the
+criterion was half a feature: "clicking the node opens that step's inputs and output"
+had an output and no inputs.
+
+**The gap was on the wire, not in the client.** `StepBody` carried `output` and not
+`params` — the same class of defect as the `node_id` one this criterion already paid for
+once, and the reason it keeps recurring is that writing a row and reading it back are two
+different things. A stored `params` is *not* the node's authored `params` on the canvas:
+a run from a node, a retry, or an edit that was never saved leave the two different, and
+the one an operator debugging a run needs is the stored one. Reusing `node.params` in the
+panel would have compiled, rendered, and quietly been the wrong number.
+
+**`step-detail.ts` is a pure function, and its three rules are what a
+`steps.find(s => s.node_id === id)` throws away:**
+
+* a node with two branches opens **both** steps. Showing the branch that ran and hiding
+  the one that did not is the exact information the `diverged` pill exists to advertise.
+* `null` (no run read) is not `[]` (a run with no steps). A rule whose first run is still
+  `pending` has steps, so the two are genuinely different, and collapsing them makes a
+  rule that has never run look like a rule whose nodes all sat out.
+* an **absent** payload is not an **empty** one. A step that ran and returned `{}` is not
+  a step that never produced anything. The server now sends `{}` rather than omitting the
+  key, precisely so `describePayload` can tell them apart, and a Rust test asserts the
+  empty object *is* sent.
+
+**Payloads are classified before they are rendered, never stringified.** `JSON.stringify`
+on a cyclic value throws, and it throws during render, which takes the whole panel with
+it. A deep value renders as one summary line however deep it goes, because expanding a
+payload until it ends is a page that never finishes loading.
+
+**The probe reads the PANEL, not the run.** Fetching the run and printing `step.output`
+would pass against a trace that rendered nothing — the same trap the pill probe fell into
+last tick, so it is now the pattern rather than a lesson. The node clicked is read off a
+*painted, non-skipped* card rather than picked by index, because clicking a node the run
+never reached is the `node-absent` state and would prove the empty-state message instead
+of the panel. One assertion reads the API instead (`stepsWithParams` / `stepsTotal`): a
+panel that renders "no inputs" on every step is a correct-looking panel built on a field
+nobody sends, and nothing on screen says so.
+
+**Proof.**
+- `apps/admin` builder suites → **85/85** (71 before; 14 new)
+- `cargo test -p omnion-api --lib` → **206/206** (203 before; 3 new)
+- `cargo test -p omnion-workflows --lib` → **95/95**
+- `cargo check -p omnion-api --all-targets` → exit 0
+- `tsc --noEmit` in `apps/admin` → exit 0
+
+**Not ticked: the criterion, and the browser pass.** The pass is queued behind w9's
+holder, and the same migration gap as last tick still stands — `0019` and `0022` are
+absent from this branch and from `origin/main` (`0019_cms_blocks.sql` on
+`origin/wave2-cms`, `0019_organization_memberships.sql` on `origin/wave5`, `0022_*` on
+`origin/wave4` and `origin/wave7`), so every `OMNION_REQUIRE_DB=1` suite still dies at
+`VersionMissing(19)` before an assertion. Renumbering another branch's migration trades
+a loud failure for a duplicate that kills every suite at once, so it stays the owner's
+call. **The `node-status` boxes stay unticked too** — the probe for them exists and is
+correct, but a criterion is not ticked on a probe that has not run.
+
+**Merged.** `origin/main` (3 commits, REQ-016 slice 2) merged at `a44d730`; the one
+conflict was both sides adding a nav item to `app-shell.tsx`, so both were kept — the
+alternative, taking one side's import line, silently deletes a nav entry from the other
+writer's wave.
+
+**Next.** The QA pass, and then criterion 3 — *Retry this node*. `store::retry_step_from`
+is deliberately a **tail** re-run, so a single-node retry is a different write and must
+not be built by narrowing it.
