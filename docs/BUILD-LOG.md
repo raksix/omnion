@@ -4760,3 +4760,79 @@ stopped and the slice committed instead. **Next tick:** if the slot is free, run
 `bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
 then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
 visited and clicked.
+
+## 2026-09-29 · REQ-064 slice 3 · the SEO toolkit
+
+**What.** Page metadata as columns, the `<meta>` and JSON-LD a crawler reads **generated** from the
+page's own fields, redirect rules with a loop guard and a dialect small enough to be safe on the
+request path, a stored sitemap with a public route, a robots.txt editor that warns instead of
+refusing, and a crawl-lite broken-link view. Migration `0139_cms_seo.sql`; store in
+`crates/content/src/seo.rs`; thirteen endpoints in `apps/api/src/routes/seo.rs` behind two new
+permissions (`seo.read`, `seo.manage`); the `/seo` screen with three panels; `runSeoDepth` and
+`--only=seo` in the harness.
+
+**The merge first.** `origin/main` had moved seven commits (the security-centre CSRF layer and the
+header policy), and `docs/BUILD-LOG.md` conflicted — the append-only splice again, this time
+verified by a **multiset**: 0 lines lost from either side, 0 lines present in the merged file that
+were in neither. The duplicated-line count it reports is dominated by blank lines and repeated
+`**Proof.**` headings, which is what a per-tick journal looks like; the check that matters is the
+one that says nothing was lost.
+
+**Five real defects, and none of them came from review.**
+
+1. **A `--` comment between two `add column` clauses kills the rest of the line** — which was the
+   entire remaining statement, so the migration died at the first `constraint` with a character
+   offset pointing *into a comment*. Comments belong between statements, and every CHECK is now
+   its own `ALTER`.
+2. **A dollar-quoted default's `\n` is a literal backslash-n**, so `robots.txt`'s default was one
+   line and the string never terminated. `E'…'` and a real newline.
+3. **`hits integer` against an `i64`.** sqlx refuses to decode INT4 into `i64`, so every read of
+   the redirect list was a 500. `bigint`. The same trap then bit the *test*: `sum()` over a
+   `bigint` returns NUMERIC, which will not decode into `i64` either.
+4. **`numeric` is not `f64` and `real` is FLOAT4, not FLOAT8.** Two attempts, two 500s on the same
+   read. `double precision`, and the workspace carries no decimal crate to make NUMERIC readable.
+5. **A leading quantifier made the pattern dialect match nothing.** `*5` is a typo, not a pattern,
+   and the first version treated it as "any number of noughts" by accident. A quantifier now
+   attaches to the token before it, and one that has none cannot be represented.
+
+**The matcher took four attempts and the tests were the judge.** Folding "matches zero times" into
+the per-character loop and advancing the position without consuming a character made `/post-*`
+match `/post-1`; keeping the skip as a separate `epsilon_closure` is what makes the state set mean
+"consumed exactly the input so far". Two of my own assertions were wrong in the other direction —
+`/post-*` does not mean "any suffix" (`.*` does that) and `/page-?` does not match `/page-1` — and
+the test that could tell the implementations apart was `/a?b?c` against four lengths, one per
+combination of two optional characters.
+
+**Two more the unit tests found, in code the compiler was happy with.** `#[serde(default)]` hands
+`PageSeo.structured_data` a JSON `null`, and the `is_object()` check called it malformed — so
+*every unedited page was unsaveable*. And `extract_links` mixed two coordinate systems: the tag was
+sliced from a `Vec<char>` while the closing `>` was found as a **byte** offset, so the crawl found
+zero links on every page and the broken-links view said "no broken links" about a site full of
+them.
+
+**A new gate, because the failure mode was expensive.** A migration's syntax error was found by the
+test suite, which needs a cargo build first: three minutes on a box six writers share, per attempt.
+`scripts/qa/sql-check.sh` applies the whole set with `psql` in **7 seconds** and caught the first
+two of the five above immediately. It is the first thing to run after writing a migration now.
+
+**A trap this suite fell into and did not report honestly.** Seven tests printed `ok` and every one
+had **skipped**: the URL lifted from `run.sh` still ends in the literal `$QA_DB_NAME`, and a `sed`
+that assumed an alphanumeric last segment matched nothing. The run script now expands it with `eval`
+and **preflights the connection before the suite**, because "green" and "proved nothing" are
+indistinguishable in libtest's output unless you read the `SKIP` lines.
+
+**Proof.**
+
+- `bash scripts/qa/sql-check.sh` → **ALL MIGRATIONS APPLY CLEAN** (139 files, 7 s)
+- `cargo test -p omnion-api --test cms_seo` → **7 passed, 0 failed**, 27 s, `--nocapture`, real
+  PostgreSQL in `omnion_w2_seo_test`, no `SKIP`
+- `cargo test -p omnion-content --lib` → **154 passed**; `omnion-permissions` → **63 passed**
+- `pnpm typecheck` → exit 0 (2 packages)
+- Commits: `ebce63e` (merge), `cd64968`, `0c00354`, `49f2817`, `009136b`, `4b7d3b2`, `cc4e279`,
+  `4404207`
+
+**Next.** The `runSeoDepth` browser pass (32 required steps) to prove the screen half: a redirect
+created through the form, the test's "it did not count a hit" line, a relative path refused with
+the rule absent from SQL, a blocking robots.txt saved *with* its warning, the regenerated XML
+previewed and its count matching what is in storage, the internal-link scan, and the delete
+confirmation naming the path. Then slice 4 — comments, newsletter, memberships, media reuse.
