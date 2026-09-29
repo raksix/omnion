@@ -6073,6 +6073,90 @@ so `restore preview` can count what it can put back. (b) The prune sweep must us
 `remove_run_artifacts` too — it deletes the same directories by its own path today, which is
 the third half that could disagree with this one.
 
+## Tick 68 — REQ-013 slice 3 (retention): the sweep had no caller
+
+**What.** `prune_candidates` shipped in slice 1 with a doc comment describing four
+exemptions, and **nothing called it**. The retention screen could list what the sweep would do
+and the walkthrough could assert the exemptions hold, and the bytes on the destination would
+accumulate for ever. Five commits: `e704c0f` the sweep, `faea0bd` the two config knobs,
+`514665c` the worker, `813f33b` the manual route, `9c8170b` the panel, `e77fd9a` the walk.
+
+**The shape of the defect is now unmistakable.** Tick 66 found a half that *counted*. Tick 67
+found a half that *scoped wrongly*. This tick found a half that **was never invoked**. Three
+ticks, three different ways for one feature to satisfy every assertion in its own tests and
+disagree with reality, and all three are the same question: *who calls this?* The delete
+knew how to take a run's artifacts off the disk; the sweep — which deletes **more** than the
+delete does, unattended, with nobody watching — had never heard of the function. That is the
+lesson worth more than the code: **a pure function with a thorough doc comment and no caller
+is the most convincing piece of dead code there is.** It reads as a feature. Its tests pass.
+Its exemption rules are correct. It does nothing at all.
+
+So `crates/backup/src/sweep.rs` is a **caller** and deliberately the only one, and it writes
+no path arithmetic of its own. Two implementations of "remove a run's directory" is how a
+destination ends up with a directory the sweep believes it deleted — the same "two halves that
+make the same mistake are not a cross-check" rule the media part taught, restated at the
+removal.
+
+Three decisions that are not obvious. **Bytes first, row second**, so an interrupted sweep
+leaves a row over an archive that is still there and the next tick takes it again. **A
+partial removal still deletes the row** — the same call the delete handler makes, because
+retention is a window and not a bulk delete, and one stuck file must not retain a run for
+ever. And the sweep walks **tenants**, not rows, through `organizations_with_backups`: a
+separate function rather than an inline `select distinct`, because a second answer to "who
+gets swept" is a rule that drifts the first time one of them is edited. `null` is a real
+member of that list — a sweep that filtered the platform's own backups away would never prune
+the restore points that matter most on a single-tenant installation.
+
+**Two flags, not one.** `OMNION_BACKUP_SWEEP` is independent of `OMNION_RETENTION_RUNNER`,
+because "never delete my backups" must not have to mean "never purge my trash"; the only way
+out otherwise is to turn the whole worker off. The six hour default is chosen from the
+feature: the shortest window the panel allows is a day and the newest successful run is exempt
+whatever it is, so hourly finds the same set six times for the same answer and nightly leaves
+a run whose day ended at 04:00 sitting there for twenty hours.
+
+**The manual route is scoped, and that is the part worth proving.** `POST
+/api/v1/backups/sweep` calls `sweep_organization` for the **caller's** tenant, never
+`sweep_all` — an operator pressing "run retention" on their own site must not delete another
+tenant's restore points. The walk creates a stranger tenant's expired run pointed at the same
+destination and requires it to keep **both** its row and its directory. The stranger is not
+decoration: without it "everything" and "this organization" are the same set, which is the
+exact blind spot the media part's tenancy fix was found through last tick. The same lesson,
+one layer up, and it is now the second time this feature needed a stranger in the fixture.
+
+The route is registered **before** `/backups/{id}`. A `POST` against `/backups/sweep` would
+otherwise match `{id}` and fail to parse `sweep` as a UUID — a 500 that reads like a router
+bug on the one route whose whole point is to be callable by hand.
+
+**Proof.** `omnion-backup --lib` **85/0** (80 before, +5 in `sweep`) · `omnion-core --lib`
+**39/0** (+2, both pinning the flag independence in both directions) · `apps/admin`
+`tsc --noEmit` clean · `the_retention_sweep_takes_the_bytes_and_spares_what_it_promised`
+**1/0 in 5.5s** over the real router and the real filesystem. That walk goes and *looks at
+the directory*, because the sweep's whole claim is about bytes and a row delete reports the
+same counts the panel shows.
+
+**Blocker, fourth tick running, unchanged and not worked around.** The browser pass did not
+run. `qa-slot.sh` is held by a live sibling (pid 142641) and the box peaked at load 23 with
+**1 GB of 32 free** and 24 GB of swap in use; `scripts/qa/run.sh` would have added a fifth
+Chromium to that. `runBackupDepth` stays written-but-unrun, so REQ-013 does not close on
+tests alone. Two toolchain facts, both recorded because each read like a product defect and neither was
+one. A **stale orphan test binary** from an earlier tick (`backups-b245d57c4aaeca51`, no
+parent shell) was holding QA database connections across ticks; killed it. And a **sibling
+deleted my `target/debug/incremental` mid-build**, which surfaces as
+`failed to move dependency graph … os error 2` — a compile failure in files that were already
+merged and building fine. The full-suite run then hung in the pre-existing
+`a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful_survives` with no
+active query and no blocked lock, so I killed it, killed the orphan, rebuilt with
+`CARGO_INCREMENTAL=0` and re-ran that exact test in isolation: **1/0 in 3.19s**. It was never
+red and never broken — it was starved. Two rules, both already half-known and now confirmed:
+**build with `CARGO_INCREMENTAL=0` when siblings are live**, and **an unexplained hang with no
+database activity is contention before it is a defect**.
+
+**Next.** (a) The restore path (slice 2) now has the index a preview needs: the media index
+is written, `pending_objects_for_organization` says whose files a run may restore, and the
+sweep tells the operator what is actually on the destination. (b) The `partial` box is still
+unticked — a run where one part fails ends as `partial` with the message visible in the UI
+needs a fault injected into the drawer, not a test.
+
 ## Wave 4b / w8 tick 27 — REQ-133 slice 2, and the 23502 slice 1 was hiding
 
 **What shipped.** Three commits: `d0e9d8f` (the write path names `project_id`), `4deb108`
