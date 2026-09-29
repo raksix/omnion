@@ -18,5 +18,12 @@ sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+# The media part copies objects rather than counting them, so it has to open the deployment's
+# own object store. It depends on the *abstraction* (omnion-storage), never on a vendor SDK:
+# a backup that only works against the S3 driver would be a backup that silently stops being a
+# backup the day a site is pointed at a directory.
+omnion-storage = { path = "../storage" }

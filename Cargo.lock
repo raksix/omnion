@@ -1433,12 +1433,14 @@ name = "omnion-backup"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "omnion-storage",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
  "thiserror",
  "time",
+ "tokio",
  "tracing",
  "uuid",
 ]
