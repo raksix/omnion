@@ -1,6 +1,6 @@
 # REQ-012 — Security Center
 
-> **Status:** in-progress — **slice 1 (posture + findings) is code-complete.** `crates/security` (posture registry, findings store, lifecycle), migration `0054_security_posture.sql`, the `/security` + `/security/findings` screens and the API behind three separate powers (`security.read` / `security.scan` / `security.manage`). Unit tests: 39 crate + 62 permissions. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress — **slices 1 and 2 are code-complete; neither has a browser pass.** `crates/security` (posture registry, findings store, lifecycle), migration `0054_security_posture.sql`, the `/security` + `/security/findings` screens and the API behind three separate powers (`security.read` / `security.scan` / `security.manage`). Unit tests: 39 crate + 62 permissions. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -107,12 +107,12 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 
 ### Acceptance criteria
 
-- [ ] `crates/security` exists with posture checks, limiter policy and IP-rule evaluation, unit-tested. *(partly: the posture registry, the findings store and the lifecycle are in and unit-tested — 39 tests. The limiter policy and the IP-rule evaluation are slice 3 and slice 4.)*
+- [ ] `crates/security` exists with posture checks, limiter policy and IP-rule evaluation, unit-tested. *(posture and the header/CSRF policies are in: 100 crate tests. The limiter policy and the IP-rule evaluation are slice 3 and slice 4.)* *(partly: the posture registry, the findings store and the lifecycle are in and unit-tested — 39 tests. The limiter policy and the IP-rule evaluation are slice 3 and slice 4.)*
 - [ ] Migration `0012_security_center.sql` applies cleanly on fresh and populated databases.
 - [ ] `/security` renders every check from the API with a truthful state; no check shows `pass` when unknown.
 - [ ] "Run checks" records a new result set and the `Last checked` timestamps move.
-- [ ] Header policy saves and the next API response carries the configured CSP/HSTS/Referrer-Policy values.
-- [ ] Report-only mode sends `Content-Security-Policy-Report-Only`; enforce mode sends the enforcing header.
+- [x] Header policy saves and the next API response carries the configured CSP/HSTS/Referrer-Policy values. *(one rendering: `HeaderPolicy::render` feeds the panel's preview column, the middleware and the posture checks, and the installed layer holds a shared cell so a save applies to the next response instead of the next restart)*
+- [x] Report-only mode sends `Content-Security-Policy-Report-Only`; enforce mode sends the enforcing header. *(mutually exclusive, and the test asserts neither mode sends the other's name — sending both would apply a policy while claiming to only report it)*
 - [ ] Rate limits are enforced: exceeding a scope's window returns `429` with a `Retry-After` header.
 - [ ] The limiter tester's verdict matches the real middleware decision for the same inputs.
 - [ ] Five failed sign-ins for one account trigger the configured lockout and emit `security.lockout.triggered`.
@@ -124,7 +124,7 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 - [x] CSV export of findings and security events matches the current filter. *(the findings half shipped: `GET /security/findings.csv` reads the same parser as the list, ignores the page size on purpose, and its 50k cap's refusal names the count. The security-events half is slice 4, with the events screen.)*
 - [ ] `/security/events` shows real sign-in, lockout, denial and settings-change entries.
 - [ ] Secret inventory lists names and rotation age only; no value appears in HTML, JSON or export.
-- [ ] CSRF protection rejects a cookie-authenticated mutation without a token.
+- [x] CSRF protection rejects a cookie-authenticated mutation without a token. *(derived HMAC over the session id, no table to rotate; `403 csrf_failed` rather than `401` because the caller is authenticated and it is the request that is refused; a bearer machine key is exempt because it is not ambient authority; a deployment with no `OMNION_CSRF_SECRET` refuses rather than skipping)*
 - [ ] Every endpoint enforces its catalogue key; a forbidden call returns `403 permission_denied`. *(the four keys are in the catalogue and every route is behind a guard; the 403 itself is unproven until a pass calls an endpoint without the key)*
 - [ ] Walkthrough passes with zero high findings.
 
@@ -135,7 +135,7 @@ The walkthrough must visit `/security` and each sub-tab, click "Run checks", ope
 ### Slices
 
 1. **Posture + findings** — schema, check registry, `/security` overview, findings list/detail and status transitions, audit entries. Done: the overview shows real states and a finding can be acknowledged, ignored with a reason and exported. **SLICE 1 COMPLETE 2026-09-29, awaiting the browser pass** (`0054_security_posture.sql`, `crates/security`, `apps/api/src/routes/security.rs`, `features/security/`, `runSecurityDepth`). The CSV export shipped with it: `crates/security/src/csv.rs` renders the filter unpaged, caps at 50k rows with a refusal that names the count, and prefixes a cell starting with `= + - @` with a tab — a findings title can be a hostile package name and a findings export is exactly the document somebody opens in a spreadsheet. 51 crate tests.
-2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. Done: the configured headers appear on API responses and a mutation without the token is refused.
+2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. **Backend complete 2026-09-29** (`crates/security/src/headers.rs`, `csrf.rs`, `header_store.rs`, `0135_security_headers.sql`, `apps/api/src/headers_middleware.rs`, `routes/security_headers.rs`, `GET/PUT /security/headers`). 46 new crate tests + 5 API tests; `cargo test -p omnion-api --lib` 208 passed. Still open: the `/security/headers` **screen** and the walkthrough entry — the browser pass has not run, so no box that names a screen is ticked.
 3. **Rate limiting + lockout** — Redis-backed limiter, scope table, tester, failed-attempt counting, lockout and unlock, `/security/sign-in-protection` and `/security/rate-limits`. Done: a scripted burst gets `429`, and five failed sign-ins lock the account until it is unlocked.
 4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. Done: a denied CIDR cannot reach the API, the events screen shows the attempt, and the inventory shows rotation age without values.
 
