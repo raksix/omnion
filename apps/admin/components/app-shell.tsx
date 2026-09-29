@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -22,6 +22,11 @@ const NAV = [
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/crm/contacts", label: "CRM", icon: Users },
   { href: "/sales/catalog", label: "Sales", icon: Package },
+  // Inventory (REQ-053). It sits beside Sales rather than under it because the two answer
+  // different questions about the same goods: Sales says what was agreed, Inventory says what is
+  // on the shelf. A stock list nested under a catalog is a list of products, which is the one
+  // thing an inventory screen must not be.
+  { href: "/inventory/stock", label: "Inventory", icon: Warehouse },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
   // Settings because both answer the same question from the bus's side — "what does the

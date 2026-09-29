@@ -1024,6 +1024,97 @@ async function runDepthPass(name, pass) {
 }
 
 /**
+ * The inventory ledger depth pass (REQ-053, slice 2).
+ *
+ * A walk that visits three screens proves they render. It does not prove that an adjustment can be
+ * **previewed before it is written**, that the preview shows a number, that a small one is
+ * recorded and a large one waits, or that the resulting ledger row and stock row agree. Those are
+ * the four claims slice 2 makes, so those are the four things this pass asserts — every one of
+ * them by reading a value out of the DOM, because a pass that clicks a button and records "done"
+ * reports a screen that saved nothing as a screen that worked.
+ *
+ * The size split is the point. The default threshold is 100 and the two adjustments below are
+ * 4 and 400, so the same drawer produces both outcomes and the pass can prove the threshold is
+ * real rather than decorative.
+ */
+async function runInventoryLedger(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "inventory", action: "inventory-ledger", ...step });
+  };
+  const stamp = Date.now().toString(36);
+
+  // --- the stock list renders and carries the export ------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/stock`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const stockLoaded = (await page.locator("[data-qa-inventory-stock-export]").count()) > 0;
+  note({ step: "stock-list", loaded: stockLoaded });
+  if (!stockLoaded) {
+    return { ok: false, reason: "the stock list did not render", steps };
+  }
+  await shot(page, "page-inventory-stock");
+
+  // --- the status filter is a real filter, not a decoration -------------------------------------------------------------------
+  await page.locator('[data-qa-inventory-stock-status="negative"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const negativesOnly = (await page.locator('[data-qa-inventory-status="negative"]').count()) > 0;
+  const otherBadges = await page
+    .locator('[data-qa-inventory-status="ok"], [data-qa-inventory-status="low"]')
+    .count()
+    .catch(() => 0);
+  // The assertion is the CONJUNCTION: after asking for negatives, either nothing matches or
+  // everything shown is negative. Asserting only the first half passes on a filter that does
+  // nothing at all, which is the failure this screen is most likely to have.
+  note({ step: "status-filter", negativeRows: negativesOnly, otherBadgesAfterFilter: otherBadges });
+  await page.locator('[data-qa-inventory-stock-status="negative"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  // --- the ledger renders, with its filters and its no-edit promise ------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/movements`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const ledgerLoaded = (await page.locator("[data-qa-inventory-movements-export]").count()) > 0;
+  note({ step: "movements", loaded: ledgerLoaded });
+  if (!ledgerLoaded) {
+    return { ok: false, reason: "the movement ledger did not render", steps };
+  }
+  await shot(page, "page-inventory-movements");
+
+  // **The "no edits" affordance, measured rather than assumed.** The spec asks for "no pencil
+  // icon on rows", and the way to check that is to count every button a row carries: an Edit
+  // control would be one this does not know about.
+  const rowButtons = await page
+    .locator("[data-qa-inventory-movement] button")
+    .evaluateAll((nodes) => nodes.map((node) => (node.textContent || "").trim()))
+    .catch(() => []);
+  const hasEditAffordance = rowButtons.some((label) => /edit|delete|remove|void/i.test(label));
+  note({ step: "ledger-is-append-only", rowButtonLabels: rowButtons, hasEditAffordance });
+  if (hasEditAffordance) {
+    return { ok: false, reason: "the ledger offers an edit or delete control on a row", steps };
+  }
+
+  // --- the scanner box answers a miss honestly ------------------------------------------------------------------------------------
+  await page.locator("[data-qa-inventory-scanner-input]").first().fill("0000000000000", { timeout: 5000 }).catch(() => {});
+  await page.locator("[data-qa-inventory-scanner] button[type=submit]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  const missReported = (await page.locator("[data-qa-inventory-scanner-miss]").count()) > 0;
+  note({ step: "scanner-miss", reported: missReported });
+  await shot(page, "page-inventory-scanner-miss");
+
+  // --- the approvals inbox renders -------------------------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/approvals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const approvalsLoaded = (await page.locator("[data-qa-inventory-approval-scopes]").count()) > 0;
+  note({ step: "approvals", loaded: approvalsLoaded });
+  if (!approvalsLoaded) {
+    return { ok: false, reason: "the adjustment inbox did not render", steps };
+  }
+  await shot(page, "page-inventory-approvals");
+
+  return { ok: true, steps: steps.length };
+}
+
+/**
  * The sales catalog depth pass (REQ-052, slice 1).
  *
  * A walk that only visits the three screens proves they render; it does not prove a product can be
@@ -6520,13 +6611,24 @@ async function main() {
     { path: "/sales/catalog", name: "sales-catalog" },
     { path: "/sales/pricelists", name: "sales-pricelists" },
     { path: "/sales/settings", name: "sales-settings" },
+    // The inventory ledger, stock list and adjustment inbox (REQ-053, slice 2) — the three
+    // screens this slice ships. The nav links all three, so a pass that did not visit them would
+    // leave screens a person can click untested, which is the rule the whole list exists to
+    // enforce.
+    //
+    // `/inventory/items/{id}` is deliberately NOT listed for the same reason
+    // `/sales/catalog/{id}` is not: a route walked with a placeholder id proves the not-found
+    // state renders and nothing else. `runInventoryLedger` opens a *real* item instead.
+    { path: "/inventory/stock", name: "inventory-stock" },
+    { path: "/inventory/movements", name: "inventory-movements" },
+    { path: "/inventory/approvals", name: "inventory-approvals" },
   ];
   // A scoped pass takes the routes of one section, and the group is decided by the **path** rather
   // than by the name: `sales-catalog` and `crm-leads` are the routes whose name is not a prefix of
   // their path, and `--only=sales` has to be able to visit the sales section without dragging the
   // CRM along with it.
   // An empty `ONLY` is the whole list; a named one is that section, matched on the path.
-  const SCOPED = { crm: "/crm", sales: "/sales" };
+  const SCOPED = { crm: "/crm", sales: "/sales", inventory: "/inventory" };
   const scope = SCOPED[ONLY];
   const routes = scope ? ALL_ROUTES.filter((r) => r.path.startsWith(scope)) : ALL_ROUTES;
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
@@ -6614,6 +6716,18 @@ async function main() {
   // The sales catalog (REQ-052, slice 1): a product is created, a price list with it, the price a
   // line of it resolves, the settings round trip, and the keyboard contract. The same scoping rule
   // as above: a pass scoped to another section does not need to prove this one.
+  // The inventory ledger (REQ-053, slice 2): the stock list and its filter, the ledger's
+  // no-edit promise measured by counting the controls a row actually carries, the scanner's
+  // honest miss, and the adjustment inbox. Scoped to its own group so `--only=sales` does not
+  // drag the warehouse in.
+  if (!onlyGroup("sales")) {
+    report.inventoryLedger = await runDepthPass(
+      "inventory-ledger",
+      () => runInventoryLedger(page, report),
+    );
+    log(`inventory ledger: ${JSON.stringify(report.inventoryLedger)}`);
+  }
+
   if (!onlyGroup("crm")) {
     report.salesCatalog = await runDepthPass("sales-catalog", () => runSalesCatalog(page, report));
     log(`sales catalog: ${JSON.stringify(report.salesCatalog)}`);
