@@ -9316,3 +9316,69 @@ red before this tick and are red for a reason that has nothing to do with ranges
 claim than "the whole media surface is green", and it is the honest one: the serve paths this tick
 touched are covered by the walk in `--test media`, which exercises them through the real router
 and the real object store.
+
+### Wave 3 / tick 24 — the save was failing because a version nobody was shown did not exist on the list (2026-09-29)
+
+**What.** `graph_version` has guarded every graph write since 0056, and it was on the column,
+on `GET /workflows/{id}/graph`, and on **neither list route**. Not `/workflows`. Not
+`/automations` — which is the surface the panel's rule list actually reads. A save that started
+from a list row had nothing to quote; the only thing a client could do was send `0`, and the
+server refuses that as `400 graph_version_required`, an error about a version the author was
+never shown.
+
+That is the whole explanation for tick 23's four empty notes. `autosave`, `two-tab-conflict`,
+`run-from-here`, `step-trace`, `cmd-s-writes-once` and `keyboard-pass` do not share a bug by
+accident — they share **one write**, and that write was dying before the toolbar could reach
+any of the code those notes were testing. The two-tab criterion is the clearest case: the
+conflict region was never reached, so `reloadOffered: false` was not a dead-end UI, it was a
+save that never got far enough to conflict.
+
+**The rebuild paths carry the STORED version, deliberately.** A version snapshot *may* choose
+would let a restore write at a version the rule is not on — refused as a conflict on any rule
+that had ever been edited — and a field an update request *may* set is a field a client can use
+to skip the concurrency check the graph write exists to perform. Both take the stored value.
+
+**Proof.** The new test is the round trip, not a body shape: list → read the version off the row
+→ `PUT` the graph that row names → `200`, version advanced exactly once, across **both** list
+surfaces. The negative control is the part worth recording — quoting `0` instead turns it red
+with `graph_version_required`, which is the exact product refusal the tick-23 note had been
+reading as a client defect. A test that cannot go red against a server that stopped sending the
+field is a test that would have passed through this bug.
+
+`cargo test -p omnion-api --test workflows a_rule_opened_from_a_list_row` → **ok** ·
+`cargo test -p omnion-workflows --lib` 139 passed · `cargo test -p omnion-automation --lib` 115
+passed · `cargo test -p omnion-api --lib` 240 passed · admin `tsc --noEmit` exit 0.
+
+**The second defect was in the harness, and it was hiding a third.** Every write test in
+`apps/api/tests/workflows.rs` answers `403 csrf_failed` whenever a CSRF secret is configured,
+because `headers().get(SET_COOKIE)` returns the **first** value and a sign-in sets two: the
+session and the CSRF token. The suite has been green only while the secret was unset — green
+against the one configuration that refuses every mutation — and it is invisible because the
+*read* tests keep passing. That is a worse failure than a red test: a suite that quietly stops
+exercising the write paths and still reports a pass. `call` reads `get_all`, `login` files the
+token in a cookie jar keyed by session, and `request` attaches it to mutations only.
+
+The jar rather than a threaded parameter is the decision worth keeping. A `csrf` argument would
+touch 57 call sites to fix the ones that write, a diff nobody reviews carefully, and the next
+test added would still have to remember it — which is how the same hole opens again. A jar is
+what a browser actually has, and it makes "forgot the header" unrepresentable.
+
+**Also recorded: the disk that filled was not the disk `df` named.** The pass died with
+`No space left on device` while `df -h /mnt/apopic` reported 13 GB free. `target` is a symlink
+into `/dev/shm`, six worktrees' targets live there, and it was at 100% — so the ENOSPC is a
+**tmpfs** exhaustion wearing the disk's error message. `readlink -f` on the target directory
+before believing a free-space reading costs one command. Reclaiming only my own
+`debug/incremental` (603 MB) was enough; nothing belonging to a sibling was touched.
+
+**Not done, and named rather than glossed.** The REQ is still `in-progress` and no acceptance
+box was ticked: the browser pass has not re-run, so the four notes that shared this blocker are
+still unmeasured. The next pass should read `cmd-s-writes-once` first (it is the cheapest and it
+gates the other three), then `two-tab-conflict`, then `run-from-here` and `step-trace`.
+`workflow-table`'s create probe is still wrong (`{name, description}` — the API needs `steps`
+and a structured `trigger`) and `validate-classes` still builds a spine with a port key
+(`next`) the registry has never had. Both are instrument defects, both were named last tick, and
+neither is a product finding.
+
+**Next.** Fix the two probe instruments (table-create payload, validation spine ports), then run
+the pass on the w3 stack and re-read the six notes behind this write in that order.
+
