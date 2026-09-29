@@ -3993,3 +3993,14 @@ gated at the unit/DB level, and unproven in a browser.
 **Next.** Read the queued pass's result first. Then the remaining slice-3 items that are not
 waiting on another wave: the inbox's SLA countdown column, the retention sweep's control, and the
 `/crm/settings/intake` health line for a source whose mapping lost a key.
+**The pass also lost its own `target/` mid-build.** With the slot finally taken (after w9
+released it, then w4 took it again on the retry) the build died with
+`could not write output to .../target/debug/deps/...: No such file or directory` — not a
+compile error: `disk-guard.sh` dropped a worktree's `target/` for being over its 6 GB ceiling
+*while cargo was writing into it*. The escape hatch is the tmpfs target, but `run.sh` runs
+`cargo build` without overriding `CARGO_TARGET_DIR` **and** starts pm2 from the hardcoded
+`target/debug/omnion-api`, so exporting the variable alone gives
+`[PM2][ERROR] Script not found: /mnt/apopic/omnion-w8/target/debug/omnion-api`. The working
+incantation is both: build with `CARGO_TARGET_DIR=/dev/shm/w8-target`, then
+`cp /dev/shm/w8-target/debug/omnion-api target/debug/omnion-api` before the pass. A pass that
+builds into a directory another process is allowed to delete will always lose this race.
