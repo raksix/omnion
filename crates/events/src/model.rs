@@ -14,9 +14,14 @@ pub const ENDPOINT_COLUMNS: &str = "id, organization_id, name, url, secret, even
 
 /// Columns of `webhook_deliveries` for one `select`, in [`Delivery`] order. The caller joins
 /// `events` for the name, so both sides of the join carry their alias.
+///
+/// The last four columns are the delivery-operations set added by migration `0052`
+/// (`trigger`, `duration_ms`, `redeliver_count`, `replayed_at`). They are in the shared list
+/// rather than in a second query because every screen that draws a delivery row draws all
+/// four, and a second query is a second thing to forget.
 pub const DELIVERY_COLUMNS: &str = "d.id, d.endpoint_id, d.event_id, e.name as event_name, \
      d.status, d.attempts, d.max_attempts, d.next_attempt_at, d.response_status, d.error, \
-     d.delivered_at, d.created_at";
+     d.delivered_at, d.created_at, d.trigger, d.duration_ms, d.redeliver_count, d.replayed_at";
 
 /// How many attempts a delivery gets when it is queued.
 ///
@@ -240,6 +245,18 @@ pub struct Delivery {
     pub delivered_at: Option<OffsetDateTime>,
     /// When it was queued.
     pub created_at: OffsetDateTime,
+    /// `event`, `test` or `replay` — what asked for this delivery.
+    ///
+    /// A `test` row is a button an operator pressed and says nothing about the organization's
+    /// real traffic, so it is counted separately everywhere it would otherwise flatter a
+    /// success rate. See migration `0052`.
+    pub trigger: String,
+    /// How long the receiver took, in milliseconds; `None` while the row has never run.
+    pub duration_ms: Option<i32>,
+    /// How many times an operator has forced this row again (cap 10).
+    pub redeliver_count: i32,
+    /// When it was last forced again, so a chased delivery reads differently from a late one.
+    pub replayed_at: Option<OffsetDateTime>,
 }
 
 /// One delivery the runner claimed, with the endpoint and the event it needs to send it.
