@@ -308,7 +308,7 @@ impl ConnectionReport {
     }
 
     fn failure(error: &TransportError, steps: &[(TestStep, String)]) -> Self {
-        let mut ladder = ladder(steps);
+        let mut ladder = ladder(steps, true);
         let step = error.step();
         let sentence = error.sentence();
         // Every step after the failure stays `pending`. Running a search after a failed bind
@@ -396,6 +396,18 @@ pub async fn run_test(
     // --- DNS / TCP / TLS happen inside `connect`, and the module reports which one failed. ---
     let mut connection = match DirectoryConnection::connect(config).await {
         Ok(connection) => {
+            // DNS is reported from the connection rather than from the configuration: the
+            // resolver already ran, and the address it chose is the evidence. Without this the
+            // DNS row stayed `pending` on a *fully passing* test — a step that never resolves,
+            // on a screen whose whole argument is that a test is a list of verdicts.
+            done.push((
+                TestStep::Dns,
+                format!(
+                    "{} resolved to {}",
+                    config.hostname(),
+                    connection.resolved_endpoint()
+                ),
+            ));
             let detail = if config.is_secure() {
                 format!(
                     "connected to {}:{} and negotiated {}",
@@ -430,7 +442,10 @@ pub async fn run_test(
             // was not the problem is a claim the panel then shows as a passing step.
             let before = match error.step() {
                 TestStep::Dns => Vec::new(),
-                TestStep::Tcp => vec![(TestStep::Dns, "the host name resolved".to_owned())],
+                TestStep::Tcp => vec![(
+                    TestStep::Dns,
+                    format!("{} resolved to an address", config.hostname()),
+                )],
                 TestStep::Tls => vec![
                     (TestStep::Dns, "the host name resolved".to_owned()),
                     (TestStep::Tcp, "the host accepted a connection".to_owned()),
@@ -449,7 +464,7 @@ pub async fn run_test(
         None => {
             connection.unbind().await;
             return ConnectionReport {
-                steps: ladder(&done),
+                steps: ladder(&done, config.is_secure()),
                 failing_step: Some(TestStep::Bind),
                 sample_attributes: Vec::new(),
                 problems: Vec::new(),
@@ -544,7 +559,7 @@ pub async fn run_test(
         // who exist — so it is a failure, not a note.
         return ConnectionReport {
             steps: {
-                let mut steps = ladder(&done);
+                let mut steps = ladder(&done, config.is_secure());
                 steps.push(StepReport {
                     step: TestStep::Attributes,
                     status: "failed",
@@ -566,7 +581,7 @@ pub async fn run_test(
     done.push((TestStep::Attributes, attributes_detail));
 
     ConnectionReport {
-        steps: ladder(&done),
+        steps: ladder(&done, config.is_secure()),
         failing_step: None,
         sample_attributes: attributes,
         problems: Vec::new(),
@@ -579,9 +594,19 @@ pub async fn run_test(
 
 /// Turn the completed steps into a full ladder: the steps that ran are `ok`, the ones after the
 /// failure are `pending` and the failure itself is filled in by the caller.
-fn ladder(done: &[(TestStep, String)]) -> Vec<StepReport> {
+///
+/// The ladder is **built from what this configuration can have**, not from the full list of six.
+/// A plaintext connection has no TLS step, and rendering a greyed-out one forever reads as a
+/// problem that never resolves — which is the reason `test_steps` filters it out on the decidable
+/// side, and the reason the live side has to do the same. The first version built from
+/// `TestStep::ALL` and a passing test showed five green rows and one that never could be anything
+/// but grey.
+fn ladder(done: &[(TestStep, String)], secure: bool) -> Vec<StepReport> {
     let mut steps = Vec::new();
     for step in TestStep::ALL {
+        if step == TestStep::Tls && !secure {
+            continue;
+        }
         if let Some((_, detail)) = done.iter().find(|(candidate, _)| *candidate == step) {
             steps.push(StepReport {
                 step,
@@ -599,6 +624,15 @@ fn ladder(done: &[(TestStep, String)]) -> Vec<StepReport> {
 pub struct DirectoryConnection {
     host: String,
     port: u16,
+    /// The address the resolver returned and the socket connected to.
+    ///
+    /// Kept because the DNS row of the ladder has to say *something* specific: "the host name
+    /// resolved" is true of every configuration that got this far, and an operator debugging a
+    /// directory behind a round-robin wants to know which of the four addresses answered. It is
+    /// also what proves the resolution happened at all — the first version of the ladder showed
+    /// the DNS step as `pending` on a fully passing test, because the resolution was buried
+    /// inside `connect` and nothing could report it.
+    resolved: String,
     tls_first: bool,
     start_tls: bool,
     verify_tls: bool,
@@ -704,6 +738,7 @@ impl DirectoryConnection {
         let mut connection = Self {
             host: host.clone(),
             port,
+            resolved: format!("{}:{}", addresses[0].ip(), port),
             tls_first: config.host.trim().starts_with("ldaps://"),
             start_tls: config.start_tls,
             verify_tls: config.verify_tls,
@@ -797,6 +832,12 @@ impl DirectoryConnection {
                 "the connection has no stream to upgrade".to_owned(),
             )),
         }
+    }
+
+    /// Where the connection actually is, which is the DNS row's sentence.
+    #[must_use]
+    pub fn resolved_endpoint(&self) -> &str {
+        &self.resolved
     }
 
     /// Where this connection is, for the sentence a timeout produces.
@@ -947,16 +988,29 @@ impl DirectoryConnection {
             self.write(&control).await?;
 
             let page_start = entries.len() as u32;
+            // Written once and read once, at the bottom of the loop; the initial `None` is the
+            // "the server never sent a done, which is a desynchronised stream" case and is
+            // handled rather than assumed away.
             let mut done: Option<(LdapResult, Option<super::ber::PagedResults>)> = None;
+            // The entries are **counted**, not collected, and the read always runs to the
+            // operation's own end.
+            //
+            // The first draft stopped as soon as it had `limit` entries. That is a framing bug
+            // wearing a performance hat: the `searchResDone` is still in the socket, so the next
+            // operation on the connection reads the *previous* search's completion — the
+            // walkthrough shows a healthy search and a root DSE with no naming contexts, which is
+            // not a wrong answer so much as an answer to the wrong question. An LDAP operation is
+            // one request and one `searchResDone`, and a client that leaves either unread cannot
+            // reuse the connection.
+            let mut over_cap = 0u32;
             loop {
                 let message = self.read_message().await?;
                 match message.response {
                     Response::Entry(entry) => {
-                        entries.push(DirectoryEntry::from_search(entry));
-                        if entries.len() as u32 >= limit {
-                            // The cap is the caller's, not the server's, and it is reached here
-                            // rather than by asking the server for fewer.
-                            break;
+                        if (entries.len() as u32) < limit {
+                            entries.push(DirectoryEntry::from_search(entry));
+                        } else {
+                            over_cap += 1;
                         }
                     }
                     Response::SearchDone { result, paged } => {
@@ -968,9 +1022,18 @@ impl DirectoryConnection {
             }
             pages += 1;
             let read = entries.len() as u32 - page_start;
-            // The cap is the caller's, and reaching it ends the walk *without* treating the
-            // partial last page as a failure: the entries read so far are real people.
+            // Reaching the cap ends the walk without treating the page as a failure: the entries
+            // read so far are real people. `over_cap` is **reported** rather than dropped,
+            // because "I read one and threw away forty" is a figure a sync run needs.
             let cap_reached = entries.len() as u32 >= limit;
+            if over_cap > 0 {
+                tracing::warn!(
+                    entries = entries.len(),
+                    dropped = over_cap,
+                    "the directory returned more entries than the cap allowed; the cap is the \
+                     caller's and the remainder was not read"
+                );
+            }
 
             if cap_reached {
                 break;
@@ -1025,10 +1088,22 @@ impl DirectoryConnection {
 
     async fn read_message_inner(&mut self) -> Result<Message, TransportError> {
         // The outer SEQUENCE's identifier and length, then the rest.
-        let mut header = [0u8; 8];
+        //
+        // **The header buffer is exactly as long as the header.** An earlier version declared
+        // eight bytes and read into all of them, on the reasonable-sounding argument that a
+        // socket returns whatever is available and a bigger read saves a syscall. Over a stream
+        // that is simply false: the kernel fills as much as it has, so a 14-byte reply arrived
+        // as eight bytes here and fourteen in the buffer, and the six bytes past the two-byte
+        // header were then **dropped** — the frame was rebuilt from the header alone and the
+        // message body was missing. The client therefore timed out against a server that had
+        // answered correctly, and the ladder reported a TCP failure. Every byte read has to go
+        // into the frame, and the frame has to start at the first byte.
+        let mut header = [0u8; 2];
         let mut have = 0usize;
+        // The header is at most six bytes (two plus four length bytes), and each read is bounded
+        // by the bytes still wanted, so `have` only ever tracks progress.
         while have < 2 {
-            let read = self.read(&mut header[have..]).await?;
+            let read = self.read(&mut header[have..2]).await?;
             if read == 0 {
                 return Err(TransportError::Closed);
             }
@@ -1049,15 +1124,19 @@ impl DirectoryConnection {
                     "the server declared a length that cannot describe a message".into(),
                 ));
             }
-            while have < 2 + count {
-                let read = self.read(&mut header[have..]).await?;
+            // The long form's own length bytes are read one at a time into their own buffer,
+            // for the same reason: a read larger than the bytes wanted is a read that discards.
+            let mut length_bytes = [0u8; 4];
+            let mut filled = 0usize;
+            while filled < count {
+                let read = self.read(&mut length_bytes[filled..count]).await?;
                 if read == 0 {
                     return Err(TransportError::Closed);
                 }
-                have += read;
+                filled += read;
             }
             let mut value = 0usize;
-            for byte in &header[2..2 + count] {
+            for byte in &length_bytes[..count] {
                 value = value.saturating_mul(256).saturating_add(*byte as usize);
             }
             (value, 2 + count)
@@ -1199,13 +1278,13 @@ pub async fn resolve_groups(
     depth_cap: u8,
     subject_cap: u32,
 ) -> Result<GroupWalk, TransportError> {
-    let Some(group_filter) = config.group_filter.clone() else {
+    if config.group_filter.is_none() {
         // No group filter configured is a configuration that was *validated*, so it is legal —
         // and a provider that syncs users but not groups is a real shape. An empty walk with the
         // flag off says "nobody", which is wrong; this one says the same thing as the caller's
         // empty state, which is right.
         return Ok(GroupWalk::default());
-    };
+    }
 
     let mut seen_people: HashSet<String> = HashSet::new();
     let mut seen_groups: HashSet<String> = HashSet::new();
@@ -1230,11 +1309,9 @@ pub async fn resolve_groups(
         }
 
         // The filter is rebuilt per group because the placeholder is the group's DN, and a
-        // filter carrying a previous group's DN would return the same answer every round.
-        // The DN is escaped for a *filter* context, then the whole text goes through the parser,
-        // which unescapes it once — so the value that reaches the server is the DN, unescaped once.
-        let escaped = escape_filter(&dn);
-        let filter_text = group_filter.replace(super::directory::USERNAME_PLACEHOLDER, &escaped);
+        // filter carrying a previous group's DN would return the same answer every round. The
+        // same helper the test calls, so a change to the escaping is exercised by both.
+        let filter_text = group_filter_for(config, &dn).unwrap_or_default();
         let filter = Filter::parse(&filter_text)
             .map_err(|error| TransportError::Protocol(error.to_string()))?;
 
@@ -1286,6 +1363,20 @@ pub async fn resolve_groups(
         max_depth,
         hit_depth_cap,
         hit_cycle,
+    })
+}
+
+/// Substitute a DN into a group's filter and hand back the rendered text.
+///
+/// The walk needs the **text**, not a `Filter`, for one reason that matters: rendering it is what
+/// puts a `(member=…)` into a sync log line, and a log an operator cannot read is a log they
+/// cannot debug. The walk then parses the text it just rendered, so the two cannot disagree —
+/// a hand-built `Filter` would put a value in the request that never appeared in the log.
+#[must_use]
+pub fn group_filter_for(config: &DirectoryConfig, dn: &str) -> Option<String> {
+    config.group_filter.as_ref().map(|filter| {
+        let escaped = escape_filter(dn);
+        filter.replace(super::directory::USERNAME_PLACEHOLDER, &escaped)
     })
 }
 

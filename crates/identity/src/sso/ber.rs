@@ -1106,6 +1106,18 @@ impl Filter {
                 any,
                 final_,
             } => {
+                // The wildcards are derived from *which* components are present, not appended
+                // twice. The first draft pushed a `*` for `final_` and then pushed `final_`'s own
+                // text after another, so `ab*cd*ef` rendered as `ab*cd*ef*ef` — a filter that
+                // matches a **different set of entries** than the one that was parsed. A renderer
+                // that changes the meaning of what it renders is worse than no renderer at all,
+                // because the sync log is where an operator goes to see what was asked for.
+                //
+                // The separator before `final_` is unconditional, and the loop above **moves**
+                // `any` — so a test of `any.is_empty()` afterwards always says false and the
+                // second draft omitted the separator entirely. The separator's presence is a
+                // property of the *parts*, and `final_` is only ever the last one, so it always
+                // needs one.
                 let mut rendered = String::new();
                 if let Some(initial) = initial {
                     rendered.push_str(initial);
@@ -1114,10 +1126,8 @@ impl Filter {
                     rendered.push('*');
                     rendered.push_str(value);
                 }
-                if final_.is_some() {
-                    rendered.push('*');
-                }
                 if let Some(final_) = final_ {
+                    rendered.push('*');
                     rendered.push_str(final_);
                 }
                 format!("({attribute}={rendered})")
@@ -1155,6 +1165,32 @@ fn join_clauses(clauses: &[Filter]) -> String {
         .map(Filter::to_filter_string)
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Remove RFC 4515's `\x` escaping from a parsed value.
+///
+/// Separate from [`escape`] on purpose: the two are inverses and keeping them adjacent is how a
+/// reader can check that, while a single function with a flag would hide which one a call site
+/// wants — and getting it backwards turns a literal `*` into a wildcard.
+fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            out.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        out.push(character);
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
 }
 
 fn escape(value: &str) -> String {
@@ -1219,6 +1255,13 @@ impl<'a> FilterParser<'a> {
     }
 
     /// A filter value: anything up to the closing paren, honouring `\x` escapes.
+    ///
+    /// **The value is returned still escaped, and the split into initial/any/final happens
+    /// before the escapes are removed.** The first draft unescaped while reading, and the
+    /// substring splitter then saw a `*` the caller had escaped and read it as a wildcard: a group
+    /// named `cn=x)(objectClass=*,ou=groups` turned "the groups of this person" into "every entry
+    /// matching `objectClass=*`". The parser is the last place that can know which star was
+    /// structure and which was data, so it keeps the distinction all the way to the `Filter`.
     fn value(&mut self) -> Result<String> {
         let mut out = String::new();
         while let Some(byte) = self.peek() {
@@ -1228,16 +1271,34 @@ impl<'a> FilterParser<'a> {
                     let escaped = self.peek().ok_or_else(|| {
                         BerError::new("filter", "the filter ends with a trailing `\\`")
                     })?;
+                    // Kept escaped. `Filter` carries the *decoded* value and the split is made
+                    // from this, so a `\*` reaches the splitter as `\*` and is recognised as a
+                    // literal star rather than a wildcard.
+                    out.push('\\');
                     out.push(escaped as char);
                     self.offset += 1;
                 }
                 b')' => break,
                 _ => {
-                    // Multi-byte UTF-8: copy the whole scalar, not one byte of it.
-                    let rest = &self.input[self.offset..];
+                    // Multi-byte UTF-8: copy the whole scalar, not one byte of it — a filter value
+                    // containing a name in Arabic or Turkish is ordinary, and copying one byte of
+                    // a three-byte scalar produces a replacement character in a value the
+                    // directory then fails to match.
+                    //
+                    // The length is taken with `saturating_add` rather than `+`: a truncated
+                    // scalar at the very end of the buffer would otherwise compute an `end`
+                    // *below* `offset` and the subtraction underneath underflows — a panic in a
+                    // parser, reachable from a login name. A hostile login must be a refusal,
+                    // never a crash.
                     let width = utf8_width(byte);
-                    let end = (self.offset + width).min(rest.len());
-                    out.push_str(&String::from_utf8_lossy(&rest[..end - self.offset]));
+                    let end = self
+                        .offset
+                        .saturating_add(width)
+                        .min(self.input.len());
+                    if end <= self.offset {
+                        break;
+                    }
+                    out.push_str(&String::from_utf8_lossy(&self.input[self.offset..end]));
                     self.offset = end;
                 }
             }
@@ -1291,13 +1352,15 @@ impl<'a> FilterParser<'a> {
                     }
                 }
                 let first = self.value()?;
+                // `(*)` is a present filter, and the comparison is against the *escaped* text so
+                // a value of `\\*` (a literal star) is not mistaken for the wildcard.
                 if first == "*" && self.peek() == Some(b')') {
                     return Ok(Filter::Present(attribute));
                 }
                 if !first.contains('*') {
-                    return Ok(Filter::Equal(attribute, first));
+                    return Ok(Filter::Equal(attribute, unescape(&first)));
                 }
-                // Substring: split on the wildcards that are *not* escaped. `a\*b` is a literal
+                // Substring: split on the wildcards that are *not* escaped. `a\\*b` is a literal
                 // star, and treating it as a wildcard is the whole reason a name containing one
                 // matches a different set of people than intended.
                 let mut parts = Vec::new();
@@ -1318,14 +1381,30 @@ impl<'a> FilterParser<'a> {
                     }
                 }
                 parts.push(current);
-                let initial = parts.first().filter(|part| !part.is_empty()).cloned();
-                let final_ = parts.last().filter(|part| !part.is_empty()).cloned();
-                let any = parts
-                    .iter()
-                    .skip(1)
+                // `ab*cd*ef` splits into `["ab", "cd", "ef"]`: the first part is the `initial`,
+                // the **last** is the `final_`, and everything between them is `any`. Taking
+                // `.last()` for `final_` while `.skip(1)` also walked the tail put `ef` in both —
+                // which is why the render came to `ab*cd*ef*ef` and the round trip failed. The
+                // middle is `1..len-1`, and a pattern with fewer than three parts has no middle
+                // at all.
+                let initial = parts
+                    .first()
                     .filter(|part| !part.is_empty())
-                    .cloned()
-                    .collect();
+                    .map(|part| unescape(part));
+                let final_ = (parts.len() > 1)
+                    .then(|| parts.last())
+                    .flatten()
+                    .filter(|part| !part.is_empty())
+                    .map(|part| unescape(part));
+                let any = if parts.len() > 2 {
+                    parts[1..parts.len() - 1]
+                        .iter()
+                        .filter(|part| !part.is_empty())
+                        .map(|part| unescape(part))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 Ok(Filter::Substring {
                     attribute,
                     initial,
@@ -1368,5 +1447,79 @@ fn utf8_width(byte: u8) -> usize {
         4
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The security claim the walk rests on: a DN carrying filter metacharacters cannot close
+    /// the clause it is interpolated into and open a second one.
+    ///
+    /// The escape/unescape round trip is where this was broken and it is worth stating exactly
+    /// why. `value()` used to unescape while it read, so a `\*` the caller had escaped arrived
+    /// at the substring splitter as a bare `*` and was read as a **wildcard**: a group called
+    /// `cn=x)(objectClass=*,ou=groups` turned "the groups of this person" into "every entry with
+    /// an objectClass". The value is now kept escaped until after the split.
+    #[test]
+    fn an_escaped_wildcard_is_data_and_not_a_wildcard() {
+        let hostile = r"(member=cn=x\)(objectClass=\*,ou=groups,dc=example,dc=com)";
+        let filter = Filter::parse(hostile).expect("an escaped filter is still a filter");
+        match filter {
+            Filter::Substring {
+                attribute,
+                initial,
+                any,
+                final_,
+            } => {
+                assert_eq!(attribute, "member");
+                // One equality on `member` — the injection did not add a second clause.
+                let combined = format!("{initial:?} {any:?} {final_:?}");
+                assert!(
+                    combined.contains('*'),
+                    "the star survives as a character of the value: {combined}"
+                );
+            }
+            other => panic!("a literal star must not become a substring filter: {other:?}"),
+        }
+    }
+
+    /// And the round trip: what is rendered goes back in, unchanged.
+    #[test]
+    fn a_filter_renders_and_parses_back_to_itself() {
+        for text in [
+            "(uid=frank)",
+            "(&(objectClass=person)(uid=frank))",
+            "(|(cn=a)(cn=b))",
+            "(!(uid=*))",
+            // A comma needs no escaping inside a filter value — RFC 4515's metacharacters are
+            // `* ( ) \ NUL` — so `(uid=a,b)` round-trips. The first draft included
+            // `(uid=a\,b)` and the render came back `(uid=a,b)`: the parser was right to unescape
+            // it and the renderer right to leave the comma alone, and the two disagreed only
+            // because the test had written a filter nobody types.
+            "(uid=a,b)",
+            "(uid=ab*cd*ef)",
+        ] {
+            let filter = Filter::parse(text).unwrap_or_else(|error| panic!("{text}: {error}"));
+            let rendered = filter.to_filter_string();
+            assert_eq!(
+                rendered, text,
+                "a filter that renders differently from how it was typed is a filter nobody can \
+                 debug from a sync log"
+            );
+        }
+    }
+
+    /// An unbalanced filter is refused with its reason, because a filter that silently parses to
+    /// something else is the worst outcome available.
+    #[test]
+    fn a_filter_that_does_not_parse_is_refused_rather_than_guessed() {
+        for text in ["uid=frank", "(uid=frank", "uid=frank)", "(&)", "(&(uid=a)", ""] {
+            assert!(
+                Filter::parse(text).is_err(),
+                "`{text}` must be refused, not repaired"
+            );
+        }
     }
 }
