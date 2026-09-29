@@ -3715,3 +3715,81 @@ data source does.
 **Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
 on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
 turns "did I remember?" into a red line with a file and a line number.
+
+## 2026-09-29 — REQ-004 slice 2 · selection gets one owner, and two of the pass's "defects" turn out to be the pass
+
+**What.** Last tick left two open defects for this slice: `escape-clears` reported
+`stillSelected: 3`, and `edge-delete` hit an edge but nothing then reported
+`data-edge-selected`. Reading them properly, **both were probe defects and the product was
+never wrong** — and they failed in the same way, which is what made them worth a slice rather
+than a patch.
+
+**1. The escape-clears defect did not exist.** The probe counted node cards whose inline
+`style` contained the substring `"outline"`. React writes `outline: none` on *every* card, so
+the count was always the node total: "3 selected" and "still selected after Escape" were the
+same reading of a probe that could not tell a selected card from an unselected one. The fix
+belongs in the product anyway — the canvas now writes `data-node-selected`, a real marker —
+and the probe reads that.
+
+**2. The edge-delete defect did not exist either.** `locator.click()` aims at an element's
+bounding box, and a bezier's box is the rectangle *around* the arc: its centre is empty
+canvas. The click fell on the desk, the canvas handler cleared the selection (which is what it
+is supposed to do), and the pass printed "no edge could be selected" — a reading that is
+indistinguishable from a dead product. The point now comes from `getPointAtLength` at the
+stroke midpoint, mapped through `getScreenCTM` so the viewport's pan and zoom are included.
+
+**3. The real defect underneath both: selection had five writers and no owner.** It lived in
+two `useState` calls and a ref, and each writer assembled "what is selected" from whichever
+combination it remembered. Three things were broken by that, and only the third was visible:
+
+- a **Shift+click could not deselect** — `onNodePointerDown` set the focus unconditionally and
+  the click handler then toggled the id *out* of the group, so the card the user had just
+  de-selected stayed outlined and a second Shift+click did nothing;
+- a **delete left a phantom focus** — the group was cleared and the focus guarded separately,
+  so deleting the focused node left the inspector holding a dead id and Duplicate still
+  enabled;
+- the **arrow-key nudge moved the ref's nodes** when the selection lived in the focus, so a
+  selection of one nudged one and a selection of three could nudge one.
+
+`selection.ts` is now the whole rule as named transitions (`selectNode`, `selectGroup`,
+`selectAll`, `toggleNode`, `extendGroup`, `selectEdge`, `clearSelection`) plus the two
+questions the builder keeps asking it (`whatEscapeClears`, `deleteTarget`). The outline, the
+minimap, the status bar, `Del`, the nudge and copy all read `isNodeSelected` / `membersOf`,
+so they cannot disagree. 20 tests.
+
+**Proof.**
+- `pnpm --filter @omnion/admin test` — **41/41** (21 previous + 20 new). `tsc --noEmit` clean.
+- `cargo test -p omnion-workflows` — **84/84** against merged main.
+- Every rule was **reverted and the suite re-run** to prove it can go red: the focus rule
+  (19/20), `deleteTarget` reading the group alone (18/20), Escape ignoring the connection
+  (19/20). A test that cannot go red is not a gate.
+- Three of my own tests failed on the first run of the module and were the useful part: a
+  delete that removed a *different set* than the outline draws is worse than either bug alone,
+  so `membersOf` returns the union of group and focus, and the three tests were corrected to
+  the new (right) semantics rather than the module being bent to them.
+
+**4. The merge.** `origin/main` (34 commits) merged clean except two files. `routes/mod.rs`
+was two comments over one binding plus a route main added — both kept. `BUILD-LOG.md` is
+append-only, so both writers land at the tail and git conflicts the whole run; spliced ours
++ main's tail byte for byte and verified by multiset (0 lost either side). That check earned
+its keep immediately: it found **three orphaned conflict markers** (`<<<<<<< HEAD`, `=======`,
+`>>>>>>> origin/main`) that an *earlier* tick had committed into this branch. The content on
+both sides had survived, so a line count would have passed while a stray `HEAD` marker sat in
+the middle of the journal.
+
+**Not proved this tick: the browser pass.** The slice is committed and every fast gate is
+green, but `bash scripts/qa/run.sh` on the w3 stack (18082/3102/3202) sat in the QA slot queue
+for 40 minutes behind w2 and w7 and never got a turn, while `/dev/shm` — where `target` is a
+symlink — hit 100% (291M free) under four concurrent cargo builds. I stopped my own queued
+pass rather than steal another writer's slot or run a build that would die on disk. **No
+acceptance box is ticked.** The first job next tick is
+`QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202 bash scripts/qa/run.sh`,
+reading `escape-clears.cleared`, `shift-click-multi.ok` and `edge-delete.removed` off the new
+markers.
+
+**Next.** The pass, then the two-tab `409` criterion and Table mode. Two environment notes
+for whoever runs it: the QA slot's reaper tests the *holder* shell, and a holder orphaned by a
+crashed pass stays alive forever (w2 left two), so a queue can stall on a place nobody is
+using; and `target` on a `/dev/shm` symlink means a full tmpfs fails the build rather than
+the pass.
+
