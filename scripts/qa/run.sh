@@ -118,9 +118,15 @@ fi
 # pm2 draws its table with a box character followed by a NON-BREAKING space (U+00A0), so a sed
 # pattern that matches an ordinary space extracts nothing at all. Strip the non-breaking spaces
 # and the box characters first, then cut the field.
+# `pm2 describe` exits non-zero for a process that does not exist, and under `set -e` a
+# failing command inside `$( )` aborts the *whole script* — so the very first pass on a
+# fresh stack (nothing registered yet, which is exactly when this runs) died here with no
+# message and no pass. The `|| true` is not a workaround: the exit code carries nothing
+# this block needs, and the value it produces is the empty string that the `if` below
+# already handles.
 RUNNING_BIN="$(pm2 describe "$API_NAME" 2>/dev/null \
   | tr -d '\302\240\342\224\202' \
-  | sed -n 's/^.*script path *//p' | head -1 | sed 's/[[:space:]]*$//')"
+  | sed -n 's/^.*script path *//p' | head -1 | sed 's/[[:space:]]*$//' || true)"
 if [ -n "$RUNNING_BIN" ] && [ "$RUNNING_BIN" != "$API_BIN" ]; then
   step "the pm2 entry runs $RUNNING_BIN, not $API_BIN — re-registering"
   pm2 delete "$API_NAME" >/dev/null 2>&1 || true
