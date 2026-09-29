@@ -1702,6 +1702,400 @@ fn csv_response(body: String, stem: &str) -> Result<Response, ApiError> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Transfers (docs/requests/REQ-053, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// Parse an opaque cursor into the id it points at.
+///
+/// A malformed cursor is a `None` rather than a refusal, and that is a deliberate asymmetry with
+/// the other filters: a cursor is an opaque continuation token, and a client that lost one wants
+/// the first page again, not a `400` it cannot recover from without reading our error body. The
+/// filters that a person types (`status=`, `kind=`) *are* refused, because a typo there silently
+/// produces a list the person did not ask for.
+fn parse_cursor(raw: Option<String>) -> Option<Uuid> {
+    raw.and_then(|value| Uuid::parse_str(value.trim()).ok())
+}
+
+/// `GET /api/v1/inventory/transfers` — the transfer list.
+pub async fn list_transfers(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<TransferListParams>,
+) -> Result<Json<Page<omnion_module_inventory::transfers::TransferView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::transfers::TransferQuery {
+        search: params.search,
+        // `?status=` repeated is a comma list in the query string, which is what a `<select
+        // multiple>` and a hand-written URL both produce.
+        statuses: split_multi(params.status),
+        from_location_id: params.from_location_id,
+        to_location_id: params.to_location_id,
+        open_only: params.open_only.unwrap_or(false),
+        limit: params.limit,
+        cursor: parse_cursor(params.cursor),
+    };
+    Ok(Json(
+        omnion_module_inventory::transfers::list_transfers(state.db().pool(), organization_id, &query)
+            .await?,
+    ))
+}
+
+/// The list's filter.
+#[derive(Debug, Deserialize)]
+pub struct TransferListParams {
+    /// Free text over the number, the note, the SKU and the item name.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// `draft`, `dispatched`, `received` or `cancelled` — repeated, or comma separated.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The source location.
+    #[serde(default)]
+    pub from_location_id: Option<Uuid>,
+    /// The target location.
+    #[serde(default)]
+    pub to_location_id: Option<Uuid>,
+    /// Only the ones still in flight.
+    #[serde(default)]
+    pub open_only: Option<bool>,
+    /// How many rows.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The page cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// Split a repeated-or-comma query parameter into its values.
+///
+/// `?status=a&status=b` and `?status=a,b` are both what a browser produces — the first from a
+/// multi-select, the second from a link somebody typed — and treating them differently would make
+/// the filter work in the list and silently do nothing in a shared URL. Empty segments drop out,
+/// so a trailing comma is not an error.
+fn split_multi(raw: Option<String>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// `GET /api/v1/inventory/transfers/{id}` — one transfer with its lines.
+pub async fn get_transfer(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    Path(transfer_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::transfers::TransferView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        omnion_module_inventory::transfers::get_transfer(
+            state.db().pool(),
+            organization_id,
+            transfer_id,
+        )
+        .await?,
+    ))
+}
+
+/// `POST /api/v1/inventory/transfers` — write a draft.
+///
+/// A draft moves nothing: the available check happens at dispatch, where the stock actually
+/// leaves, and the module's refusal then carries the number the person at the shelf needs.
+pub async fn create_transfer(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<omnion_module_inventory::transfers::NewTransfer>,
+) -> Result<(StatusCode, Json<omnion_module_inventory::transfers::TransferView>), ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view = omnion_module_inventory::transfers::create_transfer(
+        state.db().pool(),
+        organization_id,
+        &body.0,
+        Some(current.user.id),
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.transfer.created")
+            .organization(organization_id)
+            .target("inventory_transfer", view.id.to_string())
+            .metadata(json!({
+                "number": view.number,
+                "from_location_id": view.from_location_id,
+                "to_location_id": view.to_location_id,
+                "lines": view.lines.len(),
+                "quantity_total": view.quantity_total,
+            }))
+            .ip_address(None),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// `POST /api/v1/inventory/transfers/{id}/dispatch` — book the goods out and into transit.
+pub async fn dispatch_transfer(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(transfer_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::transfers::TransferView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view =
+        omnion_module_inventory::transfers::dispatch(state.db().pool(), organization_id, transfer_id, Some(current.user.id))
+            .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.transfer.dispatched")
+            .organization(organization_id)
+            .target("inventory_transfer", view.id.to_string())
+            .metadata(json!({
+                "number": view.number,
+                "lines": view.lines.len(),
+                "quantity_total": view.quantity_total,
+                "from_location_id": view.from_location_id,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.transfer.dispatched")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "transfer_id": view.id,
+                "number": view.number,
+                "quantity": view.quantity_total,
+                "from_location_id": view.from_location_id,
+            })),
+    )
+    .await;
+
+    Ok(Json(view))
+}
+
+/// What a receive books in. Every line may be a **part** of what was sent.
+#[derive(Debug, Deserialize)]
+pub struct ReceiveBody {
+    /// The lines that arrived.
+    #[serde(default)]
+    pub lines: Vec<omnion_module_inventory::transfers::TransferStepLine>,
+    /// Organization to act on.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `POST /api/v1/inventory/transfers/{id}/receive` — book the goods in at the target.
+///
+/// The body's `organization_id` is read from the **body** rather than the query string because
+/// this is the one transfer route a form posts to with a JSON body, and a form that has to put
+/// the tenant in the URL as well as the payload is a form somebody will get wrong.
+pub async fn receive_transfer(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(transfer_id): Path<Uuid>,
+    body: Json<ReceiveBody>,
+) -> Result<Json<omnion_module_inventory::transfers::TransferView>, ApiError> {
+    let organization_id = organization_of(&state, &current, body.0.organization_id).await?;
+    let view = omnion_module_inventory::transfers::receive(
+        state.db().pool(),
+        organization_id,
+        transfer_id,
+        &body.0.lines,
+        Some(current.user.id),
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.transfer.received")
+            .organization(organization_id)
+            .target("inventory_transfer", view.id.to_string())
+            .metadata(json!({
+                "number": view.number,
+                "status": view.status.as_str(),
+                "received_total": view.received_total,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.transfer.received")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "transfer_id": view.id,
+                "number": view.number,
+                "status": view.status.as_str(),
+                "received_total": view.received_total,
+            })),
+    )
+    .await;
+
+    Ok(Json(view))
+}
+
+/// `POST /api/v1/inventory/transfers/{id}/cancel` — withdraw it.
+///
+/// Cancelling a **dispatched** transfer is not free: the goods come home, and that is two more
+/// ledger rows. Writing only a status change would leave the transit balance holding goods the
+/// document says returned, and the next replay would report a disagreement the module had
+/// manufactured itself.
+pub async fn cancel_transfer(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(transfer_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::transfers::TransferView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view =
+        omnion_module_inventory::transfers::cancel(state.db().pool(), organization_id, transfer_id, Some(current.user.id))
+            .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.transfer.cancelled")
+            .organization(organization_id)
+            .target("inventory_transfer", view.id.to_string())
+            .metadata(json!({
+                "number": view.number,
+                "was_dispatched": view.dispatched_at.is_some(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(view))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Low-stock alerts (docs/requests/REQ-053, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/alerts` — the alert inbox.
+pub async fn list_alerts(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<AlertListParams>,
+) -> Result<Json<Page<omnion_module_inventory::alerts::AlertView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::alerts::AlertQuery {
+        search: params.search,
+        kinds: split_multi(params.kind),
+        open_only: params.open_only.unwrap_or(true),
+        limit: params.limit,
+        cursor: parse_cursor(params.cursor),
+    };
+    Ok(Json(
+        omnion_module_inventory::alerts::list_alerts(state.db().pool(), organization_id, &query)
+            .await?,
+    ))
+}
+
+/// The inbox's filter.
+#[derive(Debug, Deserialize)]
+pub struct AlertListParams {
+    /// Free text over the SKU, the name and the location code.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// `low_stock` or `negative_stock` — repeated, or comma separated.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Only the unanswered ones. **On by default**, because an inbox that opens on a year of
+    /// closed episodes is not an inbox.
+    #[serde(default)]
+    pub open_only: Option<bool>,
+    /// How many rows.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The page cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/inventory/alerts/open-count` — the badge.
+pub async fn open_alert_count(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<Value>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let open = omnion_module_inventory::alerts::open_count(state.db().pool(), organization_id).await?;
+    Ok(Json(json!({ "open": open })))
+}
+
+/// `POST /api/v1/inventory/alerts/sweep` — raise or clear what the current balances call for.
+///
+/// The sweep is **idempotent**, which is what lets it run on a read (`alerts_on_read`) without a
+/// busy warehouse raising one alert per page view. It is exposed as a route as well because an
+/// installation that turned that setting off needs something to call on a schedule, and a
+/// document that says "run the sweep" with no way to run it is a feature that does not exist.
+pub async fn sweep_alerts(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<omnion_module_inventory::alerts::Swept>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let swept = omnion_module_inventory::alerts::sweep(state.db().pool(), organization_id).await?;
+
+    if swept.raised > 0 {
+        record(
+            &state,
+            NewAuditEntry::by_user(current.user.id, "inventory.alert.swept")
+                .organization(organization_id)
+                .target("inventory_alert", organization_id.to_string())
+                .metadata(json!({
+                    "examined": swept.examined,
+                    "raised": swept.raised,
+                    "cleared": swept.cleared,
+                    "open": swept.open,
+                }))
+                .ip_address(None),
+        )
+        .await?;
+
+        // One event per sweep rather than per alert, because the automation rule wants "this
+        // shelf needs attention", not four hundred copies of it. The payload carries the count
+        // so a rule can branch on it.
+        emit(
+            &state,
+            NewEvent::new("inventory.alert.raised")
+                .organization(organization_id)
+                .actor(current.user.id)
+                .payload(json!({
+                    "raised": swept.raised,
+                    "cleared": swept.cleared,
+                    "open": swept.open,
+                })),
+        )
+        .await;
+    }
+
+    Ok(Json(swept))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Permissions
 // ---------------------------------------------------------------------------------------------
 

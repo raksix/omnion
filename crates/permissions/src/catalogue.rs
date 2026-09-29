@@ -749,6 +749,25 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "inventory",
         description: "Decide another operator's over-threshold stock adjustment (approve or reject)",
     },
+    // Slice 3 split the movement key in two rather than adding a fifth. The reason is the same
+    // one that separated `inventory.adjustment.approve` from `inventory.movements.record`, and
+    // it is about **what a mistake costs**:
+    //
+    // * `inventory.movements.record` moves a number at one place. A mistake is a correction.
+    // * `inventory.transfers.manage` moves a number at **two** places and asserts the goods
+    //   physically moved between them, which is a claim about the world rather than about a
+    //   balance. A dispatch books goods as in-transit on a truck that may never arrive, and the
+    //   role that may do that is not the role that may note a shelf went down by two.
+    //
+    // There is deliberately **no `inventory.alerts.*` key**: raising and clearing an alert is the
+    // sweep's judgement about a balance, and a permission to *see* the inbox is
+    // `inventory.items.read`. A key that guards nothing is a comment, and a key that guards
+    // reading is a second name for a key that already exists.
+    PermissionDef {
+        key: "inventory.transfers.manage",
+        category: "inventory",
+        description: "Create, dispatch, receive and cancel stock transfers between locations",
+    },
 ];
 
 /// Look a permission up by key.

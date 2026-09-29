@@ -1464,6 +1464,15 @@ pub fn router(state: AppState) -> Router {
         // the drawer broken for every role that may not yet be trusted with the write.
         .route("/inventory/movements/preview", post(inventory::preview_movement))
         .route("/inventory/settings", get(inventory::get_settings))
+        // The transfer and alert **reads** sit here, under `inventory.items.read`, for the
+        // reason in the comment on `inventory_transfers` above.
+        .route("/inventory/transfers", get(inventory::list_transfers))
+        .route("/inventory/transfers/{id}", get(inventory::get_transfer))
+        .route("/inventory/alerts", get(inventory::list_alerts))
+        .route(
+            "/inventory/alerts/open-count",
+            get(inventory::open_alert_count),
+        )
         // The adjustment inbox and its export. The inbox is a **read** key and not the approve
         // key on purpose: a manager's job is to see what is waiting, and an approver who cannot
         // see the queue has to ask for a link to it. The decision is the guarded write below.
@@ -1499,6 +1508,30 @@ pub fn router(state: AppState) -> Router {
     // not being able to alter the balance.
     let inventory_movements_record = Router::new()
         .route("/inventory/movements", post(inventory::record_movement))
+        .route_layer(guards::require(&state, "inventory.movements.record"));
+
+    // Transfers and the alert inbox (REQ-053 slice 3).
+    //
+    // **Reading a transfer needs only `inventory.items.read`**, and that is a deliberate choice
+    // rather than a missing guard: a transfer is a movement of stock, so anybody who may read the
+    // ledger may read the documents that produced it, and a second key would mean a role could
+    // see stock go out with no explanation of where it went.
+    let inventory_transfers = Router::new()
+        .route("/inventory/transfers", post(inventory::create_transfer))
+        .route(
+            "/inventory/transfers/{id}/dispatch",
+            post(inventory::dispatch_transfer),
+        )
+        .route("/inventory/transfers/{id}/receive", post(inventory::receive_transfer))
+        .route("/inventory/transfers/{id}/cancel", post(inventory::cancel_transfer))
+        .route_layer(guards::require(&state, "inventory.transfers.manage"));
+
+    // The sweep creates rows the inbox then shows, so it is a write — but it is the sweep's
+    // **judgement about a balance**, which is the same judgement the crossing already made, so it
+    // sits under the movement key rather than the transfer one. `inventory.transfers.manage`
+    // guards a claim that goods physically moved; the sweep makes no such claim.
+    let inventory_alerts_sweep = Router::new()
+        .route("/inventory/alerts/sweep", post(inventory::sweep_alerts))
         .route_layer(guards::require(&state, "inventory.movements.record"));
 
     // **There is no `PATCH` or `DELETE` on `/inventory/movements/{id}` and there is never going to
@@ -1538,6 +1571,8 @@ pub fn router(state: AppState) -> Router {
         .merge(inventory_locations_manage)
         .merge(inventory_movements_record)
         .merge(inventory_approvals)
+        .merge(inventory_transfers)
+        .merge(inventory_alerts_sweep)
         .merge(inventory_approvals_manage)
         .merge(inventory_approval_decisions);
 
