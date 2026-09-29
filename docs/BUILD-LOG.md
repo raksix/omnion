@@ -5284,3 +5284,50 @@ target directories) and the build could not complete. `51c3df3` is the last stat
 browser pass is still queued behind w3's live pass and has not run, so criterion 3 stays unticked
 and the REQ stays open — correctly, because a criterion about binding and searching is not proven
 by a unit test and a half-finished walk.
+
+### tick 20, continued — the last walk, and the two client defects it was hiding
+
+`85aaa83`. The cyclic-group walk was the last red one, and it found two more defects in the
+client that no amount of reading would have.
+
+**The paging control was a second request.** RFC 2696 §2.1 puts the control in the search's own
+`controls` field. This client wrote the search, then a separate `extendedRequest` carrying the
+control, then read once — so it consumed the *control's* `searchResDone` as the search's, and the
+operation was left open. A walk against a stub exposes this because a stub answers one request at
+a time, while a real directory pipelines the two and the ordering is a server detail. The lesson
+generalises: **a walk that finds a protocol-shape bug is usually pointing at code that depends on
+the server's good manners.** The control is now one request and one completion per page, and the
+criticality is `FALSE` on purpose — a server without the control answers without it rather than
+refusing, and a paged search that becomes unpaged on an old directory beats one that fails.
+
+**A remote panic on any message over 127 bytes.** The frame was rebuilt with
+`frame[..header_len].copy_from_slice(&header[..header_len])` from a two-byte header with
+`header_len` up to six. A group entry with more than one member is the ordinary case, so this was
+reached by normal use; a server announcing `0x84` crashed the client instead of being refused, and
+a crash in a task that walks somebody else's group graph is a denial of service an operator
+triggers by *editing a group*. Any `copy_from_slice` whose range is computed from a parsed field is
+a panic waiting for an input that makes the two disagree.
+
+Two more in the filter parser, both found by asserting a **round trip** rather than a shape:
+`value()` unescaped while reading, so a `\*` the caller had escaped reached the substring splitter
+as a bare `*` and became a wildcard; and the split put the last component in both `final_` and
+`any`, so `ab*cd*ef` rendered as `ab*cd*ef*ef`.
+
+**Four fixture bugs, and the pattern is the lesson** — every one produced a message about the
+client. A `#[derive(Default)]` gave the stub `page_size: 0`, so every search answered nothing and
+four walks reported "the directory found nobody" about a directory that publishes a person. `ber()`
+wrote a short-form length unconditionally, so any entry over 127 bytes announced length 2. The long
+form's bytes were read to size the frame and never written back, so the decoder saw length 0 behind
+a 149-byte body. And they were read a *second* time further down, costing a byte. A derived default
+that is a legal-looking zero in a field the behaviour depends on is the same trap as a `Vec::new()`
+where a default row was meant.
+
+**Also this tick:** `/dev/shm` reached 100% (seven sibling writers, 32G tmpfs). Only this
+worktree's `w9-target` was touched; the gate ran against a disk-backed `target/` instead.
+`iam_directory_live.rs` → **17 passed**; `omnion-identity --lib` → **246**; `omnion-api --lib` →
+**224**; `pnpm typecheck` → clean. Criterion 3 ticked (`58e7a0d`); the browser pass has still not
+run, so the panel half is unobserved and REQ-065 stays open.
+
+**Next tick:** the private pass, and the group-walk flags on the sync path — `describe_walk()`
+exists, carries "NOT complete" and "cycle", and **nothing calls it on the sync path**, so a walk
+that hit the depth cap still reads as a complete group list. Then REQ-066.
