@@ -119,6 +119,7 @@ pub mod public;
 pub mod readyz;
 pub mod sales;
 pub mod sales_approvals;
+pub mod sales_documents;
 pub mod sales_orders;
 pub mod sales_reports;
 pub mod sales_quotes;
@@ -1188,6 +1189,16 @@ pub fn router(state: AppState) -> Router {
         .route("/sales/quotes", get(sales_quotes::list_quotes))
         .route("/sales/quotes/vocabulary", get(sales_quotes::quote_vocabulary))
         .route("/sales/quotes/{id}", get(sales_quotes::get_quote))
+        // The PDF is on the **read** key, not on `send` or `update`: downloading a document
+        // changes nothing, and putting it behind a key that also freezes a document would make a
+        // read-only analyst unable to print a quote they are looking at. It is a separate route
+        // rather than `?format=pdf` for the reason the report export is — a file and a JSON body
+        // have different failure modes, and one route answering either has whichever error
+        // handling ran last.
+        .route(
+            "/sales/quotes/{id}/pdf",
+            get(sales_documents::quote_pdf),
+        )
         .route_layer(guards::require(&state, "sales.quotes.read"));
     let sales_quotes_create = Router::new()
         .route("/sales/quotes", post(sales_quotes::create_quote))
@@ -1216,6 +1227,11 @@ pub fn router(state: AppState) -> Router {
     let sales_orders_read = Router::new()
         .route("/sales/orders", get(sales_orders::list_orders))
         .route("/sales/orders/{id}", get(sales_orders::get_order))
+        // As with the quote: the PDF is a read. A role that may see the deliveries may print them.
+        .route(
+            "/sales/orders/{id}/pdf",
+            get(sales_documents::order_pdf),
+        )
         .route_layer(guards::require(&state, "sales.orders.read"));
     let sales_orders_create = Router::new()
         .route("/sales/orders", post(sales_orders::create_order))
