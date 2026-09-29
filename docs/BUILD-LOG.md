@@ -4205,3 +4205,53 @@ the next tick reads the report for the six screens it did walk.
 **Next.** Read the pass's report. Then the last slice-3 item that is not blocked on another
 wave — the health line's rendering for a source whose mapping lost a key is present, so what
 remains is the REQ-064 form-editor card, which waits on a module this branch does not carry.
+
+## wave 4b · REQ-117 · the pass was not failing because of the screens (`cad4c9e`)
+
+The open question from last tick was the walkthrough's `interact: <route> → 3 elements` on all
+five CRM screens. **It is neither a login form nor a populated screen: it is Chrome's own
+offline error page** — "Checking the proxy and the firewall" and a `Reload` button, exactly three
+elements — and `url_after` is `chrome-error://chromewebdata/` on every one of them. The session was
+never anonymous. The last route to walk *cleanly* was `analytics-realtime`; the panel was
+answering, and then it was not.
+
+**The real fault is a database name in a shell script, twenty routes away from the symptom.**
+`scripts/qa/run-crm-{convert,assignment,autoresponder}.sh` each default to `omnion_qa_w8` — the
+database the pass runs its API against — and each begins with
+`DROP DATABASE IF EXISTS … WITH (FORCE)`, which terminates every connection to it. The pass's API
+is one of those connections. Run a gate during a pass and the API takes a graceful shutdown
+mid-walkthrough (`INFO omnion_api: shutdown signal received` → `shutdown complete`, clean as a
+pancake), the panel survives, and every subsequent route records an offline page.
+
+The shape of it is the lesson. **The report named the panel, the symptom appeared on five
+screens, and the cause was in a file none of them touch.** A screen that fails with a network-level
+error is not a screen defect, and the five that failed were the five most recently added — which
+is exactly the correlation a reader would use to conclude the new screens are broken. They are
+not. `run-crm-intake.sh` already had this right (`omnion_qa_crm_intake`); the three that broke it
+copied the pass's database instead, and paid for it in two consecutive ticks.
+
+Each gate now owns a disposable database, and **refuses to start** when pointed at the pass's
+rather than dropping it:
+
+```
+$ QA_DB=omnion_qa_w8 bash scripts/qa/run-crm-convert.sh
+  FAIL: this gate would drop the QA pass's own database (omnion_qa_w8).
+        Give the gate its own: run-crm-intake.sh uses omnion_qa_crm_intake.
+```
+
+**Proof.** Merge of `origin/main` (10 commits) first — three conflicts, all unions: the
+lucide import list (`Copy`/`GitBranch` from this branch, `Webhook` from main), the runner import
+in `main.rs` (`crm_autoresponder_runner` here, `event_retention_runner` on main), and BUILD-LOG.
+`cargo build -p omnion-api` green (6m07s, 3 pre-existing warnings in `notifications_admin.rs`),
+`pnpm typecheck` 2/2, `bash -n` on all three gates, and the guard demonstrated to fire and refuse.
+
+**BUILD-LOG merge note.** `git merge-file` conflicts on this file because main **prepends** and
+wave branches **append**. Char-level `SequenceMatcher` splices timed out at 300 s on a 4.2k-line
+file; line-level still misaligned, because both sides rewrote the header region. The merge that
+works is containment, verified with a subsequence check on both sides: base 3198/3198 and ours
+4057/4057 survive. **A line count is not the check** — `Counter(base + ours)` reported "3167 lost"
+on a correct merge, because the base is a prefix of ours and was double-counted.
+
+**Next.** The rerun is walking with the gates decoupled. Settle it, then the retention steps
+committed last tick (they have still never executed) and the REQ-064 form-editor card that waits
+on a module this branch does not carry.
