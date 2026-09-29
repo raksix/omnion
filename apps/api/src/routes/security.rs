@@ -1016,14 +1016,35 @@ mod tests {
             json!({"findings": [{"title": "x", "api_key": "abc"}]}),
             json!({"findings": [{"title": "x", "nested": {"password": "hunter2"}}]}),
             json!({"findings": [{"title": "x", "evidence": "Bearer abcdefghijklmnopqrstuvwx"}]}),
-            json!({"findings": [{"title": "x", "leak": "«redacted:sk-…»"}]}),
+            json!({"findings": [{"title": "x", "evidence": "sk-0123456789abcdefghijklmno"}]}),
         ] {
             assert!(
                 looks_like_a_credential(&leaky),
                 "this report carries something that should never be imported: {leaky}"
             );
             assert!(read_report(&leaky, "dependency").is_err());
+
         }
+
+        // A **masked** secret is not a secret, and this is the boundary the case above was
+        // written for and got wrong. `«redacted:sk-…»` is what a scanner emits *after* it found
+        // something and removed it — importing that is importing the report that says "there
+        // was a credential here", which is the single most useful sentence in the document. A
+        // detector that refuses masked markers refuses every tool that masks its output, so
+        // this screen would go dark on exactly the findings worth seeing.
+        //
+        // The value shape is the reason: the mask is prefixed by the tool's own decoration, so
+        // it does not `starts_with("sk-")`, and it is far shorter than the 24-character floor a
+        // bare token has to clear. Both are properties of the *mask*, not of the detector.
+        let masked = json!({"findings": [{"title": "x", "leak": "«redacted:sk-…»"}]});
+        assert!(
+            !looks_like_a_credential(&masked),
+            "a masked secret is a report, not a leak: {masked}"
+        );
+        assert!(
+            read_report(&masked, "dependency").is_ok(),
+            "a masked secret must not make the whole report unimportable"
+        );
     }
 
     #[test]
@@ -1034,9 +1055,15 @@ mod tests {
             json!({"results": []}),
         ] {
             let err = read_report(&bad, "dependency").expect_err("an unknown shape must be named");
+            // `.message()` and not `to_string()`: `ApiError` implements neither `Display` nor
+            // `Error` — the wire shape is `{"error":{"code":…,"message":…}}` and a `Display`
+            // that printed the struct would put a Rust debug rendering into an assertion. The
+            // accessor is the field the client actually sees, so the test reads the same string
+            // the caller does.
             assert!(
-                err.to_string().contains("findings"),
-                "the message should say what was expected: {err}"
+                err.message().contains("findings"),
+                "the message should say what was expected: {}",
+                err.message()
             );
         }
     }
