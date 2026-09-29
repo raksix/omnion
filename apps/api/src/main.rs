@@ -367,6 +367,35 @@ async fn seed_iam(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync
         tracing::info!(%user_id, "owner role assigned to the earliest active account");
     }
 
+    // Re-assert the invariant AFTER the bootstrap, never only before it.
+    //
+    // `bootstrap_admin` runs one line above and can be the thing that creates the very first
+    // account, on a database whose `role_bindings` table was empty a moment earlier. The `ensure`
+    // above ran before it, so the Owner invariant was evaluated against a database with no
+    // accounts, bound nobody, and the first account was left with no role at all: the panel
+    // rendered, the sign-in succeeded, and every permission-guarded route answered
+    // `403 permission_denied … "observability.read"`. The onboarding screen did not help —
+    // `status()` derives `steps.owner` from `has_users`, not from a binding, so the wizard
+    // reported the account as the owner while holding no role.
+    //
+    // It is also the wrong place to stop at boot. `seed_iam` runs once, and a fresh install
+    // reaches its first account through the WIZARD, long after this function returned — so on the
+    // ordinary path the second call is the only one that ever sees the account. Calling it here
+    // makes the guarantee hold for both: the bootstrap path (bound by this call) and the wizard
+    // path (bound by the wizard's own `create_owner`, which already asserts it). A platform
+    // whose first account holds no role can sign in and see nothing, which is the one failure
+    // shape an installation cannot recover from by itself.
+    //
+    // `ensure` is idempotent and cheap when the invariant already holds, so the common case costs
+    // one `exists` query and writes nothing.
+    if let Some(user_id) = omnion_permissions::seed::ensure_owner_binding(db.pool()).await? {
+        tracing::info!(
+            %user_id,
+            "owner role bound to the first account after the bootstrap — without it every \
+             permission-guarded route would answer 403"
+        );
+    }
+
     Ok(())
 }
 
