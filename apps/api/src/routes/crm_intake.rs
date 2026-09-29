@@ -795,7 +795,13 @@ pub async fn capture(
     // every form submission on the site into a four-second form submission. The send is
     // spawned and the trail records what it did, which is the same contract the conversion
     // and the assignment already use for work that must not sit in the request.
-    spawn_autoresponder(state.clone(), captured.lead.clone(), source.clone());
+    // The autoresponder is spawned off the request so a visitor's `202` never waits on an SMTP
+    // handshake — and a task-local does not cross `tokio::spawn` (see
+    // `omnion_module_crm_intake::request_id`), so the id is captured here and moved in. Without
+    // this the lead's arrival line would be correlated and its acknowledgement line would not,
+    // which is precisely the pair an operator correlates.
+    let autoresponder_request_id = omnion_module_crm_intake::request_id::current();
+    spawn_autoresponder(state.clone(), captured.lead.clone(), source.clone(), autoresponder_request_id);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -811,8 +817,16 @@ pub async fn capture(
 /// A spawn failure is not fatal and is not swallowed either: the lead is already stored and
 /// the visitor is already answered with `202`, so there is nothing to roll back — but a lost
 /// autoresponder is a lead nobody is ever going to hear back on, and that has to be visible.
-fn spawn_autoresponder(state: AppState, lead: Lead, source: IntakeSource) {
+fn spawn_autoresponder(
+    state: AppState,
+    lead: Lead,
+    source: IntakeSource,
+    request_id: Option<String>,
+) {
+    // `request_id` is *passed in*, not read here: a task-local is not visible inside a spawned
+    // task, so the value has to be captured by the caller that is still on the request's task.
     tokio::spawn(async move {
+    omnion_module_crm_intake::request_id::scope_with(request_id, async {
         let pool = state.db().pool().clone();
         let outcome = match autoresponder_store::prepare(
             &pool,
@@ -878,6 +892,7 @@ fn spawn_autoresponder(state: AppState, lead: Lead, source: IntakeSource) {
                 }
             }
         }
+    }).await
     });
 }
 
@@ -2385,6 +2400,12 @@ pub(super) async fn audit(
     target_id: Uuid,
     metadata: serde_json::Value,
 ) {
+    // Acceptance 17 asks for the request id on the audit entry, and the compliance export is the
+    // reader that needs it: two edits by the same operator in the same minute are otherwise
+    // indistinguishable. The id comes from the CRM's scope (opened once for the whole router), so
+    // this function has no parameter to forget and every call site gets it for free.
+    let metadata = omnion_module_crm_intake::store::stamp_request_id(metadata);
+
     let entry = NewAuditEntry {
         organization_id: Some(organization_id),
         actor_user_id: Some(actor_user_id),
