@@ -109,6 +109,7 @@ pub mod tenancy;
 pub mod webauthn;
 pub mod webhooks;
 pub mod workflow_graph;
+pub mod workflow_listener;
 pub mod workflows;
 
 use axum::Router;
@@ -697,6 +698,17 @@ pub fn router(state: AppState) -> Router {
 
     let workflow_graph_ui_state =
         put(workflow_graph::replace_ui_state).layer(guards::require(&state, "workflows.manage"));
+
+    // *Listen for a real event* (REQ-004 slice 3, criterion 5). Arming is `workflows.run`,
+    // not `workflows.manage`: it changes nothing about the definition, and it is the first
+    // half of running the rule for real, so it belongs with the power that can already start
+    // a run. Reading the armed rows back is `workflows.read` — the panel's "listening"
+    // indicator must work for somebody who may look at a rule but not start it.
+    let workflow_listen =
+        post(workflow_listener::listen_workflow).layer(guards::require(&state, "workflows.run"));
+
+    let workflow_listeners =
+        get(workflow_listener::list_workflow_listeners).layer(guards::require(&state, "workflows.read"));
 
     let workflow_graph_validate =
         post(workflow_graph::validate_graph).layer(guards::require(&state, "workflows.manage"));
@@ -1348,6 +1360,13 @@ pub fn router(state: AppState) -> Router {
             workflow_graph_read.merge(workflow_graph_write),
         )
         .route("/workflows/{id}/graph/ui-state", workflow_graph_ui_state)
+        .route("/workflows/{id}/listen", workflow_listen)
+        .route("/workflows/{id}/listeners", workflow_listeners)
+        .route(
+            "/workflows/{id}/listeners/{token}",
+            get(workflow_listener::get_workflow_listener)
+                .layer(guards::require(&state, "workflows.read")),
+        )
         .route("/workflows/{id}/validate", workflow_graph_validate)
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)

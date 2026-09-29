@@ -324,6 +324,45 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
                 tracing::warn!(workflow_id = %workflow_id, error = %err, "the listener could not be filled in");
             }
         }
+
+        // The builder's listener is armed for a **node**, not for the rule (REQ-004
+        // criterion 5), so the rule-shaped capture above does not fill it. The node is the
+        // rule's own trigger — the one node an event starts a run at — and it is read from
+        // the graph rather than passed in, because the matcher is given a `Workflow` row and
+        // the node id lives in the graph's jsonb.
+        //
+        // A rule with no readable graph, or one whose trigger node is gone, captures nothing
+        // and is not an error: the event still ran the rule, which is the fact that matters.
+        match trigger_node_id(pool, *workflow_id).await {
+            Ok(Some(node_id)) => {
+                let now = time::OffsetDateTime::now_utc();
+                let written = omnion_workflows::test_listener::capture(
+                    pool,
+                    *workflow_id,
+                    &node_id,
+                    *event_id,
+                    event_name,
+                    payload,
+                    now,
+                )
+                .await;
+                match written {
+                    Ok(ids) if !ids.is_empty() => {
+                        tracing::info!(workflow_id = %workflow_id, node_id = %node_id, event_id, listener = %ids[0], "a builder listener captured an event");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(workflow_id = %workflow_id, error = %err, "the builder listener could not be filled in");
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(workflow_id = %workflow_id, "this rule has no trigger node to capture on");
+            }
+            Err(err) => {
+                tracing::warn!(workflow_id = %workflow_id, error = %err, "the trigger node could not be read for the builder listener");
+            }
+        }
     }
 
     for entry in &refused {
@@ -346,6 +385,28 @@ pub async fn drain(pool: &PgPool, batch: i64) -> Result<MatchReport> {
     }
 
     Ok(report)
+}
+
+/// The id of the node an event starts this rule at — the one trigger on its graph.
+///
+/// `None` for a rule whose graph is unreadable or carries no trigger. This is a *lookup per
+/// matched event* and it is worth being explicit about why it is not cached in the drain:
+/// the drain already holds the graph-less `Workflow` row, and a rule can be re-saved between
+/// two events in the same batch. Reading it per capture is one indexed row per **match**,
+/// and a match is a run somebody is paying for — a stale node id here would fill the wrong
+/// node's listener, which is the one error in this file that is silent.
+async fn trigger_node_id(pool: &PgPool, workflow_id: Uuid) -> Result<Option<String>> {
+    let Some(definition) = omnion_workflows::graph_store::find_graph(pool, workflow_id).await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(definition
+        .graph
+        .nodes
+        .iter()
+        .find(|node| omnion_workflows::graph::is_trigger_type(&node.node_type))
+        .map(|node| node.id.clone()))
 }
 
 /// Resolve every action's parameters against the event that fired the rule.
