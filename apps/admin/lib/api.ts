@@ -30,8 +30,14 @@ import type {
   WebhookStats,
   WebhookTestReport,
 
+  CommentBan,
+  CommentBulkResult,
+  CommentInbox,
+  CommentInboxRow,
+  CommentSettingsDocument,
   CreatedMediaShare,
   Form,
+  NewCommentReply,
   PageSeo,
   PageSeoBody,
   SeoBrokenLink,
@@ -5300,6 +5306,147 @@ export function setBrokenLinkIgnored(linkId: string, ignored: boolean): Promise<
     method: "PATCH",
     body: JSON.stringify({ ignored }),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page comments (REQ-064, slice 4a)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The moderation inbox: one tab, plus the counts for all four.
+ *
+ * One endpoint rather than a list and a separate counts call, because the tab bar and the table
+ * are one screen and two reads can show two moments — a count that says 4 over a table that
+ * shows 3 is a moderator wondering whether they lost one.
+ */
+export function fetchCommentInbox(filters: {
+  site_id: string;
+  status?: string;
+  search?: string;
+  page_id?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<CommentInbox> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["status", "search", "page_id", "limit", "offset"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<CommentInbox>(`/api/v1/comments?${query.toString()}`);
+}
+
+/** One comment, with the page it was left on. */
+export function fetchComment(id: string, siteId: string): Promise<CommentInboxRow> {
+  return request<CommentInboxRow>(
+    `/api/v1/comments/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Move a comment to a state.
+ *
+ * `reason` is only meaningful for `spam` and `trash`, and the panel sends it when the moderator
+ * typed one: a spam row with no reason is a row a moderator has to investigate to learn what the
+ * platform already knew.
+ */
+export function moderateComment(
+  id: string,
+  siteId: string,
+  status: string,
+  reason?: string,
+): Promise<CommentInboxRow> {
+  return request<CommentInboxRow>(
+    `/api/v1/comments/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ status, reason: reason || undefined }),
+    },
+  );
+}
+
+/**
+ * Moderate a selection.
+ *
+ * The answer reports per-comment outcomes rather than a bare count, and the panel shows the
+ * partial case: a bulk action that moved 8 of 10 and reports "10 moderated" is worse than no
+ * bulk action, because the two it did not touch are invisible.
+ */
+export function bulkModerateComments(
+  siteId: string,
+  commentIds: string[],
+  status: string,
+): Promise<CommentBulkResult> {
+  return request<CommentBulkResult>(
+    `/api/v1/comments/bulk?site_id=${encodeURIComponent(siteId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ status, comment_ids: commentIds }),
+    },
+  );
+}
+
+/** Answer a comment as the site. Published immediately. */
+export function replyToComment(
+  id: string,
+  reply: NewCommentReply,
+): Promise<CommentInboxRow> {
+  return request<CommentInboxRow>(`/api/v1/comments/${encodeURIComponent(id)}/reply`, {
+    method: "POST",
+    body: JSON.stringify(reply),
+  });
+}
+
+/** Remove a comment for good. The Trash tab only. */
+export function deleteComment(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/comments/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** The moderation policy and the bans, in one read. */
+export function fetchCommentSettings(siteId: string): Promise<CommentSettingsDocument> {
+  return request<CommentSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/comment-settings`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Save the moderation policy.
+ *
+ * The panel sends the whole policy rather than a diff, and the server applies each field it was
+ * given over the stored row — so a panel that grows a new toggle next year cannot reset the
+ * settings this year's panel knew nothing about.
+ */
+export function saveCommentSettings(
+  siteId: string,
+  settings: Partial<CommentSettingsDocument["settings"]> & { comments_enabled: boolean },
+): Promise<CommentSettingsDocument> {
+  return request<CommentSettingsDocument>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/comment-settings`,
+    { method: "PUT", body: JSON.stringify(settings) },
+  );
+}
+
+/** Place a ban. An `ip` value is fingerprinted by the server, never stored raw. */
+export function addCommentBan(
+  siteId: string,
+  input: { kind: "email" | "ip"; value: string; reason?: string; expires_at?: string | null },
+): Promise<CommentBan> {
+  return request<CommentBan>(`/api/v1/sites/${encodeURIComponent(siteId)}/comment-bans`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Lift a ban. */
+export function removeCommentBan(siteId: string, banId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/comment-bans/${encodeURIComponent(banId)}`,
+    { method: "DELETE" },
+  );
 }
 
 // ---------------------------------------------------------------------------------------------

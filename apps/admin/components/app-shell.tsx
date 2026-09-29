@@ -27,6 +27,7 @@ import {
   LockKeyhole,
   LogOut,
   Menu,
+  MessageSquare,
   Scale,
   ScrollText,
   ShieldCheck,
@@ -60,6 +61,11 @@ const NAV = [
   // The SEO toolkit (REQ-064, slice 3). It sits beside Publishing queue because both answer
   // "what does the outside world see about this site" — one about when, one about how.
   { href: "/seo", label: "SEO", icon: Globe },
+  // The comment queue (REQ-064, slice 4a). It sits beside SEO rather than under Pages because
+  // it is the one content surface that is *inbound*: everything else in this shelf is
+  // something an editor wrote, and the queue is the only place an owner finds out what
+  // readers said about it.
+  { href: "/comments", label: "Comments", icon: MessageSquare },
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },
