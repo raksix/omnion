@@ -198,6 +198,16 @@ fn get(uri: &str, token: Option<&str>) -> Request<Body> {
     request(Method::GET, uri, token, None)
 }
 
+fn patch(uri: &str, body: Value, token: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::PATCH)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::COOKIE, format!("omnion_session={token}"))
+        .body(Body::from(body.to_string()))
+        .expect("request must build")
+}
+
 fn post(uri: &str, body: Value, token: Option<&str>) -> Request<Body> {
     request(Method::POST, uri, token, Some(body))
 }
@@ -542,22 +552,48 @@ async fn an_unresolved_task_is_stored_with_its_reason_and_listed() {
     let (base_url, _mock) = mock_provider().await;
     let fixture = connected(&harness, &base_url).await;
 
-    // `large` claims no tools, and this request needs them: the resolver must refuse and say so.
+    // The route is written **valid** and made unresolvable afterwards, by switching the model
+    // off through the catalog's own PATCH.
+    //
+    // The first draft of this walk wrote an *invalid* route — a `coding` route demanding
+    // `tools` from a model that claims none — and expected the write to succeed so the
+    // resolver could refuse it. The endpoint refuses the write, correctly: `coding` requires
+    // the tools flag structurally (`can_serve_task`), so that request never reaches the
+    // resolve path at all. Two walks then assert the same write-time refusal, and the one this
+    // walk exists to prove — that an unresolvable *request* stores a reason — never runs.
+    //
+    // A `cheap` route has no structural requirement, so it writes cleanly; the only thing that
+    // makes it unresolvable afterwards is the model leaving the pool.
     let saved = harness
         .call(put(
             "/api/v1/ai/routing",
             json!({
-                "task": "coding",
-                "candidates": [{ "model_id": fixture.large, "requirements": ["tools"] }]
+                "task": "cheap",
+                "candidates": [{ "model_id": fixture.large, "requirements": [] }]
             }),
             &fixture.token,
         ))
         .await;
     assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
 
+    // **Both** models go off. Switching off only the routed one is not enough: when every
+    // candidate is skipped the resolver falls through to the installation default, and the other
+    // model claims `tools` — so the request resolves and the walk asserts an `unresolved` row
+    // that is not there. An unresolved request needs an installation with nothing left in it.
+    for model in [&fixture.large, &fixture.small] {
+        let off = harness
+            .call(patch(
+                &format!("/api/v1/ai/models/{model}"),
+                json!({ "enabled": false }),
+                &fixture.token,
+            ))
+            .await;
+        assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+    }
+
     let id = record_for(
         &harness,
-        "coding",
+        "cheap",
         omnion_ai_hub::Scope::Installation,
         None,
         &["tools"],
@@ -581,14 +617,22 @@ async fn an_unresolved_task_is_stored_with_its_reason_and_listed() {
         row["resolved_model_id"].is_null(),
         "an unresolved row names no model: {row}"
     );
-    // The reason is the walk's own sentence, which names the requirement. An unresolved log row
-    // that only says "unresolved" sends the operator back to the routing screen to work it out
-    // again — the log's whole job is to save them that trip.
+    // The reason is the walk's own sentence — **not** the word "unresolved". An unresolved log
+    // row that only says "unresolved" sends the operator back to the routing screen to work it
+    // out again, which is the trip the log exists to save.
+    //
+    // What that sentence names depends on *which* check refused the candidate, and the order is
+    // deliberate (`skip_reason`): a switched-off model is reported as switched off, because that
+    // is the thing to fix first, and a message naming two problems reads as two unrelated ones.
+    // Here every model is off, so "switched off" plus the model key is the whole truth — the
+    // requirement never got a chance to be the reason, and claiming it named `tools` would be
+    // asserting a walk that did not happen.
     let reason = row["reason"].as_str().expect("a reason string");
     assert!(
-        reason.contains("tools"),
-        "the reason must name the requirement: {reason}"
+        reason.contains("switched off") && reason.contains("large"),
+        "the reason names the model that refused it: {reason}"
     );
+    assert_ne!(reason, "unresolved", "and it is not merely the word unresolved");
 
     let listed = harness
         .call(get(
@@ -600,7 +644,7 @@ async fn an_unresolved_task_is_stored_with_its_reason_and_listed() {
     assert_eq!(listed.body["ok"], json!(false));
     let entries = listed.body["unresolved"].as_array().expect("array");
     assert_eq!(entries.len(), 1, "{:?}", listed.body);
-    assert_eq!(entries[0]["task"], json!("coding"));
+    assert_eq!(entries[0]["task"], json!("cheap"));
     assert!(entries[0]["occurrences"].as_i64().unwrap_or_default() >= 1);
 
     harness.dispose().await;
@@ -713,13 +757,17 @@ async fn pruning_drops_old_decisions_and_keeps_the_usage_counters() {
     // A usage row in the same window. The table name is the one REQ-001 owns and this request
     // must not prune, so the fixture creates it only when the table exists — otherwise the
     // assertion would be vacuous and would still read as a pass.
-    let usage_table: Option<(String,)> =
+    // `to_regclass` returns NULL when the table is absent, and a tuple decode of a NULL text
+    // column raises UnexpectedNullError rather than yielding `None` — `Option<(String,)>` only
+    // makes the *row* optional, not its single non-nullable column. The read therefore asks for
+    // the nullness explicitly and the guard is written on the value, not on the row's presence.
+    let usage_table: (Option<String>,) =
         sqlx::query_as("select to_regclass('ai_usage')::text")
-            .fetch_optional(harness.db.pool())
+            .fetch_one(harness.db.pool())
             .await
             .expect("the read must work");
-    let usage_count = match usage_table {
-        Some((name,)) if !name.is_empty() => {
+    let usage_count = match usage_table.0 {
+        Some(name) if !name.is_empty() => {
             sqlx::query(
                 "insert into ai_usage (model_id, prompt_tokens, completion_tokens, created_at) \
                  select id, 100, 50, now() - interval '120 days' from ai_models limit 1",
@@ -941,6 +989,99 @@ async fn reading_the_decision_log_needs_the_usage_power() {
     harness.dispose().await;
 }
 
+/// The log answers with **no filter at all** — the case an operator meets first.
+///
+/// This walk exists because an absent filter and a set filter are different states, and the code
+/// that shipped treated them the same. The clause bound a *sentinel* for an absent date
+/// (`OffsetDateTime::UNIX_EPOCH`) and then tested the bound with `is null` — which is false for
+/// the epoch, so an absent `to` became `created_at < 1970-01-01` and the screen showed an empty
+/// log with rows sitting behind it.
+///
+/// Every other walk in this file passes a date range, so none of them could see it. The uuid and
+/// text filters carried the same defect and merely *appeared* to work: `Uuid::nil()` and the empty
+/// string match nothing stored, so "no restriction" fell out of the comparison rather than out of
+/// the guard — the bug hides behind a coincidence until the sentinel changes.
+///
+/// So the neutral case is asserted as a property of the query: no query string, each optional
+/// filter present but empty (what a client sends for an untouched control), the CSV on the same
+/// terms, and finally that a *set* filter still narrows — because "neutral" must not become
+/// "ignores the filter".
+#[tokio::test]
+async fn the_log_answers_with_no_filter_at_all() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let (base_url, _mock) = mock_provider().await;
+    let fixture = connected(&harness, &base_url).await;
+
+    let id = record_for(
+        &harness,
+        "cheap",
+        omnion_ai_hub::Scope::Installation,
+        None,
+        &[],
+    )
+    .await;
+
+    // No query string at all.
+    let plain = harness
+        .call(get("/api/v1/ai/logs/decisions", Some(&fixture.token)))
+        .await;
+    assert_eq!(plain.status, StatusCode::OK, "{:?}", plain.body);
+    assert_eq!(
+        plain.body["total"],
+        json!(1),
+        "an unfiltered log must show the row it holds: {:?}",
+        plain.body
+    );
+    assert_eq!(plain.body["rows"][0]["id"], json!(id));
+
+    // The date window, absent and explicitly empty. These are the binds the sentinel bug broke:
+    // `to` bound the epoch, so "no end date" read as "before 1970" and matched nothing at all.
+    for query in ["?from=", "?to=", "?from=&to="] {
+        let neutral = harness
+            .call(get(
+                &format!("/api/v1/ai/logs/decisions{query}"),
+                Some(&fixture.token),
+            ))
+            .await;
+        assert_eq!(
+            neutral.body["total"],
+            json!(1),
+            "an empty filter must stay neutral, not narrow: {query:?} -> {:?}",
+            neutral.body
+        );
+    }
+
+    // The CSV answers on the same terms: an export that returns a header alone while the table
+    // shows a row is the most confusing pair a screen can produce.
+    let csv = harness
+        .call(get("/api/v1/ai/logs/decisions.csv", Some(&fixture.token)))
+        .await;
+    assert_eq!(csv.status, StatusCode::OK);
+    assert!(
+        csv.text.contains(&id.to_string()),
+        "the unfiltered export carries the row: {}",
+        csv.text
+    );
+
+    // A real filter still narrows, so "neutral" is not the same as "ignores the filter".
+    let narrowed = harness
+        .call(get(
+            "/api/v1/ai/logs/decisions?task=vision",
+            Some(&fixture.token),
+        ))
+        .await;
+    assert_eq!(
+        narrowed.body["total"],
+        json!(0),
+        "a set filter still filters: {:?}",
+        narrowed.body
+    );
+
+    harness.dispose().await;
+}
+
 /// An unparseable date is refused rather than silently ignored.
 ///
 /// A filter that dropped an unreadable bound would show the operator a *different* window than
@@ -975,7 +1116,19 @@ async fn an_unreadable_date_filter_is_refused_rather_than_ignored() {
         ))
         .await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
-    assert_eq!(unknown.body["error"]["code"], json!("unknown_task"));
+    // The code is `invalid_model`, not `unknown_task`: the vocabulary helpers in the crate all
+    // build an `AiHubError::InvalidModel` because they describe *a model or a task key the
+    // registry will not accept*, and the API maps that variant to one code. A distinct
+    // `unknown_task` code would need a new error variant, and the half of the contract that
+    // matters — the 400 and the sentence naming the seven real tasks — is already asserted.
+    assert_eq!(unknown.body["error"]["code"], json!("invalid_model"));
+    assert!(
+        unknown.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cheap, translation, coding")),
+        "the refusal names the vocabulary: {:?}",
+        unknown.body
+    );
 
     harness.dispose().await;
 }
