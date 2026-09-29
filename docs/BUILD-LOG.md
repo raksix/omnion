@@ -5092,3 +5092,51 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+
+## 2026-09-29 · Wave 5 · tick 23 — the scope was half a scope, and it was mine to fix
+
+**What.** `git fetch` showed `origin/main` 11 commits ahead, so the tick opened with the merge
+(`92ee69a`). Four conflicts, and they were four different shapes. `apps/api/src/routes/mod.rs`
+had both sides rewriting the *same* `.nest("/api/v1", v1)` statement, with a stated ordering
+constraint in main's comment ("CSRF sits OUTSIDE the permission guards on purpose") that had to
+survive: my module switch is a layer on `v1`, so keeping it inside the nest is what keeps it below
+the CSRF layer. `notifications.rs` was an empty-side union. `security.rs` was one fixture with two
+spellings, and mine was the one already reasoned about in `6280a2a` — a redaction marker is a
+*removed* secret. `docs/BUILD-LOG.md` is append-only with no shared continuation, so it is a plain
+union, verified by **multiset** (0 lines missing from either side, 79 headings, 0 duplicates) and
+not by a line count.
+
+Then the real work. Ticks 13–22 have all deferred the browser pass on box pressure, and tick 20
+said plainly that a gate which cannot be afforded is a gate that will not run. The fix belongs in
+the harness, so it went there — and the harness was still broken. `runDepthPass` checks `QA_ONLY`
+and turns a throw into a recorded finding, and fifteen call sites used it. **Sixteen more were
+invoked with a bare `await`** and ran regardless. Fifteen of those sixteen are precisely the
+passes a scoped run exists to reach: `runCdnRulesDepth`, `runCdnPurgeDepth` and all six
+`runOrganization*` passes. So every scoped artifact this branch has produced carried the label
+`cdn,events,webhooks` while holding the whole product's evidence — and, worse, a pass meant to
+reach `/cdn/purges` spent its budget in `search-depth` and never got there. That is the tick-21
+reading, and no amount of re-reading it would have found it: the scope was a *description*, not a
+control.
+
+**Proof.**
+- `git merge origin/main` → `92ee69a`; BUILD-LOG multiset: 0 missing from ours, 0 from theirs,
+  79 headings, 0 duplicate headings.
+- Scope predicate **re-executed**, not read (the tick-20 rule): `QA_ONLY=cdn` keeps **2 of 17**
+  passes (`cdnRules`, `cdnPurges`); `QA_ONLY=organization` keeps exactly the six tenant passes; the
+  core-route leak check returns `[]` for both.
+- `bun build` parses `walkthrough.cjs` clean (306 KB bundle, 1 module).
+- `grep`-level audit: **0** bare top-level pass calls remain; the two hits left
+  (`runTenantDepthFromDetail` at 3028, `organizationDepth` at 7025) are both *inside* the tenant
+  pass, whose call site is now scoped.
+
+**The trap inside the fix.** The five passes after `organizationDepth` drive the organization that
+pass *opens*, so scoping the parent alone leaves them reading `undefined.organizationId`. The
+naive repair — `return` when the tenant is missing — is worse than the bug: it abandons the
+remaining screens and the run ends with **no `summary.json`**, the one shape a QA artifact must
+never have, because a missing summary reads like a crash and hides every finding behind it. A
+missing tenant is recorded as a finding naming the reason, and the pass is skipped.
+
+**Next.** The box is still at load 20 / MemAvailable 4G / 40 Chrome, so the pass is deferred for
+the *ninth* time — but the deferral now has a fix behind it rather than a pre-flight. With the
+scope honest, a `QA_ONLY=cdn,events,webhooks` pass is roughly a fifth of a full pass, and that is
+affordable on this box. REQ-011 and REQ-005 both wait on this one green run.
