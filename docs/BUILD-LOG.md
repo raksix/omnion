@@ -5011,8 +5011,22 @@ The fix belongs in the harness, not in a feature: `run.sh` should either export 
 already knows in `CREDS` (so the boot log seeds it) or drive `/setup` explicitly when the users
 table is empty. **A pass whose first step needs state it just deleted is not a pass that reports on
 the screens after it** — it reports on its own setup, which is the same class as the `summary.json`
-with a `fatal` and no counts. **No browser box is ticked, and the depth pass is written but
-unproven.**
+with a `fatal` and no counts.
+
+**Fixed in `8139d16`:** `run.sh` now exports `QA_DATABASE_URL`, `QA_ADMIN_EMAIL` and
+`QA_ADMIN_PASSWORD` — the same pair `walkthrough.cjs` signs in with — so the API's
+`bootstrap_admin` creates the account the reset just deleted. The second run is queued behind the
+same w3 pass and did not reach the browser inside this tick, so **the fix is reasoned and committed
+but not yet observed working**; the next tick's pass is what will show it. **No browser box is
+ticked, and the depth pass is written but unproven.**
+
+**And a mask caught in the act.** Writing that fix through the `patch` tool put the tool's own
+credential mask (`***`) into `run.sh` on disk, because the value it matched on was itself masked in
+the output. `bash -n` accepted it — the URL is syntactically valid and simply points at a role named
+`***` — and the only witness was measuring the credential's byte length (10, not 13). The repair is
+to rebuild the line from *parts* so no tool output ever contains the value, and to verify by length
+rather than by printing. Same lesson as every other one about this mask; the difference is that
+`bash -n` is not a gate for it.
 
 **One environment lesson, the hard way.** I ran `rm -rf target/debug/{deps,build,incremental}` to free
 3.5 GB on a volume that had reached 100% — the move my own ledger recommends — and did it **while a
