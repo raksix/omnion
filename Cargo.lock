@@ -1364,6 +1364,7 @@ dependencies = [
  "omnion-ai-hub",
  "omnion-audit",
  "omnion-automation",
+ "omnion-backup",
  "omnion-content",
  "omnion-core",
  "omnion-events",
@@ -1421,6 +1422,21 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-backup"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
  "tracing",
  "uuid",
 ]

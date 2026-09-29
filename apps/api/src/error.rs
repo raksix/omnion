@@ -848,6 +848,47 @@ impl From<PermissionsError> for ApiError {
     }
 }
 
+impl From<omnion_backup::BackupError> for ApiError {
+    fn from(error: omnion_backup::BackupError) -> Self {
+        use omnion_backup::BackupError as B;
+        match error {
+            // A missing run or schedule is a 404, and it is a 404 rather than a 403 even
+            // when the row exists in another tenant: a 403 confirms the id is real, and a
+            // backup's existence is itself information about the platform.
+            B::NotFound => Self::new(StatusCode::NOT_FOUND, "backup_not_found", "no such backup"),
+            B::ScheduleNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "backup_schedule_not_found",
+                "no such backup schedule",
+            ),
+            // A refusal is a 409, not a 400: the request was legal and the platform has
+            // moved on. That is the same split the permissions and media modules use, and
+            // the two answer different questions for the caller.
+            B::Rejected(message) => Self::new(StatusCode::CONFLICT, "backup_rejected", message),
+            B::Invalid(message) => Self::bad_request("invalid_backup", message),
+            B::Partial {
+                failed,
+                total,
+                message,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "backup_partial",
+                format!("{failed} of {total} parts failed: {message}"),
+            ),
+            B::Database(err) if dependency_unavailable(&err) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            B::Database(err) => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                err.to_string(),
+            ),
+        }
+    }
+}
+
 impl From<MediaError> for ApiError {
     fn from(error: MediaError) -> Self {
         match error {
@@ -1080,6 +1121,17 @@ impl From<StorageError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_error",
                 format!("the object store refused the request (status {status}): {message}"),
+            ),
+            // A `409`, not a `503`: nothing is unavailable and retrying will not help, because
+            // the object and the row disagree about its length and only a repair fixes that. A
+            // retryable status here would have a client — or a media player — asking for ever.
+            StorageError::RangeNotSatisfiable { key, requested } => Self::new(
+                StatusCode::CONFLICT,
+                "object_range_not_satisfiable",
+                format!(
+                    "the stored object is shorter than the range that was asked for \
+                     ({requested} of {key:?})"
+                ),
             ),
         }
     }

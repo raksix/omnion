@@ -76,6 +76,27 @@ impl FsStorage {
         }
     }
 
+    /// Read a window of an object back; a missing file is a `NotFound`.
+    ///
+    /// The local driver serves ranges out of one in-memory read rather than seeking, because the
+    /// file is already mapped into this process — but the *answer* is the window, not the whole
+    /// object, so a caller cannot tell from the bytes it got whether the store or the driver
+    /// produced them. A window past the end is a `RangeNotSatisfiable`, exactly as S3 answers,
+    /// so the route's `416` does not depend on which driver is mounted.
+    pub async fn get_range(&self, key: &str, start: u64, end: u64) -> Result<Vec<u8>> {
+        let bytes = self.get(key).await?;
+        let total = bytes.len() as u64;
+        if total == 0 || start >= total || end < start {
+            return Err(StorageError::RangeNotSatisfiable {
+                key: key.to_owned(),
+                requested: format!("bytes={start}-{end}"),
+            });
+        }
+        let start = start as usize;
+        let end = end.min(total - 1) as usize;
+        Ok(bytes[start..=end].to_vec())
+    }
+
     /// Remove an object; `true` when one was there.
     pub async fn delete(&self, key: &str) -> Result<bool> {
         let path = self.path_for(key)?;
@@ -148,6 +169,95 @@ mod tests {
             Err(StorageError::Invalid(_))
         ));
         assert!(!Path::new(&root).join("..").join("outside.txt").exists());
+        std::fs::remove_dir_all(&root).expect("the test root must clean up");
+    }
+
+    /// A window is compared **as bytes**, and every edge of it is checked against the object
+    /// rather than against a length the test computed: the single-byte case and the last-byte
+    /// case are where an off-by-one hides, and a length check passes by accident on both.
+    #[tokio::test]
+    async fn a_window_answers_exactly_the_bytes_it_names() {
+        let root = temp_root("range");
+        let store = FsStorage::new(&root).expect("the root must open");
+        let body = b"omnion range".to_vec();
+        store
+            .put("sites/a/one.bin", &body, "application/octet-stream")
+            .await
+            .expect("the object must be written");
+
+        let head = store
+            .get_range("sites/a/one.bin", 0, 5)
+            .await
+            .expect("a window must read");
+        assert_eq!(head, b"omnion".to_vec(), "the first six bytes");
+
+        let tail = store
+            .get_range("sites/a/one.bin", 7, 11)
+            .await
+            .expect("a window must read");
+        assert_eq!(tail, b"range".to_vec(), "the last five bytes");
+
+        // The whole object, as one window: a range request that covers everything is the same
+        // bytes, which is what a player asks for when it starts playing from the beginning.
+        let whole = store
+            .get_range("sites/a/one.bin", 0, 11)
+            .await
+            .expect("a window must read");
+        assert_eq!(whole, body);
+
+        // A single byte at each end — the two windows a stream reader asks for first.
+        let first = store
+            .get_range("sites/a/one.bin", 0, 0)
+            .await
+            .expect("a one-byte window must read");
+        assert_eq!(first, b"o".to_vec());
+        let last = store
+            .get_range("sites/a/one.bin", 11, 11)
+            .await
+            .expect("a one-byte window must read");
+        assert_eq!(last, b"e".to_vec());
+
+        std::fs::remove_dir_all(&root).expect("the test root must clean up");
+    }
+
+    /// A window past the end is refused rather than silently shortened, and an **empty object**
+    /// has no window at all — a store that answers `416` there is what the route expects, and a
+    /// store that answers an empty slice leaves the caller unable to tell the two apart.
+    #[tokio::test]
+    async fn a_window_past_the_end_is_refused() {
+        let root = temp_root("range-end");
+        let store = FsStorage::new(&root).expect("the root must open");
+        store
+            .put("sites/a/one.bin", b"omnion", "application/octet-stream")
+            .await
+            .expect("the object must be written");
+        store
+            .put("sites/a/empty.bin", b"", "application/octet-stream")
+            .await
+            .expect("the empty object must be written");
+
+        for (start, end) in [(6, 9), (99, 120)] {
+            assert!(
+                matches!(
+                    store.get_range("sites/a/one.bin", start, end).await,
+                    Err(StorageError::RangeNotSatisfiable { .. })
+                ),
+                "bytes={start}-{end} is past the end of a six-byte object"
+            );
+        }
+        assert!(matches!(
+            store.get_range("sites/a/empty.bin", 0, 0).await,
+            Err(StorageError::RangeNotSatisfiable { .. })
+        ));
+
+        // A window whose end runs past the object is clamped, not refused: that is the player
+        // asking for "the rest of this file" and the object being shorter than it believed.
+        let clamped = store
+            .get_range("sites/a/one.bin", 3, 9999)
+            .await
+            .expect("a clamped window must read");
+        assert_eq!(clamped, b"ion".to_vec());
+
         std::fs::remove_dir_all(&root).expect("the test root must clean up");
     }
 }

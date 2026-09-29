@@ -18,6 +18,7 @@ import {
   FileText,
   Fingerprint,
   Globe,
+  HardDriveDownload,
   Images,
   Import,
   KeyRound,
@@ -79,6 +80,10 @@ const NAV = [
   // the two is about to grant a visitor a set of platform permissions.
   { href: "/members", label: "Members", icon: UserRoundCheck },
   { href: "/media", label: "Media", icon: Images },
+  // Backups sit beside Media rather than under Settings: an operator asking "where are my
+  // files and can I get them back" is one question, and burying half of it under a
+  // settings sub-path is what makes somebody believe the platform has no restore point.
+  { href: "/backups", label: "Backups", icon: HardDriveDownload },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under

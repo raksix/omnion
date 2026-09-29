@@ -561,6 +561,44 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "security",
         description: "Change the IP allow and deny lists",
     },
+    // Backup centre (docs/requests/REQ-013). Four powers, and the split is the one the
+    // request draws: **taking** a backup and **overwriting the live platform** are different
+    // powers, and the gap between them is the whole risk of the screen.
+    //
+    // * `backup.read` is the list, the detail, the manifest and the status cards. It is
+    //   safe to grant broadly: knowing when the last backup ran is an operational fact
+    //   every support conversation needs, and knowing it is *old* is the alarm.
+    // * `backup.create` starts a run and re-verifies one. Verifying is here rather than
+    //   under `manage` because it only reads: an account that may ask "is that artifact
+    //   still there?" is not an account that may delete it.
+    // * `backup.restore` is deliberately its own key. A restore overwrites the platform's
+    //   content with an older copy, and the person who holds it should be the same person
+    //   who could delete the backups and start new ones — no more, and the two are
+    //   grantable apart so a site owner can be given both without being given `manage`.
+    // * `backup.manage` is schedules, retention and settings. It does NOT include
+    //   `backup.restore`: a platform where the schedule editor can also overwrite live
+    //   content is a platform where the nightly job and the operator's button are the same
+    //   authority, which is how a retention window becomes an outage.
+    PermissionDef {
+        key: "backup.read",
+        category: "backup",
+        description: "Read backups, their parts, manifests and status",
+    },
+    PermissionDef {
+        key: "backup.create",
+        category: "backup",
+        description: "Run a backup and verify an existing one",
+    },
+    PermissionDef {
+        key: "backup.restore",
+        category: "backup",
+        description: "Restore the platform from a backup",
+    },
+    PermissionDef {
+        key: "backup.manage",
+        category: "backup",
+        description: "Manage backup schedules, retention and destination settings",
+    },
     PermissionDef {
         key: "notifications.read",
         category: "notifications",

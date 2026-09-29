@@ -52,6 +52,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -170,7 +171,9 @@ elif [ -n "$(find apps crates modules database Cargo.toml -newer target/debug/om
   step "building the API (sources or migrations are newer than the binary)"
 fi
 if [ "$NEEDS_BUILD" = "1" ]; then
-  cargo build -p omnion-api
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 # A writer loop on a tight volume builds into a scratch target (CARGO_TARGET_DIR, usually a
 # tmpfs) to keep /mnt/apopic from filling — but pm2 is started from the fixed path below, and

@@ -2551,3 +2551,225 @@ export const REFERRER_POLICIES = [
  * the browser silently drops", and an operator setting 3600 deserves to be told before saving.
  */
 export const MIN_HSTS_MAX_AGE = 15_768_000;
+
+/* ---------------------------------------------------------------------------------------------
+ * Backups (REQ-013)
+ * ------------------------------------------------------------------------------------------- */
+
+/** One part of a run, as the detail screen's table reads it. */
+export interface BackupPart {
+  /** Which part: database, media, configuration, themes or plugins. */
+  part: string;
+  /** queued, running, done or failed. */
+  status: string;
+  /** Things accounted for — rows for `database`, objects for `media`. */
+  item_count: number;
+  /** Bytes the artifact occupies. */
+  size_bytes: number;
+  /** Hex SHA-256 of the artifact. */
+  checksum: string | null;
+  /** The artifact's key inside the run's prefix. */
+  storage_path: string | null;
+  /** Why it failed. */
+  error: string | null;
+  /** Whether the restore wizard may offer this part. */
+  restorable: boolean;
+}
+
+/** One run, as the list and the detail screen read it. */
+export interface BackupRun {
+  /** Run id. */
+  id: string;
+  /** Tenant it belongs to. */
+  organization_id: string | null;
+  /** Operator's label; may be empty. */
+  label: string;
+  /** manual or scheduled. */
+  kind: string;
+  /** The schedule that started it. */
+  schedule_id: string | null;
+  /** The parts it was asked for. */
+  scopes: string[];
+  /** queued, running, succeeded, partial or failed. */
+  status: string;
+  /** Sum of its parts' sizes. */
+  size_bytes: number;
+  /** local or s3. */
+  destination: string;
+  /** Prefix its artifacts live under. */
+  storage_prefix: string;
+  /** SHA-256 over its manifest. */
+  checksum: string | null;
+  /** Whether the prune sweep leaves it alone. */
+  protected: boolean;
+  /** When the prune sweep may remove it. */
+  retain_until: string | null;
+  /** Why it failed. */
+  error: string | null;
+  /** Who started it. */
+  created_by: string | null;
+  /** When it was asked for. */
+  created_at: string;
+  /** When it began producing. */
+  started_at: string | null;
+  /** When it stopped producing. */
+  finished_at: string | null;
+  /** The label, or the created instant when there is no label. */
+  title: string;
+}
+
+/** How many runs are in each state — the filter chips and the status cards read the same object. */
+export interface BackupStatusCounts {
+  /** Waiting to start. */
+  queued: number;
+  /** In flight. */
+  running: number;
+  /** Every part produced its artifact. */
+  succeeded: number;
+  /** Some parts produced theirs, some did not. */
+  partial: number;
+  /** No part produced its artifact. */
+  failed: number;
+}
+
+/** A destination's state, with the probe's verdict. */
+export interface BackupDestination {
+  /** local or s3. */
+  kind: string;
+  /** The absolute root, for a local destination. */
+  local_root: string;
+  /** The bucket prefix, for an s3 destination. */
+  s3_prefix: string | null;
+  /** A secret-store reference — never a value. */
+  credential_ref: string | null;
+  /** Whether the last probe passed. */
+  writable: boolean;
+  /** The operating system's reason when it did not. */
+  reason: string;
+  /** The line the screen shows under the probe result. */
+  message: string;
+  /** none or passphrase. */
+  encryption: string;
+}
+
+/** The four cards at the top of the overview. */
+export interface BackupStatus {
+  /** When the last run that produced artifacts finished. */
+  last_successful_at: string | null;
+  /** That run's id, so the card links to a specific row. */
+  last_successful_id: string | null;
+  /** How long ago that was, in seconds. */
+  last_successful_age_seconds: number | null;
+  /** Total bytes this tenant's backups occupy. */
+  total_size_bytes: number;
+  /** The counts behind the filter chips. */
+  counts: BackupStatusCounts;
+  /** How many backups the prune sweep will never remove. */
+  protected: number;
+  /** The nearest schedule that is due. */
+  next_scheduled_at: string | null;
+  /** The destination's health. */
+  destination: BackupDestination;
+}
+
+/** A page of runs. */
+export interface BackupList {
+  /** The page's rows. */
+  items: BackupRun[];
+  /** How many rows the filters match in total. */
+  total: number;
+  /** The counts behind the chips. */
+  counts: BackupStatusCounts;
+}
+
+/** A run's detail: the row, its parts and its manifest. */
+export interface BackupDetail {
+  /** The run. */
+  backup: BackupRun;
+  /** Its parts, in execution order. */
+  parts: BackupPart[];
+  /** Its manifest, as stored. */
+  manifest: unknown;
+}
+
+/** What a verification pass found. */
+export interface BackupVerification {
+  /** The run that was verified. */
+  backup_id: string;
+  /** Whether every part matched. */
+  clean: boolean;
+  /** Parts whose recorded checksum and size both match. */
+  matched: string[];
+  /** Parts whose recorded checksum does not match. */
+  mismatched: string[];
+  /** Parts that could not be read back at all. */
+  unreadable: string[];
+  /** Artifacts the run never asked for. */
+  unexpected: string[];
+  /** One sentence naming what is wrong rather than only that something is. */
+  summary: string;
+}
+
+/** The result of taking a backup. */
+export interface BackupCreateResult {
+  /** The finished run. */
+  backup: BackupRun;
+  /** Its parts, with the state each reached. */
+  parts: BackupPart[];
+}
+
+/** The settings record. */
+export interface BackupSettings {
+  /** local or s3. */
+  destination: string;
+  /** Absolute root. */
+  local_root: string;
+  /** Bucket prefix. */
+  s3_prefix: string | null;
+  /** A secret-store reference — never a value. */
+  credential_ref: string | null;
+  /** none or passphrase. */
+  encryption: string;
+  /** Default retention for a new schedule. */
+  default_retention: number;
+  /** Whether a run re-reads its own artifacts. */
+  verify_after_backup: boolean;
+  /** When it was last saved. */
+  updated_at: string;
+}
+
+/** A recurring backup definition. */
+export interface BackupSchedule {
+  /** Row id. */
+  id: string;
+  /** Tenant it belongs to. */
+  organization_id: string | null;
+  /** Display name. */
+  name: string;
+  /** hourly, daily, weekly or monthly. */
+  frequency: string;
+  /** Time of day, for everything but hourly. */
+  at_time: string | null;
+  /** Weekday, for weekly only. */
+  day_of_week: number | null;
+  /** Day of the month, for monthly only. */
+  day_of_month: number | null;
+  /** Timezone the schedule is computed in. */
+  timezone: string;
+  /** The parts it produces. */
+  scopes: string[];
+  /** How many of its own runs it keeps. */
+  retention_count: number;
+  /** Destination. */
+  destination: string;
+  /** Whether the worker acts on it. */
+  enabled: boolean;
+  /** When it last ran. */
+  last_run_at: string | null;
+  /** When it next runs. */
+  next_run_at: string | null;
+  /** The run it produced last. */
+  last_backup_id: string | null;
+  /** What the screen says the frequency means, in one sentence. */
+  cadence: string;
+}
