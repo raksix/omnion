@@ -125,6 +125,44 @@ type ErrorBody = {
   };
 };
 
+/** The header the API reads the CSRF token back in, matching `CSRF_HEADER` on the server. */
+const CSRF_COOKIE = "omnion_csrf";
+const CSRF_HEADER = "x-omnion-csrf";
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Read one cookie, tolerating the several-cookie headers and whitespace a browser may send. */
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  for (const part of document.cookie.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+    return decodeURIComponent(part.slice(separator + 1).trim());
+  }
+  return null;
+}
+
+/**
+ * The `x-omnion-csrf` header a state-changing request needs, or nothing.
+ *
+ * The API refuses a cookie-authenticated mutation that carries no token (REQ-012, slice 2), and
+ * the token arrives as a readable cookie at sign-in. So every mutating call has to echo it here —
+ * **one** place, or a second screen that forgot would answer `403 csrf_failed` on a save that
+ * works everywhere else, which is the hardest kind of bug to find from a user's report.
+ *
+ * Read-safe methods send nothing: the server never asks for one, and sending it anyway would put
+ * a token in a request that has no need for it. When the cookie is absent (a server-rendered
+ * first paint, a test double) the header is simply omitted and the server's own refusal — which
+ * names the missing secret, or the missing token — is what the operator sees, rather than a
+ * client-side guess about which of the two it is.
+ */
+function csrfHeader(init: RequestInit): Record<string, string> {
+  const method = (init.method ?? "GET").toUpperCase();
+  if (SAFE_METHODS.has(method)) return {};
+  const token = readCookie(CSRF_COOKIE);
+  return token ? { [CSRF_HEADER]: token } : {};
+}
+
 async function readJson(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text) {
@@ -148,6 +186,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         // Only a JSON body gets the JSON content type: an upload sends `FormData`, and the
         // browser has to set that content type itself — including its multipart boundary.
         ...(typeof init.body === "string" ? { "content-type": "application/json" } : {}),
+        ...csrfHeader(init),
         ...init.headers,
       },
     });
