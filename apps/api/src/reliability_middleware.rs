@@ -275,34 +275,80 @@ where
                 .extensions
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|axum::extract::ConnectInfo(address)| address.ip());
-            if let Some(refusal) =
-                decide_request(&limiter, &parts.method, &parts.uri, &parts.headers, peer).await
-            {
+            let outcome = decide_request(&limiter, &parts.method, &parts.uri, &parts.headers, peer).await;
+            if let Decision::Refused(refusal) = outcome {
                 return Ok(refusal.into_response());
             }
-            inner.call(Request::from_parts(parts, body)).await
+            // The ALLOWED path still owes the caller its budget. `apply_headers` was split out and
+            // documented for exactly this, and returning only a refusal discarded the verdict that
+            // carries the numbers: a client that can see what it has left does not have to spend
+            // the ceiling discovering it, which is the difference between a client that backs off
+            // and one that retries into the refusal. The verdict is returned rather than a bool
+            // because `Unlimited` (no policy) and `Uncounted` (a policy, an unreadable counter)
+            // are both "allowed" and both carry no publishable number — a header here would be a
+            // measurement nobody took, and `apply_headers` refuses to invent one.
+            let response = inner.call(Request::from_parts(parts, body)).await?;
+            Ok(match outcome {
+                Decision::Allowed { verdict, policy } => {
+                    apply_headers(response, &verdict, policy.as_ref(), OffsetDateTime::now_utc())
+                }
+                Decision::Refused(_) => response,
+            })
         })
     }
 }
 
-/// The `429` a refused request gets, or `None` when it may proceed.
+/// What the layer decided about one request.
+///
+/// Two variants rather than an `Option<ApiError>` **plus a side effect**, because the earlier
+/// shape could only express a refusal: the allowed path's verdict was computed, used to decide
+/// "proceed", and then dropped, so the `X-RateLimit-*` contract could not be honoured on a
+/// request that was served. Everything the header needs travels with the decision.
+///
+/// `Debug` only, deliberately: the returned value is matched and then moved, and adding `Clone`
+/// to `ApiError` — a shared error type used by every route in the platform — to satisfy a derive
+/// this enum does not need would be a change to the whole API for a local convenience.
+#[derive(Debug)]
+pub(crate) enum Decision {
+    /// The request may proceed; carry the verdict and the winning policy for the headers.
+    Allowed {
+        verdict: Verdict,
+        policy: Option<LimitPolicy>,
+    },
+    /// The request is refused, with the error to answer it.
+    Refused(ApiError),
+}
+
+/// What this layer decided about one request: it may proceed (with the verdict the headers need),
+/// or it is refused (with the error to answer it).
 pub(crate) async fn decide_request(
     limiter: &PlatformLimiter,
     method: &Method,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
     peer: Option<IpAddr>,
-) -> Option<ApiError> {
+) -> Decision {
     let policies = limiter.current();
     if policies.is_empty() {
         // No budget is written, so there is nothing to spend. The panel says the same thing, and
         // the log line that would explain an outage is not written because this is not one.
-        return None;
+        // `Unlimited` rather than a bare "no policy": it is the answer that carries no number, and
+        // it is what stops the caller from publishing a `Limit: 0` for a deployment nobody capped.
+        return Decision::Allowed {
+            verdict: Verdict::Unlimited,
+            policy: None,
+        };
     }
 
     let path = uri.path();
     if is_exempt_path(path) {
-        return None;
+        // A probe or a public surface is outside the budgets entirely, so it is not merely
+        // "unlimited" — it was never a candidate. Same answer, and the difference is written down
+        // so nobody later reads the exemption as a zero budget.
+        return Decision::Allowed {
+            verdict: Verdict::Unlimited,
+            policy: None,
+        };
     }
 
     // A machine key is not ambient authority, so it does not spend the *user* budget — but it
@@ -332,7 +378,9 @@ pub(crate) async fn decide_request(
         limiter_redis::enforce(&limiter.state.redis(), &policies, &subject, now, limiter.fail_mode).await;
 
     if verdict.is_allowed() {
-        return None;
+        // The verdict travels with the decision. Dropping it here is what made the allowed path
+        // header-less: the numbers existed, `apply_headers` existed, and nothing connected them.
+        return Decision::Allowed { verdict, policy };
     }
 
     let now_stamp = time::OffsetDateTime::now_utc();
@@ -355,7 +403,13 @@ pub(crate) async fn decide_request(
         record_rollup(limiter, rollup).await;
     }
 
-    Some(refusal_error(&verdict, &policies, &subject, counted, now_stamp))
+    Decision::Refused(refusal_error(
+        &verdict,
+        &policies,
+        &subject,
+        counted,
+        now_stamp,
+    ))
 }
 
 /// Count the refusal into this window's rollup, and emit on the window's first one.

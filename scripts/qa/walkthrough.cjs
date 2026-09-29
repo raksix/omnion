@@ -5652,6 +5652,15 @@ async function main() {
     // a settings change the API then refuses on purpose.
     { path: "/observability/alerts", name: "observability-alerts" },
     { path: "/observability/settings", name: "observability-settings" },
+    // The platform-wide rate-limit policies and the dry-run (REQ-127, slice 1) — walked here
+    // and driven by the depth pass below, which creates a policy, proves the dry-run names the
+    // SAME policy the request path resolves, and asserts an over-ceiling reading is refused with
+    // the three `X-RateLimit-*` headers rather than a bare 429.
+    //
+    // It is a separate route from `/settings/security/rate-limits` on purpose: both limiters are
+    // live in the same request chain, and a walk that visited only one of them would leave the
+    // question "which document refused this caller" untested.
+    { path: "/settings/reliability/limits", name: "reliability-limits" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },
