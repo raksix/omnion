@@ -6763,8 +6763,39 @@ async function runIamAuthenticationDepth(page, report) {
     // And it must not claim a claims step that never ran.
     claimsStepPending: samlSteps.includes("claims:pending"),
   });
+  // The removal is a dialog now, and it reads the impact before it offers the button. Waiting on
+  // the panel rather than on a fixed pause: the click below is refused by a 400 ms timeout if
+  // the count has not arrived, and a timed-out click in a pass that swallows errors is a step
+  // that silently stops testing anything.
   await page.locator(`[data-provider-delete="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
+  await page.waitForSelector(`[data-provider-deletion-dialog="qa-saml-${sstamp}"] [data-provider-deletion-count]`, { timeout: 15000 }).catch(() => {});
+  // A provider the pass just created has provisioned nobody, so the delete is NOT blocked and
+  // the repair button must be absent. Asserting its absence is the half that matters: a reassign
+  // button that appears for a provider with nothing to fall back sends an empty batch and is
+  // told `no_subjects`.
+  const unblocked = {
+    dialogOpened: (await page.locator(`[data-provider-deletion-dialog="qa-saml-${sstamp}"]`).count()) > 0,
+    affected: await page
+      .locator(`[data-provider-deletion-dialog="qa-saml-${sstamp}"] [data-provider-deletion-count]`)
+      .first()
+      .getAttribute("data-affected")
+      .catch(() => null),
+    blocked: await page
+      .locator(`[data-provider-deletion-dialog="qa-saml-${sstamp}"] [data-provider-deletion-count]`)
+      .first()
+      .getAttribute("data-blocked")
+      .catch(() => null),
+    offersReassign: (await page.locator(`[data-provider-reassign]`).count()) > 0,
+  };
+  note({
+    step: "deletion-dialog-unblocked",
+    ...unblocked,
+    // The count must be a real number and the block must be derived from it, not hardcoded.
+    countIsZero: unblocked.affected === "0",
+    notBlocked: unblocked.blocked === "false",
+    hidesTheRepair: unblocked.offersReassign === false,
+  });
+  await shot(page, "page-iam-provider-deletion-dialog");
   await page.locator(`[data-provider-delete-confirm="qa-saml-${sstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(1500);
 
@@ -6872,7 +6903,9 @@ async function runIamAuthenticationDepth(page, report) {
   // account, has no client secret at all, and its test is a *ladder* — so connecting one and
   // reading the steps is the only way the screen is actually exercised rather than rendered.
   await page.locator(`[data-provider-delete="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
+  // The dialog reads the impact before it offers the button, so the confirm is waited on rather
+  // than assumed. See the SAML case above for why a fixed pause is the wrong instrument here.
+  await page.waitForSelector(`[data-provider-deletion-dialog="qa-${stamp}"] [data-provider-deletion-count]`, { timeout: 15000 }).catch(() => {});
   await page.locator(`[data-provider-delete-confirm="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
@@ -7001,7 +7034,8 @@ async function runIamAuthenticationDepth(page, report) {
   }
 
   await page.locator(`[data-provider-delete="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(400);
+  // Same wait as the other two removals: the confirm only exists once the impact has arrived.
+  await page.waitForSelector(`[data-provider-deletion-dialog="qa-dir-${dstamp}"] [data-provider-deletion-count]`, { timeout: 15000 }).catch(() => {});
   await page.locator(`[data-provider-delete-confirm="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
