@@ -1690,6 +1690,49 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
     assert_eq!(sibling_rows.len(), 1, "one site, one entry: {}", sibling_view.body);
     assert_eq!(sibling_rows[0]["page_id"], json!(sibling_page_id));
 
+    // **And writes.** The read path was corrected for this account and the four write handlers
+    // were left on `require_organization`, so the queue screen listed a row and then answered 400
+    // `no_organization` to Reschedule and Cancel on that very row — every button on the page dead
+    // for the platform owner, while every test stayed green because their fixtures all carry an
+    // organization. This is the shape that catches it: `create_account(db, None)`, no exception.
+    let owned_entry = scheduled_mine.body["id"].as_str().expect("an entry id").to_owned();
+    let moved_to = (time::OffsetDateTime::now_utc() + time::Duration::hours(9))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let owner_reschedule = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/publishing/queue/{owned_entry}"),
+            Some(&owner_token),
+            Some(json!({ "scheduled_at": moved_to })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_reschedule.status,
+        StatusCode::OK,
+        "an owner must be able to move the entry they just read: {}",
+        owner_reschedule.body
+    );
+    let owner_cancel = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/publishing/queue/{owned_entry}/cancel"),
+            Some(&owner_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        owner_cancel.status,
+        StatusCode::OK,
+        "and to cancel it: {}",
+        owner_cancel.body
+    );
+    assert_eq!(owner_cancel.body["status"], json!("cancelled"));
+
     // Unscoped, an organization account still sees both rows: the queue is a per-site screen and
     // the organization-wide read is the API's own convenience, not a panel path.
     let org_token = fixture.curator().await;

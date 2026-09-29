@@ -826,7 +826,7 @@ pub async fn reschedule_entry(
     Path(id): Path<Uuid>,
     Json(body): Json<RescheduleRequest>,
 ) -> Result<Json<QueueEntryBody>, ApiError> {
-    let organization_id = require_organization(&current)?;
+    let organization_id = entry_in_scope(&state, &current, id).await?;
     let entry = omnion_content::reschedule(
         state.db().pool(),
         organization_id,
@@ -848,7 +848,7 @@ pub async fn cancel_entry(
     current: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<Json<QueueEntryBody>, ApiError> {
-    let organization_id = require_organization(&current)?;
+    let organization_id = entry_in_scope(&state, &current, id).await?;
     let entry = omnion_content::cancel(state.db().pool(), organization_id, id).await?;
     emit(
         &state,
@@ -867,7 +867,7 @@ pub async fn publish_now(
     current: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<Json<QueueEntryBody>, ApiError> {
-    let organization_id = require_organization(&current)?;
+    let organization_id = entry_in_scope(&state, &current, id).await?;
     let entry = omnion_content::find_entry(state.db().pool(), organization_id, id)
         .await?
         .ok_or(ContentError::PublishingEntryNotFound)?;
@@ -891,7 +891,7 @@ pub async fn retry_entry(
     current: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<Json<QueueEntryBody>, ApiError> {
-    let organization_id = require_organization(&current)?;
+    let organization_id = entry_in_scope(&state, &current, id).await?;
     // Retry lands one minute out rather than "now", so a page that failed for a reason which has
     // not been fixed is not republished in the same second by an impatient click.
     let entry = omnion_content::retry(
@@ -998,6 +998,49 @@ async fn menu_in_scope(
         .await?
         .ok_or(ContentError::MenuNotFound)?;
     Ok(found)
+}
+
+/// The organization that owns a queue entry, once the caller has been checked against it.
+///
+/// The queue's four write handlers used to read `current.user.organization_id` directly, which
+/// is a 400 for the platform owner — the one account a fresh installation creates, and the one
+/// account a deployment's own admin uses. The read path was corrected for exactly that case two
+/// ticks ago and the write paths were left behind, so the queue screen could LIST and then refuse
+/// every button on a row it had just shown. Resolving the entry and scoping through
+/// `ensure_same_organization` is the same check the menu and page handlers already use, and it
+/// works for an account that has no organization at all.
+async fn entry_in_scope(
+    state: &AppState,
+    current: &CurrentSession,
+    id: Uuid,
+) -> Result<Uuid, ApiError> {
+    let row: Option<(Uuid,)> = sqlx::query_as("select organization_id from cms_publishing_queue where id = $1")
+        .bind(id)
+        .fetch_optional(state.db().pool())
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("reading the publishing entry: {error}"),
+            )
+        })?;
+    let Some((organization_id,)) = row else {
+        return Err(ContentError::PublishingEntryNotFound.into());
+    };
+    // A cross-tenant caller gets 404, never 403. `ensure_same_organization` answers "this exists
+    // and is not yours", and the difference between that and "there is no such entry" is the
+    // difference between a refusal and an existence oracle: an account from another tenant can
+    // then probe entry ids and learn which are real. The store's own `where organization_id = $1`
+    // had this right for free, which is why the previous implementation returned 404 — this
+    // helper reads the organization and then has to reproduce that concealment by hand.
+    if let Some(own) = current.user.organization_id
+        && own != organization_id
+    {
+        return Err(ContentError::PublishingEntryNotFound.into());
+    }
+    ensure_same_organization(current, Some(organization_id))?;
+    Ok(organization_id)
 }
 
 async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
