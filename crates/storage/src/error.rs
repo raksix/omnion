@@ -21,6 +21,18 @@ pub enum StorageError {
     /// The configuration cannot be used (blank endpoint, unexpected scheme, bad key shape).
     #[error("{0}")]
     Invalid(String),
+    /// The store holds an object that is shorter than the window a caller asked for.
+    ///
+    /// Its own variant rather than a `Provider`, because the caller *can* act on it: the `media`
+    /// row claims a length the object does not have, and the honest answer is a `416` that
+    /// reports the real total rather than a body the client will wait on for ever.
+    #[error("the object store cannot satisfy {requested} of {key:?}")]
+    RangeNotSatisfiable {
+        /// Object key that was addressed.
+        key: String,
+        /// The window the caller asked for, in `bytes=<first>-<last>` form.
+        requested: String,
+    },
     /// The object store could not be reached at all.
     #[error("the object store is unreachable: {0}")]
     Unavailable(String),
@@ -77,5 +89,21 @@ mod tests {
             message: "internal".to_owned(),
         };
         assert!(error.to_string().contains("500"), "rendered: {error}");
+    }
+
+    /// A short read is a *disagreement* the caller has to see, not a transport failure worth
+    /// retrying: the object is there, it is just not as long as the row said.
+    #[test]
+    fn an_unsatisfiable_window_is_not_retryable_and_names_the_window() {
+        let error = StorageError::RangeNotSatisfiable {
+            key: "sites/a/one.mp4".to_owned(),
+            requested: "bytes=900-999".to_owned(),
+        };
+        assert!(!error.is_retryable());
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("bytes=900-999") && rendered.contains("sites/a/one.mp4"),
+            "the error names both the window and the key: {rendered}"
+        );
     }
 }
