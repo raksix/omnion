@@ -36,7 +36,7 @@ use omnion_workflows::{
     StepStatus, TriggerKind, WorkflowDefinition, WorkflowExecution, WorkflowStep,
 };
 use serde_json::{Value, json};
-use time::Duration;
+use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, MutexGuard};
@@ -2370,6 +2370,520 @@ async fn retry_this_node_reruns_one_step_and_sends_no_second_email() {
     .await
     .expect("the audit log is readable");
     assert_eq!(audited, 1, "the retry left exactly one audit row");
+
+    fixture.cleanup().await;
+}
+
+/// *Listen for a real event* (REQ-004 slice 3, criterion 5): a real bus event lands in the
+/// inspector within one matcher tick, and a listener that nobody answers expires leaving no
+/// live row behind.
+///
+/// The criterion is two claims and the walk is shaped to make each of them **fail loudly** if
+/// it is not true:
+///
+/// * *"within one matcher tick"* is asserted as exactly one `matcher::drain` between the arm
+///   and the capture. A second drain would still pass a `captured_at` check, and a listener
+///   that needed two ticks would be a broken one.
+/// * *"leaving no stray token"* is asserted against the **matcher's own predicate**, not
+///   against the row count: `prune` deletes expired rows, but a matcher that filters on
+///   `consumed_at` alone would happily fill a dead row, and only a check that asks "would a
+///   live-listener query still see this?" distinguishes the two. That is why the expired
+///   case drives a *real event* through the matcher and asserts nothing was captured.
+#[tokio::test]
+async fn listen_for_a_real_event_captures_once_then_expires() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let token = login(&fixture.state, &fixture.operator_email).await;
+
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&token),
+            Some(json!({
+                "organization_id": fixture.organization_a,
+                "name": "Listen for a real event",
+                "trigger": { "kind": "event", "event": "page.published" },
+                "steps": [ { "name": "record", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let workflow_id = created.body["id"]
+        .as_str()
+        .expect("a created rule has an id")
+        .to_owned();
+
+    // ---------------------------------------------------------------------------------
+    // The refusals come first, because they are the ones that cost an author 15 minutes
+    // ---------------------------------------------------------------------------------
+    let no_node = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/listen"),
+            Some(&token),
+            Some(json!({ "node_id": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        no_node.status,
+        StatusCode::BAD_REQUEST,
+        "a listener with no node is refused: {}",
+        no_node.body
+    );
+    assert_eq!(no_node.body["error"]["code"], "node_required");
+
+    let unknown = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/listen"),
+            Some(&token),
+            Some(json!({ "node_id": "not-a-node" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "a node that is not on the canvas is refused rather than armed for ever: {}",
+        unknown.body
+    );
+    assert_eq!(unknown.body["error"]["code"], "unknown_node");
+
+    // ---------------------------------------------------------------------------------
+    // Arm, on the rule's real trigger node
+    // ---------------------------------------------------------------------------------
+    let trigger_node = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await
+    .body["graph"]["nodes"][0]["id"]
+        .as_str()
+        .expect("a rule is born with a trigger node")
+        .to_owned();
+
+    let armed = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/listen"),
+            Some(&token),
+            Some(json!({ "node_id": trigger_node })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        armed.status,
+        StatusCode::CREATED,
+        "arming was refused: {}",
+        armed.body
+    );
+    assert_eq!(armed.body["listener"]["status"], "armed", "{}", armed.body);
+    // The window is REQ-004's fifteen minutes, asserted rather than assumed — a constant
+    // that drifts to 5 or 60 is still a "listener" and still passes every other line here.
+    //
+    // Asserted on the **gap between the two timestamps**, not on the countdown. The
+    // countdown is `whole_seconds()` of a window that began microseconds before the read, so
+    // it is 899 by the time the response lands; pinning it to 900 would be asserting a
+    // rounding rule rather than the window, and the gap is the thing the criterion names.
+    let armed_at = OffsetDateTime::parse(
+        armed.body["listener"]["armed_at"]
+            .as_str()
+            .expect("an arming time"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("the arming time is rfc3339, as every timestamp on this API is");
+    let expires_at = OffsetDateTime::parse(
+        armed.body["listener"]["expires_at"]
+            .as_str()
+            .expect("an expiry"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("the expiry is rfc3339");
+    assert_eq!(
+        expires_at - armed_at,
+        time::Duration::minutes(15),
+        "the criterion names fifteen minutes: {}",
+        armed.body
+    );
+    // And the countdown the panel draws is the same window, never negative and never longer.
+    let countdown = armed.body["expires_in_seconds"].as_i64().unwrap_or(-1);
+    assert!(
+        (899..=900).contains(&countdown),
+        "the countdown is the same window, within a second of rounding: {countdown}"
+    );
+    let token_handle = armed.body["token"]
+        .as_str()
+        .expect("arming answers with the token, once")
+        .to_owned();
+
+    // The event name is what the author is told it is waiting for, and it is the trigger's
+    // own `params.event` — not the node's label, which is what an author typed on a card.
+    assert_eq!(
+        armed.body["listener"]["event_name"], "page.published",
+        "the armed row says out loud what it waits for: {}",
+        armed.body
+    );
+
+    // The token is never stored in the clear. This is the check that makes "leaving no
+    // stray token" mean something: a dump of the table hands over no armed listener.
+    let stored: Vec<String> = sqlx::query_scalar(
+        "select token_hash from workflow_test_listeners where workflow_id = $1::uuid",
+    )
+    .bind(&workflow_id)
+    .fetch_all(fixture.state.db().pool())
+    .await
+    .expect("the listener table is readable");
+    assert_eq!(stored.len(), 1, "one armed listener");
+    assert!(
+        !stored[0].contains(&token_handle),
+        "only the hash is stored, never the cleartext token"
+    );
+
+    // ---------------------------------------------------------------------------------
+    // One matcher tick, one real bus event → captured
+    // ---------------------------------------------------------------------------------
+    let event_id = omnion_events::bus::emit(
+        fixture.state.db().pool(),
+        omnion_events::model::NewEvent::new("page.published")
+            .organization(fixture.organization_a)
+            .actor(fixture.accounts[0])
+            .payload(json!({ "page_id": "a-real-page", "slug": "release-notes" })),
+    )
+    .await
+    .expect("the bus must record the event")
+    .event
+    .id;
+
+    let report = omnion_automation::matcher::drain(fixture.state.db().pool(), 100)
+        .await
+        .expect("the matcher must run");
+    assert!(
+        report.evaluated >= 1 && report.matched >= 1,
+        "the rule must have matched the real event: {report:?}"
+    );
+
+    let read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/listeners"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    assert_eq!(read.body["armed"], 0, "the listener is spent: {}", read.body);
+    let captured = read.body["captured"]
+        .as_object()
+        .expect("the read answers with the newest capture, so the panel need not pick it");
+    assert_eq!(captured["status"], "captured", "{captured:?}");
+    assert_eq!(
+        captured["event_id"], event_id,
+        "the capture names the bus event that filled it: {captured:?}"
+    );
+    // The payload is what the author could not otherwise know — this is the whole point of
+    // the feature, so it is asserted rather than left to the panel.
+    assert_eq!(
+        captured["payload"]["slug"], "release-notes",
+        "the captured payload is the real one: {captured:?}"
+    );
+    assert!(
+        captured["payload_text"]
+            .as_str()
+            .is_some_and(|text| text.contains("release-notes")),
+        "the inspector has a readable rendering: {captured:?}"
+    );
+
+    // The token reads its own row back, which is what a caller scripts against.
+    let by_token = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/listeners/{token_handle}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(by_token.status, StatusCode::OK, "{}", by_token.body);
+    assert_eq!(by_token.body["status"], "captured");
+
+    // One shot: a second event does not produce a second capture, and does not resurrect the
+    // spent row.
+    omnion_events::bus::emit(
+        fixture.state.db().pool(),
+        omnion_events::model::NewEvent::new("page.published")
+            .organization(fixture.organization_a)
+            .payload(json!({ "page_id": "a-later-page" })),
+    )
+    .await
+    .expect("the bus must record the second event");
+    omnion_automation::matcher::drain(fixture.state.db().pool(), 100)
+        .await
+        .expect("the second matcher tick must run");
+
+    let after = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/listeners"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        after.body["listeners"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        1,
+        "a second event must not open a second row: {}",
+        after.body
+    );
+    assert_eq!(
+        after.body["captured"]["payload"]["page_id"], "a-real-page",
+        "the first capture is the one that stands: {}",
+        after.body
+    );
+
+    // ---------------------------------------------------------------------------------
+    // The expiry half, against the matcher's own predicate
+    // ---------------------------------------------------------------------------------
+    let expired_armed = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/listen"),
+            Some(&token),
+            Some(json!({ "node_id": trigger_node })),
+        ),
+    )
+    .await;
+    assert_eq!(expired_armed.status, StatusCode::CREATED, "{}", expired_armed.body);
+    let listener_id = Uuid::parse_str(expired_armed.body["listener"]["id"].as_str().expect("id"))
+        .expect("a listener id is a uuid");
+
+    // Close the window by hand. Waiting fifteen minutes is not a thing a walk may do, and
+    // the claim under test is the *predicate* the matcher uses, not the clock.
+    //
+    // **`created_at` moves with it**, and that is the migration's own constraint talking:
+    // `workflow_test_listeners_expiry_after_creation` refuses a row that expires before it
+    // was armed, which is a rule the schema holds against every writer — a sweep that
+    // back-dated `expires_at` alone would hit the same wall, so moving both columns is what
+    // a clock crossing the boundary actually looks like to the database.
+    sqlx::query(
+        "update workflow_test_listeners \
+           set created_at = now() - interval '16 minutes', \
+               expires_at = now() - interval '1 minute' \
+         where id = $1",
+    )
+    .bind(listener_id)
+    .execute(fixture.state.db().pool())
+    .await
+    .expect("the listener row is writable");
+
+    // A real event goes through the real matcher. If the matcher's UPDATE omitted
+    // `expires_at > now()`, this fills a dead row and the panel reports a capture for an
+    // event nobody was watching — the exact failure the criterion's second clause names.
+    omnion_events::bus::emit(
+        fixture.state.db().pool(),
+        omnion_events::model::NewEvent::new("page.published")
+            .organization(fixture.organization_a)
+            .payload(json!({ "page_id": "after-expiry" })),
+    )
+    .await
+    .expect("the bus must record the third event");
+    omnion_automation::matcher::drain(fixture.state.db().pool(), 100)
+        .await
+        .expect("the third matcher tick must run");
+
+    let expired_read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/listeners"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    let expired_row = expired_read.body["listeners"]
+        .as_array()
+        .expect("an array of listeners")
+        .iter()
+        .find(|row| row["id"] == listener_id.to_string())
+        .expect("the expired row is still listed — a row that vanished is indistinguishable \
+                  from one that was never armed");
+    assert_eq!(
+        expired_row["status"], "expired",
+        "an expired listener says so instead of vanishing: {expired_row:?}"
+    );
+    assert!(
+        expired_row["payload"].is_null(),
+        "an expired listener captures nothing: {expired_row:?}"
+    );
+    // The one place a "no stray token" claim is actually proven: the live-listener query the
+    // matcher runs must not see this row, which is the definition of "not armed".
+    let live: i64 = sqlx::query_scalar(
+        "select count(*) from workflow_test_listeners          where workflow_id = $1::uuid and consumed_at is null and expires_at > now()",
+    )
+    .bind(&workflow_id)
+    .fetch_one(fixture.state.db().pool())
+    .await
+    .expect("the listener table is readable");
+    assert_eq!(live, 0, "an expired listener leaves no live token behind");
+
+    // And the panel's own countdown is closed: a negative "expires in −94s" is a number only
+    // a clock comparison produces.
+    assert_eq!(
+        expired_row["expires_in_seconds"], 0,
+        "the countdown never goes negative: {expired_row:?}"
+    );
+
+    // Arming is `workflows.run` and reading is `workflows.read` — the REQ's own split, and
+    // it is asserted from *both* sides because the guard is the only thing standing between
+    // "may start this rule" and "may leave it listening for an event nobody is watching".
+    //
+    // The member of the fixture holds neither key, so both surfaces answer 403. The operator
+    // holds both, which the rest of this walk already proved.
+    let member_token = login(&fixture.state, &fixture.member_email).await;
+    let member_read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/listeners"),
+            Some(&member_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        member_read.status,
+        StatusCode::FORBIDDEN,
+        "reading a rule's listeners needs workflows.read: {}",
+        member_read.body
+    );
+
+    let member_arm = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/listen"),
+            Some(&member_token),
+            Some(json!({ "node_id": trigger_node })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        member_arm.status,
+        StatusCode::FORBIDDEN,
+        "arming needs workflows.run — it is the first half of running the rule for real: {}",
+        member_arm.body
+    );
+
+    // A *different* tenant's rule is not reachable with a valid token either: the guard passes
+    // and the scope check refuses. This is the check that stops a listener from being armed
+    // on somebody else's rule by guessing an id.
+    //
+    // The rule is created by the **platform owner**, because the organization-A operator
+    // cannot create a rule in organization B at all — it is refused at creation with
+    // `cross_organization`. The owner holds the keys across tenants, which is exactly the
+    // power that must then be *withheld* from the operator when it comes to arming.
+    let platform_token = login(&fixture.state, &fixture.platform_email).await;
+    let other_rule = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&platform_token),
+            Some(json!({
+                "organization_id": fixture.organization_b,
+                "name": "Another tenant's rule",
+                "trigger": { "kind": "event", "event": "page.published" },
+                "steps": [ { "name": "record", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(other_rule.status, StatusCode::CREATED, "{}", other_rule.body);
+    let other_id = other_rule.body["id"].as_str().expect("an id").to_owned();
+
+    //
+    // It answers `403 cross_organization` and not `404`, which is the platform's standing
+    // decision for every scoped surface (the scope check runs *after* the rule is found, so
+    // a 404 here would mean "no such rule" — a claim about the id space this API does not
+    // make). What matters for this criterion is that it is **not** a success and not a 200.
+    let across = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{other_id}/listen"),
+            Some(&token),
+            Some(json!({ "node_id": "trigger" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        across.status,
+        StatusCode::FORBIDDEN,
+        "another tenant's rule cannot be armed from here: {}",
+        across.body
+    );
+    assert_eq!(across.body["error"]["code"], "cross_organization");
+    let across_read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{other_id}/listeners"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        across_read.status,
+        StatusCode::FORBIDDEN,
+        "and its listeners are not readable either: {}",
+        across_read.body
+    );
+
+    // The refusal left nothing behind in that tenant — a cross-tenant arm that "failed" but
+    // wrote a row is the failure this whole paragraph exists to prevent.
+    let leaked: i64 = sqlx::query_scalar(
+        "select count(*) from workflow_test_listeners where workflow_id = $1::uuid",
+    )
+    .bind(&other_id)
+    .fetch_one(fixture.state.db().pool())
+    .await
+    .expect("the listener table is readable");
+    assert_eq!(leaked, 0, "a refused arm must leave no row behind");
+
+    // The audit trail names the arming, so "who left this rule listening" is answerable.
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'workflow.listener_armed' \
+         and organization_id = $1",
+    )
+    .bind(fixture.organization_a)
+    .fetch_one(fixture.state.db().pool())
+    .await
+    .expect("the audit log is readable");
+    assert_eq!(audited, 2, "each arming leaves exactly one audit row");
 
     fixture.cleanup().await;
 }
