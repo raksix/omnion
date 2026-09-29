@@ -229,10 +229,18 @@ fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --api "$API_URL" --out "$OUT"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --api "$API_URL" --out "$OUT" ${QA_ONLY:+--only="$QA_ONLY"}
 
-step "vision review"
-node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+# The vision review reads the whole shot set and judges it against the product's visual rules.
+# On a scoped pass that set is a fraction of the screens, so its verdicts describe a product
+# state that does not exist — and it is the slowest step in the pass. Skipping it is honest;
+# running it is a report about a partial set.
+if [ -z "${QA_ONLY:-}" ]; then
+  step "vision review"
+  node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
+else
+  step "vision review (skipped: scoped pass, QA_ONLY=$QA_ONLY)"
+fi
 
 step "summary"
 node -e '
