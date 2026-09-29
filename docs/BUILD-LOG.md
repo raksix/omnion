@@ -3325,3 +3325,85 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 `report.notificationOutbox` to be **present** — that last one is the first pass that can close
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
+
+## wave 4b · REQ-117 slice 3, take two · the autoresponder's send delay (`5733fe9`, `cb87ba9`)
+
+**The block first, because it is the kind of thing that ends a loop.** `/mnt/apopic` was at
+**100%** — 0 bytes free — when this tick started, and the QA pass died on
+`failed to write … rustcIHGU6g/lib.rmeta: No space left on device` two minutes into its
+build. The worktree's own `apps/admin/.next/dev` was 773 MB of dev-server cache and
+`target/debug/incremental` was another slice of the same; those are mine to delete and I
+deleted them, which bought 1.8 GB. **Nothing outside this worktree was touched**: nine writers
+share this disk and six of them had a live cargo in flight.
+
+Two things I did that are worth writing down. The first is that a *tmpfs* `CARGO_TARGET_DIR`
+is a real escape hatch when `/mnt/apopic` is full — `/dev/shm/w8-target` already held a
+**5 GB** build with `omnion-api` linked at 02:09, so when the pass's own `target/` was deleted
+out from under it I copied the binary back and the pass continued. The second is that
+`/dev/shm` is at 94% and holds **seven** per-writer targets (w6 8.2 GB, w3 5.2, w8 5.0, w9
+3.8, w10 2.9, w2 2.8, main 1.8). The tmpfs trick is not a fix, it is a deferral, and the
+box needs either a bigger `/dev/shm` or `disks` space. **This is the second disk-full tick in
+two days and it is the same cause: unbounded per-worktree `target/` on a 60 GB mount.**
+
+**What.** The send delay was a control that reserved nothing. `prepare` took a claim only for
+a message ready *now*, on the reasoning that "the worker will claim the delayed one" — and
+there was no worker, and the one that now exists only *completes* reservations. A source with
+any delay at all answered nobody, on exactly the sources that asked for the reply to wait.
+Every unit test was green throughout: the pure half produced the right verdict and the
+delayed `Message` carried the right `due_at`. The feature was dead on the only path where
+deadness shows.
+
+**Three more defects on the same path, all found the same way — by reading the stored row.**
+
+1. `json!({"due_at": message.due_at})` has no special case for `time::OffsetDateTime`, so it
+   serialises as serde's component **array** (`[2026, 272, 3, 11, 51, 855202933, 0, 0, 0]`)
+   and `detail->>'due_at'` yields NULL for a JSON array. The sweep's predicate matched nothing,
+   for ever. I found this by running `select jsonb_pretty(detail)` — the `psql` output is the
+   only place the struct and the column disagree.
+2. The claim index's predicate `coalesce(detail->>'sent' = 'false', false) = false` is **TRUE
+   for a skip line**, because the comparison is NULL there and `coalesce` maps NULL to false.
+   So `record_skip`'s note occupied the one claim slot a lead has, and a lead whose
+   autoresponder skipped once could never be answered at all.
+3. `existing_claim` ordered by `id desc` alone, so after a skip it returned the **note**, whose
+   missing `sent` key read as "not sent" — the next attempt believed the lead was never
+   answered. `release_claim` and `mark_sent` had the same hole and could complete or delete a
+   note.
+
+The fix for all three is one idea: **a claim row and a note about a claim are different
+rows, and the readers have to say which they want.** The index asks `detail ? 'sent'` — does
+this row claim the send? — and the three readers filter on the same key.
+
+**Renumbered 0057 → 0058.** `origin/wave4` took `0057_sales_order_reservations.sql` while
+this branch was idle. Checking *main's* high-water was not enough; the collision that matters
+is with whoever merges second, so the number has to clear every branch. The same lesson as the
+0051 → 0055 renumber, one level up.
+
+**The index is on the stored STRING, and the first two attempts are worth recording.** A cast
+expression — `(((detail->>'due_at')::timestamptz), id)` — is refused by Postgres with
+`functions in index expression must be marked IMMUTABLE`, correctly: `text::timestamptz` is
+`STABLE`, so the same row could sort to a different instant on two machines. A migration that
+aborts takes the whole worker with it, and one that *had* been accepted would be silently
+wrong. The second attempt, with one pair of parentheses instead of two, is
+`syntax error at or near "->>"`: `on t (a->>'b', id)` parses as a column list with a stray
+operator. The query compares the string too, which is only correct because exactly one
+function writes that key in one fixed-width format.
+
+**Proof.** `run-crm-autoresponder.sh` **10/10**, up from 6. `omnion-module-crm-intake --lib`
+**137**. `omnion-core --lib` **37** (+3 config tests). `run-crm-intake.sh` PASS,
+`run-crm-assignment.sh` **14**, `run-crm-convert.sh` **5**. `clippy` clean on both crates. The
+API builds; its three warnings are pre-existing and live in `routes/notifications*.rs`.
+`strings target/debug/omnion-api | grep crm_lead_autoresponder_due_idx` → 1, so the migration
+really is embedded rather than left behind in a file.
+
+**Not proven, and not claimed.** The browser pass has now been queued for a **fourth** tick
+and has not run; all six screens remain unproven in a browser. The autoresponder's **editor**
+is not on this branch at all — `intake-sources.tsx` has no autoresponder section — so the
+control that configures the template, the subject and the delay is not reachable from any
+screen. That is the next slice and it is a real gap, not a cosmetic one: the feature is
+complete below the UI and invisible above it.
+
+**Next.** Start the pass in the background at the very top of the next tick and let it run the
+whole tick. Then the autoresponder section in the source editor (template picker, subject,
+delay, `Send test to myself`) — the store already exposes `TEMPLATES`, `template_names()` and
+the delay clamp, so the screen is a real form over shipped behaviour rather than a mock.
+REQ-117 stays **in-progress**.
