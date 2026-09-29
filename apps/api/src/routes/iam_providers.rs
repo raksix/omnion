@@ -768,8 +768,6 @@ pub async fn test_provider(
     }))
 }
 
-
-
 /// One sentence for the top of a directory test result.
 ///
 /// The ladder below carries the detail; this is what the panel shows before it, and it has to
@@ -798,8 +796,10 @@ fn directory_detail(outcome: &directory::TestOutcome, bind_present: bool) -> Str
         _ => "every step passed".to_owned(),
     };
     if !bind_present {
-        sentence.push_str(" — the bind password is not defined in this installation, so the bind \
-                           step cannot succeed until it is");
+        sentence.push_str(
+            " — the bind password is not defined in this installation, so the bind \
+                           step cannot succeed until it is",
+        );
     }
     sentence
 }
@@ -882,7 +882,8 @@ async fn set_enabled(
 
     emit(
         state,
-        NewEvent::new("iam.provider_enabled").organization(Some(updated.organization_id))
+        NewEvent::new("iam.provider_enabled")
+            .organization(Some(updated.organization_id))
             .actor(Some(current.user.id))
             .payload(json!({ "provider_id": updated.id, "slug": updated.slug })),
     )
@@ -1058,7 +1059,12 @@ async fn test_oidc(
             ) else {
                 return protocol_steps::TestOutcome::unconfigured(
                     "oidc",
-                    &["issuer", "authorization_endpoint", "token_endpoint", "jwks_uri"],
+                    &[
+                        "issuer",
+                        "authorization_endpoint",
+                        "token_endpoint",
+                        "jwks_uri",
+                    ],
                 );
             };
             let discovery = Discovery {
@@ -1273,10 +1279,19 @@ mod tests {
     #[test]
     fn the_status_chip_distinguishes_disabled_from_degraded() {
         assert_eq!(connection_status(&provider_with(None, false)), "disabled");
-        assert_eq!(connection_status(&provider_with(Some(false), false)), "disabled");
+        assert_eq!(
+            connection_status(&provider_with(Some(false), false)),
+            "disabled"
+        );
         // Enabled and failing is the state worth seeing: it is load-bearing and broken.
-        assert_eq!(connection_status(&provider_with(Some(false), true)), "degraded");
-        assert_eq!(connection_status(&provider_with(Some(true), true)), "enabled");
+        assert_eq!(
+            connection_status(&provider_with(Some(false), true)),
+            "degraded"
+        );
+        assert_eq!(
+            connection_status(&provider_with(Some(true), true)),
+            "enabled"
+        );
         // Never tested but enabled can only happen through a hand-edited row; it is not
         // "degraded" because nothing is known to be wrong.
         assert_eq!(connection_status(&provider_with(None, true)), "enabled");
@@ -1299,7 +1314,12 @@ mod tests {
                 "`{field}` changes what a test would prove"
             );
         }
-        for field in ["name", "default_role_id", "jit_enabled", "sync_interval_minutes"] {
+        for field in [
+            "name",
+            "default_role_id",
+            "jit_enabled",
+            "sync_interval_minutes",
+        ] {
             assert!(
                 !providers::edit_invalidates_test(&[field]),
                 "renaming a provider does not make its last test untrue: `{field}`"
@@ -1351,11 +1371,17 @@ mod tests {
         assert!(ProviderKind::Ldap.is_directory());
         assert!(ProviderKind::ActiveDirectory.is_directory());
         assert!(!ProviderKind::Oidc.is_directory());
-        assert!(!ProviderKind::Ldap.uses_scopes(), "a directory requests no scopes");
+        assert!(
+            !ProviderKind::Ldap.uses_scopes(),
+            "a directory requests no scopes"
+        );
         assert!(ProviderKind::Oidc.uses_scopes());
         // A directory has no authorization-code flow, and naming one anyway would be a lie the
         // challenge table cannot even store.
-        assert_eq!(omnion_identity::sso::oidc::flow_of(ProviderKind::Ldap), "directory");
+        assert_eq!(
+            omnion_identity::sso::oidc::flow_of(ProviderKind::Ldap),
+            "directory"
+        );
         assert!(default_scopes(ProviderKind::ActiveDirectory).is_empty());
     }
 

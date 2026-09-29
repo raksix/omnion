@@ -133,19 +133,21 @@ impl DirectoryConfig {
             bind_dn: text("bind_dn").unwrap_or_default(),
             bind_secret_ref: text("bind_secret_ref").unwrap_or_default(),
             base_dn: text("base_dn").unwrap_or_default(),
-            user_filter: text("user_filter")
-                .unwrap_or_else(|| "(objectClass=person)".to_owned()),
+            user_filter: text("user_filter").unwrap_or_else(|| "(objectClass=person)".to_owned()),
             group_filter: Some(
                 text("group_filter").unwrap_or_else(|| "(objectClass=group)".to_owned()),
             ),
-            group_depth_cap: number("group_depth_cap")
-                .map_or(DEFAULT_GROUP_DEPTH_CAP, |value| value.min(u64::from(MAX_GROUP_DEPTH)) as u8),
-            subject_cap: number("subject_cap")
-                .map_or(DEFAULT_SUBJECT_CAP, |value| value.min(u64::from(MAX_SUBJECT_CAP)) as u32),
+            group_depth_cap: number("group_depth_cap").map_or(DEFAULT_GROUP_DEPTH_CAP, |value| {
+                value.min(u64::from(MAX_GROUP_DEPTH)) as u8
+            }),
+            subject_cap: number("subject_cap").map_or(DEFAULT_SUBJECT_CAP, |value| {
+                value.min(u64::from(MAX_SUBJECT_CAP)) as u32
+            }),
             verify_tls: flag("verify_tls").unwrap_or(true),
             allow_insecure: flag("allow_insecure").unwrap_or(false),
-            page_size: number("page_size")
-                .map_or(DEFAULT_PAGE_SIZE, |value| value.min(u64::from(MAX_PAGE_SIZE)) as u16),
+            page_size: number("page_size").map_or(DEFAULT_PAGE_SIZE, |value| {
+                value.min(u64::from(MAX_PAGE_SIZE)) as u16
+            }),
         })
     }
 
@@ -277,8 +279,10 @@ impl DirectoryConfig {
             // that is the wrong person getting in.
             problems.push(ConfigProblem::new(
                 "user_filter",
-                format!("the user filter must contain `{USERNAME_PLACEHOLDER}`, otherwise every \
-                         sign-in would match every person in the directory"),
+                format!(
+                    "the user filter must contain `{USERNAME_PLACEHOLDER}`, otherwise every \
+                         sign-in would match every person in the directory"
+                ),
                 Problem::Invalid,
             ));
         } else if let Some(message) = unbalanced_filter(&self.user_filter) {
@@ -288,7 +292,11 @@ impl DirectoryConfig {
         if let Some(filter) = self.group_filter.as_deref()
             && let Some(message) = unbalanced_filter(filter)
         {
-            problems.push(ConfigProblem::new("group_filter", message, Problem::Invalid));
+            problems.push(ConfigProblem::new(
+                "group_filter",
+                message,
+                Problem::Invalid,
+            ));
         }
 
         if self.group_depth_cap == 0 {
@@ -682,11 +690,16 @@ pub fn test_steps(config: &DirectoryConfig) -> TestOutcome {
         .iter()
         .copied()
         .filter(|step| {
-            *step != TestStep::Tls || config.is_secure() || problems.is_empty() && config.is_secure()
+            *step != TestStep::Tls
+                || config.is_secure()
+                || problems.is_empty() && config.is_secure()
         })
         .collect();
 
-    let mut reports = steps.into_iter().map(StepReport::pending).collect::<Vec<_>>();
+    let mut reports = steps
+        .into_iter()
+        .map(StepReport::pending)
+        .collect::<Vec<_>>();
 
     // The first problem decides the first step that can even be attempted: there is no point
     // resolving a name when there is no name.
@@ -699,8 +712,7 @@ pub fn test_steps(config: &DirectoryConfig) -> TestOutcome {
             _ => continue,
         };
         if let Some(position) = reports.iter().position(|report| report.step == step) {
-            reports[position] =
-                StepReport::done(step, "failed", problem.message.clone());
+            reports[position] = StepReport::done(step, "failed", problem.message.clone());
             blocked_at.get_or_insert(step);
         }
     }
@@ -849,7 +861,10 @@ mod tests {
         let config = DirectoryConfig::from_value(&json!({ "issuer": "https://idp.example" }))
             .expect("unknown keys are ignored");
         assert_eq!(config, DirectoryConfig::default());
-        assert!(!config.validate().is_empty(), "a blank directory is not a valid directory");
+        assert!(
+            !config.validate().is_empty(),
+            "a blank directory is not a valid directory"
+        );
     }
 
     #[test]
@@ -860,7 +875,9 @@ mod tests {
         };
         let problems = config.validate();
         assert!(
-            problems.iter().any(|problem| problem.field == "user_filter"),
+            problems
+                .iter()
+                .any(|problem| problem.field == "user_filter"),
             "a constant filter would match every person in the directory: {problems:?}"
         );
     }
@@ -895,9 +912,18 @@ mod tests {
             None,
             "a balanced filter is not a problem"
         );
-        assert!(unbalanced_filter("(uid=x").is_some(), "an unclosed bracket is refused");
-        assert!(unbalanced_filter("uid=x)").is_some(), "a stray close is refused");
-        assert!(unbalanced_filter("(uid=\\)").is_some(), "a trailing escape is refused");
+        assert!(
+            unbalanced_filter("(uid=x").is_some(),
+            "an unclosed bracket is refused"
+        );
+        assert!(
+            unbalanced_filter("uid=x)").is_some(),
+            "a stray close is refused"
+        );
+        assert!(
+            unbalanced_filter("(uid=\\)").is_some(),
+            "a trailing escape is refused"
+        );
         // Same number of opens and closes, still broken: only the scan sees this.
         assert!(
             unbalanced_filter("(a)(b(").is_some(),
@@ -952,7 +978,8 @@ mod tests {
         assert!(
             problems
                 .iter()
-                .any(|problem| problem.field == "allow_insecure" && problem.kind == Problem::Conflict),
+                .any(|problem| problem.field == "allow_insecure"
+                    && problem.kind == Problem::Conflict),
             "an IP has no name to match a certificate against: {problems:?}"
         );
     }
@@ -1023,7 +1050,10 @@ mod tests {
     #[test]
     fn a_service_account_outside_the_declared_subtree_is_visible() {
         let mut config = valid();
-        assert!(!config.bind_within_base(), "the service account is not under ou=people");
+        assert!(
+            !config.bind_within_base(),
+            "the service account is not under ou=people"
+        );
         config.base_dn = "dc=example,dc=com".to_owned();
         assert!(config.bind_within_base());
         // Case and spacing are the directory's business, not the operator's.
@@ -1058,20 +1088,33 @@ mod tests {
 
     #[test]
     fn an_ad_account_is_disabled_by_a_bit_not_by_a_number() {
-        assert!(DirectoryConfig::ad_account_disabled(0x2), "the plain disabled flag");
+        assert!(
+            DirectoryConfig::ad_account_disabled(0x2),
+            "the plain disabled flag"
+        );
         assert!(
             DirectoryConfig::ad_account_disabled(0x0200 | 0x2),
             "a normal account also carries the 'not required to change password' bit"
         );
-        assert!(!DirectoryConfig::ad_account_disabled(512), "512 alone is not disabled");
-        assert!(!DirectoryConfig::ad_account_disabled(0), "0 is an enabled account");
+        assert!(
+            !DirectoryConfig::ad_account_disabled(512),
+            "512 alone is not disabled"
+        );
+        assert!(
+            !DirectoryConfig::ad_account_disabled(0),
+            "0 is an enabled account"
+        );
     }
 
     #[test]
     fn each_kind_matches_the_login_attribute_its_server_uses() {
         let mut config = valid();
         assert_eq!(config.login_attribute(), "uid");
-        assert_eq!(config.disabled_attribute(), None, "plain LDAP has no such flag");
+        assert_eq!(
+            config.disabled_attribute(),
+            None,
+            "plain LDAP has no such flag"
+        );
 
         config.kind = DirectoryKind::ActiveDirectory;
         assert_eq!(config.login_attribute(), "userPrincipalName");

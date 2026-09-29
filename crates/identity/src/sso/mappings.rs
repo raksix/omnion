@@ -65,8 +65,7 @@ impl From<Row> for StoredMapping {
         // visible and fixable rather than fatal.
         let mapping = AttributeMapping {
             source_attr: row.source_attr,
-            target_field: TargetField::parse(&row.target_field)
-                .unwrap_or(TargetField::Email),
+            target_field: TargetField::parse(&row.target_field).unwrap_or(TargetField::Email),
             transform: Transform::parse(&row.transform).unwrap_or(Transform::None),
             transform_arg: row.transform_arg,
             required: row.required,
@@ -171,10 +170,11 @@ pub async fn replace_map(
 
 /// How many rows a provider's map carries — the editor's badge.
 pub async fn count_mappings(pool: &PgPool, provider_id: Uuid) -> Result<i64> {
-    let count: i64 =
-        sqlx::query_scalar("select count(*) from provider_attribute_mappings where provider_id = $1")
-            .bind(provider_id)
-            .fetch_one(pool)
-            .await?;
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from provider_attribute_mappings where provider_id = $1",
+    )
+    .bind(provider_id)
+    .fetch_one(pool)
+    .await?;
     Ok(count)
 }

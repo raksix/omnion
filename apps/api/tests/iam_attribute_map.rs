@@ -64,12 +64,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-fn request(
-    method: Method,
-    uri: &str,
-    session: Option<&str>,
-    body: Option<Value>,
-) -> Request<Body> {
+fn request(method: Method, uri: &str, session: Option<&str>, body: Option<Value>) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(credential) = session {
         builder = if credential.starts_with("omnion_session=") {
@@ -133,7 +128,9 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let mut organizations = Vec::new();
         let mut sessions = Vec::new();
@@ -374,7 +371,11 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
         .iter()
         .map(|row| row["position"].as_i64().expect("a position"))
         .collect();
-    assert_eq!(positions, vec![0, 1, 2, 3], "positions are renumbered on write");
+    assert_eq!(
+        positions,
+        vec![0, 1, 2, 3],
+        "positions are renumbered on write"
+    );
 
     // --- 3. A replacement is a replacement, not an append --------------------------------------
     let shorter = json!({ "mappings": [
@@ -433,15 +434,31 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
     // value is all-lowercase. An assertion written with a capital F tests the author's memory
     // of the sample rather than the projection, and it fails for a reason that looks like a
     // product bug while being entirely the test's.
-    assert!(values.contains(&("email".to_owned(), "furkan@example.com".to_owned())), "{values:?}");
-    assert!(values.contains(&("display_name".to_owned(), "Furkan".to_owned())), "{values:?}");
+    assert!(
+        values.contains(&("email".to_owned(), "furkan@example.com".to_owned())),
+        "{values:?}"
+    );
+    assert!(
+        values.contains(&("display_name".to_owned(), "Furkan".to_owned())),
+        "{values:?}"
+    );
     // A multi-valued attribute reads its first usable member, and a number is a valid id.
-    assert!(values.contains(&("department".to_owned(), "Platform".to_owned())), "{values:?}");
-    assert!(values.contains(&("employee_id".to_owned(), "4812".to_owned())), "{values:?}");
+    assert!(
+        values.contains(&("department".to_owned(), "Platform".to_owned())),
+        "{values:?}"
+    );
+    assert!(
+        values.contains(&("employee_id".to_owned(), "4812".to_owned())),
+        "{values:?}"
+    );
 
     // --- 5. A missing required field refuses by name -----------------------------------------
     let incomplete = fixture
-        .preview(provider, &session, json!({ "sub": "1", "given_name": "Nobody" }))
+        .preview(
+            provider,
+            &session,
+            json!({ "sub": "1", "given_name": "Nobody" }),
+        )
         .await;
     assert_eq!(incomplete.status, StatusCode::OK, "{}", incomplete.body);
     assert_eq!(
@@ -473,7 +490,12 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
             ]}),
         )
         .await;
-    assert_eq!(no_email.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", no_email.body);
+    assert_eq!(
+        no_email.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        no_email.body
+    );
     // The refusal names the missing field. Errors arrive in the `{error:{code,message}}`
     // envelope every other walk reads, so the message is two levels down — reading
     // `body["message"]` here would have tested `Null`, which is a passing assertion about
@@ -498,7 +520,12 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
             ]}),
         )
         .await;
-    assert_eq!(duplicate.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", duplicate.body);
+    assert_eq!(
+        duplicate.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        duplicate.body
+    );
     assert!(
         duplicate.body["error"]["message"]
             .as_str()
@@ -518,7 +545,12 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
             ]}),
         )
         .await;
-    assert_eq!(no_argument.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", no_argument.body);
+    assert_eq!(
+        no_argument.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        no_argument.body
+    );
 
     // An unknown field, and a field the platform does not have.
     let unknown_field = fixture
@@ -530,7 +562,12 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
             ]}),
         )
         .await;
-    assert_eq!(unknown_field.status, StatusCode::BAD_REQUEST, "{}", unknown_field.body);
+    assert_eq!(
+        unknown_field.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        unknown_field.body
+    );
 
     let unknown_transform = fixture
         .put_map(
@@ -567,13 +604,14 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
         cleared.body
     );
     let after_clear = fixture.map_of(provider, &session).await;
-    assert_eq!(after_clear.body["mappings"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        after_clear.body["mappings"].as_array().map(Vec::len),
+        Some(0)
+    );
 
     // --- 8. The cross-tenant case: absent, not forbidden --------------------------------------
     // A provider id is not a secret, so the answer must not distinguish "exists" from "not mine".
-    let foreign = fixture
-        .map_of(fixture.foreign_provider, &session)
-        .await;
+    let foreign = fixture.map_of(fixture.foreign_provider, &session).await;
     assert_eq!(
         foreign.status,
         StatusCode::NOT_FOUND,
@@ -590,7 +628,12 @@ async fn the_attribute_map_replaces_atomically_previews_and_refuses() {
     let not_an_object = fixture
         .preview(provider, &session, json!("a string, not a claims object"))
         .await;
-    assert_eq!(not_an_object.status, StatusCode::BAD_REQUEST, "{}", not_an_object.body);
+    assert_eq!(
+        not_an_object.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        not_an_object.body
+    );
 
     // --- 10. The audit entry records the shape, not the rows -----------------------------------
     // The fields that changed, and nothing else: a department and an employee number are personal

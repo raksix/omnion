@@ -900,7 +900,8 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert_eq!(
-        enable.status, StatusCode::BAD_REQUEST,
+        enable.status,
+        StatusCode::BAD_REQUEST,
         "an untested provider cannot be switched on, and the refusal names the reason: {}",
         enable.body
     );
@@ -939,8 +940,10 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert_eq!(
-        still_off.status, StatusCode::BAD_REQUEST,
-        "a test that did not pass leaves the provider off: {}", still_off.body
+        still_off.status,
+        StatusCode::BAD_REQUEST,
+        "a test that did not pass leaves the provider off: {}",
+        still_off.body
     );
     assert_eq!(still_off.body["error"]["code"], json!("provider_not_ready"));
 
@@ -958,12 +961,14 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
     )
     .await;
     assert_eq!(
-        redirect.status, StatusCode::NOT_FOUND,
+        redirect.status,
+        StatusCode::NOT_FOUND,
         "an unreachable, unproven provider is refused at the start route: {}",
         redirect.body
     );
     assert_eq!(
-        redirect.body["error"]["code"], json!("provider_disabled"),
+        redirect.body["error"]["code"],
+        json!("provider_disabled"),
         "and the refusal names the cause for the operator while the status stays indistinguishable \
          from an unknown provider"
     );

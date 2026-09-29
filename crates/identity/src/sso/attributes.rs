@@ -338,6 +338,34 @@ impl AttributeMapping {
         }
     }
 
+    /// Every value a claim path resolves to, not just the first.
+    ///
+    /// [`Self::read`] is deliberately first-value-wins: a *mapping* row writes one panel field, so
+    /// two candidates is an ambiguity to be resolved by a transform. A *role rule* has the
+    /// opposite problem — "is this person in `staff`" is true when `staff` is anywhere in a
+    /// multi-valued claim, and a rule engine that only saw the first member would match one
+    /// directory and silently never match the next.
+    ///
+    /// The literal key is tried **before** the dotted path, and that order is a fix rather than a
+    /// convenience. Claim names are routinely URIs — `https://claims.example.com/team` is a real
+    /// one in the wild — and a dotted-path reader splits `https://claims.example.com/team` on its
+    /// dots into five segments and then fails to find any of them. A rule on a URI-named claim
+    /// would silently never match, which reads to an operator as "the rule is wrong" and sends
+    /// them to edit a rule that was correct. An exact key is the specific case and the path is the
+    /// fallback, so `department` still reaches `{"user": {"department": …}}` while a URI claim
+    /// reaches itself.
+    #[must_use]
+    pub fn values_at_path(source: &Value, path: &str) -> Vec<String> {
+        let path = path.trim();
+        if let Some(exact) = source.get(path) {
+            return flatten_values(exact);
+        }
+        match super::claims::value_at_path(source, path) {
+            Some(raw) => flatten_values(&raw),
+            None => Vec::new(),
+        }
+    }
+
     /// The transformed value for this row, or `None` when the source carries nothing.
     ///
     /// [`Transform::Static`] is the one case that answers even for a claim the payload does not
@@ -394,7 +422,8 @@ impl AttributeMap {
             Value::Null => &[],
             _ => {
                 return Err(IdentityError::InvalidProvider(
-                    "the attribute map must be an array, or an object with a `mappings` array".into(),
+                    "the attribute map must be an array, or an object with a `mappings` array"
+                        .into(),
                 ));
             }
         };
@@ -577,6 +606,31 @@ impl Projection {
     }
 }
 
+/// Flatten a claim value into the strings a comparison may read.
+///
+/// Directory payloads are not consistent about shape: the same attribute arrives as `"Staff"` from
+/// one provider, `["Staff"]` from another, and `{"value": "Staff"}` from a third. A rule engine
+/// that only understands strings matches the first provider and silently never matches the other
+/// two — a failure that looks exactly like "the rule is wrong" and sends the operator to edit a
+/// rule that was correct all along. Numbers and booleans are included for the same reason: a
+/// department that is an integer is still a department.
+#[must_use]
+pub fn flatten_values(value: &Value) -> Vec<String> {
+    match value {
+        Value::String(text) => vec![text.clone()],
+        Value::Number(number) => vec![number.to_string()],
+        Value::Bool(flag) => vec![flag.to_string()],
+        Value::Array(items) => items.iter().flat_map(flatten_values).collect(),
+        // SCIM and several directories wrap single values in `{ "value": … }`.
+        Value::Object(map) => map
+            .get("value")
+            .or_else(|| map.get("values"))
+            .map(flatten_values)
+            .unwrap_or_default(),
+        Value::Null => Vec::new(),
+    }
+}
+
 /// One problem with the map, attached to the input that owns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MapProblem {
@@ -645,16 +699,16 @@ fn mapping_from_value(value: &Value, index: usize) -> Result<AttributeMapping> {
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
 
-    let position = object
-        .get("position")
-        .and_then(Value::as_i64)
-        .map_or(Ok(i32::try_from(index).unwrap_or(i32::MAX)), |value| {
+    let position = object.get("position").and_then(Value::as_i64).map_or(
+        Ok(i32::try_from(index).unwrap_or(i32::MAX)),
+        |value| {
             i32::try_from(value).map_err(|_| {
                 IdentityError::InvalidProvider(format!(
                     "mapping {index}: `position` is out of range"
                 ))
             })
-        })?;
+        },
+    )?;
 
     Ok(AttributeMapping {
         source_attr,
@@ -791,7 +845,10 @@ mod tests {
     fn split_with_no_argument_defaults_to_a_comma_and_is_not_an_error() {
         let mut mapping = row("mail", TargetField::Email);
         mapping.transform = Transform::Split;
-        assert!(mapping.validate().is_empty(), "an empty split argument is a default");
+        assert!(
+            mapping.validate().is_empty(),
+            "an empty split argument is a default"
+        );
         assert_eq!(
             mapping.apply(&json!({ "mail": "first@x.com,second@x.com" })),
             Some("first@x.com".to_owned())
@@ -870,7 +927,12 @@ mod tests {
         let right = AttributeMap::from_value(&wrapped).expect("wrapped");
         assert_eq!(left, right);
         // And an absent `mappings` is an empty map, not a 400: clearing the map is a real action.
-        assert!(AttributeMap::from_value(&json!({})).expect("empty").rows.is_empty());
+        assert!(
+            AttributeMap::from_value(&json!({}))
+                .expect("empty")
+                .rows
+                .is_empty()
+        );
     }
 
     #[test]
@@ -887,9 +949,14 @@ mod tests {
 
     #[test]
     fn an_empty_map_is_valid_json_and_an_invalid_shape_is_named() {
-        assert!(AttributeMap::from_value(&Value::Null).expect("null").rows.is_empty());
-        let error = AttributeMap::from_value(&json!({ "mappings": "nope" }))
-            .expect_err("string mappings");
+        assert!(
+            AttributeMap::from_value(&Value::Null)
+                .expect("null")
+                .rows
+                .is_empty()
+        );
+        let error =
+            AttributeMap::from_value(&json!({ "mappings": "nope" })).expect_err("string mappings");
         assert!(error.to_string().contains("must be an array"), "{error}");
     }
 

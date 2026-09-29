@@ -32,6 +32,8 @@ pub mod oidc;
 pub mod protocol_steps;
 pub mod providers;
 pub mod provisioning;
+pub mod role_rule_store;
+pub mod role_rules;
 pub mod saml;
 
 pub use attributes::{

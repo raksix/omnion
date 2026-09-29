@@ -764,7 +764,9 @@ mod tests {
         let detail = &outcome.steps[0].detail;
         assert!(detail.contains("certificate"), "{detail}");
         assert!(
-            outcome.steps[1..].iter().all(|step| step.status == "pending"),
+            outcome.steps[1..]
+                .iter()
+                .all(|step| step.status == "pending"),
             "nothing after an unreadable certificate may claim to have run"
         );
     }

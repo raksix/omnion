@@ -1294,15 +1294,14 @@ async fn discovery_for(provider: &AuthProvider) -> Result<Discovery, ApiError> {
     // cache makes that concrete — a document fetched once is served to every later sign-in, so a
     // mismatch the `Test connection` button reports and the callback ignores is a mismatch an
     // operator has been told about and nothing has acted on. Same function, same verdict.
-    protocol_steps::require_issuer(&discovery, config_text(provider, "issuer").as_deref()).map_err(
-        |error| {
+    protocol_steps::require_issuer(&discovery, config_text(provider, "issuer").as_deref())
+        .map_err(|error| {
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "provider_misconfigured",
                 error.to_string(),
             )
-        },
-    )?;
+        })?;
     cache.put(&key, document);
     Ok(discovery)
 }

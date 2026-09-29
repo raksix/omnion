@@ -78,10 +78,11 @@ pub mod content;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
-pub mod iam_policy;
 pub mod iam_attribute_mappings;
+pub mod iam_policy;
 pub mod iam_providers;
 pub mod iam_provisioning;
+pub mod iam_role_rules;
 pub mod iam_security;
 pub mod iam_subjects;
 pub mod me;
@@ -291,8 +292,8 @@ pub fn router(state: AppState) -> Router {
     // blocking the safe direction as well (REQ-065).
     let iam_provider_enable =
         post(iam_providers::enable_provider).layer(guards::require(&state, "iam.providers.manage"));
-    let iam_provider_disable =
-        post(iam_providers::disable_provider).layer(guards::require(&state, "iam.providers.manage"));
+    let iam_provider_disable = post(iam_providers::disable_provider)
+        .layer(guards::require(&state, "iam.providers.manage"));
 
     let iam_provider_events = get(iam_providers::list_provider_events)
         .layer(guards::require(&state, "iam.providers.read"));
@@ -300,17 +301,26 @@ pub fn router(state: AppState) -> Router {
     // The attribute map (REQ-065, slice 2). Reading it and rehearsing it is `read` — a preview
     // writes nothing — while replacing it is `manage`, because the map decides which claim becomes
     // somebody's email address.
-    let iam_provider_attribute_mappings =
-        get(iam_attribute_mappings::get_attribute_mappings)
-            .layer(guards::require(&state, "iam.providers.read"))
-            .merge(
-                put(iam_attribute_mappings::replace_attribute_mappings)
-                    .layer(guards::require(&state, "iam.providers.manage")),
-            );
-    let iam_provider_attribute_preview = post(
-        iam_attribute_mappings::preview_attribute_mappings,
-    )
-    .layer(guards::require(&state, "iam.providers.read"));
+    let iam_provider_attribute_mappings = get(iam_attribute_mappings::get_attribute_mappings)
+        .layer(guards::require(&state, "iam.providers.read"))
+        .merge(
+            put(iam_attribute_mappings::replace_attribute_mappings)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        );
+    let iam_provider_attribute_preview = post(iam_attribute_mappings::preview_attribute_mappings)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    // The role rules (REQ-065, slice 3). Same split as the attribute map and for the same reason:
+    // reading the set and rehearsing it write nothing, so they are `read`, while replacing it is
+    // `manage`, because the rules decide which role a verified directory identity is granted.
+    let iam_provider_role_rules = get(iam_role_rules::get_role_rules)
+        .layer(guards::require(&state, "iam.providers.read"))
+        .merge(
+            put(iam_role_rules::replace_role_rules)
+                .layer(guards::require(&state, "iam.providers.manage")),
+        );
+    let iam_provider_role_rule_preview = post(iam_role_rules::preview_role_rules)
+        .layer(guards::require(&state, "iam.providers.read"));
 
     // The public sign-in surface: no guard, because there is no session yet — the same reason
     // `auth/login` and `auth/mfa/verify` carry none. `sso/{slug}/saml` is the panel page a SAML
@@ -1079,6 +1089,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/iam/providers/{id}/attribute-mappings/preview",
             iam_provider_attribute_preview,
+        )
+        .route("/iam/providers/{id}/role-rules", iam_provider_role_rules)
+        .route(
+            "/iam/providers/{id}/role-rules/preview",
+            iam_provider_role_rule_preview,
         )
         .route("/scim/v2/ServiceProviderConfig", scim_config)
         .route("/scim/v2/Schemas", scim_schemas)

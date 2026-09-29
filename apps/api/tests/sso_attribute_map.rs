@@ -97,7 +97,12 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-fn session_request(method: Method, uri: &str, session: Option<&str>, body: Option<Value>) -> Request<Body> {
+fn session_request(
+    method: Method,
+    uri: &str,
+    session: Option<&str>,
+    body: Option<Value>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(credential) = session {
         builder = if credential.starts_with("omnion_session=") {
@@ -221,7 +226,9 @@ impl Fixture {
             redis,
             test_storage(),
         );
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         // Everything this walk owns is marked with a prefix and cleared only by that prefix, so
         // a suite sharing the database is never touched. The addresses are fixed so a run that
@@ -356,13 +363,11 @@ impl Fixture {
 
     /// Every account this organization holds whose address came from the provider.
     async fn provisioned_addresses(&self) -> Vec<String> {
-        sqlx::query_scalar(
-            "select email from users where organization_id = $1 order by created_at",
-        )
-        .bind(self.organization_id)
-        .fetch_all(self.db.pool())
-        .await
-        .expect("the address list must read")
+        sqlx::query_scalar("select email from users where organization_id = $1 order by created_at")
+            .bind(self.organization_id)
+            .fetch_all(self.db.pool())
+            .await
+            .expect("the address list must read")
     }
 
     /// Remove everything carrying this walk's prefix. Scoped like the setup, so a suite sharing
@@ -424,8 +429,10 @@ async fn connect(fixture: &Fixture, cookie: &str, idp: &StubIdp) -> Uuid {
     )
     .await;
     assert_eq!(
-        response.status, StatusCode::CREATED,
-        "connect: {}", response.body
+        response.status,
+        StatusCode::CREATED,
+        "connect: {}",
+        response.body
     );
     let id = response.body["id"]
         .as_str()
@@ -446,8 +453,10 @@ async fn connect(fixture: &Fixture, cookie: &str, idp: &StubIdp) -> Uuid {
     )
     .await;
     assert_eq!(
-        early.status, StatusCode::BAD_REQUEST,
-        "a provider that has never passed a test stays off: {}", early.body
+        early.status,
+        StatusCode::BAD_REQUEST,
+        "a provider that has never passed a test stays off: {}",
+        early.body
     );
     assert_eq!(early.body["error"]["code"], json!("provider_not_ready"));
 
@@ -466,7 +475,8 @@ async fn connect(fixture: &Fixture, cookie: &str, idp: &StubIdp) -> Uuid {
     assert_eq!(
         tested.body["status"],
         json!("ok"),
-        "discovery answered and the JWKS is readable: {}", tested.body
+        "discovery answered and the JWKS is readable: {}",
+        tested.body
     );
 
     let published = call(
@@ -480,8 +490,10 @@ async fn connect(fixture: &Fixture, cookie: &str, idp: &StubIdp) -> Uuid {
     )
     .await;
     assert_eq!(
-        published.status, StatusCode::OK,
-        "a tested provider may be switched on: {}", published.body
+        published.status,
+        StatusCode::OK,
+        "a tested provider may be switched on: {}",
+        published.body
     );
     id
 }
@@ -576,12 +588,24 @@ async fn the_attribute_map_decides_who_a_live_sign_in_becomes() {
         ),
     )
     .await;
-    assert_eq!(mapped.status, StatusCode::OK, "the map must be saved: {}", mapped.body);
+    assert_eq!(
+        mapped.status,
+        StatusCode::OK,
+        "the map must be saved: {}",
+        mapped.body
+    );
 
     // The same provider, a *different* person: the mapped address can only appear if the
     // callback read the map, because the stub asserts the claim address and the map says
     // `name` is the email.
-    let second = sign_in(&fixture, &idp, "stub-mapped-2", "sso-map-second-claim@omnion.test", MAPPED_EMAIL).await;
+    let second = sign_in(
+        &fixture,
+        &idp,
+        "stub-mapped-2",
+        "sso-map-second-claim@omnion.test",
+        MAPPED_EMAIL,
+    )
+    .await;
     assert!(
         second.status.is_success(),
         "a mapped provider signs the person in: {}",
@@ -678,7 +702,8 @@ async fn the_attribute_map_decides_who_a_live_sign_in_becomes() {
     )
     .await;
     assert_eq!(
-        cleared.status, StatusCode::OK,
+        cleared.status,
+        StatusCode::OK,
         "clearing a map is a real action, not a refusal: {}",
         cleared.body
     );
