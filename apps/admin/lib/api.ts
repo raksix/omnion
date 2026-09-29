@@ -47,6 +47,13 @@ import type {
   CommentInboxRow,
   CommentSettingsDocument,
   CreatedMediaShare,
+  ImportReport,
+  NewsletterIssue,
+  NewsletterList,
+  NewsletterListRow,
+  NewsletterSubscriber,
+  NewNewsletterList,
+  SubscriberPage,
   Form,
   NewCommentReply,
   PageSeo,
@@ -5457,6 +5464,208 @@ export function removeCommentBan(siteId: string, banId: string): Promise<void> {
   return request<void>(
     `/api/v1/sites/${encodeURIComponent(siteId)}/comment-bans/${encodeURIComponent(banId)}`,
     { method: "DELETE" },
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Newsletter (REQ-064, slice 4b)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Every list of a site, each carrying its four counts.
+ *
+ * One endpoint rather than a list plus a counts call per row, because the counts are printed
+ * beside the list they belong to: a "3" over a table that now shows 4 is an owner wondering
+ * whether they lost a subscriber.
+ */
+export function fetchNewsletterLists(siteId: string): Promise<NewsletterList[]> {
+  return request<NewsletterList[]>(
+    `/api/v1/newsletter/lists?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/** One list. */
+export function fetchNewsletterList(id: string, siteId: string): Promise<NewsletterList> {
+  return request<NewsletterList>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Create a list.
+ *
+ * `key` is deliberately optional: the server derives one from the name and resolves a
+ * collision to `weekly-news-2` rather than refusing. A panel that demanded a unique key would
+ * make the owner invent a slug to get past a form that should just work.
+ */
+export function createNewsletterList(body: NewNewsletterList): Promise<NewsletterList> {
+  return request<NewsletterList>("/api/v1/newsletter/lists", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * Change a list.
+ *
+ * The client sends only the fields the form owns, so a `double_opt_in` an owner never looked at
+ * is not silently reset by saving a name.
+ */
+export function patchNewsletterList(
+  id: string,
+  siteId: string,
+  patch: { name?: string; description?: string; double_opt_in?: boolean },
+): Promise<NewsletterList> {
+  return request<NewsletterList>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PUT", body: JSON.stringify(patch) },
+  );
+}
+
+/**
+ * Delete a list.
+ *
+ * The list's subscribers go with it (`on delete cascade`): the screen's confirmation names the
+ * count, because "delete this list" and "delete these 412 addresses" are different decisions
+ * and the second one is irreversible.
+ */
+export function deleteNewsletterList(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One filtered page of subscribers. */
+export function fetchSubscribers(filters: {
+  site_id: string;
+  list_id?: string;
+  status?: string;
+  search?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<SubscriberPage> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["list_id", "status", "search", "limit", "offset"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  return request<SubscriberPage>(`/api/v1/newsletter/subscribers?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * Add one address by hand.
+ *
+ * The response is a 202-shaped `pending` row on a double-opt-in list: the panel says "a
+ * confirmation link is on its way" rather than "added", because the address cannot receive an
+ * issue until somebody clicks it, and a table that claimed otherwise would be lying.
+ */
+export function addSubscriber(
+  listId: string,
+  siteId: string,
+  body: { email: string; name?: string; source?: string },
+): Promise<NewsletterSubscriber> {
+  return request<NewsletterSubscriber>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(listId)}/subscribers?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+/** Move a subscriber to a state. `reason` is stored and shown on the row. */
+export function setSubscriberStatus(
+  id: string,
+  siteId: string,
+  status: string,
+  reason?: string,
+): Promise<NewsletterSubscriber> {
+  return request<NewsletterSubscriber>(
+    `/api/v1/newsletter/subscribers/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "PATCH", body: JSON.stringify({ status, reason: reason || undefined }) },
+  );
+}
+
+/** Remove a subscriber row for good — the panel's own action, not the unsubscribe link. */
+export function deleteSubscriber(id: string, siteId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/newsletter/subscribers/${encodeURIComponent(id)}?site_id=${encodeURIComponent(siteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Import addresses from CSV text.
+ *
+ * The report is returned rather than summarised to a count: an import that says "18 added" over
+ * a file with 40 rows has lost 22 addresses somewhere, and those 22 are named in `skipped`.
+ */
+export function importSubscribers(
+  listId: string,
+  siteId: string,
+  csv: string,
+  source?: string,
+): Promise<ImportReport> {
+  return request<ImportReport>(
+    `/api/v1/newsletter/lists/${encodeURIComponent(listId)}/import?site_id=${encodeURIComponent(siteId)}`,
+    { method: "POST", body: JSON.stringify({ csv, source: source || undefined }) },
+  );
+}
+
+/**
+ * Export the filtered rows as CSV text.
+ *
+ * The server answers `{ csv: "..." }` rather than a `text/csv` response, because a
+ * `Content-Disposition` header is invisible to `fetch`: the file would arrive as a string the
+ * operator has to save by hand, which is not what "Export" means to them.
+ */
+export async function exportSubscribers(filters: {
+  site_id: string;
+  list_id?: string;
+  status?: string;
+  search?: string;
+}): Promise<string> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  for (const key of ["list_id", "status", "search"] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== "") query.set(key, String(value));
+  }
+  const body = await request<{ csv: string }>(
+    `/api/v1/newsletter/subscribers/export?${query.toString()}`,
+  );
+  return body.csv;
+}
+
+/** The sent-issue archive. */
+export function fetchNewsletterIssues(filters: {
+  site_id: string;
+  limit?: number;
+}): Promise<NewsletterIssue[]> {
+  const query = new URLSearchParams({ site_id: filters.site_id });
+  if (filters.limit) query.set("limit", String(filters.limit));
+  return request<NewsletterIssue[]>(`/api/v1/newsletter/issues?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * Send an issue and archive it.
+ *
+ * `recipient_count` comes back from the send rather than being computed by the browser: the
+ * list changed after the send, so a count read now is a count about a different question.
+ */
+export function sendNewsletterIssue(body: {
+  site_id: string;
+  list_id: string;
+  subject: string;
+  body_html: string;
+  archive_slug?: string;
+}): Promise<{ id: string; recipient_count: number; archive_slug: string }> {
+  return request<{ id: string; recipient_count: number; archive_slug: string }>(
+    "/api/v1/newsletter/issues",
+    { method: "POST", body: JSON.stringify(body) },
   );
 }
 

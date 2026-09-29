@@ -1997,6 +1997,110 @@ export type NewCommentReply = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// Newsletter (REQ-064, slice 4b) — lists, double opt-in subscribers, the sent archive
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The four subscriber states.
+ *
+ * `pending` is the whole point of a double opt-in: the row exists and is NOT deliverable yet.
+ * A UI that renders `pending` as a failure teaches an owner that subscribers are broken; it is
+ * the state a signup is in until somebody clicks the link.
+ */
+export type SubscriberStatus = "pending" | "confirmed" | "unsubscribed" | "bounced";
+
+/** One list. `key` is what a theme's signup form posts to, so the panel always shows it. */
+export type NewsletterList = {
+  id: string;
+  site_id: string;
+  organization_id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  double_opt_in: boolean;
+  created_at: string;
+  updated_at: string;
+  /**
+   * The per-state counts, present on the list read and absent on a single-row read — the row
+   * itself has no such columns. `undefined` means "not in this response", so the panel shows a
+   * placeholder rather than printing zero, which would read as "this list has no subscribers".
+   */
+  counts?: ListCounts;
+};
+
+/** The counts beside a list, from the same read as the list. */
+export type ListCounts = {
+  pending: number;
+  confirmed: number;
+  unsubscribed: number;
+  bounced: number;
+  total: number;
+};
+
+/** A list with its counts — one row of the list screen. */
+export type NewsletterListRow = { list: NewsletterList; counts: ListCounts };
+
+/** One subscriber row. */
+export type NewsletterSubscriber = {
+  id: string;
+  site_id: string;
+  list_id: string;
+  email: string;
+  name: string | null;
+  source: string | null;
+  status: SubscriberStatus;
+  /** The store never returns the token digests — they are not in the panel's vocabulary. */
+  confirmed_at: string | null;
+  unsubscribed_at: string | null;
+  /** Whether the confirmation link is still waiting for a click, and when it stops being one. */
+  confirm_expires_at: string | null;
+  /** Why the row is in the state it is in. The first question an owner asks. */
+  status_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  /** The list's name, so a mixed-list table does not need a join in the browser. */
+  list_name: string | null;
+};
+
+/** A page of subscribers plus its total. */
+export type SubscriberPage = {
+  subscribers: NewsletterSubscriber[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+/** One sent issue in the archive list. */
+export type NewsletterIssue = {
+  id: string;
+  site_id: string;
+  list_id: string;
+  subject: string;
+  /** How many addresses the send reached — what the send knew, not today's count. */
+  recipient_count: number;
+  archive_slug: string;
+  sent_at: string;
+  list_name: string | null;
+};
+
+/** What a CSV import did, and what it refused to do. */
+export type ImportReport = {
+  added: number;
+  blank: number;
+  /** One entry per address already on the list, with the state it is in. */
+  skipped: { email: string; status: string }[];
+};
+
+/** A new list, as the create form sends it. `key` is derived server-side when omitted. */
+export type NewNewsletterList = {
+  site_id: string;
+  name: string;
+  key?: string;
+  description?: string;
+  double_opt_in?: boolean;
+};
+
+// ---------------------------------------------------------------------------------------------
 // Security centre (REQ-012, slice 2) — the header policy
 // ---------------------------------------------------------------------------------------------
 

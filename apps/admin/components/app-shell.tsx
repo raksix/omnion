@@ -26,6 +26,7 @@ import {
   ListTree,
   LockKeyhole,
   LogOut,
+  Mail,
   Menu,
   MessageSquare,
   Scale,
@@ -66,6 +67,11 @@ const NAV = [
   // something an editor wrote, and the queue is the only place an owner finds out what
   // readers said about it.
   { href: "/comments", label: "Comments", icon: MessageSquare },
+  // The mailing lists (REQ-064, slice 4b). It sits directly after Comments because both answer
+  // the same inbound question — what visitors sent us — and both are the places an owner has to
+  // decide about a stranger's address. Everything before them in this shelf is an outbound or
+  // authored surface.
+  { href: "/newsletter", label: "Newsletter", icon: Mail },
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },

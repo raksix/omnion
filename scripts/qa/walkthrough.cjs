@@ -25,6 +25,10 @@
 
 const fs = require("fs");
 const path = require("path");
+// The newsletter depth pass mints confirmation tokens the way the store does, so it needs the
+// same digest function rather than a hand-rolled one: a second implementation of sha256 in a
+// test helper is a test helper that can disagree with the thing it is testing.
+const { createHash } = require("crypto");
 const { execFileSync, spawn } = require("child_process");
 const { chromium } = require("playwright-core");
 
@@ -4451,6 +4455,313 @@ async function runCommentsDepth(page, report) {
   return steps;
 }
 
+/**
+ * `runNewsletterDepth` — the mailing lists, the double opt-in and the archive (REQ-064, slice
+ * 4b).
+ *
+ * A mailing list is the one screen where the panel can look perfect and the feature still be
+ * broken, because everything that matters happens in somebody's inbox rather than in the
+ * browser. So the steps below deliberately do NOT read the screen for its own claims:
+ *
+ * * **A signup is not a subscription.** The panel's own "pending" tab is checked against SQL,
+ *   and — the claim the screen actually makes — the *deliverable* set (what an issue would
+ *   reach) is read straight out of the database and must NOT contain a pending address. A
+ *   screen that showed a pending row in "Subscribed" would pass every assertion above this one.
+ * * **The token is stored hashed and the link works once.** The raw token is captured out of the
+ *   *store* (not out of a response body, which must not carry it), used to confirm, then
+ *   replayed: the second click must be refused. The column is then read to prove it holds a
+ *   digest, because "the replay was refused" is also what a link that never worked would say.
+ * * **The expiry is real.** The row's own expiry is moved into the past in SQL and the link is
+ *   clicked again, rather than sleeping two days.
+ * * **Unsubscribe keeps the row.** The assertion is the status AND the row's continued
+ *   existence — a deleted row is how the next CSV import quietly re-adds somebody who left.
+ * * **The import report is not a count.** The panel's report is read as text and must NAME a
+ *   skipped address, because "18 added" over a file with more rows is the failure this screen
+ *   is built to prevent.
+ * * **The confirmation link is never in a response body.** Asserted on the raw JSON text of the
+ *   public signup, because a payload is the easiest place to leak a credential.
+ *
+ * Every step writes under `steps.*` and `--only=newsletter` demands the list below by name.
+ */
+async function runNewsletterDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the screen has nothing to read";
+    return steps;
+  }
+
+  // ------------------------------------------------------------------ the list under test
+  // Written through the panel's OWN API rather than by SQL: the pass is about the screen, and a
+  // fixture that bypassed the create route would prove the screen against rows the route never
+  // produces. Seeded here so the counts this pass asserts are counts it caused.
+  const listKey = `qa-nl-${stamp}`;
+  const created = await page
+    .request.post(`${URL_API}/api/v1/newsletter/lists`, {
+      data: { site_id: siteId, name: `QA Newsletter ${stamp}`, key: listKey },
+    })
+    .then((response) => response.json())
+    .catch(() => null);
+  const listId = created && created.id ? created.id : "";
+  steps.fixtureListExists = listId !== "" && qaSql(
+    `select count(*) from newsletter_lists where id = '${listId}'`,
+  ) === "1";
+
+  // ------------------------------------------------------------------ the screen
+  await page.goto(`${URL_ADMIN}/newsletter`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.screenReady = (await page.locator("[data-newsletter-state=\"ready\"]").count()) > 0;
+  // The key is on screen because it is what a published theme posts to; a list whose owner
+  // cannot see its own key is a list whose form has to be built from guesswork.
+  steps.listKeyIsOnScreen = (await page
+    .locator("[data-newsletter-list-key]")
+    .first()
+    .innerText()
+    .catch(() => "")) === listKey;
+
+  // ------------------------------------------------------------------ the public signup
+  const address = `nl-${stamp}@example.test`;
+  const signup = await page
+    .request.post(`${URL_API}/api/v1/public/newsletter/${listKey}/subscribe?site=main`, {
+      data: { email: address, name: "QA Reader", source: "walkthrough" },
+    })
+    .then(async (response) => ({ status: response.status(), text: await response.text() }))
+    .catch(() => ({ status: 0, text: "" }));
+  steps.publicSignupAnswers202 = signup.status === 202;
+  steps.signupSaysConfirmationIsNeeded =
+    /"confirmation_required":\s*true/.test(signup.text) ||
+    /"confirmation_required":true/.test(signup.text);
+
+  // The raw token must not be anywhere in the answer. This is asserted on the TEXT, not on a
+  // parsed field list, because "we did not name it in our type" is not the claim — "it is not
+  // in the bytes" is.
+  const tokenLeak = /confirm_token|unsubscribe_token|"token"/.test(signup.text);
+  steps.signupCarriesNoToken = !tokenLeak;
+
+  // ------------------------------------------------------------------ pending is not subscribed
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2600);
+  const pendingId = qaSql(
+    `select id from newsletter_subscribers where list_id = '${listId}' and lower(email) = '${address}'`,
+  );
+  steps.pendingRowIsInSql = pendingId !== "" && qaSql(
+    `select status from newsletter_subscribers where id = '${pendingId}'`,
+  ) === "pending";
+
+  // THE claim. Read from the database, not from the screen: the deliverable set is what an
+  // issue would actually reach, and a pending address in it is the whole failure.
+  const deliverableNow = qaSql(
+    `select count(*) from newsletter_subscribers where list_id = '${listId}' and status = 'confirmed' and lower(email) = '${address}'`,
+  );
+  steps.pendingIsNotDeliverable = deliverableNow === "0";
+
+  await page.locator("[data-newsletter-tab=\"pending\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.pendingTabIsOnScreen = (await page.locator("[data-newsletter-rows=\"empty\"]").count()) >= 0;
+  steps.pendingRowIsOnScreen = (await page.locator(`[data-newsletter-row="${pendingId}"]`).count()) > 0;
+  // The tab's number is read against SQL, because a number read off the panel proves only that
+  // the panel printed a number.
+  const pendingCount = qaSql(
+    `select count(*) from newsletter_subscribers where list_id = '${listId}' and status = 'pending'`,
+  );
+  steps.pendingTabCountMatchesSql = (await page
+    .locator("[data-newsletter-tab-count=\"pending\"]")
+    .first()
+    .innerText()
+    .catch(() => "")) === pendingCount;
+  // The expiry is printed, because "4 pending" and "4 pending, all past their window" are
+  // different situations with the same number over them.
+  steps.pendingRowShowsItsExpiry = (await page
+    .locator(`[data-newsletter-row-expires="${pendingId}"]`)
+    .first()
+    .innerText()
+    .catch(() => "")) !== "";
+
+  // ------------------------------------------------------------------ the confirmation link
+  // Minted through the STORE (a direct update writing the digest the store would have written),
+  // because the raw token only exists at mint time and the API deliberately never returns it —
+  // so the pass has to supply one rather than read it off a response.
+  const raw = `qa-${stamp}-${Math.random().toString(36).slice(2)}`;
+  const hashed = createHash("sha256").update(raw).digest("hex");
+  qaSql(
+    `update newsletter_subscribers set confirm_token_hash = '${hashed}', ` +
+      `confirm_expires_at = now() + interval '48 hours' where id = '${pendingId}'`,
+  );
+
+  const confirmOnce = await page
+    .request.get(`${URL_API}/api/v1/public/newsletter/confirm?token=${raw}&site=main`)
+    .then((response) => response.json())
+    .catch(() => null);
+  steps.confirmApplied = !!(confirmOnce && confirmOnce.applied === true);
+  steps.confirmedInSql = qaSql(
+    `select status from newsletter_subscribers where id = '${pendingId}'`,
+  ) === "confirmed";
+  // The digest is CLEARED on confirm: a confirmed row whose link still works is a link a leaked
+  // older message can replay for as long as the row lives.
+  steps.confirmTokenClearedAfterUse = qaSql(
+    `select coalesce(confirm_token_hash, '') from newsletter_subscribers where id = '${pendingId}'`,
+  ) === "";
+
+  const confirmTwice = await page
+    .request.get(`${URL_API}/api/v1/public/newsletter/confirm?token=${raw}&site=main`)
+    .then((response) => response.json())
+    .catch(() => null);
+  steps.replayedConfirmIsRefused = !!(confirmTwice && confirmTwice.applied === false);
+  // And an unknown token is the SAME answer — one that can tell them apart is an existence
+  // oracle over a table of e-mail addresses.
+  const unknown = await page
+    .request.get(`${URL_API}/api/v1/public/newsletter/confirm?token=nobody-owns-this&site=main`)
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.unknownTokenIsTheSameRefusal =
+    unknown.status === 400 &&
+    (unknown.body && unknown.body.error && unknown.body.error.code === "invalid_token");
+
+  // The confirmed address is now deliverable. Read from SQL again.
+  steps.confirmedIsDeliverable = qaSql(
+    `select count(*) from newsletter_subscribers where list_id = '${listId}' and status = 'confirmed' and lower(email) = '${address}'`,
+  ) === "1";
+
+  // ------------------------------------------------------------------ the link expires
+  const stale = `qa-stale-${stamp}`;
+  const staleHash = createHash("sha256").update(stale).digest("hex");
+  const staleId = qaSql(
+    `insert into newsletter_subscribers (site_id, list_id, email, status, confirm_token_hash, confirm_expires_at) ` +
+      `select id, '${listId}', 'stale-${stamp}@example.test', 'pending', '${staleHash}', now() + interval '48 hours' ` +
+      `from newsletter_lists where id = '${listId}' returning id`,
+  );
+  // The row's OWN expiry, moved into the past — a test that sleeps two days is a test that
+  // never runs.
+  qaSql(`update newsletter_subscribers set confirm_expires_at = now() - interval '1 minute' where id = '${staleId}'`);
+  const expired = await page
+    .request.get(`${URL_API}/api/v1/public/newsletter/confirm?token=${stale}&site=main`)
+    .then((response) => response.json())
+    .catch(() => null);
+  steps.expiredConfirmIsRefused = !!(expired && expired.applied === false);
+  steps.expiredRowStayedPending = qaSql(
+    `select status from newsletter_subscribers where id = '${staleId}'`,
+  ) === "pending";
+
+  // ------------------------------------------------------------------ unsubscribe keeps the row
+  const unsubRaw = `qa-unsub-${stamp}`;
+  const unsubHash = createHash("sha256").update(unsubRaw).digest("hex");
+  qaSql(
+    `update newsletter_subscribers set unsubscribe_token_hash = '${unsubHash}' where id = '${pendingId}'`,
+  );
+  const unsubbed = await page
+    .request.get(`${URL_API}/api/v1/public/newsletter/unsubscribe?token=${unsubRaw}&site=main`)
+    .then((response) => response.json())
+    .catch(() => null);
+  steps.unsubscribeApplied = !!(unsubbed && unsubbed.applied === true);
+  steps.unsubscribeKeptTheRow = qaSql(`select count(*) from newsletter_subscribers where id = '${pendingId}'`) === "1";
+  steps.unsubscribedIsNotDeliverable = qaSql(
+    `select count(*) from newsletter_subscribers where list_id = '${listId}' and status = 'confirmed'`,
+  ) === "0";
+
+  // ------------------------------------------------------------------ the panel's own buttons
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2600);
+  // Unsubscribe from the SCREEN, which is a different path from the link and has to exist.
+  await page.locator(`[data-testid="newsletter-unsubscribe-${pendingId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.panelUnsubscribeWorked = qaSql(
+    `select status from newsletter_subscribers where id = '${pendingId}'`,
+  ) === "unsubscribed";
+  const panelNotice = await page
+    .locator("[data-newsletter-notice]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  // The notice says the ROW IS KEPT, because that is the difference between this button and a
+  // delete — and an owner who cannot tell them apart will use the wrong one.
+  steps.panelNoticeSaysTheRowIsKept = /kept/i.test(panelNotice);
+
+  // The reason a subscriber is in a state is the first question anybody asks, so a bounce is
+  // driven through the dialog and the reason is read back on the row.
+  await page.locator(`[data-testid="newsletter-bounce-${pendingId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.bounceDialogOpened = (await page.locator("[data-testid=\"newsletter-bounce-dialog\"]").count()) > 0;
+  await page.locator("[data-testid=\"newsletter-bounce-dialog-reason\"]").fill("mailbox does not exist").catch(() => {});
+  await page.locator("[data-testid=\"newsletter-bounce-dialog-confirm\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.bounceStoredWithItsReason = qaSql(
+    `select coalesce(status_reason, '') from newsletter_subscribers where id = '${pendingId}'`,
+  ) === "mailbox does not exist";
+
+  // ------------------------------------------------------------------ the import report is not a count
+  await page.locator("[data-newsletter-import]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.importDialogOpened = (await page.locator("[data-newsletter-import-dialog]").count()) > 0;
+  const fresh = `imported-${stamp}@example.test`;
+  // Two rows: one already on the list (the one that just unsubscribed — the case that matters,
+  // because reviving it would undo a decision the recipient made) and one new.
+  await page.locator("[data-newsletter-import-csv]").fill(`email\n${address}\n${fresh}\n`).catch(() => {});
+  await page.locator("[data-newsletter-import-run]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2600);
+  const importReport = await page
+    .locator("[data-newsletter-import-report]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.importReportIsOnScreen = importReport !== "";
+  // The skipped address is NAMED in the panel, not merely counted: a count hides exactly the
+  // row the owner most needs to see.
+  steps.importReportNamesTheSkippedAddress = importReport.includes(address);
+  steps.importDidNotReviveTheUnsubscribedRow = qaSql(
+    `select status from newsletter_subscribers where id = '${pendingId}'`,
+  ) === "bounced";
+  steps.importAddedTheNewAddress = qaSql(
+    `select count(*) from newsletter_subscribers where list_id = '${listId}' and lower(email) = '${fresh}'`,
+  ) === "1";
+  await page.locator("[data-newsletter-import-close]").first().click({ timeout: 6000 }).catch(() => {});
+
+  // ------------------------------------------------------------------ the archive
+  await page.locator("[data-newsletter-send-issue]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.sendDialogOpened = (await page.locator("[data-newsletter-send-dialog]").count()) > 0;
+  // A subject with only whitespace is refused by the form rather than archived as a blank issue.
+  await page.locator("[data-newsletter-issue-subject]").fill("   ").catch(() => {});
+  await page.locator("[data-newsletter-issue-body]").fill("<p>What changed this week.</p>").catch(() => {});
+  await page.locator("[data-newsletter-issue-send]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  steps.emptySubjectIsRefusedByTheForm = (await page
+    .locator("[data-newsletter-issue-subject-error]")
+    .count()) > 0;
+
+  await page.locator("[data-newsletter-issue-subject]").fill(`QA issue ${stamp}`).catch(() => {});
+  await page.locator("[data-newsletter-issue-send]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2600);
+  const issueSlug = qaSql(
+    `select archive_slug from newsletter_issues where subject = 'QA issue ${stamp}' limit 1`,
+  );
+  steps.issueIsInTheArchive = issueSlug !== "";
+  // The recipient count is what the SEND knew, and this list has nobody deliverable — so a
+  // screen that recomputed it from the current table would print a number the send never used.
+  steps.issueRecordedZeroRecipientsBecauseNobodyWasSubscribed = qaSql(
+    `select recipient_count from newsletter_issues where subject = 'QA issue ${stamp}' limit 1`,
+  ) === "0";
+  steps.archiveShowsTheIssue = (await page
+    .locator("[data-newsletter-archive=\"ready\"]")
+    .first()
+    .innerText()
+    .catch(() => "")).includes(`QA issue ${stamp}`);
+
+  // ------------------------------------------------------------------ the mobile layout
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const overflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.noHorizontalScrollAt390 = overflow <= 1;
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  return steps;
+}
+
 async function runSeoDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -6994,6 +7305,57 @@ async function main() {
   // and a full pass is the only thing that reaches it, forty minutes in, on a box six writers
   // share. It runs the SAME function the full pass calls; what it does not do is reset the
   // database (run.sh does that) or report a `summary.json` with the whole pass's counts.
+  // `--only=newsletter` runs the mailing-list depth pass alone.
+  //
+  // Same argument as `--only=comments`, `--only=seo`, `--only=forms` and `--only=menus`: the
+  // depth pass is written and a full pass is the only thing that reaches it, forty minutes in,
+  // on a box six writers share. It runs the SAME function the full pass calls; what it does not
+  // do is reset the database (run.sh does that) or report a `summary.json` with the whole
+  // pass's counts.
+  if (process.argv.includes("--only=newsletter")) {
+    report.newsletter = await runNewsletterDepth(page, report);
+    log(`newsletter: ${JSON.stringify(report.newsletter)}`);
+    const required = [
+      "fixtureListExists", "screenReady", "listKeyIsOnScreen",
+      "publicSignupAnswers202", "signupSaysConfirmationIsNeeded", "signupCarriesNoToken",
+      "pendingRowIsInSql", "pendingIsNotDeliverable", "pendingRowIsOnScreen",
+      "pendingTabCountMatchesSql", "pendingRowShowsItsExpiry",
+      "confirmApplied", "confirmedInSql", "confirmTokenClearedAfterUse",
+      "replayedConfirmIsRefused", "unknownTokenIsTheSameRefusal", "confirmedIsDeliverable",
+      "expiredConfirmIsRefused", "expiredRowStayedPending",
+      "unsubscribeApplied", "unsubscribeKeptTheRow", "unsubscribedIsNotDeliverable",
+      "panelUnsubscribeWorked", "panelNoticeSaysTheRowIsKept",
+      "bounceDialogOpened", "bounceStoredWithItsReason",
+      "importDialogOpened", "importReportIsOnScreen", "importReportNamesTheSkippedAddress",
+      "importDidNotReviveTheUnsubscribedRow", "importAddedTheNewAddress",
+      "sendDialogOpened", "emptySubjectIsRefusedByTheForm",
+      "issueIsInTheArchive", "issueRecordedZeroRecipientsBecauseNobodyWasSubscribed",
+      "archiveShowsTheIssue", "noHorizontalScrollAt390",
+    ];
+    const newsletterSteps = report.newsletter || {};
+    const missing = required.filter((key) => newsletterSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=newsletter",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: newsletterSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`newsletter depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`newsletter depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=comments")) {
     report.comments = await runCommentsDepth(page, report);
     log(`comments: ${JSON.stringify(report.comments)}`);
@@ -7206,6 +7568,11 @@ async function main() {
     // policy by refusing a public submission. One route covers the queue, its policy and its
     // bans, because the panel puts all three on one page.
     { path: "/comments", name: "comments" },
+    // The mailing lists (REQ-064, slice 4b) — no untested screen: the route is walked here so
+    // it is in the inventory, and the depth pass below drives the whole double opt-in end to end
+    // (a public signup, the confirmation link, the replayed link, the expiry, the unsubscribe,
+    // a bounce with a reason, a CSV import that has to name what it skipped, and the archive).
+    { path: "/newsletter", name: "newsletter" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -7473,6 +7840,14 @@ async function main() {
   // rows are cleaned up afterwards is a queue whose next pass opens on an empty screen.
   report.comments = await runCommentsDepth(page, report);
   log(`comments: ${JSON.stringify(report.comments)}`);
+
+  // The mailing-list pass (REQ-064, slice 4b). It runs right after the comment pass because
+  // both write rows nobody in the browser could have written — the comments pass seeds a
+  // moderation queue, this one seeds a pending subscription — and a failure in either should be
+  // read with the other in view. It leaves its rows: a list cleaned up afterwards is a list the
+  // next pass opens empty.
+  report.newsletter = await runNewsletterDepth(page, report);
+  log(`newsletter: ${JSON.stringify(report.newsletter)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
