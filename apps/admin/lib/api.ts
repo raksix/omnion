@@ -41,6 +41,7 @@ import type {
   GraphSaved,
   GraphValidated,
   ExpressionPreviewed,
+  ExpressionCompleted,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -4965,6 +4966,36 @@ export function previewExpressions(
   return request<ExpressionPreviewed>(
     `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/preview`,
     { method: "POST", body: JSON.stringify({ params, namespaces }) },
+  );
+}
+
+/**
+ * Ask the server which expressions are legal in the field being typed.
+ *
+ * The **graph travels in the body**, and that is the part worth arguing for. "Upstream
+ * outputs" is a fact about the graph as it is on screen — including wires drawn but not yet
+ * saved — so reading the stored graph would complete against a topology the person has
+ * already changed, at exactly the moment they are most likely to trust the list.
+ *
+ * The candidate grammar is the server's for the same reason the preview's is: a client that
+ * reimplemented the rules would offer `{{node.count + 1}}`, which previews as a refusal.
+ *
+ * `prefix` may be the path inside the braces or the whole expression; the server accepts both,
+ * so the seam between them cannot become a bug where typing `{{` empties the menu.
+ */
+export function completeExpressions(
+  workflowId: string,
+  nodeKey: string,
+  prefix: string,
+  graph: GraphDocument,
+  namespaces: Record<string, unknown>,
+): Promise<ExpressionCompleted> {
+  return request<ExpressionCompleted>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/complete`,
+    {
+      method: "POST",
+      body: JSON.stringify({ node_key: nodeKey, prefix, graph, namespaces }),
+    },
   );
 }
 

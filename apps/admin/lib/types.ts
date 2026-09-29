@@ -2026,6 +2026,15 @@ export type GraphDocument = {
 export type GraphIssue = {
   code: string;
   node_key?: string;
+  /**
+   * The parameter the problem is on, when it is about one.
+   *
+   * Optional on the wire and used by the code editor's gutter to mark a line. Deliberately a
+   * field rather than a convention in `message`: the message is prose, and `"url" must be a
+   * URL` naming the parameter in quotes is a sentence convention, not something a client can
+   * depend on.
+   */
+  param?: string;
   connection_index?: number;
   message: string;
 };
@@ -2068,4 +2077,33 @@ export type ExpressionPreviewed = {
   preview_count: number;
   /** The namespaces that were available, for autocomplete. */
   namespaces: string[];
+};
+
+/**
+ * Where a completion candidate came from.
+ *
+ * The value is the contract, not a label: the menu groups on it, so a typo here would not
+ * fail a build and would quietly merge the three groups the REQ asks to be distinguishable.
+ */
+export type CompletionSource = "upstream" | "runtime" | "sample";
+
+/** One candidate the expression editor can insert. */
+export type CompletionCandidate = {
+  /** The text to insert, e.g. `node_fetch_1.body`. */
+  label: string;
+  source: CompletionSource;
+  /** The second line of the menu entry. */
+  detail: string;
+};
+
+/** `POST /workflows/{id}/graph/expressions/complete` — the server's candidate list. */
+export type ExpressionCompleted = {
+  node_key: string;
+  candidates: CompletionCandidate[];
+  candidate_count: number;
+  /** Upstream node keys, sorted. */
+  upstream_nodes: string[];
+  /** How many upstream namespaces were left out because the answer was capped. */
+  truncated_namespaces: number;
+  truncated_paths: boolean;
 };

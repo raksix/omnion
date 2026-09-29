@@ -343,6 +343,16 @@ pub struct Issue {
     /// Node the problem is on, when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_key: Option<String>,
+    /// The **parameter** the problem is on, when the issue is about one.
+    ///
+    /// Additive rather than something the client has to parse out of `message`. The code
+    /// editor's gutter needs to mark the *line* a problem is on, and the message is prose
+    /// written for a person — `"url" must be a URL` carries the name in quotes today, which
+    /// is a convention, not a contract, and every consumer that scraped it would break the
+    /// first time a sentence was reworded. Skipped when absent, so an issue with no
+    /// parameter serialises exactly as it did before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<String>,
     /// Connection index, for the connection codes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_index: Option<usize>,
@@ -355,6 +365,7 @@ impl Issue {
         Self {
             code,
             node_key: None,
+            param: None,
             connection_index: None,
             message: message.into(),
         }
@@ -368,6 +379,27 @@ impl Issue {
         Self {
             code,
             node_key: Some(node_key.into()),
+            param: None,
+            connection_index: None,
+            message: message.into(),
+        }
+    }
+
+    /// An issue about one parameter of one node.
+    ///
+    /// The `at_node` constructor with the parameter name attached, so the ~17 call sites in
+    /// this module that report a parameter problem cannot forget to say which one — and the
+    /// code editor's gutter has something to point at.
+    fn at_param(
+        code: &'static str,
+        node_key: impl Into<String>,
+        param: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            node_key: Some(node_key.into()),
+            param: Some(param.into()),
             connection_index: None,
             message: message.into(),
         }
@@ -377,6 +409,7 @@ impl Issue {
         Self {
             code,
             node_key: None,
+            param: None,
             connection_index: Some(index),
             message: message.into(),
         }
@@ -597,9 +630,10 @@ fn check_params(node: &GraphNode, definition: &'static registry::NodeDefinition)
     for param in &definition.params {
         let value = node.params.get(&param.name);
         if param.required && value.is_none() {
-            issues.push(Issue::at_node(
+            issues.push(Issue::at_param(
                 "node_param_required",
                 &node.key,
+                &param.name,
                 format!("{} needs \"{}\"", definition.label, param.name),
             ));
             continue;
@@ -607,9 +641,10 @@ fn check_params(node: &GraphNode, definition: &'static registry::NodeDefinition)
         let Some(value) = value else { continue };
 
         if matches!(value, Value::Null) {
-            issues.push(Issue::at_node(
+            issues.push(Issue::at_param(
                 "node_param_invalid",
                 &node.key,
+                &param.name,
                 format!("\"{}\" is empty", param.name),
             ));
             continue;
@@ -620,17 +655,19 @@ fn check_params(node: &GraphNode, definition: &'static registry::NodeDefinition)
         // counts: `"  "` is what a field holding a space produces, and trimming it first is
         // what makes the check catch that rather than only the visibly-empty case.
         if value.as_str().is_some_and(|raw| raw.trim().is_empty()) {
-            issues.push(Issue::at_node(
+            issues.push(Issue::at_param(
                 "node_param_invalid",
                 &node.key,
+                &param.name,
                 format!("\"{}\" is empty", param.name),
             ));
             continue;
         }
         if let Some(problem) = json_type_mismatch(&param.kind, value) {
-            issues.push(Issue::at_node(
+            issues.push(Issue::at_param(
                 "node_param_invalid",
                 &node.key,
+                &param.name,
                 format!("\"{}\" {problem}", param.name),
             ));
             continue;
@@ -639,9 +676,10 @@ fn check_params(node: &GraphNode, definition: &'static registry::NodeDefinition)
             let options: Vec<&str> = param.options.iter().map(String::as_str).collect();
             let chosen = value.as_str().unwrap_or_default();
             if !options.contains(&chosen) {
-                issues.push(Issue::at_node(
+                issues.push(Issue::at_param(
                     "node_param_invalid",
                     &node.key,
+                    &param.name,
                     format!(
                         "\"{}\" must be one of {}, got \"{chosen}\"",
                         param.name,
@@ -669,9 +707,10 @@ fn check_params(node: &GraphNode, definition: &'static registry::NodeDefinition)
                 .as_str()
                 .is_some_and(|raw| raw.len() > MAX_CREDENTIAL_REFERENCE)
         {
-            issues.push(Issue::at_node(
+            issues.push(Issue::at_param(
                 "node_param_invalid",
                 &node.key,
+                &param.name,
                 format!(
                     "\"{}\" names a credential by its key, not by its secret; a value this long \
                      is a secret pasted into a reference field",

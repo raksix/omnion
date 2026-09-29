@@ -288,13 +288,9 @@ mod tests {
     #[test]
     fn a_node_is_never_its_own_upstream() {
         let mut looping = graph();
-        looping.connections.push(Connection {
-            from: "http_1".to_owned(),
-            from_port: "main".to_owned(),
-            to: "http_1".to_owned(),
-            to_port: "in".to_owned(),
-            branch: None,
-        });
+        looping
+            .connections
+            .push(Connection::new("http_1", "main", "http_1", "in"));
         let answer = complete(&looping, "http_1", "", &json!({}));
         assert!(!answer.upstream_nodes.contains(&"http_1".to_owned()));
     }
@@ -308,7 +304,33 @@ mod tests {
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect();
-        assert_eq!(labels, vec!["event.title", "event.meta.author"]);
+        // `event.meta` is here because the intermediate object *is* a path the evaluator can
+        // read — a lone `{{event.meta}}` resolves to the object. Dropping intermediates would
+        // have made the list shorter and would have removed a candidate that previews fine.
+        // Sorted, so the assertion does not depend on the walk order of a serde map.
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec!["event.meta", "event.meta.author", "event.title"],
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_array_index_is_a_candidate_because_the_evaluator_indexes_it() {
+        let sample = json!({ "event": { "items": [ { "title": "First" } ] } });
+        let answer = complete(&graph(), "http_1", "event.items", &sample);
+        let labels: Vec<&str> = answer
+            .candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+        assert!(
+            labels.contains(&"event.items.0"),
+            "an array index resolves today, so it belongs in the list: {labels:?}"
+        );
+        assert!(labels.contains(&"event.items.0.title"), "{labels:?}");
     }
 
     #[test]
@@ -363,7 +385,8 @@ mod tests {
         for index in 0..(MAX_NAMESPACES + 4) {
             let key = format!("node_{index}");
             wide.nodes.push(node(&key));
-            wide.connections.push(Connection::new(key, "main", "sink", "in"));
+            wide.connections
+                .push(Connection::new(key, "main", "sink", "in"));
         }
         wide.nodes.push(node("sink"));
 

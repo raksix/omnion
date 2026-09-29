@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
+use omnion_workflows::completion;
 use omnion_workflows::expression;
 use omnion_workflows::graph::{self, Graph};
 use omnion_workflows::graph_store::{self, SaveOutcome};
@@ -370,6 +371,54 @@ pub async fn preview_expressions(
     }))
 }
 
+/// `POST /api/v1/workflows/{id}/graph/expressions/complete` — candidates for the expression
+/// editor, storing nothing (REQ-086 slice 3).
+///
+/// The graph travels in the body, and that is the load-bearing decision rather than a
+/// convenience. "Upstream outputs" is a fact about the graph **as it is right now**, including
+/// wires the person has drawn but not saved; reading the stored graph would complete against
+/// yesterday's topology, which is exactly when a completion list is least useful and most
+/// confidently wrong. It also means this handler needs no store call of its own beyond the one
+/// tenancy check — the stored row answers "may this caller see this workflow", and everything
+/// else comes from the caller.
+///
+/// It is a read for the same reason the preview is: nothing is stored, and nothing it returns
+/// is derived from a row the caller cannot already read.
+pub async fn complete_expressions(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(workflow_id): Path<Uuid>,
+    Json(body): Json<CompleteRequest>,
+) -> Result<Json<completion::Completion>, ApiError> {
+    let stored = graph_store::find_graph(state.db().pool(), workflow_id)
+        .await?
+        .ok_or_else(graph_workflow_not_found)?;
+    crate::scope::ensure_same_organization(&current, Some(stored.organization_id))?;
+
+    // A node key nobody sent is a caller bug rather than a graph problem, and answering with an
+    // empty list would read as "nothing completes here" — the exact lie the preview half
+    // already avoids by naming its field. So it refuses, and it names the node.
+    if !body
+        .graph
+        .nodes
+        .iter()
+        .any(|node| node.key == body.node_key)
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "node_not_found",
+            format!("no node `{}` in this graph", body.node_key),
+        ));
+    }
+
+    Ok(Json(completion::complete(
+        &body.graph,
+        &body.node_key,
+        &body.prefix,
+        &body.namespaces,
+    )))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Expression preview
 // ---------------------------------------------------------------------------------------------
@@ -380,6 +429,27 @@ pub async fn preview_expressions(
 /// gains nothing from a thousand: the inspector previews the one node being edited, and a
 /// request that big is either a bug or an attempt to use this as a general evaluator.
 const MAX_PREVIEW_FIELDS: usize = 64;
+
+/// A completion request.
+///
+/// `deny_unknown_fields` because every one of these is load-bearing and a typo in a key would
+/// otherwise be answered with a list built from defaults — the caller would see four runtime
+/// namespaces and conclude the graph has no upstream nodes at all.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteRequest {
+    /// The node whose parameters are being edited.
+    pub node_key: String,
+    /// What has been typed inside the braces so far. May be the whole expression or the path
+    /// within it; the server accepts both so the seam cannot become a bug.
+    #[serde(default)]
+    pub prefix: String,
+    /// The graph as the canvas holds it, unsaved wires included.
+    pub graph: Graph,
+    /// The pinned sample, for the same reason the preview takes it: never fetched, never live.
+    #[serde(default)]
+    pub namespaces: expression::Namespaces,
+}
 
 /// A preview request.
 #[derive(Debug, Deserialize)]

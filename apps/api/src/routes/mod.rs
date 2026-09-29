@@ -705,6 +705,14 @@ pub fn router(state: AppState) -> Router {
     let workflow_graph_preview = post(workflow_graph::preview_expressions)
         .layer(guards::require(&state, "workflows.read"));
 
+    // The completion list (slice 3) takes the same read power for the same reason, and one
+    // more that is specific to it: the *graph* travels in the body, so the only row it reads
+    // is the workflow's own, which the caller could already read. Completing a list against
+    // the saved graph rather than the one on screen would answer against a topology the
+    // person has already changed.
+    let workflow_graph_complete = post(workflow_graph::complete_expressions)
+        .layer(guards::require(&state, "workflows.read"));
+
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
@@ -1485,6 +1493,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/workflows/{id}/graph/expressions/preview",
             workflow_graph_preview,
+        )
+        .route(
+            "/workflows/{id}/graph/expressions/complete",
+            workflow_graph_complete,
         )
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)
