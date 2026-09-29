@@ -28,12 +28,14 @@
  *    is unindexed" are different problems with the same blank preview, and only one of them is
  *    the owner's to fix.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
+  Download,
   Eye,
   EyeOff,
+  FileUp,
   Globe,
   Loader2,
   Plus,
@@ -47,7 +49,9 @@ import {
   ApiError,
   createSeoRedirect,
   deleteSeoRedirect,
+  downloadSeoRedirectCsv,
   fetchSeoOverview,
+  importSeoRedirects,
   regenerateSitemap,
   saveSeoSettings,
   scanBrokenLinks,
@@ -57,7 +61,13 @@ import {
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
 import { useSites } from "@/lib/sites";
-import type { SeoBrokenLink, SeoOverview, SeoRedirect, SeoRedirectTest } from "@/lib/types";
+import type {
+  SeoBrokenLink,
+  SeoOverview,
+  SeoRedirect,
+  SeoRedirectImport,
+  SeoRedirectTest,
+} from "@/lib/types";
 
 /** Google's own truncation points — the numbers the preview warns against. */
 const SERP_TITLE_LIMIT = 60;
@@ -234,6 +244,7 @@ function RedirectsPanel({
   const [pendingDelete, setPendingDelete] = useState<SeoRedirect | null>(null);
   const [test, setTest] = useState<SeoRedirectTest | null>(null);
   const [testPath, setTestPath] = useState("");
+  const [importing, setImporting] = useState(false);
 
   return (
     <section className="space-y-3" data-seo-panel="redirects">
@@ -242,19 +253,56 @@ function RedirectsPanel({
           Literal rules are checked before pattern rules, and the first match answers. A path two
           rules match is reported by the test below rather than resolved silently.
         </p>
-        <button
-          type="button"
-          data-seo-redirect-new
-          onClick={() => {
-            setEditing("new");
-            setTest(null);
-          }}
-          className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px]"
-        >
-          <Plus className="h-3.5 w-3.5" aria-hidden />
-          New redirect
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-seo-redirect-export
+            onClick={async () => {
+              await onRun(async () => {
+                await downloadSeoRedirectCsv(siteId);
+                return `Downloaded ${rules.length} rule${rules.length === 1 ? "" : "s"} as CSV.`;
+              });
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px]"
+          >
+            <Download className="h-3.5 w-3.5" aria-hidden />
+            Export CSV
+          </button>
+          <button
+            type="button"
+            data-seo-redirect-import
+            aria-expanded={importing}
+            onClick={() => setImporting((open) => !open)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px]"
+          >
+            <FileUp className="h-3.5 w-3.5" aria-hidden />
+            Import CSV
+          </button>
+          <button
+            type="button"
+            data-seo-redirect-new
+            onClick={() => {
+              setEditing("new");
+              setTest(null);
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px]"
+          >
+            <Plus className="h-3.5 w-3.5" aria-hidden />
+            New redirect
+          </button>
+        </div>
       </div>
+
+      {importing ? (
+        <RedirectImportPanel
+          siteId={siteId}
+          onCancel={() => setImporting(false)}
+          onImported={async (count) => {
+            setImporting(false);
+            await onRun(async () => `Imported ${count} redirect rule${count === 1 ? "" : "s"}.`);
+          }}
+        />
+      ) : null}
 
       {editing ? (
         <RedirectForm
@@ -396,6 +444,204 @@ function RedirectsPanel({
         </p>
       ) : null}
     </section>
+  );
+}
+
+/**
+ * Paste or drop a CSV of rules, read it, and — only after the read says the file is whole —
+ * write it.
+ *
+ * The two presses are the whole design. A 400-row file is something an owner wants to *see*
+ * before they commit it, and the import is all-or-nothing, so the read is where a refusal
+ * belongs: a report naming the lines, with the write button never enabled. A panel that offered
+ * one button would either hide the report behind an error toast or write the file before anybody
+ * read what was in it.
+ */
+function RedirectImportPanel({
+  siteId,
+  onCancel,
+  onImported,
+}: {
+  siteId: string;
+  onCancel: () => void;
+  onImported: (count: number) => Promise<void>;
+}) {
+  const [csv, setCsv] = useState("");
+  const [report, setReport] = useState<SeoRedirectImport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const fileInput = useRef<HTMLInputElement | null>(null);
+  const textarea = useRef<HTMLTextAreaElement | null>(null);
+
+  const readFile = async (file: File) => {
+    setError(null);
+    setReport(null);
+    try {
+      setCsv(await file.text());
+    } catch (caught) {
+      setError((caught as ApiError).message);
+    }
+  };
+
+  const check = async (dryRun: boolean) => {
+    if (!csv.trim()) {
+      setError("There is nothing to read yet — paste a file or choose one.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await importSeoRedirects({ site_id: siteId, csv, dry_run: dryRun });
+      setReport(result);
+      if (!dryRun && result.clean) {
+        await onImported(result.imported);
+        return;
+      }
+    } catch (caught) {
+      setError((caught as ApiError).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // A file chosen with the keyboard lands here, and a dropped file lands here too — the drop
+  // handler is the same state setter, so both paths behave identically rather than one of them
+  // being wired and the other merely styled.
+  const onDrop = (event: React.DragEvent<HTMLTextAreaElement>) => {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0];
+    if (file) void readFile(file);
+  };
+
+  const readyToWrite = report?.clean === true && report.imported === 0 && report.accepted > 0;
+
+  return (
+    <div
+      className="space-y-3 rounded-lg border border-line px-4 py-3"
+      data-seo-redirect-import-panel
+    >
+      <div>
+        <p className="text-[12.5px] font-medium">Import rules from a CSV</p>
+        <p className="mt-0.5 text-[12px] text-muted">
+          The file needs a <code>from</code> and a <code>to</code> column;{" "}
+          <code>status</code>, <code>pattern</code> and <code>enabled</code> are optional and
+          default to a 301 literal rule. A file with any row refused imports <strong>nothing</strong>{" "}
+          — the report below names the lines, so the fix is to edit the file.
+        </p>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-seo-redirect-import-file
+          onClick={() => fileInput.current?.click()}
+          className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px]"
+        >
+          <FileUp className="h-3.5 w-3.5" aria-hidden />
+          Choose a file
+        </button>
+        <input
+          ref={fileInput}
+          type="file"
+          accept=".csv,text/csv,text/plain"
+          className="sr-only"
+          data-seo-redirect-import-file-input
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void readFile(file);
+          }}
+        />
+        <span className="text-[12px] text-muted">or paste below</span>
+      </div>
+
+      <textarea
+        ref={textarea}
+        value={csv}
+        onChange={(event) => {
+          setCsv(event.target.value);
+          setReport(null);
+        }}
+        onDrop={onDrop}
+        onDragOver={(event) => event.preventDefault()}
+        data-seo-redirect-import-text
+        aria-label="Redirect rules as CSV"
+        placeholder={"from,to,status,pattern,enabled\n/old-page,/new-page,301,literal,true"}
+        rows={7}
+        spellCheck={false}
+        className="w-full rounded-md border border-line bg-transparent px-3 py-2 font-mono text-[12px]"
+      />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          data-seo-redirect-import-check
+          disabled={busy}
+          onClick={() => void check(true)}
+          className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+          Read the file
+        </button>
+        <button
+          type="button"
+          data-seo-redirect-import-commit
+          disabled={!readyToWrite || busy}
+          title={
+            readyToWrite
+              ? `Write ${report?.accepted ?? 0} rule${report?.accepted === 1 ? "" : "s"}`
+              : "Read the file first — a file that was refused cannot be written"
+          }
+          onClick={() => void check(false)}
+          className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Check className="h-3.5 w-3.5" aria-hidden />
+          Import
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md border border-line px-2.5 py-1.5 text-[12.5px]"
+        >
+          Close
+        </button>
+      </div>
+
+      {error ? (
+        <p className="text-[12.5px] text-amber-700 dark:text-amber-300" data-seo-redirect-import-error>
+          {error}
+        </p>
+      ) : null}
+
+      {report ? (
+        <div
+          className="rounded-md border border-line px-3 py-2 text-[12.5px]"
+          data-seo-redirect-import-report
+          data-clean={report.clean ? "true" : "false"}
+        >
+          <p className={report.clean ? "text-muted" : "text-amber-700 dark:text-amber-300"}>
+            {report.summary}
+          </p>
+          {report.clean && report.imported === 0 && report.accepted > 0 ? (
+            <p className="mt-1 text-muted" data-seo-redirect-import-ready>
+              Nothing has been written yet. Press <strong>Import</strong> to add{" "}
+              {report.accepted} rule{report.accepted === 1 ? "" : "s"}.
+            </p>
+          ) : null}
+          {report.rejected.length > 0 ? (
+            <ul className="mt-2 space-y-1" data-seo-redirect-import-rejections>
+              {report.rejected.map((rejection) => (
+                <li key={`${rejection.line}-${rejection.reason}`} className="font-mono text-[11.5px]">
+                  <span className="text-muted">
+                    {rejection.line > 0 ? `line ${rejection.line}` : "file"}
+                  </span>{" "}
+                  — {rejection.reason}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
