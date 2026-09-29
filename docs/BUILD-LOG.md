@@ -5734,3 +5734,64 @@ is the only reason REQ-010, REQ-012 and REQ-013 stay open.
 change per suite now, and each one is a REQ that can then be closed on its browser pass rather
 than on the note that its suite was already red. (b) The `media` part of a backup run is the
 place to look next: it counts rows, and a backup that only counts is a manifest, not a backup.
+
+## 2026-09-29 · wave2 · REQ-064 slice 2, the notification e-mail (criteria 8 closed)
+
+**What.** The one thing criterion 8 asked for that had to be *built* rather than verified. The
+builder stored who to notify and a subject template, and nothing rendered or transported them —
+three ticks of status lines had been careful to say so instead of ticking the box.
+
+- `crates/content/src/forms_notify.rs` — the words, away from the transport.
+- `apps/api/src/routes/forms.rs` — `notify()` + `record_notification()`, on the public submit path.
+- `0160_form_submission_notifications.sql` — `notified_at`, `notify_status`, `notify_error`.
+- `apps/api/tests/cms_form_notifications.rs` — 5 walks against a real SMTP server.
+- `apps/admin/features/forms/form-inbox.tsx` — the drawer states the outcome; the list marks the
+  rows whose notification did not go out.
+
+**Proof.**
+
+```
+cargo test -p omnion-content --lib                       → 208 passed (195 + 13 new)
+cargo test -p omnion-api --test cms_form_notifications    → 5 passed   (real SMTP, loopback)
+cargo test -p omnion-api --test cms_forms                 → 12 passed  (was 12 FAILED)
+apps/admin: tsc --noEmit                                  → 0 errors
+```
+
+**Three things the walks refused to let me get away with.**
+
+1. **A status column is not a delivery.** The first version recorded `sent` and the walk found
+   nothing on the wire, because I had asserted on my own row. It now reads `RCPT TO`, `DATA`, the
+   rendered subject and every answer straight off the socket.
+2. **The two "sent nothing" paths returned before recording.** Both rows sat at NULL — precisely
+   the indistinguishable-from-unreached state the columns exist to remove. Every outcome is
+   recorded now, which is what the `skipped` reasons are for.
+3. **A form was born with nobody to notify.** `CreateFormRequest` had no `notify_emails` at all;
+   recipients were settable only by a follow-up `PUT`, so the panel saved, published, and the
+   notification had no address until somebody remembered the settings tab. Found by the walk
+   asserting on a form it had just created.
+
+**And the suite that was never measuring anything.** `cms_forms.rs` predates CSRF: it sent the
+session cookie alone, and its login helper read only the *first* `Set-Cookie` header, silently
+dropping the token sign-in issues next to it. All twelve walks were refused at one line with a
+403 that read like a broken form builder. Proved by stashing this slice and watching it fail
+identically — a harness fact worth more than the fix: a suite that reports the *same* failure
+twelve times is not measuring the thing it names.
+
+**Two smaller traps.** `notify_emails: []` and an absent list are the same JSON once it has been
+through `Vec<String>`, so a form with no recipients and a form nobody configured are one state,
+not two — and the walk asserts that state rather than the difference. And the default subject is
+a *template*: choosing the fallback before the renderer runs greets the owner with a literal
+`{{form_name}}`, which the unit test caught and the product would not have.
+
+**The browser pass has NOT run.** Six worktrees are queued for the one QA slot (w4 holds it), load
+average is 61, and `/mnt/apopic` has 5.6 GB free — below the 6 GB a full pass needs, so a pass
+started now would be downgraded mid-flight and then killed. This tick is not a REQ-close tick, so
+the tiered gates are the ones that were owed, and they are green. **Acceptance 18 remains open and
+no walkthrough counter is claimed.** Also queued and still unrun: `--only=featured-media` and
+`--only=members`.
+
+**Next.** (a) A full pass when the slot frees, at 1440 px and 390 px, which closes 18. (b) The
+two unrun depth passes. (c) REQ-063's acceptance 17 still wants its full-pass half re-measured.
+
+---
+
