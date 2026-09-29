@@ -165,6 +165,17 @@ fi
 if [ "$NEEDS_BUILD" = "1" ]; then
   cargo build -p omnion-api
 fi
+# A writer loop on a tight volume builds into a scratch target (CARGO_TARGET_DIR, usually a
+# tmpfs) to keep /mnt/apopic from filling — but pm2 is started from the fixed path below, and
+# a build that landed somewhere else left that path missing. The pass then died with
+# "Script not found: .../target/debug/omnion-api" and no report at all, which reads as a broken
+# harness rather than as a build that went to another directory. Copy it over whenever the two
+# differ; the binary is 140 MB and the scratch copy is already warm, so this costs a copy.
+QA_BUILD_TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
+if [ "$QA_BUILD_TARGET" != "$ROOT/target" ] && [ -x "$QA_BUILD_TARGET/debug/omnion-api" ]; then
+  mkdir -p "$ROOT/target/debug"
+  cp "$QA_BUILD_TARGET/debug/omnion-api" "$ROOT/target/debug/omnion-api"
+fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
