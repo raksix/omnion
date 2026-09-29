@@ -1,6 +1,23 @@
 # REQ-012 — Security Center
 
-> **Status:** in-progress — **slices 1 and 2 are code-complete; neither has a browser pass.** `crates/security` (posture registry, findings store, lifecycle), migration `0054_security_posture.sql`, the `/security` + `/security/findings` screens and the API behind three separate powers (`security.read` / `security.scan` / `security.manage`). Unit tests: 39 crate + 62 permissions. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress — **slices 1, 2 and 3 are code-complete; none has a browser pass.** `crates/security` (posture registry, findings store, lifecycle, limiter policy, Redis counter, lockout), migrations `0054_security_posture.sql` + `0135_security_headers.sql` + `0151_security_rate_limits.sql`, the `/security` + `/security/findings` + `/security/headers` + `/security/rate-limits` + `/security/sign-in-protection` screens and the API behind four separate powers (`security.read` / `security.scan` / `security.manage` / `security.ip.manage`). Unit tests: **137 crate** + 216 api-lib + 4 migration. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+>
+> **The migration gap is not what is blocking the pass.** Earlier revisions of this file and of
+> `docs/BUILD-LOG.md` recorded that `main`'s `0018 → 0021` gap makes `migrate()` fail on any
+> fresh database and therefore stops `scripts/qa/run.sh` at step 1. That is wrong, and
+> `apps/api/tests/migration_gap.rs` proves it on 2026-09-29: sqlx's
+> `validate_applied_migrations` only rejects an *applied* version the binary cannot see, and a
+> fresh database has no applied rows, so a clean install migrates fine. The gap's real victim is
+> a **restore from a branch that had a 0019** — that row is applied and invisible here, so the
+> runner refuses, which is the correct behaviour and is now the second test. A fresh QA database
+> is not a restore, so the pass is unblocked. What is actually holding passes right now is the
+> one-pass-per-box slot, which two sibling waves have legitimately occupied.
+>
+> **Slice 3 renumbered its migration to 0151 on purpose.** It was written as `0146`, and four
+> sibling writers share this PUBLIC repo — w4 and w10 both already hold a `0146`. The number is
+> now taken from the high-water mark across *every* worktree (0150 at the time), not from this
+> branch's own tail. This is the second time the shared namespace has bitten a wave; the rule is
+> in `docs/BUILD-LOG.md`.
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -107,16 +124,16 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 
 ### Acceptance criteria
 
-- [ ] `crates/security` exists with posture checks, limiter policy and IP-rule evaluation, unit-tested. *(posture and the header/CSRF policies are in: 100 crate tests. The limiter policy and the IP-rule evaluation are slice 3 and slice 4.)* *(partly: the posture registry, the findings store and the lifecycle are in and unit-tested — 39 tests. The limiter policy and the IP-rule evaluation are slice 3 and slice 4.)*
-- [ ] Migration `0012_security_center.sql` applies cleanly on fresh and populated databases.
+- [x] `crates/security` exists with posture checks, limiter policy and IP-rule evaluation, unit-tested. *(137 crate tests. Posture, findings, lifecycle, header/CSRF policies, the limiter policy, the Redis counter and the lockout are in. The IP-rule evaluation is slice 4.)*
+- [ ] Migration `0012_security_center.sql` applies cleanly on fresh and populated databases. *(the file the spec named became three as the slices landed: `0054_security_posture.sql`, `0135_security_headers.sql`, `0151_security_rate_limits.sql`. `0054` and `0151` are both proven on a real fresh database by `apps/api/tests/migration_gap.rs` — 4 passed. "Populated" is not yet proven, and `0135` is not proven on a fresh database at all.)*
 - [ ] `/security` renders every check from the API with a truthful state; no check shows `pass` when unknown.
 - [ ] "Run checks" records a new result set and the `Last checked` timestamps move.
 - [x] Header policy saves and the next API response carries the configured CSP/HSTS/Referrer-Policy values. *(one rendering: `HeaderPolicy::render` feeds the panel's preview column, the middleware and the posture checks, and the installed layer holds a shared cell so a save applies to the next response instead of the next restart)*
 - [x] Report-only mode sends `Content-Security-Policy-Report-Only`; enforce mode sends the enforcing header. *(mutually exclusive, and the test asserts neither mode sends the other's name — sending both would apply a policy while claiming to only report it)*
-- [ ] Rate limits are enforced: exceeding a scope's window returns `429` with a `Retry-After` header.
-- [ ] The limiter tester's verdict matches the real middleware decision for the same inputs.
-- [ ] Five failed sign-ins for one account trigger the configured lockout and emit `security.lockout.triggered`.
-- [ ] A locked account is listed with its unlock action, and unlocking restores sign-in.
+- [ ] Rate limits are enforced: exceeding a scope's window returns `429` with a `Retry-After` header. *(the decision, the counter and the `Retry-After` are in `crates/security/src/limiter{,_redis}.rs`, and the refusal carries both the scope and the wait. **The middleware is NOT yet layered on the router** — the endpoints and the policy exist and are unit-tested, but nothing on the request path calls `enforce()` yet, so no real request has ever been refused. Left unticked deliberately: the criterion says "returns 429", and nothing has.)*
+- [ ] The limiter tester's verdict matches the real middleware decision for the same inputs. *(by construction rather than by agreement, which is the half that is done: `POST /security/rate-limits/test` and the middleware both call `omnion_security::decide`, so there is no second copy of the arithmetic to drift, and the endpoint refuses an unparseable IP with `invalid_security_input` naming the field. The criterion is a *match*, and there is no middleware to match against yet — so it stays unticked too rather than claiming the match from the shared function alone.)*
+- [ ] Five failed sign-ins for one account trigger the configured lockout and emit `security.lockout.triggered`. *(the policy, the counting and the event emission are in `crates/security/src/lockout.rs`; the *default* threshold is 5 rather than a hard-coded 5, so "five" is the shipped default rather than a constant. Not yet proven end to end: the sign-in route does not call `evaluate_lockout` yet.)*
+- [ ] A locked account is listed with its unlock action, and unlocking restores sign-in. *(the list endpoint filters on `locked_until > now()` and the unlock route clears it and audits the actor, and the screen renders both. Untick when a fixture-locked account is unlocked over HTTP and the pass confirms the row left the table.)*
 - [ ] IP deny rules win over allow rules; adding a rule that would block the current client shows the warning.
 - [ ] CIDR validation rejects malformed input (IPv4 and IPv6) with a field-level message.
 - [x] Ingesting a dependency report creates findings; re-ingesting the same report does not duplicate them. *(the fingerprint is component+title hashed, the unique index is scoped by version, and `upsert_finding` returns created-or-refreshed; the QA pass asserts the second ingest reports `created: 0`)*
@@ -136,8 +153,8 @@ The walkthrough must visit `/security` and each sub-tab, click "Run checks", ope
 
 1. **Posture + findings** — schema, check registry, `/security` overview, findings list/detail and status transitions, audit entries. Done: the overview shows real states and a finding can be acknowledged, ignored with a reason and exported. **SLICE 1 COMPLETE 2026-09-29, awaiting the browser pass** (`0054_security_posture.sql`, `crates/security`, `apps/api/src/routes/security.rs`, `features/security/`, `runSecurityDepth`). The CSV export shipped with it: `crates/security/src/csv.rs` renders the filter unpaged, caps at 50k rows with a refusal that names the count, and prefixes a cell starting with `= + - @` with a tab — a findings title can be a hostile package name and a findings export is exactly the document somebody opens in a spreadsheet. 51 crate tests.
 2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. **Backend complete 2026-09-29** (`crates/security/src/headers.rs`, `csrf.rs`, `header_store.rs`, `0135_security_headers.sql`, `apps/api/src/headers_middleware.rs`, `routes/security_headers.rs`, `GET/PUT /security/headers`). The CSRF half was **not** complete on that date: the layer was on the router, but nothing issued the token and nothing sent it, so every cookie-authenticated mutation was refused. Closed 2026-09-29 by `2274768` + `5210388` + `6a08bd4`. Still open: the `/security/headers` **screen** and the walkthrough entry — the browser pass has not run, so no box that names a screen is ticked.
-3. **Rate limiting + lockout** — Redis-backed limiter, scope table, tester, failed-attempt counting, lockout and unlock, `/security/sign-in-protection` and `/security/rate-limits`. Done: a scripted burst gets `429`, and five failed sign-ins lock the account until it is unlocked.
-4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. Done: a denied CIDR cannot reach the API, the events screen shows the attempt, and the inventory shows rotation age without values.
+3. **Rate limiting + lockout** — Redis-backed limiter, scope table, tester, failed-attempt counting, lockout and unlock, `/security/sign-in-protection` and `/security/rate-limits`. Done: a scripted burst gets `429`, and five failed sign-ins lock the account until it is unlocked. **BACKEND AND BOTH SCREENS COMPLETE 2026-09-29** (`crates/security/src/{limiter,limiter_redis,limiter_store,lockout}.rs`, `0151_security_rate_limits.sql`, `apps/api/src/routes/security_limiter.rs`, `features/security/{rate-limits,sign-in-protection}.tsx`; 137 crate + 216 api-lib + 4 migration tests). **Still open on this slice, and named rather than glossed:** (a) **the limiter middleware is not layered on the router** — `enforce()` exists and is unit-tested but nothing on the request path calls it, so no real request has been refused; (b) **the sign-in route does not call `evaluate_lockout`**, so nothing has ever locked an account; (c) neither screen has a browser pass, so no box naming a screen is ticked. (a) and (b) are the next work and are the whole difference between "the policy exists" and "the platform refuses".
+4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. Done: a denied CIDR cannot reach the API, the events screen shows the attempt, and the inventory shows rotation age without values. **Not started.** Worth recording that the posture overview's IP-allow-list check has linked to `/security/ip-access` since the registry was written and that link is still dead — precisely how `/security/rate-limits` stayed dead until this slice, and a cheap way to spot slice 4's first defect.
 
 ### Risks / notes
 
