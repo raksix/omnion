@@ -157,6 +157,30 @@ pub async fn get_published_page(
         return Err(page_not_found(&slug));
     };
 
+    // The membership gate (REQ-064, slice 4c), enforced HERE rather than left to a theme.
+    //
+    // A theme that forgets to ask the gate is not a broken theme, it is a page served to
+    // everybody, and the REQ's criterion is about what the *API* answers for a signed-out
+    // visitor — not about what a well-behaved template does with the payload. So the rule lives
+    // in the route, and `routes::members::gate` is the same function the theme's own probe calls,
+    // which is what keeps the prompt a visitor is shown and the 404 they get from drifting apart.
+    //
+    // Both refusals answer the SAME 404 as a page that does not exist. A `403` would confirm the
+    // page is there, and a member-only page's existence is itself the thing being hidden.
+    let verdict = crate::routes::members::gate(&state, site.id, &slug, &headers).await?;
+    if !verdict.allowed {
+        // The site's own policy may ask for a sign-in prompt instead of a bare 404, and then the
+        // answer says 401 with the address to go to. That is the SITE disclosing its own page,
+        // which is a decision an operator made, not a leak the platform performed.
+        if verdict.behaviour == "prompt" && verdict.exists {
+            return Err(ApiError::unauthorized(
+                "member_required",
+                "sign in to read this page",
+            ));
+        }
+        return Err(page_not_found(&slug));
+    }
+
     // The viewport filter runs on the stored payload before it is handed out. A page that
     // carries blocks the author hid from phones is a different page for a phone, and the only
     // honest way to serve that is to never build the other one.
