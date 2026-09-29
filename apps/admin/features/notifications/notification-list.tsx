@@ -80,7 +80,12 @@ function filtersFrom(params: URLSearchParams): NotificationFilters {
   const priority = params.get("priority");
   if (priority) filters.priority = priority;
   if (params.get("archived") === "1") filters.archived = true;
-  if (params.get("with_read") === "1") filters.with_read = true;
+  // **Only when it is explicitly off.** `with_read` is the one filter whose absence means
+  // *on*: the API treats an unmentioned `with_read` as "show read and unread", which is what
+  // the State menu's default option says this screen is showing. Sending `with_read=1` from
+  // here would be redundant with the default — and the honest default is the one that keeps a
+  // reader's read notifications on the screen, where they can be found again.
+  if (params.get("with_read") === "0") filters.with_read = false;
   return filters;
 }
 
@@ -302,7 +307,7 @@ export function NotificationList() {
     (filters.read ? 1 : 0) +
     (filters.priority ? 1 : 0) +
     (filters.archived ? 1 : 0) +
-    (filters.with_read ? 1 : 0);
+    (filters.with_read === false ? 1 : 0);
 
   return (
     <div className="flex flex-col gap-4">
@@ -516,11 +521,16 @@ export function NotificationList() {
                 Nothing here{activeFilters > 0 ? " matches these filters" : " yet"}.
               </p>
             </div>
-            {filters.read === "unread" ? (
+            {/* Two different ways to be looking at an unread-only list, so the way out has to
+                be offered for both: the State menu's explicit "Unread only", and `?with_read=0`.
+                The button clears `with_read` rather than setting it — the list now shows read
+                and unread by default, so "show me the read ones" is a question about *removing*
+                a filter, not adding one. */}
+            {filters.read === "unread" || filters.with_read === false ? (
               <button
                 type="button"
                 data-notification-show-read
-                onClick={() => setFilter("with_read", true)}
+                onClick={() => setFilter("with_read", false)}
                 className="rounded-lg border border-line px-3 py-1.5 text-[12.5px] text-accent-strong hover:underline"
               >
                 Show read notifications
