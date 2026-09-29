@@ -4334,8 +4334,11 @@ async function runMenusDepth(page, report) {
       .filter((row) => {
         const li = row.closest("li");
         if (!li) return false;
-        const hasChildren = li.querySelector(`[data-menu-item-row="${li.getAttribute("data-menu-item")}"] ul li`) !== null;
-        return hasChildren && li.querySelector(":scope > ul") === null;
+        // Open already? The child list is a direct child of the same <li>, and its presence is
+        // the whole of "this branch is open". Asking INSIDE the row for a descendant list finds
+        // nothing: the row is a sibling of the <ul>, not its parent, which is why the previous
+        // version reported zero collapsed branches and left the deepest row off the count.
+        return li.querySelector(":scope > ul") === null;
       })
       .map((row) => row.getAttribute("data-menu-item-row")),
   );
