@@ -4791,3 +4791,47 @@ omnion_qa)` is a hardcoded string in `run.sh`; the line above it correctly repor
 merely says the wrong thing, which is the kind of line that teaches the next reader that this
 stack is not isolated. Worth correcting in its own commit.
 
+
+### REQ-065 slice 4 part 11 — bulk enable/disable, and the SSO buttons it needs
+
+**What.** `POST /iam/providers/bulk` over a selection, and the single sign-on buttons on
+`/login`. The criterion — "Bulk enable/disable works; a disabled provider's button disappears
+from `/login` within one page load" — was half **absent**, not merely unproven: the registry had
+`/{id}/enable` and `/{id}/disable` and nothing over a selection, and `GET /auth/sso/providers`
+had **zero callers** in the panel, so there was no button for the disappearance to happen to.
+
+**Proof.**
+- `bash scripts/qa/run-media-walk.sh iam_provider_bulk` → **5 passed** (24.4s), each walk able to
+  fail alone: the partial batch (3 requested → applied 2, refused 1, three rows, refusal naming
+  the *never tested* state), a cross-tenant id reported `missing` rather than `refused`, `disable`
+  never gated plus idempotence (`applied: 0` on the repeat), and the sign-in list read before and
+  after a **bulk** disable.
+- `cargo test -p omnion-api --lib` → **217 passed**; `-p omnion-identity --lib` → **227**;
+  `-p omnion-security --lib` → **100**.
+- `pnpm --filter @omnion/admin typecheck` → clean.
+
+**Three things the fixture had to get right, and each is a trap worth naming.**
+1. The CSRF layer **refuses** a cookie-authenticated write outright when no secret is configured
+   (`csrf_unavailable`, 403) rather than skipping the check. The walk therefore reported "bulk
+   enable is broken" on every call while never reaching the handler. The key is now set by the
+   walk itself, next to the code that depends on it.
+2. The token is derived from the **resolved session id**, not the cookie value. The cookie holds
+   an opaque token; deriving from it produces a token that looks right and is wrong, and fails as
+   `csrf_failed` — a *second*, more confusing error that hides the first.
+3. `GET /auth/sso/providers` picks its organization **by host** and correctly answers `501
+   organization_required` for a multi-tenant installation reached on an unregistered hostname. The
+   fix is to reach the panel the way the panel is reached — the fixture registers a site domain
+   and the read carries that `Host` — not to relax the check. The host must be **per fixture**:
+   `site_domains.host` is globally unique and this file builds one fixture per test against a
+   single database, so a shared constant dies on `23505` from the second test on.
+
+**A box note.** `/dev/shm` read 96% full (1.5G free) and my own `w9-target` was 6G of it. Moved
+to `/mnt/apopic/w9-target`, which freed tmpfs to 77% for the seven other writers and cost this
+branch nothing. `/mnt/apopic` is at 82% with 11G free.
+
+**Next.** (a) Extend the walkthrough to provision an account through SCIM first, so the deletion
+dialog's **blocked** half (count non-zero, repair button visible, reassign then delete) is
+observed — that assertion has never executed; the pass died at `iam-authentication` on the last
+attempt, under three concurrent writers. (b) The live OIDC round trip against the stub IdP with a
+SCIM-provisioned subject, which `115cce4` still rests on unit tests and a dry run for. Then
+REQ-066 (MFA/passkeys and device trust).
