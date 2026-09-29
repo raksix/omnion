@@ -7059,13 +7059,41 @@ async function runWorkflowBuilderDepth(page, report) {
   note({ step: "autosave", saveState });
   await shot(page, "page-workflow-builder-saved");
 
-  // ---- The version, read from the server rather than from the screen -----------------------
+  // ---- ⌘S writes once, and the version says so ---------------------------------------------
+  // "Does not write twice" is not observable from the screen: a second write lands while the
+  // indicator still reads "saved", and the only witness is `graph_version`. So the probe
+  // presses the key and then reads the version the *server* holds, twice — once
+  // immediately, and again after longer than the autosave debounce. If ⌘S left the debounce
+  // armed, the second read is one higher than the first, and that difference is the whole
+  // defect in one number.
+  //
+  // The key goes to the canvas, not the document: the handler is on the canvas's onKeyDown,
+  // and a global listener would be testing a different product.
   const readGraph = async () =>
     page.evaluate(async (id) => {
       const response = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
       if (!response.ok) return null;
       return await response.json();
     }, workflowId);
+
+  const versionBeforeSaveKey = (await readGraph())?.graph_version ?? 0;
+  await page.locator("[data-builder-canvas]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(600);
+  const versionAfterKey = (await readGraph())?.graph_version ?? 0;
+  // Longer than AUTOSAVE_MS, so a debounce that was never cancelled has fired by now.
+  await page.waitForTimeout(2600);
+  const versionAfterSettle = (await readGraph())?.graph_version ?? 0;
+  note({
+    step: "cmd-s-writes-once",
+    before: versionBeforeSaveKey,
+    afterKey: versionAfterKey,
+    // A write did happen — otherwise this reads as "no double write" for the wrong reason.
+    wroteSomething: versionAfterKey > versionBeforeSaveKey,
+    // The criterion itself: no second write arrived after the debounce window.
+    settledSame: versionAfterSettle === versionAfterKey,
+  });
+  await shot(page, "page-workflow-builder-cmd-s");
 
   const afterSave = await readGraph();
   const versionAfterSave = afterSave?.graph_version ?? 0;
