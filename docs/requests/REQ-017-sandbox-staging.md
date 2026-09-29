@@ -1,11 +1,14 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** in-progress (slice 3 of 4 — the whole slice is now written: the API (`0f6779f…491810c`) and
-> the panel (`07464d7`…`5c8870d`) — the Changes tab with a checkbox column and a selection-scoped
-> `Promote selection`, the promotion dialog with its frozen summary, conflict list, server-decided
-> typed confirmation and step timeline, and the Promotions tab reading the record back. The
-> **browser gate is still owed**: the four new claims in `runEnvironmentsDepth` have never run,
-> because a sibling writer held the QA slot for the whole tick
+> **Status:** in-progress (slices 3–4; tick 67 fixed the clone-wizard contract — three of the six
+> clone areas copied nothing while being labelled and priced like the three that do, and the
+> panel's guard counted ticked boxes where the runner requires an area that actually copies, so a
+> staging environment could be created empty through the browser. `Area::copies()`/`Area::note()`
+> now declare the truth in the crate, the API carries `copies` + `note` on every option, the
+> shared areas are listed unticked and explained rather than hidden, and a unit test reads the
+> runner off disk so the two halves cannot drift again (`5c10e54`). **Still owed: the browser
+> gate** — the four `runEnvironmentsDepth` claims plus the five new ones for the clone areas have
+> never executed, and the box was at load 75–181 with `/dev/shm` at 100% for this tick
 > · **Captured:** 2026-09-25 ·
 > **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
