@@ -3292,3 +3292,31 @@ on `origin/main`** by checking out main and re-running with none of this branch'
 **Next.** The rest of REQ-099 slice 1: the provider call and tool execution, the runner's
 claim/heartbeat/requeue, `POST /ai/agents/{id}/runs` with SSE, the run list and the trace screen.
 
+
+
+## w7 · REQ-099 slice 1, the loop · 2026-09-29
+
+**What** — `crates/ai-hub/src/tools.rs` (the tool boundary) and `crates/ai-hub/src/loop_engine.rs`
+(the loop, behind a `Model` trait and the tool registry). `424284b`.
+
+**Proof**
+- `cargo test -p omnion-ai-hub --quiet` → **217 passed, 0 failed, 0 skipped** (197 before this
+  commit, +20). The skip count is measured, not assumed:
+  `-- --nocapture 2>&1 | grep -c skipping` reads 0.
+- `pnpm typecheck` → 2/2 packages, exit 0.
+- The run is 0.02 s. Before the fix three tests were still running at 60 s, which is how the
+  missing terminal frame was found.
+
+**Two product bugs the tests found, both fixed here**
+- The provider-failure, loop-detected and parked paths returned an `Outcome` directly and never
+  published a terminal frame. An SSE consumer that stops on `Done` held its connection open
+  until the browser gave up, then `EventSource` reconnected — the run looked like it restarted
+  itself. Every terminal path now goes through `finish()`.
+- A run that hit a cap with no answer was written `completed`, because the status came from
+  `is_failure()` alone, which deliberately excludes `Cancelled`. A parked run is its own status,
+  not a cancellation.
+
+**Next** — slice 1's remaining half: the `Model` adapter over `omnion_ai_hub::client`, the
+store-backed runner (claim with `skip locked`, heartbeat, requeue), `POST /ai/agents/{id}/runs`
+with SSE, the run list and the trace screen, then extend `scripts/qa/walkthrough.cjs`. Do **not**
+close the REQ: the QA browser pass has not run and eight acceptance boxes are still open.

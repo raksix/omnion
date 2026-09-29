@@ -1,7 +1,7 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
-> **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record —
-> `0fc9fe4`, `0e6b0fb`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record and
+> the loop — `0fc9fe4`, `0e6b0fb`, `424284b`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 >
 > **Slice 1, first commit** (`0fc9fe4`): `crates/ai-hub/src/agent.rs` — `RunLimits` and its
@@ -22,6 +22,21 @@
 > secret-shaped tool arguments are redacted before a transcript stores them. Still open in slice 1:
 > the provider call, tool execution, the runner's claim/heartbeat/requeue loop, the SSE endpoint
 > and every screen.
+>
+> **Slice 1, third commit** (`424284b`): `crates/ai-hub/src/tools.rs` and
+> `crates/ai-hub/src/loop_engine.rs` — the loop itself, behind two seams. `tools.rs` answers one
+> question before anything runs: may this agent do this, and if so, does it need a decision
+> first. `loop_engine.rs` drives the step machine through a `Model` trait and the tool registry,
+> so the SSE route can implement `Model` over the real provider client while a test implements it
+> over scripted answers — which is what turns "max_steps makes no further provider call" from a
+> claim into a measurement. What this commit proves, in 20 new tests: a plain answer completes
+> in one step and streams its text; a tool call runs and the next step answers; `max_steps`
+> stops the run after exactly the allowed number of provider calls; three identical calls end
+> the run `loop_detected` with the third never executed; a denied tool is refused with
+> `tool_denied` and the model is told why; an approval-gated tool parks the run after exactly one
+> provider call; a provider failure carries the bridge's code; a tool result reaches the model
+> inside the untrusted fence. Still open: the `Model` adapter over the real client, the store-
+> backed runner, `POST /ai/agents/{id}/runs` with SSE, and every screen.
 
 ## Request
 
@@ -131,11 +146,11 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 ### Acceptance criteria
 
 - [ ] A run started from the panel streams steps into the detail view live, and the same run reloaded after completion shows an identical step list (replay matches SSE).
-- [ ] `max_steps` stops a run that never reaches a final answer with `stop_reason = max_steps` and no further provider calls (test counts upstream calls).
-- [ ] The deadline stops a run against a deliberately slow stub, the token budget stops an overshooting run, and cancellation stops at the next step boundary with a finished partial trace.
-- [ ] Three identical tool calls in a row end the run with `loop_detected` and an `ai.run.loop_detected` event.
-- [ ] A tool the agent does not allow-list is refused with a stable code, nothing is executed, and the target row is unchanged (asserted in the test).
-- [ ] A tool on the approval list parks the run as `awaiting_approval`; approving from the trace resumes it to completion, rejecting ends it with `stop_reason = cancelled` and no effect.
+- [x] `max_steps` stops a run that never reaches a final answer with `stop_reason = max_steps` and no further provider calls *(the loop's own test counts the stub's calls: a two-step cap makes exactly two calls, and the third would have been the third `page.search`; the run is written `failed`, not `completed`, because it produced no answer)*.
+- [ ] The deadline stops a run against a deliberately slow stub, the token budget stops an overshooting run, and cancellation stops at the next step boundary with a finished partial trace. *(the `ScriptedModel::slow` seam exists; the three stop conditions themselves are proved in `agent.rs` with a clock the test owns — the loop-level test lands with the runner)*
+- [x] Three identical tool calls in a row end the run with `loop_detected` and an `ai.run.loop_detected` event *(the run's `stop_reason` and its `error` event with code `loop_detected`; the third call is caught *before* execution, asserted by counting tool results = 2. The bus event is the route's job and lands with `POST /runs`)*.
+- [x] A tool the agent does not allow-list is refused with a stable code, nothing is executed, and the target row is unchanged *(asserted in the test)*.
+- [ ] A tool on the approval list parks the run as `awaiting_approval`; approving from the trace resumes it to completion, rejecting ends it with `stop_reason = cancelled` and no effect. *(the park half is proved: the loop leaves on `awaiting_approval` after exactly one provider call, publishes `Done` so the stream closes, and the tool body never ran. The decision and the resume are REQ-101's)*
 - [ ] A run interrupted by killing the runner resumes from the first non-completed step, and a step whose tool already ran is not executed twice (test asserts one side effect for one step row).
 - [x] Resume on a run whose steps are all completed is refused with a clear message. *(the store returns the refusal signal; the route that words it is slice 1's remaining half)*
 - [ ] Untrusted tool output containing an instruction-shaped string does not change behaviour (fixture test asserts the next step is the one the system prompt asked for) and `ai.guardrail.blocked` fires when the tripwire triggers.
