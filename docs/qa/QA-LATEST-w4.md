@@ -1,45 +1,35 @@
 # Omnion QA — latest pass (w4)
 
-- When: 2026-09-28T18:48:21.272Z · artifacts: `qa-artifacts/20260928-181211`
-- Interactions: 1172 clicks · 93 field fills · 3 form submissions · 1245 screenshots
-- Console errors: 30 · failed requests: 27 · dialogs: 1
-- Programmatic findings: 68 (high 59 · medium 9 · low 0)
+- When: 2026-09-29T05:57:36.975Z · artifacts: `qa-artifacts/20260929-054500`
+- Interactions: 689 clicks · 120 field fills · 35 form submissions · 842 screenshots
+- Console errors: 368 · failed requests: 367 · dialogs: 1
+- Programmatic findings: 869 (high 857 · medium 12 · low 0)
 - Vision issues: 0
 
 ## Top findings
 
-- **[medium] offscreen-mobile** — mobile crm-contacts: 4 element(s) outside the viewport
-- **[medium] offscreen-mobile** — mobile crm-companies: 1 element(s) outside the viewport
-- **[high] console-error** — main http://127.0.0.1:3103/setup: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-- **[high] console-error** — main http://127.0.0.1:3103/setup: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-- **[high] console-error** — main http://127.0.0.1:3103/setup: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
-- **[high] console-error** — main http://127.0.0.1:3103/analytics/sources: ./apps/admin/features/crm/contacts-view.tsx:1319:15
-Error: Expected '</', got ')'
-  1317 |                   </td>
-  1318 |                 </tr>
-> 1319 |               ))}
-       
-- **[high] console-error** — main http://127.0.0.1:3103/analytics/sources: ./apps/admin/features/crm/contacts-view.tsx:1319:15
-Error: Expected '</', got ')'
-  1317 |                   </td>
-  1318 |                 </tr>
-> 1319 |               ))}
-       
-- **[high] console-error** — main http://127.0.0.1:3103/crm/activities: Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/leads: Failed to load resource: the server responded with a status of 403 (Forbidden)
-- **[high] console-error** — main http://127.0.0.1:3103/analytics/pages: Failed to load resource: the server responded with a status of 400 (Bad Request)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/companies: Failed to load resource: the server responded with a status of 409 (Conflict)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/deals: Failed to load resource: the server responded with a status of 409 (Conflict)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/leads: Failed to load resource: the server responded with a status of 403 (Forbidden)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/contacts: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/companies: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/deals: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/activities: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/leads: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/contacts: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/contacts: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/contacts: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/contacts: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/contacts: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/deals: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
-- **[high] console-error** — main http://127.0.0.1:3103/crm/deals: Failed to load resource: the server responded with a status of 503 (Service Unavailable)
+- **[medium] low-contrast** — sales-quotes: 1 text node(s) under WCAG AA, e.g. {"text":"0","ratio":1,"min":4.5,"fontSize":12}
+- **[medium] low-contrast** — sales-orders: 1 text node(s) under WCAG AA, e.g. {"text":"0","ratio":1,"min":4.5,"fontSize":12}
+- **[high] overflow-mobile** — mobile crm-contacts: horizontal overflow
+- **[medium] offscreen-mobile** — mobile crm-contacts: 172 element(s) outside the viewport
+- **[high] overflow-mobile** — mobile crm-companies: horizontal overflow
+- **[medium] offscreen-mobile** — mobile crm-companies: 172 element(s) outside the viewport
+- **[high] overflow-mobile** — mobile crm-deals-mobile: horizontal overflow
+- **[medium] offscreen-mobile** — mobile crm-deals-mobile: 172 element(s) outside the viewport
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theSheetOpens
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theSheetNamesTheKeys
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theSheetAdvertisesDestinations
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theSheetReopensAfterNavigation
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: slashFocusesSearch
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theListHasRows
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: nCreates
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: gThenDGoesToDeals
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: thePhoneDefaultsToTheList
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theBoardIsStillOffered
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theBoardScrollsOnAPhone
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theStageHeaderSticks
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theStagesKeepTheirTotals
+- **[high] crm-keyboard-mobile** — keyboard/mobile step failed: theFormIsOnAPhone
+- **[high] crm-state** — state step failed: contacts_hasAState
+- **[high] crm-state** — state step failed: contacts_readsAsASentence
+- **[high] crm-state** — state step failed: contacts_showsTheRequestId

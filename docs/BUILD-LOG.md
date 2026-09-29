@@ -5853,3 +5853,69 @@ same sentence slice 3 ended on, and the reason this entry does not claim a QA re
 
 **Next.** Slice 5 — the sales-order reservation, for which `reserve`/`release` exist with no
 route — then the reports screen and the sales integration, then the QA pass above.
+
+## tick 31 — REQ-053 slice 5, the sales-order reservation (`7dbd1ae`, `f623ba4`)
+
+**What.** A confirmed sales order now holds stock, and the ledger can see that it did.
+
+**Proof.**
+
+* `cargo test -p omnion-module-inventory --lib --quiet` — **84/84** (83 before slice 5, 1 new).
+* `cargo test -p omnion-api --test inventory_reservations -- --ignored --test-threads=1` —
+  **7/7** walks against `omnion_qa_w4` with `OMNION_REQUIRE_DB=1`, so a green tick cannot be a
+  quiet skip.
+* `pnpm turbo run typecheck --force` — **2/2**.
+* `bash scripts/qa/run.sh` on `QA_STACK=w4` — **still running** at the time of writing (see below).
+
+**What the criterion was hiding.** `reserve` and `release` existed as movement kinds with correct
+arithmetic, and `sales_order_reservations` existed as the sales module's own table — and confirming
+an order wrote the sales rows **without touching `inventory_stock` at all**. The order detail showed
+a hold; the stock list showed the same units as fully available; a second order could promise them
+again. Migration `0057` is explicit that the table exists "even when inventory is not installed", so
+`reservation_state` could say `total` and nothing on any screen was red: **a record that describes a
+hold is not a hold**, and the mirror is what hides the gap.
+
+The walk asserts on the **stock list** rather than on the order, because the order is never where
+this was visible, and the balance is read through the API the screen reads — a bridge that fed the
+rollup a different number than the one it reported would pass an assertion on the order and fail
+this one.
+
+**Two defects, both mine, both found by the walks.**
+
+*A second confirm held the stock again.* The unique index on `(order_id, line_id)` made the sales
+row idempotent, so the double-click wrote no second hold there and every order screen stayed
+correct while the shelf drained twice. This is the second time in this module a unique index in one
+table has hidden a write in another. The guard asks the ledger what the order still holds on that
+line, which is only answerable because of `0146`'s nullable `order_line_id` pointer — a pointer and
+not a copy of the quantity, so a wrong one can only make the guard conservative, and it keeps this
+crate from reading the sales module's table to decide whether to write its own.
+
+*`replay` could not see a hold at all.* `signed()` is `0` for both reservation kinds and the arm
+that caught `0` was a plain **addition**, so a hold of 4 replayed as `on_hand = 14` while the
+rollup said `10`. Harmless only while no write moved `reserved`; the first real hold would have made
+`reconciliation_report` report a permanent disagreement on every reserved row — which is how a
+report learns to be ignored. `replay` now returns a `ReplayedPosition` carrying both numbers,
+decided by `MovementKind::touches_reserved` rather than by a multiplier that is zero for both, and
+`reconciliation_report` compares both. It was also reporting `replayed_reserved` as the rollup's own
+figure — a column agreeing with itself by construction, so a corrupted reservation column would have
+been reported as clean.
+
+**Three decisions the criterion implies, which the module now makes explicitly.**
+
+* A line is held across the item's **locations**, spread largest-room-first, because an order does
+  not nominate a shelf and asking the seller to would invent a fact.
+* A line with no inventory item behind it is held **nowhere**, reported as `unheld` with a sentence,
+  and the order stays `partial` — the spec's "a visible note rather than a silent failure". A line
+  that only half fits reports as unheld rather than quietly holding half of what was promised.
+* Every write goes through `ledger::record_resolved`, the same function a hand-written movement
+  reaches, so "reserve raises `reserved` and leaves `on_hand` alone" is not written down twice —
+  slice 2's approval path already paid for that lesson once.
+
+**The QA pass has still not run.** The slot is held by another writer, the box is at load ~12 with
+1 GiB of RAM available across five writers, and the pass that has been running since 05:45 is the
+one against this stack. The screens themselves needed no work for this slice — the stock list
+already renders `reserved` and the order detail already renders the hold, which is the shape of
+this gap: everything that draws the number was built, and nothing produced it.
+
+**Next.** The reports screen (`/inventory/reports` — value-lite, movement summary, idle stock) and
+the sales integration, then the QA pass above.
