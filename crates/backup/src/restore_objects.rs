@@ -30,6 +30,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use sqlx::PgPool;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -100,6 +102,58 @@ where
     fn touch(&self, object: CopiedObject) -> Boxed<bool> {
         (self)(object)
     }
+}
+
+/// Write the library row that points at a restored object, if the site is still there.
+///
+/// **Keyed on `storage_key`, never on the archive's `id`.** The id was the row's id at the
+/// time of the backup; a file uploaded since then got its own id, and writing the archive's
+/// id back would either collide with a live row or resurrect a trashed one. The key is what
+/// a page resolves, and `media` has a unique index on it per the base migration, so this is
+/// an upsert rather than an insert-then-catch.
+///
+/// **Scoped by organization in the same `where`.** A site belonging to another tenant is
+/// `false`, not an error: the object is restored into the store, the row is refused, and the
+/// report's `rows_touched` says so. A restore that wrote a stranger's row would be the
+/// media-part leak again, read backwards.
+///
+/// A row that was **trashed** (`deleted_at` set) is revived rather than refused: the archive
+/// says this file was in the library, and a file that is in the library and also in the
+/// trash is the state a restore exists to undo.
+pub async fn restore_row(
+    pool: &PgPool,
+    object: &CopiedObject,
+    organization_id: Option<Uuid>,
+) -> Result<bool> {
+    let touched = sqlx::query(
+        "insert into media (id, site_id, storage_key, filename, content_type, size_bytes, \
+         checksum, created_at, updated_at, deleted_at, deleted_by, purged_at) \
+         select $1, s.id, $3, $4, $5, $6, $7, now(), now(), null, null, null \
+         from sites s \
+         where s.id = $2 and (s.organization_id is not distinct from $8) \
+         on conflict (storage_key) do update \
+           set filename = excluded.filename, \
+               content_type = excluded.content_type, \
+               size_bytes = excluded.size_bytes, \
+               checksum = excluded.checksum, \
+               updated_at = now(), \
+               deleted_at = null, \
+               deleted_by = null, \
+               purged_at = null \
+         where media.site_id = excluded.site_id \
+         returning (select true)",
+    )
+    .bind(object.id)
+    .bind(object.site_id)
+    .bind(&object.storage_key)
+    .bind(&object.filename)
+    .bind(&object.content_type)
+    .bind(object.size_bytes)
+    .bind(&object.checksum)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(touched.is_some())
 }
 
 /// One object that could not be written back.

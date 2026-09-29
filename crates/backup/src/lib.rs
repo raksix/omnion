@@ -72,7 +72,7 @@ pub use preview::{LiveComparison, MAX_MATCHED_KEYS, compare_database, compare_me
 pub use restore_objects::{
     ArchiveReader, Boxed, LibraryWriter, MediaRestoreReport, RestoreFailure, RowToucher,
     MAX_REPORTED_FAILURES as MAX_REPORTED_RESTORE_FAILURES, archived_sites, index_objects, read_index,
-    restore_objects,
+    restore_objects, restore_row,
 };
 pub use restore::{
     LiveCounts, MAX_REPORTED_SITES, PartEvidence, RestoreMode, RestorePreview, RestoreWarning,
