@@ -1327,7 +1327,7 @@ async fn active_run(pool: &sqlx::PgPool, agent_id: Uuid) -> Result<Option<Run>, 
     let runs = sqlx::query_as::<_, Run>(
         "select id, organization_id, site_id, agent_id, user_id, trigger, goal, status, \
          stop_reason, model_id, current_step, resume_count, cancel_requested_at, deadline_at, \
-         token_budget, prompt_tokens, completion_tokens, cost_micros, heartbeat_at, started_at, \
+         token_budget, prompt_tokens, completion_tokens, cost_micros, output_repairs, heartbeat_at, started_at, \
          finished_at, error from ai_runs where agent_id = $1 \
          and status in ('queued','running','awaiting_approval') order by started_at asc nulls first limit 1",
     )
@@ -1604,6 +1604,11 @@ pub fn stop_reasons() -> Vec<StopReason> {
         StopReason::Cancelled,
         StopReason::LoopDetected,
         StopReason::Error,
+        // The output-schema failure (REQ-099 slice 4). In the filter and not folded into
+        // `error`, because an operator chasing "the answer did not match the shape" through
+        // a filter labelled "error" is looking at the wrong thing: nothing failed, the rule
+        // did its job.
+        StopReason::OutputSchema,
     ]
 }
 

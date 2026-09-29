@@ -19,6 +19,8 @@
  *    from the API, and the button is shown for the states the API accepts rather than letting
  *    the reader find out by pressing it.
  */
+import { cost, duration, reasonLabel, tokens } from "./metrics";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -67,28 +69,6 @@ const STATUS_TONE: Record<string, string> = {
   failed: "bg-danger/10 text-danger",
   cancelled: "bg-quiet-soft text-muted",
 };
-
-const REASON_LABEL: Record<string, string> = {
-  final_answer: "Final answer",
-  max_steps: "Max steps",
-  deadline: "Deadline",
-  token_budget: "Token budget",
-  cancelled: "Cancelled",
-  loop_detected: "Loop detected",
-  error: "Error",
-};
-
-function cost(micros: number): string {
-  if (!micros) return "—";
-  const dollars = micros / 1_000_000;
-  return dollars < 0.01 ? `$${dollars.toFixed(4)}` : `$${dollars.toFixed(2)}`;
-}
-
-function tokens(count: number): string {
-  if (count < 1000) return String(count);
-  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
-  return `${(count / 1_000_000).toFixed(1)}M`;
-}
 
 /** A run's JSON payload as readable text, with the ceiling a transcript row deserves. */
 function pretty(value: unknown): string {
@@ -215,6 +195,12 @@ export function AiRunDetailView({ runId }: { runId: string }) {
   }, [run, runId, organizationId, load]);
 
   const steps = run?.steps ?? [];
+  // The recomputed half of the header. The run's own columns are the *stored* totals; this is
+  // a second read of the same fact from the step rows, and the panel puts them next to each
+  // other on purpose — a drift between them is then something a person can see rather than
+  // something only a test can find. It is `undefined` on a run that has not loaded yet, and
+  // the panel is not rendered at all in that state.
+  const telemetry = run?.telemetry;
   // The run's named workspace references, in the order the sheet wrote them. A run created before
   // this column existed (or by a trigger that named nothing) carries an empty list, not `undefined`
   // — the route always sends the key, so the screen never has to guard for a missing field.
@@ -334,11 +320,67 @@ export function AiRunDetailView({ runId }: { runId: string }) {
             {" · "}
             {run.current_step} steps · {tokens(run.prompt_tokens + run.completion_tokens)} tokens ·{" "}
             {cost(run.cost_micros)}
-            {run.stop_reason ? ` · ${REASON_LABEL[run.stop_reason] ?? run.stop_reason}` : ""}
+            {telemetry && telemetry.duration_ms > 0 ? ` · ${duration(telemetry.duration_ms)}` : ""}
+            {run.stop_reason ? ` · ${reasonLabel(run.stop_reason)}` : ""}
             {run.resume_count > 0 ? ` · resumed ${run.resume_count}×` : ""}
           </p>
           {run.error ? <p className="mt-1 text-[12.5px] text-danger">{run.error}</p> : null}
         </div>
+
+        {/* The telemetry panel. Six numbers, and the only one that can disagree with another is
+            the cost — so that one is shown twice, once from the run's stored columns and once
+            recomputed from the step rows, and a mismatch is called out rather than hidden. A
+            panel that picks one of the two would be asserting the acceptance criterion
+            instead of showing it. */}
+        {telemetry ? (
+          <dl
+            data-run-telemetry={run.id}
+            className="grid grid-cols-2 gap-x-4 gap-y-2 rounded-xl border border-line bg-surface px-3 py-2.5 text-[12.5px] sm:grid-cols-3 lg:grid-cols-6"
+          >
+            <div>
+              <dt className="text-[11px] uppercase tracking-wide text-muted">Steps</dt>
+              <dd data-run-telemetry-steps={run.id}>
+                {telemetry.completed_steps} done
+                {telemetry.failed_steps > 0 ? `, ${telemetry.failed_steps} failed` : ""}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-[11px] uppercase tracking-wide text-muted">Tool calls</dt>
+              <dd data-run-telemetry-tools={run.id}>{telemetry.tool_calls}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] uppercase tracking-wide text-muted">Tokens</dt>
+              <dd data-run-telemetry-tokens={run.id}>{tokens(telemetry.total_tokens)}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] uppercase tracking-wide text-muted">Duration</dt>
+              <dd data-run-telemetry-duration={run.id}>{duration(telemetry.duration_ms)}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] uppercase tracking-wide text-muted">Cost (stored)</dt>
+              <dd>{cost(run.cost_micros)}</dd>
+            </div>
+            <div>
+              <dt className="text-[11px] uppercase tracking-wide text-muted">Cost (from steps)</dt>
+              <dd
+                data-run-telemetry-cost={run.id}
+                className={
+                  run.cost_micros === telemetry.cost_micros ? undefined : "text-danger"
+                }
+                title={
+                  run.cost_micros === telemetry.cost_micros
+                    ? undefined
+                    : `The run row says ${cost(run.cost_micros)} and its steps sum to ${cost(
+                        telemetry.cost_micros,
+                      )}`
+                }
+              >
+                {cost(telemetry.cost_micros)}
+                {run.cost_micros === telemetry.cost_micros ? null : " · mismatch"}
+              </dd>
+            </div>
+          </dl>
+        ) : null}
 
         <div className="flex flex-wrap items-center gap-1.5">
           {running ? (

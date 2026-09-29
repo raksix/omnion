@@ -55,10 +55,14 @@ pub const AGENT_COLUMNS: &str = "id, organization_id, site_id, key, name, descri
      coalesce((select array_agg(value) from jsonb_array_elements_text(approvals)), '{}') as approvals, \
      memory_scope, enabled, created_by, created_at, updated_at";
 
+// `output_repairs` is in the column list rather than read separately, because the resume path
+// needs it at the same moment it needs the limits: a run that is re-claimed has to learn what
+// the run is *and* what the output rule already spent, and two reads of one row are two reads
+// that can straddle a write.
 const RUN_COLUMNS: &str = "id, organization_id, site_id, agent_id, user_id, trigger, goal, status, \
      stop_reason, model_id, current_step, resume_count, cancel_requested_at, deadline_at, \
-     token_budget, prompt_tokens, completion_tokens, cost_micros, heartbeat_at, started_at, \
-     finished_at, error";
+     token_budget, prompt_tokens, completion_tokens, cost_micros, output_repairs, heartbeat_at, \
+     started_at, finished_at, error";
 
 const STEP_COLUMNS: &str = "id, run_id, step_no, kind, tool, arguments, result, status, \
      prompt_tokens, completion_tokens, cost_micros, duration_ms, error, started_at, finished_at";
@@ -224,6 +228,13 @@ pub struct Run {
     pub completion_tokens: i32,
     /// Cost in millionths, the same unit `ai_usage` uses.
     pub cost_micros: i64,
+    /// Repair turns the output verification has already spent (REQ-099 slice 4).
+    ///
+    /// Persisted because the budget has to survive the process. The loop counts what it spent
+    /// and reports it on the `Outcome`, but a count that lives only in the loop's stack is a
+    /// zero after a restart — so an interrupted run resumes with a fresh allowance and
+    /// repairs forever, which is the exact failure the one-turn constant exists to prevent.
+    pub output_repairs: i32,
     /// The runner's last sign of life.
     pub heartbeat_at: Option<OffsetDateTime>,
     /// When the first step began.
@@ -785,15 +796,39 @@ pub async fn finish_run(
     reason: StopReason,
     error: Option<&str>,
 ) -> Result<()> {
+    finish_run_with_repairs(pool, run_id, status, reason, error, 0).await
+}
+
+/// [`finish_run`], recording how much of the output-verification budget this attempt spent.
+///
+/// **The default is `0`, and that is a decision rather than a convenience.** The four other
+/// call sites in this crate predate the output rule and are finishing runs that never had one,
+/// so `0` is the correct value for all of them. The runner passes the loop's own count, and a
+/// caller that forgets to will see the budget reset on the next resume — which is why the
+/// column is bounded to `between 0 and 1` rather than left open: a run claiming two repairs is
+/// a violation the database refuses, not a number the panel quietly renders.
+pub async fn finish_run_with_repairs(
+    pool: &PgPool,
+    run_id: Uuid,
+    status: StepStatus,
+    reason: StopReason,
+    error: Option<&str>,
+    output_repairs: u32,
+) -> Result<()> {
     let run_status = match status {
         StepStatus::Completed => "completed",
         StepStatus::Failed => "failed",
         _ => "cancelled",
     };
     let totals = run_totals_match_steps(pool, run_id).await?;
+    // `least(1, …)` rather than trusting the caller: the constant is a Rust value and the
+    // constraint is a SQL one, and the day they disagree the one that loses is whichever is
+    // checked later. Saturating here makes the write succeed with the policy's own ceiling.
+    let repairs = i32::try_from(output_repairs).unwrap_or(i32::MAX).min(1);
     sqlx::query(
         "update ai_runs set status = $2, stop_reason = $3, error = $4, finished_at = now(), \
-         prompt_tokens = $5, completion_tokens = $6, cost_micros = $7 where id = $1",
+         prompt_tokens = $5, completion_tokens = $6, cost_micros = $7, output_repairs = $8 \
+         where id = $1",
     )
     .bind(run_id)
     .bind(run_status)
@@ -802,6 +837,7 @@ pub async fn finish_run(
     .bind(totals.prompt_tokens)
     .bind(totals.completion_tokens)
     .bind(totals.cost_micros)
+    .bind(repairs)
     .execute(pool)
     .await?;
     Ok(())

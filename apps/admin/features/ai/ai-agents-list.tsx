@@ -19,6 +19,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { cost, tokens } from "./metrics";
+
 import {
   Copy,
   Loader2,
@@ -47,6 +49,30 @@ import { useSession } from "@/lib/session";
 import { RunSheet } from "./run-sheet";
 
 /** How a tool count reads, with the approval half called out. */
+/**
+ * The 30-day cell.
+ *
+ * Three rules, each a way this column lies about an agent:
+ *
+ * - **An agent with no runs shows an em dash, not 0%.** The rate is over *finished* runs, so a
+ *   brand-new agent has no rate at all; a cell reading "0%" is a claim about a division that
+ *   never happened, and it is the same claim as "this agent fails every time".
+ * - **The cancelled count is shown, not folded in.** A person pressing stop stopped the run.
+ *   Reading "2 runs, 1 success" and then "50%" without knowing one was cancelled is how an
+ *   operator concludes an agent is unreliable when the real answer is that they cancelled it.
+ * - **Cost renders in the same unit as the run detail**, from micros, so the two screens can be
+ *   compared without a reader doing arithmetic in their head.
+ */
+function telemetryLabel(agent: AiAgent): string {
+  const roll = agent.telemetry;
+  if (!roll || roll.runs === 0) return "—";
+  const rate =
+    roll.success_rate === null ? "—" : `${Math.round(roll.success_rate)}%`;
+  const parts = [`${roll.runs} run${roll.runs === 1 ? "" : "s"}`, rate];
+  if (roll.cancelled > 0) parts.push(`${roll.cancelled} stopped`);
+  return parts.join(" · ");
+}
+
 function toolsLabel(agent: AiAgent): string {
   const total = agent.tools.length;
   if (total === 0) return "no tools";
@@ -425,6 +451,9 @@ export function AiAgentsList() {
                   <th className="px-2 py-2" scope="col">Name</th>
                   <th className="px-2 py-2" scope="col">Model</th>
                   <th className="px-2 py-2" scope="col">Tools</th>
+                  <th className="px-2 py-2" scope="col">
+                    Last 30 days
+                  </th>
                   <th className="px-2 py-2" scope="col">Memory</th>
                   <th className="px-2 py-2" scope="col">Updated</th>
                   <th className="px-2 py-2" scope="col">Status</th>
@@ -473,6 +502,15 @@ export function AiAgentsList() {
                       <span data-agent-tools={toolsLabel(agent)} className="text-[12.5px]">
                         {toolsLabel(agent)}
                       </span>
+                    </td>
+                    <td className="px-2 py-2" data-agent-telemetry={agent.id}>
+                      <span className="text-[12.5px]">{telemetryLabel(agent)}</span>
+                      {agent.telemetry && agent.telemetry.runs > 0 ? (
+                        <span className="mt-0.5 block text-[11.5px] text-muted">
+                          {tokens(agent.telemetry.total_tokens)} ·{" "}
+                          {cost(agent.telemetry.cost_micros)}
+                        </span>
+                      ) : null}
                     </td>
                     <td className="px-2 py-2 text-[12.5px] text-muted">{agent.memory_scope}</td>
                     <td className="px-2 py-2 text-[12.5px] text-muted">{relative(agent.updated_at)}</td>
@@ -562,6 +600,8 @@ export function AiAgentsList() {
                   <dd className="font-mono text-[12px]">{agent.key}</dd>
                   <dt className="text-muted">Tools</dt>
                   <dd data-agent-tools={toolsLabel(agent)}>{toolsLabel(agent)}</dd>
+                  <dt className="text-muted">Last 30 days</dt>
+                  <dd data-agent-telemetry={agent.id}>{telemetryLabel(agent)}</dd>
                   <dt className="text-muted">Memory</dt>
                   <dd>{agent.memory_scope}</dd>
                   <dt className="text-muted">Updated</dt>

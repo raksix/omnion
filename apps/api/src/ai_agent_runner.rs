@@ -33,7 +33,9 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use omnion_ai_hub::agent::{AgentEvent, RunLimits, StepKind, StepStatus, StopReason};
-use omnion_ai_hub::loop_engine::{CancelHandle, Persist, Runtime, Sink, run as run_agent};
+use omnion_ai_hub::loop_engine::{
+    CancelHandle, OutputVerification, Persist, RunOptions, Runtime, Sink, run_with as run_agent,
+};
 use omnion_ai_hub::provider_model::ProviderModel;
 use omnion_ai_hub::run_store::{self, Run};
 use omnion_ai_hub::tools::{AllowList, ToolRegistry};
@@ -317,7 +319,25 @@ pub async fn execute_with_sink(
     // endpoint never needs to know about: the column is the contract between them, not a channel.
     let cancel = runtime.cancel_handle();
     let persister = persister(pool.clone(), run.id, cancel);
-    let outcome = run_agent(&runtime, &run.goal, limits, &sink, &persister).await;
+    // The output rule, seeded with what this run has already spent. A run claimed for the first
+    // time carries `0`; a run that was interrupted *after* a repair turn carries `1`, and
+    // arriving with a fresh allowance is how a run ends up repairing until the step cap. The
+    // rule itself is `None` for now — no caller of `POST /ai/agents/{id}/runs` has declared one
+    // yet — but the seam is here and tested, and a caller that adds the column changes one
+    // line rather than teaching the resume path about a concept it does not have.
+    let output = output_rule_for(run).map(|rule| OutputVerification {
+        rule,
+        repairs_spent: u32::try_from(run.output_repairs).unwrap_or(0),
+    });
+    let outcome = run_agent(
+        &runtime,
+        &run.goal,
+        limits,
+        &sink,
+        &persister,
+        RunOptions { output, ..RunOptions::default() },
+    )
+    .await;
     heartbeat(pool, run.id).await;
 
     // A parked run is written `awaiting_approval` with no stop reason at all, because a run
@@ -344,7 +364,18 @@ pub async fn execute_with_sink(
         } else {
             None
         };
-        let _ = run_store::finish_run(pool, run.id, status, outcome.stop_reason, error.as_deref()).await;
+        // The repair count goes on the row, not just into this attempt's trace: it is the one
+        // number that has to survive a restart, and a run that failed its output rule and was
+        // later resumed must arrive with the budget already spent.
+        let _ = run_store::finish_run_with_repairs(
+            pool,
+            run.id,
+            status,
+            outcome.stop_reason,
+            error.as_deref(),
+            outcome.output_repairs,
+        )
+        .await;
     }
 
     // The run events that make a run automatable (REQ-099's event list). Emitted after the row is
@@ -415,6 +446,17 @@ fn run_limits_for(run: &Run, agent: &run_store::Agent) -> RunLimits {
         deadline_seconds: agent.deadline_seconds.max(1) as u32,
         token_budget: run.token_budget.unwrap_or(agent.token_budget),
     })
+}
+
+/// The output rule a run executes under, if its caller declared one.
+///
+/// `None` today, and that is the honest answer rather than a stub: the request's output
+/// verification is about *a workflow node* asking for a shape, and the run-start route has no
+/// field for it yet. What exists is the seam — the run's persisted `output_repairs` is read
+/// above and threaded in — so the day a column lands here, the resume path already obeys the
+/// budget instead of resetting it.
+fn output_rule_for(_run: &Run) -> Option<omnion_ai_hub::guardrails::OutputRule> {
+    None
 }
 
 /// Publish the terminal event for one run.

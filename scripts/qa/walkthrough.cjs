@@ -6660,6 +6660,28 @@ async function runAiAgentsDepth(page, report) {
   // The whole point of the column: the approvals half is visible without expanding anything.
   steps.toolColumnNamesApprovals = /approvals:\s*1/i.test(steps.toolColumn);
   steps.mobileCard = (await page.locator(`[data-agent-card="${agentId}"]`).count()) > 0;
+
+  // The 30-day column (REQ-099 slice 4). The assertion is that it renders an **em dash** and
+  // not a zero: this agent was created seconds ago and has never run, so a cell reading "0%"
+  // would be a claim about a division that never happened, and it is the same string a
+  // genuinely failing agent produces. Both the desktop cell and the mobile card are read,
+  // because "the same rows as cards on a phone" is only true if the card carries the data too.
+  const telemetryCell = (
+    await page.locator(`[data-agent-row="${agentId}"] [data-agent-telemetry]`).innerText().catch(() => "")
+  )
+    .trim();
+  steps.telemetryEmptyIsNotZero = telemetryCell === "—" || telemetryCell.length === 0;
+  steps.telemetryCellPresent = telemetryCell.length > 0;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  const cardTelemetry = (
+    await page.locator(`[data-agent-card="${agentId}"] [data-agent-telemetry]`).innerText().catch(() => "")
+  )
+    .trim();
+  steps.telemetryOnMobileCard = cardTelemetry === telemetryCell;
+  await shot(page, "ai-agents-list-telemetry");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(400);
   await shot(page, "ai-agents-list");
 
   await page.locator("[data-agents-search]").fill("qa-agent-key-that-does-not-exist", { timeout: 4000 }).catch(() => {});
@@ -6896,6 +6918,29 @@ async function runAiAgentsDepth(page, report) {
       steps.stepExpands = (await page.locator("[data-run-step-body]").count()) > 0;
     }
     steps.copyControl = (await page.locator("[data-run-detail-copy]").count()) > 0;
+
+    // ---- the telemetry panel (REQ-099 slice 4) --------------------------------------------------
+    //
+    // The panel shows the run's *stored* cost and the cost *recomputed from its step rows* side
+    // by side, so the acceptance criterion "telemetry equals the underlying rows" is something
+    // a person can read off the screen. Two things are asserted here and they are different:
+    // the panel is present with all six numbers, and the two costs **agree** on a real run —
+    // a panel that renders one number and hides the other would pass the first and be useless.
+    const telemetryPanel = await page.locator("[data-run-telemetry]").count();
+    steps.telemetryPanel = telemetryPanel > 0;
+    steps.telemetrySteps = (await page.locator("[data-run-telemetry-steps]").count()) > 0;
+    steps.telemetryTools = (await page.locator("[data-run-telemetry-tools]").count()) > 0;
+    steps.telemetryTokens = (await page.locator("[data-run-telemetry-tokens]").count()) > 0;
+    steps.telemetryDuration = (await page.locator("[data-run-telemetry-duration]").count()) > 0;
+    const recomputedCost = (
+      await page.locator("[data-run-telemetry-cost]").first().innerText().catch(() => "")
+    ).trim();
+    steps.telemetryCost = recomputedCost.length > 0;
+    // "mismatch" is the word the panel prints when the two disagree. Asserting its *absence*
+    // is the check; a run whose stored cost drifted from its steps would put it on screen, and
+    // this is where a person would see it.
+    steps.telemetryCostAgrees = recomputedCost.length > 0 && !/mismatch/i.test(recomputedCost);
+    await shot(page, "ai-run-detail-telemetry");
     steps.cancelOrResume = await page.locator("[data-run-detail-cancel], [data-run-detail-resume]").count();
     await shot(page, "ai-runs-detail");
   } else {

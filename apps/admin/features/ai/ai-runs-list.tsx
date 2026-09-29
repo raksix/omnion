@@ -29,6 +29,7 @@ import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { ApiError, type AiAgent, type AiRun, fetchAiAgents, fetchAiRuns } from "@/lib/api";
 import { useSession } from "@/lib/session";
+import { cost, reasonLabel, tokens } from "./metrics";
 
 /** The statuses the loop writes, in the order an operator cares about. */
 const STATUSES = [
@@ -64,32 +65,6 @@ const STATUS_TONE: Record<string, string> = {
   failed: "bg-danger/10 text-danger",
   cancelled: "bg-quiet-soft text-muted",
 };
-
-/** Stop reasons that read in words rather than as the loop's own snake_case key. */
-const REASON_LABEL: Record<string, string> = {
-  final_answer: "Final answer",
-  max_steps: "Max steps",
-  deadline: "Deadline",
-  token_budget: "Token budget",
-  cancelled: "Cancelled",
-  loop_detected: "Loop detected",
-  error: "Error",
-};
-
-/** A cost in millionths as the panel shows it: "—" when nothing is known, "$0.004" when it is. */
-function cost(micros: number): string {
-  if (!micros) return "—";
-  const dollars = micros / 1_000_000;
-  if (dollars < 0.01) return `$${dollars.toFixed(4)}`;
-  return `$${dollars.toFixed(2)}`;
-}
-
-/** A token count in the compact form the table has room for. */
-function tokens(count: number): string {
-  if (count < 1000) return String(count);
-  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
-  return `${(count / 1_000_000).toFixed(1)}M`;
-}
 
 /** A duration between two timestamps, as the run list shows it. */
 function duration(started: string | null, finished: string | null): string {
@@ -387,7 +362,7 @@ export function AiRunsList() {
                       {duration(run.started_at, run.finished_at)}
                     </td>
                     <td className="whitespace-nowrap px-2 py-2 text-[12.5px]">
-                      {run.stop_reason ? (REASON_LABEL[run.stop_reason] ?? run.stop_reason) : "—"}
+                      {run.stop_reason ? (reasonLabel(run.stop_reason)) : "—"}
                     </td>
                     <td className="px-2 py-2">
                       <span
@@ -433,7 +408,7 @@ export function AiRunsList() {
                   <dt className="text-muted">Duration</dt>
                   <dd>{duration(run.started_at, run.finished_at)}</dd>
                   <dt className="text-muted">Reason</dt>
-                  <dd>{run.stop_reason ? (REASON_LABEL[run.stop_reason] ?? run.stop_reason) : "—"}</dd>
+                  <dd>{run.stop_reason ? (reasonLabel(run.stop_reason)) : "—"}</dd>
                 </dl>
                 {run.status === "running" || run.status === "queued" ? (
                   <button

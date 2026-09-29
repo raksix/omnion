@@ -700,6 +700,117 @@ async fn tool_usage_sees_only_this_tenants_calls() {
 }
 
 // -------------------------------------------------------------------------------------------
+// The persisted repair budget (migration 0158)
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_database_refuses_a_stop_reason_outside_the_vocabulary() {
+    // The constraint is the vocabulary's only enforcement, and a new `StopReason` with no entry
+    // here is a run the loop produces and the store cannot write: the transaction fails with a
+    // constraint name instead of the sentence the panel needs. Proved with a *newer* reason
+    // rather than the one that just landed, so the walk also says the constraint is still
+    // there — a dropped constraint accepts anything and this test would pass on it.
+    let store = bench!();
+    let run_id = store
+        .finished_run("completed", "final_answer", 0, 0, 0, 0)
+        .await;
+    let refused = sqlx::query("update ai_runs set stop_reason = 'a_reason_from_the_future' where id = $1")
+        .bind(run_id)
+        .execute(&store.pool)
+        .await;
+    assert!(refused.is_err(), "an unknown stop reason must be refused");
+
+    let ok = sqlx::query("update ai_runs set stop_reason = 'output_schema' where id = $1")
+        .bind(run_id)
+        .execute(&store.pool)
+        .await;
+    assert!(ok.is_ok(), "the reason slice 4 added must be accepted");
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn the_repair_budget_survives_the_row_and_is_bounded() {
+    // The whole reason the column exists: a count that lives only in the loop's stack is zero
+    // after a restart, and a run that is interrupted mid-repair then resumes with a fresh
+    // allowance and repairs forever.
+    let store = bench!();
+    let run_id = store
+        .finished_run("failed", "output_schema", 1, 10, 10, 10)
+        .await;
+
+    let stored = run_store::get_run(&store.pool, store.organization_id, run_id)
+        .await
+        .expect("the run read must work")
+        .expect("the run must exist");
+    assert_eq!(stored.output_repairs, 0, "the fixture has spent nothing");
+
+    // A run that spent its turn, written through the function the runner uses.
+    run_store::finish_run_with_repairs(
+        &store.pool,
+        run_id,
+        StepStatus::Failed,
+        StopReason::OutputSchema,
+        Some("the answer did not match"),
+        1,
+    )
+    .await
+    .expect("the run must finish");
+
+    let after = run_store::get_run(&store.pool, store.organization_id, run_id)
+        .await
+        .expect("the run read must work")
+        .expect("the run must exist");
+    assert_eq!(after.output_repairs, 1, "the spent turn is on the row");
+    assert_eq!(after.stop_reason.as_deref(), Some("output_schema"));
+
+    // A caller passing more than the policy allows is clamped by the write rather than
+    // rejected by it: the Rust constant and the SQL constraint are two spellings of one rule,
+    // and the day they disagree the one that loses should not be the run.
+    run_store::finish_run_with_repairs(
+        &store.pool,
+        run_id,
+        StepStatus::Failed,
+        StopReason::OutputSchema,
+        None,
+        7,
+    )
+    .await
+    .expect("an over-budget write still lands");
+    let clamped = run_store::get_run(&store.pool, store.organization_id, run_id)
+        .await
+        .expect("the run read must work")
+        .expect("the run must exist");
+    assert_eq!(clamped.output_repairs, 1, "clamped to the policy, not stored as seven");
+
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn the_column_defaults_to_zero_for_a_run_that_never_verified_anything() {
+    // The other four `finish_run` callers predate the output rule, and their default has to be
+    // the correct value for them rather than a convenient one.
+    let store = bench!();
+    let run_id = store
+        .finished_run("completed", "final_answer", 0, 0, 0, 0)
+        .await;
+    run_store::finish_run(
+        &store.pool,
+        run_id,
+        StepStatus::Completed,
+        StopReason::FinalAnswer,
+        None,
+    )
+    .await
+    .expect("the run must finish");
+    let stored = run_store::get_run(&store.pool, store.organization_id, run_id)
+        .await
+        .expect("the run read must work")
+        .expect("the run must exist");
+    assert_eq!(stored.output_repairs, 0);
+    store.dispose().await;
+}
+
+// -------------------------------------------------------------------------------------------
 // The rate's own shape
 // -------------------------------------------------------------------------------------------
 
