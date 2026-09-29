@@ -85,6 +85,7 @@ pub mod iam_provisioning;
 pub mod iam_role_rules;
 pub mod iam_security;
 pub mod iam_subjects;
+pub mod iam_sync;
 pub mod me;
 pub mod media;
 pub mod media_duplicates;
@@ -296,6 +297,18 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "iam.providers.manage"));
 
     let iam_provider_events = get(iam_providers::list_provider_events)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    // The sync ledger (REQ-065, slice 4 part 2). Reading a run and its failures is `read`; asking
+    // for a retry is `manage`, because a retry re-walks a live directory and writes a run row
+    // an operator will later read as evidence that somebody asked.
+    let iam_provider_sync_runs = get(iam_sync::list_sync_runs)
+        .layer(guards::require(&state, "iam.providers.read"));
+    let iam_provider_sync_run = get(iam_sync::get_sync_run)
+        .layer(guards::require(&state, "iam.providers.read"));
+    let iam_provider_sync_retry = post(iam_sync::retry_sync_run)
+        .layer(guards::require(&state, "iam.providers.manage"));
+    let iam_provider_sync_groups = get(iam_sync::list_group_links)
         .layer(guards::require(&state, "iam.providers.read"));
 
     // The attribute map (REQ-065, slice 2). Reading it and rehearsing it is `read` — a preview
@@ -1089,6 +1102,13 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers/{id}/enable", iam_provider_enable)
         .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
+        .route("/iam/providers/{id}/sync-runs", iam_provider_sync_runs)
+        .route("/iam/providers/{id}/sync-runs/{run_id}", iam_provider_sync_run)
+        .route(
+            "/iam/providers/{id}/sync-runs/{run_id}/retry",
+            iam_provider_sync_retry,
+        )
+        .route("/iam/providers/{id}/sync-groups", iam_provider_sync_groups)
         .route(
             "/iam/providers/{id}/attribute-mappings",
             iam_provider_attribute_mappings,

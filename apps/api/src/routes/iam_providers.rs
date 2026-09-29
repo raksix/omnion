@@ -955,6 +955,19 @@ pub async fn list_provider_events(
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
+/// Read a provider for a *sub*-surface, refusing one outside the caller's organization.
+///
+/// This is [`load`] with a name other modules can reach, and it is the same function: the tenant
+/// check is the one place that answers "may this caller touch this provider", and a second copy
+/// of it is a second answer to that question.
+pub async fn load_for_sync(
+    state: &AppState,
+    current: &CurrentSession,
+    id: Uuid,
+) -> Result<AuthProvider, ApiError> {
+    load(state, current, id).await
+}
+
 /// Read a provider and refuse one outside the caller's organization.
 async fn load(
     state: &AppState,
