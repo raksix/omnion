@@ -586,6 +586,15 @@ const PURGE_COLUMNS: &str = "id, site_id, kind, targets, status, provider, item_
 const ITEM_COLUMNS: &str = "id, purge_id, target, status, attempts, next_attempt_at, \
                             response_status, error, done_at";
 
+/// The same projection, qualified with the alias the claim's `update` uses.
+///
+/// `ITEM_COLUMNS` is for plain `select` statements, where the column names are the whole
+/// projection. In an `update ... from` with a CTE both relations are in scope, so every
+/// name must be qualified — and one unqualified name makes the whole statement fail, not
+/// just that column.
+const RETURNING_ITEMS: &str = "i.id, i.purge_id, i.target, i.status, i.attempts, \
+                               i.next_attempt_at, i.response_status, i.error, i.done_at";
+
 /// Write a purge and one item row per target, in one transaction.
 ///
 /// The transaction is the whole point: a purge row with no items is a queue entry that will
@@ -705,19 +714,25 @@ pub async fn claim_due(
     pool: &sqlx::PgPool,
     limit: i64,
 ) -> Result<Vec<PurgeItemRow>, CdnError> {
+    // The RETURNING list is qualified with the table alias, and that is not a style choice.
+    // `returning id` is ambiguous here: the `due` CTE exposes an `id` column of its own, and
+    // PostgreSQL resolves the bare name against both relations and refuses the statement with
+    // `column reference "id" is ambiguous` — at runtime, on the first item the worker ever
+    // claimed. Every other column in the list is qualified for the same reason; `purge_id`,
+    // `target` and `status` would be ambiguous too if `due` ever grew them.
     sqlx::query_as::<_, PurgeItemRow>(&format!(
         "with due as ( \
-            select id from cdn_purge_items \
-            where status = 'pending' and next_attempt_at <= now() \
-            order by next_attempt_at asc, id asc \
+            select i.id as claimed_id from cdn_purge_items i \
+            where i.status = 'pending' and i.next_attempt_at <= now() \
+            order by i.next_attempt_at asc, i.id asc \
             limit $1 \
             for update skip locked \
          ) \
          update cdn_purge_items i \
          set status = 'running' \
          from due \
-         where i.id = due.id \
-         returning {ITEM_COLUMNS}",
+         where i.id = due.claimed_id \
+         returning {RETURNING_ITEMS}",
     ))
     .bind(limit.clamp(1, MAX_BATCH as i64))
     .fetch_all(pool)
