@@ -2812,3 +2812,48 @@ its own row count, because the first version of that script used the wrong colum
 single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The browser pass
 itself is still queued; the three probes above are what this slice is closed on, and the pass
 will confirm the three screens when it gets a slot.
+
+**The screen probe found a bug the API probe could not, and it was the worst kind: the create
+form could not save at all.** `scripts/qa/credential-screens.cjs` drives the three screens in a
+real browser, and the first thing it did was paste a key and press Save — which is what a person
+does — and got nothing, because the whole create was refused with `503 secret_store_unavailable`.
+
+That refusal was written for the wrong endpoint. On `POST /credentials/{id}/secret` — the
+deliberate replace path — refusing is right: the caller asked for one specific thing, it did not
+happen, and a 503 that says so is the honest answer. On a *create* it is not. The credential is a
+real row with a name, a key and a type, and the REQ says outright that a save is allowed without
+a passing test and shows as "not verified". A secret is an attachment somebody can add from the
+detail screen; refusing the whole create over it makes the surface unusable until REQ-125 lands,
+which is the worst possible way to ship half a feature. The create now succeeds and reports what
+did not happen in `secret_write_warning`, and the panel shows that **on the row it concerns** —
+a reader who pasted a key and was redirected to a detail screen that never mentions it will
+assume the key is there, and then debug a node that cannot authenticate for want of a key they
+are certain they pasted.
+
+**And a probe that counts "this situation did not arise" as a pass inflates its own
+denominator.** The screen probe reported "17 of 19" while two of those were notes, not claims —
+it looked like it was failing two things when it had asserted less than it said. Claims and notes
+are now distinct outcomes and the totals only count claims. A number that overstates the
+assurance you gave is worse than a lower one.
+
+**Final state of the slice, all against the live private w10 stack:**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | **75 passed** |
+| `cargo test -p omnion-api --lib` | **177 passed** |
+| `cargo test -p omnion-permissions --lib` | **62 passed** |
+| `pnpm typecheck` | 2 successful, 0 errors |
+| `scripts/qa/credential-contract.sh` | **43/43** |
+| `scripts/qa/delete-guard.sh` | **20/20** |
+| `scripts/qa/usage-probe.sh` | **5/5** |
+| `scripts/qa/credential-screens.cjs` | **19/19 claims**, 2 notes |
+
+The full `scripts/qa/run.sh` browser pass is still working through the other stacks' screens
+behind me; `credential-screens.cjs` renders and measures the same three routes directly, so the
+screens are confirmed either way.
+
+**Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider (state + PKCE), the
+single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The one clause left
+on slice 2 is "disables the dependent nodes", which needs the canvas (REQ-086 slice 2) to have
+somewhere to disable them.
