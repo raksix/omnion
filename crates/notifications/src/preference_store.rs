@@ -64,9 +64,27 @@ pub async fn read_settings(pool: &PgPool, user_id: Uuid) -> Result<Settings> {
         Option<i16>,
         i16,
     )> = sqlx::query_as(
-        "select quiet_hours_start::text, quiet_hours_end::text, timezone, digest_cadence, \
-                    digest_weekday, digest_hour \
-             from notification_settings where user_id = $1",
+        // `to_char(…, 'HH24:MI')` and **not** `::text`. Postgres prints a `time` with `::text` as
+        // `22:00:00` — seconds always present, zero-padded — while the platform's own clock
+        // vocabulary is `HH:MM`, the shape the settings form sends and the shape the runtime
+        // parses. Reading the column the other way handed every consumer a string nothing
+        // could read, so a quiet window that had been saved correctly came back as no window
+        // at all: `parse_clock` returned `None`, `in_quiet_hours` took its documented "no
+        // window means not quiet" arm, and the setting the reader had just turned on silently
+        // did nothing from the next request onwards.
+        //
+        // The shape is produced in **SQL** rather than by casting to `time::Time` and
+        // formatting in Rust, and that is deliberate on both counts:
+        //
+        // * `to_char` returns `text`, so the column is decoded as `Option<String>` — declaring
+        //   it as `Option<time::Time>` fails at runtime with "mismatched types … not compatible
+        //   with SQL type TEXT", which is a `500` on the settings screen rather than a build
+        //   error, because `query_as` is checked at decode time and not at compile time.
+        // * one literal in the SQL is the whole of the platform's clock vocabulary, so the
+        //   query and every caller cannot drift apart the way a shape spelled twice did.
+        "select to_char(quiet_hours_start, 'HH24:MI'), to_char(quiet_hours_end, 'HH24:MI'), \
+                timezone, digest_cadence, digest_weekday, digest_hour \
+         from notification_settings where user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(pool)
@@ -76,6 +94,10 @@ pub async fn read_settings(pool: &PgPool, user_id: Uuid) -> Result<Settings> {
         || Settings::default_for(user_id),
         |(start, end, timezone, cadence, weekday, hour)| Settings {
             user_id,
+            // `to_char` already produced the platform's own `HH:MM`, so these are the strings
+            // as read. `format_clock` is the *write*-side counterpart that documents the shape
+            // and is asserted against the parser, so a future change to one of them has to
+            // change both — which is the property the defect was missing.
             quiet_hours_start: start,
             quiet_hours_end: end,
             timezone,
