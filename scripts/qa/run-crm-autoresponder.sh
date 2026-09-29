@@ -20,7 +20,18 @@ cd "$ROOT"
 export PATH="$HOME/.cargo/bin:$PATH"
 
 CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}"
-DB="${QA_DB:-omnion_qa_w8}"
+DB="${QA_DB:-omnion_qa_w8_autoresponder}"
+
+# A gate may not share the browser pass's database. `DROP DATABASE … WITH (FORCE)` terminates
+# every connection, and the pass's API is one of them: the walk then dies partway through the
+# route list and the failure is reported on whichever screens came *next* (the five CRM screens,
+# as offline chrome-error pages) — the cause and the symptom are twenty routes apart. The gate
+# fails in silence, the pass fails loudly and wrongly, and the report names the panel.
+if [ "${DB}" = "omnion_qa" ] || [ "${DB}" = "omnion_qa_w8" ]; then
+  echo "  FAIL: this gate would drop the QA pass's own database ($DB)." >&2
+  echo "        Give the gate its own: run-crm-intake.sh uses omnion_qa_crm_intake." >&2
+  exit 1
+fi
 export DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/${DB}"
 export CARGO_TARGET_DIR="${QA_CARGO_TARGET_DIR:-/dev/shm/w8-target}"
 export CARGO_INCREMENTAL=0
