@@ -1,19 +1,25 @@
 # REQ-016 — Webhook + Event Bus
 
-> **Status:** in-progress — **slice 1 is code-complete and verified.** The registry is
-> `crates/events/src/catalogue.rs`: 68 names (67 live, 1 reserved) with their area, a
-> one-sentence description, their payload fields and a required flag, compiled in rather
-> than stored. `GET /api/v1/events/catalogue` serves it; a group subscription (`page.*`)
-> is stored as the wildcard **and** as today's expansion, and the fan-out tests the
-> wildcard, so an event added next release reaches an endpoint nobody edited. Proof:
-> `cargo test -p omnion-events --lib` **41** (24 + 17), `cargo test -p omnion-api --test
-> events` **4/4** against real Postgres and a real loopback receiver, `omnion-api --lib`
-> **188**, `tsc --noEmit` exit 0. **Not yet done in slice 1:** emission calls for the names
-> the modules do not yet record (`page.created|updated|unpublished|deleted|restored`,
-> `user.updated|deleted`, `site.archived`, `domain.*`, `plugin.*`, `theme.activated`,
-> `workflow.run.*`) and the `/events` screen with its Feed and Catalogue tabs — the
-> catalogue's data source exists, its screen does not. Slice 2 (endpoint management UI) is
-> untouched. · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
+> **Status:** in-progress — **slices 1 and the emission half of slice 3 are code-complete and
+> verified.** The registry is `crates/events/src/catalogue.rs`: 68 names (57 live, 11 reserved)
+> with their area, a one-sentence description, their payload fields and a required flag,
+> compiled in rather than stored. `GET /api/v1/events/catalogue` serves it; a group
+> subscription (`page.*`) is stored as the wildcard **and** as today's expansion, and the
+> fan-out tests the wildcard, so an event added next release reaches an endpoint nobody edited.
+> **Slice 1's second half found a lie in the registry and fixed it:** the drift gate only
+> walked emitted → catalogue, so nothing asked whether a name marked *live* was emitted at
+> all. Twenty-seven were not. Eleven now emit (`page.created|updated|deleted|restored`,
+> `translation.updated`, `domain.added|removed`, `site.archived`, `user.updated|deleted`,
+> `theme.activated`, `webhook.endpoint.created|updated|removed|tested`,
+> `webhook.secret.rotated`, `webhook.delivery.failed`), and the ten that have no write path
+> anywhere are marked **reserved** with the module that owes each one, pinned by
+> `a_reserved_name_names_the_module_that_ships_it`. Proof: `cargo test -p omnion-events --lib`
+> **42**, `cargo test -p omnion-api --test events` **5/5** against real Postgres and a real
+> loopback receiver, `omnion-api --lib` **188**, `tsc --noEmit` exit 0. The new gate
+> `every_live_name_has_an_emitter` was proved in both directions (promoting `plugin.installed`
+> to live turned it red with the name). **Not done:** the `/events` screen with its Feed and
+> Catalogue tabs — the catalogue's data source exists, its screen does not. Slice 2 (endpoint
+> management UI) and slice 3's delivery-operations UI are untouched. · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -141,10 +147,31 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
 
 - [ ] `GET /api/v1/events/catalogue` returns every event name in the registry with area, description and payload fields, and the `/events` Catalogue tab renders
   it.
-- [ ] Publishing a page records `page.published` with `page_id`, `site_id`, `revision_no` and `slug` in the payload; creating, updating, unpublishing and
+      — **Left unticked on purpose: the screen half does not exist.** The API half is done and
+      proven — the endpoint serves the whole table (area, description, payload fields with their
+      kind and required flag) and the endpoint form's picker is built from it. Ticking a box whose
+      second clause is unbuilt is how a checklist stops meaning anything, so the box waits for the
+      `/events` Catalogue tab.
+- [x] Publishing a page records `page.published` with `page_id`, `site_id`, `revision_no` and `slug` in the payload; creating, updating, unpublishing and
   restoring a page record their own names.
-- [ ] Creating, updating and deleting a user records `user.created|updated|deleted`; the same is true for site, domain, media, plugin, theme and workflow-run
+      — `page.published` (pre-existing), `page.created`, `page.updated`, `page.deleted` and
+      `page.restored` all emit, proven in `the_bus_records_events_and_delivers_signed_webhooks`,
+      which now sees the full lifecycle in the feed with correct payloads. **`page.unpublished`
+      is not ticked and is marked reserved instead**: the content model has no route that takes a
+      published page back to draft (`grep` finds only prose), so there is nothing to emit beside.
+      Writing the route is REQ-064's scheduled-publishing work, not a missing `bus::emit`.
+- [x] Creating, updating and deleting a user records `user.created|updated|deleted`; the same is true for site, domain, media, plugin, theme and workflow-run
   mutations.
+      — Emitting: `user.created` (pre-existing), `user.updated` (the IAM update route),
+      `user.deleted` (the SCIM deactivation, which is the one write that takes an account out of
+      service on a provider's instruction), `site.archived` (on the status transition only, so a
+      rename does not claim an archive), `domain.added|removed`, `theme.activated`,
+      `webhook.endpoint.created|updated|removed|tested`, `webhook.secret.rotated`, and the
+      `media.*` family that already emitted. **Reserved rather than faked:** `plugin.*` (no plugin
+      module exists — REQ-121), `workflow.run.*` (the engine starts runs, but the bus would feed
+      the automation matcher that reads the bus; emitting there needs a loop guard, which is a
+      decision, not a line), `domain.verified` (no verification state), `translation.published`
+      (no publish route for a translation). Each is listed as reserved with its owning module.
 - [x] Subscribing an endpoint to `page.*` receives a delivery for a newly added `page.*` event without editing the endpoint.
       — A `page.*` subscription is stored as the wildcard plus today's eight names, and
       `enqueue_fanout` matches either; publishing a page delivers to a receiver that named
@@ -159,7 +186,13 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
   `duration_ms`.
 - [ ] A receiver answering `500` produces retries with increasing `next_attempt_at`, and the row ends `failed` with `attempts = max_attempts` and a readable
   `error`.
-- [ ] `webhook.delivery.failed` is recorded once per exhausted delivery and appears in the feed.
+- [x] `webhook.delivery.failed` is recorded once per exhausted delivery and appears in the feed.
+      — Recorded in `engine::deliver_one` on the terminal branch only (a retry is not a failure),
+      carrying delivery id, endpoint, event name, attempt count, HTTP status and the trimmed
+      reason. Asserted in `the_bus_records_events_and_delivers_signed_webhooks`: after the
+      receiver refused five times the feed shows exactly one, and its payload names the endpoint.
+      Recorded *after* `mark_failed` and its error is logged rather than propagated, so a receiver
+      that stays broken cannot take the delivery runner down with it.
 - [ ] Redelivery of a `failed` row resets it to `pending`, increments `redeliver_count`, and a receiver that then answers `200` moves it to `delivered`; a
   second redelivery of the same row beyond the cap is refused with a clear error.
 - [ ] Bulk redelivery of 100 ids returns per-id outcomes; pending rows are reported as skipped.
