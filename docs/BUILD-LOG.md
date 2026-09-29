@@ -5859,3 +5859,45 @@ all**, so the pass's `?site=main` addresses a site that does not exist. That is 
 question, not a site-scoping defect, and it is the one question between REQ-063 and `done`.
 
 ---
+
+## 2026-09-29 · REQ-064 slice 2 · the rate limit now answers 429 with a real wait
+
+**What.** Criterion 6 has been sitting half-ticked for several ticks with a note of my own
+making: *"This criterion is not met as written: it asks for a 429 with a retry hint, and the
+implementation deliberately does not send one."* That was wrong, and the evidence sat in the
+store the whole time. A rate limit is not a verdict about the sender; it is a fact about a
+window. The same visitor who was refused, retrying in five minutes, is stored normally — so the
+only honest answer is one that says so and says when.
+
+`submit_public` now returns `retry_after_seconds`, set **only** by the rate-limit refusal, as the
+remainder of the moving window: an hour minus the age of the sender's oldest row inside it, which
+is the first instant a retry could be allowed. The route turns that one refusal into
+`429 form_rate_limited` with a real `Retry-After`. The spam refusals keep their silence, and the
+store's check order is what guarantees it — the honeypot is tested *first*, so a scripted sender
+never reaches the limit and cannot be told which of the two it tripped.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo build -p omnion-api` | clean |
+| `cargo test -p omnion-api --test cms_forms -- --test-threads=1` | **12 passed**, 0 failed (164 s) |
+| `cargo test -p omnion-content --lib` | **226 passed**, 0 failed |
+
+**The suite hung the first time and the hang was not mine.** Twelve walks against one database
+concurrently left the binary idle for sixteen minutes with every PostgreSQL connection idle and
+both Redis ports answering — infrastructure was fine, the interference was between my own tests.
+Isolated, the same walk runs in 4.9 s. This is the interference rule again, and it is worth
+writing down in the ledger in the exact shape it bit: *"the suite hung"* is a fact about the
+harness until an isolated run says otherwise, and the isolated run costs five seconds.
+
+**Two assertions of mine were wrong and the suite said so rather than agreeing with me.** I read
+the error code off `body["code"]`; the platform's envelope puts it at `body["error"]["code"]`, so
+the walk failed on a real 429 with a real `Retry-After` because I had looked in the wrong place.
+And I asserted on `response.headers` in a `TestResponse` that has no such field — the header is
+consumed before the body, so it has to be captured inside `call`.
+
+**Next.** (a) A full browser pass the moment the box frees — this is not a close tick, and
+acceptance 18 stays open. (b) `--only=featured-media`, then `--only=members`. (c) REQ-063's
+`publicRendered` — answered from SQL last tick, still waiting on a pass that can address a site.
+
