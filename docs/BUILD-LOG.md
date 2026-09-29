@@ -5422,3 +5422,76 @@ open item is still the `publicRendered` site-scoping question.
 
 **Commits:** `11786b5` the panel · `1f6d90e` the depth pass · `df83f68` the empty state ·
 `510285e` `/members/settings` as its own route.
+
+## 2026-09-29 · REQ-064 slice 4d — media reuse (a page's featured image, its alt, its legend, its focal point)
+
+**What.** The "media reuse" half of the CMS depth pack, and the last acceptance criterion (17) this
+REQ had open on the data side. `0158_cms_featured_media.sql` puts `featured_media_id`,
+`featured_alt`, `featured_legend`, `focal_x` and `focal_y` on `pages`; `crates/content/src/featured.rs`
+is the store; `apps/api/src/routes/featured_media.rs` carries `GET`/`PUT /pages/{id}/featured-media`
+and `GET /sites/{site_id}/featured-media/candidates`; the public page payload gained
+`featured_image`; and `/pages/<id>/media` is the screen, reached from the pages list.
+
+**Proof.**
+
+- `cargo test -p omnion-content --lib` → **195 passed**, 0 failed (was 183: 12 new, five of them
+  about the JSON reader and the availability states).
+- `cargo test -p omnion-api --test cms_featured_media -- --test-threads=1` → **6 passed**, 0 failed
+  against real PostgreSQL in a disposable database (`omnion_test_w2feat`, dropped and recreated
+  first so the suite is proved against a schema that has never had a row in it).
+- `apps/admin` `tsc --noEmit` → **0 errors**.
+- `node --check scripts/qa/walkthrough.cjs` → clean; `runFeaturedMediaDepth` writes **57 steps** and
+  is reachable alone through `--only=featured-media`.
+
+**Five decisions, each a way the obvious version is wrong.**
+
+1. **The columns are the page's, and the store never reads `media.alt_text`.** One photograph is the
+   hero of three pages with three descriptions and three crops; copying the file's alt onto the page
+   renames the image everywhere on the first save. The picker *offers* the file's own alt behind an
+   explicit button.
+2. **The trashed-file degradation is computed on the read, not written by a `media.deleted` consumer.**
+   REQ-010 keeps a trashed file's row, so the id still resolves while the object is gone — a
+   consumer that has not run yet is a page serving a dead URL with nothing on screen saying why. So
+   the read path reports it, the page still renders, and the panel's warning names the file.
+3. **A focal point is both axes or neither.** Half is not "centre vertically": it looks right in the
+   editor and wrong in every rendering that crops the other axis. CHECK + store.
+4. **The alt is required by a CHECK**, because a screen reader reads a missing `alt` as the file
+   name — "hero set, alt empty" is worse than no hero, and the refusal is what makes the panel ask.
+5. **`double precision`, not the REQ's `numeric(4,3)`.** sqlx decodes `NUMERIC` as a decimal type, so
+   a `f64` field answered `mismatched types … FLOAT8 … NUMERIC` at the first read. The 0..1 CHECK is
+   the bound; the column type only restated it.
+
+**Four real defects the gates found, and two of my own assertions the suite refused.**
+
+- **A JSON `null` is not a missing field, and serde will not tell them apart.** I checked that
+  against the crate rather than trusting `Option<Option<f64>>`: `{}` and `{"focal_x": null}` both
+  arrive as `None`. So the panel's *Clear crop* button sent a null, the API read it as "leave it",
+  and the control **silently did nothing** — the operator believes the crop is gone while the page
+  is still cropped everywhere it renders, and nothing errors. The change set is now read by a
+  hand-written `TryFrom<Value>`, which also refuses an unknown key: a client sending `focal_point`
+  and answered 200 has been told a crop was saved that was not.
+- **Two `FromRow` columns that do not exist under the field's name.** `sqlx`'s runtime row reader
+  looks the struct field up as a *column* name, so `p.id` had to be `p.id as page_id`,
+  `p.featured_media_id as media_id`, `p.featured_alt as alt`, `p.featured_legend as legend`. A
+  compile-time `FromRow` derive would have caught all four; the runtime one cost three test runs.
+- **A page editor could not read the alt they are required to write.** The first cut guarded the
+  page's own read with `media.read` "because the body mentions a file", which refused an account
+  that can edit this page's title, body and crop. Three questions, three keys: the page's own read
+  is `content.pages.read`, the write is `content.pages.update`, the picker is `media.read` on its
+  own route — one endpoint serving both needs one guard for both, and the weaker one wins.
+- **I asserted a site boundary the platform does not have**, and a walk that insisted on it would
+  have had the endpoint made narrower than the permission model. `ensure_same_organization`
+  compares *organizations*; two sites in one organization are one tenant, and a stricter scope
+  would make every `Scope::Site` binding inert. The walk now asserts the real boundary (another
+  organization is refused by id) **and** the real inner one (a sibling site's file is not borrowable
+  — that IS a boundary, and the store holds it in the same statement as the write).
+- **I asserted `404` where the platform deliberately answers `403 cross_organization`.** A `404`
+  would have to mean "no such page", and a *member* of the other organization hitting the same route
+  legitimately gets one. The `403` discloses no page and tells an operator the difference between
+  "wrong tenant" and "wrong id", which is the difference they need. The walk asserts the platform's
+  value, and says why insisting on the 404 would have made the endpoint less informative.
+
+**Next.** (a) Run `runFeaturedMediaDepth` alone (`--only=featured-media`) and fix what it finds;
+acceptance 18 closes on a clean full pass at 1440 px and 390 px. (b) The `--only=members` pass is
+still queued from last tick — slice 4c's browser half is written but unrun. (c) REQ-063
+acceptance 17's last open item is still the `publicRendered` site-scoping question.

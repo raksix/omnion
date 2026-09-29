@@ -75,6 +75,113 @@ export type {
   TemplateListResponse,
 } from "@omnion/types";
 
+// ---------------------------------------------------------------------------------------------
+// Featured media (REQ-064, slice 4d)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Whether a page's picture can be drawn.
+ *
+ * The FOUR states rather than a boolean, because the panel's words and the renderer's markup are
+ * different for each: `none` is a page that never had a hero, `trashed` is a page that lost one
+ * and says so, and `missing` is a column pointing at a row that is gone. A boolean collapses the
+ * last three into "no image", which is exactly the message that sends an operator looking in the
+ * wrong place after somebody emptied the trash.
+ */
+export type FeaturedAvailability = "none" | "available" | "trashed" | "missing";
+
+/** A page's featured image, with the file's state folded in. */
+export type FeaturedMedia = {
+  page_id: string;
+  site_id: string;
+  slug: string;
+  media_id: string | null;
+  /** Alt text for THIS page's use — not the file's own `alt_text`. */
+  alt: string;
+  legend: string;
+  /** 0–1 fraction, `null` when the page has never been cropped. */
+  focal_x: number | null;
+  focal_y: number | null;
+  updated_at: string;
+  storage_key: string | null;
+  filename: string | null;
+  content_type: string | null;
+  width: number | null;
+  height: number | null;
+  deleted_at: string | null;
+};
+
+/**
+ * Exactly what a renderer will draw, and nothing else.
+ *
+ * A separate type from `FeaturedMedia` so the panel cannot reach the storage key and build a URL
+ * by hand: a hand-built URL is one base-path setting away from an image that 404s on every page
+ * of the site. A `null` `render` here is a `null` on the public payload, so the preview cannot be
+ * greener than what a visitor gets.
+ */
+export type FeaturedImage = {
+  media_id: string;
+  url: string;
+  alt: string;
+  legend: string;
+  object_position: string | null;
+  width: number | null;
+  height: number | null;
+};
+
+/** One row of the picker's list. */
+export type FeaturedCandidate = {
+  id: string;
+  filename: string;
+  content_type: string;
+  storage_key: string;
+  width: number | null;
+  height: number | null;
+  /**
+   * The file's OWN alt text, offered as a starting point.
+   *
+   * Never written for the page without the editor pressing the button that copies it: the same
+   * file is the hero of several pages with different descriptions, and a store that copied it
+   * would rename the image everywhere on the first save.
+   */
+  alt_text: string;
+  /** How many pages already feature this file — the "reuse" signal, made visible. */
+  used_by_pages: number;
+};
+
+/** `GET`/`PUT /api/v1/pages/{id}/featured-media`. */
+export type FeaturedMediaBody = {
+  media: FeaturedMedia;
+  /** The chip's words, from the server — the panel never invents a state name. */
+  availability_label: string;
+  /** The degradation sentence, `null` when there is nothing wrong. */
+  warning: string | null;
+  render: FeaturedImage | null;
+};
+
+/** A change to one page's featured image. */
+export type FeaturedChanges = {
+  media_id?: string | null;
+  alt?: string | null;
+  legend?: string | null;
+  /**
+   * `undefined` leaves the crop alone; `null` CLEARS it; a number sets it.
+   *
+   * Three states, and the difference between the first two is the whole reason the API reads this
+   * payload by hand — serde cannot tell a missing key from a JSON null, so a plain optional field
+   * would make the *Clear crop* button a silent no-op.
+   */
+  focal_x?: number | null;
+  focal_y?: number | null;
+  clear?: boolean;
+};
+
+/** `GET /api/v1/sites/{site_id}/featured-media/candidates`. */
+export type FeaturedCandidatesBody = {
+  candidates: FeaturedCandidate[];
+  limit: number;
+};
+
 /**
  * `BlockIssue` again, as a *binding* rather than a re-export.
  *

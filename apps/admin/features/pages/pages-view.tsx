@@ -8,7 +8,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Boxes, Pencil, Plus, RefreshCw, Rocket } from "lucide-react";
+import { Boxes, ImageIcon, Pencil, Plus, RefreshCw, Rocket } from "lucide-react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 
@@ -508,6 +508,17 @@ export function PagesView() {
                         >
                           <Boxes className="size-3" aria-hidden />
                           <span className="hidden sm:inline">Blocks</span>
+                        </Link>
+                        {/* The featured image is its own route (REQ-064 slice 4d), so the list
+                            links to it the way it links to the block editor rather than growing a
+                            drawer that would have to own a second unsaved state. */}
+                        <Link
+                          href={`/pages/${page.id}/media`}
+                          aria-label={`Choose the featured image of ${pageTitle(page)}`}
+                          className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:bg-canvas"
+                        >
+                          <ImageIcon className="size-3" aria-hidden />
+                          <span className="hidden sm:inline">Image</span>
                         </Link>
                         <button
                           type="button"

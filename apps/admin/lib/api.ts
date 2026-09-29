@@ -61,6 +61,12 @@ import type {
   SubscriberPage,
   Form,
   NewCommentReply,
+  FeaturedCandidate,
+  FeaturedCandidatesBody,
+  FeaturedChanges,
+  FeaturedImage,
+  FeaturedMedia,
+  FeaturedMediaBody,
   PageSeo,
   PageSeoBody,
   SeoBrokenLink,
@@ -462,6 +468,80 @@ export async function fetchPages(siteId: string, status?: string): Promise<Page[
 /** One page with its working draft and the revision visitors see. */
 export function fetchPage(pageId: string): Promise<Page> {
   return request<Page>(`/api/v1/pages/${encodeURIComponent(pageId)}`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Featured media (REQ-064, slice 4d)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Read one page's featured image, its crop and what a renderer would do with them.
+ *
+ * The response carries the renderer's own payload (`render`) rather than the fields alone, so
+ * this screen's preview and the public page's markup are the same object rather than two
+ * re-derivations that can agree with each other and disagree with the site.
+ */
+export function fetchFeaturedMedia(pageId: string): Promise<FeaturedMediaBody> {
+  return request<FeaturedMediaBody>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/featured-media`,
+  );
+}
+
+/**
+ * Write one page's featured image.
+ *
+ * `focal_x`/`focal_y` are omitted rather than sent when the editor did not touch the crop: the
+ * server reads a MISSING key as "leave it" and an explicit `null` as "clear it", and sending both
+ * as `null` on every save would clear the crop of every page the panel ever touched.
+ */
+export function saveFeaturedMedia(
+  pageId: string,
+  changes: FeaturedChanges,
+): Promise<FeaturedMediaBody> {
+  const body: FeaturedChanges = {};
+  if (changes.media_id !== undefined) {
+    body.media_id = changes.media_id;
+  }
+  if (changes.alt !== undefined) {
+    body.alt = changes.alt;
+  }
+  if (changes.legend !== undefined) {
+    body.legend = changes.legend;
+  }
+  if (changes.focal_x !== undefined) {
+    body.focal_x = changes.focal_x;
+  }
+  if (changes.focal_y !== undefined) {
+    body.focal_y = changes.focal_y;
+  }
+  if (changes.clear !== undefined) {
+    body.clear = changes.clear;
+  }
+  return request<FeaturedMediaBody>(
+    `/api/v1/pages/${encodeURIComponent(pageId)}/featured-media`,
+    { method: "PUT", body: JSON.stringify(body) },
+  );
+}
+
+/**
+ * The images a page could feature.
+ *
+ * A separate read from the page's own because it is a different question with a different power:
+ * this one is about the LIBRARY and needs `media.read`, while the page's own read is about the
+ * page. `limit` is clamped server-side, so the picker pages rather than asking for everything.
+ */
+export function fetchFeaturedCandidates(
+  siteId: string,
+  limit?: number,
+): Promise<FeaturedCandidatesBody> {
+  const query = new URLSearchParams();
+  if (limit !== undefined) {
+    query.set("limit", String(limit));
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
+  return request<FeaturedCandidatesBody>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/featured-media/candidates${suffix}`,
+  );
 }
 
 /** Create a page together with its first, draft revision. */

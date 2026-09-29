@@ -1001,6 +1001,340 @@ async function uploadMediaSample(page, source) {
   };
 }
 
+
+// ---------------------------------------------------------------- featured media (REQ-064, slice 4d)
+
+/**
+ * `runFeaturedMediaDepth` — a page's hero image, its alt, its legend and its crop.
+ *
+ * The criterion is three sentences and each has a way to be satisfied by a panel that does not
+ * work, so each is checked from the side that can fail it:
+ *
+ * * **"round-trip on the page"** — read back out of SQL, not out of the screen. A form that
+ *   renders what it holds proves nothing about what it wrote, and the interesting case is the
+ *   PARTIAL save: the legend moves and the alt and the crop must survive it.
+ * * **"used by the renderer"** — checked on the PUBLIC payload, from a request with no panel
+ *   cookie. The panel previewing its own object is a panel agreeing with itself.
+ * * **"a deleted featured image leaves the page renderable with a warning"** — the page must
+ *   still answer, still carry its content, and the payload must be `null` rather than a URL that
+ *   404s. A 200 alone would pass against a page shipping a dead image.
+ *
+ * Three things the screen is asked because they are silent when they go wrong: the empty state
+ * (this pass creates its own image, so only an assertion BEFORE the fixture can see it), the
+ * required alt (the migration refuses a blank one, so the save button has to be off before the
+ * round trip), and the *Clear crop* control (which sends an explicit null pair — the only way the
+ * API can tell "clear it" from "leave it", and a control that does nothing when pressed is the
+ * failure this step exists for).
+ *
+ * Every step writes under `steps.*` and `--only=featured-media` demands the list below by name.
+ */
+async function runFeaturedMediaDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the screen has nothing to read";
+    return steps;
+  }
+
+  // The page this pass works on is its OWN, seeded before the screen is opened. A depth pass that
+  // borrowed a page another pass created is how four of its checks went unrun for a tick.
+  const slug = `featured-${stamp}`;
+  const seeded = await page
+    .request.post(`${URL_API}/api/v1/pages`, {
+      data: { site_id: siteId, slug, title: `Featured ${stamp}` },
+    })
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.pageWasCreated = seeded.status === 201 && Boolean(seeded.body && seeded.body.id);
+  const pageId = (seeded.body && seeded.body.id) || "";
+  if (!pageId) {
+    steps.reason = "the fixture page could not be created, so there is nothing to drive";
+    return steps;
+  }
+
+  // A media file the picker can offer. Seeded through the panel's OWN upload route so the row is
+  // one the routes produce — same table, same checks, same object key the renderer will serve.
+  const imageId = qaSql(
+    `insert into media (site_id, storage_key, filename, content_type, size_bytes, checksum, alt_text)
+     values ('${siteId}', 'qa/featured-${stamp}.png', 'featured-${stamp}.png', 'image/png', 2048,
+             '${"b".repeat(64)}', 'the file own alt')
+     returning id`,
+  );
+  steps.fixtureImageExists = Boolean(imageId);
+
+  // ------------------------------------------------------------------ the empty state, first
+  // Asserted while the page genuinely has no image, because the first thing this pass does next
+  // is give it one — and after that every state is populated. The empty state is the one an owner
+  // meets on a fresh page, and it is the one a self-seeding pass can never reach again.
+  await page.goto(`${URL_ADMIN}/pages/${pageId}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.screenReady = (await page.locator("[data-featured-media-tab]").count()) > 0;
+  steps.emptyStateIsShown = (await page.locator("[data-featured-empty]").count()) > 0;
+  steps.emptyStateSaysNoImage = /no featured image/i.test(
+    await page.locator("[data-featured-media-tab]").first().innerText().catch(() => ""),
+  );
+  // The chip is the server's own word, and a fresh page must not claim one.
+  steps.availabilitySaysNoImage = /^No featured image$/i.test(
+    await page.locator("[data-featured-availability]").first().innerText().catch(() => ""),
+  );
+  // The alt field is disabled with no image: asking for a description of a file that is not there
+  // is the form telling the operator it has not understood the state.
+  steps.altIsDisabledWithNoImage =
+    (await page.locator("[data-featured-alt]").first().isDisabled().catch(() => false)) === true;
+  await shot(page, "featured-media-empty");
+
+  // ------------------------------------------------------------------ the required alt
+  // The migration refuses an image with a blank alt, so the SAVE has to be off before the round
+  // trip. A button that is enabled and then answers 400 teaches the operator the rule is a
+  // suggestion.
+  await page.locator("[data-featured-open-picker]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.pickerOpened = (await page.locator("[data-featured-candidate]").count()) > 0;
+  steps.pickerOffersTheFile =
+    (await page.locator(`[data-featured-candidate="${imageId}"]`).count()) > 0;
+  await shot(page, "featured-media-picker");
+
+  await page.locator(`[data-featured-candidate="${imageId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.pickingClosedThePicker = (await page.locator("[data-featured-candidate]").count()) === 0;
+
+  // The alt is still blank, so the save must be refused. Asserted on the BUTTON rather than on a
+  // banner: the rule is a precondition of the form, not a message the API sends afterwards.
+  steps.saveIsBlockedWithoutAnAlt =
+    (await page.locator("[data-featured-save]").first().isDisabled().catch(() => false)) === true;
+  steps.screenExplainsWhy = /alt text is required|before an image can be saved/i.test(
+    await page.locator("[data-featured-media-tab]").first().innerText().catch(() => ""),
+  );
+  await shot(page, "featured-media-alt-required");
+
+  // The file's own alt is OFFERED and never applied on its own: the same photograph is the hero
+  // of several pages with different descriptions.
+  steps.theFilesOwnAltIsOffered =
+    (await page.locator("[data-featured-use-file-alt]").count()) > 0;
+  await page.locator("[data-featured-use-file-alt]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.theFilesOwnAltIsNowInTheField =
+    (await page.locator("[data-featured-alt]").first().inputValue().catch(() => "")) ===
+    "the file own alt";
+
+  // ------------------------------------------------------------------ the save and the round trip
+  const legend = `A legend written by the pass ${stamp}`;
+  await page.locator("[data-featured-alt]").first().fill("Two people on a stone bridge at dusk");
+  await page.locator("[data-featured-legend]").first().fill(legend);
+  await page.locator("[data-featured-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.savedWithoutError = (await page.locator("[data-featured-error]").count()) === 0;
+  steps.noticeIsOnScreen = (await page.locator("[data-featured-notice]").count()) > 0;
+
+  // **The round trip is read out of SQL.** A panel that renders what it holds proves nothing
+  // about what it wrote.
+  const stored = qaSql(
+    `select coalesce(featured_alt, '<null>') || '|' || coalesce(featured_legend, '<null>') || '|' ||
+            coalesce(featured_media_id::text, '<null>') || '|' || coalesce(focal_x::text, '<null>')
+     from pages where id = '${pageId}'`,
+  );
+  const [storedAlt, storedLegend, storedMedia, storedFocal] = String(stored).split("|");
+  steps.altIsInSql = storedAlt === "Two people on a stone bridge at dusk";
+  steps.legendIsInSql = storedLegend === legend;
+  steps.mediaIdIsInSql = storedMedia === imageId;
+  steps.cropStartsUnset = storedFocal === "<null>";
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.altSurvivesAReload =
+    (await page.locator("[data-featured-alt]").first().inputValue().catch(() => "")) ===
+    "Two people on a stone bridge at dusk";
+  steps.availabilitySaysAvailable = /^Available$/i.test(
+    await page.locator("[data-featured-availability]").first().innerText().catch(() => ""),
+  );
+  steps.previewIsOnScreen = (await page.locator("[data-featured-preview]").count()) > 0;
+  // The preview is an image with a REAL alt, and the alt it carries is this page's alt.
+  steps.previewCarriesTheAlt = await page
+    .locator("[data-featured-preview] img")
+    .first()
+    .getAttribute("alt")
+    .then((value) => value === "Two people on a stone bridge at dusk")
+    .catch(() => false);
+  steps.noCropIsAnnounced = (await page.locator("[data-featured-no-crop]").count()) > 0;
+  await shot(page, "featured-media-saved");
+
+  // ------------------------------------------------------------------ the crop
+  // The pad is a pointer target, so the pass presses ARROW KEYS on it: a focal point is the one
+  // control where an exact value matters, and a pass that only drags proves nothing about the
+  // keyboard path a precision crop needs.
+  const pad = page.locator("[data-featured-focal-pad]").first();
+  await pad.click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  for (let i = 0; i < 4; i += 1) {
+    await pad.press("ArrowRight").catch(() => {});
+    await pad.press("ArrowDown").catch(() => {});
+  }
+  await page.locator("[data-featured-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const storedCrop = qaSql(
+    `select coalesce(focal_x::text, '<null>') || '|' || coalesce(focal_y::text, '<null>') from pages where id = '${pageId}'`,
+  );
+  const [cropX, cropY] = String(storedCrop).split("|");
+  steps.cropIsInSql = cropX !== "<null>" && cropY !== "<null>";
+  steps.cropAxesWerePaired = cropX === cropY;
+  steps.cropMovedRightAndDown = Number(cropX) > 0.5 && Number(cropY) > 0.5;
+
+  // The public payload carries the object position, and it is the renderer's own string.
+  await page
+    .request.post(`${URL_API}/api/v1/pages/${pageId}/publish`, { data: { body: "Featured body" } })
+    .catch(() => {});
+  const published = await page
+    .request.get(`${URL_API}/api/v1/public/pages/${slug}`)
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.publicPageAnswers = published.status === 200;
+  const publicImage = (published.body && published.body.featured_image) || null;
+  steps.publicPayloadCarriesTheImage = Boolean(publicImage);
+  steps.publicAltIsThisPagesAlt = Boolean(publicImage) && publicImage.alt === "Two people on a stone bridge at dusk";
+  steps.publicObjectPositionIsSet =
+    Boolean(publicImage) && typeof publicImage.object_position === "string" && publicImage.object_position.includes("%");
+  steps.publicLegendIsCarried = Boolean(publicImage) && publicImage.legend === legend;
+  await shot(page, "featured-media-public");
+
+  // ------------------------------------------------------------------ the partial save
+  // The legend moves and NOTHING ELSE is sent. This is what `coalesce($n, column)` buys, and it
+  // is the case a panel which always POSTs the whole object cannot exercise — and a crop that
+  // silently resets on an unrelated edit is the complaint this step exists to prevent.
+  await page.locator("[data-featured-legend]").first().fill(`${legend} (edited)`);
+  await page.locator("[data-featured-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const afterPartial = qaSql(
+    `select coalesce(featured_legend, '<null>') || '|' || coalesce(featured_alt, '<null>') || '|' ||
+            coalesce(focal_x::text, '<null>')
+     from pages where id = '${pageId}'`,
+  );
+  const [pLegend, pAlt, pFocal] = String(afterPartial).split("|");
+  steps.partialSaveMovedTheLegend = pLegend === `${legend} (edited)`;
+  steps.partialSaveKeptTheAlt = pAlt === "Two people on a stone bridge at dusk";
+  steps.partialSaveKeptTheCrop = pFocal !== "<null>";
+
+  // ------------------------------------------------------------------ clear the crop
+  // The control sends an explicit null PAIR. If it sent a missing key the crop would stay, and
+  // the button would be a control that does nothing at all — which is why the check is on the
+  // COLUMN and not on "the click happened".
+  await page.locator("[data-featured-clear-crop]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.clearingTheCropShowedTheUnsetMessage =
+    (await page.locator("[data-featured-no-crop]").count()) > 0;
+  await page.locator("[data-featured-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.clearingTheCropActuallyClearedIt =
+    qaSql(`select coalesce(focal_x::text, '<null>') from pages where id = '${pageId}'`) === "<null>";
+  steps.clearingTheCropKeptTheImage =
+    qaSql(`select coalesce(featured_media_id::text, '<null>') from pages where id = '${pageId}'`) ===
+    imageId;
+
+  // ------------------------------------------------------------------ the deletion degradation
+  // The file goes to the TRASH, which keeps its row (REQ-010 holds the bytes until the trash is
+  // emptied) — so this is the case where the column still resolves and the object is gone, and
+  // the case a `delete from media` would never reach.
+  qaSql(`update media set deleted_at = now() where id = '${imageId}'`);
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.trashedFileWarnsTheOperator = (await page.locator("[data-featured-warning]").count()) > 0;
+  steps.trashedFileNamesItself = /trash/i.test(
+    await page.locator("[data-featured-warning]").first().innerText().catch(() => ""),
+  );
+  steps.trashedFileSaysThePageStillRenders = /still renders/i.test(
+    await page.locator("[data-featured-warning]").first().innerText().catch(() => ""),
+  );
+  steps.availabilitySaysTrashed = /^In the trash$/i.test(
+    await page.locator("[data-featured-availability]").first().innerText().catch(() => ""),
+  );
+  // The crop controls stay usable after a trash: a RESTORE brings the picture back with the crop
+  // the operator already set, and a screen that disabled them would make them set it twice.
+  steps.cropIsStillUsableWhileTrashed =
+    (await page.locator("[data-featured-legend]").first().isDisabled().catch(() => true)) === false;
+  await shot(page, "featured-media-trashed");
+
+  // **The page is still renderable.** Asserted on the public route, from the same published slug.
+  const afterTrash = await page
+    .request.get(`${URL_API}/api/v1/public/pages/${slug}`)
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.pageStillRendersWithNoImage = afterTrash.status === 200;
+  steps.pageStillCarriesItsTitle =
+    Boolean(afterTrash.body) && afterTrash.body.revision && afterTrash.body.revision.title === `Featured ${stamp}`;
+  // **And it does not carry a dead image.** A 200 alone would pass against a page shipping a URL
+  // that 404s on every visitor's screen; the payload has to be null.
+  steps.pageDoesNotCarryTheTrashedImage =
+    Boolean(afterTrash.body) && (afterTrash.body.featured_image === null ||
+      afterTrash.body.featured_image === undefined);
+
+  // The column still names the file, so a restore needs no re-pick — a store that nulled it on
+  // trash would turn a restore into a re-upload, which is the thing that actually loses work.
+  steps.columnStillNamesTheTrashedFile =
+    qaSql(`select coalesce(featured_media_id::text, '<null>') from pages where id = '${pageId}'`) ===
+    imageId;
+
+  // A trashed file is not offered by the picker: choosing it would 404 the moment it was saved.
+  await page.locator("[data-featured-open-picker]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.pickerDoesNotOfferATrashedFile =
+    (await page.locator(`[data-featured-candidate="${imageId}"]`).count()) === 0;
+  await shot(page, "featured-media-picker-after-trash");
+
+  // ------------------------------------------------------------------ restore, and remove
+  qaSql(`update media set deleted_at = null where id = '${imageId}'`);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.restoringBringsTheImageBack = /^Available$/i.test(
+    await page.locator("[data-featured-availability]").first().innerText().catch(() => ""),
+  );
+  steps.aRestoredImageWarnsAboutNothing =
+    (await page.locator("[data-featured-warning]").count()) === 0;
+
+  // Removal clears all four columns in one save, and the confirmation SAYS all four — a button
+  // labelled "Remove" that kept the crop is how an operator re-attaches an image to a crop they
+  // chose for the last one.
+  await page.locator("[data-featured-remove]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.removeConfirmationOpened = (await page.locator("[data-featured-remove-confirm]").count()) > 0;
+  const confirmText = await page
+    .locator("[data-featured-remove-confirm]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.removeConfirmationNamesTheAlt = /alt/i.test(confirmText);
+  steps.removeConfirmationNamesTheCrop = /crop/i.test(confirmText);
+  steps.removeConfirmationSaysTheFileStays = /stays in the library/i.test(confirmText);
+  await shot(page, "featured-media-remove-confirm");
+
+  await page.locator("[data-featured-remove-confirm-yes]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const afterRemove = qaSql(
+    `select coalesce(featured_media_id::text, '<null>') || '|' || coalesce(featured_alt, '<null>') ||
+            '|' || coalesce(featured_legend, '<null>') || '|' || coalesce(focal_x::text, '<null>')
+     from pages where id = '${pageId}'`,
+  );
+  steps.removeClearedEverything = afterRemove === "<null>|<null>|<null>|<null>";
+  steps.removeReturnedToTheEmptyState = (await page.locator("[data-featured-empty]").count()) > 0;
+  // And the file itself is untouched: removing an image from a page is not deleting it.
+  steps.removeDidNotDeleteTheFile =
+    qaSql(`select count(*) from media where id = '${imageId}'`) === "1";
+
+  // ------------------------------------------------------------------ 390 px
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const scroll = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+  }));
+  steps.noHorizontalScrollAt390 = scroll.scrollWidth <= scroll.clientWidth + 1;
+  await shot(page, "featured-media-390");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  return steps;
+}
+
 // ---------------------------------------------------------------- file manager (REQ-010, slice 1)
 
 /**
@@ -7792,6 +8126,69 @@ async function main() {
     await page.context().browser()?.close().catch(() => {});
     return;
   }
+  // `--only=featured-media` runs a page's featured-image depth pass alone.
+  //
+  // Same argument as every other depth pass on this harness, and for one more reason here: the
+  // degradation half of the criterion needs a TRASHED file and a RESTORE, and a full pass resets
+  // the database on its way, so a trashed-file assertion in the full pass is at the mercy of
+  // whatever the pass happens to do next. Driving it alone makes the sequence deterministic.
+  // It runs the SAME function the full pass calls.
+  if (process.argv.includes("--only=featured-media")) {
+    report.featuredMedia = await runFeaturedMediaDepth(page, report);
+    log(`featured media: ${JSON.stringify(report.featuredMedia)}`);
+    // The list is the pass's own vocabulary. Every name here was a claim worth making, and a name
+    // that stops appearing is a claim nobody is checking any more.
+    const required = [
+      "pageWasCreated", "fixtureImageExists", "screenReady", "emptyStateIsShown",
+      "emptyStateSaysNoImage", "availabilitySaysNoImage", "altIsDisabledWithNoImage",
+      "pickerOpened", "pickerOffersTheFile", "pickingClosedThePicker",
+      "saveIsBlockedWithoutAnAlt", "screenExplainsWhy", "theFilesOwnAltIsOffered",
+      "theFilesOwnAltIsNowInTheField", "savedWithoutError", "noticeIsOnScreen",
+      "altIsInSql", "legendIsInSql", "mediaIdIsInSql", "cropStartsUnset",
+      "altSurvivesAReload", "availabilitySaysAvailable", "previewIsOnScreen",
+      "previewCarriesTheAlt", "noCropIsAnnounced",
+      "cropIsInSql", "cropAxesWerePaired", "cropMovedRightAndDown",
+      "publicPageAnswers", "publicPayloadCarriesTheImage", "publicAltIsThisPagesAlt",
+      "publicObjectPositionIsSet", "publicLegendIsCarried",
+      "partialSaveMovedTheLegend", "partialSaveKeptTheAlt", "partialSaveKeptTheCrop",
+      "clearingTheCropShowedTheUnsetMessage", "clearingTheCropActuallyClearedIt",
+      "clearingTheCropKeptTheImage",
+      "trashedFileWarnsTheOperator", "trashedFileNamesItself",
+      "trashedFileSaysThePageStillRenders", "availabilitySaysTrashed",
+      "cropIsStillUsableWhileTrashed",
+      "pageStillRendersWithNoImage", "pageStillCarriesItsTitle",
+      "pageDoesNotCarryTheTrashedImage", "columnStillNamesTheTrashedFile",
+      "pickerDoesNotOfferATrashedFile",
+      "restoringBringsTheImageBack", "aRestoredImageWarnsAboutNothing",
+      "removeConfirmationOpened", "removeConfirmationNamesTheAlt",
+      "removeConfirmationNamesTheCrop", "removeConfirmationSaysTheFileStays",
+      "removeClearedEverything", "removeReturnedToTheEmptyState", "removeDidNotDeleteTheFile",
+      "noHorizontalScrollAt390",
+    ];
+    const featuredSteps = report.featuredMedia || {};
+    const missing = required.filter((key) => featuredSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=featured-media",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: featuredSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`featured media depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`featured media depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=members")) {
     report.members = await runMembersDepth(page, report);
     log(`members: ${JSON.stringify(report.members)}`);
@@ -8201,6 +8598,14 @@ async function main() {
   // the tab where the file's other facts are.
   report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
   log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
+
+  // A page's featured image (REQ-064, slice 4d): the empty state, the required alt, the round
+  // trip read out of SQL, the crop from the KEYBOARD, the public payload, the partial save, the
+  // clear, and the trashed-file degradation with its restore.
+  report.featuredMedia = await runDepthPass("featured-media", () =>
+    runFeaturedMediaDepth(page, report),
+  );
+  log(`featured media: ${JSON.stringify(report.featuredMedia)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   await runPalette(page, report);
