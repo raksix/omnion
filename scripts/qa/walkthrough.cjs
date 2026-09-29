@@ -66,7 +66,24 @@ const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
  * a whole-repository pass. A scoped run that covers nothing is a mistake and says so loudly.
  */
 const ONLY = (arg("only", process.env.QA_ONLY || "") || "").trim();
-const inScope = (name) => !ONLY || name.split(",").some((w) => w.trim() && name.includes(w.trim()));
+const inScope = (name) => !ONLY || ONLY.split(",").some((w) => w.trim() && name.includes(w.trim()));
+// A scope is a claim about what the pass covered, and a claim that quietly degrades into "I
+// walked everything" is worse than no claim: every artifact then carries the narrower label while
+// holding the wider evidence, and the next tick reads the label. A scoped run therefore has to
+// *demonstrate* that it narrowed — at the first place the route table exists — and stop rather
+// than continue under a label it has already failed to honour. Without this, a typo'd or
+// mis-parsed scope walks the whole product and files it as a targeted result.
+if (ONLY && ONLY.length >= 1) {
+  const sample = ["overview", "pages", "media", "sites"];
+  const leaked = sample.filter((n) => inScope(n));
+  if (leaked.length) {
+    console.error(
+      `[walk] the scope "${ONLY}" does not narrow anything — it matches ${leaked.join(", ")}, ` +
+        "which are core routes. A scope word that appears inside unrelated names is not a scope.",
+    );
+    process.exit(4);
+  }
+}
 
 const CREDS = {
   name: "QA Owner",
@@ -6457,6 +6474,12 @@ async function main() {
   // memory) used to end the entire run, so every route after the crash and every depth pass
   // were skipped and no report was written at all. A page that dies is a finding about that
   // page; the pages after it still have to be looked at.
+  // The scope is honoured here and nowhere else, so the pass says out loud what it resolved and
+  // which routes that left. Without it a mis-scoped run is *silent*: it walks the whole product
+  // under a scope label, and every artifact it writes — screenshots, clicks, the summary's
+  // `scope` field — then claims the narrower coverage. That is the same failure as a dead run
+  // writing a clean report, one level down, and the only witness is this line.
+  if (ONLY) log(`scope: "${ONLY}" keeps ${routes.filter((r) => inScope(r.name)).length} of ${routes.length} routes`);
   for (const route of routes) {
     if (!inScope(route.name)) continue;
     log(`page: ${route.name}`);
