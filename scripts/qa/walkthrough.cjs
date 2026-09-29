@@ -3215,6 +3215,47 @@ function qaSql(statement) {
   ).trim();
 }
 
+/**
+ * Two pages for a pass that needs them: one published (with the revision a published page carries
+ * its title in) and one draft.
+ *
+ * The draft is not decoration. "The picker offers published pages only" is proved by *offering a
+ * draft somewhere and showing it is absent* — with no draft in the database the assertion
+ * `pickerOnlyOffersPublished` compares against an empty list and passes for any picker at all,
+ * including one that lists everything. Both rows are written directly because the screen under
+ * test is the menu editor, not the page editor, and a fixture that has to be driven through
+ * another screen is a fixture that inherits that screen's failure.
+ */
+function ensureQaPages(siteId, stamp) {
+  if (!siteId) return false;
+  const slug = `qa-menu-page-${stamp}`;
+  try {
+    qaSql(
+      `insert into pages (site_id, slug, page_type, status)
+       values ('${siteId}', '${slug}', 'page', 'published')
+       on conflict (site_id, slug) do update set status = 'published'`,
+    );
+    const pageId = qaSql(`select id from pages where site_id = '${siteId}' and slug = '${slug}' limit 1`);
+    if (!pageId) return false;
+    // The label a page item gets is the revision's title, so a published page with no revision
+    // would prove `labelComesFromTheTitle` against nothing.
+    qaSql(
+      `insert into page_revisions (page_id, revision_no, state, title, body, published_at)
+       values ('${pageId}', 1, 'published', 'QA Menu Page ${stamp}', 'qa', now())
+       on conflict (page_id, revision_no) do update set title = excluded.title`,
+    );
+    qaSql(
+      `insert into pages (site_id, slug, page_type, status)
+       values ('${siteId}', '${slug}-draft', 'page', 'draft')
+       on conflict (site_id, slug) do nothing`,
+    );
+    return true;
+  } catch (error) {
+    log(`ensureQaPages failed: ${error.message}`);
+    return false;
+  }
+}
+
 /** Post one beacon to the public collection endpoint of the QA site. */
 async function postBeacon(body, { userAgent, forwardedFor, country }) {
   const headers = { "content-type": "application/json", "user-agent": userAgent };
@@ -4089,6 +4130,20 @@ async function runMenusDepth(page, report) {
   const menuKey = `qa-menu-${stamp}`;
   const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
 
+  // ---------------------------------------------------------------- its own pages
+  //
+  // The picker, the page-labelled items and the whole publishing queue hang off a published page,
+  // and this pass used to READ one that a different pass had created. Under `--only=menus` on a
+  // private stack that database is empty, so every one of those steps was skipped by the `if` and
+  // the report showed fourteen checks missing with no reason attached — a harness that quietly
+  // stops proving things looks exactly like a screen that is not there. The pass therefore writes
+  // what it needs, and refuses to continue without it.
+  steps.seededPages = ensureQaPages(siteId, stamp);
+  if (!steps.seededPages) {
+    steps.reason = "this site's pages could not be seeded, so the picker and queue cannot run";
+    return steps;
+  }
+
   // ---------------------------------------------------------------- the list and the form
   await page.goto(`${URL_ADMIN}/menus`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1600);
@@ -4196,23 +4251,23 @@ async function runMenusDepth(page, report) {
       .locator("[data-menu-item-label] span:first-child")
       .allInnerTexts()
       .catch(() => []);
-    // "Did the third row become a child of the second?" is a question about PARENTS, not about
-    // how many rows are on screen: a nested child renders inside its parent's row, so after a
-    // successful nest the visible labels are two, not three. Reading `rowLabels.length` as the
-    // verdict reports a working editor as broken — which is why `parentsAreStored` below, read
-    // from SQL after the reload, is the assertion that counts, and this one only says the pass
-    // got as far as the row that became the child.
-    steps.nestedUnderSecond =
-      steps.nestClicked === true &&
-      !steps.rowLabels.includes("QA third") &&
-      steps.rowLabels.includes("QA second");
-    const nestedId = await page
-      .locator("[data-menu-item-label]")
-      .nth(1)
-      .getAttribute("data-menu-item-label")
+    // "Did the third row become a child of the second?" is answered from the tree's own markup,
+    // which records the parent on every row: `[data-menu-item-row="<child>"]` sits inside the
+    // `<li data-menu-item="<parent>">`. Counting visible labels inverts the answer — a nested
+    // child renders INSIDE its parent's row, so a successful nest shows two labels, not three —
+    // and an assertion that counts reports the working editor as broken. This version also
+    // explains a nest that did not happen: if the parent's branch never opened, the child is
+    // legitimately absent from the DOM and this reads false with the labels printed beside it.
+    const nestedChildId = await page
+      .locator(`[data-menu-item="${secondId}"] [data-menu-item-row]`)
+      .first()
+      .getAttribute("data-menu-item-row")
       .catch(() => null);
-    steps.nestedUnderSecond = nestedId !== null && nestedId !== secondId;
-    if (nestedId) {
+    steps.nestedUnderSecond = nestedChildId !== null;
+    steps.nestedParentRowFound =
+      (await page.locator(`[data-menu-item="${secondId}"]`).count()) > 0;
+    if (nestedChildId) {
+      const nestedId = nestedChildId;
       await page.locator(`[data-menu-item-label="${nestedId}"]`).click({ timeout: 3000 }).catch(() => {});
       await page.waitForTimeout(200);
       await page
@@ -4525,6 +4580,10 @@ async function runMenusDepth(page, report) {
   if (steps.entryId) {
     qaSql(`delete from cms_publishing_queue where id = '${steps.entryId}'`);
   }
+  // The seeded pages go with it. Left behind, they accumulate one pair per run and the picker's
+  // own list grows until the pass takes noticeably longer to open it — a fixture that is never
+  // cleaned is a slow failure that looks like a slow product.
+  qaSql(`delete from pages where slug like 'qa-menu-page-%-${stamp}' or slug = 'qa-menu-page-${stamp}'`);
   return steps;
 }
 
@@ -5205,8 +5264,8 @@ async function main() {
       // the list and the form
       "listReady", "formOpened", "keyFollowsName", "rowLanded", "rowOnScreen",
       // the tree
-      "editorReady", "threeTopLevel", "nestedUnderSecond", "treeRendered", "treeHasChildren",
-      "savedItems", "parentsAreStored", "depthLabel",
+      "editorReady", "threeTopLevel", "nestedUnderSecond", "nestedParentRowFound",
+      "treeRendered", "treeHasChildren", "savedItems", "parentsAreStored", "depthLabel",
       "fourthLevelRefused", "fourthLevelStatus", "refusalLeftTheTreeAlone",
       // Add pages…
       "pickerOpened", "pickerOnlyOffersPublished", "pageItems", "labelComesFromTheTitle",
