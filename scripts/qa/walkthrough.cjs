@@ -524,16 +524,57 @@ async function clickAction(page) {
   return primaryClick(page);
 }
 
+/**
+ * Whether this installation has never been set up.
+ *
+ * Asked of the API rather than inferred from the browser's address bar. The panel sends an
+ * anonymous visitor at `/` to `/login`, and `/login` only sends it on to `/setup` after an
+ * `GET /onboarding` round trip inside a `useEffect` — so the address bar is a *lagging* witness.
+ * Sampling it after a fixed 900 ms read "not in setup" on every fast machine and on every
+ * slow one alike, and the pass then went on to a database with no owner, no organization and
+ * no site. Every organization-scoped route then answered `403 no_organization` or `400`,
+ * and the log said "installation already exists" — a sentence that was never checked against
+ * anything. Three ticks of CRM browser depth were lost to that, each of them logged as a
+ * product failure and none of them a harness failure.
+ *
+ * The state lives in the API, so that is where the question is asked.
+ */
+async function installationNeedsSetup(page) {
+  return page.evaluate(async () => {
+    const response = await fetch("/api/v1/onboarding", { credentials: "same-origin" });
+    if (!response.ok) return null; // anonymous callers may be refused; treat as "cannot tell"
+    const body = await response.json();
+    return Boolean(body && body.needs_setup);
+  });
+}
+
 async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(900);
+  const needsSetup = await installationNeedsSetup(page);
   const url = page.url();
-  if (!url.includes("/setup")) {
-    log(`wizard: not in setup (${url}) — installation already exists`);
-    return { ran: false, url };
+  if (needsSetup === false) {
+    log(`wizard: not needed (${url}) — the installation already has accounts`);
+    return { ran: false, url, needsSetup };
   }
-  report.steps.push({ step: 0, url, action: "reached /setup" });
+  if (needsSetup === null) {
+    // The status route is unreachable, so the browser's own address is the only witness left.
+    // Say which one was used: a detection that can silently fall back is a detection whose
+    // failure is invisible.
+    log(`wizard: status unreachable, falling back to the address (${url})`);
+    if (!url.includes("/setup")) return { ran: false, url, needsSetup: null };
+  }
+  // The redirect above is client-side and asynchronous, so wait for the wizard to actually be
+  // on screen rather than assuming the navigation already happened.
+  await page
+    .waitForURL(/\/setup/, { timeout: 15000 })
+    .catch(() => page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" }));
+  await page
+    .waitForSelector("[data-setup-step], [data-setup-progress]", { timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(400);
+  report.steps.push({ step: 0, url: page.url(), action: "reached /setup" });
   await shot(page, "01-setup-step-1");
   for (let i = 1; i <= 10; i++) {
     const stepKey = await page
@@ -3368,19 +3409,27 @@ async function seedAnalytics(report) {
   let spread = "skipped";
   try {
     const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
-    const shift = (table, column) => `
-      update ${table} set ${column} = ${column} - (
-        case when id % 3 = 1 then (1 + (id % 6)) else (7 + (id % 23)) end || ' days'
-      )::interval
-      where site_id = '${site}' and id % 3 <> 0;`;
-    for (const statement of [
-      shift("analytics_pageviews", "occurred_at"),
-      shift("analytics_visits", "started_at"),
-      shift("analytics_events", "occurred_at"),
-    ]) {
-      qaSql(statement);
+    // A missing site used to be interpolated into the statement anyway, and `where site_id = ''`
+    // is a Postgres type error rather than a no-op — the fixture then reported a 120-character
+    // slice of that error under the word "skipped", which reads like a fixture problem and is
+    // really a missing one. Say which it is.
+    if (!site) {
+      spread = `skipped: no site answers to the key "${CREDS.siteKey}"`;
+    } else {
+      const shift = (table, column) => `
+        update ${table} set ${column} = ${column} - (
+          case when id % 3 = 1 then (1 + (id % 6)) else (7 + (id % 23)) end || ' days'
+        )::interval
+        where site_id = '${site}' and id % 3 <> 0;`;
+      for (const statement of [
+        shift("analytics_pageviews", "occurred_at"),
+        shift("analytics_visits", "started_at"),
+        shift("analytics_events", "occurred_at"),
+      ]) {
+        qaSql(statement);
+      }
+      spread = "applied";
     }
-    spread = "applied";
   } catch (err) {
     spread = `skipped: ${String(err).slice(0, 120)}`;
   }
@@ -3761,22 +3810,35 @@ async function runCrmAssignmentDepth(page, report) {
   steps.simulatorNamesTheFailingKey = failedOn === "country";
 
   // 4. The fairness claim: running the simulator must not move the cursor.
-  const cursorBefore = await page.evaluate(async (ruleId) => {
-    const response = await fetch("/api/v1/crm/assignment/rules", { credentials: "same-origin" });
-    const rules = await response.json();
-    return rules.find((r) => r.id === ruleId)?.round_robin_cursor ?? null;
-  }, people ? people.id : null);
+  //
+  // `rules.find` was called on whatever the route answered. The list route is permission
+  // guarded, so a refusal is a JSON *object* — `{"error": …}` — and `find` on it is a
+  // `TypeError` that aborts the whole depth pass with no step recorded at all. The pass then
+  // reported "crm-assignment failed" and said nothing about which half it had proved, which
+  // is the worst of both answers: it looks like a product fault and it hides the real one.
+  // Reading the shape first turns a crash into a step that names the status code.
+  const readCursor = () =>
+    page.evaluate(async (ruleId) => {
+      const response = await fetch("/api/v1/crm/assignment/rules", { credentials: "same-origin" });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) return { ok: false, status: response.status, cursor: null };
+      if (!Array.isArray(body)) return { ok: false, status: "not-a-list", cursor: null };
+      return { ok: true, status: response.status, cursor: body.find((r) => r.id === ruleId)?.round_robin_cursor ?? null };
+    }, people ? people.id : null);
+
+  const cursorBefore = await readCursor();
+  steps.cursorReadBefore = cursorBefore.ok;
+  if (!cursorBefore.ok) steps.cursorReadStatus = cursorBefore.status;
   for (let n = 0; n < 3; n += 1) {
     await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
     await page.waitForTimeout(900);
   }
-  const cursorAfter = await page.evaluate(async (ruleId) => {
-    const response = await fetch("/api/v1/crm/assignment/rules", { credentials: "same-origin" });
-    const rules = await response.json();
-    return rules.find((r) => r.id === ruleId)?.round_robin_cursor ?? null;
-  }, people ? people.id : null);
+  const cursorAfter = await readCursor();
+  steps.cursorReadAfter = cursorAfter.ok;
+  // The claim is "reading the simulator moved nothing", so it needs two real reads. Two nulls
+  // are equal to each other and would otherwise read as proof that nothing changed.
   steps.simulatorDidNotAdvanceTheCursor =
-    cursorBefore !== null && cursorBefore === cursorAfter;
+    cursorBefore.ok && cursorAfter.ok && cursorBefore.cursor !== null && cursorBefore.cursor === cursorAfter.cursor;
   steps.poolShowsItsNextMember = (
     await page.locator("[data-testid='assignment-rule']").allInnerTexts()
   ).some((text) => text.includes("next:"));
@@ -6562,6 +6624,43 @@ async function main() {
     await browser.close();
     process.exit(3);
   }
+
+  // The account must actually own something before any organization-scoped screen is judged.
+  //
+  // Everything below is a *product* verdict, and an account with no organization turns every
+  // one of those screens into `400 no_organization` — a wall of failures that all point at
+  // the CRM, the media library and the analytics, and none of them at the pass that let the
+  // pass walk a database it never finished setting up. Ask the question here, where the
+  // answer still belongs to the harness, and stop: a pass that cannot build its own fixture
+  // has nothing to say about the feature.
+  const tenant = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/onboarding", { credentials: "same-origin" });
+    if (!response.ok) return { ok: false, reason: `onboarding status answered ${response.status}` };
+    const body = await response.json();
+    const steps = body.steps || {};
+    return {
+      ok: true,
+      needsSetup: Boolean(body.needs_setup),
+      completed: Boolean(body.completed),
+      steps,
+      organization: body.summary?.organization_name ?? null,
+      site: body.summary?.site_name ?? null,
+    };
+  });
+  report.tenant = tenant;
+  if (!tenant.ok || tenant.needsSetup || !tenant.organization) {
+    const detail = tenant.ok
+      ? `needs_setup=${tenant.needsSetup} organization=${JSON.stringify(tenant.organization)}`
+      : tenant.reason;
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ fatal: `the pass has no tenant to walk: ${detail}`, ...report }, null, 2),
+    );
+    console.error(`[walk] FATAL: the pass has no tenant to walk: ${detail}`);
+    await browser.close();
+    process.exit(4);
+  }
+  log(`tenant: organization=${tenant.organization} site=${JSON.stringify(tenant.site)}`);
   await shot(page, "11-overview-after-login");
 
   // The analytics batch goes in before the routes are walked: the report screens read it, and the

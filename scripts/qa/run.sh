@@ -117,8 +117,16 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
+  # `OMNION_CSRF_SECRET` is not optional on this stack. The middleware refuses every
+  # cookie-authenticated mutation without one (`403 csrf_unavailable`), and the panel signs in
+  # with a cookie, so an API started without it turns every save, create and delete in the
+  # walkthrough into a refusal — the IAM depth pass reported a role that "could not be created"
+  # because of it. A fixed value is correct here: the token is an HMAC over the session id
+  # inside this one process, so nothing is shared with another stack and there is nothing to
+  # keep secret between passes.
   OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+  OMNION_CSRF_SECRET="qa-stack-${STACK}-csrf-secret-not-a-production-value" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
