@@ -321,10 +321,31 @@ async fn send(kind: ExporterKind, row: &Configured, batch: &Batch) -> FlushOutco
         // by the same arm deliberately — the difference between "wrong endpoint" and "wrong
         // payload" is the backend's answer, which is what the screen shows either way.
         ExporterKind::Otlp | ExporterKind::PrometheusRemoteWrite => {
+            // **Appending `/v1/logs` unconditionally is a bug this walk exists to catch**, and the
+            // symptom is invisible in a unit test because the URL is only ever built here. An
+            // operator's endpoint is a full ingestion URL — the OTel Collector's own
+            // documentation writes `http://collector:4318/v1/logs`, and the admin form's help
+            // text says the same — so the value stored in `obs_exporters.endpoint` ALREADY
+            // carries the path. Appending again produced
+            // `http://127.0.0.1:PORT/v1/logs/v1/logs`, a 404 from the collector, a batch that
+            // never arrived, and a health chip that correctly said `degraded` about a backend
+            // that was working perfectly.
+            //
+            // The three walks that drive a real request went red for this one reason: they were
+            // the only ones whose assertion is "the backend RECEIVED something", and a 404 is a
+            // silent false for a mock that answers `not found` and records nothing.
+            //
+            // So the rule is: a base URL gets the path, a full ingestion URL is used as given.
+            // The two are told apart by the path itself, not by a flag nobody sets.
             let endpoint = if row.endpoint.ends_with('/') {
                 row.endpoint.clone()
             } else {
-                format!("{}/v1/logs", row.endpoint.trim_end_matches('/'))
+                let base = row.endpoint.trim_end_matches('/');
+                if base.ends_with("/v1/logs") || base.ends_with("/v1/traces") {
+                    base.to_owned()
+                } else {
+                    format!("{base}/v1/logs")
+                }
             };
             post_json(&endpoint, row.timeout_ms, batch).await
         }

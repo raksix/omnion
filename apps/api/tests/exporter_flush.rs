@@ -601,14 +601,49 @@ async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
         exporter::global().status(&name).is_some(),
         "the sweep did not register a stored row"
     );
+    // The chip, and the assertion here is a CORRECTION. This walk used to demand `ok` — "an
+    // empty buffer left the row's chip as something a screen would render as a problem" — and
+    // that expectation is wrong in the product's favour, three times over:
+    //
+    //   * the migration declares `health ... default 'unknown'` with
+    //     `(health in ('unknown','ok','degraded','down'))`, so `unknown` is a legal state;
+    //   * `Buffer::health` derives it from the flush counter, and an exporter that has never
+    //     flushed has no evidence to be anything else;
+    //   * `emit_health_change` says it outright: "`unknown` is where an exporter starts, not a
+    //     state it recovers into. A configured exporter that has never flushed is not news".
+    //
+    // And the request's own screen contract agrees: the exporters list has a "no telemetry yet
+    // — the exporter was just enabled" state, which is what `unknown` renders as. Demanding
+    // `ok` here would have forced a `Test`-probe success into the *measured* chip, so a
+    // backend that has never answered a single batch would look healthy.
+    //
+    // What this walk is actually for — and what it now asserts — is the SWEEP registering a row
+    // no code path in this process created, which is the claim in its name. That is checked
+    // above, against the in-process collector, which is the only place a registration exists.
     let health: String = sqlx::query_scalar("select health from obs_exporters where name = $1")
         .bind(&name)
         .fetch_one(state.db().pool())
         .await
         .expect("the row is readable");
     assert_eq!(
-        health, "ok",
-        "an empty buffer left the row's chip as something a screen would render as a problem"
+        health, "unknown",
+        "a never-flushed exporter reported a health the screen has no empty state for: {health:?}"
+    );
+    // The sweep must still have FOLDED the row back — persisting `unknown` is the same write
+    // that persists `ok`, so this is what proves the empty-buffer path persisted at all rather
+    // than skipping the row. Without it the previous line would pass on a row the sweep never
+    // touched, which is its own default from the migration.
+    let dropped: (Option<i64>, bool) = sqlx::query_as(
+        "select dropped_total, enabled from obs_exporters where name = $1",
+    )
+    .bind(&name)
+    .fetch_one(state.db().pool())
+    .await
+    .expect("the row is readable");
+    assert_eq!(
+        dropped,
+        (Some(0), true),
+        "the sweep did not fold the registered row's state back: {dropped:?}"
     );
 
     exporter::global().remove(&name);
