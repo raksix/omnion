@@ -23,12 +23,25 @@ fn workflow_columns() -> &'static str {
 
 /// Insert a workflow definition.
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
+    // A rule is born with a *valid* graph — a trigger, an end, and the edge between them.
+    //
+    // The column default is `{"nodes":[],"edges":[]}`, which is why this was a bug rather than
+    // a cosmetic gap: 0051 backfilled the rules that existed, and every rule created *after*
+    // it inherited the empty default. The builder then opened on a canvas with nothing on it,
+    // and the server refused the first save with `graph_invalid` — "the graph has no nodes,
+    // a definition needs at least a trigger" — for a rule the author had just created through
+    // the same screen. An unsaveable new rule is the one defect no amount of editing recovers
+    // from, so the row starts valid and the author only ever moves forward from there.
+    //
+    // The starter is the same `Graph::starter` the backfill and the registry describe, so a
+    // rule born here and a rule backfilled by SQL open identically.
+    let starter = crate::graph::Graph::starter(new.trigger.as_str(), new.trigger_event.as_deref());
     let sql = format!(
         "insert into workflows (organization_id, site_id, name, description, enabled, \
          trigger_kind, schedule, trigger_event, conditions, on_error, run_as_user_id, \
-         rate_limit_per_hour, concurrency, next_run_at, steps, created_by) \
+         rate_limit_per_hour, concurrency, next_run_at, steps, graph, created_by) \
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                 coalesce($12, 60), coalesce($13, 'queue'), $14, $15, $16) returning {}",
+                 coalesce($12, 60), coalesce($13, 'queue'), $14, $15, $16, $17) returning {}",
         workflow_columns()
     );
 
@@ -53,6 +66,10 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
         .bind(new.concurrency)
         .bind(new.next_run_at)
         .bind(new.steps)
+        // The graph the builder opens on, seeded rather than defaulted.
+        .bind(serde_json::to_value(starter).unwrap_or_else(|_| {
+            serde_json::json!({ "nodes": [], "edges": [] })
+        }))
         .bind(new.created_by)
         .fetch_one(pool)
         .await?;
