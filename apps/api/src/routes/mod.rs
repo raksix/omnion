@@ -1451,6 +1451,20 @@ pub fn router(state: AppState) -> Router {
         // the drawer broken for every role that may not yet be trusted with the write.
         .route("/inventory/movements/preview", post(inventory::preview_movement))
         .route("/inventory/settings", get(inventory::get_settings))
+        // The adjustment inbox and its export. The inbox is a **read** key and not the approve
+        // key on purpose: a manager's job is to see what is waiting, and an approver who cannot
+        // see the queue has to ask for a link to it. The decision is the guarded write below.
+        .route("/inventory/approvals", get(inventory::list_approvals))
+        .route(
+            "/inventory/approvals/pending-count",
+            get(inventory::pending_approval_count),
+        )
+        .route("/inventory/approvals/export", get(inventory::export_approvals))
+        .route("/inventory/stock/export", get(inventory::export_stock))
+        .route(
+            "/inventory/movements/export",
+            get(inventory::export_movements),
+        )
         .route_layer(guards::require(&state, "inventory.items.read"));
 
     let inventory_items_manage = Router::new()
@@ -1478,10 +1492,41 @@ pub fn router(state: AppState) -> Router {
     // be one.** The criterion asks for a 405 and axum answers that for a path it does not
     // implement, which is the only answer that cannot be undone by a later handler that decides to
     // be helpful. The way to fix a mistake is another movement.
+    // The approval route itself. Raising a request needs only the **movement record** key,
+    // because a request is not a movement: an operator who may adjust stock may ask for a large
+    // adjustment to be approved, and the decision belongs to whoever holds the key below. The
+    // `raise` path is also reachable from the save route above, which is why this router exists
+    // separately — a client that wants to ask explicitly, without attempting the write, can.
+    let inventory_approvals = Router::new()
+        .route("/inventory/approvals", post(inventory::raise_approval))
+        .route_layer(guards::require(&state, "inventory.movements.record"));
+
+    // **`inventory.adjustment.approve` guards the decision and nothing else.** A holder approves
+    // somebody else's recount; that is the whole meaning of the key, and it is why it is
+    // separate from `inventory.movements.record` (a manager who may approve is not thereby
+    // authorised to move stock) and separate from `inventory.negative.manage` (which is not on
+    // any route at all).
+    let inventory_approvals_manage = Router::new()
+        .route(
+            "/inventory/approvals/{id}",
+            get(inventory::get_approval),
+        )
+        .route_layer(guards::require(&state, "inventory.items.read"));
+    let inventory_approval_decisions = Router::new()
+        .route(
+            "/inventory/approvals/{id}/decision",
+            post(inventory::decide_approval),
+        )
+        .route("/inventory/approvals/{id}/cancel", post(inventory::cancel_approval))
+        .route_layer(guards::require(&state, "inventory.adjustment.approve"));
+
     let inventory = inventory_items_read
         .merge(inventory_items_manage)
         .merge(inventory_locations_manage)
-        .merge(inventory_movements_record);
+        .merge(inventory_movements_record)
+        .merge(inventory_approvals)
+        .merge(inventory_approvals_manage)
+        .merge(inventory_approval_decisions);
 
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))

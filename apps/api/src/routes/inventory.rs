@@ -26,7 +26,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
-use omnion_module_inventory::ledger::{self, Movement, MovementQuery, NewMovement, Recorded};
+use axum::response::Response;
+use omnion_module_inventory::ledger::{self, Movement, MovementQuery, NewMovement, RecordOutcome};
 use omnion_module_inventory::store::{
     self, ItemPatch, ItemQuery, ItemView, LocationPatch, LocationView, NewItem, NewLocation,
     NewWarehouse, Overview, Page, SettingsPatch, StockLevel, StockPosition, StockQuery,
@@ -801,7 +802,7 @@ pub async fn record_movement(
     address: ClientAddress,
     Query(organization): Query<OrganizationParam>,
     body: Json<RecordMovementBody>,
-) -> Result<(StatusCode, Json<Recorded>), ApiError> {
+) -> Result<(StatusCode, Json<RecordOutcome>), ApiError> {
     let organization_id = organization_of(&state, &current, body.0.organization_id.or(organization.organization_id)).await?;
     let pool = state.db().pool();
 
@@ -811,8 +812,93 @@ pub async fn record_movement(
     let may_go_negative = holds_permission(&state, &current, organization_id, "inventory.negative.manage")
         .await?;
 
-    let before = ledger::stock_level(pool, organization_id, body.0.item_id, body.0.location_id).await?;
-    let new = body.0.into_movement(pool, organization_id, may_go_negative).await?;
+    // **The threshold check, before the write and before anything is written about it.** The
+    // comparison is the module's (`approvals::needs_approval`), not a second `>` in this file:
+    // the drawer asks the same function through the preview, the save asks it here, and the two
+    // answers have to be the same or a screen will say "no approval needed" and then refuse.
+    //
+    // Three outcomes, and only one of them writes:
+    //
+    // * under the threshold, or the caller may approve — write the movement (the old behaviour);
+    // * over the threshold and the caller may not approve — **raise a request and return 202**
+    //   with it, so the drawer shows "waiting on a decision" rather than a success;
+    // * over the threshold and a request is already open for this item at this location — the
+    //   module's own refusal, which carries the pending amount.
+    let body = body.0;
+    let settings = store::get_settings(pool, organization_id).await?;
+    let may_approve = holds_permission(
+        &state,
+        &current,
+        organization_id,
+        "inventory.adjustment.approve",
+    )
+    .await?;
+
+    // The amount is measured on the number as typed and against the current on-hand, which is
+    // why a `counted` request is turned into its distance *before* the comparison. Measuring a
+    // counted total against the threshold would ask for approval of a recount of 6 when the
+    // shelf holds 10, which is a refusal of a correction the operator already made.
+    let level = ledger::stock_level(pool, organization_id, body.item_id, body.location_id).await?;
+    let mode = body.mode.clone().unwrap_or_else(|| "delta".to_owned());
+    let typed = store::parse_quantity("movement", "quantity", &body.quantity)?;
+    let amount = omnion_module_inventory::approvals::approval_amount(&mode, typed, level.on_hand);
+
+    if omnion_module_inventory::approvals::needs_approval(amount, &settings) && !may_approve {
+        let reason = omnion_module_inventory::items::default_reason(body.reason.as_deref())?;
+        let kind = preview_kind(body.kind.as_deref(), reason, typed)?;
+        let request = omnion_module_inventory::approvals::NewApproval {
+            item_id: body.item_id,
+            location_id: body.location_id,
+            kind: kind.as_str().to_owned(),
+            mode,
+            quantity: typed,
+            reason: reason.as_str().to_owned(),
+            note: body.note.clone().unwrap_or_default(),
+            source_kind: body.source_kind.clone(),
+            source_id: body.source_id,
+        };
+        let view = omnion_module_inventory::approvals::request_approval(
+            pool,
+            organization_id,
+            &request,
+            current.user.id,
+        )
+        .await?;
+        record(
+            &state,
+            NewAuditEntry::by_user(current.user.id, "inventory.adjustment.requested")
+                .organization(organization_id)
+                .target("inventory_adjustment_approval", view.id.to_string())
+                .metadata(json!({
+                    "approval_id": view.id,
+                    "item_id": view.item_id,
+                    "location_id": view.location_id,
+                    "amount": view.amount.to_text(),
+                    "threshold": view.threshold.to_text(),
+                }))
+                .ip_address(address.as_text()),
+        )
+        .await?;
+        emit(
+            &state,
+            NewEvent::new("inventory.adjustment.requested")
+                .organization(organization_id)
+                .actor(current.user.id)
+                .payload(json!({
+                    "approval_id": view.id,
+                    "sku": view.sku,
+                    "amount": view.amount.to_text(),
+                    "threshold": view.threshold.to_text(),
+                })),
+        )
+        .await;
+        // `202 Accepted`, not `201 Created`: the request was created, and the thing the caller
+        // asked for — a movement — has not. A `201` here would tell the drawer it worked.
+        return Ok((StatusCode::ACCEPTED, Json(RecordOutcome::AwaitingApproval { approval: view })));
+    }
+
+    let before = level;
+    let new = body.into_movement(pool, organization_id, may_go_negative).await?;
     let recorded = ledger::record_movement(pool, organization_id, &new, Some(current.user.id)).await?;
 
     record(
@@ -867,7 +953,13 @@ pub async fn record_movement(
         .await;
     }
 
-    Ok((StatusCode::CREATED, Json(recorded)))
+    Ok((
+        StatusCode::CREATED,
+        Json(RecordOutcome::Recorded {
+            movement: recorded.movement,
+            position: recorded.position,
+        }),
+    ))
 }
 
 /// Whether this write took the row from above its reorder point to at or below it.
@@ -1210,6 +1302,403 @@ pub async fn update_settings(
     .await?;
 
     Ok(Json(after))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Adjustment approvals (slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/// The body of a decision.
+#[derive(Debug, Deserialize)]
+pub struct ApprovalDecisionBody {
+    /// `approve` or `reject`.
+    pub decision: String,
+    /// Required on a rejection.
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// The body of a raise.
+#[derive(Debug, Deserialize)]
+pub struct RaiseApprovalBody {
+    /// The item.
+    pub item_id: Uuid,
+    /// The location.
+    pub location_id: Uuid,
+    /// The kind, when the caller knows it.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The number as typed: a delta, or with `mode: "counted"` the counted total.
+    pub quantity: String,
+    /// `delta` or `counted` — the same two modes the drawer offers.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Why.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// A note for the approver.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Where the write came from.
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    /// That document's id.
+    #[serde(default)]
+    pub source_id: Option<Uuid>,
+    /// Organization to act on.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/inventory/approvals` — the decision inbox.
+pub async fn list_approvals(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<ApprovalListParams>,
+) -> Result<Json<omnion_module_inventory::store::Page<omnion_module_inventory::approvals::ApprovalView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::approvals::ApprovalQuery {
+        status: params.status,
+        item_id: params.item_id,
+        limit: params.limit.unwrap_or(50),
+        cursor: params.cursor,
+    };
+    Ok(Json(
+        omnion_module_inventory::approvals::list_approvals(state.db().pool(), organization_id, &query)
+            .await?,
+    ))
+}
+
+/// The inbox's filter.
+#[derive(Debug, Deserialize)]
+pub struct ApprovalListParams {
+    /// `pending`, `approved`, `rejected` or `cancelled`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// One item's history.
+    #[serde(default)]
+    pub item_id: Option<Uuid>,
+    /// How many rows.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The page cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/inventory/approvals/{id}` — one request.
+pub async fn get_approval(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    Path(approval_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::approvals::ApprovalView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view = omnion_module_inventory::approvals::get_approval(
+        state.db().pool(),
+        organization_id,
+        approval_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "inventory_approval_not_found",
+            "no such adjustment request in this organization",
+        )
+    })?;
+    Ok(Json(view))
+}
+
+/// `POST /api/v1/inventory/approvals` — raise a request for an over-threshold adjustment.
+///
+/// **The route that makes slice 1's threshold real.** The save path checks the threshold first
+/// and calls this instead of writing, so the drawer never has to decide whether a number is big
+/// enough — that comparison lives in one place and this route is what it calls.
+pub async fn raise_approval(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    body: Json<RaiseApprovalBody>,
+) -> Result<(StatusCode, Json<omnion_module_inventory::approvals::ApprovalView>), ApiError> {
+    let organization_id = organization_of(&state, &current, body.0.organization_id).await?;
+    let pool = state.db().pool();
+    let body = body.0;
+
+    let quantity = store::parse_quantity("movement", "quantity", &body.quantity)?;
+    let reason = omnion_module_inventory::items::default_reason(body.reason.as_deref())?;
+    // Read before the arithmetic so a foreign id is a 404 rather than a request carrying a
+    // quantity measured against a row that does not exist.
+    ledger::stock_level(pool, organization_id, body.item_id, body.location_id).await?;
+    let kind = preview_kind(body.kind.as_deref(), reason, quantity)?;
+
+    let request = omnion_module_inventory::approvals::NewApproval {
+        item_id: body.item_id,
+        location_id: body.location_id,
+        kind: kind.as_str().to_owned(),
+        mode: body.mode.clone().unwrap_or_else(|| "delta".to_owned()),
+        quantity,
+        reason: reason.as_str().to_owned(),
+        note: body.note.unwrap_or_default(),
+        source_kind: body.source_kind,
+        source_id: body.source_id,
+    };
+    let view = omnion_module_inventory::approvals::request_approval(
+        pool,
+        organization_id,
+        &request,
+        current.user.id,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.adjustment.requested")
+            .organization(organization_id)
+            .target("inventory_adjustment_approval", view.id.to_string())
+            .metadata(json!({
+                "approval_id": view.id,
+                "item_id": view.item_id,
+                "location_id": view.location_id,
+                "amount": view.amount.to_text(),
+                "threshold": view.threshold.to_text(),
+                "reason": view.reason,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.adjustment.requested")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "approval_id": view.id,
+                "sku": view.sku,
+                "item_id": view.item_id,
+                "location_id": view.location_id,
+                "amount": view.amount.to_text(),
+                "threshold": view.threshold.to_text(),
+            })),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// `POST /api/v1/inventory/approvals/{id}/decision` — approve or reject.
+///
+/// The approve branch returns the **movement it produced** alongside the request, so a screen
+/// can show the new balance without a second round trip — and so a caller can tell the
+/// difference between "approved" and "approved, and here is what it did".
+pub async fn decide_approval(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(approval_id): Path<Uuid>,
+    body: Json<ApprovalDecisionBody>,
+) -> Result<Json<ApprovalDecisionOutcome>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    // The approver's own negative-stock permission, not the requester's: the control exists so a
+    // decision is made by somebody in a position to make it, and a person without the key
+    // approving a correction into negative stock is exactly the case it should stop.
+    let may_go_negative =
+        holds_permission(&state, &current, organization_id, "inventory.negative.manage").await?;
+
+    let (view, recorded) = omnion_module_inventory::approvals::decide(
+        pool,
+        organization_id,
+        approval_id,
+        current.user.id,
+        &body.0.decision,
+        body.0.comment.as_deref(),
+        may_go_negative,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.adjustment.decided")
+            .organization(organization_id)
+            .target("inventory_adjustment_approval", view.id.to_string())
+            .metadata(json!({
+                "approval_id": view.id,
+                "decision": view.decision,
+                "comment": view.comment,
+                "amount": view.amount.to_text(),
+                "threshold": view.threshold.to_text(),
+                "movement_id": view.movement_id,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    if let Some(recorded) = &recorded {
+        emit(
+            &state,
+            NewEvent::new("inventory.movement.recorded")
+                .organization(organization_id)
+                .actor(current.user.id)
+                .payload(recorded.movement.reference()),
+        )
+        .await;
+    }
+
+    Ok(Json(ApprovalDecisionOutcome {
+        approval: view,
+        movement: recorded.map(|entry| entry.movement),
+    }))
+}
+
+/// What a decision produced: the request, and the movement an approval wrote.
+///
+/// Only those two. The new balance is deliberately **not** echoed here: the stock row is read
+/// once, by the write path, and a second copy of it in a response is a second thing that can be
+/// stale. The screen re-reads `/inventory/stock`, which is the screen that owns the balance.
+#[derive(Debug, serde::Serialize)]
+pub struct ApprovalDecisionOutcome {
+    /// The request, now decided.
+    pub approval: omnion_module_inventory::approvals::ApprovalView,
+    /// The movement the approval wrote, when it was approved.
+    pub movement: Option<omnion_module_inventory::Movement>,
+}
+
+/// `POST /api/v1/inventory/approvals/{id}/cancel` — the requester withdraws.
+pub async fn cancel_approval(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(approval_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::approvals::ApprovalView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view = omnion_module_inventory::approvals::cancel(
+        state.db().pool(),
+        organization_id,
+        approval_id,
+        current.user.id,
+    )
+    .await?;
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.adjustment.cancelled")
+            .organization(organization_id)
+            .target("inventory_adjustment_approval", view.id.to_string())
+            .metadata(json!({ "approval_id": view.id }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+    Ok(Json(view))
+}
+
+/// `GET /api/v1/inventory/approvals/pending-count` — the nav badge.
+pub async fn pending_approval_count(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<PendingCount>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(PendingCount {
+        pending: omnion_module_inventory::approvals::pending_count(
+            state.db().pool(),
+            organization_id,
+        )
+        .await?,
+    }))
+}
+
+/// How many requests are waiting.
+#[derive(Debug, serde::Serialize)]
+pub struct PendingCount {
+    /// The count.
+    pub pending: i64,
+}
+
+// ---------------------------------------------------------------------------------------------
+// CSV export
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/stock/export` — the stock list as a CSV.
+///
+/// The body is produced from **the same list the table rendered**: the route re-runs the screen's
+/// filter with the screen's limit and hands the resulting page to the writer. A second query with
+/// its own filter list would be a second answer, and the export is the file people paste into a
+/// spreadsheet — it has to be the rows they were looking at.
+pub async fn export_stock(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<StockListParams>,
+) -> Result<Response, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    // **The same `StockQuery::from` the list route builds.** That is the whole argument for the
+    // export: one filter type, one builder, two callers. A hand-rolled filter list here would be
+    // a second answer to "which rows is the operator looking at".
+    let query = StockQuery::from(params);
+    let page = store::list_stock(state.db().pool(), organization_id, &query).await?;
+    csv_response(omnion_module_inventory::csv::stock_csv(&page), "stock")
+}
+
+/// `GET /api/v1/inventory/movements/export` — the ledger as a CSV.
+pub async fn export_movements(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<MovementListParams>,
+) -> Result<Response, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    // The same builder the ledger screen used, for the same reason as the stock export above.
+    let query = params.into_query()?;
+    let page = ledger::list_movements(state.db().pool(), organization_id, &query).await?;
+    csv_response(omnion_module_inventory::csv::movements_csv(&page), "movements")
+}
+
+/// `GET /api/v1/inventory/approvals/export` — the decision list as a CSV.
+pub async fn export_approvals(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<ApprovalListParams>,
+) -> Result<Response, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::approvals::ApprovalQuery {
+        status: params.status,
+        item_id: params.item_id,
+        limit: params.limit.unwrap_or(1_000),
+        cursor: params.cursor,
+    };
+    let page = omnion_module_inventory::approvals::list_approvals(
+        state.db().pool(),
+        organization_id,
+        &query,
+    )
+    .await?;
+    csv_response(omnion_module_inventory::csv::approvals_csv(&page), "adjustments")
+}
+
+/// Wrap a CSV in the response the browser downloads, with a dated filename.
+///
+/// `Content-Disposition: attachment` rather than an inline body: an inline CSV opens in the
+/// browser's text view, and the operator's next click is "save as" on a page that looks like
+/// the platform. The date is in the name because a file called `stock.csv` is the one from last
+/// Tuesday by Friday.
+fn csv_response(body: String, stem: &str) -> Result<Response, ApiError> {
+    let day = time::OffsetDateTime::now_utc().date().to_string();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "text/csv; charset=utf-8",
+        )
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{stem}-{day}.csv\""),
+        )
+        .body(axum::body::Body::from(body))
+        .expect("a CSV response header is static and valid"))
 }
 
 // ---------------------------------------------------------------------------------------------

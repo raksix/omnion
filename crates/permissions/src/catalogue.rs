@@ -713,6 +713,12 @@ pub const CATALOGUE: &[PermissionDef] = &[
     //   permitted for you", and giving it a route would be giving it a second meaning.
     // * `inventory.locations.manage` is separate from the movement key because closing a location
     //   makes stock unreachable, which is a structural change rather than a day's work.
+    // * `inventory.adjustment.approve` is separate from `inventory.movements.record` because
+    //   approving somebody else's recount is a **second pair of eyes**, not a bigger pen: a
+    //   manager who may approve is not thereby authorised to move stock, and an operator who may
+    //   move stock is not thereby authorised to wave their own through. The module refuses a
+    //   self-approval in the service, so the key alone is not the whole rule — it is the first
+    //   half.
     PermissionDef {
         key: "inventory.items.read",
         category: "inventory",
@@ -737,6 +743,11 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "inventory.negative.manage",
         category: "inventory",
         description: "Allow a correction to take stock below zero (needed with reason `correction`)",
+    },
+    PermissionDef {
+        key: "inventory.adjustment.approve",
+        category: "inventory",
+        description: "Decide another operator's over-threshold stock adjustment (approve or reject)",
     },
 ];
 
@@ -967,7 +978,7 @@ mod tests {
 
     #[test]
     fn the_inventory_family_is_catalogued_and_one_key_guards_no_route() {
-        // REQ-053. Four keys guard routes and the fifth does not — `inventory.negative.manage`
+        // REQ-053. Five keys guard routes and one does not — `inventory.negative.manage`
         // is a service rule the schema cannot check, so it exists only to unlock one refusal.
         // A catalogue entry for it is what lets a role **hold** it; nothing in `routes/inventory.rs`
         // may `require()` it, and this test cannot see that, so the comment in the route file is
@@ -978,6 +989,7 @@ mod tests {
             "inventory.movements.record",
             "inventory.locations.manage",
             "inventory.negative.manage",
+            "inventory.adjustment.approve",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),

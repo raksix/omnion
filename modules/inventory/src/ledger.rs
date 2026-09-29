@@ -234,6 +234,34 @@ pub struct Recorded {
     pub position: StockLevel,
 }
 
+/// What a record request produced: either the movement, or a request waiting for a decision.
+///
+/// **Two states, not two endpoints.** The drawer posts one body to one URL, and the honest
+/// answer to "I typed an adjustment of 400" is sometimes a ledger row and sometimes a pending
+/// request. If those were two endpoints the drawer would have to know the threshold to choose
+/// between them — which is exactly the knowledge the server holds. Making the *response* say
+/// which happened keeps the decision in one place, and it is why the save button can say
+/// "requesting" without the screen re-implementing `needs_approval`.
+///
+/// Serialised as `{"status": "recorded" | "awaiting_approval", …}` so a client reads one field
+/// rather than probing for a missing key.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RecordOutcome {
+    /// The movement was written.
+    Recorded {
+        /// The ledger row.
+        movement: Movement,
+        /// The stock row after the write.
+        position: StockLevel,
+    },
+    /// The adjustment was over the threshold and is waiting for somebody else to decide it.
+    AwaitingApproval {
+        /// The request that now exists.
+        approval: crate::approvals::ApprovalView,
+    },
+}
+
 /// Compute what a movement would do, without writing it.
 ///
 /// The adjust drawer calls this to show "you are about to take 4 from 10, leaving 6" **before**
