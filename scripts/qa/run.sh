@@ -44,12 +44,22 @@ step() { printf '\n[qa] %s\n' "$*"; }
 
 wait_http() { # url, seconds
   local url="$1" deadline=$(( $(date +%s) + ${2:-120} ))
+  local last=""
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
-    if [ -n "$code" ] && [ "$code" != "000" ]; then return 0; fi
+    last="$code"
+    # Only a 2xx means ready. Accepting any non-000 is how a Next dev server that is still
+    # compiling its first route looked ready: it answers 500 while it compiles, the pass walked
+    # in, and the walkthrough reported "admin panel unreachable ... responded 500" — a product
+    # failure invented entirely by the readiness check. A 5xx here is the server booting, and
+    # the panel is not a thing that should be left half-compiled for a browser to look at.
+    case "$code" in
+      2*) return 0 ;;
+    esac
     sleep 2
   done
+  echo "[qa] $url never answered 2xx (last: ${last:-none})" >&2
   return 1
 }
 
@@ -117,7 +127,7 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_ADMIN" --name "$ADMIN_NAME" --cwd "$ROOT/apps/admin" --time -- dev --port "$ADMIN_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$ADMIN_PORT/login" 150 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
+wait_http "http://127.0.0.1:$ADMIN_PORT/login" 300 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "public renderer on :$WEB_PORT"
 NEXT_WEB="$ROOT/apps/web/node_modules/next/dist/bin/next"
@@ -127,7 +137,7 @@ else
   OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
-wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
+wait_http "http://127.0.0.1:$WEB_PORT/" 300 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "browser walkthrough"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
