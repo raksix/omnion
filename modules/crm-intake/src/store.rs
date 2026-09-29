@@ -1540,6 +1540,13 @@ pub async fn append_event(
 /// trail is the only record of what happened (assignment, conversion, a response): if the
 /// transaction commits without the line, the panel shows a lead in a state its own history
 /// contradicts, and no later read can detect the gap because both halves look valid on their own.
+///
+/// **The request id is stamped here, in this one function, and nowhere else.** Every trail line in
+/// the crate goes through these two, so this is the single place that has to know the id exists —
+/// and therefore the single place that can be audited for it. A caller that wanted to add it
+/// itself would have two ways to spell the same fact, and a line written by the second way would
+/// carry whichever value won. Stamping here also means a caller cannot forget: forgetting is
+/// silent, the line is written, and the id reads `null` while the row looks healthy.
 pub async fn append_event_on<'e, E>(
     executor: E,
     lead_id: Uuid,
@@ -1557,10 +1564,35 @@ where
     .bind(lead_id)
     .bind(kind)
     .bind(actor_user_id)
-    .bind(detail)
+    .bind(stamp_request_id(detail))
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Add the current exchange's id to a detail object.
+///
+/// A detail that is not an object is wrapped rather than replaced. Every caller in the crate
+/// passes `json!({…})`, so the wrap is unreachable today — which is exactly why it must not be a
+/// `match` that *drops* the value: a future caller passing an array would have its line written
+/// with its detail silently discarded, and the trail would read as empty rather than as broken.
+///
+/// A caller that already set `request_id` keeps its own value. The only way that happens today is
+/// a test that stamps one deliberately, and a line that claims a different exchange than the one
+/// the server did is the one thing a correlation id must never be.
+#[must_use]
+pub fn stamp_request_id(detail: serde_json::Value) -> serde_json::Value {
+    let mut value = match detail {
+        serde_json::Value::Object(map) => serde_json::Value::Object(map),
+        other => serde_json::json!({ "detail": other }),
+    };
+    let object = value
+        .as_object_mut()
+        .expect("the object branch above produced an object");
+    object
+        .entry("request_id")
+        .or_insert_with(crate::request_id::detail_value);
+    value
 }
 
 /// Set a lead's status, refusing one the platform does not know.
