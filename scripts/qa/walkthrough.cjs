@@ -10066,6 +10066,156 @@ async function runWorkflowTableDepth(page, report) {
   note({ step: "table-save-survives", builderSeesTableEdit });
   await shot(page, "page-workflow-table-final");
 
+  // ---- An unfinished rule SAVES, and the run is where it refuses ---------------------------
+  // The guard moved from "you may not save" to "you may not run" (91bcbda), and a probe written
+  // against the old contract is the reason this half went unmeasured: the save answers **200**
+  // carrying `findings`, so a note that reads `saveState === "error"` reports the opposite of
+  // what happened, and a "save failed" row is an instrument defect rather than a product one.
+  // The problems list is therefore read off the **response body** — the only place a 200 can
+  // carry a verdict — and the Run button is then pressed and its refusal read as text.
+  //
+  // The graph used here is the one the table pass just renamed, so it is already a real rule with
+  // real nodes; what makes it un-runnable is a *missing event name* on the trigger, which is the
+  // state a rule is in for the whole of the first minute of its life and the one the previous
+  // contract made unsavable.
+  const unfinished = await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const graph = current.graph;
+    // A trigger with no event name: `missing_parameter`, an error, and the graph still projects
+    // well enough to store — the exact shape the old save refused and the new one records.
+    const trigger = graph.nodes.find((n) => n.type.startsWith("trigger"));
+    if (!trigger) return { skipped: "no trigger node in the graph" };
+    trigger.params = { ...(trigger.params ?? {}) };
+    delete trigger.params.event;
+
+    const csrf = document.cookie
+      .split(";")
+      .map((pair) => pair.split("="))
+      .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+      ?.trim();
+
+    const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+      },
+      body: JSON.stringify({ graph, graph_version: current.graph_version }),
+    });
+    const body = await response.json().catch(() => null);
+    return {
+      status: response.status,
+      errorCount: body?.error_count ?? null,
+      findingCount: body?.findings?.length ?? null,
+      codes: (body?.findings ?? []).map((f) => f.code).slice(0, 6),
+      recordedReason: body?.validation_error ?? null,
+      version: body?.graph_version ?? null,
+    };
+  }, workflowId);
+  note({
+    step: "unfinished-saves",
+    // 200 is the whole claim: refusing to store a rule that is not yet runnable is refusing
+    // the first keystroke of the feature whose job is being edited.
+    savedWith200: unfinished.status === 200,
+    status: unfinished.status ?? null,
+    errorCount: unfinished.errorCount ?? null,
+    findingCount: unfinished.findingCount ?? null,
+    codes: unfinished.codes ?? null,
+    reasonRecorded: Boolean((unfinished.recordedReason ?? "").trim()),
+    reason: (unfinished.recordedReason ?? "").slice(0, 120) || null,
+    skipped: unfinished.skipped ?? null,
+  });
+
+  // Now the run. The refusal must be a *sentence about the rule*, read off the screen, and the
+  // stored steps must still be the last runnable list — a save that blanked them would make
+  // "not yet runnable" and "has never run" the same row.
+  const runResponse = await page.evaluate(async (id) => {
+    const csrf = document.cookie
+      .split(";")
+      .map((pair) => pair.split("="))
+      .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+      ?.trim();
+    const response = await fetch(`/api/v1/workflows/${id}/run`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { ...(csrf ? { "x-omnion-csrf": csrf } : {}) },
+    });
+    const body = await response.json().catch(() => null);
+    const after = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    return {
+      status: response.status,
+      code: body?.error?.code ?? null,
+      message: (body?.error?.message ?? "").slice(0, 160) || null,
+      stepsKept: Array.isArray(after?.steps) ? after.steps.length : null,
+      executions: await (await fetch(`/api/v1/workflows/${id}/executions`, { credentials: "same-origin" }))
+        .json()
+        .then((r) => (Array.isArray(r?.executions) ? r.executions.length : null))
+        .catch(() => null),
+    };
+  }, workflowId);
+  note({
+    step: "unfinished-run-refused",
+    // 400, not 403/404/409: the caller is allowed to try, this rule is not ready.
+    refused: runResponse.status === 400,
+    status: runResponse.status ?? null,
+    code: runResponse.code,
+    message: runResponse.message,
+    // The recorded reason reaches the author verbatim rather than as a generic refusal.
+    messageNamesTheGraph: Boolean((runResponse.message ?? "").trim()),
+    // A refusal must leave no run behind: an execution row for a run that never started is a
+    // rule that looks like it fired.
+    executionsAfter: runResponse.executions ?? null,
+    stepsKept: runResponse.stepsKept ?? null,
+  });
+
+  // And the panel, which is where an author finds out: the problems list must render the
+  // findings the 200 carried. A 200 whose findings never reach the screen is a save that
+  // answers "yes" and tells the author nothing.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const problemsAfterUnfinishedSave = await page.evaluate(() => {
+    const toggle = document.querySelector("[data-problems-toggle]");
+    return {
+      header: (toggle?.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 80),
+      listed: [...document.querySelectorAll("[data-finding]")].map((el) => el.getAttribute("data-finding")),
+      saysNone: Boolean(document.querySelector("[data-problems-none]")),
+    };
+  });
+  note({
+    step: "unfinished-problems-panel",
+    header: problemsAfterUnfinishedSave.header,
+    listed: problemsAfterUnfinishedSave.listed,
+    // "No problems" over a graph the server will not run is the exact failure the finding list
+    // fix was made for.
+    notClaimingClean: !problemsAfterUnfinishedSave.saysNone,
+    namesTheMissingParameter: problemsAfterUnfinishedSave.listed.includes("missing_parameter"),
+  });
+
+  // Put the rule back together, so a later pass step that runs a rule of its own is not handed
+  // the rule this probe broke.
+  await page.evaluate(async (id) => {
+    const current = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+    const trigger = current.graph.nodes.find((n) => n.type.startsWith("trigger"));
+    if (!trigger) return;
+    trigger.params = { ...(trigger.params ?? {}), event: "user.created" };
+    const csrf = document.cookie
+      .split(";")
+      .map((pair) => pair.split("="))
+      .find(([name]) => name.trim() === "omnion_csrf")?.[1]
+      ?.trim();
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "content-type": "application/json",
+        ...(csrf ? { "x-omnion-csrf": csrf } : {}),
+      },
+      body: JSON.stringify({ graph: current.graph, graph_version: current.graph_version }),
+    });
+  }, workflowId);
+  note({ step: "repaired", repaired: true });
+
   log(`workflow-table: ${JSON.stringify(steps)}`);
   report.workflowTable = steps;
   return steps;
