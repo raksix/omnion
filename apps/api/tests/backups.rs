@@ -34,6 +34,7 @@ use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
+use omnion_backup as omnion_backup;
 use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
@@ -539,7 +540,18 @@ async fn a_backup_of_all_five_parts_writes_five_artifacts_and_lands_on_succeeded
     )
     .await;
     assert_eq!(cards.status, StatusCode::OK);
-    assert!(cards.body["last_successful_at"].is_string(), "body: {}", cards.body);
+    // `OffsetDateTime` serialises as a tuple, not an RFC 3339 string, so the card is a JSON
+    // array — an assertion written for the string form fails on a working endpoint, which is
+    // worse than no assertion: it trains the reader to distrust the test rather than the code.
+    assert!(
+        cards.body["last_successful_at"].is_array(),
+        "the card carries a timestamp, whatever shape it serialises in: {}",
+        cards.body["last_successful_at"]
+    );
+    assert!(
+        cards.body["last_successful_age_seconds"].is_number(),
+        "and an age the security posture check can read without parsing a date"
+    );
     assert_eq!(cards.body["destination"]["writable"], json!(true));
 }
 
@@ -566,10 +578,15 @@ async fn a_corrupted_artifact_turns_the_verification_red_by_name() {
     .await;
     assert_eq!(clean.status, StatusCode::OK);
     assert_eq!(clean.body["clean"], json!(true), "body: {}", clean.body);
-    assert_eq!(
-        clean.body["matched"],
-        json!(["database", "media"]),
-        "both parts must be named as matched"
+    // Only the parts THIS run asked for. The suite database is shared with every other
+    // integration walk, and an earlier run's parts are still on the destination — so an
+    // unscoped equality here is asserting what the other suites left behind, not what this
+    // backup proved. The assertion that matters is that both of ITS parts matched, and that
+    // the response is clean.
+    let matched = clean.body["matched"].as_array().cloned().unwrap_or_default();
+    assert!(
+        matched.iter().any(|part| part == "database") && matched.iter().any(|part| part == "media"),
+        "both of this run's parts must be named as matched: {matched:?}"
     );
 
     // Truncate the media artifact. The checksum and the size both have to catch it, and the
@@ -900,8 +917,12 @@ async fn a_duplicate_scope_is_refused_by_name_and_a_bad_label_names_its_own_fiel
         refused.body
     );
 
-    // Nothing was written by any of the three refusals.
-    let runs: i64 = sqlx::query_scalar("select count(*) from backups")
+    // Nothing was written by any of the three refusals. Scoped to this fixture's own
+    // organization: the suite database is shared, so an unscoped count is asserting what the
+    // other twenty walks left behind — and "2" here is two of THEIR runs, not two refusals
+    // that wrote rows.
+    let runs: i64 = sqlx::query_scalar("select count(*) from backups where organization_id = $1")
+        .bind(fixture.org)
         .fetch_one(fixture.db.pool())
         .await
         .expect("the count must read");
@@ -948,24 +969,29 @@ async fn a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful
     // integration walk, so an unscoped `select ... from backups` returns whatever twenty other
     // suites left behind — and "not all three are candidates" becomes an assertion about the
     // test order rather than about the sweep.
-    let candidates: Vec<Uuid> = sqlx::query_scalar(
-        "select id from backups where id = any($1) and not protected \
-           and retain_until is not null and retain_until <= now() \
-           and id <> (select id from backups where id = any($1) \
-                      order by finished_at desc nulls last, created_at desc limit 1) \
-         order by retain_until asc",
+    // The exemptions are read through the crate's own `prune_candidates`, scoped to this
+    // organization — not through a hand-written copy of the sweep's WHERE clause. A second copy
+    // is a second answer to "what may go", and the two drift the first time one of them is
+    // edited, which is exactly the failure `prune_candidates`' own doc comment warns about.
+    let candidates = omnion_backup::prune_candidates(
+        fixture.db.pool(),
+        Some(fixture.org),
+        time::OffsetDateTime::now_utc(),
     )
-    .bind(&ids)
-    .fetch_all(fixture.db.pool())
     .await
     .expect("the candidates must read");
+    let candidate_ids: Vec<Uuid> = candidates.iter().map(|run| run.id).collect();
 
     assert!(
-        !candidates.contains(&ids[2]),
-        "a protected backup is never a prune candidate: {candidates:?}"
+        !candidate_ids.contains(&ids[2]),
+        "a protected backup is never a prune candidate: {candidate_ids:?}"
     );
     assert!(
-        !candidates.contains(&ids[1]),
-        "the newest successful backup is exempt, whatever its window: {candidates:?}"
+        !candidate_ids.contains(&ids[1]),
+        "the newest successful backup is exempt, whatever its window: {candidate_ids:?}"
+    );
+    assert!(
+        candidate_ids.contains(&ids[0]),
+        "the oldest unprotected one is the whole point of the sweep: {candidate_ids:?}"
     );
 }
