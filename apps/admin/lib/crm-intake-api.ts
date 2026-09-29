@@ -316,6 +316,49 @@ export function fetchIntakeSources(): Promise<IntakeSource[]> {
   return request<IntakeSource[]>("/api/v1/crm/intake/sources");
 }
 
+/** The autoresponder templates the server owns, with the placeholders the renderer knows. */
+export type AutoresponderTemplates = {
+  templates: { name: string; subject: string; body: string }[];
+  placeholders: { token: string; renders: string }[];
+  max_delay_minutes: number;
+};
+
+/** What a preview of the autoresponder answers: a verdict and, when there is one, the message. */
+export type AutoresponderPreview = {
+  verdict: string;
+  reason: string;
+  subject: string | null;
+  body: string | null;
+  delayed: boolean;
+  due_at: string | null;
+  unfilled: string[];
+};
+
+/**
+ * The template list, from the server rather than from this file.
+ *
+ * `Autoresponder::from_json` reads the *template's* body out of the column, so a client that
+ * offered its own list would let an operator pick a name the send path cannot render — the
+ * message would go out as a bare subject line, and the operator would believe it was fine.
+ */
+export function fetchAutoresponderTemplates(): Promise<AutoresponderTemplates> {
+  return request<AutoresponderTemplates>("/api/v1/crm/intake/autoresponder/templates");
+}
+
+/** Preview the autoresponder as the editor currently holds it. Writes nothing and claims nothing. */
+export function previewAutoresponder(input: {
+  autoresponder: Record<string, unknown>;
+  first_name?: string;
+  address?: string;
+  product_interest?: string;
+  source_name?: string;
+}): Promise<AutoresponderPreview> {
+  return request<AutoresponderPreview>("/api/v1/crm/intake/autoresponder/preview", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 /** One source. No key: it exists on exactly one answer in a source's lifetime. */
 export function fetchIntakeSource(id: string): Promise<IntakeSource> {
   return request<IntakeSource>(`/api/v1/crm/intake/sources/${encodeURIComponent(id)}`);

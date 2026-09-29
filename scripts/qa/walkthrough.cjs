@@ -4206,6 +4206,79 @@ async function runCrmIntakeDepth(page, report) {
   ).includes("Contactable");
   await shot(page, "page-crm-intake-source-editor");
 
+  // The autoresponder editor. Every step is measured, not clicked-and-hoped: a section that
+  // renders but does not configure anything is the defect this pass exists to catch, because
+  // the send path it configures is invisible in every other screen.
+  const autoresponderApi = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/crm/intake/autoresponder/templates", {
+      credentials: "same-origin",
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  });
+  steps.autoresponderTemplatesStatus = autoresponderApi.status;
+  steps.autoresponderTemplateCount = autoresponderApi.body?.templates?.length ?? 0;
+  steps.autoresponderPlaceholderCount = autoresponderApi.body?.placeholders?.length ?? 0;
+
+  // Off by default: an unconfigured autoresponder sends nothing and must say so, not hide.
+  steps.autoresponderHiddenWhenOff =
+    (await page.locator("[data-autoresponder-section] [data-autoresponder-template]").count()) === 0;
+
+  await page.locator("[data-autoresponder-enabled]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+
+  // On with no text is the dangerous state, and the screen has to name it before the save.
+  steps.autoresponderEmptyWarned = (await page.locator("[data-autoresponder-empty-warning]").count()) > 0;
+
+  // Picking a template fills the prose from the SERVER's copy, not a client's list.
+  const firstTemplate = autoresponderApi.body?.templates?.[0]?.name ?? "";
+  await page
+    .locator("[data-autoresponder-template]")
+    .first()
+    .selectOption(firstTemplate)
+    .catch(() => {});
+  await page.waitForTimeout(600);
+  steps.autoresponderSubjectFilled =
+    (await page.locator("[data-autoresponder-subject]").first().inputValue().catch(() => "")).trim().length > 0;
+  steps.autoresponderEmptyWarnCleared =
+    (await page.locator("[data-autoresponder-empty-warning]").count()) === 0;
+
+  // A delay has to read as *held*, with a due time — the control whose effect is invisible.
+  await page.locator("[data-autoresponder-delay]").first().fill("45").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-autoresponder-preview]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.autoresponderPreviewRendered = (await page.locator("[data-autoresponder-preview]").count()) > 0;
+  steps.autoresponderPreviewHeld = (await page.locator("[data-autoresponder-preview]").innerText().catch(() => ""))
+    .includes("Held until");
+  steps.autoresponderPreviewDue = (await page.locator("[data-autoresponder-due]").count()) > 0;
+  await shot(page, "page-crm-autoresponder");
+
+  // A placeholder the renderer does not know must be *named*, not silently blanked.
+  await page
+    .locator("[data-autoresponder-body]")
+    .first()
+    .fill("Dear {{salutation}}, {{name}} — from {{source}}.")
+    .catch(() => {});
+  await page.locator("[data-autoresponder-preview]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.autoresponderUnfilledNamed = (
+    await page.locator("[data-autoresponder-unfilled]").innerText().catch(() => "")
+  ).includes("{{salutation}}");
+  await shot(page, "page-crm-autoresponder-unfilled");
+
+  // Save it, then read the column back: the screen's claim is that this persists, and a
+  // control that only lives in component state is the failure this asserts against.
+  await page.locator("[data-source-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const persisted = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/v1/crm/intake/sources/${id}`, { credentials: "same-origin" });
+    const body = await response.json().catch(() => null);
+    return body?.autoresponder ?? null;
+  }, source.id);
+  steps.autoresponderPersistedEnabled = persisted?.enabled === true;
+  steps.autoresponderPersistedDelay = persisted?.delay_minutes;
+  steps.autoresponderPersistedTemplate = persisted?.template;
+
   // A mapping that does not save is also refused by the API; a preview of the *saved* mapping
   // is the honest limit of this slice, so the screen does not pretend otherwise.
   await page.locator("[data-source-save]").first().click({ timeout: 5000 }).catch(() => {});

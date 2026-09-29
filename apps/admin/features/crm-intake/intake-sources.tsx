@@ -27,6 +27,7 @@ import {
   Copy,
   KeyRound,
   Loader2,
+  Mail,
   Plus,
   RefreshCw,
   RotateCw,
@@ -52,11 +53,15 @@ import {
 import {
   createIntakeSource,
   deleteIntakeSource,
+  fetchAutoresponderTemplates,
   fetchIntakeSources,
   intakeEndpointUrl,
+  previewAutoresponder,
   rotateIntakeKey,
   testIntakeMapping,
   updateIntakeSource,
+  type AutoresponderPreview,
+  type AutoresponderTemplates,
   type IntakeSource,
   type MappingLine,
   type MappingPreview,
@@ -82,6 +87,14 @@ type EditorState = {
   dedupePolicy: string;
   rateLimitPerHour: number;
   active: boolean;
+  /**
+   * The autoresponder column, as the editor holds it.
+   *
+   * Typed as a record rather than as a form because it is *the column*: the server reads four
+   * keys out of it and ignores the rest, so a screen that mapped it to its own shape would
+   * have to remember that an unknown key is a disabled autoresponder, not an error.
+   */
+  autoresponder: Record<string, unknown>;
 };
 
 function editorOf(source: IntakeSource): EditorState {
@@ -96,6 +109,7 @@ function editorOf(source: IntakeSource): EditorState {
     dedupePolicy: source.dedupe_policy,
     rateLimitPerHour: source.rate_limit_per_hour,
     active: source.active,
+    autoresponder: source.autoresponder ?? {},
   };
 }
 
@@ -188,6 +202,10 @@ export function IntakeSources() {
         dedupe_policy: state.dedupePolicy,
         rate_limit_per_hour: state.rateLimitPerHour,
         active: state.active,
+        // The autoresponder is saved in the same write as everything else rather than on its
+        // own button: an operator who turns it on and edits its delay in two presses is owed
+        // one atomic change, not a window where the flag is on and the delay is the old one.
+        autoresponder: state.autoresponder,
       });
       setRows((previous) => (previous ?? []).map((row) => (row.id === saved.id ? saved : row)));
       setEditing(editorOf(saved));
@@ -532,6 +550,291 @@ export function IntakeSources() {
 }
 
 /** The editor for one source: surface, mapping, rules and a preview that writes nothing. */
+/**
+ * The autoresponder section of the source editor.
+ *
+ * It is the last control on the path a lead takes, and it is the only one that *sends
+ * something to a stranger*, so the screen is built around three questions an operator actually
+ * has: what does it say, when does it go, and what happens if it is wrong.
+ *
+ * * **What it says.** The template list is the server's, and the preview is the server's render
+ *   of the server's decision. The client never substitutes `{{name}}` itself, because the two
+ *   implementations would agree until they did not, and the only place that shows up is a
+ *   visitor's inbox.
+ * * **When it goes.** The delay is the one control whose effect is invisible until minutes later,
+ *   so the preview answers it in the same sentence as the rest.
+ * * **What happens if it is wrong.** An enabled-but-empty autoresponder is the dangerous state —
+ *   it eats the lead's single reply and reports nothing. The screen says so before the save, in
+ *   the same words the store's `InvalidTemplate` uses.
+ */
+function AutoresponderSection({
+  sourceName,
+  value,
+  onChange,
+}: {
+  sourceName: string;
+  value: Record<string, unknown>;
+  onChange: (next: Record<string, unknown>) => void;
+}) {
+  const [templates, setTemplates] = useState<AutoresponderTemplates | null>(null);
+  const [templatesError, setTemplatesError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<AutoresponderPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+
+  const enabled = value.enabled === true;
+  const template = typeof value.template === "string" ? value.template : "";
+  const subject = typeof value.subject === "string" ? value.subject : "";
+  const body = typeof value.template_body === "string" ? value.template_body : "";
+  const delay = typeof value.delay_minutes === "number" ? value.delay_minutes : 0;
+
+  /** The client-side mirror of `is_configured`, so the warning arrives before the save. */
+  const empty = enabled && (subject.trim() === "" || body.trim() === "");
+
+  useEffect(() => {
+    let live = true;
+    fetchAutoresponderTemplates()
+      .then((answer) => {
+        if (live) setTemplates(answer);
+      })
+      .catch((caught: unknown) => {
+        // The section still works without the list: the delay and the hand-written text are
+        // editable, and the preview runs server-side either way. A failed list is a degraded
+        // control, not a dead screen.
+        if (live) setTemplatesError(caught instanceof ApiError ? caught.message : "The templates could not be read.");
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const pick = (name: string) => {
+    const chosen = templates?.templates.find((entry) => entry.name === name);
+    onChange({
+      ...value,
+      template: name,
+      // Picking a template writes its prose in. It does not *pin* it: the two keys are stored
+      // side by side so an operator can edit the body and keep the name for the trail.
+      subject: chosen?.subject ?? subject,
+      template_body: chosen?.body ?? body,
+    });
+    setPreview(null);
+  };
+
+  const runPreview = async () => {
+    setChecking(true);
+    setPreviewError(null);
+    try {
+      setPreview(
+        await previewAutoresponder({
+          autoresponder: { ...value, enabled: true },
+          // A visitor's name from the mapping's own sample, so the greeting is the real one.
+          first_name: "Ada",
+          address: "ada@example.com",
+          product_interest: "40 seats",
+          source_name: sourceName,
+        }),
+      );
+    } catch (caught) {
+      setPreviewError(caught instanceof ApiError ? caught.message : "The preview could not be run.");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <div data-autoresponder-section className="rounded-lg border border-line bg-canvas p-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h4 className="flex items-center gap-1.5 text-[12.5px] font-semibold">
+            <Mail className="size-3.5" aria-hidden />
+            The reply the visitor gets
+          </h4>
+          <p className="mt-0.5 max-w-prose text-[11.5px] text-muted">
+            One message per accepted lead, whatever the submission is retried. A spam or rejected
+            submission sends nothing — telling a spammer their address works is the one thing a
+            filter must never do.
+          </p>
+        </div>
+        <label className="flex items-center gap-2 text-[12px] text-ink">
+          <input
+            type="checkbox"
+            data-autoresponder-enabled
+            checked={enabled}
+            onChange={(event) => onChange({ ...value, enabled: event.target.checked })}
+            className="size-3.5"
+          />
+          Answer this source automatically
+        </label>
+      </div>
+
+      {empty ? (
+        <p
+          data-autoresponder-empty-warning
+          role="alert"
+          className="mt-2 flex items-start gap-1.5 rounded-lg border border-caution/40 bg-caution-soft px-2.5 py-2 text-[12px] text-caution"
+        >
+          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+          It is switched on with no text, so every accepted lead would get nothing and the store
+          would record that as a misconfiguration. Pick a template below or switch it off.
+        </p>
+      ) : null}
+
+      {enabled ? (
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+            <span className="font-medium">Template</span>
+            <select
+              data-autoresponder-template
+              value={template}
+              onChange={(event) => pick(event.target.value)}
+              className="rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px] text-ink"
+            >
+              <option value="">Hand-written</option>
+              {templates?.templates.map((entry) => (
+                <option key={entry.name} value={entry.name}>
+                  {entry.name.replace(/_/g, " ")}
+                </option>
+              ))}
+            </select>
+            {templatesError ? (
+              <span data-autoresponder-templates-error className="text-caution">
+                {templatesError} The delay and your own text still work.
+              </span>
+            ) : null}
+          </label>
+
+          <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+            <span className="font-medium">Send it after</span>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={templates?.max_delay_minutes ?? 10080}
+                data-autoresponder-delay
+                value={delay}
+                onChange={(event) =>
+                  onChange({ ...value, delay_minutes: Math.max(0, Number(event.target.value) || 0) })
+                }
+                className="w-24 rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px] text-ink"
+              />
+              <span className="text-[11.5px] text-muted">
+                {delay === 0 ? "minutes (immediately)" : `minute${delay === 1 ? "" : "s"}`}
+              </span>
+            </div>
+            <span>
+              A delay is a reservation, not a sleep: the lead is claimed now and a worker sends
+              the message when the time comes, so a restart does not lose it and nobody gets a
+              second one.
+            </span>
+          </label>
+
+          <label className="flex flex-col gap-1 text-[11.5px] text-muted sm:col-span-2">
+            <span className="font-medium">Subject</span>
+            <input
+              data-autoresponder-subject
+              value={subject}
+              onChange={(event) => onChange({ ...value, subject: event.target.value })}
+              className="rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px] text-ink"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-[11.5px] text-muted sm:col-span-2">
+            <span className="font-medium">Body</span>
+            <textarea
+              rows={6}
+              data-autoresponder-body
+              value={body}
+              onChange={(event) => onChange({ ...value, template_body: event.target.value })}
+              className="w-full rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px] text-ink"
+            />
+            {templates?.placeholders.length ? (
+              <span className="flex flex-wrap items-center gap-1">
+                {templates.placeholders.map((placeholder) => (
+                  <button
+                    key={placeholder.token}
+                    type="button"
+                    title={placeholder.renders}
+                    data-autoresponder-placeholder={placeholder.token}
+                    onClick={() => onChange({ ...value, template_body: `${body}${placeholder.token}` })}
+                    className="rounded-full bg-quiet-soft px-2 py-0.5 text-[11px] text-muted hover:text-ink"
+                  >
+                    {placeholder.token}
+                  </button>
+                ))}
+                <span>click to add one</span>
+              </span>
+            ) : null}
+          </label>
+
+          <div className="sm:col-span-2">
+            <button
+              type="button"
+              data-autoresponder-preview
+              disabled={checking}
+              onClick={() => void runPreview()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12px] transition hover:text-ink disabled:opacity-50"
+            >
+              {checking ? (
+                <Loader2 className="size-3.5 animate-spin" aria-hidden />
+              ) : (
+                <Wand2 className="size-3.5" aria-hidden />
+              )}
+              Show it to a sample visitor
+            </button>
+            <p className="mt-1 text-[11.5px] text-muted">
+              Renders on the server, exactly as the send path will, and sends nothing.
+            </p>
+
+            {previewError ? (
+              <p role="alert" data-autoresponder-preview-error className="mt-2 text-[12px] text-red-700">
+                {previewError}
+              </p>
+            ) : null}
+            {preview ? (
+              <div
+                data-autoresponder-preview
+                className="mt-2 rounded-lg border border-line bg-surface p-3 text-[12px]"
+              >
+                {preview.verdict === "ready" ? (
+                  <>
+                    <p className="flex flex-wrap items-center gap-2">
+                      <span className="inline-flex items-center gap-1 rounded-full bg-positive-soft px-2 py-0.5 text-[11px] font-medium text-positive">
+                        <Check className="size-3" aria-hidden />
+                        {preview.delayed ? "Held until the delay has passed" : "Sent as soon as the lead is accepted"}
+                      </span>
+                    </p>
+                    {preview.due_at ? (
+                      <p data-autoresponder-due className="mt-1 text-muted">
+                        Goes out around {new Date(preview.due_at).toLocaleString()}.
+                      </p>
+                    ) : null}
+                    <p className="mt-2 font-medium">{preview.subject}</p>
+                    <p className="mt-1 whitespace-pre-wrap text-muted">{preview.body}</p>
+                  </>
+                ) : (
+                  <p data-autoresponder-preview-empty className="text-caution">
+                    {preview.verdict === "invalid_template"
+                      ? "The text does not render to a message, so the store would refuse the send and record why. Fill in a subject and a body."
+                      : preview.verdict === "no_address"
+                        ? "The sample visitor has no address, so there is nothing to send to. That is also what a submission whose mapping loses the e-mail field would do."
+                        : "This autoresponder would send nothing."}
+                  </p>
+                )}
+                {preview.unfilled.length > 0 ? (
+                  <p data-autoresponder-unfilled className="mt-2 text-caution">
+                    {preview.unfilled.join(", ")} is not a placeholder this renderer knows, so it
+                    arrives as an empty space. Use {"{{name}}"}, {"{{source}}"} or {"{{product}}"}.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function SourceEditor({
   state,
   busy,
@@ -892,6 +1195,12 @@ function SourceEditor({
           </label>
         ) : null}
       </div>
+
+      <AutoresponderSection
+        sourceName={state.name}
+        value={state.autoresponder}
+        onChange={(autoresponder) => onChange({ ...state, autoresponder })}
+      />
 
       {/* The preview. Writes nothing, and says so. */}
       <div className="rounded-lg border border-line bg-canvas p-3">

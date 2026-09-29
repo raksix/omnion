@@ -1073,6 +1073,16 @@ pub fn router(state: AppState) -> Router {
             post(crm_intake::test_mapping).layer(guards::require(&state, "crm.intake.manage")),
         )
         .route(
+            "/crm/intake/autoresponder/templates",
+            get(crm_intake::autoresponder_templates)
+                .layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
+            "/crm/intake/autoresponder/preview",
+            post(crm_intake::preview_autoresponder)
+                .layer(guards::require(&state, "crm.intake.manage")),
+        )
+        .route(
             "/crm/leads",
             get(crm_intake::list_leads).layer(guards::require(&state, "crm.leads.read")),
         )

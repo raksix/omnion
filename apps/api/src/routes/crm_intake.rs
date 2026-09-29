@@ -1651,6 +1651,241 @@ pub async fn test_mapping(
 }
 
 // ---------------------------------------------------------------------------------------------
+// The autoresponder\'s editor
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/crm/intake/autoresponder/templates` — the templates an operator picks from.
+///
+/// The list lives on the server because the *prose* does. A template list shipped in the front
+/// end is a list the send path cannot honour: `Autoresponder::from_json` reads the template's
+/// own `template_body`, so a client that offers names the server does not have produces a
+/// message that renders as a bare subject line and no body, and `deliver` answers
+/// `InvalidTemplate` — an autoresponder the operator believes is configured and is not.
+#[derive(Debug, Serialize)]
+pub struct TemplateBody {
+    /// The name stored in the source's `autoresponder` column.
+    pub name: &'static str,
+    /// The default subject line.
+    pub subject: &'static str,
+    /// The default body, with its `{{placeholders}}` intact.
+    pub body: &'static str,
+}
+
+/// The placeholders a template may use, and what each one renders as.
+///
+/// Served rather than hard-coded in the client, because the render function is the server's
+/// and an editor that offers a placeholder the renderer does not know produces an empty string
+/// in somebody's inbox.
+#[derive(Debug, Serialize)]
+pub struct PlaceholderBody {
+    /// The token, braces included.
+    pub token: &'static str,
+    /// What it becomes, in a visitor's terms.
+    pub renders: &'static str,
+}
+
+/// `GET /api/v1/crm/intake/autoresponder/templates`.
+pub async fn autoresponder_templates(
+    State(_state): State<AppState>,
+    session: CurrentSession,
+) -> Result<Json<TemplatesBody>, ApiError> {
+    let _ = organization_of(&session)?;
+    Ok(Json(TemplatesBody {
+        templates: omnion_module_crm_intake::autoresponder::TEMPLATES
+            .iter()
+            .map(|(name, subject, body)| TemplateBody {
+                name,
+                subject,
+                body,
+            })
+            .collect(),
+        placeholders: PLACEHOLDERS
+            .iter()
+            .map(|(token, renders)| PlaceholderBody { token, renders })
+            .collect(),
+        max_delay_minutes: omnion_module_crm_intake::autoresponder::Autoresponder::MAX_DELAY_MINUTES,
+    }))
+}
+
+/// The templates answer.
+#[derive(Debug, Serialize)]
+pub struct TemplatesBody {
+    /// Every template, name, subject and body.
+    pub templates: Vec<TemplateBody>,
+    /// The tokens the renderer knows.
+    pub placeholders: Vec<PlaceholderBody>,
+    /// The longest delay the store accepts, in minutes.
+    pub max_delay_minutes: i32,
+}
+
+/// The placeholder table, mirroring `autoresponder::render`’s match arms exactly.
+///
+/// The three `name` aliases, the two `source` aliases and the two `product` aliases are three
+/// groups, not six tokens: the editor lists the groups, and the aliases are the reason a
+/// template written against an older release still renders.
+const PLACEHOLDERS: &[(&str, &str)] = &[
+    ("{{name}}", "Hello <first name>"),
+    ("{{source}}", "the name of this intake source"),
+    ("{{product}}", "what the visitor wrote in the product field"),
+];
+
+/// `POST /api/v1/crm/intake/sources/{id}/autoresponder/preview` — what the visitor would get.
+///
+/// Runs the *same* [`omnion_module_crm_intake::autoresponder::Autoresponder::deliver`] the send
+/// path runs, over the same `Recipient` shape, and answers the rendered subject and body plus
+/// the verdict. It writes nothing: a preview that stored a claim would consume the one claim
+/// a lead has, so "look at what it says" could make "send it" a no-op.
+#[derive(Debug, Deserialize)]
+pub struct AutoresponderPreviewBody {
+    /// The column as the editor currently holds it, unsaved lines included.
+    #[serde(default)]
+    pub autoresponder: serde_json::Value,
+    /// A submitter's first name, for the greeting.
+    #[serde(default)]
+    pub first_name: Option<String>,
+    /// The address it would go to. Omitting it answers `no_address`, which is the most useful
+    /// thing the editor can be told when the mapping is wrong.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// What they asked about.
+    #[serde(default)]
+    pub product_interest: Option<String>,
+    /// The source's own name, so `{{source}}` renders the name the visitor will actually be
+    /// told. Defaulting it to a constant would make the preview *look* right for a template
+    /// whose whole job is naming the place the message came from.
+    #[serde(default)]
+    pub source_name: Option<String>,
+}
+
+impl Default for AutoresponderPreviewBody {
+    fn default() -> Self {
+        Self {
+            autoresponder: serde_json::Value::Null,
+            first_name: None,
+            address: None,
+            product_interest: None,
+            source_name: None,
+        }
+    }
+}
+
+/// The preview’s answer: the verdict, the reason, and the message when there is one.
+#[derive(Debug, Serialize)]
+pub struct AutoresponderPreviewResponse {
+    /// The delivery verdict name, one word: `ready`, `disabled`, `no_address`, `invalid_template`.
+    pub verdict: &'static str,
+    /// The same reason the timeline writes, so the editor and the trail speak one language.
+    pub reason: &'static str,
+    /// The rendered subject, when a message was produced.
+    pub subject: Option<String>,
+    /// The rendered body, when a message was produced.
+    pub body: Option<String>,
+    /// Whether this send is held for the configured delay.
+    pub delayed: bool,
+    /// When the held message becomes due.
+    pub due_at: Option<String>,
+    /// The placeholders in the template that no recipient can fill, so the editor can name them.
+    pub unfilled: Vec<String>,
+}
+
+pub async fn preview_autoresponder(
+    State(_state): State<AppState>,
+    session: CurrentSession,
+    Json(body): Json<AutoresponderPreviewBody>,
+) -> Result<Json<AutoresponderPreviewResponse>, ApiError> {
+    let _ = organization_of(&session)?;
+    let source_name = body.source_name.as_deref().unwrap_or("your website");
+    let autoresponder =
+        omnion_module_crm_intake::autoresponder::Autoresponder::from_json(&body.autoresponder);
+    let recipient = omnion_module_crm_intake::autoresponder::Recipient {
+        address: body.address.as_deref(),
+        first_name: body.first_name.as_deref().unwrap_or_default(),
+        source_name,
+        product_interest: body.product_interest.as_deref().unwrap_or_default(),
+        // The preview is of a *configurable* autoresponder, so the submission is accepted by
+        // definition: the only thing left to test is the configuration.
+        accepted: true,
+        reason: "preview",
+    };
+    let delivery = autoresponder.deliver(
+        &recipient,
+        time::OffsetDateTime::now_utc(),
+        /* already_sent */ false,
+    );
+
+    let (subject, rendered, delayed, due_at) = match &delivery {
+        Delivery::Ready(message) => (
+            Some(message.subject.clone()),
+            Some(message.body.clone()),
+            message.delayed,
+            message.due_at,
+        ),
+        _ => (None, None, false, None),
+    };
+
+    Ok(Json(AutoresponderPreviewResponse {
+        verdict: verdict_name(&delivery),
+        reason: delivery.reason(),
+        subject,
+        body: rendered,
+        delayed,
+        due_at: due_at.map(omnion_module_crm_intake::autoresponder::date_header),
+        unfilled: unfilled_placeholders(&autoresponder),
+    }))
+}
+
+/// The verdict’s name, in the order the editor wants to explain them.
+fn verdict_name(delivery: &Delivery) -> &'static str {
+    match delivery {
+        Delivery::Ready(_) => "ready",
+        Delivery::Disabled => "disabled",
+        Delivery::NoRecipient(_) => "not_accepted",
+        Delivery::NoAddress => "no_address",
+        Delivery::NotYet(_) => "delayed",
+        Delivery::AlreadySent => "already_sent",
+        Delivery::InvalidTemplate(_) => "invalid_template",
+    }
+}
+
+/// The placeholders a template asks for that no recipient can ever fill.
+///
+/// `{{name}}` is filled from the mapping's `first_name`, which the *preview* has no value for,
+/// so it is never reported: this is about tokens the *renderer* does not know, which is the
+/// mistake a hand-written template actually makes. The tokens are collected as owned strings
+/// rather than `&'static str` — a per-call `Box::leak` of a request's own input is a leak that
+/// grows with every keystroke in the editor.
+fn unfilled_placeholders(
+    autoresponder: &omnion_module_crm_intake::autoresponder::Autoresponder,
+) -> Vec<String> {
+    const KNOWN: [&str; 7] = [
+        "name",
+        "first_name",
+        "firstname",
+        "source",
+        "source_name",
+        "product",
+        "product_interest",
+    ];
+    let mut unknown: Vec<String> = Vec::new();
+    for text in [&autoresponder.subject, &autoresponder.body] {
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("{{") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("}}") else { break };
+            let key = after[..end].trim().to_ascii_lowercase();
+            if !KNOWN.contains(&key.as_str()) {
+                let token = format!("{{{{{key}}}}}");
+                if !unknown.contains(&token) {
+                    unknown.push(token);
+                }
+            }
+            rest = &after[end + 2..];
+        }
+    }
+    unknown
+}
+
+// ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -1881,6 +2116,178 @@ mod tests {
             "x".repeat(128).parse().expect("header must build"),
         );
         assert_eq!(idempotency_key(&headers).map(|key| key.len()), Some(128));
+    }
+
+// -----------------------------------------------------------------------------------------
+    // The autoresponder editor's answers
+    // -----------------------------------------------------------------------------------------
+
+    /// The pure half of the preview, so a test can drive it without a request.
+    fn preview_of(
+        column: serde_json::Value,
+        first_name: &str,
+        address: Option<&str>,
+    ) -> AutoresponderPreviewResponse {
+        let autoresponder =
+            omnion_module_crm_intake::autoresponder::Autoresponder::from_json(&column);
+        let recipient = omnion_module_crm_intake::autoresponder::Recipient {
+            address,
+            first_name,
+            source_name: "Analytical Engines",
+            product_interest: "40 seats",
+            accepted: true,
+            reason: "preview",
+        };
+        let delivery = autoresponder.deliver(
+            &recipient,
+            time::OffsetDateTime::now_utc(),
+            false,
+        );
+        let (subject, body, delayed, due_at) = match &delivery {
+            Delivery::Ready(message) => (
+                Some(message.subject.clone()),
+                Some(message.body.clone()),
+                message.delayed,
+                message.due_at,
+            ),
+            _ => (None, None, false, None),
+        };
+        AutoresponderPreviewResponse {
+            verdict: verdict_name(&delivery),
+            reason: delivery.reason(),
+            subject,
+            body,
+            delayed,
+            due_at: due_at.map(omnion_module_crm_intake::autoresponder::date_header),
+            unfilled: unfilled_placeholders(&autoresponder),
+        }
+    }
+
+    fn configured(delay: i64, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "template": "acknowledgement",
+            "subject": "We received your message",
+            "template_body": body,
+            "delay_minutes": delay,
+        })
+    }
+
+    #[test]
+    fn a_configured_autoresponder_previews_the_message_the_send_path_would_send() {
+        let answer = preview_of(
+            configured(0, "Hello,\n\nwe have {{name}}'s message from {{source}}."),
+            "Ada",
+            Some("ada@example.com"),
+        );
+        assert_eq!(answer.verdict, "ready", "{answer:?}");
+        assert_eq!(answer.reason, "sent");
+        // The point of the endpoint: the greeting is the *server's* render, not the client's.
+        // A client-side substitution would agree on `{{name}}` and disagree on the aliases.
+        assert!(answer.body.as_deref().unwrap().contains("Hello Ada's message"));
+        assert!(answer.body.as_deref().unwrap().contains("Analytical Engines"));
+        assert!(answer.unfilled.is_empty(), "{:?}", answer.unfilled);
+    }
+
+    #[test]
+    fn a_delayed_autoresponder_previews_as_held_with_a_due_time() {
+        let answer = preview_of(configured(30, "we have your message"), "Ada", Some("ada@x.com"));
+        assert_eq!(answer.verdict, "ready", "{answer:?}");
+        assert!(answer.delayed, "a delay has to read as held, not as sent");
+        assert!(answer.due_at.is_some(), "a held message answers when it goes out");
+    }
+
+    #[test]
+    fn an_enabled_autoresponder_with_no_text_previews_as_invalid_not_as_disabled() {
+        // The distinction the editor exists to make: "off" is a choice, "on and empty" is a
+        // misconfiguration that eats the lead's single reply without saying so.
+        let answer = preview_of(
+            serde_json::json!({ "enabled": true, "subject": "", "template_body": "" }),
+            "Ada",
+            Some("ada@x.com"),
+        );
+        assert_eq!(answer.verdict, "invalid_template", "{answer:?}");
+        assert_eq!(answer.reason, "invalid_template");
+        assert!(answer.subject.is_none(), "an unusable template renders no message");
+    }
+
+    #[test]
+    fn a_mapping_that_lost_the_address_previews_as_no_address() {
+        // What an operator sees when the *mapping* is the thing that is wrong: the
+        // autoresponder is fine and there is nobody to send it to.
+        let answer = preview_of(configured(0, "we have your message"), "Ada", None);
+        assert_eq!(answer.verdict, "no_address", "{answer:?}");
+        assert_eq!(answer.reason, "no_address");
+    }
+
+    #[test]
+    fn an_absent_autoresponder_column_previews_as_disabled() {
+        let answer = preview_of(serde_json::Value::Null, "Ada", Some("ada@x.com"));
+        assert_eq!(answer.verdict, "disabled", "{answer:?}");
+        assert_eq!(answer.reason, "not_configured");
+    }
+
+    #[test]
+    fn a_placeholder_the_renderer_does_not_know_is_named_rather_than_left_blank() {
+        // The failure this reports is invisible in a rendered message: `{{salutation}}` becomes
+        // an empty space, so the visitor reads "Dear ," and nobody knows the template is wrong.
+        let answer = preview_of(
+            configured(0, "Dear {{salutation}}, {{name}} — from {{source}} and {{company}}."),
+            "Ada",
+            Some("ada@x.com"),
+        );
+        assert_eq!(answer.verdict, "ready", "{answer:?}");
+        assert_eq!(
+            answer.unfilled,
+            vec!["{{salutation}}".to_string(), "{{company}}".to_string()],
+            "both unknown tokens, in the order the template asks for them"
+        );
+    }
+
+    #[test]
+    fn every_alias_of_a_known_placeholder_is_known() {
+        // `render` accepts three spellings of each idea. If the editor's list and the
+        // renderer's arms drift apart, a hand-written template stops rendering.
+        for token in [
+            "{{name}}",
+            "{{first_name}}",
+            "{{firstname}}",
+            "{{source}}",
+            "{{source_name}}",
+            "{{product}}",
+            "{{product_interest}}",
+        ] {
+            let body = format!("x {token} y");
+            let answer = preview_of(configured(0, &body), "Ada", Some("ada@x.com"));
+            assert!(answer.unfilled.is_empty(), "{token} was reported as unknown: {answer:?}");
+        }
+    }
+
+    #[test]
+    fn the_template_list_the_server_serves_is_the_one_the_send_path_can_render() {
+        // The editor's list is the server's, and this is the tie between them: every template
+        // the endpoint offers must survive `is_configured` with its own defaults filled in.
+        for (name, subject, body) in omnion_module_crm_intake::autoresponder::TEMPLATES {
+            let answer = preview_of(
+                serde_json::json!({
+                    "enabled": true, "template": name, "subject": subject, "template_body": body
+                }),
+                "Ada",
+                Some("ada@example.com"),
+            );
+            assert_eq!(answer.verdict, "ready", "template {name} offered but unrenderable");
+        }
+    }
+
+    #[test]
+    fn the_placeholder_table_names_only_tokens_the_renderer_understands() {
+        for (token, _) in PLACEHOLDERS {
+            let key = token.trim_matches(|c| c == '{' || c == '}');
+            assert!(
+                ["name", "source", "product"].contains(&key),
+                "{token} is offered in the editor but render() has no arm for it"
+            );
+        }
     }
 
     #[test]
