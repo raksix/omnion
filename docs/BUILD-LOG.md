@@ -4648,3 +4648,78 @@ begins, and the `backup.restored` audit entry. (b) The `partial` box is still un
 where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
 is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
 read the price, the warnings and the phrase, so when the slot frees there is something to run.
+
+## 2026-09-29 · wave 7 · tick 24 — the wizard fixture, and a disk that had run out of room (`9447237`, `e869196`)
+
+**What.** Not a feature slice: the tick that unblocks every slice behind it. REQ-099 could not be
+closed because the QA pass could not sign in, and the reason was in the harness rather than in
+anything the REQ had built.
+
+**The blocker, and it was not the one this log had recorded.** The previous entry said the QA
+fixture never creates the tenant. The truth is one step earlier. `runWizard` decided "installation
+already exists" by reading `page.url()` 900 ms after `goto('/')`. `proxy.ts` sends an anonymous
+visitor from `/` to `/login`; `/login` is the only screen that calls `fetchOnboarding()`, and it
+does that in a `useEffect` — so `/setup` arrives **one navigation after** the first one settles.
+The read therefore landed on `/login` on a brand-new database, the check concluded an installation
+existed, the wizard never ran, **no account was ever created**, and `ensureSignedIn` then tried to
+sign in with an account that does not exist. The log line said "installation already exists" while
+`users` held **zero rows**: a message about a state that was never observed.
+
+Two fixes, both necessary. The state is read from `GET /api/v1/onboarding` — the same call the
+sign-in screen makes — and anything short of a definite `needs_setup:false` goes to the wizard,
+because replaying completed first-run steps is refused by the API while skipping the wizard is a
+dead pass. And a null `[data-setup-step]` read is a **paint race, not the end of the wizard**: the
+loop used to `break` on the first null, stopped on step 1 of 5, left the owner created and the
+organization missing, and every later screen answered `organization_required` — the same symptom
+one step further along. Taken from `3cbdb0c` on wave4, which found it first; re-solving a defect
+another worktree has already fixed writes a second, different fix for the same bug.
+
+**This is the fourth failure in three ticks with the same shape.** A stale binary, a literal `***`
+in a committed connection URL, a duplicate route, and now a client-hop race — every one of them
+reported a symptom of something other than itself, and every one sent the reading to the wrong
+system. The observable was always the same: no tenant, a 403 storm, "43 560 high findings". That
+number is **one failure cascading**, not 43 560 defects, and the two telemetry assertions written
+last tick have still never executed.
+
+**The box had run out of room, and that outranks the slice.** `/mnt/apopic` was at **100 %**
+(531 MB free) and `/dev/shm` at **100 %** (275 MB free). On a full disk cargo cannot link, a QA
+pass cannot build, and `git commit` can fail with "No space left on device" while `git status` and
+`git diff` keep working — so a tick can look healthy and commit nothing. Two directories with
+**zero holders** were reclaimed: `/mnt/apopic/w9-target` (12 h idle, 7.0 GB) and
+`/dev/shm/omnion-build-t` (6 h idle, 2.6 GB), returning 9.6 GB. Both were verified by reading
+`CARGO_TARGET_DIR` out of every live process's own environment and every `/proc/*/cwd`, **not** by
+age: `/dev/shm/w3-target` had no process in it and was being written 0 minutes earlier, and deleting
+it would have killed a sibling mid-build. "Nobody holds it" and "nobody has written it lately" are
+different questions, and only the first one authorises a delete.
+
+**A harness that refuses, piped into one that cannot fail, is not a gate.** `merge-build-log.py`
+exits **1** when it decides entries were lost. Run as
+`… | tail -8 && git add … && git cherry-pick --continue`, the pipeline's exit code is `tail`'s —
+zero — so the chain continued and **committed a BUILD-LOG containing literal `<<<<<<<` markers**.
+Caught by `grep -c '^<<<<<<<'` and undone with `git reset --soft HEAD~1` plus
+`git checkout 9447237 -- docs/BUILD-LOG.md`. A merge of an append-only log must be verified by its
+own refusal, and the refusal has to be read, not truncated.
+
+**Proof.** `cargo build -p omnion-api` → clean (exit 0; 13 warnings, all pre-existing from main's
+merge, none in files this branch owns). `cargo test -p omnion-ai-hub --lib` → **346 passed, 0
+failed**. `cargo test -p omnion-api --lib` → **228 passed, 0 failed**. `cargo test -p omnion-api
+--test router_builds` → **1 passed** (the gate that catches a duplicate `MethodRouter`, which is a
+boot-time panic no other gate here can see). `pnpm typecheck` → **2/2**. `node --check
+scripts/qa/walkthrough.cjs` → OK. `probe-depth-fixture.cjs` → **6/6**. No duplicate migration number
+across all ten worktrees; shared high-water is now `0169`.
+
+**The pass is queued, not run.** A w8 pass genuinely holds the single QA slot (live, with a child),
+so `run.sh` is waiting on `QA_SLOT_WAIT` rather than proceeding without one. `/tmp/w7-qa-tick24.log`
+is the log. The one line that decides whether REQ-099 can move is `passkeys: … reachedApp:true` —
+if it appears, the finding count collapses to something readable and the two telemetry assertions
+execute for the first time.
+
+**Also open, and it is mine:** `scripts/qa/probe-pass-scope.cjs` is 5/7 and fails on "run.sh does
+not forward `QA_ONLY` to the walkthrough". It came from `acb73eb` (this branch's scoped-pass work)
+and still fails at `9447237~1`, so it predates this merge rather than being caused by it. It is the
+scoped-pass tooling, not REQ-099, and it is not ticked off.
+
+**Next.** Read the pass. Fix whatever `runAiAgentsDepth` reports against a real session, close
+REQ-099 on the two boxes that are genuinely its own, then REQ-100 — the AI tool system, first in
+the queue with no prior commits, and the natural owner of the tool catalogue REQ-099's agent editor
+already references.
