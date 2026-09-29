@@ -5249,6 +5249,198 @@ async function runNotificationOutboxDepth(page, report) {
 }
 
 /**
+ * The event console (REQ-016, slice 1): the feed and the catalogue, each driven rather than
+ * merely rendered.
+ *
+ * The events are emitted through real routes — a page is published, so the bus records
+ * `page.created`, `page.published` and `page.updated` with payloads the panel has to show —
+ * and the pass then proves the three things a feed screen can quietly get wrong:
+ *
+ * 1. **The filter narrows the table.** A name is chosen, and every row on screen carries it.
+ *    A filter bar wired to nothing still renders rows, and rows are what a screenshot proves,
+ *    so this has to be asserted against the rows rather than against the control.
+ * 2. **The filter survives a reload.** The chips are read from the query string, so a second
+ *    visit to the same URL is the same view. This is the paste-to-a-colleague claim.
+ * 3. **The catalogue is the registry, not a picture of one.** Its total is the registry's
+ *    total, and narrowing it by area leaves a subset of it — a catalogue that had been
+ *    hand-listed in the screen would drift from the API, and the drift is the bug the whole
+ *    request exists to prevent.
+ */
+async function runEventsDepth(page, report) {
+  const steps = {};
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+
+  // 1. Emit real facts through real routes. Publishing a page is the one an operator can
+  //    always do, and it produces three names with three different payload shapes.
+  const published = await page.evaluate(async (site) => {
+    const created = await fetch(`/api/v1/pages?site_id=${site}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "QA · an event to look at", slug: `qa-event-${Date.now()}` }),
+    }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    if (!created?.id) return { created: null };
+    const publishedPage = await fetch(`/api/v1/pages/${created.id}/publish`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    return { created: created.id, published: publishedPage?.status ?? null };
+  }, siteId);
+  steps.emitted = published;
+
+  // 2. The feed, on its own route.
+  await page.goto(`${URL_ADMIN}/events`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.table = (await page.locator("[data-event-table]").count()) > 0;
+  steps.rows = await page.locator("[data-event-row]").count();
+  steps.empty = (await page.locator("[data-event-empty]").count()) > 0;
+  // The page this pass just published has to be on screen; a feed that does not show the
+  // event an operator just caused is a log file nobody reads.
+  steps.sawThePublication = (await page.locator('[data-event-row] >> text=page.published').count()) > 0;
+  await shot(page, "page-events-feed");
+
+  // 3. The name filter narrows the table, and the URL carries it.
+  if (steps.rows > 0) {
+    const firstName = (await page.locator("[data-event-row] td:nth-child(3)").first().innerText().catch(() => "")).trim();
+    steps.firstName = firstName;
+    if (firstName) {
+      await page.locator(`[data-event-name-option="${firstName}"]`).check({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      await shot(page, "page-events-filtered");
+      steps.filterInUrl = page.url().includes("name=");
+      steps.filterChip = (await page.locator(`[data-event-name-chip="${firstName}"]`).count()) > 0;
+      const names = await page.locator("[data-event-row] td:nth-child(3)").allInnerTexts();
+      steps.everyRowMatches = names.length > 0 && names.every((value) => value.trim() === firstName);
+      steps.filteredRows = names.length;
+
+      // And the same URL gives the same view — the paste-to-a-colleague claim, asserted by
+      // reloading rather than by trusting the router.
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1300);
+      const afterReload = await page.locator("[data-event-row] td:nth-child(3)").allInnerTexts();
+      steps.survivesReload =
+        afterReload.length > 0 && afterReload.every((value) => value.trim() === firstName);
+      steps.reset = await (async () => {
+        await page.locator("[data-event-reset]").click({ timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(1000);
+        return !page.url().includes("name=");
+      })();
+    }
+  }
+
+  // 4. The payload inspector: a row expands and shows the payload as it was recorded.
+  if (steps.rows > 0) {
+    const rowId = await page.locator("[data-event-row]").first().getAttribute("data-event-row");
+    await page.locator(`[data-event-expand="${rowId}"]`).click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    steps.expanded = (await page.locator(`[data-event-payload="${rowId}"]`).count()) > 0;
+    steps.payloadText = (
+      await page.locator(`[data-event-payload="${rowId}"]`).innerText().catch(() => "")
+    ).slice(0, 200);
+    await shot(page, "page-events-payload");
+    // The keyboard path: `j` walks the cursor and `Enter` opens, so the shortcuts are real.
+    await page.locator("[data-event-table] tbody").focus().catch(() => {});
+    await page.keyboard.press("j");
+    await page.waitForTimeout(200);
+    steps.cursorMoved = (await page.locator('[data-event-row][data-cursor="true"]').count()) > 0;
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(400);
+    steps.keyboardOpens = (await page.locator("[data-event-detail]").count()) > 0;
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+    steps.escapeCloses = (await page.locator("[data-event-detail]").count()) === 0;
+  }
+
+  // 5. The error state, provoked the honest way: a route that answers 500. A feed that cannot
+  //    say "the API could not be reached" is a feed that renders an empty table and calls it
+  //    "nothing recorded yet", which is the most expensive kind of wrong.
+  await page.route("**/api/v1/events?*", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "qa_forced", message: "The QA pass forced this." } }),
+    }),
+  );
+  await page.goto(`${URL_ADMIN}/events?window=24h`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.errorShown = (await page.locator("[data-event-error]").count()) > 0;
+  steps.errorSaysWhy = (await page.locator("[data-event-error]").innerText().catch(() => "")).includes(
+    "QA pass forced this",
+  );
+  steps.retryPresent = (await page.locator("[data-event-error] >> text=Retry").count()) > 0;
+  await shot(page, "page-events-error");
+  await page.unroute("**/api/v1/events?*").catch(() => {});
+
+  // 6. The catalogue: the registry's own totals, and a narrowing that leaves a subset.
+  await page.goto(`${URL_ADMIN}/events?tab=catalogue`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.catalogueTable = (await page.locator("[data-event-catalogue-table]").count()) > 0;
+  steps.catalogueRows = await page.locator("[data-catalogue-row]").count();
+  steps.catalogueLive = (await page.locator("[data-catalogue-live]").innerText().catch(() => "")).trim();
+  steps.catalogueReserved = (await page.locator("[data-catalogue-reserved]").innerText().catch(() => "")).trim();
+  // The screen's total must be the API's total — read from the API, not from the rows, so a
+  // filtered list cannot quietly become a smaller registry.
+  const fromApi = await page
+    .evaluate(() =>
+      fetch("/api/v1/events/catalogue", { credentials: "same-origin" })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null),
+    )
+    .catch(() => null);
+  steps.catalogueMatchesApi =
+    fromApi?.events?.length != null && fromApi.events.length === steps.catalogueRows;
+  steps.catalogueCountsAreNumbers =
+    typeof fromApi?.live_count === "number" && typeof fromApi?.reserved_count === "number";
+  steps.everyEntryHasADeliveryCount =
+    Array.isArray(fromApi?.events) &&
+    fromApi.events.every((entry) => typeof entry.deliveries_24h === "number");
+  // A reserved name says so on screen; hiding it would leave a subscriber waiting forever
+  // for an event no module emits.
+  steps.reservedIsVisible = (await page.locator('[data-catalogue-row][data-status="reserved"]').count()) > 0;
+  steps.liveIsVisible = (await page.locator('[data-catalogue-row][data-status="live"]').count()) > 0;
+  await shot(page, "page-events-catalogue");
+
+  const area = await page
+    .locator("#event-area option")
+    .nth(1)
+    .getAttribute("value")
+    .catch(() => "");
+  if (area) {
+    await page.selectOption("#event-area", area).catch(() => {});
+    await page.waitForTimeout(600);
+    const areas = await page.locator("[data-catalogue-row] td:nth-child(2)").allInnerTexts();
+    steps.areaNarrowed =
+      areas.length > 0 && areas.length < steps.catalogueRows && areas.every((value) => value.trim() === area);
+    steps.area = area;
+  }
+
+  // 7. The payload fields of one entry, because "what does this event carry" is the question
+  //    a receiver asks before subscribing and the screen is where it is answered.
+  const firstEntry = await page.locator("[data-catalogue-row]").first().getAttribute("data-catalogue-row").catch(() => "");
+  if (firstEntry) {
+    await page.locator(`[data-catalogue-expand="${firstEntry}"]`).click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+    steps.payloadFields = await page.locator(`[data-catalogue-field="${firstEntry}"]`).count();
+  }
+
+  // 8. "Filter feed" from the catalogue must land on the Feed tab with the name applied — the
+  //    two tabs are one screen, and a button that does not cross between them is a button
+  //    that lies about what it does.
+  if (firstEntry) {
+    await page.locator(`[data-catalogue-filter="${firstEntry}"]`).click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1300);
+    steps.crossTabFilter =
+      !page.url().includes("tab=catalogue") && page.url().includes("name=");
+    steps.crossTabChip = (await page.locator(`[data-event-name-chip="${firstEntry}"]`).count()) > 0;
+    await shot(page, "page-events-filtered-from-catalogue");
+  }
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -5563,6 +5755,13 @@ async function main() {
     // screen whose first paint nobody has seen. Its depth pass below writes a rule, runs an
     // event through the router, reads the counts back and removes the rule again.
     { path: "/notifications/outbox", name: "notifications-outbox" },
+    // The event console (REQ-016, slice 1). Walked on its own route for the same reason as the
+    // settings screen above: the Catalogue tab is a second data source behind a query string,
+    // and a tab nobody ever visits is a tab whose first paint nobody has seen. Its depth pass
+    // below filters the feed by a name, expands a payload, opens the catalogue and narrows it
+    // by area.
+    { path: "/events", name: "events" },
+    { path: "/events?tab=catalogue", name: "events-catalogue" },
     { path: "/analytics", name: "analytics" },
     { path: "/analytics/pages", name: "analytics-pages" },
     { path: "/analytics/sources", name: "analytics-sources" },
@@ -5725,6 +5924,13 @@ async function main() {
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
   report.notifications = await runNotificationsDepth(page, report);
   log(`notifications: ${JSON.stringify(report.notifications)}`);
+
+  // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
+  // catalogue. It runs after the notification passes because it publishes a page, and the
+  // content screens' own passes are ordered after it in the file.
+  report.events = await runDepthPass("events-console", () => runEventsDepth(page, report));
+  log(`events: ${JSON.stringify(report.events)}`);
+
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.

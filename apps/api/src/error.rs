@@ -167,6 +167,13 @@ impl From<EventsError> for ApiError {
             EventsError::Client(message) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
             }
+            // A refused redelivery is a `409`, not a `400`: the request was well formed and the
+            // row's *state* is what the operator has to change first (wait for the pending
+            // attempt, or stop forcing a delivery the receiver already refused ten times). A
+            // `400` would tell them to fix their request, which is not the problem.
+            EventsError::RedeliveryRefused { code, message } => {
+                Self::new(StatusCode::CONFLICT, code, message)
+            }
         }
     }
 }

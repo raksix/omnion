@@ -324,6 +324,21 @@ pub async fn create_page(
     )
     .await?;
 
+    emit(
+        &state,
+        page_event(
+            NewEvent::new("page.created").payload(json!({
+                "page_id": page.id,
+                "site_id": site.id,
+                "slug": page.slug,
+                "status": page.status,
+            })),
+            &site,
+            current.user.id,
+        ),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "page.created")
@@ -363,12 +378,33 @@ pub async fn update_page(
     Json(body): Json<UpdatePageRequest>,
 ) -> Result<Json<PageBody>, ApiError> {
     let page = page_in_scope(&state, &current, page_id).await?;
+    let site = site_of(&state, page.site_id).await?;
     let changes = body.changes();
     let appends = changes.touches_content();
 
     let updated =
         pages::update_page(state.db().pool(), page.id, &changes, Some(current.user.id)).await?;
     let body = load_page_body(&state, &updated).await?;
+
+    // An endpoint subscribed to `page.*` hears edits too. Only an edit that actually appended
+    // a revision is a content change; a pure rename is still worth telling, so it is reported
+    // with `status` omitted rather than filtered out — a receiver that rebuilds a sitemap needs
+    // the rename, and the payload's `status` is the optional field for exactly that.
+    emit(
+        &state,
+        page_event(
+            NewEvent::new("page.updated").payload(json!({
+                "page_id": updated.id,
+                "site_id": updated.site_id,
+                "slug": updated.slug,
+                "status": updated.status,
+                "content_changed": appends,
+            })),
+            &site,
+            current.user.id,
+        ),
+    )
+    .await?;
 
     record(
         &state,
@@ -380,7 +416,7 @@ pub async fn update_page(
                 "content_changed": appends,
             }))
             .ip_address(address.as_text())
-            .organization(site_of(&state, updated.site_id).await?.organization_id),
+            .organization(site.organization_id),
     )
     .await?;
 
@@ -400,6 +436,20 @@ pub async fn delete_page(
     if !pages::delete_page(state.db().pool(), page.id).await? {
         return Err(page_not_found());
     }
+
+    emit(
+        &state,
+        page_event(
+            NewEvent::new("page.deleted").payload(json!({
+                "page_id": page.id,
+                "site_id": page.site_id,
+                "slug": page.slug,
+            })),
+            &site,
+            current.user.id,
+        ),
+    )
+    .await?;
 
     record(
         &state,
@@ -590,6 +640,25 @@ pub async fn restore_revision(
     )
     .await?;
 
+    // Restoring a revision copies it forward as a new draft. The page was never removed, so the
+    // fact a receiver wants is "its content is back the way it was" — `page.restored` with the
+    // revision it came from, which is the only identifier that makes the restore reproducible.
+    emit(
+        &state,
+        page_event(
+            NewEvent::new("page.restored").payload(json!({
+                "page_id": page.id,
+                "site_id": page.site_id,
+                "slug": page.slug,
+                "restored_from_revision_id": body.revision_id,
+                "revision_no": restored.revision_no,
+            })),
+            &site,
+            current.user.id,
+        ),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "page.revision.restored")
@@ -663,6 +732,22 @@ pub async fn set_translations(
         written.push(field);
     }
 
+    emit(
+        &state,
+        page_event(
+            NewEvent::new("translation.updated").payload(json!({
+                "page_id": page.id,
+                "site_id": page.site_id,
+                "locale": language.to_lowercase(),
+                "revision_id": revision.id,
+                "fields": written,
+            })),
+            &site,
+            current.user.id,
+        ),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "page.translation.updated")
@@ -694,6 +779,42 @@ pub async fn set_translations(
 async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
     omnion_audit::record(state.db().pool(), entry).await?;
     Ok(())
+}
+
+/// Record a content fact on the platform's bus (REQ-016 slice 2).
+///
+/// The page lifecycle is what the outside world most wants to hear about, and until this call
+/// existed the catalogue *promised* `page.created`, `page.updated`, `page.deleted` and
+/// `page.restored` as live names while nothing ever recorded them. A `bus::emit` is a `bus::emit`
+/// here for the same reason it is beside `page.published`: an endpoint subscribed to
+/// `page.*` is entitled to hear the whole lifecycle, not only the publish.
+async fn emit(state: &AppState, event: NewEvent) -> Result<(), ApiError> {
+    let report = bus::emit(state.db().pool(), event).await?;
+
+    tracing::debug!(
+        event_id = report.event.id,
+        deliveries = report.deliveries,
+        name = %report.event.name,
+        "content event recorded"
+    );
+
+    Ok(())
+}
+
+/// Attach a page's site and its actor to an event that has already been named.
+///
+/// The name arrives as a built `NewEvent` rather than a `&str` on purpose. The first version
+/// took the name as a string, and that has a cost worth writing down: the drift gate
+/// (`apps/api/tests/events.rs`) finds emitters by looking for the constructor call in the
+/// source, so a name that lives in a helper's argument is invisible to it. It fired at once,
+/// reporting `page.created` unbacked from a file that emitted it three lines above. A gate
+/// that a convenience wrapper can blind is a gate to design against, so the literal stays at
+/// the call site and this helper only fills in what every content event shares.
+fn page_event(event: NewEvent, site: &Site, actor: Uuid) -> NewEvent {
+    event
+        .organization(site.organization_id)
+        .site(site.id)
+        .actor(actor)
 }
 
 /// Load a site or answer `404 site_not_found`.

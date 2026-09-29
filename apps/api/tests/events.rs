@@ -815,18 +815,37 @@ async fn the_bus_records_events_and_delivers_signed_webhooks() {
         .call(get("/api/v1/events?limit=50", Some(&owner_token)))
         .await;
     let events = feed.body["events"].as_array().expect("events").clone();
-    assert_eq!(events.len(), 4, "{:?}", feed.body);
+    // The feed holds every recorded event, and since REQ-016 slice 2 that is the whole
+    // lifecycle, not just the publications: creating the endpoint, testing it, creating the
+    // page, editing it, publishing, and the delivery that gave up. Counting exact rows would
+    // make every new emission a breaking test, so this asserts the facts that matter instead —
+    // what is present, and that the ordering is newest first.
+    let names: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    for expected in [
+        "webhook.endpoint.created",
+        "webhook.test",
+        "webhook.endpoint.tested",
+        "page.created",
+        "page.updated",
+        "page.published",
+        "webhook.delivery.failed",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "the feed must carry {expected}; it has {names:?}"
+        );
+    }
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["name"] == json!("page.published"))
-            .count(),
+        names.iter().filter(|name| **name == "page.published").count(),
         3,
         "three publications were recorded: {:?}",
         feed.body
     );
-    assert_eq!(events[0]["name"], json!("page.published"), "newest first");
-    assert_eq!(events[3]["name"], json!("webhook.test"), "oldest last");
+    assert_eq!(events[0]["name"], json!("webhook.delivery.failed"), "newest first");
+    assert_eq!(names.last(), Some(&"webhook.endpoint.created"), "oldest last");
 
     let audit = harness
         .call(get("/api/v1/iam/audit", Some(&owner_token)))
@@ -1054,11 +1073,37 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
         deliveries_b.body
     );
 
-    // The event feed is tenant-scoped too.
+    // The event feed is tenant-scoped too — and the scoping is now worth stating precisely,
+    // because connecting an endpoint records an event *about that endpoint*. Tenant B's feed is
+    // no longer empty, and that is correct rather than a leak: the row is B's own, created by
+    // B's own operator, and it says nothing about tenant A. What must never appear in B's feed
+    // is anything of A's, which is the assertion that carries the isolation rule.
     let feed_b = harness.call(get("/api/v1/events", Some(&token_b))).await;
-    assert_eq!(feed_b.body["events"], json!([]));
+    let names_b: Vec<&str> = feed_b.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert_eq!(
+        names_b,
+        vec!["webhook.endpoint.created"],
+        "tenant B sees only its own endpoint, and nothing of tenant A: {:?}",
+        feed_b.body
+    );
     let feed_a = harness.call(get("/api/v1/events", Some(&token_a))).await;
-    assert_eq!(feed_a.body["events"].as_array().expect("events").len(), 1);
+    let names_a: Vec<&str> = feed_a.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["name"].as_str())
+        .collect();
+    assert_eq!(
+        names_a,
+        vec!["page.published", "page.created", "webhook.endpoint.created"],
+        "tenant A sees its own endpoint and its own page, and nothing of tenant B: {:?}",
+        feed_a.body
+    );
 
     // An endpoint switched off while its queue waits: the queued delivery settles as failed
     // instead of sitting pending forever.
@@ -1167,6 +1212,680 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
 
 // ---------------------------------------------------------------------------------------------
 // Stack helpers
+// ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// The catalogue and group wildcards, over HTTP (REQ-016 slice 1)
+// ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// The feed's filters, keyset pagination and refusals, over HTTP (REQ-016 slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/// The event feed narrows to what the operator asked for, pages without repeating a row, and
+/// says so when the platform cannot serve the request.
+///
+/// This is the walk behind the `/events` screen (REQ-016, slice 1). The feed existed with a
+/// limit and an organization scope; what it did not have was the set of filters the screen
+/// offers, which means the screen's filter bar would have been a decoration — every control
+/// wired to nothing, which is the failure the build plan names as "no dead buttons".
+#[tokio::test]
+async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    // A platform account, used only as the `actor_user_id` on the seeded rows — a fact with
+    // an actor that happens inside one tenant while the reader is a member of another is
+    // exactly the row a broken actor filter would leak, so the two ids differ on purpose.
+    let (actor_id, _actor_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), actor_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "feed", "Feed Filter Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Feed Site").await;
+    let other_site = create_site_row(&harness.db, organization, "second", "Second Site").await;
+
+    // Five facts to narrow: three page events on one site, one on another, and one that
+    // belongs to a different organization entirely. The last one is the row a tenancy filter
+    // that quietly stopped working would leak, so it is seeded deliberately.
+    let other_organization =
+        create_organization_row(&harness.db, "other", "Someone Else").await;
+    for (name, site_id, owner) in [
+        ("page.created", site, organization),
+        ("page.updated", site, organization),
+        ("page.deleted", site, organization),
+        ("page.created", other_site, organization),
+        ("user.updated", site, other_organization),
+    ] {
+        sqlx::query("insert into events (name, organization_id, site_id, actor_user_id, payload) \
+                     values ($1, $2, $3, $4, '{}'::jsonb)")
+            .bind(name)
+            .bind(owner)
+            .bind(site_id)
+            .bind(actor_id)
+            .execute(harness.db.pool())
+            .await
+            .expect("the seeded event must be inserted");
+    }
+
+    // ---- Scoping: an organization account sees its own and nothing else -------------------------
+    // The reader is an *organization* account, not the platform owner. That distinction is the
+    // whole point of the assertion and it is worth spelling out, because the owner's session
+    // carries `organization_id = None` and the store's `($1::uuid is null or …)` clause reads
+    // "no organization" as *every* organization. A tenancy test written against the owner
+    // would therefore pass for the wrong reason — it would be asserting that the platform
+    // superuser sees everything, which is correct and is not what a tenant may see.
+    let (reader_id, reader_token) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        reader_id,
+        organization,
+        &["events.read", "content.pages.read"],
+    )
+    .await;
+
+    let feed = harness
+        .call(get("/api/v1/events?limit=50", Some(&reader_token)))
+        .await;
+    assert_eq!(feed.status, StatusCode::OK, "{:?}", feed.body);
+    let names: Vec<String> = feed.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        names.len(),
+        4,
+        "the reader's own organization and nothing else: {names:?}"
+    );
+    assert!(
+        !names.contains(&"user.updated".to_owned()),
+        "another organization's event never reaches this feed: {names:?}"
+    );
+
+    // ---- A name list ----------------------------------------------------------------------------
+    // Repeated `?name=` means "any of these", which is the only reading a multi-select can
+    // have. Reading one of the two would make the second click look like it did nothing.
+    let filtered = harness
+        .call(get(
+            "/api/v1/events?name=page.created&name=page.deleted&limit=50",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(filtered.status, StatusCode::OK, "{:?}", filtered.body);
+    let filtered_names: Vec<String> = filtered.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        filtered_names.len(),
+        3,
+        "two page.created rows and one page.deleted: {filtered_names:?}"
+    );
+    assert!(
+        filtered_names.iter().all(|name| name != "page.updated"),
+        "a name that was not asked for is not returned: {filtered_names:?}"
+    );
+
+    // ---- A site ---------------------------------------------------------------------------------
+    let by_site = harness
+        .call(get(
+            &format!("/api/v1/events?site_id={site}&limit=50"),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(by_site.status, StatusCode::OK, "{:?}", by_site.body);
+    assert_eq!(
+        by_site.body["events"]
+            .as_array()
+            .expect("events")
+            .as_slice()
+            .len(),
+        3,
+        "the site's three facts and not the other site's one"
+    );
+
+    // ---- A window -------------------------------------------------------------------------------
+    // A window in the future is empty, and it is empty *because it says so* rather than because
+    // the filter was dropped — a silently ignored filter is indistinguishable from a bus that
+    // stopped recording.
+    let windowed = harness
+        .call(get(
+            "/api/v1/events?from=2999-01-01T00:00:00Z&limit=50",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(windowed.status, StatusCode::OK, "{:?}", windowed.body);
+    assert!(
+        windowed.body["events"].as_array().expect("events").is_empty(),
+        "a future window is honoured, not ignored: {:?}",
+        windowed.body
+    );
+    assert_eq!(
+        windowed.body["has_more"],
+        json!(false),
+        "and an empty page says there is no further page"
+    );
+
+    // ---- A malformed request is refused by name ---------------------------------------------------
+    let bad_window = harness
+        .call(get("/api/v1/events?from=yesterday", Some(&reader_token)))
+        .await;
+    assert_eq!(
+        bad_window.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        bad_window.body
+    );
+    assert_eq!(bad_window.body["error"]["code"], json!("invalid_event_window"));
+    assert!(
+        bad_window.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("from"),
+        "the refusal names the parameter the operator mistyped: {:?}",
+        bad_window.body
+    );
+
+    // A name that cannot exist is refused too, and so is every repetition of it — a filter
+    // that validated only the first `?name=` would quietly return the unfiltered feed. The
+    // value is percent-encoded, which makes the assertion two things at once: the name is
+    // refused *and* the parser decoded it on the way (an undecoded `%20` would pass the
+    // validator's character check and reach the store as a name nothing has ever emitted).
+    let bad_name = harness
+        .call(get(
+            "/api/v1/events?name=page.created&name=NOT%20A%20NAME",
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(bad_name.status, StatusCode::BAD_REQUEST, "{:?}", bad_name.body);
+
+    // ---- Keyset pagination -----------------------------------------------------------------------
+    let first = harness
+        .call(get("/api/v1/events?limit=2", Some(&reader_token)))
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{:?}", first.body);
+    let first_ids: Vec<i64> = first.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["id"].as_i64().expect("an id"))
+        .collect();
+    assert_eq!(first_ids.len(), 2, "the page is the page size");
+    assert_eq!(
+        first.body["has_more"],
+        json!(true),
+        "three rows are left behind a two-row page"
+    );
+
+    let cursor = first.body["next_cursor"].as_i64().expect("a cursor");
+    assert_eq!(
+        cursor,
+        *first_ids.last().expect("a last row"),
+        "the cursor is the last row of the page, so the next page cannot repeat it"
+    );
+
+    let second = harness
+        .call(get(
+            &format!("/api/v1/events?limit=2&cursor={cursor}"),
+            Some(&reader_token),
+        ))
+        .await;
+    assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
+    let second_ids: Vec<i64> = second.body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| event["id"].as_i64().expect("an id"))
+        .collect();
+    assert_eq!(second_ids.len(), 2);
+    assert_eq!(
+        second.body["has_more"],
+        json!(false),
+        "the last page says so, so the panel can stop offering 'Load older'"
+    );
+    assert_eq!(
+        second.body["next_cursor"],
+        json!(null),
+        "and carries no cursor to follow"
+    );
+
+    let overlap: Vec<&i64> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    assert!(
+        overlap.is_empty(),
+        "no row is served twice across the page boundary: {first_ids:?} then {second_ids:?}"
+    );
+    assert!(
+        first_ids[0] > first_ids[1] && first_ids[1] > second_ids[0],
+        "the feed is newest-first across the boundary, not per page: \
+         {first_ids:?} then {second_ids:?}"
+    );
+
+    harness.dispose().await;
+}
+
+/// The catalogue is readable, complete, and a group subscription really does expand.
+///
+/// The unit tests in `omnion_events::catalogue` prove the table's shape; this proves the two
+/// seams they cannot reach — that the endpoint form's data source is the same registry the
+/// emitters are checked against, and that a `page.*` subscription reaches a receiver for a
+/// member it never named. Both are claims about the running platform, so both are made
+/// against the running platform.
+#[tokio::test]
+async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "cat", "Catalogue Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Catalogue Site").await;
+
+    // ---- The catalogue reads -------------------------------------------------------------------
+    assert_eq!(
+        harness
+            .call(get("/api/v1/events/catalogue", None))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED,
+        "the catalogue is behind a session like every other read"
+    );
+
+    let catalogue = harness
+        .call(get("/api/v1/events/catalogue", Some(&owner_token)))
+        .await;
+    assert_eq!(catalogue.status, StatusCode::OK, "{:?}", catalogue.body);
+
+    let entries = catalogue.body["events"]
+        .as_array()
+        .expect("events is a list")
+        .clone();
+    assert!(
+        entries.len() >= 60,
+        "the catalogue carries {} names; the brief asks for coverage across every module",
+        entries.len()
+    );
+
+    // Every entry is complete enough for a receiver to subscribe without guessing.
+    for entry in &entries {
+        let name = entry["name"].as_str().expect("a name");
+        assert!(
+            !entry["description"].as_str().unwrap_or_default().is_empty(),
+            "{name} says nothing about what it means"
+        );
+        assert!(
+            !entry["area"].as_str().unwrap_or_default().is_empty(),
+            "{name} belongs to no area"
+        );
+        assert!(!entry["payload_fields"].as_array().expect("fields").is_empty(), "{name}");
+
+        // The group is the part a receiver can subscribe to as a whole, and it must agree
+        // with the name: a `group` that does not prefix the `name` is a picker that would
+        // offer a subscription the fan-out never matches.
+        let group = entry["group"].as_str().expect("a group");
+        assert!(
+            name.starts_with(&format!("{group}.")),
+            "{name} claims group {group}, which does not prefix it"
+        );
+    }
+
+    // The published page event is described with the fields it actually carries — this is the
+    // row the acceptance criterion names, so it is checked by value and not by presence.
+    let published = entries
+        .iter()
+        .find(|entry| entry["name"] == "page.published")
+        .expect("page.published is listed");
+    assert_eq!(published["status"], "live");
+    assert_eq!(published["group"], "page");
+    let fields = published["payload_fields"].as_array().expect("fields");
+    for required in ["page_id", "site_id", "slug", "revision_no"] {
+        let field = fields
+            .iter()
+            .find(|field| field["name"] == required)
+            .unwrap_or_else(|| panic!("page.published must declare {required}"));
+        assert_eq!(field["required"], true, "{required} is promised as required");
+    }
+
+    // The counts agree with the list, and the ceiling the panel enforces is published with
+    // it so the form does not hardcode a number that can drift from the validator.
+    assert_eq!(
+        catalogue.body["live_count"].as_u64().expect("live_count") as usize
+            + catalogue.body["reserved_count"].as_u64().expect("reserved_count") as usize,
+        entries.len(),
+        "live + reserved is the whole list"
+    );
+    assert_eq!(
+        catalogue.body["max_subscriptions"],
+        json!(omnion_events::validation::MAX_SUBSCRIPTIONS),
+        "the panel's ceiling is the validator's ceiling"
+    );
+    assert!(
+        !catalogue.body["areas"].as_array().expect("areas").is_empty(),
+        "the picker groups by area"
+    );
+
+    // `order.created` is named, described and subscribable while its module is unshipped —
+    // and it says so, rather than pretending the platform is broken.
+    let reserved = entries
+        .iter()
+        .find(|entry| entry["name"] == "order.created")
+        .expect("order.created is listed");
+    assert_eq!(reserved["status"], "reserved");
+    assert_eq!(reserved["group"], "order");
+
+    // ---- A group subscription expands and delivers --------------------------------------------
+    let created = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "organization_id": organization,
+                "name": "Group Receiver",
+                "url": receiver.url,
+                // One selection that stands for eight names.
+                "events": ["page.*"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let secret = created.body["secret"]
+        .as_str()
+        .expect("the platform generates a secret and shows it once")
+        .to_owned();
+
+    let stored = created.body["events"].as_array().expect("events").clone();
+    let stored_names: Vec<&str> = stored
+        .iter()
+        .map(|entry| entry.as_str().expect("a name"))
+        .collect();
+
+    assert!(
+        stored_names.contains(&"page.*"),
+        "the wildcard is kept so catalogue growth reaches this endpoint: {stored_names:?}"
+    );
+    assert!(
+        stored_names.contains(&"page.published"),
+        "today's members are stored too, so the row is readable without resolving a group"
+    );
+    assert!(
+        !stored_names.contains(&"media.created"),
+        "the group is page's, not everything: {stored_names:?}"
+    );
+    assert!(
+        stored_names.windows(2).all(|pair| pair[0] < pair[1]),
+        "the stored list is sorted and deduplicated: {stored_names:?}"
+    );
+
+    // The wildcard in the stored row is the whole reason the fan-out has to test it, and
+    // publishing a page is the proof that it does.
+    let page = harness
+        .call(post(
+            "/api/v1/pages",
+            json!({ "site_id": site, "slug": "grouped", "title": "Grouped" }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(page.status, StatusCode::CREATED, "{:?}", page.body);
+    let page_id = page.body["id"].as_str().expect("page id").to_owned();
+
+    let published = harness
+        .call(post(
+            &format!("/api/v1/pages/{page_id}/publish"),
+            json!({}),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(published.status, StatusCode::OK, "{:?}", published.body);
+
+    // A `page.*` subscription is no longer publish-only: the group now carries the whole page
+    // lifecycle, so the page that was just created is delivered alongside its publication. That
+    // is the point of the group — one subscription, every page fact — and the count is 2
+    // because the walk creates the page before publishing it.
+    let report = tick(&harness).await;
+    assert_eq!(
+        report.delivered, 2,
+        "a page.* subscription delivers page.created and page.published: {report:?}"
+    );
+
+    let captured = receiver.captured();
+    assert_eq!(captured.len(), 2, "the receiver took both deliveries");
+    let delivered_names: Vec<&str> = captured.iter().map(|hit| hit.event.as_str()).collect();
+    assert_eq!(
+        delivered_names,
+        vec!["page.created", "page.published"],
+        "the group delivers its members oldest first: {delivered_names:?}"
+    );
+    let delivered = &captured[1];
+    assert_eq!(delivered.event, "page.published");
+
+    // A name the receiver never named still arrives signed and verifiable.
+    let body = delivered.json();
+    assert_eq!(body["name"], "page.published");
+    assert_eq!(body["payload"]["slug"], "grouped");
+    assert!(
+        omnion_events::signature::verify(
+            &secret,
+            delivered.timestamp,
+            &delivered.body,
+            &delivered.signature
+        ),
+        "the delivery verifies against the secret the creation response returned: {:?}",
+        delivered.signature
+    );
+
+    // ---- A group that does not exist is kept, not refused --------------------------------------
+    let future = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "organization_id": organization,
+                "name": "Future Group",
+                "url": receiver.url,
+                "events": ["payments.*"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(
+        future.status,
+        StatusCode::CREATED,
+        "a group whose module has not shipped is a legitimate subscription: {:?}",
+        future.body
+    );
+    assert_eq!(
+        future.body["events"],
+        json!(["payments.*"]),
+        "and it is stored exactly as written, becoming real when the names arrive"
+    );
+
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The registry vs the emitters: no `NewEvent::new("…")` may name an event the catalogue
+// does not carry
+// ---------------------------------------------------------------------------------------------
+
+/// Every event name the modules actually record, read out of the source tree.
+///
+/// This is a *source* test, not a database test, and it is the only thing that keeps the
+/// registry honest. The catalogue is hand-written; the emitters are hand-written; nothing
+/// stops the two from drifting, and the drift is invisible: the bus records the fact, the
+/// delivery is queued, and no receiver can subscribe to a name the picker never offered.
+///
+/// So the test walks the tree and asks the opposite question of the one the unit tests ask.
+/// A unit test in `omnion-events` can only see that crate's own emitters; this one sees
+/// every module's, and it names the offending file and line so the fix is obvious rather
+/// than a puzzle.
+#[test]
+fn every_emitted_name_is_in_the_catalogue() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("the workspace root is two levels above apps/api")
+        .to_path_buf();
+
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut files = 0_usize;
+
+    for area in ["apps", "crates", "modules"] {
+        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+    }
+
+    assert!(
+        files > 10,
+        "the walk found {files} Rust files; a walk that sees nothing proves nothing"
+    );
+    assert!(
+        emitted.len() > 30,
+        "the walk found {} emissions; the emitters are not where this test looks",
+        emitted.len()
+    );
+
+    let mut unlisted: Vec<String> = Vec::new();
+    for (name, where_) in &emitted {
+        if !omnion_events::catalogue::is_known(name) {
+            unlisted.push(format!("  {name}  ({where_})"));
+        }
+    }
+
+    assert!(
+        unlisted.is_empty(),
+        "{} emitted name(s) are not in the catalogue — add a row to \
+         crates/events/src/catalogue.rs, or fix the emitter:\n{}",
+        unlisted.len(),
+        unlisted.join("\n"),
+    );
+}
+
+/// Collect `NewEvent::new("…")` out of every `.rs` file below `root`.
+fn walk_rust(
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    found: &mut Vec<(String, String)>,
+    files: &mut usize,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // `target` is build output, not source: a stale copy of an emitter in there is
+            // not drift, it is a build artifact.
+            let skip = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "target" || name == "node_modules");
+            if !skip {
+                walk_rust(&path, workspace, found, files);
+            }
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+
+        *files += 1;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for (index, line) in text.lines().enumerate() {
+            let Some(rest) = line.split("NewEvent::new(\"").nth(1) else {
+                continue;
+            };
+            let Some(name) = rest.split('"').next() else {
+                continue;
+            };
+            // A name that is not dotted lower-case is a *test fixture* asserting the
+            // validator refuses it, not an emitter. The catalogue's own test covers those.
+            let shaped = name.split('.').count() >= 2
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_');
+            if !shaped {
+                continue;
+            }
+            let relative = path.strip_prefix(workspace).unwrap_or(&path);
+            found.push((
+                name.to_owned(),
+                format!("{}:{}", relative.display(), index + 1),
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The registry vs the emitters, the other direction: a name the catalogue calls *live* must
+// have an emitter
+// ---------------------------------------------------------------------------------------------
+
+/// Every name marked `Live` in the catalogue is emitted by some module.
+///
+/// The gate above walks one direction, and one direction is not enough. It proves an emitter
+/// never names a row that is missing — but it says nothing about a row that exists with
+/// nothing behind it, and that is the failure that actually shipped: twenty-seven rows carried
+/// `Live`, which the type documents as "emitted by the platform today", while the platform
+/// emitted nothing of the sort. In the panel's picker they read exactly like a working event;
+/// an operator subscribes, the delivery never comes, and there is nothing to show for the
+/// subscription at all.
+///
+/// A registry is a promise about what other software will receive, so the promise has to be
+/// checked. Two options, and only one of them is honest:
+///
+/// * emit the fact, if the write path exists — this tick added `page.created|updated|deleted|
+///   restored`, `translation.updated`, `domain.added|removed`, `site.archived`, `user.updated`,
+///   `user.deleted` and `theme.activated` for exactly this reason; or
+/// * mark it `Reserved`, which the panel renders as "a module ships this" instead of implying
+///   the platform is broken.
+///
+/// So the leftover rows are `Reserved` rather than `Live`. That is not demotion for its own
+/// sake: `order.created` is `Reserved` for the same reason, and the status column exists to
+/// carry it. Naming them honestly is what lets the picker say something true.
+#[test]
+fn every_live_name_has_an_emitter() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("the workspace root is two levels above apps/api")
+        .to_path_buf();
+
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut files = 0_usize;
+    for area in ["apps", "crates", "modules"] {
+        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+    }
+
+    let mut unbacked: Vec<String> = Vec::new();
+    for name in omnion_events::catalogue::live_names() {
+        if !emitted.iter().any(|(emitted_name, _)| emitted_name == name) {
+            unbacked.push(name.to_owned());
+        }
+    }
+
+    assert!(
+        unbacked.is_empty(),
+        "{} name(s) are marked Live but no module emits them — `Live` means the platform \
+         records them today, and the picker shows an operator a name that will never fire. \
+         Emit the fact, or change the row to Reserved and say which module ships it:\n{}\
+         (the emitters this test can see are in {files} files)",
+        unbacked.len(),
+        unbacked.join("\n"),
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
