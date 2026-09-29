@@ -1169,6 +1169,360 @@ async fn webhooks_are_scoped_per_organization_and_permission_guarded() {
 // Stack helpers
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// The catalogue and group wildcards, over HTTP (REQ-016 slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/// The catalogue is readable, complete, and a group subscription really does expand.
+///
+/// The unit tests in `omnion_events::catalogue` prove the table's shape; this proves the two
+/// seams they cannot reach — that the endpoint form's data source is the same registry the
+/// emitters are checked against, and that a `page.*` subscription reaches a receiver for a
+/// member it never named. Both are claims about the running platform, so both are made
+/// against the running platform.
+#[tokio::test]
+async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let receiver = Receiver::start(false).await;
+
+    let (owner_id, owner_token) = account(&harness, None).await;
+    seed::bind_owner(harness.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be created");
+
+    let organization = create_organization_row(&harness.db, "cat", "Catalogue Test").await;
+    let site = create_site_row(&harness.db, organization, "main", "Catalogue Site").await;
+
+    // ---- The catalogue reads -------------------------------------------------------------------
+    assert_eq!(
+        harness
+            .call(get("/api/v1/events/catalogue", None))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED,
+        "the catalogue is behind a session like every other read"
+    );
+
+    let catalogue = harness
+        .call(get("/api/v1/events/catalogue", Some(&owner_token)))
+        .await;
+    assert_eq!(catalogue.status, StatusCode::OK, "{:?}", catalogue.body);
+
+    let entries = catalogue.body["events"]
+        .as_array()
+        .expect("events is a list")
+        .clone();
+    assert!(
+        entries.len() >= 60,
+        "the catalogue carries {} names; the brief asks for coverage across every module",
+        entries.len()
+    );
+
+    // Every entry is complete enough for a receiver to subscribe without guessing.
+    for entry in &entries {
+        let name = entry["name"].as_str().expect("a name");
+        assert!(
+            !entry["description"].as_str().unwrap_or_default().is_empty(),
+            "{name} says nothing about what it means"
+        );
+        assert!(
+            !entry["area"].as_str().unwrap_or_default().is_empty(),
+            "{name} belongs to no area"
+        );
+        assert!(!entry["payload_fields"].as_array().expect("fields").is_empty(), "{name}");
+
+        // The group is the part a receiver can subscribe to as a whole, and it must agree
+        // with the name: a `group` that does not prefix the `name` is a picker that would
+        // offer a subscription the fan-out never matches.
+        let group = entry["group"].as_str().expect("a group");
+        assert!(
+            name.starts_with(&format!("{group}.")),
+            "{name} claims group {group}, which does not prefix it"
+        );
+    }
+
+    // The published page event is described with the fields it actually carries — this is the
+    // row the acceptance criterion names, so it is checked by value and not by presence.
+    let published = entries
+        .iter()
+        .find(|entry| entry["name"] == "page.published")
+        .expect("page.published is listed");
+    assert_eq!(published["status"], "live");
+    assert_eq!(published["group"], "page");
+    let fields = published["payload_fields"].as_array().expect("fields");
+    for required in ["page_id", "site_id", "slug", "revision_no"] {
+        let field = fields
+            .iter()
+            .find(|field| field["name"] == required)
+            .unwrap_or_else(|| panic!("page.published must declare {required}"));
+        assert_eq!(field["required"], true, "{required} is promised as required");
+    }
+
+    // The counts agree with the list, and the ceiling the panel enforces is published with
+    // it so the form does not hardcode a number that can drift from the validator.
+    assert_eq!(
+        catalogue.body["live_count"].as_u64().expect("live_count") as usize
+            + catalogue.body["reserved_count"].as_u64().expect("reserved_count") as usize,
+        entries.len(),
+        "live + reserved is the whole list"
+    );
+    assert_eq!(
+        catalogue.body["max_subscriptions"],
+        json!(omnion_events::validation::MAX_SUBSCRIPTIONS),
+        "the panel's ceiling is the validator's ceiling"
+    );
+    assert!(
+        !catalogue.body["areas"].as_array().expect("areas").is_empty(),
+        "the picker groups by area"
+    );
+
+    // `order.created` is named, described and subscribable while its module is unshipped —
+    // and it says so, rather than pretending the platform is broken.
+    let reserved = entries
+        .iter()
+        .find(|entry| entry["name"] == "order.created")
+        .expect("order.created is listed");
+    assert_eq!(reserved["status"], "reserved");
+    assert_eq!(reserved["group"], "order");
+
+    // ---- A group subscription expands and delivers --------------------------------------------
+    let created = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "organization_id": organization,
+                "name": "Group Receiver",
+                "url": receiver.url,
+                // One selection that stands for eight names.
+                "events": ["page.*"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let secret = created.body["secret"]
+        .as_str()
+        .expect("the platform generates a secret and shows it once")
+        .to_owned();
+
+    let stored = created.body["events"].as_array().expect("events").clone();
+    let stored_names: Vec<&str> = stored
+        .iter()
+        .map(|entry| entry.as_str().expect("a name"))
+        .collect();
+
+    assert!(
+        stored_names.contains(&"page.*"),
+        "the wildcard is kept so catalogue growth reaches this endpoint: {stored_names:?}"
+    );
+    assert!(
+        stored_names.contains(&"page.published"),
+        "today's members are stored too, so the row is readable without resolving a group"
+    );
+    assert!(
+        !stored_names.contains(&"media.created"),
+        "the group is page's, not everything: {stored_names:?}"
+    );
+    assert!(
+        stored_names.windows(2).all(|pair| pair[0] < pair[1]),
+        "the stored list is sorted and deduplicated: {stored_names:?}"
+    );
+
+    // The wildcard in the stored row is the whole reason the fan-out has to test it, and
+    // publishing a page is the proof that it does.
+    let page = harness
+        .call(post(
+            "/api/v1/pages",
+            json!({ "site_id": site, "slug": "grouped", "title": "Grouped" }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(page.status, StatusCode::CREATED, "{:?}", page.body);
+    let page_id = page.body["id"].as_str().expect("page id").to_owned();
+
+    let published = harness
+        .call(post(
+            &format!("/api/v1/pages/{page_id}/publish"),
+            json!({}),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(published.status, StatusCode::OK, "{:?}", published.body);
+
+    let report = tick(&harness).await;
+    assert_eq!(
+        report.delivered, 1,
+        "a page.* subscription delivers a page.published: {report:?}"
+    );
+
+    let captured = receiver.captured();
+    assert_eq!(captured.len(), 1, "the receiver took the delivery");
+    let delivered = &captured[0];
+    assert_eq!(delivered.event, "page.published");
+
+    // A name the receiver never named still arrives signed and verifiable.
+    let body = delivered.json();
+    assert_eq!(body["name"], "page.published");
+    assert_eq!(body["payload"]["slug"], "grouped");
+    assert!(
+        omnion_events::signature::verify(
+            &secret,
+            delivered.timestamp,
+            &delivered.body,
+            &delivered.signature
+        ),
+        "the delivery verifies against the secret the creation response returned: {:?}",
+        delivered.signature
+    );
+
+    // ---- A group that does not exist is kept, not refused --------------------------------------
+    let future = harness
+        .call(post(
+            "/api/v1/webhooks",
+            json!({
+                "organization_id": organization,
+                "name": "Future Group",
+                "url": receiver.url,
+                "events": ["payments.*"],
+            }),
+            Some(&owner_token),
+        ))
+        .await;
+    assert_eq!(
+        future.status,
+        StatusCode::CREATED,
+        "a group whose module has not shipped is a legitimate subscription: {:?}",
+        future.body
+    );
+    assert_eq!(
+        future.body["events"],
+        json!(["payments.*"]),
+        "and it is stored exactly as written, becoming real when the names arrive"
+    );
+
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The registry vs the emitters: no `NewEvent::new("…")` may name an event the catalogue
+// does not carry
+// ---------------------------------------------------------------------------------------------
+
+/// Every event name the modules actually record, read out of the source tree.
+///
+/// This is a *source* test, not a database test, and it is the only thing that keeps the
+/// registry honest. The catalogue is hand-written; the emitters are hand-written; nothing
+/// stops the two from drifting, and the drift is invisible: the bus records the fact, the
+/// delivery is queued, and no receiver can subscribe to a name the picker never offered.
+///
+/// So the test walks the tree and asks the opposite question of the one the unit tests ask.
+/// A unit test in `omnion-events` can only see that crate's own emitters; this one sees
+/// every module's, and it names the offending file and line so the fix is obvious rather
+/// than a puzzle.
+#[test]
+fn every_emitted_name_is_in_the_catalogue() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("the workspace root is two levels above apps/api")
+        .to_path_buf();
+
+    let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut files = 0_usize;
+
+    for area in ["apps", "crates", "modules"] {
+        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+    }
+
+    assert!(
+        files > 10,
+        "the walk found {files} Rust files; a walk that sees nothing proves nothing"
+    );
+    assert!(
+        emitted.len() > 30,
+        "the walk found {} emissions; the emitters are not where this test looks",
+        emitted.len()
+    );
+
+    let mut unlisted: Vec<String> = Vec::new();
+    for (name, where_) in &emitted {
+        if !omnion_events::catalogue::is_known(name) {
+            unlisted.push(format!("  {name}  ({where_})"));
+        }
+    }
+
+    assert!(
+        unlisted.is_empty(),
+        "{} emitted name(s) are not in the catalogue — add a row to \
+         crates/events/src/catalogue.rs, or fix the emitter:\n{}",
+        unlisted.len(),
+        unlisted.join("\n"),
+    );
+}
+
+/// Collect `NewEvent::new("…")` out of every `.rs` file below `root`.
+fn walk_rust(
+    root: &std::path::Path,
+    workspace: &std::path::Path,
+    found: &mut Vec<(String, String)>,
+    files: &mut usize,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // `target` is build output, not source: a stale copy of an emitter in there is
+            // not drift, it is a build artifact.
+            let skip = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "target" || name == "node_modules");
+            if !skip {
+                walk_rust(&path, workspace, found, files);
+            }
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+
+        *files += 1;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+
+        for (index, line) in text.lines().enumerate() {
+            let Some(rest) = line.split("NewEvent::new(\"").nth(1) else {
+                continue;
+            };
+            let Some(name) = rest.split('"').next() else {
+                continue;
+            };
+            // A name that is not dotted lower-case is a *test fixture* asserting the
+            // validator refuses it, not an emitter. The catalogue's own test covers those.
+            let shaped = name.split('.').count() >= 2
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_');
+            if !shaped {
+                continue;
+            }
+            let relative = path.strip_prefix(workspace).unwrap_or(&path);
+            found.push((
+                name.to_owned(),
+                format!("{}:{}", relative.display(), index + 1),
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
 async fn live_db(config: &Config) -> Option<Db> {
     match Db::connect(&DatabaseConfig {
