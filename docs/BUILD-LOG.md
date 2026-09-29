@@ -5289,3 +5289,72 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
+
+---
+
+## 2026-09-29 · tick 63 · REQ-064 slice 4c — visitor accounts, and the page gate
+
+**What.** `0154_cms_members.sql` (three member tables and the site policy, plus `pages.visibility`),
+`crates/content/src/members.rs` (the store), `apps/api/src/routes/members.rs` (twenty endpoints
+behind two permissions), the gate enforced in `routes::public`, four event names and two
+permission keys. Acceptance 16 is ticked.
+
+**Proof, all real:**
+
+```
+cargo test -p omnion-api --test cms_members   -> 10 passed; 0 failed   (live PostgreSQL, fresh DB)
+cargo test -p omnion-content --lib            -> 183 passed; 0 failed
+cargo test -p omnion-events --lib             ->  47 passed; 0 failed
+cargo test -p omnion-permissions --lib        ->  63 passed; 0 failed
+bash scripts/qa/sql-check.sh                  -> ALL MIGRATIONS APPLY CLEAN
+```
+
+**The boundary the REQ calls its most important one is structural, and the walk checks the
+schema rather than trusting a convention.** No member table references `users`, no role row points
+at one, `roles` is a `text[]` the SITE owns rather than the IAM role table, and the cookie is
+`omnion_member` rather than the panel's `omnion_session`. A site may call its own member `editor`
+and that word must never resolve to the platform's `content.pages.update`. The walk asserts both
+directions of the cookie and then reads `information_schema.columns` — because a boundary held by
+convention is a boundary the next writer erases.
+
+**Five defects the gates found, and two of them would have taken a whole public site down.**
+
+The first: **an ungated page answered 404 to every signed-out visitor.** The gate asked the member
+whether the page was satisfied and used the answer — `member.is_some_and(|m| m.satisfies(…))` is
+`false` for a visitor, because there is no member to ask. A site that had gated nothing would have
+served nothing to anybody. The gate is a property of the page first and the member second, and
+that ordering is now in the code rather than in a comment next to it.
+
+The second is the same shape and worse, because it failed its own acceptance criterion: the site
+policy shipped `gated_page_behaviour default 'prompt'`, so a fresh install answered **401** where
+the criterion asks for **404**. A default is not a neutral starting value; it is the behaviour
+everybody gets until they change it. The walk now asserts the default *before* anything is
+configured, which is the only order in which "the default is the criterion" is a test.
+
+The other three are smaller and each is its own lesson. `make_interval(hours => $3)` bound an
+`f64` and PostgreSQL has no `double precision` overload, so **every verification signup was a
+500** — the double opt-in was dead on arrival and the walk that was supposed to prove it was the
+thing that noticed. `cms_member_tokens_expiry_check` compared `expires_at` to `created_at`, which
+forbids moving a live row's expiry into the past; the constraint made the 48-hour window
+untestable, and **a constraint that a correct behaviour cannot satisfy is a constraint that gets
+dropped** rather than one that gets worked around. And the password-reset route serves both halves
+of one flow while requiring an `email` the finishing half does not have — a member following a
+link does not know which of ten thousand accounts they are — so the finishing half was a 422
+always, and a reset that cannot be finished is not a slower reset, it is no reset.
+
+**One harness change is worth recording because it is a trap the loop will hit again.** REQ-012
+slice 3 put the rate limiter on the request path last tick, and `sign_in` ships at 10 per 300
+seconds. Ten walks that each sign a panel account in twice is 24 requests from one process, so the
+suite's first run died with `429` on its *second* fixture. The fix is the same shape as that
+tick's: `ensure_installed` first, then reload, then **assert the live policy carries the suite's
+number** — because a silently-ignored reload and a working one are indistinguishable from the
+call site, and the failure then waits for a day when the suite is bigger.
+
+**Next.** (a) The browser half of slice 4c: the `/members` and `/members/settings` screens, the
+depth pass, and acceptance 18 at 390 px. (b) The browser pass is still queued rather than passed —
+the global QA slot is held by another writer and this box ran at load 29 with 0 MB of free RAM,
+which is also why the suite is proved as 9 walks plus 1 rather than 10 in one process (the tenth
+starved in `spawn_blocking` with the runtime's workers gone; it passes alone in 19 s).
+
+**Commits:** `cd66014` the migration · `b191fe7` the store · `4d61ab4` the API surface · `96a05e7`
+the ten walks · `7f4100d` the gate on the public page. Pushed.
