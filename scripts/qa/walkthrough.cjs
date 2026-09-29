@@ -6938,13 +6938,13 @@ async function main() {
   log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
-  await runPalette(page, report);
+  await runDepthPass("palette", () => runPalette(page, report));
 
   // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
-  await runCommandCenter(page, report);
+  await runDepthPass("command-center", () => runCommandCenter(page, report));
 
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
-  await runSearchDepth(page, report);
+  await runDepthPass("search-depth", () => runSearchDepth(page, report));
 
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
@@ -7060,7 +7060,7 @@ async function main() {
 
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
-  await runIamSubjectsDepth(page, report);
+  await runDepthPass("iam-subjects-depth", () => runIamSubjectsDepth(page, report));
 
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
   report.iamPolicies = await runIamPoliciesDepth(page, report);
@@ -7069,7 +7069,7 @@ async function main() {
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
   // and a diff on save, the session list with a real revoke, the device registry and the MFA
   // enrolment dialog.
-  await runIamSecurityDepth(page, report);
+  await runDepthPass("iam-security-depth", () => runIamSecurityDepth(page, report));
   log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -7086,26 +7086,26 @@ async function main() {
   // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
   // owner's own account, the panel lists it, the sign-in asks for it and completes with it, and
   // the pass is removed again so the account is back to its password.
-  await runPasskeysDepth(page, report);
+  await runDepthPass("iam-passkeys", () => runPasskeysDepth(page, report));
   log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
   // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
   // refusals of the ask form. It runs after the count-sensitive passes because an approval adds a
   // time-boxed binding (and the generated grant role) to the organization.
-  await runIamApprovalsDepth(page, report);
+  await runDepthPass("iam-approvals-depth", () => runIamApprovalsDepth(page, report));
   log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
 
   // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
   // round trip through the real endpoint from this browser, read the sync log back, revoke the
   // token and prove it is refused afterwards.
-  await runIamProvisioningDepth(page, report);
+  await runDepthPass("iam-provisioning-depth", () => runIamProvisioningDepth(page, report));
   log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
   // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
   // remove the provider and see the list go back to its empty state.
-  await runIamAuthenticationDepth(page, report);
+  await runDepthPass("iam-authentication-depth", () => runIamAuthenticationDepth(page, report));
   log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
 
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
