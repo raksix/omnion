@@ -3970,3 +3970,70 @@ close slice 1; if the pass finds anything, fix it in the same tick — the depth
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
+
+## 2026-09-29 · tick 10 · REQ-065 slice 4 part 4 — a token that can be rotated, and one that expires
+
+**What.** The store's module doc has claimed "tokens are rotatable" since `0011_iam_advanced`
+wrote the table, and no rotation existed. The only thing a caller could do was revoke, which is a
+different operation: it kills the credential and hands back nothing to paste into the directory.
+REQ-065's acceptance criterion names the difference — "a **rotated** token refuses the old value" —
+so the criterion was half absent rather than merely unproven. Slice 4 part 4 builds it, and with it
+the **expiry** the spec asks for and the table could not express: a token minted in 2024 was still
+accepted in 2026, and a token that never expires is the one credential whose compromise is silent
+(no user, no password, no login to notice).
+
+`0124` adds the chain (`provisioning_token_rotations`, old → new), `rotated_at`/`expires_at` on the
+token, and a check constraint refusing an expiry that precedes creation. The old row is **kept**,
+revoked and linked, never deleted — it is the evidence that the secret found in a log is the one
+that was replaced. `rotate_token` is one transaction: revoke-then-insert would leave a live connector
+with no working credential if the insert failed, which is strictly worse than a revoke the operator
+chose deliberately, and the `for update` on the old row means two rotations cannot both mint a
+successor.
+
+**Three defects, none of them found by reading the code.**
+
+- The rotation response rendered the replaced token from the row read **before** the write, so it
+  said `rotated: false` about a token that was now rotated. That is the one surface whose entire
+  job is to say "this was replaced", and it contradicted the list the panel refreshes into. It
+  re-reads the persisted row. A response about a write should describe the write.
+- `From<IdentityError>` had **no arm** for `InvalidProvisioning`, so every provisioning refusal fell
+  through to the catch-all and became `500 internal_error`. A zero-day lifetime told the operator
+  the platform was broken. This is the same class as the JIT-password defect earlier in this REQ: a
+  wrong status on a credential path is a tell, and this one says "a token is near its limit" rather
+  than "we are down".
+- A cross-tenant rotation answered `cross_organization`, which **confirms the guessed id names a
+  real token**. `ensure_same_organization` is right for a body field the caller supplied and wrong
+  for a path id that was never theirs; the route now answers `404` like a missing row.
+
+**The test asserts the acceptance sentence and not a flag.** The old secret is presented to the real
+`/scim/v2/Users` and the `401` is read — after first asserting that same secret returned `200` a
+moment earlier, so the test cannot pass against a token that never worked. The list check greps the
+whole response body for the secret rather than looking for a `secret` field, because a secret that
+leaks into a neighbour field is the same leak. The expiry assertion shortens the window to one
+second and *waits* rather than backdating the column, because the constraint correctly refuses an
+expiry before creation and a test that had to defeat the constraint to set up its own scenario was
+testing the wrong thing.
+
+**Proof.** `cargo test -p omnion-api --test iam_token_rotation` → **1 passed** (15.5s) against the
+real router and a real database. `cargo test -p omnion-identity --lib` → **199 passed**.
+`cargo build -p omnion-api` → clean (3 pre-existing warnings, none in this slice's files).
+`npx tsc --noEmit` in `apps/admin` → exit 0.
+
+**Not claimed.** The browser pass that was in flight when this tick started walked every `iam-*`
+route — `iam-provisioning`, `iam-authentication`, `iam-roles` and the rest all rendered and were
+interacted with — and then died with `ECONNREFUSED 127.0.0.1:3108`: the admin process was gone
+because the host had reached 31 of 32 GB used and `/` at 100%. That is the box, not the change,
+and it happened *before* the depth passes, so the rotation step this slice added to
+`walkthrough.cjs` has never been driven. Slice 4 stays open and so does slice 3.
+
+**Merge.** `origin/main` had moved 11 commits and the append-only `BUILD-LOG.md` conflicted. The
+headings in this file are not all `##`: one entry (`### Wave 5b · REQ-065 slice 3`) is `###`, and a
+splitter that only recognises `##` silently drops it — which is exactly how 84 lines of my own
+slice-3 entry went missing on the first attempt. Entries are split on `#{2,3}` and the result is
+verified as a **per-side containment** check (`Counter(ours) - Counter(merged)` and the same for
+theirs, both zero) rather than a line count, because `ours + theirs` double-counts the shared base
+and reports the entire base as lost. Line counts cannot verify a merge; multiset containment can.
+
+**Next.** Free the host (the `omnion_*` test databases are 15–20 MB each and there are dozens), then
+run the pass on the private stack and read the rotation step. After that, slice 4 part 5: the
+`iam.group_membership_synced` event, which no code path emits today.
