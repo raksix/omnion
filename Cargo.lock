@@ -1372,6 +1372,7 @@ dependencies = [
  "omnion-media",
  "omnion-module-analytics",
  "omnion-module-crm-intake",
+ "omnion-module-ecommerce",
  "omnion-notifications",
  "omnion-onboarding",
  "omnion-permissions",
@@ -1565,6 +1566,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-ecommerce"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "time",

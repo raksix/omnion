@@ -558,6 +558,31 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Manage first-response targets, business hours and escalation targets",
     },
+    // Commerce (REQ-118, slice 1a). Split by *what the key lets somebody change*, and the
+    // split is the one REQ-118's own admin surface names: the settings that decide how the
+    // public shop behaves, and the visitor accounts that shop created.
+    //
+    // * `commerce.storefront.manage` is the per-site configuration — page size, tax wording,
+    //   the quantity cap, whether a stranger may check out. Every one of those is a number a
+    //   customer sees, which is why it is not folded into a general "commerce" key: a role
+    //   that can edit the storefront must not thereby gain the ability to read every visitor's
+    //   account.
+    PermissionDef {
+        key: "commerce.storefront.manage",
+        category: "commerce",
+        description: "Manage per-site storefront settings: listing, checkout, tax display and limits",
+    },
+    // * `commerce.storefront.accounts.read` is the visitor account list and the abandoned-cart
+    //   view. It is deliberately *not* part of `manage`: the settings describe a shop, these
+    //   rows describe people. Reading somebody's name and e-mail is a different and larger act
+    //   than changing a page size, and the visitor accounts are deliberately separate tables
+    //   from panel users (REQ-118 §Risks, "Visitor accounts stay separate from panel users") —
+    //   so their power must be separate too.
+    PermissionDef {
+        key: "commerce.storefront.accounts.read",
+        category: "commerce",
+        description: "Read visitor accounts and abandoned carts, including contact details",
+    },
     // `notifications.admin` is the org-wide delivery log and the router's rules. It arrived with
     // slice 3, which is the first build where it has routes behind it — a permission with no
     // route is a role entry granting a promise the platform cannot keep, which is why it was

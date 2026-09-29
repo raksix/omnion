@@ -79,6 +79,7 @@ pub mod commands;
 pub mod content;
 pub mod crm_assignment;
 pub mod crm_intake;
+pub mod storefront;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -225,6 +226,30 @@ fn crm_assignment_surface(state: &AppState) -> Router<AppState> {
         .route("/crm/assignment/simulate", post(crm_assignment::simulate))
         .route_layer(guards::require(state, "crm.leads.read"));
     assignment.merge(sla).merge(simulate)
+}
+
+/// The storefront configuration surface (REQ-118, slice 1a).
+///
+/// One router, one permission, and **only the routes whose tables exist**. The catalogue, the
+/// cart and the checkout are a surface over the commerce engine (REQ-008), which is unbuilt —
+/// declaring a route here that reads `commerce_products` would be a route that 500s on every
+/// request, so they ship with the commerce engine rather than ahead of it.
+///
+/// `/vocabulary` is declared **before** `/{site_id}` for the same reason the CRM router
+/// declares `/order` first: axum ranks static segments ahead of parameters, but the explicit
+/// ordering means the intent is in the file rather than inferred from a matcher.
+fn storefront_surface(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/commerce/storefront", get(storefront::list_sites))
+        .route(
+            "/commerce/storefront/vocabulary",
+            get(storefront::vocabulary),
+        )
+        .route(
+            "/commerce/storefront/{site_id}",
+            get(storefront::get_settings).merge(put(storefront::update_settings)),
+        )
+        .route_layer(guards::require(state, "commerce.storefront.manage"))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1428,6 +1453,7 @@ pub fn router(state: AppState) -> Router {
         // them into separate `.merge()`s would let a later edit give one of them the other's
         // key without anybody noticing.
         .merge(crm_assignment_surface(&state))
+        .merge(storefront_surface(&state))
         .route(
             "/analytics/settings",
             analytics_settings_read.merge(analytics_settings_write),
