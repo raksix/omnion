@@ -121,6 +121,35 @@ impl Lifecycle {
         !self.draining.swap(true, Ordering::AcqRel)
     }
 
+    /// Return to the serving phase, clearing the flag and the recorded summary.
+    ///
+    /// ## Why a drain can be abandoned
+    ///
+    /// A `SIGTERM` is a *request* to stop, and a supervisor sends one for reasons that do not
+    /// always survive the seconds it takes to act on it: an operator cancels a rolling restart,
+    /// `docker stop` is followed by `docker start` without the container having exited yet, an
+    /// autoscaler scales up while a node is mid-drain. In every one of those cases the process is
+    /// alive, holding its listener, and must go back to accepting traffic — and without this
+    /// method it has no way to say so. The drain's *effects* are deliberately not undone: the
+    /// in-flight requests that finished are finished, and the buffers that were swept were sent.
+    /// Only the flag is cleared, because the flag is the only part a readiness probe reads.
+    ///
+    /// The same reasoning is why a test can use it. `global()` is a `OnceLock`, so a walk that
+    /// flipped it and did not put it back would answer `503` to `/readyz` for every later test in
+    /// the same binary — a leaked flag is a failed suite that reports itself as a product defect.
+    /// A helper is used here rather than `self.draining.store(false, …)` so the reset goes
+    /// through the same door as the set, and cannot drift from it.
+    ///
+    /// Returns `true` if a drain was actually in progress, so a caller can log an *abandoned*
+    /// drain rather than a no-op — the two are different facts about the same call.
+    pub fn end_drain(&self) -> bool {
+        let was_draining = self.draining.swap(false, Ordering::AcqRel);
+        if let Ok(mut summary) = self.summary.lock() {
+            *summary = None;
+        }
+        was_draining
+    }
+
     /// How many requests are in flight.
     #[must_use]
     pub fn in_flight(&self) -> u64 {
@@ -425,6 +454,35 @@ mod tests {
             "an idle drain slept before checking: {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_drain_returns_the_process_to_serving() {
+        let lifecycle = Lifecycle::new();
+        assert!(lifecycle.begin_drain(), "the first drain must report that it started it");
+        assert!(lifecycle.is_draining());
+
+        assert!(
+            lifecycle.end_drain(),
+            "ending a drain that was in progress must say so — a caller logs an ABANDONED \
+             drain, which is a different event from a no-op"
+        );
+        assert!(
+            !lifecycle.is_draining(),
+            "readiness still fails after the drain was abandoned, so the process refuses traffic \
+             it is perfectly able to serve"
+        );
+        assert!(
+            !lifecycle.end_drain(),
+            "a second end_drain reported a drain that was not happening"
+        );
+
+        // And it is idempotent with a real drain: begin → drain → end leaves nothing behind.
+        let lifecycle = Lifecycle::new();
+        drain_and_flush(&lifecycle, None, Duration::from_millis(50)).await;
+        assert!(lifecycle.is_draining(), "a completed drain must still be draining");
+        assert!(lifecycle.end_drain());
+        assert!(lifecycle.summary().is_none(), "the abandoned summary was left readable");
     }
 
     #[tokio::test]
