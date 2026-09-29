@@ -88,12 +88,35 @@ pub async fn find_page(pool: &PgPool, id: Uuid) -> Result<Option<Page>> {
         .map_err(Into::into)
 }
 
-/// Look a page up by site and slug — the address the public renderer resolves (phase P07).
-pub async fn find_page_by_slug(pool: &PgPool, site_id: Uuid, slug: &str) -> Result<Option<Page>> {
+/// Look a page up by site and slug, in one environment — the address the public renderer
+/// resolves (phase P07).
+///
+/// The environment is a **required** argument rather than a filter, and that is the whole point
+/// of the signature. Migration 0148 moved a page's identity from `(site_id, slug)` to
+/// `(site_id, environment_id, slug)`, so the two-column match this function used to run is no
+/// longer a lookup — it is a *multi-row* query the moment any staging environment holds a copy,
+/// and `fetch_optional` over two rows is a protocol error rather than "the first one". Making the
+/// environment mandatory means a caller can no longer forget it: a staging copy cannot silently
+/// break production's public read, because there is no version of this function that looks at
+/// more than one environment.
+///
+/// Which environment is the caller's decision, and it is never a guess: the public renderer asks
+/// for the organization's production environment, because a visitor's host addresses the live
+/// site. See `crate::routes::public`.
+pub async fn find_page_by_slug(
+    pool: &PgPool,
+    site_id: Uuid,
+    environment_id: Uuid,
+    slug: &str,
+) -> Result<Option<Page>> {
     let slug = validate_slug(slug)?;
-    let sql = format!("select {PAGE_COLUMNS} from pages where site_id = $1 and slug = $2");
+    let sql = format!(
+        "select {PAGE_COLUMNS} from pages \
+         where site_id = $1 and environment_id = $2 and slug = $3"
+    );
     sqlx::query_as::<_, Page>(&sql)
         .bind(site_id)
+        .bind(environment_id)
         .bind(&slug)
         .fetch_optional(pool)
         .await

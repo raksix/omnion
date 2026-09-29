@@ -20,6 +20,7 @@ use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use omnion_content::{ContentError, pages};
+use omnion_environment::store as environment_store;
 use omnion_identity::Site;
 use omnion_identity::sites;
 use serde::{Deserialize, Serialize};
@@ -138,7 +139,24 @@ pub async fn get_published_page(
     let pool = state.db().pool();
     let site = resolve_site(pool, query.site.as_deref(), &headers).await?;
 
-    let page = match pages::find_page_by_slug(pool, site.id, &slug).await {
+    // Which environment the visitor is reading is decided HERE and never inferred: a host
+    // addresses the organization's *production* content, and the staging copy of the same slug
+    // is a different row in a different environment (REQ-017, migration 0148). Resolving the
+    // production environment rather than "any row with this slug" is what keeps two failures
+    // apart — the visitor sees the published revision, and a staging draft can never be served
+    // to the public even by accident.
+    //
+    // An organization with no production environment cannot happen while migration 0147's trigger
+    // holds (every organization gets one on insert), but a site whose organization somehow lost
+    // it should answer the *public* 404 rather than a 500 — a visitor learns nothing about an
+    // installation that is missing its own invariant, and a leaked `environment_not_found` would
+    // tell them one exists.
+    let environment_id = match environment_store::production(pool, site.organization_id).await {
+        Ok(environment) => environment.id,
+        Err(_) => return Err(page_not_found(&slug)),
+    };
+
+    let page = match pages::find_page_by_slug(pool, site.id, environment_id, &slug).await {
         Ok(page) => page,
         // A public address that is not a slug shape is simply not found — a `400` would leak
         // the panel's validation rules to a visitor.
