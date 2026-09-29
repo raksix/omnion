@@ -4827,6 +4827,21 @@ async function runMembersDepth(page, report) {
   await page.waitForTimeout(2500);
   steps.screenReady = (await page.locator("[data-members-state=\"ready\"]").count()) > 0;
   steps.policyPanelIsOnScreen = (await page.locator("[data-member-policy=\"ready\"]").count()) > 0;
+
+  // ------------------------------------------------------------------ the empty state, first
+  // The screen's table only shows what the fixture creates, so the state an owner meets on a
+  // fresh site is the one table this pass can never produce by accident — it has to be asserted
+  // while it is genuinely empty, or a panel that renders a blank panel on day one is only found
+  // by a person. It is read here BEFORE the fixture, and the hint is checked for the URL the
+  // signup form lives at: "nothing here" is an answer, "here is where they come from" is the
+  // part an owner actually needs.
+  steps.emptyStateIsShownWhenThereAreNoMembers =
+    (await page.locator("[data-members-state=\"ready\"]").innerText().catch(() => "")).length > 0 &&
+    (await page.locator("text=/No visitors have signed up yet/i").count()) > 0;
+  steps.emptyStateNamesTheSignupRoute =
+    (await page.locator("text=/sign ?up/i").count()) > 0;
+  await shot(page, "members-empty-state");
+
   // The panel must show the behaviour in force, not only offer the choice. An owner who cannot
   // see which answer a gated page gives cannot reason about who can find their pages.
   steps.panelShowsTheGatedBehaviour =
@@ -4844,7 +4859,8 @@ async function runMembersDepth(page, report) {
     })
     .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
     .catch(() => ({ status: 0, body: null }));
-  steps.operatorCreatedAMember = created.status === 201 && created.body && created.body.id;
+  steps.operatorCreatedAMember =
+    created.status === 201 && Boolean(created.body && created.body.id);
   const waitingId = (created.body && created.body.id) || "";
 
   // An invited address has NO password: that is the difference the table's badge draws, and a
@@ -7745,6 +7761,7 @@ async function main() {
     const required = [
       "memberTableExists", "memberTableHasNoPanelLink", "memberRolesArePlainText",
       "defaultGatedBehaviourIsNotFound", "screenReady", "policyPanelIsOnScreen",
+      "emptyStateIsShownWhenThereAreNoMembers", "emptyStateNamesTheSignupRoute",
       "panelShowsTheGatedBehaviour", "operatorCreatedAMember", "invitedHasNoPassword",
       "invitedRowSaysSo", "rowIsOnScreen", "pendingIsNotRenderedAsAFailure",
       "pendingTabMatchesSql", "drawerOpened", "drawerStatesTheBoundary", "rolesAreOnTheInput",
