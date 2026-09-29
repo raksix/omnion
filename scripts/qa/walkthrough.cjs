@@ -4175,7 +4175,6 @@ async function runMenusDepth(page, report) {
     `select count(*) from cms_menu_items where menu_id = '${menuId}'`,
   );
   const fourth = await page.evaluate(async (id) => {
-    const me = await fetch("/api/v1/me", { credentials: "same-origin" }).then((r) => r.json());
     const detail = await fetch(`/api/v1/menus/${id}`, { credentials: "same-origin" }).then((r) => r.json());
     // A fourth level under the deepest existing row, written through the store's own contract.
     const deepest = detail.items.find((item) => item.label === "QA third") ?? detail.items[0];
@@ -4234,6 +4233,10 @@ async function runMenusDepth(page, report) {
     steps.pickerOpened = (await page.locator("[data-page-picker]").count()) > 0;
     // Only published pages are offered: the server refuses a batch containing a draft *whole*,
     // so a picker that listed drafts would let an editor select five pages and lose all five.
+    // The picker's own answer and the API's are compared, and both halves are read from inside
+    // the browser: a Playwright locator is not in scope inside `page.evaluate`, and reaching for
+    // one there throws `ReferenceError: page is not defined` — which aborts the pass and reports
+    // a crash rather than a failed assertion.
     steps.pickerOnlyOffersPublished = await page.evaluate(async () => {
       const site = await fetch("/api/v1/sites", { credentials: "same-origin" }).then((r) => r.json());
       const first = site.sites?.[0];
@@ -4243,7 +4246,10 @@ async function runMenusDepth(page, report) {
       );
       const drafts = (all.pages ?? []).filter((p) => p.status !== "published").map((p) => p.id);
       if (drafts.length === 0) return true;
-      return (await page.locator(`[data-page-picker-page="${drafts[0]}"]`).count()) === 0;
+      const offered = Array.from(
+        document.querySelectorAll("[data-page-picker-page]"),
+      ).map((node) => node.getAttribute("data-page-picker-page"));
+      return drafts.every((id) => !offered.includes(id));
     });
     await page.locator(`[data-page-picker-page="${publishedPage}"]`).check({ timeout: 3000 }).catch(() => {});
     await page.locator("[data-page-picker-add]").click({ timeout: 5000 }).catch(() => {});

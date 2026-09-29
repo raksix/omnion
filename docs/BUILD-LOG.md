@@ -3672,3 +3672,58 @@ plus tenancy scoping, read/write permission separation and the cross-organizatio
 settings, the location rail, the rendered preview strip with the audience toggle) and
 `/publishing/queue`. Then extend `scripts/qa/walkthrough.cjs` so both are in the inventory and
 run the browser pass — which is what closes this slice.
+
+## 2026-09-29 · wave2 (#14) · REQ-064 slice 1 — the three screens, and three defects the tests could not see
+
+**What.** The admin half of slice 1: `/menus`, `/menus/{id}/edit` and `/publishing/queue`, plus
+the walkthrough routes and a depth pass that drives all three against SQL.
+
+**The editor's shape, and why each part is the way it is.**
+
+1. **The ids are the editor's and never rewritten.** A drag is a reorder and a drop is a reparent,
+   and both are one whole-document `PUT` — six partial updates can half-apply, and a header with
+   a duplicate and a hole is a bug nobody reports until a visitor does.
+2. **The preview reads `GET /public/menus/{location}?audience=…`** — the call the theme makes. A
+   client-side re-implementation of the audience filter would agree with nothing, and the day it
+   disagreed with the live site somebody would believe the preview.
+3. **Reordering is buttons first and a pointer drag second**, over one `move()` function. A
+   gesture that only exists for a mouse is a feature half the panel cannot reach.
+4. **Only a pending queue row carries reschedule / cancel / publish-now.** The server refuses the
+   others, and a present-but-dead button teaches people to distrust the row it sits on.
+5. **The timezone is printed beside the instant, not converted into it.** The instant is UTC and
+   the label is the author's wall clock; collapsing the two is how a 9:00 post goes out at 6:00.
+
+**Three defects, none of which a unit test could have found.**
+
+- **The tree row closed over the wrong id.** `TreeRow` took eight already-bound callbacks and
+  passed them to its children, so every depth ran the *top-level* row's handlers: a third-level
+  "delete" took the first-level branch with it, and a "nest" moved the first row instead of the
+  third. It type-checks, it renders, and the type system has nothing to say about it. The fix is
+  a `actionsFor(id)` factory the recursion calls per row — the shape that cannot express the bug.
+- **Eight events were constructed and then dropped.** `emit()` returns a future; every call site
+  in `menus.rs` forgot `.await`, so `content.menu.updated` and `content.page.schedule_cancelled`
+  had never reached the bus. A create, a rename, a tree save, a page bulk-add, a delete, a
+  schedule, a reschedule and a cancellation all announced themselves to nobody — and 191 lib
+  tests were green throughout, because a bus write is a side effect of the *route*, not of the
+  store. The only thing that named it was `warning: unused implementer of std::future::Future`.
+- **The migration number was already taken.** Merging main brought `0051_notification_routes.sql`
+  into a branch that already had a 0051; sqlx replayed both under one version and every boot of
+  the QA stack died with *"migration 51 was previously applied but has been modified"* — a
+  message that reads as a corrupt database rather than as two files claiming the same number.
+  The ledger is a shared namespace: the next free number is read off `origin/main`'s high-water
+  mark at commit time, never off the branch. 0051 -> 0052.
+
+**One harness defect, found twice the hard way.** A QA pass died with `Script not found:
+.../target/debug/omnion-api` — twice, each time after the database had already been reset. This
+worktree builds into `/dev/shm/w2-target` to keep the shared volume from filling, pm2 starts from
+the fixed path, and nothing copied between them. `run.sh` now copies the binary over whenever
+`CARGO_TARGET_DIR` differs from `target/`, which also covers the case where the disk guard dropped
+`target/` between the build and the pm2 start.
+
+**Proof.** `pnpm typecheck` -> 2 successful, 0 errors. `cargo test -p omnion-content --lib` ->
+**118 passed** (the migration-consistency test reads the renumbered file). `cargo test -p
+omnion-api --lib` -> **191 passed**. `bash scripts/qa/run.sh` under `QA_STACK=w2` ->
+see the report entry below.
+
+**Next.** Close slice 1 on the browser pass, then REQ-062 (`themes`) and the rest of the wave-2
+queue: REQ-019, REQ-018, REQ-020, REQ-031, REQ-029, REQ-026, then wave 2b (REQ-109..116, 082, 084).
