@@ -4565,3 +4565,79 @@ one of them is the actual security fix:
 tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
 referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
 real to report, which is why those two rows are the most useful thing this tick left behind.
+
+## 2026-09-29 · omnion-w9 · REQ-065 slice 4 part 9 — the provider deletion guard
+
+**The criterion was absent rather than unproven.** `0127` gave `users` the three columns
+REQ-065's own data model names — and declared
+`provisioned_by_provider_id … on delete set null`. So `DELETE /iam/providers/{id}` was
+**unguarded and silent**: a provider with provisioned accounts went away, and every one of
+those accounts quietly became a `local` account, keeping its sessions and its role grants
+while losing every record of which directory had vouched for it. The criterion asks for a
+count. There was no count anywhere.
+
+**Four atomic commits.**
+
+- `4f44147` — `0127_user_identity_provenance.sql` and `scripts/qa/run-iam-0127.sh`.
+- `3dc28a4` — `crates/identity/src/provenance.rs`: the store, `Impact`, and the refusal sentence.
+- `f9e3598` — `ApiError::conflict`. `400` says "fix your request", `403` says "you may not",
+  and nothing said "your request is right and the current state refuses it".
+- `422e9b8` — the guarded delete, `GET /deletion-impact`, `POST /reassign`, and the walk.
+
+**The design decision the count is built on.** `Impact` carries a total **and** a per-source
+breakdown, because either alone is a plausible wrong answer. "7 accounts" is a number to be
+waved through; "7 accounts: 5 LDAP, 2 SCIM" tells an operator that a directory sweep created
+these people. And the SCIM case is why the breakdown exists: `0127` deliberately leaves a
+pushed row with **both** halves null, because a connector names no provider — so a guard keyed
+on the provider id answers "0 accounts" for a directory that just created eight people. That
+is the lie that matters, and the walk pins it.
+
+**The walk found a contradiction between two halves of the same migration.** `on delete set
+null` nulls the provider and leaves the external id — which is *precisely* the half-written
+provenance `users_provenance_paired_check` exists to refuse. Deleting a provider with one
+provisioned account therefore raised `23514` and rolled back. The delete was blocked, which is
+the outcome the request asks for, but by an error nobody can read: a constraint name, instead
+of the refusal that names the count and what to do about it. `restrict` moves that refusal to
+the layer that owns the rule, so the application guard runs first and gets to be the good
+error, and the foreign key is what is left if somebody reaches past the API. Neither half of
+`0127` was wrong on its own terms.
+
+**Three further defects, all found rather than assumed.**
+
+- `comment on column` takes a literal, not a concatenation expression. The `||` form is a
+  plausible way to wrap a long comment and it is a syntax error.
+- The gate's own duplicate-id fixture used `from organizations o, auth_providers p where
+  o.slug = … and p.slug = 'okta'` — a cross join over two tenants' identically-slugged
+  providers, with `limit 1` picking whichever row the planner returned first. The same
+  unscoped-slug mistake the migration's own header warns about, committed inside the test
+  that exists to catch it.
+- `Impact::refusal` produced `"3 accounts are were provisioned"` — a template with both a
+  pluralised noun and a baked-in verb. It shipped to the walk, which printed it, before the
+  unit tests could.
+
+**Two places where the test was wrong and the code was right, and both are worth naming.**
+The walk first asserted a cross-tenant read answers `404`; this surface has always answered
+`403 cross_organization`, because `load()` resolves the organization on the loaded row.
+Changing `load()` for this slice would be the wrong trade, so the test now pins the guarantee
+that actually matters — the refusal must not carry an address, a source or a count. And the
+unknown-source case asked the database to accept `'passkey_only'`, which `0127`'s closed
+vocabulary correctly refuses; the test now drops the constraint inside a rolled-back
+transaction, which is the only way to produce the state a *newer* migration leaves on an
+*older* binary.
+
+**Proof.**
+
+- `bash scripts/qa/run-iam-0127.sh` → **PASS** — 5 pre-existing accounts survived, the same
+  provider slug in two organizations did not cross tenants, `confdeltype = 'r'`, the delete is
+  refused while anything depends on it and permitted once every account is reassigned.
+- `bash scripts/qa/run-media-walk.sh iam_provider_deletion` → **3 passed** (21.6s) against the
+  real router and a disposable database.
+- `cargo test -p omnion-identity --lib` → **227 passed** (218 before).
+- `cargo test -p omnion-api --lib` → **208 passed**.
+- `pnpm --filter @omnion/admin typecheck` → clean.
+
+**Not claimed.** The panel half: the deletion dialog, the impact read and the reassign button
+do not exist yet, and the browser pass on the private stack (`QA_STACK=w9`, 18088/3108/3208)
+has still not run on this branch at all. Criterion 15's screen boxes stay unticked until it
+has. The remaining REQ-065 work after that is the panel half of this slice, the live OIDC
+round trip against the stub IdP with a SCIM-provisioned subject, and then REQ-066.
