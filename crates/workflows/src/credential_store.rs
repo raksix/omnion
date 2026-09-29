@@ -444,37 +444,74 @@ pub async fn mark_connected(
 // Usage: derived, never stored
 // ---------------------------------------------------------------------------------------------
 
+/// The `jsonb_array_elements` expression a usage probe reads.
+///
+/// A workflow's nodes live in `graph` once the visual builder's migration (REQ-086 slice 1,
+/// `0051_workflow_graph.sql`) has landed, and in `steps` before it. Both are probed and
+/// coalesced, because the two live in *different branches* until someone merges them — and a
+/// probe that names only `graph` is a `500` on every install that has not merged it yet, which
+/// is exactly what the first run of `scripts/qa/credential-contract.sh` found.
+///
+/// The shape is the same in both: an array of nodes, each with `params`. `graph` is the one the
+/// canvas edits and the one that carries the credential reference; `steps` is what the runner
+/// executes, and it carries the same `params` because they are the same definition written
+/// twice. Reading both and coalescing means the answer is right on either branch, and right on
+/// the merged one where both exist.
+/// `to_jsonb(w)` is the whole trick: it projects whatever columns the row *has*, so naming a
+/// key that does not exist is a null at run time rather than a parse error. `w.graph` written
+/// directly would be rejected by the planner before the query ever runs, on any install that
+/// has not merged `0051_workflow_graph.sql` — and a probe that cannot be parsed cannot be
+/// rescued by a `coalesce` around it.
+const NODES_EXPR: &str = "coalesce(
+        case when jsonb_typeof(to_jsonb(w) -> 'graph' -> 'nodes') = 'array'
+             then to_jsonb(w) -> 'graph' -> 'nodes' end,
+        case when jsonb_typeof(to_jsonb(w) -> 'steps') = 'array'
+             then to_jsonb(w) -> 'steps' end,
+        '[]'::jsonb)";
+
+/// The usage statement, built once.
+///
+/// Both call sites run *this*: the public view and the guard inside the delete's transaction.
+/// Two copies of a query is two queries that can disagree, and a guard that disagrees with the
+/// screen that explains it is the worst pair on this surface — the reader is told a credential
+/// is unused, presses delete, and the guard refuses for a reason neither of them can see.
+const SQL_USAGE: &str = "select w.id as workflow_id, w.name as workflow_name, \
+     coalesce(n->>'id', '') as node_id, \
+     coalesce(nullif(n->>'label', ''), nullif(n->>'name', '')) as node_label, \
+     coalesce(nullif(n->>'type', ''), nullif(n->>'action', '')) as node_type \
+   from workflows w, lateral jsonb_array_elements(";
+
 /// Every node in every workflow of this organization that names `key`.
 ///
-/// The probe reads the *graph* rather than the `steps` array because the builder writes the
-/// graph and the runner reads the steps, and a credential reference lives on the node — the
-/// two representations are the same definition, and the graph is the one the canvas edits.
-/// `coalesce` on each field matters: a graph written by the SQL backfill (REQ-086's predecessor)
-/// carries `params` on every node, and a node without one is a node that references nothing
-/// rather than a row that drops out of the result.
+/// The `coalesce` on each projected field matters: a graph written by the SQL backfill carries
+/// `params` on every node, and a node without one is a node that references nothing rather
+/// than a row that drops out of the result.
 pub async fn usage(
     pool: &PgPool,
     organization_id: Uuid,
     key: &str,
 ) -> Result<CredentialUsageReport> {
-    let rows: Vec<CredentialUsage> = sqlx::query_as(
-        "select w.id as workflow_id, w.name as workflow_name, \
-           coalesce(n->>'id', '') as node_id, \
-           nullif(n->>'label', '') as node_label, \
-           nullif(n->>'type', '') as node_type \
-         from workflows w, \
-              lateral jsonb_array_elements( \
-                case when jsonb_typeof(w.graph -> 'nodes') = 'array' \
-                     then w.graph -> 'nodes' else '[]'::jsonb end) as n \
+    let sql = format!(
+        "{SQL_USAGE}{NODES_EXPR}) as n \
          where w.organization_id = $1 \
            and n->'params'->>'credential_key' = $2 \
-         order by w.name, node_id",
-    )
-    .bind(organization_id)
-    .bind(key)
-    .fetch_all(pool)
-    .await?;
+         order by w.name, node_id"
+    );
+    let rows: Vec<CredentialUsage> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(key)
+        .fetch_all(pool)
+        .await?;
+    Ok(report_from(rows))
+}
 
+/// Build a report from raw references: distinct workflows, distinct node types, and whether
+/// anything was found at all.
+///
+/// The two counts are counted differently on purpose — three references in two workflows is
+/// *two* workflows for the delete guard and *three* references for the reader — and doing it
+/// in one function means the two call sites cannot disagree about which is which.
+fn report_from(rows: Vec<CredentialUsage>) -> CredentialUsageReport {
     let mut workflows: Vec<Uuid> = rows.iter().map(|r| r.workflow_id).collect();
     workflows.sort_unstable();
     workflows.dedup();
@@ -482,12 +519,12 @@ pub async fn usage(
     node_types.sort_unstable();
     node_types.dedup();
 
-    Ok(CredentialUsageReport {
+    CredentialUsageReport {
         workflow_count: workflows.len(),
         node_type_count: node_types.len(),
         in_use: !rows.is_empty(),
         references: rows,
-    })
+    }
 }
 
 /// The keys of every credential a set of workflows names, for the canvas's "missing
@@ -496,19 +533,17 @@ pub async fn usage(
 /// Distinct by construction: a graph may name the same key on four nodes, and the canvas wants
 /// one warning per key, not four.
 pub async fn referenced_keys(pool: &PgPool, organization_id: Uuid) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
+    let sql = format!(
         "select distinct n->'params'->>'credential_key' as key \
-         from workflows w, \
-              lateral jsonb_array_elements( \
-                case when jsonb_typeof(w.graph -> 'nodes') = 'array' \
-                     then w.graph -> 'nodes' else '[]'::jsonb end) as n \
+         from workflows w, lateral jsonb_array_elements({NODES_EXPR}) as n \
          where w.organization_id = $1 and n->'params' ? 'credential_key' \
            and nullif(btrim(n->'params'->>'credential_key'), '') is not null \
-         order by key",
-    )
-    .bind(organization_id)
-    .fetch_all(pool)
-    .await?;
+         order by key"
+    );
+    let rows: Vec<(String,)> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(|(key,)| key).collect())
 }
 
@@ -582,42 +617,27 @@ pub struct DeleteOutcome {
 }
 
 /// The usage probe over an open transaction, so the guard reads inside its own lock.
+///
+/// The same statement and the same `report_from` as the public probe: the guard inside the
+/// transaction and the usage view outside it must agree, or a delete can be refused with a
+/// count the reader then sees differently.
 async fn usage_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     organization_id: Uuid,
     key: &str,
 ) -> Result<CredentialUsageReport> {
-    let rows: Vec<CredentialUsage> = sqlx::query_as(
-        "select w.id as workflow_id, w.name as workflow_name, \
-           coalesce(n->>'id', '') as node_id, \
-           nullif(n->>'label', '') as node_label, \
-           nullif(n->>'type', '') as node_type \
-         from workflows w, \
-              lateral jsonb_array_elements( \
-                case when jsonb_typeof(w.graph -> 'nodes') = 'array' \
-                     then w.graph -> 'nodes' else '[]'::jsonb end) as n \
+    let sql = format!(
+        "{SQL_USAGE}{NODES_EXPR}) as n \
          where w.organization_id = $1 \
            and n->'params'->>'credential_key' = $2 \
-         order by w.name, node_id",
-    )
-    .bind(organization_id)
-    .bind(key)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    let mut workflows: Vec<Uuid> = rows.iter().map(|r| r.workflow_id).collect();
-    workflows.sort_unstable();
-    workflows.dedup();
-    let mut node_types: Vec<&str> = rows.iter().filter_map(|r| r.node_type.as_deref()).collect();
-    node_types.sort_unstable();
-    node_types.dedup();
-
-    Ok(CredentialUsageReport {
-        workflow_count: workflows.len(),
-        node_type_count: node_types.len(),
-        in_use: !rows.is_empty(),
-        references: rows,
-    })
+         order by w.name, node_id"
+    );
+    let rows: Vec<CredentialUsage> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(key)
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(report_from(rows))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -816,6 +836,104 @@ mod tests {
                 "{forbidden} must never be a column of this table"
             );
         }
+    }
+
+    #[test]
+    fn the_usage_probe_reads_the_graph_or_the_steps_and_never_a_missing_column() {
+        // `graph` arrives with the visual builder's migration (REQ-086 slice 1,
+        // `0051_workflow_graph.sql`) and `steps` is what every install has today. The two live
+        // in different branches, so a probe naming only `graph` is a `500` on any install that
+        // has not merged it — which is what the first run of `scripts/qa/credential-contract.sh`
+        // found, as a 500 on `/usage` and on the delete that guards with it.
+        assert!(
+            NODES_EXPR.contains("-> 'graph' -> 'nodes'"),
+            "the builder's representation is probed"
+        );
+        assert!(
+            NODES_EXPR.contains("-> 'steps'"),
+            "the runner's representation is probed too"
+        );
+        // The direct form would not parse at all on a branch without the builder's migration,
+        // so the projection goes through `to_jsonb` — a missing key is null, not a syntax
+        // error. This assertion is the difference between the two being caught at build time
+        // and being caught as a 500 in production.
+        assert!(
+            NODES_EXPR.contains("to_jsonb(w)"),
+            "the probe projects the row, so a column that does not exist yet is not a parse error"
+        );
+        assert!(
+            !NODES_EXPR.contains("w.graph"),
+            "a bare `w.graph` reference is rejected by the planner on any install without 0051"
+        );
+        assert!(
+            NODES_EXPR.trim_start().starts_with("coalesce("),
+            "and the two are coalesced, so neither branch is a hard dependency"
+        );
+        // The two representations disagree about names, and the usage view has to render
+        // whichever it is given. A `steps` node calls its name `name` and its type `action`; a
+        // `graph` node calls them `label` and `type`. Reading only the graph's spelling makes
+        // every usage row on a pre-builder install say nothing, which is what the first run of
+        // `scripts/qa/delete-guard.sh` found — the guard fired correctly and the row was blank.
+        assert!(
+            SQL_USAGE.contains("nullif(n->>'name', '')")
+                && SQL_USAGE.contains("nullif(n->>'action', '')"),
+            "a steps-era node's `name`/`action` are read as well as a graph node's `label`/`type`"
+        );
+        // A probe with no fallback would be one `500` away from a silently empty usage view,
+        // which reads as "nothing uses this" and lets the guard delete a live credential.
+        assert!(
+            NODES_EXPR.contains("'[]'::jsonb"),
+            "a workflow with neither representation contributes no nodes rather than failing"
+        );
+    }
+
+    #[test]
+    fn the_report_counts_workflows_and_references_differently_on_purpose() {
+        // Three references in two workflows is *two* workflows for the delete guard and
+        // *three* references for the reader. Getting this wrong in either direction is a real
+        // bug: undercount the workflows and the guard lets a live credential go.
+        let rows = vec![
+            CredentialUsage {
+                workflow_id: Uuid::from_u128(1),
+                workflow_name: "Nightly".into(),
+                node_id: "n1".into(),
+                node_label: None,
+                node_type: Some("http_request".into()),
+            },
+            CredentialUsage {
+                workflow_id: Uuid::from_u128(1),
+                workflow_name: "Nightly".into(),
+                node_id: "n2".into(),
+                node_label: None,
+                node_type: Some("http_request".into()),
+            },
+            CredentialUsage {
+                workflow_id: Uuid::from_u128(2),
+                workflow_name: "Signup".into(),
+                node_id: "n1".into(),
+                node_label: None,
+                node_type: Some("send_email".into()),
+            },
+        ];
+        let report = report_from(rows);
+        assert_eq!(report.references.len(), 3, "three references");
+        assert_eq!(report.workflow_count, 2, "two workflows");
+        assert_eq!(
+            report.node_type_count, 2,
+            "two node types, the repeat collapsed"
+        );
+        assert!(report.in_use);
+    }
+
+    #[test]
+    fn an_empty_probe_is_not_in_use() {
+        // The other direction of the same guard: a credential nothing names must be
+        // deletable, or the guard refuses forever and the reader concludes the button is
+        // broken.
+        let report = report_from(Vec::new());
+        assert!(!report.in_use);
+        assert_eq!(report.workflow_count, 0);
+        assert_eq!(report.references.len(), 0);
     }
 
     #[test]
