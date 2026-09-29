@@ -233,7 +233,19 @@ pub struct Lead {
     /// The normalized key the dedupe verdict used.
     pub dedupe_key: Option<String>,
     /// The lead this one duplicates, when the policy kept it separate.
+    ///
+    /// A **lead**, not a contact: this pointer answers "this submission repeats one we already
+    /// have", and the "it matched an existing contact" question is `dedupe_contact_id`. The two
+    /// were one column for fourteen ticks and the code wrote a contact id here, which the
+    /// foreign key refuses on every installation that has the CRM.
     pub duplicate_of: Option<Uuid>,
+    /// The contact the dedupe verdict matched.
+    ///
+    /// No foreign key to `crm_contacts`, by design: that table is REQ-051's and an installation
+    /// without the CRM still has to be able to write a lead row (with this column null).
+    pub dedupe_contact_id: Option<Uuid>,
+    /// The confidence the verdict was made on, 0.0–1.0.
+    pub dedupe_score: Option<f64>,
     /// The verdict.
     pub decision: Option<String>,
     /// The rule that assigned it (slice 2).
@@ -686,12 +698,10 @@ mod tests {
         assert!(verdict.reasons.contains(&"honeypot".to_string()));
         // The submitter's own words are never part of the reason: the detail is shown to an
         // operator, and a reason that quoted the spam would put attacker text in the panel.
-        assert!(
-            !verdict
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("spam.example"))
-        );
+        assert!(!verdict
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("spam.example")));
     }
 
     #[test]
@@ -822,6 +832,8 @@ mod tests {
             payload: Value::Null,
             payload_bytes: 0,
             dedupe_key: None,
+            dedupe_contact_id: None,
+            dedupe_score: None,
             duplicate_of: None,
             decision: None,
             assignment_rule_id: None,

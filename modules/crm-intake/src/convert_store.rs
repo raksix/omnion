@@ -554,6 +554,8 @@ mod tests {
             payload: json!({ "message": "hello" }),
             payload_bytes: 20,
             dedupe_key: None,
+            dedupe_contact_id: None,
+            dedupe_score: None,
             duplicate_of: None,
             decision: None,
             assignment_rule_id: None,

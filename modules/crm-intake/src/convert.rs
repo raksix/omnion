@@ -401,6 +401,8 @@ mod tests {
             payload: json!({}),
             payload_bytes: 2,
             dedupe_key: None,
+            dedupe_contact_id: None,
+            dedupe_score: None,
             duplicate_of: None,
             decision: None,
             assignment_rule_id: None,
