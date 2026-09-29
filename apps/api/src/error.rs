@@ -78,6 +78,15 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, code, message)
     }
 
+    /// `409` — the request is well formed and the caller may do it, but the current state
+    /// refuses it. Distinct from `400` on purpose: `400` says "fix your request", `409` says
+    /// "your request is right and the world is not", and a client that conflates them either
+    /// gives up on a recoverable state or retries a malformed one forever.
+    #[must_use]
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
     /// Map a core error onto the API surface.
     ///
     /// A dependency that did not answer becomes `503` (retryable); everything else is an

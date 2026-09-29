@@ -284,7 +284,19 @@ pub fn router(state: AppState) -> Router {
         .merge(
             delete(iam_providers::delete_provider)
                 .layer(guards::require(&state, "iam.providers.manage")),
-        );
+        )
+        // Two more verbs on the same guard, and the split is the design: reading the impact is
+        // a *read*, and a dialog that had to press Delete to learn that Delete is refused is a
+        // dialog that failed. The reassign action writes accounts, so it stays under `manage` —
+        // an account that can read the provider list must not be able to strip a directory's
+        // claim on somebody's identity.
+        ;
+
+    let iam_provider_deletion_impact = get(iam_providers::provider_deletion_impact)
+        .layer(guards::require(&state, "iam.providers.read"));
+
+    let iam_provider_reassign = post(iam_providers::reassign_provisioned_accounts)
+        .layer(guards::require(&state, "iam.providers.manage"));
 
     let iam_provider_test =
         post(iam_providers::test_provider).layer(guards::require(&state, "iam.providers.manage"));
@@ -1187,6 +1199,18 @@ pub fn router(state: AppState) -> Router {
         .route("/iam/providers", iam_providers)
         .route("/iam/providers/{id}", iam_provider)
         .route("/iam/providers/{id}/test", iam_provider_test)
+        // Separate routes, not verbs merged onto `/iam/providers/{id}`. The deletion impact is a
+        // GET on a *sub*-path and the reassign a POST: merging them into the `{id}` method
+        // router would make the impact a second GET of the provider and the reassign a second
+        // POST of a provider, which are different actions with different guards.
+        .route(
+            "/iam/providers/{id}/deletion-impact",
+            iam_provider_deletion_impact,
+        )
+        .route(
+            "/iam/providers/{id}/reassign",
+            iam_provider_reassign,
+        )
         .route("/iam/providers/{id}/enable", iam_provider_enable)
         .route("/iam/providers/{id}/disable", iam_provider_disable)
         .route("/iam/providers/{id}/events", iam_provider_events)
