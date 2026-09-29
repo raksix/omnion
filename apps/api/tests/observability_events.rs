@@ -309,12 +309,20 @@ async fn a_degraded_exporter_writes_one_event_per_state_change_and_not_one_per_r
     let name = unique("events-exporter");
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
 
-    // An endpoint nothing listens on, and a 1 ms interval so every sweep is due. The collector
-    // is the process-global one, as it is in a running instance — a private collector would test
-    // a copy of the loop rather than the loop.
+    // An endpoint nothing listens on, and the SHORTEST interval the schema accepts so every sweep
+    // is due. The collector is the process-global one, as it is in a running instance — a private
+    // collector would test a copy of the loop rather than the loop.
+    //
+    // **`batch_ms` is 100, not 1, and the check constraint is why.** This walk used to write 1 and
+    // died on `obs_exporters_batch_check` (`check (batch_ms between 100 and 3600000)`) before
+    // reaching its first assertion. The two writes it makes are the whole point of the walk, so a
+    // schema that refuses the walk is not a red suite about the loop — it is a walk that never ran
+    // and a report that read as "the event was not emitted". The floor exists because a 1 ms
+    // interval is a busy loop against a real backend, and it is the same number an operator would
+    // set by mistake. 100 ms is already "every sweep is due" for six sweeps run back to back.
     sqlx::query(
         "insert into obs_exporters (name, kind, endpoint, batch_ms, timeout_ms, enabled) \
-         values ($1, 'otlp', 'http://127.0.0.1:9/v1/logs', 1, 200, true)",
+         values ($1, 'otlp', 'http://127.0.0.1:9/v1/logs', 100, 200, true)",
     )
     .bind(&name)
     .execute(pool)
@@ -392,9 +400,15 @@ async fn a_recovering_exporter_writes_the_recovery_half_of_the_pair() {
         let _ = axum::serve(listener, app).await;
     });
 
+    // `batch_ms` is 100, the shortest the schema's own `check (batch_ms between 100 and 3600000)`
+    // accepts, so every sweep in this walk is due. A literal `1` here is refused by
+    // `obs_exporters_batch_check` before the walk reaches its first assertion, and the report then
+    // reads "the recovery event was not emitted" for a row that was never written. The floor is
+    // not arbitrary: a 1 ms interval is a busy loop against a real backend, and 100 ms is already
+    // "every sweep is due" for the handful of sweeps this walk runs back to back.
     sqlx::query(
         "insert into obs_exporters (name, kind, endpoint, batch_ms, timeout_ms, enabled) \
-         values ($1, 'otlp', $2, 1, 2000, true)",
+         values ($1, 'otlp', $2, 100, 2000, true)",
     )
     .bind(&name)
     .bind(format!("http://{}/v1/logs", address))
@@ -514,12 +528,12 @@ async fn a_silence_writes_its_event_with_the_reason_and_the_rule_name() {
          remove is anonymous otherwise"
     );
     assert!(
-        !event.organization_id.is_some(),
+        event.organization_id.is_some(),
         "a silence is somebody's decision about their own instance, so it must name the tenant \
          whose webhook endpoints it fans out to"
     );
     assert!(
-        !event.actor_user_id.is_some(),
+        event.actor_user_id.is_some(),
         "the actor is the person who pressed the button, and a tenant event with no actor is a \
          silent write"
     );
@@ -552,8 +566,34 @@ async fn a_settings_save_writes_the_moves_it_made_and_nothing_for_a_resave() {
     let original = starting.body.clone();
 
     let moved = unique("ratio");
+
+    // **The target ratio is DERIVED from what is stored, and is guaranteed to DIFFER from it.**
+    // This walk used to write a literal `0.42`, and that made it a walk that passed exactly once.
+    // The settings row is instance-wide and the walk restores it only at the very end, so a run
+    // that failed anywhere between the save and the restore — or any other walk touching the same
+    // row — leaves a value behind, and the next run's save then moves the ratio to the value it is
+    // already at. The route is right to write no event for a save that changed nothing; the walk
+    // was asking for a move that had no reason to exist.
+    //
+    // **Deriving it is not enough on its own — the first version of the derivation had exactly the
+    // hole it was written to close.** `if current < 0.5 { 0.42 } else { 0.11 }` picks 0.42 whenever
+    // the stored value is anything below half, *including* a stored 0.42, so one leftover run put
+    // the walk in a state where it could never move again and every later run reported
+    // "`observability.sampling.changed` reached the events table" for a save that legitimately
+    // changed nothing. The condition has to be about EQUALITY with the value, not about which half
+    // of the range it falls in.
+    let current_ratio = original["sampling_ratio"]
+        .as_f64()
+        .expect("the settings row carries a numeric sampling ratio");
+    let target_ratio = if current_ratio == 0.42 { 0.11 } else { 0.42 };
+    assert_ne!(
+        target_ratio, current_ratio,
+        "the target must be a move: a walk that saves the stored value proves the no-op branch \
+         and nothing else"
+    );
+
     let body = json!({
-        "sampling_ratio": 0.42,
+        "sampling_ratio": target_ratio,
         "logs_retention_days": original["logs_retention_days"].clone(),
         "traces_retention_days": original["traces_retention_days"].clone(),
         "log_level_default": "warn",
@@ -575,23 +615,24 @@ async fn a_settings_save_writes_the_moves_it_made_and_nothing_for_a_resave() {
     )
     .await;
     assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
-    assert_eq!(saved.body["sampling_ratio"], 0.42);
+    assert_eq!(saved.body["sampling_ratio"], target_ratio);
 
     let sampling = caused_events(pool, events::SAMPLING_CHANGED, before)
         .await
         .into_iter()
         .last()
         .expect("`observability.sampling.changed` reached the events table");
-    assert_eq!(sampling.payload["current"], 0.42);
+    assert_eq!(sampling.payload["current"], target_ratio);
     let previous = sampling.payload["previous"]
         .as_f64()
         .expect("the previous ratio is a number");
     assert_ne!(
-        previous, 0.42,
+        previous, target_ratio,
         "the event reported no move, which is the same as saying it does not know what it moved from"
     );
     assert!(
-        (sampling.payload["delta"].as_f64().expect("a delta") - (0.42 - previous)).abs() < 1e-9,
+        (sampling.payload["delta"].as_f64().expect("a delta") - (target_ratio - previous)).abs()
+            < 1e-9,
         "the delta does not match the two values it is derived from"
     );
 
@@ -679,7 +720,14 @@ async fn a_pruning_sweep_writes_the_eighth_event_and_the_other_seven_are_the_one
     .await
     .expect("the line is written");
 
-    let report = retention::sweep(pool, retention::Retention::defaults()).await;
+    // `prune_from_settings` rather than `sweep`: the walk has to drive the path the instance
+    // drives, and that path is the one that writes the event. Calling `sweep` and waiting for an
+    // event only a 24-hour loop emits is how this acceptance line stayed ticked for a slice with
+    // a test that had never run. The settings row is the instance's own, so the window is whatever
+    // the operator set — which is the claim being proved: the sweep honours the screen.
+    let report = retention::prune_from_settings(pool)
+        .await
+        .expect("the retention window is readable");
     assert!(report.log_rows >= 1, "the sweep removed nothing: {report:?}");
     assert!(
         !report.failed(),
@@ -702,36 +750,57 @@ async fn a_pruning_sweep_writes_the_eighth_event_and_the_other_seven_are_the_one
         "a retention sweep is a fact about the instance, not about a tenant"
     );
 
-    // And the claim this file exists to make hold: every name the request documents has been
-    // written to the bus by this walk or by the walk beside it. Named one by one rather than as
-    // a count, so a regression says WHICH event stopped arriving.
-    let proven = [
-        (events::ALERT_FIRED, "the rule walk"),
-        (events::ALERT_RESOLVED, "the rule walk"),
+    // **This walk used to assert that all eight names have been emitted, and that assertion made
+    // the suite order-dependent.** `alert.fired` and `alert.resolved` are proved by the RULE walk
+    // in this same file, so with `--test-threads=1` this walk — which sorts first — ran BEFORE the
+    // walk that produces them and reported "`observability.alert.fired` has never been emitted"
+    // against a correct implementation. The fix is not to order the tests: a test that can only
+    // pass after its neighbour has run is a landmine for whoever runs the suite second, and the
+    // parallel default would make it fail the other way.
+    //
+    // The claim "every documented event has a walk that drives the path that produces it" is
+    // held here in the only form that is order-independent: **every name in the shared table has a
+    // walk in this file that asserts it by name.** `DOCUMENTED` holds the event *strings* and the
+    // walks reference the *identifiers* (`events::ALERT_FIRED`), so the pair is matched: the
+    // identifier's own declaration carries the string, and the walk's reference carries the
+    // identifier. A name that is documented, declared and emitted by code but has no walk in here
+    // fails this. The other half — that every constant has a NON-TEST caller — is `events.rs`'s
+    // own two-sided unit test, which reads the REQUEST file for the names and greps `crates/`
+    // and `apps/api/src` for the identifiers.
+    //
+    // The identifiers are named explicitly rather than derived from the table: deriving them
+    // would mean parsing `events.rs`'s source for `pub const <NAME>: &str = "<value>"`, which is
+    // the same "check that parses its own subject" mistake the bundle cross-check had to be
+    // unwound for. A list the test owns and the walk above refers to is a contract; a list one
+    // side generates is a tautology.
+    let walked = [
         (events::EXPORTER_DEGRADED, "the degraded-exporter walk"),
         (events::EXPORTER_RECOVERED, "the recovering-exporter walk"),
+        (events::ALERT_FIRED, "the rule walk"),
+        (events::ALERT_RESOLVED, "the rule walk"),
         (events::SILENCE_CREATED, "the silence walk"),
         (events::SAMPLING_CHANGED, "the settings walk"),
         (events::LOG_LEVEL_CHANGED, "the settings walk"),
         (events::RETENTION_PRUNED, "this walk"),
     ];
-    for (name, who) in proven {
-        let found: i64 = sqlx::query_scalar(
-            "select count(*) from events where name = $1 and created_at > $2",
-        )
-        .bind(name)
-        .bind(before)
-        .fetch_one(pool)
-        .await
-        .expect("the count runs");
+    assert_eq!(
+        walked.len(),
+        omnion_telemetry::events::DOCUMENTED.len(),
+        "the walk list and the documented table disagree in length: a name was added to one and \
+         not the other, which is the same drift this check exists to catch"
+    );
+    for (name, who) in walked {
         assert!(
-            found >= 1,
-            "`{name}` has never been emitted, so it is still the documented-and-dead state {} \
-             proves — assert it in {who}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
+            omnion_telemetry::events::DOCUMENTED.contains(&name),
+            "`{name}` has a walk ({who}) but is not in the documented table, so the request and \
+             the code disagree about what this platform emits"
+        );
+    }
+    for name in omnion_telemetry::events::DOCUMENTED {
+        assert!(
+            walked.iter().any(|(walked, _)| *walked == name),
+            "`{name}` is in the documented table but no walk in this file drives its emitter, so \
+             it is exactly the documented-and-dead state this file was written to end"
         );
     }
 
