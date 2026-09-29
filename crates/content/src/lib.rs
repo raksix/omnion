@@ -25,6 +25,7 @@ pub mod patterns;
 pub mod publishing;
 pub mod sanitize;
 pub mod seo;
+pub mod seo_csv;
 pub mod templates;
 pub mod translations;
 pub mod validation;
