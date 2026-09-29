@@ -22,6 +22,8 @@
 //! * [`store`] — items, warehouses, locations, the stock list and the rollup itself.
 //! * [`ledger`] — the append-only movement ledger, the reason codes, the negative-stock rule and
 //!   the replay that proves the rollup.
+//! * [`reservations`] — the bridge from a confirmed sales order to the shelf, and the rule that a
+//!   record describing a hold is not a hold.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature behind the `inventory.*`
 //! permission family, not infrastructure the core depends on. It talks to PostgreSQL and to
@@ -38,13 +40,20 @@ pub mod items;
 pub mod ledger;
 pub mod model;
 pub mod money;
+pub mod reservations;
 pub mod store;
 pub mod stocktake;
 pub mod transfers;
 
 pub use error::{InventoryError, Result};
 pub use items::Item;
-pub use ledger::{Movement, MovementQuery, NewMovement, Recorded, apply_movement, replay, record_movement};
+pub use ledger::{
+    Movement, MovementQuery, NewMovement, Recorded, apply_movement, record_resolved, replay,
+    record_movement,
+};
+pub use reservations::{
+    ReservationAction, ReservationOutcome, UnheldLine, reserve_for_order,
+};
 pub use model::{
     LocationKind, MovementKind, ReasonCode, Settings, StockStatus, TransferStatus,
 };

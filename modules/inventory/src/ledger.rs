@@ -413,18 +413,55 @@ pub async fn record_movement(
     let note = items::validate_note("movement", new.note.as_deref().unwrap_or_default())?;
     let reason = items::default_reason(new.reason.as_deref())?;
     let quantity = store::parse_quantity("movement", "quantity", &new.quantity)?;
+    // `resolve_kind` is what refuses a hand-written reservation, and it is reached only from
+    // here: the reservation bridge calls `record_resolved` with the kind already decided, so the
+    // two callers that need opposite answers never have to be told apart by a flag.
     let kind = resolve_kind(new.kind.as_deref(), reason, quantity)?;
 
-    if new.source_kind.as_deref().is_some_and(|raw| {
-        raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-    }) {
-        return Err(InventoryError::invalid(
-            "movement",
-            "source_kind",
-            "use lower-case words and underscores, like `order` or `stocktake`",
-        ));
-    }
+    check_source_kind(new.source_kind.as_deref())?;
 
+    record_resolved(
+        pool,
+        organization_id,
+        new.item_id,
+        new.location_id,
+        kind,
+        quantity,
+        reason,
+        new.source_kind.as_deref(),
+        new.source_id,
+        &note,
+        new.may_go_negative,
+        actor,
+    )
+    .await
+}
+
+/// The one write path, with every decision already made.
+///
+/// [`record_movement`] validates and decides, then calls this. [`crate::reservations`] calls this
+/// directly, because a reservation knows its kind by definition — that is the whole difference
+/// between a hold and a hand-written movement, and re-deciding it here would mean a second place
+/// where "which kind is this?" is answered.
+///
+/// The split exists so the ordering argument in this module's own header stays in one function:
+/// the lock, the arithmetic, the ledger row first, the rollup second. A second caller cannot get
+/// it half right because there is no second copy of it to get half right.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_resolved(
+    pool: &PgPool,
+    organization_id: Uuid,
+    item_id: Uuid,
+    location_id: Uuid,
+    kind: MovementKind,
+    quantity: Quantity,
+    reason: ReasonCode,
+    source_kind: Option<&str>,
+    source_id: Option<Uuid>,
+    note: &str,
+    may_go_negative: bool,
+    actor: Option<Uuid>,
+) -> Result<Recorded> {
     let mut transaction = pool.begin().await?;
 
     // The lock, and the only place the rollup is read for a write.
@@ -433,8 +470,8 @@ pub async fn record_movement(
          where organization_id = $1 and item_id = $2 and location_id = $3 for update",
     )
     .bind(organization_id)
-    .bind(new.item_id)
-    .bind(new.location_id)
+    .bind(item_id)
+    .bind(location_id)
     .fetch_optional(&mut *transaction)
     .await?;
 
@@ -460,7 +497,7 @@ pub async fn record_movement(
         kind,
         quantity,
         reason,
-        new.may_go_negative,
+        may_go_negative,
     )?;
 
     // The ledger row first, carrying the numbers that were computed from the locked read.
@@ -471,14 +508,14 @@ pub async fn record_movement(
          returning id",
     )
     .bind(organization_id)
-    .bind(new.item_id)
-    .bind(new.location_id)
+    .bind(item_id)
+    .bind(location_id)
     .bind(kind.as_str())
     .bind(quantity.to_text())
     .bind(reason.as_str())
-    .bind(new.source_kind.as_deref())
-    .bind(new.source_id)
-    .bind(&note)
+    .bind(source_kind)
+    .bind(source_id)
+    .bind(note)
     .bind(next_on_hand.to_text())
     .bind(next_reserved.to_text())
     .bind(actor)
@@ -509,8 +546,8 @@ pub async fn record_movement(
     )
     .bind(stock_id)
     .bind(organization_id)
-    .bind(new.item_id)
-    .bind(new.location_id)
+    .bind(item_id)
+    .bind(location_id)
     .bind(next_on_hand.to_text())
     .bind(next_reserved.to_text())
     .execute(&mut *transaction)
@@ -521,7 +558,7 @@ pub async fn record_movement(
     // Read both back through the same functions the screens use, so the answer a caller gets is
     // the answer the list would have drawn — not a re-derivation of the arithmetic done twice.
     let movement = get_movement(pool, movement_id).await?;
-    let position = stock_level(pool, organization_id, new.item_id, new.location_id).await?;
+    let position = stock_level(pool, organization_id, item_id, location_id).await?;
     Ok(Recorded { movement, position })
 }
 
@@ -532,7 +569,35 @@ pub async fn record_movement(
 /// a positive quantity with `purchase_receipt` is a receipt, a positive quantity with
 /// `sale_shipment` is an issue, and a positive quantity with `customer_return` is a receipt (the
 /// goods come **back**). Getting that last one backwards is the mistake the table exists to
-/// prevent, so it is spelled out rather than left to the caller.
+/// The `source_kind` a movement names, validated once for both callers.
+///
+/// The ledger's `source` column is what a person reads three months later to answer "what did
+/// this?" (`order SO-2026-0007`, `stocktake ST-4`), and it is also an `inventory_movements_source_idx`
+/// lookup key. Free text there would make that index useless and the column a place to type
+/// whatever the mood suggested, so the vocabulary is closed to lower-case words and underscores.
+fn check_source_kind(raw: Option<&str>) -> Result<()> {
+    if let Some(raw) = raw
+        && (raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+    {
+        return Err(InventoryError::invalid(
+            "movement",
+            "source_kind",
+            "use lower-case words and underscores, like `order` or `stocktake`",
+        ));
+    }
+    Ok(())
+}
+
+/// A hand-written movement may only *choose* a kind it is allowed to record.
+///
+/// This lives inside [`resolve_kind`] rather than beside the caller because the reservation
+/// bridge names its kind too, and the two callers need opposite answers: a person at the adjust
+/// drawer must be refused a `reserve` (a hold nobody will fulfil is a lie in the ledger), while
+/// `sales.order.confirmed` must be *able* to name one. Splitting on "is this caller the order
+/// service?" is exactly the kind of question that gets answered wrongly at 02:00, so the resolver
+/// asks about the **caller's claim** instead: if the caller is explicit about the kind, it is
+/// taken; if it left the kind to the reason, the reason decides and a reason can never produce a
+/// reservation.
 fn resolve_kind(named: Option<&str>, reason: ReasonCode, quantity: Quantity) -> Result<MovementKind> {
     if let Some(raw) = named.map(str::trim).filter(|raw| !raw.is_empty()) {
         let kind = MovementKind::parse(raw).ok_or_else(|| {
