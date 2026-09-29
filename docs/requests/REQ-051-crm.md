@@ -237,6 +237,13 @@ Payloads carry ids and the changed field list only — never a rendered document
   The third is the assertion that matters: the defect was a screen claiming to load, so the proof
   is that nothing claims to load any more.
 - [ ] Mobile 390×844: lists are usable, the board scrolls horizontally with sticky stage headers, and forms are single-column.
+  *Proved by `runCrmKeyboardAndMobile` (REQ-051, `927ddb6`) against the live stack: the phone
+  defaults to the **list** and offers the board rather than taking it away, the board's own box
+  reads `overflow-x: auto|scroll` with `scrollWidth > clientWidth` (it scrolls *inside* its own
+  box), the page itself does not scroll sideways, the stage header is read from the element and is
+  `position: sticky`, and the contact form's fields are measured rather than assumed — the set of
+  distinct `left` offsets is the assertion, because "single column" is a claim about geometry and
+  a class name cannot make it.*
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
 
 ### QA plan
