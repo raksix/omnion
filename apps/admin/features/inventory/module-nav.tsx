@@ -19,12 +19,16 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { AlertTriangle, ArrowRightLeft, ScrollText, Warehouse } from "lucide-react";
+import { AlertTriangle, ArrowRightLeft, ClipboardCheck, ScrollText, Warehouse } from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: typeof Warehouse }[] = [
   { href: "/inventory/stock", label: "Stock", icon: Warehouse },
   { href: "/inventory/movements", label: "Movements", icon: ScrollText },
   { href: "/inventory/transfers", label: "Transfers", icon: ArrowRightLeft },
+  // The count, next to the transfers it shares a floor with: a stocktake is the other way
+  // stock moves between locations, and a shelf that lists one without the other reads as if
+  // one of them does not exist.
+  { href: "/inventory/stocktake", label: "Stocktake", icon: ClipboardCheck },
   { href: "/inventory/alerts", label: "Low stock", icon: AlertTriangle },
   { href: "/inventory/approvals", label: "Adjustments", icon: ScrollText },
 ];

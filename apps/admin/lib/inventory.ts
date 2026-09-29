@@ -736,3 +736,173 @@ export function signedText(movement: Movement): string {
 export function movementTone(movement: Movement): string {
   return Number.parseFloat(movement.quantity) < 0 ? "text-red-700" : "text-emerald-800";
 }
+
+// ---------------------------------------------------------------------------------------------
+// The stocktake (REQ-053 slice 4)
+// ---------------------------------------------------------------------------------------------
+
+export type StocktakeStatus = "open" | "closed" | "cancelled";
+
+/**
+ * One line of a counting sheet.
+ *
+ * `counted_qty` is `null` while nobody has looked, and **that is not the same as `"0"`**: the
+ * screen must render "not counted" rather than an empty box, because a box that looks blank is a
+ * box somebody will read as a zero and close the sheet on.
+ */
+export type StocktakeLine = {
+  id: string;
+  item_id: string;
+  sku: string;
+  item_name: string;
+  location_id: string;
+  location_code: string;
+  /** What the rollup held **when the sheet was opened** — frozen, never today's number. */
+  expected_qty: Quantity;
+  counted_qty: Quantity | null;
+  /** `counted − expected`, computed by the server. Signed. */
+  variance: Quantity;
+  note: string;
+};
+
+export type Stocktake = {
+  id: string;
+  organization_id: string;
+  number: string;
+  status: StocktakeStatus;
+  location_ids: string[];
+  category: string | null;
+  location_codes: string[];
+  counted_on: string | null;
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  closed_by: string | null;
+  closed_at: string | null;
+  lines: StocktakeLine[];
+  lines_counted: number;
+  variances_count: number;
+  /** How many lines nobody has looked at — what blocks the close. */
+  lines_pending: number;
+  variance_total: Quantity;
+};
+
+/** What a close posted. */
+export type StocktakeOutcome = {
+  lines: number;
+  variances: number;
+  variance_total: Quantity;
+  movements: Movement[];
+};
+
+/**
+ * The variance report — the document somebody opens six months later.
+ *
+ * `agrees` is the point: the header's frozen total beside the ledger's own sum, computed by two
+ * different paths. A report with one number could not fail.
+ */
+export type StocktakeReport = {
+  stocktake: Stocktake;
+  movements: Movement[];
+  variance_total: Quantity;
+  ledger_total: Quantity;
+  agrees: boolean;
+};
+
+export type StocktakeFilters = {
+  search?: string;
+  status?: string;
+  open_only?: boolean;
+  limit?: number;
+  cursor?: string;
+};
+
+export function fetchStocktakes(filters: StocktakeFilters = {}): Promise<Page<Stocktake>> {
+  return inventoryRequest<Page<Stocktake>>(
+    `/api/v1/inventory/stocktake${query(filters as Record<string, unknown>)}`,
+  );
+}
+
+export function fetchStocktake(id: string): Promise<Stocktake> {
+  return inventoryRequest<Stocktake>(
+    `/api/v1/inventory/stocktake/${encodeURIComponent(id)}`,
+  );
+}
+
+export function fetchStocktakeReport(id: string): Promise<StocktakeReport> {
+  return inventoryRequest<StocktakeReport>(
+    `/api/v1/inventory/stocktake/${encodeURIComponent(id)}/report`,
+  );
+}
+
+/** Open a sheet. The scope is frozen here — the expectations do not move afterwards. */
+export function createStocktake(body: {
+  location_ids: string[];
+  category?: string;
+  counted_on?: string;
+  note?: string;
+}): Promise<Stocktake> {
+  return inventoryRequest<Stocktake>("/api/v1/inventory/stocktake", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Write what the counter saw. Moves nothing — only a close posts. */
+export function countStocktake(
+  id: string,
+  lines: { line_id: string; quantity: string; note?: string }[],
+): Promise<Stocktake> {
+  return inventoryRequest<Stocktake>(
+    `/api/v1/inventory/stocktake/${encodeURIComponent(id)}/count`,
+    { method: "POST", body: JSON.stringify({ lines }) },
+  );
+}
+
+/** Post the variances and finish the sheet. Refused while a line is uncounted. */
+export function closeStocktake(id: string): Promise<StocktakeOutcome> {
+  return inventoryRequest<StocktakeOutcome>(
+    `/api/v1/inventory/stocktake/${encodeURIComponent(id)}/close`,
+    { method: "POST" },
+  );
+}
+
+/** Withdraw the sheet. Posts nothing — nothing had moved. */
+export function cancelStocktake(id: string): Promise<Stocktake> {
+  return inventoryRequest<Stocktake>(
+    `/api/v1/inventory/stocktake/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * A variance's sign, as a person reads it. The sign is in the text, never colour alone.
+ *
+ * **Two overloads, and the reason is the branded `Quantity`.** The brand exists to stop a wire
+ * string being treated as a number, and a value that never crossed the wire — a variance the
+ * browser computed from the box as the counter types it — has no business claiming the brand by
+ * casting. So the number pair is the real implementation and the branded pair delegates, which
+ * keeps one implementation of the formatting rather than two that can disagree about the sign.
+ */
+export function varianceText(variance: number): string {
+  if (variance > 0) return `+${variance.toFixed(3)}`;
+  if (variance < 0) return `−${Math.abs(variance).toFixed(3)}`;
+  return "0.000";
+}
+
+/** The tone class for a variance. The **text** carries the meaning; this only reinforces it. */
+export function varianceTone(variance: number): string {
+  if (variance < 0) return "text-red-700";
+  if (variance > 0) return "text-emerald-800";
+  return "text-muted";
+}
+
+/** The `Quantity` form, for a number that came off the wire. */
+export function varianceTextFromWire(variance: Quantity): string {
+  return varianceText(Number.parseFloat(variance));
+}
+
+/** The `Quantity` tone, for a number that came off the wire. */
+export function varianceToneFromWire(variance: Quantity): string {
+  return varianceTone(Number.parseFloat(variance));
+}
