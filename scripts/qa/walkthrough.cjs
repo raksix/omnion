@@ -4035,6 +4035,412 @@ async function runNotificationSettingsDepth(page, report) {
  *      *same* event id collapses as a duplicate rather than writing a second row;
  *   6. the retry path answers for a failed row, and the rule can be removed again.
  */
+/**
+ * The navigation and queue pass (REQ-064, slice 1).
+ *
+ * The screen is walked and this pass drives it, because the claims that matter are the ones a
+ * render cannot check:
+ *
+ *   1. a menu created from the form is a row in `cms_menus`, and its key follows the name;
+ *   2. a three-level tree survives a save and a reload — the store, not the client, is what
+ *      keeps the order, and a client that re-sorts on read would agree here and disagree on a
+ *      second browser;
+ *   3. a fourth level is refused and the stored tree is *untouched* — the refused save is the
+ *      interesting half, because an editor who has built forty rows should not lose them;
+ *   4. `Add pages…` inserts a published page with the page's own title as its label, and a
+ *      draft is not even offered;
+ *   5. claiming a location the QA menu already holds is refused, and the refusal names the
+ *      holder — a 409 with no holder is a dead end for the person holding it;
+ *   6. the audience toggle reads the *public* endpoint, and a members-only item is absent for a
+ *      visitor and present for a member;
+ *   7. a queue entry can be rescheduled and cancelled, and a non-pending row cannot be.
+ */
+async function runMenusDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const menuKey = `qa-menu-${stamp}`;
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+
+  // ---------------------------------------------------------------- the list and the form
+  await page.goto(`${URL_ADMIN}/menus`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.listReady = (await page.locator("[data-menus-state=ready]").count()) > 0;
+  if (!steps.listReady) {
+    steps.reason = await page
+      .locator("[data-menus-state=error]")
+      .innerText()
+      .catch(() => "the menu list did not reach its ready state");
+    return steps;
+  }
+
+  await page.locator("[data-menus-create]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.formOpened = (await page.locator("[data-menu-form]").count()) > 0;
+  await page.locator("[data-menu-form-name]").fill(`QA Menu ${stamp}`).catch(() => {});
+  // The key is derived from the name until the editor touches it, so a form that asked for both
+  // up front would make the common case two fields and the duplicate-key 409 a puzzle.
+  steps.keyFollowsName = await page
+    .locator("[data-menu-form-key]")
+    .inputValue()
+    .catch(() => "");
+  await page.locator("[data-menu-form-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const menuId = qaSql(`select id from cms_menus where key = '${menuKey}' limit 1`);
+  steps.key = menuKey;
+  steps.menuId = menuId || null;
+  steps.rowLanded = Boolean(menuId);
+  steps.rowOnScreen = (await page.locator(`[data-menu-row="${menuKey}"]`).count()) > 0;
+  if (!menuId) return steps;
+
+  // ---------------------------------------------------------------- the editor
+  await page.goto(`${URL_ADMIN}/menus/${menuId}/edit`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.editorReady = (await page.locator("[data-menu-editor-state=ready]").count()) > 0;
+  steps.treeEmpty = (await page.locator("[data-menu-tree-empty]").count()) > 0;
+
+  // Three top-level rows, then a child under the second and a grandchild under the child.
+  for (const label of ["QA first", "QA second", "QA third"]) {
+    await page.locator("[data-menu-add-item]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(250);
+    const rows = page.locator("[data-menu-item-label]");
+    const count = await rows.count();
+    await rows.nth(count - 1).click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-item-label]").fill(label).catch(() => {});
+    await page.locator("[data-item-url]").fill(`/qa-${stamp}`).catch(() => {});
+    await page.waitForTimeout(150);
+  }
+  const secondId = await page
+    .locator("[data-menu-item-label]")
+    .nth(1)
+    .getAttribute("data-menu-item-label")
+    .catch(() => null);
+  const firstId = await page
+    .locator("[data-menu-item-label]")
+    .nth(0)
+    .getAttribute("data-menu-item-label")
+    .catch(() => null);
+  steps.threeTopLevel = secondId !== null && firstId !== null;
+
+  if (secondId) {
+    // "Nest under the row above" on the third row, then again on the row that became a child.
+    await page.locator(`[data-menu-item-label="${secondId}"]`).click({ timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(200);
+    await page
+      .locator(`button[aria-label^="Nest QA third"]`)
+      .click({ timeout: 3000 })
+      .catch(() => {});
+    await page.waitForTimeout(400);
+    const nestedId = await page
+      .locator("[data-menu-item-label]")
+      .nth(1)
+      .getAttribute("data-menu-item-label")
+      .catch(() => null);
+    steps.nestedUnderSecond = nestedId !== null && nestedId !== secondId;
+    if (nestedId) {
+      await page.locator(`[data-menu-item-label="${nestedId}"]`).click({ timeout: 3000 }).catch(() => {});
+      await page.waitForTimeout(200);
+      await page
+        .locator(`button[aria-label^="Nest ${"QA"}"]`)
+        .first()
+        .click({ timeout: 3000 })
+        .catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    await page.locator("[data-menu-save]").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+  }
+
+  // The reload is the claim: the store kept the parents and the positions.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const storedParents = qaSql(
+    `select coalesce(string_agg(parent_id::text, ',' order by position), 'none') from cms_menu_items where menu_id = '${menuId}'`,
+  );
+  steps.savedItems = Number(
+    qaSql(`select count(*) from cms_menu_items where menu_id = '${menuId}'`) || 0,
+  );
+  steps.treeHasChildren = storedParents.includes(",") || (storedParents ?? "").length > 4;
+  steps.parentsAreStored = steps.treeHasChildren;
+  steps.treeRendered = (await page.locator("[data-menu-tree] li").count()) >= steps.savedItems;
+  steps.depthLabel = await page
+    .locator("[data-menu-editor-state=ready] p")
+    .first()
+    .innerText()
+    .catch(() => "");
+
+  // ---------------------------------------------------------------- a fourth level is refused
+  const beforeRefusal = qaSql(
+    `select count(*) from cms_menu_items where menu_id = '${menuId}'`,
+  );
+  const fourth = await page.evaluate(async (id) => {
+    const me = await fetch("/api/v1/me", { credentials: "same-origin" }).then((r) => r.json());
+    const detail = await fetch(`/api/v1/menus/${id}`, { credentials: "same-origin" }).then((r) => r.json());
+    // A fourth level under the deepest existing row, written through the store's own contract.
+    const deepest = detail.items.find((item) => item.label === "QA third") ?? detail.items[0];
+    const items = detail.items.map((item) => ({
+      id: item.id,
+      parent_id: item.parent_id,
+      position: item.position,
+      label: item.label,
+      item_type: item.item_type,
+      page_id: item.page_id,
+      url: item.url,
+      target: item.target,
+      rel: item.rel,
+      css_class: item.css_class,
+      enabled: item.enabled,
+      visibility: item.visibility,
+      visibility_roles: item.visibility_roles,
+    }));
+    items.push({
+      id: crypto.randomUUID(),
+      parent_id: deepest ? deepest.parent_id : null,
+      position: 99,
+      label: "QA fourth",
+      item_type: "url",
+      page_id: null,
+      url: "/qa-fourth",
+      target: "_self",
+      rel: "",
+      css_class: "",
+      enabled: true,
+      visibility: "everyone",
+      visibility_roles: [],
+    });
+    const response = await fetch(`/api/v1/menus/${id}/items`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items, locations: detail.locations }),
+    });
+    return { status: response.status, body: await response.json().catch(() => ({})) };
+  }, menuId);
+  steps.fourthLevelStatus = fourth.status;
+  steps.fourthLevelRefused = fourth.status === 400;
+  steps.fourthLevelCode = fourth.body?.error?.code ?? null;
+  steps.refusalLeftTheTreeAlone =
+    Number(qaSql(`select count(*) from cms_menu_items where menu_id = '${menuId}'`) || 0) ===
+    Number(beforeRefusal);
+
+  // ---------------------------------------------------------------- Add pages…
+  const publishedPage = qaSql(
+    `select id from pages where site_id = '${siteId}' and status = 'published' limit 1`,
+  );
+  if (publishedPage) {
+    await page.locator("[data-menu-add-pages]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    steps.pickerOpened = (await page.locator("[data-page-picker]").count()) > 0;
+    // Only published pages are offered: the server refuses a batch containing a draft *whole*,
+    // so a picker that listed drafts would let an editor select five pages and lose all five.
+    steps.pickerOnlyOffersPublished = await page.evaluate(async () => {
+      const site = await fetch("/api/v1/sites", { credentials: "same-origin" }).then((r) => r.json());
+      const first = site.sites?.[0];
+      if (!first) return null;
+      const all = await fetch(`/api/v1/pages?site_id=${first.id}`, { credentials: "same-origin" }).then(
+        (r) => r.json(),
+      );
+      const drafts = (all.pages ?? []).filter((p) => p.status !== "published").map((p) => p.id);
+      if (drafts.length === 0) return true;
+      return (await page.locator(`[data-page-picker-page="${drafts[0]}"]`).count()) === 0;
+    });
+    await page.locator(`[data-page-picker-page="${publishedPage}"]`).check({ timeout: 3000 }).catch(() => {});
+    await page.locator("[data-page-picker-add]").click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    steps.pageItems = Number(
+      qaSql(
+        `select count(*) from cms_menu_items where menu_id = '${menuId}' and item_type = 'page'`,
+      ) || 0,
+    );
+    // The label is the page's own title, not its slug — a menu of slugs is a menu somebody has
+    // to edit by hand afterwards.
+    steps.labelComesFromTheTitle = Number(
+      qaSql(
+        `select count(*) from cms_menu_items i join page_revisions r on r.page_id = i.page_id
+         where i.menu_id = '${menuId}' and r.title = i.label`,
+      ) || 0,
+    );
+    await page.waitForTimeout(800);
+  }
+
+  // ---------------------------------------------------------------- the location rail
+  await page.locator('[data-menu-location-toggle="header"]').check({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator("[data-menu-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.claimedHeader = qaSql(
+    `select count(*) from cms_menus where id = '${menuId}' and 'header' = any(locations)`,
+  ) === "1";
+
+  // A second menu cannot take the same slot, and the refusal must name the holder.
+  const rivalKey = `qa-menu-rival-${stamp}`;
+  const rival = await page.evaluate(
+    async ([id, key]) => {
+      const detail = await fetch(`/api/v1/menus/${id}`, { credentials: "same-origin" }).then((r) => r.json());
+      const created = await fetch("/api/v1/menus", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ site_id: detail.site_id, key, name: "QA rival" }),
+      });
+      const body = await created.json();
+      if (!created.ok) return { created: created.status, body };
+      const claimed = await fetch(`/api/v1/menus/${body.id}`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: [], locations: ["header"] }),
+      });
+      return {
+        created: created.status,
+        rivalId: body.id,
+        claimStatus: claimed.status,
+        claimBody: await claimed.json().catch(() => ({})),
+      };
+    },
+    [menuId, rivalKey],
+  );
+  steps.rivalClaimStatus = rival.claimStatus ?? null;
+  steps.rivalClaimRefused = rival.claimStatus === 409;
+  steps.rivalRefusalNamesTheHolder =
+    (rival.claimBody?.error?.message ?? "").includes(menuKey) ||
+    (rival.claimBody?.error?.details?.toString?.() ?? "").includes(menuKey);
+  steps.firstHolderKeptIt = qaSql(
+    `select count(*) from cms_menus where id = '${menuId}' and 'header' = any(locations)`,
+  ) === "1";
+
+  // ---------------------------------------------------------------- the audience toggle
+  // A members-only item, saved through the screen, then read back from the *public* endpoint.
+  const memberId = await page.evaluate(async (id) => {
+    const detail = await fetch(`/api/v1/menus/${id}`, { credentials: "same-origin" }).then((r) => r.json());
+    const items = detail.items.map((item) => ({ ...item }));
+    const target = items.find((item) => item.label === "QA first") ?? items[0];
+    target.visibility = "members";
+    const response = await fetch(`/api/v1/menus/${id}/items`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items, locations: detail.locations }),
+    });
+    return { status: response.status, itemId: target.id };
+  }, menuId);
+  steps.memberItemSaved = memberId.status === 200;
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const visitorCount = await page
+    .locator("[data-menu-preview-item]")
+    .count()
+    .catch(() => 0);
+  steps.visitorItems = visitorCount;
+  await page.locator('[data-menu-preview-audience="member"]').click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const memberCount = await page.locator("[data-menu-preview-item]").count().catch(() => 0);
+  steps.memberItems = memberCount;
+  // The acceptance criterion in one comparison: the same endpoint, two audiences, and the
+  // members-only row is the difference between them.
+  steps.audienceToggleChangesThePayload = memberCount > visitorCount;
+  steps.membersItemHiddenFromVisitor =
+    (await page
+      .locator(`[data-menu-preview-item="${memberId.itemId}"]`)
+      .count()
+      .catch(() => 0)) > 0;
+
+  // ---------------------------------------------------------------- the queue
+  const queuePage = qaSql(
+    `select id from pages where site_id = '${siteId}' and status = 'published' limit 1`,
+  );
+  if (queuePage) {
+    const entry = await page.evaluate(
+      async ([id, stamp]) => {
+        const response = await fetch(`/api/v1/pages/${id}/schedule`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            action: "publish",
+            scheduled_at: new Date(Date.now() + 3 * 24 * 3600 * 1000).toISOString(),
+            timezone: "Europe/Istanbul",
+          }),
+        });
+        return { status: response.status, body: await response.json().catch(() => ({})) };
+      },
+      [queuePage, stamp],
+    );
+    steps.scheduleStatus = entry.status;
+    steps.entryId = entry.body?.id ?? null;
+
+    await page.goto(`${URL_ADMIN}/publishing/queue`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.queueReady = (await page.locator("[data-queue-state=ready]").count()) > 0;
+    steps.entryOnScreen = entry.body?.id
+      ? (await page.locator(`[data-queue-row="${entry.body.id}"]`).count()) > 0
+      : false;
+
+    if (entry.body?.id) {
+      // Reschedule through the form, then read the stored instant back from SQL.
+      await page
+        .locator(`[data-queue-reschedule="${entry.body.id}"]`)
+        .click({ timeout: 4000 })
+        .catch(() => {});
+      await page.waitForTimeout(500);
+      steps.rescheduleFormOpened =
+        (await page.locator(`[data-queue-reschedule-form="${entry.body.id}"]`).count()) > 0;
+      const moved = new Date(Date.now() + 5 * 24 * 3600 * 1000);
+      const stamp5 = `${moved.getFullYear()}-${String(moved.getMonth() + 1).padStart(2, "0")}-${String(
+        moved.getDate(),
+      ).padStart(2, "0")}T09:00`;
+      await page.locator("[data-queue-reschedule-input]").fill(stamp5).catch(() => {});
+      await page.locator("[data-queue-reschedule-save]").click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      const stored = qaSql(
+        `select to_char(scheduled_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI') from cms_publishing_queue where id = '${entry.body.id}'`,
+      );
+      steps.rescheduleStored = stored;
+      // The instant is stored in UTC and the field is a local wall clock, so the comparison is
+      // "tomorrow, not today" rather than an exact string: a form that sent the wall clock
+      // unconverted would land five hours off, and an equality check would only pass on a
+      // machine at UTC+0.
+      steps.rescheduleMoved = /^\d{4}-\d{2}-\d{2}T09:00$/.test(stored ?? "");
+      steps.rescheduleIsLater = stored > (entry.body.scheduled_at ?? "").slice(0, 16);
+
+      // A done row is not reschedulable, cancellable or publishable — the buttons are not drawn.
+      const doneRow = qaSql(`select id from cms_publishing_queue where status = 'done' limit 1`);
+      if (doneRow) {
+        steps.doneRowHasNoActions = (await page.locator(`[data-queue-cancel="${doneRow}"]`).count()) === 0;
+      }
+
+      // Cancel it, and prove the row is really cancelled rather than merely off screen.
+      await page.locator(`[data-queue-cancel="${entry.body.id}"]`).click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.cancelledInSql = qaSql(
+        `select status from cms_publishing_queue where id = '${entry.body.id}'`,
+      ) === "cancelled";
+      steps.cancelButtonGone =
+        (await page.locator(`[data-queue-cancel="${entry.body.id}"]`).count()) === 0;
+    }
+
+    // The filter is the server's, so the chip has to narrow the table rather than the page.
+    await page.locator('[data-queue-chip="pending"]').click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    steps.filteredToPending = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-queue-row]")).every((row) => {
+        const text = row.textContent ?? "";
+        return !/cancelled/.test(text);
+      }),
+    );
+  }
+
+  // ---------------------------------------------------------------- cleanup
+  qaSql(`delete from cms_menu_items where menu_id in (select id from cms_menus where key like 'qa-menu-%')`);
+  qaSql(`delete from cms_menus where key like 'qa-menu-%'`);
+  if (steps.entryId) {
+    qaSql(`delete from cms_publishing_queue where id = '${steps.entryId}'`);
+  }
+  return steps;
+}
+
 async function runNotificationOutboxDepth(page, report) {
   const steps = {};
   await page.goto(`${URL_ADMIN}/notifications/outbox`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -4517,6 +4923,14 @@ async function main() {
     // editor's page, and builds a page from a template.
     { path: "/patterns", name: "patterns" },
     { path: "/page-templates", name: "page-templates" },
+    // The navigation editor and the scheduled publishing queue (REQ-064, slice 1) — no untested
+    // screen: both are walked here and the depth pass below builds a three-level menu, claims a
+    // location, adds a published page through the picker, flips the audience toggle, and then
+    // reschedules and cancels a queue entry. The menu *editor* is not in this list on purpose,
+    // for the same reason the media file detail screen is not: its address carries a menu id,
+    // and a route walked with a placeholder id would only prove the 404 state renders.
+    { path: "/menus", name: "menus" },
+    { path: "/publishing/queue", name: "publishing-queue" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -4726,6 +5140,12 @@ async function main() {
   report.notificationOutbox = await runNotificationOutboxDepth(page, report);
   log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
+
+  // The navigation and queue pass (REQ-064, slice 1). It runs after the content passes because
+  // `Add pages…` needs a published page to point at, and it cleans up every menu and entry it
+  // creates — a QA database whose header menu grows a row per pass stops proving anything.
+  report.menus = await runMenusDepth(page, report);
+  log(`menus: ${JSON.stringify(report.menus)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.

@@ -64,7 +64,13 @@ import type {
   NotificationRow,
   NotificationSettingsRow,
   NotificationSummary,
+  Menu,
+  MenuDetail,
+  MenuItem,
   PagePreview,
+  PublishingEntry,
+  RenderedMenu,
+  RenderedMenuItem,
   PageTemplateSummary,
   PatternBlocksResponse,
   PatternListResponse,
@@ -4406,3 +4412,142 @@ export function runNotificationRoute(input: {
     body: JSON.stringify(input),
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Menus and the scheduled publishing queue (REQ-064, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** The menus of one site. */
+export function fetchMenus(siteId: string): Promise<Menu[]> {
+  return request<Menu[]>(`/api/v1/menus?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/**
+ * One menu with its items and the vocabulary the editor draws from.
+ *
+ * The vocabulary travels with the document rather than being hard-coded in the panel: a list the
+ * server would then refuse is a picker that offers an option the save rejects, and the rejection
+ * is a 400 the editor sees as an unexplained failure.
+ */
+export function fetchMenu(menuId: string): Promise<MenuDetail> {
+  return request<MenuDetail>(`/api/v1/menus/${encodeURIComponent(menuId)}`);
+}
+
+export function createMenu(input: {
+  site_id: string;
+  key: string;
+  name: string;
+}): Promise<Menu> {
+  return request<Menu>("/api/v1/menus", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function updateMenu(
+  menuId: string,
+  input: { name?: string; key?: string; locations?: string[] },
+): Promise<Menu> {
+  return request<Menu>(`/api/v1/menus/${encodeURIComponent(menuId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteMenu(menuId: string): Promise<void> {
+  return request<void>(`/api/v1/menus/${encodeURIComponent(menuId)}`, { method: "DELETE" });
+}
+
+/**
+ * Save the whole item tree and the claimed locations in one write.
+ *
+ * One request rather than one per row: a reorder of six items is one transaction that either
+ * lands whole or not at all, and six partial updates that can half-apply are how a site's header
+ * ends up with a duplicate and a hole.
+ */
+export function saveMenuDocument(
+  menuId: string,
+  input: { items: MenuItemInput[]; locations: string[] },
+): Promise<MenuDetail> {
+  return request<MenuDetail>(`/api/v1/menus/${encodeURIComponent(menuId)}/items`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** `Add pages…` — only published pages of this site are inserted, labels come from their titles. */
+export function addPagesToMenu(
+  menuId: string,
+  input: { page_ids: string[]; parent_id?: string | null; position?: number | null },
+): Promise<MenuDetail> {
+  return request<MenuDetail>(`/api/v1/menus/${encodeURIComponent(menuId)}/items/from-pages`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * What the theme renders for a location, filtered for an audience.
+ *
+ * The editor's preview calls the *public* endpoint rather than re-implementing the filter, so a
+ * preview and the live site cannot disagree about who sees a members-only link.
+ */
+export function fetchRenderedMenu(
+  location: string,
+  audience: "visitor" | "member",
+  site?: string,
+): Promise<RenderedMenu | null> {
+  const query = new URLSearchParams({ audience });
+  if (site) query.set("site", site);
+  return request<RenderedMenu | null>(
+    `/api/v1/public/menus/${encodeURIComponent(location)}?${query.toString()}`,
+  );
+}
+
+/** The queue. Filters are the server's, so the count on screen is the count in the database. */
+export function fetchPublishingQueue(filters: {
+  status?: string;
+  page_type?: string;
+  limit?: number;
+} = {}): Promise<PublishingEntry[]> {
+  const query = new URLSearchParams();
+  if (filters.status) query.set("status", filters.status);
+  if (filters.page_type) query.set("page_type", filters.page_type);
+  if (filters.limit) query.set("limit", String(filters.limit));
+  const suffix = query.toString();
+  return request<PublishingEntry[]>(`/api/v1/publishing/queue${suffix ? `?${suffix}` : ""}`);
+}
+
+export function rescheduleEntry(entryId: string, scheduledAt: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(`/api/v1/publishing/queue/${encodeURIComponent(entryId)}`, {
+    method: "PUT",
+    body: JSON.stringify({ scheduled_at: scheduledAt }),
+  });
+}
+
+export function cancelEntry(entryId: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(
+    `/api/v1/publishing/queue/${encodeURIComponent(entryId)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Make the entry due and let the runner do the work.
+ *
+ * Deliberately not a second publish path: a button with its own lighter publish would leave two
+ * definitions of "published" in one platform, and they would disagree within a week.
+ */
+export function publishEntryNow(entryId: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(
+    `/api/v1/publishing/queue/${encodeURIComponent(entryId)}/publish-now`,
+    { method: "POST" },
+  );
+}
+
+export function retryEntry(entryId: string): Promise<PublishingEntry> {
+  return request<PublishingEntry>(
+    `/api/v1/publishing/queue/${encodeURIComponent(entryId)}/retry`,
+    { method: "POST" },
+  );
+}
+
+/** One item as the editor submits it — the same shape the stored item has. */
+export type MenuItemInput = MenuItem;

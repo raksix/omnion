@@ -9,6 +9,7 @@ import { useState, type ReactNode } from "react";
 import {
   BarChart3,
   Bell,
+  CalendarClock,
   Bot,
   Boxes,
   ClipboardCheck,
@@ -21,6 +22,7 @@ import {
   KeyRound,
   LayoutDashboard,
   LayoutGrid,
+  ListTree,
   LockKeyhole,
   LogOut,
   Menu,
@@ -48,6 +50,10 @@ const NAV = [
   { href: "/blocks", label: "Blocks", icon: Boxes },
   { href: "/patterns", label: "Patterns", icon: LayoutGrid },
   { href: "/page-templates", label: "Page templates", icon: FileStack },
+  // The navigation editor and the queue of scheduled publishes (REQ-064, slice 1). Both are
+  // content surfaces rather than settings, so they sit next to Pages rather than under it.
+  { href: "/menus", label: "Menus", icon: ListTree },
+  { href: "/publishing/queue", label: "Publishing queue", icon: CalendarClock },
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },

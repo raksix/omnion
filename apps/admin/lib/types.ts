@@ -1256,3 +1256,120 @@ export type NotificationRouteReport = {
   unmatched_rules: number;
   unknown_event: boolean;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Menus and the scheduled publishing queue (REQ-064, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A menu as the list shows it: the name, the theme slots it renders into and the number of items
+ * it holds — nested ones included, because a menu with two rows on screen and eleven entries is
+ * not a menu with two entries.
+ */
+export type Menu = {
+  id: string;
+  site_id: string;
+  key: string;
+  name: string;
+  locations: string[];
+  item_count: number;
+  updated_at: string;
+};
+
+/**
+ * One navigation row.
+ *
+ * `id` is minted by the editor and never rewritten, which is what lets a drag be expressed as a
+ * whole-tree write: the same id moves to a new parent, and the store replaces the whole document
+ * in one transaction instead of applying six partial updates that can half-apply.
+ */
+export type MenuItem = {
+  id: string;
+  parent_id: string | null;
+  position: number;
+  label: string;
+  item_type: string;
+  page_id: string | null;
+  url: string;
+  target: string;
+  rel: string;
+  css_class: string;
+  enabled: boolean;
+  visibility: string;
+  visibility_roles: string[];
+};
+
+/** The closed vocabularies the editor draws its pickers from, sent by the server. */
+export type MenuVocabulary = {
+  locations: string[];
+  item_types: string[];
+  visibilities: string[];
+  max_depth: number;
+};
+
+/** The editor's own document: the menu, its items and the vocabulary. */
+export type MenuDetail = Menu & {
+  items: MenuItem[];
+  vocabulary: MenuVocabulary;
+};
+
+/** What an item can link to, in the editor's own words. */
+export const MENU_ITEM_TYPES = [
+  { value: "page", label: "Page", hint: "A page of this site" },
+  { value: "url", label: "URL", hint: "Any address, absolute or site-relative" },
+  { value: "anchor", label: "Anchor", hint: "A #section on the current page" },
+  { value: "index", label: "Site index", hint: "The front page of the site" },
+] as const;
+
+/** Who may see an item. The server refuses anything outside this list. */
+export const MENU_VISIBILITIES = [
+  { value: "everyone", label: "Everyone" },
+  { value: "members", label: "Signed-in visitors" },
+  { value: "logged_out", label: "Signed-out visitors" },
+  { value: "roles", label: "Visitors with these roles" },
+] as const;
+
+/** One queue row: a promise that a page appears or disappears at an instant. */
+export type PublishingEntry = {
+  id: string;
+  page_id: string;
+  page_slug: string;
+  page_title: string;
+  page_type: string;
+  action: string;
+  /** RFC 3339, UTC. `timezone` beside it is the author's wall clock, not an offset. */
+  scheduled_at: string;
+  timezone: string;
+  status: string;
+  result: string;
+  error: string;
+  claimed_at: string | null;
+};
+
+/** The four states a queue row can be in, and the ones a worker can still act on. */
+export const PUBLISHING_STATUSES = [
+  { value: "", label: "All states" },
+  { value: "pending", label: "Pending" },
+  { value: "done", label: "Done" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+] as const;
+
+/** One audience-filtered navigation row, as `GET /api/v1/public/menus/{location}` answers. */
+export type RenderedMenuItem = {
+  id: string;
+  label: string;
+  /** Already resolved: a `page` item's slug became a path, an `anchor` kept its hash. */
+  href: string;
+  external: boolean;
+  rel: string;
+  css_class: string;
+  children: RenderedMenuItem[];
+};
+
+/** What the theme draws for one location. */
+export type RenderedMenu = {
+  key: string;
+  name: string;
+  items: RenderedMenuItem[];
+};
