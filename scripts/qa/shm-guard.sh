@@ -41,6 +41,25 @@
 #
 # ## Usage
 #
+# 3. **Integration-test binaries.** `debug/deps/` holds one 73–79 MB executable per `tests/*.rs`
+#    walk — 56 of them here, 3.0 GB. The dedup pass above only removes a crate's *older copies*,
+#    so with one copy of each it reclaims nothing, and the pass then refuses to start for want of
+#    space while sitting on 3 GB of binaries it will never run: `scripts/qa/run.sh` builds
+#    `omnion-api` and walks the panel in a browser, and never invokes `cargo test`. The gate that
+#    DOES need them is the tick's own `cargo test -p <crate>`, which relinks what it needs.
+#
+#   Two independent writers on this box recorded "not enough shared build space" from this floor
+#   within an hour of each other, and the reclaimable space was sitting in the very directory the
+#   guard was already pruning — a guard that only knows one shape of waste is a guard that stops
+#   the queue for a reason its author did not anticipate.
+#
+#   The scope rule is unchanged and is the reason this is safe: another writer's `target/` is
+#   never touched, and a concurrent `cargo test` in THIS worktree only ever relinks, so a
+#   deletion costs a relink and never a build error.
+#
+#   Set `QA_SHM_KEEP_TEST_BINS=1` when a test run is the reason for the pass and the binaries are
+#   wanted warm.
+#
 #   bash scripts/qa/shm-guard.sh            # prune this worktree, report the box
 #   QA_SHM_MIN_FREE_MB=4096 …                # fail if the box is below the floor anyway
 set -euo pipefail
@@ -117,6 +136,49 @@ for base, entries in groups.items():
 if removed:
     print(f"[shm-guard] dropped {removed} stale duplicate build artifacts ({freed // 1048576} MB)")
 PY
+
+# The pass this guards builds `omnion-api` and drives a browser; it never runs a test binary.
+# Cargo never removes these, so they accumulate one 73–79 MB copy per `tests/*.rs` walk. Dropping
+# them costs the NEXT `cargo test` a relink, which is the tick's own gate to pay for — and that
+# relink is the cheaper outcome by far compared to a pass that refuses to start.
+if [ "${QA_SHM_KEEP_TEST_BINS:-0}" != "1" ]; then
+  TARGET="$TARGET" python3 - <<'PY' >&2 || true
+import os, re
+
+target = os.environ["TARGET"]
+deps = os.path.join(target, "debug", "deps")
+if not os.path.isdir(deps):
+    raise SystemExit(0)
+
+# Cargo names a build artifact `<crate-or-walk>-<16 hex>`. A walk is a top-level file in
+# `apps/api/tests/` or `crates/<c>/tests/`, so it is matched by NAME rather than by mtime: an
+# age rule would keep every binary a tick happened to link and drop none of them, and a size rule
+# would eventually eat the API binary itself.
+WALK = re.compile(r"^[a-z0-9_]+-[0-9a-f]{16}$")
+# `omnion_api-<hash>` is not a walk — it is the binary `run.sh` starts and the one thing in this
+# directory the pass cannot relink around cheaply. Its name matches the walk pattern, so the
+# exception is stated here rather than discovered as a full rebuild on the next pass. Unit-test
+# binaries of the workspace crates (`omnion_telemetry-<hash>`) carry no prefix and DO go: the
+# tick's `cargo test -p` is what wants them, and it relinks in seconds.
+KEEP = re.compile(r"^omnion_api-[0-9a-f]{16}$")
+freed = 0
+removed = 0
+for name in os.listdir(deps):
+    if not WALK.match(name) or KEEP.match(name):
+        continue
+    path = os.path.join(deps, name)
+    if not os.path.isfile(path) or not os.access(path, os.X_OK):
+        continue
+    try:
+        freed += os.path.getsize(path)
+        os.unlink(path)
+        removed += 1
+    except OSError:
+        pass
+if removed:
+    print(f"[shm-guard] dropped {removed} test binaries this pass will not run ({freed // 1048576} MB)")
+PY
+fi
 
 after="$(shm_free_mb)"
 printf '[shm-guard] reclaimed %s MB — %s MB free before, %s MB after\n' \
