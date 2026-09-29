@@ -1,6 +1,6 @@
 # REQ-126 — Observability Stack
 
-> **Status:** in-progress (close gate NOT green — 2 suites in my own files are red) · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress (close gate still NOT green — the admin client bindings are missing, `pnpm typecheck` red) · **Captured:** 2026-09-26 · **Layer:** infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -155,6 +155,31 @@ Migration: `database/migrations/0027_observability.sql` (next free slot at tick 
   because main's `056b04d` added `page.created` to the bus while the walk hard-codes
   `report.evaluated == 1` for a publish that is now two events, and `media_duplicates` /
   `media_grants` are not this writer's files.
+
+  **Third close-gate tick, and the blocker moved: the Rust side is green and the web side is not.**
+  `cargo test -p omnion-secrets` 54/54, `-p omnion-telemetry` 179/179, and twelve API walks with
+  `--no-fail-fast` all pass — including `exporter_flush` 5/5, which the previous tick's collector
+  ordering had taken to 2/5 and which is now green. The two walks this file recorded as
+  "pre-existing, not claimed" were both real and both are closed.
+
+  **`pnpm typecheck` fails, and it is not a small thing: `apps/admin/lib/api.ts` is missing its
+  entire observability AND secrets section.** `alerts-view.tsx`, `exporters-view.tsx`,
+  `traces-view.tsx`, `metrics-view.tsx`, `settings-view.tsx` and the credential/lease/key-ring
+  screens import ~70 symbols — `fetchAlertRules`, `createExporter`, `testExporter`,
+  `fetchTrace`, `syncMetricCatalog`, `fetchDeploymentKeys`, `rotateRootKey`, and every
+  accompanying type — and the module exports none of them (4435 lines, zero occurrences of
+  `AlertRule`). **The screens of this request cannot have been clicked against a client that does
+  not exist**, which is consistent with the previous tick's "no browser pass": the pass would not
+  have loaded.
+
+  So the acceptance box stays unticked, and the honest statement is stronger than "the gate is
+  red": six screens of this request are committed without their client bindings, which is the
+  "documented but unreachable" shape this file has already produced four times — in the one
+  direction that had not been checked. **Next slice: write the missing section of `api.ts`**
+  (types + fetchers for the metric catalogue/query, traces and trace detail, exporters and their
+  test probe, alert rules, alerts, silences, observability settings, the bundle manifest, and the
+  credential/lease/deployment-key/key-ring/secret-audit families), then `pnpm typecheck`,
+  `pnpm build`, then the private-stack walkthrough.
 
 ### QA plan
 

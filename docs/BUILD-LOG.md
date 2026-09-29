@@ -4485,3 +4485,52 @@ a probe that selects a hook the screen does not carry is a probe that cannot fai
 `bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
 slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
 (REQ-012/013/014 — the security, backup and system-health centres).
+
+## iter 17 — five refusals behind one 401, and a suite that had never passed
+- `exporter_flush` is **5/5**. The last tick's fix was right and the suite went green, but only
+  after the environment stopped lying: the box-wide `disk-guard.sh` deleted my `/dev/shm` target
+  TWICE mid-build (it reclaims any `*-target` in tmpfs that no process names, and it looks for
+  `CARGO_TARGET_DIR` in a process environment — a worktree that reaches tmpfs through a
+  **symlink** is invisible to it). Exporting `CARGO_TARGET_DIR=/dev/shm/omnion-w6-target`
+  explicitly is what makes the build survive; without it a sibling's guard silently reaps 3.9 G
+  and cargo reports `failed to write ... No such file or directory`, which reads like a source
+  error. /dev/shm is a SHARED 32 G tmpfs across seven writers; a full one makes `ld` die with
+  `signal 7 [Bus error]`, so `CARGO_PROFILE_{DEV,TEST}_DEBUG=0` is mandatory here, not a nicety.
+- `secret_leases` was red and had been red since REQ-125 shipped. Its single positive assertion —
+  "a machine identity in scope redeems the secret" — **had never passed on any database**, and
+  three product defects stood behind it: `secret_leases.last_address` was written by
+  `redeem_lease` and read by three of four reads while **no migration ever created it** (500 on
+  the last statement of a redemption that had otherwise worked); `0 as uses` is an INT4 literal
+  decoded into `i64` (500 minting any deployment key); and the walk's key prefix `omdk_` matched
+  nothing the product mints. Migration `0124` adds the column; the list now prefers it over the
+  use-log projection, because a keyless loopback redemption writes **no** `deployment_key_uses`
+  row and was therefore blank on the one column an operator reads to find a leak.
+- **A real information leak, found by the walk comparing two 401 BODIES rather than two
+  statuses.** Five refusals (unknown / revoked / expired / wrong address / wrong scope) shared
+  `401` and `deployment_key_unavailable` and nothing else, so a caller could confirm a guessed key
+  was real ("was revoked") and could confirm a credential existed ("not scoped to that
+  credential"). All five now render `DEPLOYMENT_KEY_UNUSABLE`; the operator keeps the distinction
+  in the use log, which never travels to the caller. The unit test that held the diagnostic
+  wording was the reason this looked like a feature: **a test asserting a refusal is
+  "diagnostic" is a test that forbids the fix.**
+- Five more walk expectations were wrong and each is now what the product does, with the reason
+  written in the file: scopes name **credentials** with a `prefix.*` wildcard (not a permission
+  name — a key scoped to `secrets.lease` matches nothing); issuing is session-guarded so a machine
+  key gets 401, and the scope rule lives at redemption; a backdated key is refused **at creation**
+  ("dead on arrival") so the `expired` rendering is checked on a key aged in the database; revoke
+  and delete answer **204**; the use log is a **bare array**, not `{uses:[...]}`.
+- Proof: `cargo test -p omnion-secrets` **54/54**, `-p omnion-telemetry` **179/179**, and twelve API
+  walks green with `--no-fail-fast` (secret_leases 1, exporter_flush 5, observability_traces 8,
+  observability_events 11, observability_metrics 10, secret_audit 3, events 8, ...). Commit
+  `17fc7cb`, pushed to `wave6`.
+- **BLOCKER for the REQ close, not fixed this tick.** `pnpm typecheck` fails: `alerts-view.tsx`,
+  `exporters-view.tsx`, `traces-view.tsx`, `metrics-view.tsx`, `settings-view.tsx` and the
+  secrets screens import ~70 symbols from `@/lib/api` that **that module does not export** — the
+  whole observability + secrets client-binding section is absent from `apps/admin/lib/api.ts`
+  (4435 lines, zero occurrences of `AlertRule` or `observability`). REQ-126 stays **in-progress**
+  and its close box stays unticked. Restoring ~70 typed bindings is a slice of its own, not a
+  tail on this one.
+- **Next.** Write the missing `apps/admin/lib/api.ts` section (types + fetchers for the metrics,
+  traces, exporters, alert-rules, alerts, silences, settings, bundle and secret credential, lease
+  and key-ring families), then `pnpm typecheck` and `pnpm build`, then the private-stack
+  walkthrough and only then the close box.
