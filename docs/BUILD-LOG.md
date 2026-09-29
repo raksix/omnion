@@ -4552,3 +4552,46 @@ QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104 QA_WEB_PORT=3204 QA_SLOTS=0 \
 When it does run, the inventory is the first that contains **both** sides of the merge — the
 three CDN routes and the events and webhooks routes — so it is the first pass on this branch
 that would actually exercise what this tick merged.
+
+## 2026-09-29 · Wave 5 · tick 20 — the gate ran, and every layer of it was lying
+
+Eight ticks deferred the browser gate on resource grounds. It turns out the resources were
+mostly fine and the **harness** was the thing that had never worked. Three defects, stacked,
+each hiding the next.
+
+**1. The pass booted an API with no user.** `run.sh` resets the QA database, which drops every
+account, and then passed `OMNION_ADMIN_EMAIL`/`OMNION_ADMIN_PASSWORD` **only on the first pm2
+registration**. On every later pass the already-registered process was restarted, so the API
+logged `no accounts exist yet`, the panel correctly served `/login` instead of `/setup`, and
+the walkthrough had nothing to sign in with. The fix passes the seed on every boot; the account
+the API creates and the credentials in `walkthrough.cjs` are now the same three variables.
+Proof: `first administrator account created user_id=cb2f03bf...`, and
+`select email,status from users` -> `qa-owner@omnion.test|active`, which was empty before.
+
+**2. A dead pass exited 0 and wrote a clean report.** A fatal walkthrough still leaves a
+`summary.json`, and `{"fatal": "could not sign in"}` has no `findings` key - so the report
+stage happily rewrote `QA-LATEST-w5.md` as a clean pass and the script returned success.
+*Absence of evidence was being filed as evidence*, the same failure the `{"fatal": ...}` note
+warned about, one level up. A non-zero walkthrough exit, a `fatal` summary, and a scope that
+recorded zero pages are now all gate failures. Observed: the broken pass went from `RUN_RC=0`
+to `RUN_RC=3`.
+
+**3. I broke the database password myself, and the tool helped me do it.** Rewriting that
+block, I reproduced the connection string from a read in which the tool had **masked the
+password as `***`** - so literal asterisks went into the file and every pass died with
+`password authentication failed for user "omnion"`, a harness error dressed as a database
+problem. Repaired by recovering the line from the revision *before* the bad commit and proving
+it byte-for-byte (sha256 `a89bb61a27f30753`, 51 chars, identical to the original) - the
+credential never entered this log. `grep -c '***' scripts/qa/run.sh` -> 0.
+
+**And the disk, which seven ticks of pre-flight blamed for the deferral.** `/` was at 100% with
+429M free, and 3.5G of it was `/root/w5-build` - my own build directory, on the one filesystem
+whose fullness breaks everything. Moved to `/mnt/apopic/w5-build` (copy, verify, delete; two
+cargo processes belonged to w6 and w7 and neither used it). `/` went 100% -> 97% with 3.9G
+free, and the API binary runs from the new home: `healthz 200`, migrations clean.
+
+**Next.** `apps/admin/.next` was 839M of stale dev state with no `BUILD_ID` and logs reading
+"The directory ... was deleted. Restarting the server to recover" - Next dev thrashing on a
+full mount, which is also why that directory was eating the disk. Cleared it; `/login` now
+answers in 160ms instead of 3.6s and renders a real email+password form. Re-running the scoped
+pass.
