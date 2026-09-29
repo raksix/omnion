@@ -55,7 +55,12 @@ pub struct GraphUpdate {
     pub graph_version: i32,
 }
 
-const GRAPH_COLUMNS: &str = "workflow_id, graph, ui_state, graph_version, validated_at, \
+// `id as workflow_id`, not `workflow_id`: the `workflows` table's primary key is `id` (see
+// `create table workflows`), and selecting `workflow_id` here fails at run time with
+// 'column "workflow_id" does not exist'. The alias keeps the row tuple's shape — the
+// GraphDefinition binds the first column to `workflow_id` — without renaming the column
+// everywhere the query is written.
+const GRAPH_COLUMNS: &str = "id as workflow_id, graph, ui_state, graph_version, validated_at, \
      validation_error, steps";
 
 /// Read the graph of one workflow.

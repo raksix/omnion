@@ -1466,3 +1466,55 @@ fn the_definition_rules_are_the_engine_rules() {
     };
     assert!(!execution.is_terminal());
 }
+
+/// The graph store's own read path, against a real database.
+///
+/// `find_graph` selected `workflow_id` from `workflows`, whose primary key is `id`, so every
+/// read failed with `column "workflow_id" does not exist` — and the builder's only symptom
+/// was its error screen, which a walkthrough reporting "the builder did not open" cannot tell
+/// apart from a missing page. A store that cannot read its own table is not vouched for by a
+/// unit test on `project_steps`, so the guard is the statement against the real schema.
+#[tokio::test]
+async fn the_graph_store_reads_a_column_the_workflows_table_actually_has() {
+    let Some((_state, db)) = live_state().await else {
+        return;
+    };
+
+    // The schema is the assertion: every column `find_graph` selects must exist on `workflows`.
+    // Reading the catalogue beats running the query, because a query that happens to hit no
+    // row still proves nothing about a column that only some rows carry.
+    //
+    // `id` is the primary key, and `find_graph` reads it as `id as workflow_id` — so the
+    // physical column list starts with `id`, not `workflow_id`. A test that asserted the alias
+    // instead would have demanded the bug this test was written for.
+    let named = [
+        "id",
+        "graph",
+        "ui_state",
+        "graph_version",
+        "validated_at",
+        "validation_error",
+        "steps",
+    ];
+    for column in named {
+        let exists: i64 = sqlx::query_scalar(
+            "select count(*) from information_schema.columns \
+             where table_schema = 'public' and table_name = 'workflows' and column_name = $1",
+        )
+        .bind(column)
+        .fetch_one(db.pool())
+        .await
+        .expect("the catalogue is readable");
+        assert_eq!(exists, 1, "workflows has no column named {column}");
+    }
+
+    // And the read itself must not be a database error. A column that does not exist arrives as
+    // `WorkflowError::Database`, and it is the *only* way `find_graph` fails here: an absent id
+    // is `Ok(None)`. Matching the variant rather than `is_err` is what makes the failure name
+    // the column, which is the whole point of the guard.
+    match omnion_workflows::graph_store::find_graph(db.pool(), uuid::Uuid::nil()).await {
+        Ok(None) => {}
+        Ok(Some(found)) => panic!("a nil uuid must not match a workflow, got {}", found.workflow_id),
+        Err(err) => panic!("find_graph named a column the workflows table does not have: {err}"),
+    }
+}
