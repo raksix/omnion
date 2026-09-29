@@ -5491,6 +5491,17 @@ and `GET /sites/{site_id}/featured-media/candidates`; the public page payload ga
   "wrong tenant" and "wrong id", which is the difference they need. The walk asserts the platform's
   value, and says why insisting on the 404 would have made the endpoint less informative.
 
+**The browser pass is QUEUED, not run.** `runFeaturedMediaDepth` is written and registered, but at
+kick-off this box had **17 `scripts/qa/run.sh` processes for one QA slot** and `/dev/shm` at 96% from
+ten writers' cargo targets. The pass waited the whole `QA_SLOT_WAIT=1200` and was stopped rather than
+started and OOM-killed — a pass that starts under load 12 and dies at twenty minutes costs more than
+one that waits. So **acceptance 18 is NOT met** and no claim is made about the walkthrough's counters:
+they have not run. (One harness fact worth writing down, because it cost this tick: a QA-slot place
+file whose holder is DEAD blocks the whole queue until something reaps it, and reaping only happens
+after a 120s grace — so a crashed pass holds the queue hostage for two minutes and a stale one from
+a killed writer can hold it for as long as nobody notices. Check `kill -0 $(cat
+/tmp/omnion-qa-slot-holders/*)` before concluding a slot is busy.)
+
 **Next.** (a) Run `runFeaturedMediaDepth` alone (`--only=featured-media`) and fix what it finds;
 acceptance 18 closes on a clean full pass at 1440 px and 390 px. (b) The `--only=members` pass is
 still queued from last tick — slice 4c's browser half is written but unrun. (c) REQ-063
