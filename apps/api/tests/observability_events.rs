@@ -38,10 +38,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::{alert_loop, exporter, exporter_flush, events, metrics, retention};
@@ -107,38 +107,6 @@ fn with_cookie(mut request: Request<Body>, cookie: &str) -> Request<Body> {
         cookie.parse().expect("a cookie header value"),
     );
     request
-}
-
-async fn state_or_skip() -> Option<AppState> {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("SKIP: the configuration is not valid ({error})");
-            return None;
-        }
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
-            return None;
-        }
-    };
-    if let Err(error) = db.migrate().await {
-        eprintln!("SKIP: the migrations did not apply ({error})");
-        return None;
-    }
-    seed::ensure(db.pool()).await.expect("the catalogue seeds");
-    let redis = RedisClient::new(&config.redis.url).expect("a redis url");
-    let storage = omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
-        .expect("the default storage configuration is valid");
-    Some(AppState::new(
-        BuildInfo::new("omnion-api", "0.0.0-test"),
-        config,
-        db,
-        redis,
-        storage,
-    ))
 }
 
 /// Sign in as a fresh account that holds the Owner role, and return its session cookie.
@@ -228,9 +196,7 @@ async fn caused_events(pool: &sqlx::PgPool, name: &str, since: OffsetDateTime) -
 
 #[tokio::test]
 async fn a_rule_that_fires_and_resolves_writes_both_alert_events_with_the_documented_payload() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let name = unique("EventsQueueBacklog");
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
@@ -338,9 +304,7 @@ async fn a_rule_that_fires_and_resolves_writes_both_alert_events_with_the_docume
 
 #[tokio::test]
 async fn a_degraded_exporter_writes_one_event_per_state_change_and_not_one_per_retry() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let name = unique("events-exporter");
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
@@ -408,9 +372,7 @@ async fn a_degraded_exporter_writes_one_event_per_state_change_and_not_one_per_r
 
 #[tokio::test]
 async fn a_recovering_exporter_writes_the_recovery_half_of_the_pair() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let name = unique("events-recover");
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
@@ -503,9 +465,7 @@ async fn a_recovering_exporter_writes_the_recovery_half_of_the_pair() {
 
 #[tokio::test]
 async fn a_silence_writes_its_event_with_the_reason_and_the_rule_name() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
     let pool = state.db().pool();
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
@@ -576,9 +536,7 @@ async fn a_silence_writes_its_event_with_the_reason_and_the_rule_name() {
 
 #[tokio::test]
 async fn a_settings_save_writes_the_moves_it_made_and_nothing_for_a_resave() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
     let pool = state.db().pool();
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
@@ -705,9 +663,7 @@ async fn a_settings_save_writes_the_moves_it_made_and_nothing_for_a_resave() {
 
 #[tokio::test]
 async fn a_pruning_sweep_writes_the_eighth_event_and_the_other_seven_are_the_ones_that_were_dead() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let before = OffsetDateTime::now_utc() - time::Duration::seconds(2);
 

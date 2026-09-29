@@ -48,10 +48,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::routing::post;
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::alert_loop;
@@ -220,40 +220,6 @@ fn with_cookie(mut request: Request<Body>, cookie: &str) -> Request<Body> {
     request
 }
 
-async fn state_or_skip() -> Option<AppState> {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("SKIP: the configuration is not valid ({error})");
-            return None;
-        }
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
-            return None;
-        }
-    };
-    if let Err(error) = db.migrate().await {
-        eprintln!("SKIP: the migrations did not apply ({error})");
-        return None;
-    }
-    seed::ensure(db.pool())
-        .await
-        .expect("the permission catalogue seeds");
-    let redis = RedisClient::new(&config.redis.url).expect("a redis url");
-    let storage = omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
-        .expect("the default storage configuration is valid");
-    Some(AppState::new(
-        BuildInfo::new("omnion-api", "0.0.0-test"),
-        config,
-        db,
-        redis,
-        storage,
-    ))
-}
-
 async fn sign_in(state: &AppState) -> String {
     let suffix = Uuid::new_v4().simple().to_string();
     let organization = omnion_identity::organizations::create_organization(
@@ -314,9 +280,7 @@ fn drops_for(name: &str) -> f64 {
 
 #[tokio::test]
 async fn a_shipped_rule_fires_through_a_real_outage_and_resolves_when_the_dependency_returns() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let cookie = sign_in(&state).await;
 

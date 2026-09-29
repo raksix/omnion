@@ -27,10 +27,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::metric_catalog;
@@ -104,36 +104,6 @@ fn get(path: &str) -> Request<Body> {
         .uri(path)
         .body(Body::empty())
         .expect("a static request builds")
-}
-
-async fn state_or_skip() -> Option<AppState> {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!(
-                "[observability metrics] skipping: the environment is not configured ({error})"
-            );
-            return None;
-        }
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "[observability metrics] skipping: PostgreSQL is not reachable ({error}) — \
-                 set OMNION_DATABASE_URL to a database with the migrations applied"
-            );
-            return None;
-        }
-    };
-    if let Err(error) = db.migrate().await {
-        eprintln!("[observability metrics] skipping: migrations failed ({error})");
-        return None;
-    }
-    let redis = RedisClient::new(&config.redis.url).ok()?;
-    let storage = omnion_storage::Storage::from_env().ok()?;
-    let build = BuildInfo::new("omnion-api", env!("CARGO_PKG_VERSION"));
-    Some(AppState::new(build, config, db, redis, storage))
 }
 
 /// An authenticated caller with the owner role bound, so the guarded routes are not a 403.
@@ -212,9 +182,7 @@ fn authed(method: Method, path: &str, token: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_status_class() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // Traffic, over the real router, so the families are filled the way they are in production.
@@ -390,9 +358,7 @@ async fn a_scrape_returns_the_documented_families_with_route_templates_and_a_sta
 
 #[tokio::test]
 async fn a_query_names_the_family_when_the_selector_is_unknown_and_clamps_an_over_wide_window() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     let refused = call(
@@ -455,9 +421,7 @@ async fn a_query_names_the_family_when_the_selector_is_unknown_and_clamps_an_ove
 
 #[tokio::test]
 async fn a_family_past_its_budget_is_folded_and_the_fold_is_reported_three_ways() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // Two caps exist and a test has to know which one it is driving:
@@ -544,9 +508,7 @@ async fn a_family_past_its_budget_is_folded_and_the_fold_is_reported_three_ways(
 
 #[tokio::test]
 async fn the_catalogue_is_seeded_from_the_registry_and_a_resync_is_audited() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (user, token) = sign_in(&state).await;
 
     // Seed explicitly, the way the boot does.
@@ -626,9 +588,7 @@ async fn the_catalogue_is_seeded_from_the_registry_and_a_resync_is_audited() {
 
 #[tokio::test]
 async fn observability_read_does_not_grant_the_catalogue_resync() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     // A caller with no binding at all: the guard refuses before the handler, which is the whole
     // point of the split between `observability.read` and `observability.manage`.
     let response = call(
@@ -661,9 +621,7 @@ async fn observability_read_does_not_grant_the_catalogue_resync() {
 
 #[tokio::test]
 async fn the_exposition_is_not_cached_and_carries_the_canonical_content_type() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let peer: SocketAddr = "198.51.100.7:51234".parse().expect("a literal");
     let mut request = get("/metrics");
     request
@@ -791,9 +749,7 @@ fn a_catalogue_timestamp_is_an_rfc3339_string_not_a_tuple() {
 /// configured. The depth pass caught it: the copied string was literally `other`.
 #[tokio::test]
 async fn the_promql_names_a_real_series_and_not_the_overflow_bucket() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // Drive a family past its label bound so the overflow series exists AND sorts into the list.

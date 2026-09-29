@@ -29,10 +29,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::alert_loop;
@@ -110,43 +110,6 @@ fn get(uri: &str) -> Request<Body> {
     request(Method::GET, uri, None)
 }
 
-async fn state_or_skip() -> Option<AppState> {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("SKIP: the configuration is not valid ({error})");
-            return None;
-        }
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "SKIP: PostgreSQL is not reachable ({error}) — start it with \
-                 `docker compose -f infra/compose/docker-compose.dev.yml up -d`"
-            );
-            return None;
-        }
-    };
-    if let Err(error) = db.migrate().await {
-        eprintln!("SKIP: the migrations did not apply ({error})");
-        return None;
-    }
-    seed::ensure(db.pool())
-        .await
-        .expect("the permission catalogue seeds");
-    let redis = RedisClient::new(&config.redis.url).expect("a redis url");
-    let storage = omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
-        .expect("the default storage configuration is valid");
-    Some(AppState::new(
-        BuildInfo::new("omnion-api", "0.0.0-test"),
-        config,
-        db,
-        redis,
-        storage,
-    ))
-}
-
 /// Sign in as a fresh account that holds the Owner role, and return the session cookie.
 ///
 /// The owner binding is not optional here. Every route in this file is behind
@@ -218,9 +181,7 @@ fn record_queue_depth(depth: f64) {
 
 #[tokio::test]
 async fn a_rule_fires_through_a_real_metric_notifies_once_and_resolves() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkQueueBacklog");
@@ -380,9 +341,7 @@ async fn a_rule_fires_through_a_real_metric_notifies_once_and_resolves() {
 
 #[tokio::test]
 async fn a_dwell_holds_a_rule_pending_before_it_fires() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkDwell");
     let rule_id: Uuid = sqlx::query_scalar(
@@ -450,9 +409,7 @@ async fn a_dwell_holds_a_rule_pending_before_it_fires() {
 
 #[tokio::test]
 async fn a_pending_event_that_falls_back_is_discarded_rather_than_written_as_resolved() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkFlap");
     let rule_id: Uuid = sqlx::query_scalar(
@@ -496,9 +453,7 @@ async fn a_pending_event_that_falls_back_is_discarded_rather_than_written_as_res
 
 #[tokio::test]
 async fn a_silence_suppresses_the_event_but_does_not_erase_it() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkSilenced");
@@ -616,9 +571,7 @@ async fn a_silence_suppresses_the_event_but_does_not_erase_it() {
 
 #[tokio::test]
 async fn the_preview_reports_live_state_and_refuses_an_expression_the_evaluator_would_refuse() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
 
     let firing = call(
@@ -727,9 +680,7 @@ async fn the_preview_reports_live_state_and_refuses_an_expression_the_evaluator_
 
 #[tokio::test]
 async fn the_settings_row_validates_every_field_and_a_valid_save_takes_effect_immediately() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
     let before = tracing_spine::sampling_ratio();
 
@@ -917,9 +868,7 @@ async fn the_settings_row_validates_every_field_and_a_valid_save_takes_effect_im
 
 #[tokio::test]
 async fn a_temporary_level_raise_expires_without_a_restart() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let cookie = sign_in(&state).await;
     let base = json!({
         "sampling_ratio": 0.1,
@@ -994,9 +943,7 @@ async fn a_temporary_level_raise_expires_without_a_restart() {
 
 #[tokio::test]
 async fn sigterm_flips_readyz_to_503_while_healthz_stays_200() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     // The process-wide lifecycle, so the flip is the one the routes read. Reset at the end so the
     // rest of this binary's tests are not run inside a drain.
     let lifecycle = lifecycle::global();

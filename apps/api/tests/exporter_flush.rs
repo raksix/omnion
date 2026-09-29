@@ -32,10 +32,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::routing::post;
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::exporter;
@@ -165,34 +165,6 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-async fn state_or_skip() -> Option<AppState> {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("[exporter flush] skipping: the environment is not configured ({error})");
-            return None;
-        }
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "[exporter flush] skipping: PostgreSQL is not reachable ({error}) — \
-                 set OMNION_DATABASE_URL to a database with the migrations applied"
-            );
-            return None;
-        }
-    };
-    if let Err(error) = db.migrate().await {
-        eprintln!("[exporter flush] skipping: migrations failed ({error})");
-        return None;
-    }
-    let redis = RedisClient::new(&config.redis.url).ok()?;
-    let storage = omnion_storage::Storage::from_env().ok()?;
-    let build = BuildInfo::new("omnion-api", env!("CARGO_PKG_VERSION"));
-    Some(AppState::new(build, config, db, redis, storage))
-}
-
 async fn sign_in(state: &AppState) -> String {
     seed::ensure(state.db().pool())
         .await
@@ -312,9 +284,7 @@ async fn remove_exporter(state: &AppState, token: &str, id: Uuid) {
 /// to rule out.
 #[tokio::test]
 async fn a_request_s_line_reaches_a_configured_backend() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     let name = format!("otlp-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
@@ -433,9 +403,7 @@ async fn a_request_s_line_reaches_a_configured_backend() {
 /// counted, and the number is persisted rather than reset by the next read.
 #[tokio::test]
 async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     let name = format!("webhook-{}", Uuid::new_v4().simple());
     // Zero successes: the first batch is already refused.
@@ -520,9 +488,7 @@ async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
 /// the row directly and never calls the create route.
 #[tokio::test]
 async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     let name = format!("restored-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
@@ -577,9 +543,7 @@ async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
 /// backlog an operator asked not to send is visible in the drop counter rather than vanishing.
 #[tokio::test]
 async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     let name = format!("disabled-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
@@ -641,9 +605,7 @@ async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
 /// from one that is waiting for the wrong reason.
 #[tokio::test]
 async fn a_batch_interval_is_respected_between_flushes() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
     let name = format!("paced-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;

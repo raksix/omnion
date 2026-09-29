@@ -27,10 +27,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
 use omnion_telemetry::exporter::{self, ExporterKind, FlushOutcome};
@@ -108,36 +108,6 @@ fn get(path: &str) -> Request<Body> {
         .expect("a static request builds")
 }
 
-async fn state_or_skip() -> Option<AppState> {
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!(
-                "[observability traces] skipping: the environment is not configured ({error})"
-            );
-            return None;
-        }
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!(
-                "[observability traces] skipping: PostgreSQL is not reachable ({error}) — \
-                 set OMNION_DATABASE_URL to a database with the migrations applied"
-            );
-            return None;
-        }
-    };
-    if let Err(error) = db.migrate().await {
-        eprintln!("[observability traces] skipping: migrations failed ({error})");
-        return None;
-    }
-    let redis = RedisClient::new(&config.redis.url).ok()?;
-    let storage = omnion_storage::Storage::from_env().ok()?;
-    let build = BuildInfo::new("omnion-api", env!("CARGO_PKG_VERSION"));
-    Some(AppState::new(build, config, db, redis, storage))
-}
-
 async fn sign_in(state: &AppState) -> (Uuid, String) {
     seed::ensure(state.db().pool())
         .await
@@ -205,9 +175,7 @@ fn authed(method: Method, path: &str, token: &str) -> Request<Body> {
 /// template — never by a literal path.
 #[tokio::test]
 async fn a_request_produces_a_trace_findable_by_its_request_id() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // Sample everything for the duration of this test. At the documented default of 0.1 roughly
@@ -292,9 +260,7 @@ async fn a_request_produces_a_trace_findable_by_its_request_id() {
 /// a *relationship*, and only the parent id states it.
 #[tokio::test]
 async fn the_consumer_span_links_back_to_the_producers_publish_span() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // 1. A producer publishes a job, inside a request, and stamps the publish span on the row.
@@ -403,9 +369,7 @@ async fn the_consumer_span_links_back_to_the_producers_publish_span() {
 /// the ratio happened to include it is not an error bias at all.
 #[tokio::test]
 async fn a_five_hundred_is_sampled_at_a_zero_ratio_and_is_findable_by_request_id() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // At ratio 0.0 with no inbound parent, `decide` returns `RatioDropped` — so a trace that IS in
@@ -452,9 +416,7 @@ async fn a_five_hundred_is_sampled_at_a_zero_ratio_and_is_findable_by_request_id
 /// everything else.
 #[tokio::test]
 async fn a_full_exporter_buffer_drops_oldest_counts_the_drop_and_never_stalls() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // A private collector, NOT the global: the global is shared with every other test in this
@@ -553,9 +515,7 @@ async fn an_exported_span_carries_usage_and_neither_prompt_text_nor_a_secret() {
 /// looks complete.
 #[tokio::test]
 async fn a_trace_over_the_span_cap_is_flagged_in_the_index() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     let trace_id = format!("d{}", &Uuid::new_v4().simple().to_string()[..30]);
@@ -615,9 +575,7 @@ async fn a_trace_over_the_span_cap_is_flagged_in_the_index() {
 /// writes an audit row.
 #[tokio::test]
 async fn a_reader_cannot_add_an_exporter_and_an_owner_ones_mutation_is_audited() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     // The reader: a signed-in account with no role bound at all.
@@ -780,9 +738,7 @@ async fn a_reader_cannot_add_an_exporter_and_an_owner_ones_mutation_is_audited()
 /// The trace search validates its own filters rather than answering an empty list for nonsense.
 #[tokio::test]
 async fn the_trace_search_refuses_an_unknown_status_and_an_absurd_window() {
-    let Some(state) = state_or_skip().await else {
-        return;
-    };
+    let state = support::walk_state::state_or_fail().await;
     let (_user, token) = sign_in(&state).await;
 
     let bad_status = call(

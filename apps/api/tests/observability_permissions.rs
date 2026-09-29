@@ -38,10 +38,10 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+mod support;
+
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
-use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
@@ -263,62 +263,6 @@ fn request(method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
     }
 }
 
-/// Build the state, or FAIL — never silently skip.
-///
-/// This helper used to `return None` and let every test `return` early, printing a `SKIP:` line
-/// on stderr. That is a suite that reports **`ok. 4 passed`** while asserting nothing: libtest
-/// captures stderr from a passing test, so the only place the skip was visible was
-/// `--nocapture`, and a green run is exactly what a reader (and CI) looks at. It happened for
-/// real — a sibling wave's `0047_media_grants.sql` had a `unique (coalesce(...))` constraint,
-/// which PostgreSQL refuses, and every walk in this file quietly became a no-op.
-///
-/// A walk that cannot reach its database has not passed. Whether the environment is
-/// unavailable at all is a legitimate condition, so it is honoured only when the operator has
-/// said so: without `OMNION_REQUIRE_DB=1` the walk prints a loud banner and still refuses, so
-/// the failure is never silent.
-async fn state_or_fail() -> AppState {
-    let strict = std::env::var("OMNION_REQUIRE_DB").is_ok_and(|value| value == "1");
-    let mut bail = |reason: String| -> ! {
-        if strict {
-            panic!("{reason}");
-        }
-        eprintln!(
-            "\n\
-             ============================================================\n\
-             WALK DID NOT RUN: {reason}\n\
-             Every assertion in this file was skipped. A 'test result: ok' above\n\
-             this line is a vacuous pass, not evidence.\n\
-             Set OMNION_REQUIRE_DB=1 to make this a hard failure.\n\
-             ============================================================\n"
-        );
-        std::process::exit(101);
-    };
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => bail(format!("the configuration is not valid ({error})")),
-    };
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => bail(format!("PostgreSQL is not reachable ({error})")),
-    };
-    if let Err(error) = db.migrate().await {
-        bail(format!("the migrations did not apply ({error})"));
-    }
-    seed::ensure(db.pool())
-        .await
-        .expect("the permission catalogue seeds");
-    let redis = RedisClient::new(&config.redis.url).expect("a redis url");
-    let storage = omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
-        .expect("the default storage configuration is valid");
-    AppState::new(
-        BuildInfo::new("omnion-api", "0.0.0-test"),
-        config,
-        db,
-        redis,
-        storage,
-    )
-}
-
 /// An account in a fresh organization, with a role holding exactly `permissions`.
 ///
 /// The role is created per run and per walk step rather than shared, because a role whose
@@ -444,7 +388,7 @@ async fn observability_read_is_refused_on_every_write_and_the_refusal_names_the_
     // `observability.exporters.manage` does NOT create an exporter, and asking the account under
     // test to create its own fixture is the mistake this two-account split removes. The account
     // that is then refused holds `observability.read` and nothing else.
-    let state = state_or_fail().await;
+    let state = support::walk_state::state_or_fail().await;
     let (_admin, _admin_org, admin_cookie) =
         account_with(&state, &["observability.manage", "observability.read"]).await;
     let (_actor, _organization, cookie) =
@@ -585,7 +529,7 @@ async fn observability_read_is_refused_on_every_write_and_the_refusal_names_the_
 
 #[tokio::test]
 async fn every_mutation_writes_its_own_audit_row() {
-    let state = state_or_fail().await;
+    let state = support::walk_state::state_or_fail().await;
     let (actor, _organization, cookie) = account_with(
         &state,
         &[
@@ -838,7 +782,7 @@ fn authed(method: Method, uri: &str, body: Option<Value>, cookie: &str) -> Reque
 
 #[tokio::test]
 async fn the_preview_stays_read_only_for_an_account_with_manage() {
-    let state = state_or_fail().await;
+    let state = support::walk_state::state_or_fail().await;
     let (_actor, _organization, cookie) = account_with(
         &state,
         &["observability.read", "observability.manage"],
@@ -871,7 +815,7 @@ async fn the_preview_stays_read_only_for_an_account_with_manage() {
 
 #[tokio::test]
 async fn a_read_only_account_may_still_read_the_whole_surface() {
-    let state = state_or_fail().await;
+    let state = support::walk_state::state_or_fail().await;
     let (_actor, _organization, cookie) = account_with(&state, &["observability.read"]).await;
 
     // The narrowing property: `observability.read` is a REAL read permission, not a permission
