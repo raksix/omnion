@@ -99,6 +99,12 @@ import type {
   NotificationSummary,
   Site,
   User,
+  // Staging environments (REQ-017).
+  Environment,
+  EnvironmentCloneJob,
+  EnvironmentDetailResponse,
+  EnvironmentFilters,
+  EnvironmentListResponse,
 } from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
@@ -5648,5 +5654,95 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
   return request<HeaderPolicySaved>("/api/v1/security/headers", {
     method: "PUT",
     body: JSON.stringify(save),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Staging environments (REQ-017)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The list, with its filters.
+ *
+ * A filter value the API does not recognise is answered as *no filter* rather than as a `400` —
+ * that rule lives in the route, and the panel passes the chip through unchanged so the two can
+ * never disagree about what a value means.
+ */
+export async function fetchEnvironments(
+  filters: EnvironmentFilters = {},
+): Promise<EnvironmentListResponse> {
+  const query = new URLSearchParams();
+  if (filters.type) query.set("type", filters.type);
+  if (filters.status) query.set("status", filters.status);
+  if (filters.search && filters.search.trim() !== "") query.set("search", filters.search.trim());
+  const suffix = query.toString();
+  return request<EnvironmentListResponse>(
+    `/api/v1/environments${suffix ? `?${suffix}` : ""}`,
+  );
+}
+
+/** One environment, with its job history and the estimate for the next clone. */
+export async function fetchEnvironment(id: string): Promise<EnvironmentDetailResponse> {
+  return request<EnvironmentDetailResponse>(`/api/v1/environments/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Create a staging environment and start its first clone.
+ *
+ * The response is the environment with status `cloning`: the copy itself runs in the API's own
+ * worker, so the wizard returns the moment the row exists and the list screen polls from there.
+ */
+export async function createEnvironment(input: {
+  name: string;
+  key?: string;
+  staging_host?: string;
+  areas: string[];
+  exclude_archived: boolean;
+}): Promise<Environment> {
+  return request<Environment>("/api/v1/environments", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The live progress of an environment's clone, polled while one is open. */
+export async function fetchCloneJobs(id: string): Promise<EnvironmentCloneJob[]> {
+  return request<EnvironmentCloneJob[]>(
+    `/api/v1/environments/${encodeURIComponent(id)}/clone-jobs`,
+  );
+}
+
+/**
+ * Re-clone from production.
+ *
+ * `discard_confirmed` is not advisory: the API refuses with `clone_discard_unconfirmed` and
+ * names how many staging rows would be lost, and that refusal is what the confirmation dialog is
+ * built from. The dialog therefore sends the second request *after* the operator has seen the
+ * count, not before.
+ */
+export async function startEnvironmentClone(
+  id: string,
+  input: { areas: string[]; exclude_archived: boolean; discard_confirmed: boolean },
+): Promise<EnvironmentCloneJob> {
+  return request<EnvironmentCloneJob>(`/api/v1/environments/${encodeURIComponent(id)}/clone`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Stop a running clone. */
+export async function cancelEnvironmentClone(
+  id: string,
+  jobId: string,
+): Promise<{ job: EnvironmentCloneJob; environment_status: string }> {
+  return request(`/api/v1/environments/${encodeURIComponent(id)}/clone-jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
+}
+
+/** Archive a staging environment: its content is kept, its host is released. */
+export async function archiveEnvironment(id: string): Promise<Environment> {
+  return request<Environment>(`/api/v1/environments/${encodeURIComponent(id)}`, {
+    method: "DELETE",
   });
 }
