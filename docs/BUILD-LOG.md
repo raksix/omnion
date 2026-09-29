@@ -4910,3 +4910,74 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+
+## 2026-09-29 · omnion-w9 · tick 18 — REQ-065 slice 4 part 12: the guard was counting zero
+
+Merged `origin/main` first (9 commits, conflict only in this append-only log — `3c761d9`, the
+`merge-build-log.py` merge verified with a multiset check: 0 base lines lost, union additions
+1369 == merged 1369, no duplicated blocks).
+
+**What.** The provider-deletion guard counts the accounts a connector provisioned, and the column
+it counts from was **never written by anything the platform does**. `0127` added
+`users.identity_source` and backfilled the accounts that existed at migration time;
+`provenance::attribute` — the one function that could write it afterwards — had **zero callers in
+the workspace**. `users::create_user` inserts no such column, so every account a connector created
+after the migration stayed `local` for the rest of its life, and `local` is the single value the
+guard's query excludes. A directory that provisioned eight people on Tuesday had a guard that read
+**zero** on Wednesday, and `DELETE /iam/providers/{id}` walked out with all eight accounts keeping
+their sessions, their role grants and their password-less sign-in.
+
+**Why every walk was green.** Each one builds its accounts with
+`insert into users (…, identity_source, provisioned_by_provider_id, external_id) values (…)`. A
+fixture that sets the column proves the **query**; the **writer** was never executed by anything.
+That is the same class of gap as the six events this branch found recorded-but-unlistable, one
+layer down and quieter: nothing is red, and a criterion is ticked on a guard that cannot see the
+directory it is guarding.
+
+**The fix, in three writes rather than one.** `mark_scim_provisioned` stamps the source and nothing
+else — a SCIM token is an organization-scoped bearer that names no provider, so a pushed account is
+legitimately unattributable and `users_provenance_paired_check` refuses the alternative. It is
+idempotent by construction (`is distinct from`), and returns whether the row changed, because a
+database read after the fact cannot tell a no-op from a rewrite of the same value and a connector
+re-sends its whole user set on a timer. It is called from **all three** write paths: the create, the
+replace/patch (a connector that only ever patches the accounts it finds is the classic "sync an
+existing IdP" and creates nobody while owning everybody), and the idempotent-create arm. Deliberately
+**not** folded into `users::create_user`: a panel sign-up is not somebody else's directory's account,
+and a default in the shared constructor is exactly how that label would end up on every row.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test iam_provider_deletion` → **6 passed** (20.2s) against the real
+  router and a real database, three of them new and driving `/scim/v2/Users` with a token minted by
+  the real store.
+- **Before/after on the fix itself:** with `apps/api/src/routes/scim.rs` stashed and nothing else
+  changed, the two new walks fail on *"a pushed account must be attributed to the connector"* and
+  **the other three still pass**. That asymmetry is the shape of the bug, and it is the reason the
+  fixture was rewritten rather than extended.
+- `cargo test -p omnion-identity --lib` → **227 passed**; `-p omnion-api --lib` → **221 passed**
+  (both up from the merge, not from this change — `--lib` and the test target are two separate
+  gates, and only running the test target is what would have caught the `403` below).
+- `pnpm --filter @omnion/admin typecheck` → clean.
+
+**A third defect, in the test file itself.** `main` fixed the *panel* half of CSRF on 2026-09-29 —
+the token is now minted in all four sign-in paths and echoed by the client. This file was left
+behind, so **three of its six walks had been answering `403 csrf_unavailable` before reaching any
+of the code they claim to test**. It is the exact trap this branch's ledger already records, and it
+is worth naming twice: a deployment with no `OMNION_CSRF_SECRET` *refuses* cookie-authenticated
+writes rather than skipping the check, so the symptom is "the route is broken" and the message
+names neither CSRF nor the fixture. The secret now lives in the file that depends on it, set
+before `Config::from_env` (setting it afterwards leaves the router holding a config with no secret),
+and the token is derived from the **resolved session id** — not from the cookie value, which
+compiles, looks plausible, and fails as a *second*, more confusing error.
+
+**A box note.** The QA slot was held by a live pass from another writer for the whole first half of
+this tick, so the browser pass is queued behind it rather than run in parallel. Per the standing
+note in the invariants, the code is committed and proved against the database; the walkthrough
+change is committed but its assertions have **not** executed yet, and this entry does not claim
+otherwise.
+
+**Next.** Run `QA_STACK=w9 … bash scripts/qa/run.sh` when the slot frees, and read
+`page-iam-provider-deletion-blocked` and `page-iam-provider-deletion-reassigned` for the blocked
+half. Then the live OIDC round trip against the stub IdP with a SCIM-provisioned subject, which
+`115cce4` still rests on unit tests and a dry run for — and after that REQ-066 (MFA/passkeys and
+device trust).
