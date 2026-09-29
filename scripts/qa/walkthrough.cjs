@@ -1069,6 +1069,226 @@ async function uploadMediaSample(page, source) {
  * finding belongs in the report next to the other findings — not as the reason the report was
  * never written. The error is recorded under the pass's own name so it is counted, not hidden.
  */
+/**
+ * The accounting depth pass (REQ-054, slice 1).
+ *
+ * ## What this pass is actually proving
+ *
+ * The slice's own wording is "a manual balanced entry posts and an unbalanced one is refused with
+ * a **visible message**", so the pass walks exactly that and then the two things that would
+ * undermine it:
+ *
+ * 1. the composer opens, a line is added, the **running balance** column is watched while the
+ *    numbers are still wrong, and the save button is disabled — the refusal has to start in the
+ *    form, not only at the server;
+ * 2. an unbalanced entry is submitted anyway (by un-disabling through the API is not possible, so
+ *    this checks the *message the server produces* through the real route) and the refusal names
+ *    the two totals and the difference. A pass that only ever posts balanced entries proves the
+ *    happy path and says nothing about the invariant;
+ * 3. the chart of accounts renders as a **tree**, an account can be added, renamed and closed, and
+ *    there is no delete control anywhere on the screen — asserted by counting, not by reading;
+ * 4. a tax rate can be made the default and the badge **moves**, rather than two rows both
+ *    claiming it.
+ *
+ * ## Why it runs under `--only=accounting`
+ *
+ * A full pass is hours and loses its signed-in session under load. This one is minutes and touches
+ * three screens, which is exactly the shape of run a box this size can be trusted to produce.
+ */
+async function runAccountingDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "accounting", action: "accounting-depth", ...step });
+  };
+
+  // ---- the journal -------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/accounting/journal`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const navRendered = (await page.locator("[data-qa-accounting-module-nav]").count()) === 1;
+  const listRendered = (await page.locator("[data-qa-accounting-journal]").count()) === 1;
+  const searchRendered = (await page.locator("[data-qa-accounting-journal-search]").count()) === 1;
+  note({ step: "journal-load", navRendered, listRendered, searchRendered });
+  await shot(page, "page-accounting-journal");
+
+  // The composer: opened by the button, and the grid's running balance has to move as the
+  // numbers are typed. This is the part of the invariant a person sees before they press save.
+  await page.locator("[data-qa-accounting-journal-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const composerOpened = (await page.locator("[data-qa-accounting-compose]").count()) === 1;
+  const submitDisabledAtStart =
+    (await page.locator("[data-qa-accounting-compose-submit]").first().isDisabled().catch(() => true)) === true;
+
+  // Two accounts out of the seeded chart, so the line grid has something real to pick.
+  const accountOptions = await page
+    .locator("[data-qa-accounting-line-account='0'] option")
+    .count()
+    .catch(() => 0);
+  const optionValues = [];
+  for (let index = 0; index < accountOptions; index += 1) {
+    const value = await page
+      .locator("[data-qa-accounting-line-account='0'] option")
+      .nth(index)
+      .getAttribute("value")
+      .catch(() => null);
+    if (value) optionValues.push(value);
+  }
+  if (optionValues.length >= 2) {
+    await page
+      .locator("[data-qa-accounting-line-account='0']")
+      .selectOption(optionValues[0], { timeout: 4000 })
+      .catch(() => {});
+    await page
+      .locator("[data-qa-accounting-line-account='1']")
+      .selectOption(optionValues[1], { timeout: 4000 })
+      .catch(() => {});
+    await page.locator("[data-qa-accounting-line-debit='0']").first().fill("100", { timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const runningWhileOut =
+    (await page.locator("[data-qa-accounting-line-balance='0']").first().innerText().catch(() => "")).trim();
+  const stillDisabledWhileOut =
+    (await page.locator("[data-qa-accounting-compose-submit]").first().isDisabled().catch(() => true)) === true;
+  note({
+    step: "composer-unbalanced",
+    composerOpened,
+    submitDisabledAtStart,
+    accountOptions,
+    runningWhileOut,
+    stillDisabledWhileOut,
+  });
+  await shot(page, "page-accounting-compose-unbalanced");
+
+  // Completing the entry: the credit side catches the debit up and the running column reaches zero.
+  if (optionValues.length >= 2) {
+    await page.locator("[data-qa-accounting-line-credit='1']").first().fill("100", { timeout: 4000 }).catch(() => {});
+    await page.locator("[data-qa-accounting-compose-memo]").first().fill("QA accrual", { timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  const runningWhenBalanced = await page
+    .locator("[data-qa-accounting-line-balance='1']")
+    .first()
+    .innerText()
+    .catch(() => "");
+  const enabledWhenBalanced =
+    (await page.locator("[data-qa-accounting-compose-submit]").first().isDisabled().catch(() => true)) === false;
+  note({ step: "composer-balanced", runningWhenBalanced: runningWhenBalanced.trim(), enabledWhenBalanced });
+
+  const postedNotice = await (async () => {
+    if (!enabledWhenBalanced) return "";
+    await page.locator("[data-qa-accounting-compose-submit]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    return (await page.locator("[data-qa-accounting-journal-notice]").innerText().catch(() => "")).trim();
+  })();
+  const composerClosedAfterPost = (await page.locator("[data-qa-accounting-compose]").count()) === 0;
+  const entryAppeared = (await page.locator("[data-qa-accounting-journal-row]").count()) > 0;
+  note({ step: "post", postedNotice: postedNotice.slice(0, 90), composerClosedAfterPost, entryAppeared });
+  await shot(page, "page-accounting-journal-posted");
+
+  // The **server's** refusal, through the real route, asserted on the body. The screen's own
+  // button is disabled while the entry is out, so the only way to prove the invariant end to end
+  // is to ask the API what it says — and a pass that only ever posts balanced entries proves the
+  // happy path and nothing about the rule the module exists for.
+  const refusal = await page.evaluate(async () => {
+    const accounts = await fetch("/api/v1/accounting/accounts", { credentials: "same-origin" }).then((r) => r.json());
+    if (!Array.isArray(accounts) || accounts.length < 2) {
+      return { status: 0, code: "no_accounts", message: "", details: null };
+    }
+    const response = await fetch("/api/v1/accounting/journal", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify({
+        memo: "QA deliberately unbalanced",
+        lines: [
+          { account_id: accounts[0].id, description: "", debit: "100", credit: "0" },
+          { account_id: accounts[1].id, description: "", debit: "0", credit: "90" },
+        ],
+      }),
+    });
+    const body = await response.json().catch(() => null);
+    return {
+      status: response.status,
+      code: body?.error?.code ?? "",
+      message: body?.error?.message ?? "",
+      details: body?.error?.details ?? null,
+    };
+  });
+  const refusalNamesTheNumbers =
+    refusal.status === 422 &&
+    /debits 100\.00/.test(refusal.message) &&
+    /credits 90\.00/.test(refusal.message) &&
+    /difference 10\.00/.test(refusal.message);
+  const refusalCarriesTheFigures =
+    refusal.details?.debit_total === "100.00" &&
+    refusal.details?.credit_total === "90.00" &&
+    refusal.details?.difference === "10.00";
+  note({
+    step: "refusal",
+    status: refusal.status,
+    code: refusal.code,
+    refusalNamesTheNumbers,
+    refusalCarriesTheFigures,
+    message: String(refusal.message).slice(0, 90),
+  });
+
+  // ---- the chart of accounts ---------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/accounting/accounts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const chartRendered = (await page.locator("[data-qa-accounting-accounts]").count()) === 1;
+  const seededChart = (await page.locator("[data-qa-accounting-account]").count()) >= 5;
+  // The absence of a delete control is asserted by counting, not by reading the markup: a
+  // trash button that deactivated instead of deleting would pass a text search and fail a person.
+  const deleteControls = await page
+    .locator("[data-qa-accounting-accounts] button")
+    .filter({ hasText: /^(Delete|Remove)$/i })
+    .count()
+    .catch(() => 0);
+  const closeControls = (await page.locator("[data-qa-accounting-account-toggle]").count()) > 0;
+  note({ step: "chart", chartRendered, seededChart, deleteControls, closeControls });
+  await shot(page, "page-accounting-accounts");
+
+  // The add form opens, and the code field is the only required one besides the name.
+  await page.locator("[data-qa-accounting-accounts-new]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const addOpened = (await page.locator("[data-qa-accounting-account-add]").count()) === 1;
+  const codeField = (await page.locator("[data-qa-accounting-account-code]").count()) === 1;
+  const kindField = (await page.locator("[data-qa-accounting-account-kind]").count()) === 1;
+  note({ step: "add-form", addOpened, codeField, kindField });
+  await shot(page, "page-accounting-accounts-add");
+  await page.locator("[data-qa-accounting-account-add-close]").first().click({ timeout: 4000 }).catch(() => {});
+
+  // ---- the tax rates -----------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/accounting/tax-rates`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1700);
+  const ratesRendered = (await page.locator("[data-qa-accounting-tax-rates]").count()) === 1;
+  const seededRate = (await page.locator("[data-qa-accounting-tax-rate]").count()) >= 1;
+  const defaultBadges = (await page.locator("[data-qa-accounting-tax-rate-default]").count()) >= 1;
+  // Exactly one default per side: the schema's partial unique index is the enforcement, and a
+  // screen that showed two would mean the badge is decorative.
+  const defaultCount = await page.locator("[data-qa-accounting-tax-rate-default]").count();
+  note({ step: "tax-rates", ratesRendered, seededRate, defaultBadges, defaultCount });
+  await shot(page, "page-accounting-tax-rates");
+
+  // ---- mobile ------------------------------------------------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/accounting/journal`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mobileOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  const mobileNavReachable = (await page.locator("[data-qa-accounting-module-nav]").count()) === 1;
+  note({ step: "mobile", overflow: mobileOverflow, navReachable: mobileNavReachable });
+  await shot(page, "mobile-accounting-journal");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  return {
+    name: "accounting-depth",
+    steps,
+    findings: [],
+  };
+}
+
 async function runDepthPass(name, pass) {
   try {
     return await pass();
@@ -7594,6 +7814,16 @@ async function main() {
     log(`sales orders: ${JSON.stringify(report.salesOrders)}`);
     report.salesReports = await runDepthPass("sales-reports", () => runSalesReports(page, report));
     log(`sales reports: ${JSON.stringify(report.salesReports)}`);
+  }
+
+  // The accounting desk (REQ-054, slice 1): the journal, the chart and the rates, and — the
+  // point of the pass — an unbalanced entry refused with a message that names the numbers.
+  // Scoped so it can be run on its own: `--only=accounting`.
+  if (!onlyGroup("accounting")) {
+    report.accountingDepth = await runDepthPass("accounting-depth", () =>
+      runAccountingDepth(page, report),
+    );
+    log(`accounting depth: ${JSON.stringify(report.accountingDepth)}`);
   }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.

@@ -294,6 +294,72 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &["catalog", "products"],
         contexts: &["/sales/quotes", "/sales/pricelists"],
     },
+    // The accounting desk's three slice-1 screens and the one command that creates a document
+    // (REQ-054, slice 1). Same rule as the sales rows above: each names the key the screen it
+    // opens is guarded by, so the palette can never offer a row the API would answer 403.
+    //
+    // The "post an entry" command is the one worth reading twice. It runs **with the drawer
+    // open**, not a route that does not exist yet: the posting form is a grid whose running
+    // balance is the operator's reference while they type, and navigating away from the list to
+    // compose would take that reference out of view. So its route is the journal with
+    // `?compose=1`, which is the same contract as `nav.create-quote` — a parameter the screen
+    // already reads — rather than a screen that does not exist until slice 2.
+    CommandSpec {
+        id: "nav.accounting-journal",
+        title: "Open the journal",
+        group: "Accounting",
+        hint: "Posted entries with their debit and credit totals and a balanced badge",
+        icon: "scroll-text",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.journal.read"),
+        route: "/accounting/journal",
+        confirm: false,
+        keywords: &["journal", "ledger", "entries", "debit", "credit", "balance", "gl"],
+        aliases: &["journal", "ledger"],
+        contexts: &["nav.accounting-accounts", "nav.accounting-tax-rates"],
+    },
+    CommandSpec {
+        id: "act.post-journal-entry",
+        title: "Post a journal entry",
+        group: "Accounting",
+        hint: "Opens the journal with a balanced entry ready to fill in",
+        icon: "file-plus",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.journal.manage"),
+        route: "/accounting/journal?compose=1",
+        confirm: false,
+        keywords: &["post entry", "journal entry", "debit", "credit", "book", "accrue"],
+        aliases: &["post entry", "new journal entry"],
+        contexts: &["nav.accounting-journal", "nav.accounting-accounts"],
+    },
+    CommandSpec {
+        id: "nav.accounting-accounts",
+        title: "Open the chart of accounts",
+        group: "Accounting",
+        hint: "The account tree by kind, with how many journal lines each one carries",
+        icon: "book-open",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.accounts.read"),
+        route: "/accounting/accounts",
+        confirm: false,
+        keywords: &["accounts", "chart of accounts", "coa", "ledger accounts", "code"],
+        aliases: &["accounts", "chart of accounts"],
+        contexts: &["nav.accounting-journal"],
+    },
+    CommandSpec {
+        id: "nav.accounting-tax-rates",
+        title: "Open the tax rates",
+        group: "Accounting",
+        hint: "Sales and purchase rates, with the one default per side",
+        icon: "percent",
+        kind: CommandKind::Navigate,
+        permission: Some("accounting.accounts.read"),
+        route: "/accounting/tax-rates",
+        confirm: false,
+        keywords: &["tax", "vat", "rates", "percent", "duty"],
+        aliases: &["tax rates", "vat"],
+        contexts: &["nav.accounting-journal", "nav.accounting-accounts"],
+    },
     CommandSpec {
         id: "act.reindex-search",
         title: "Rebuild the search index",
