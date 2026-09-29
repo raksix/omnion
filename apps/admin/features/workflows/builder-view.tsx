@@ -81,6 +81,7 @@ import {
 import { decideConnection } from "./connect-edge";
 import { readVersionFrom, resolveConflict } from "./conflict";
 import { arbitrateSave } from "./save-arbitration";
+import { startability, startMessage } from "@/features/workflows/run-from-here";
 import {
   clearSelection,
   deleteTarget,
@@ -136,6 +137,18 @@ type SaveState =
  * Everything is derived from two pieces of state — the graph and the layout — plus the
  * registry, so there is exactly one place a change is made and one place it is written.
  */
+/** What `POST /workflows/{id}/run-from-node` answers with. */
+interface RunFromNodeBody {
+  /** The node the run started at. */
+  started_from_node?: string;
+  /** The steps it passed over, each with the reason the trace shows. */
+  skipped?: Array<{ step_no: number; name: string; node_id: string; reason: string }>;
+  /** The run itself, with every step including the skipped prefix. */
+  steps?: Array<{ step_no: number; status: string; skip_reason?: string | null }>;
+  /** The error shape every refused write answers with. */
+  error?: { code?: string; message?: string };
+}
+
 export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const router = useRouter();
 
@@ -1274,6 +1287,42 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     }
   }, [edges, nodes, workflowId]);
 
+  const runFrom = useCallback(
+    async (node: GraphNode) => {
+      setRunning(true);
+      setRunMessage(null);
+      try {
+        const response = await fetch(
+          `/api/v1/workflows/${workflowId}/run-from-node`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { accept: "application/json", "content-type": "application/json" },
+            body: JSON.stringify({ node_id: node.id }),
+          },
+        );
+        const body = (await response.json().catch(() => null)) as RunFromNodeBody | null;
+        if (!response.ok) {
+          throw new Error(
+            body?.error?.message ?? `The run could not be started (status ${response.status}).`,
+          );
+        }
+        // The server is the authority on what was skipped, not this screen's guess: the
+        // canvas knows the graph it holds, the server ran the one it stored, and after an
+        // autosave those are the same graph at two moments. Reporting the server's count
+        // keeps the message true even in the tick between them.
+        setRunMessage(startMessage(node.label, body?.skipped ?? []));
+      } catch (error) {
+        setRunMessage(
+          error instanceof Error ? error.message : "The run could not be started.",
+        );
+      } finally {
+        setRunning(false);
+      }
+    },
+    [workflowId],
+  );
+
   const runOnce = useCallback(async () => {
     setRunning(true);
     setRunMessage(null);
@@ -1804,6 +1853,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               onChange={(patch) => updateNode(selectedNode.id, patch)}
               onDelete={() => removeNode(selectedNode.id)}
               onRemoveConnection={(edgeId) => removeEdge(edgeId)}
+              onRunFromHere={(nodeId) => {
+                const target = nodes.find((entry) => entry.id === nodeId);
+                if (target) void runFrom(target);
+              }}
+              running={running}
             />
           ) : (
             <div className="p-3">
@@ -2029,6 +2083,69 @@ function ToolbarButton({
  * validates against — a field here that the server ignores would be a form that accepts
  * anything, so there is no hand-written field in this component.
  */
+/**
+ * *Run from here*, on one node.
+ *
+ * The button is offered wherever a run can genuinely start, and it is disabled with a
+ * stated reason where one cannot — the end of the graph being the case an operator is
+ * most likely to try. A disabled button with no reason teaches nothing; a live button
+ * that always fails is worse.
+ *
+ * "Is this the last node on the path" is answered from the edges rather than from the
+ * node type alone, because a node with no outgoing edge is the end of the run whatever it
+ * is called. The walk follows the first outgoing edge, and a graph the server refused to
+ * save is not the case this has to survive: an unsaved graph is a graph whose *nodes* the
+ * author is still editing.
+ */
+function RunFromHereControl({
+  node,
+  nodeType,
+  edges,
+  onRun,
+  running,
+}: {
+  node: GraphNode;
+  nodeType: GraphNodeType;
+  edges: GraphEdge[];
+  onRun: () => void;
+  running: boolean;
+}) {
+  const hasOutgoing = edges.some((edge) => edge.source === node.id);
+  const answer = startability(
+    { id: node.id, type: node.type, inert: nodeType.inert === true },
+    !hasOutgoing,
+  );
+
+  return (
+    <div
+      className="rounded-md border border-line p-2"
+      data-run-from-here={node.id}
+      data-can-start={answer.canStart ? "true" : "false"}
+    >
+      <button
+        type="button"
+        onClick={onRun}
+        disabled={!answer.canStart || running}
+        title={answer.reason ?? `Start a run at ${node.label}`}
+        className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-[12px] disabled:cursor-not-allowed disabled:opacity-60"
+        data-run-from-here-button
+      >
+        {running ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+        ) : (
+          <Play className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
+        Run from here
+      </button>
+      {answer.reason ? (
+        <p className="mt-1.5 text-[11.5px] text-muted" data-run-from-here-reason>
+          {answer.reason}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function NodeInspector({
   node,
   nodeType,
@@ -2037,6 +2154,8 @@ function NodeInspector({
   onChange,
   onDelete,
   onRemoveConnection,
+  onRunFromHere,
+  running,
 }: {
   node: GraphNode;
   nodeType: GraphNodeType | null;
@@ -2045,6 +2164,8 @@ function NodeInspector({
   onChange: (patch: Partial<GraphNode>) => void;
   onDelete: () => void;
   onRemoveConnection: (edgeId: string) => void;
+  onRunFromHere: (nodeId: string) => void;
+  running: boolean;
 }) {
   if (!nodeType) {
     return (
@@ -2072,6 +2193,14 @@ function NodeInspector({
         <h2 className="text-[13px] font-medium">{nodeType.label}</h2>
         <p className="text-[12px] text-muted">{nodeType.summary}</p>
       </div>
+
+      <RunFromHereControl
+        node={node}
+        nodeType={nodeType}
+        edges={edges}
+        onRun={() => onRunFromHere(node.id)}
+        running={running}
+      />
 
       <label className="block text-[12px] font-medium" htmlFor={`label-${node.id}`}>
         Label
