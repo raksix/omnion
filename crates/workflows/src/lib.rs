@@ -25,6 +25,7 @@ pub mod cron;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod expression;
 pub mod graph;
 pub mod graph_store;
 pub mod handler;
