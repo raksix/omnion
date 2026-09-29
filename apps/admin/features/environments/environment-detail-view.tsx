@@ -1,10 +1,18 @@
 "use client";
 
 /**
- * `/environments/{id}` — one environment (REQ-017, slice 2).
+ * `/environments/{id}` — one environment (REQ-017, slices 2 and 3).
  *
- * The screen answers: *what is in this copy, when was it last refreshed, and can I refresh it
- * again without losing something?* Two things here are load-bearing:
+ * The screen answers: *what is in this copy, when was it last refreshed, and what can I do with
+ * what it holds?* Four tabs, because those are four questions, and mixing them makes all of them
+ * worse:
+ *
+ * - **Overview** — the facts and the clone history.
+ * - **Changes** — what staging holds that production does not, with a checkbox column and
+ *   `Promote selection` (slice 2's diff, slice 3's bulk action).
+ * - **Promotions** — the history of what was asked for, and what happened to it.
+ *
+ * Three things here are load-bearing:
  *
  * - **The re-clone confirmation is built from the server's refusal, not from a guess.** The API
  *   answers a re-clone with `clone_discard_unconfirmed` and a `details` payload naming how many
@@ -15,15 +23,18 @@
  * - **Cancel is offered only where the job says it can be.** `cancellable` comes from the API. A
  *   cancel button on a finished job is not a small lie, it is a button that returns `409` and
  *   makes the operator think their environment is broken.
+ * - **A promotion is offered only from the Changes tab, and only for a staging environment.**
+ *   Production has nothing to promote *out of*, and a `Promote` button on the production row
+ *   would be the one dead button this screen is not allowed to have.
  *
- * Keyboard: `r` re-clones, `c` cancels the open job, `Esc` closes the dialog. Mobile: the job
- * history and the summary stack, the progress bar stays the same element.
+ * Keyboard: `r` re-clones, `c` cancels the open job, `p` opens the promotion dialog, `Esc` closes
+ * the dialog. Mobile: the tabs scroll, the job history and the summary stack.
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { ArrowLeft, CopyPlus, RefreshCw, Trash2, X } from "lucide-react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -36,6 +47,17 @@ import {
   startEnvironmentClone,
 } from "@/lib/api";
 import type { EnvironmentCloneJob, EnvironmentDetailResponse } from "@/lib/types";
+import { ChangesTab } from "./changes-tab";
+import { PromotionsTab } from "./promotions-tab";
+
+/** The four tabs, in the order the request lists them. */
+const TABS = [
+  { id: "overview", label: "Overview" },
+  { id: "changes", label: "Changes" },
+  { id: "promotions", label: "Promotions" },
+] as const;
+
+type TabId = (typeof TABS)[number]["id"];
 
 /** What a refusal of the discard confirmation says the operator is about to lose. */
 type DiscardNotice = {
@@ -49,6 +71,8 @@ type DiscardNotice = {
 export function EnvironmentDetailView() {
   const params = useParams<{ id: string }>();
   const id = typeof params?.id === "string" ? params.id : "";
+  const router = useRouter();
+  const search = useSearchParams();
 
   const [detail, setDetail] = useState<EnvironmentDetailResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -57,6 +81,28 @@ export function EnvironmentDetailView() {
   const [dialog, setDialog] = useState<"clone" | "archive" | null>(null);
   const [discard, setDiscard] = useState<DiscardNotice | null>(null);
   const [reloadToken, setReloadToken] = useState(0);
+
+  // The tab and the change filters live in the query string, so a filtered Changes tab is a URL
+  // that can be pasted to a colleague and survives a reload. The same rule as the list screen.
+  const tabParam = search?.get("tab");
+  const tab: TabId = TABS.some((entry) => entry.id === tabParam)
+    ? (tabParam as TabId)
+    : "overview";
+  const changeKind = search?.get("change") ?? "";
+  const changeSearch = search?.get("q") ?? "";
+
+  const setParam = useCallback(
+    (key: string, value: string | undefined) => {
+      const next = new URLSearchParams(search?.toString() ?? "");
+      if (value === undefined || value === "") {
+        next.delete(key);
+      } else {
+        next.set(key, value);
+      }
+      router.replace(`${window.location.pathname}?${next.toString()}`, { scroll: false });
+    },
+    [router, search],
+  );
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
@@ -323,6 +369,55 @@ export function EnvironmentDetailView() {
         </p>
       ) : null}
 
+      <div role="tablist" aria-label="Environment views" className="flex gap-1 border-b border-line">
+        {TABS.map((entry) => {
+          const active = tab === entry.id;
+          return (
+            <button
+              key={entry.id}
+              type="button"
+              role="tab"
+              id={`env-tab-${entry.id}`}
+              aria-selected={active}
+              aria-controls={`env-panel-${entry.id}`}
+              data-env-tab={entry.id}
+              onClick={() => setParam("tab", entry.id === "overview" ? undefined : entry.id)}
+              className={`-mb-px px-3 py-2 text-[13px] transition ${
+                active ? "border-accent border-b-2 font-medium text-ink" : "text-muted hover:text-ink"
+              }`}
+            >
+              {entry.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {tab === "changes" ? (
+        <div role="tabpanel" id="env-panel-changes" aria-labelledby="env-tab-changes">
+          {environment.type === "staging" ? (
+            <ChangesTab
+              environmentId={environment.id}
+              environmentName={environment.name}
+              filters={{ kind: changeKind, search: changeSearch }}
+              onPromoted={reload}
+            />
+          ) : (
+            <EmptyState
+              title="Production has no changes to promote"
+              hint="A promotion carries staging's content to production, so there is nothing to compare when this *is* production. Open a staging environment to see its change set."
+            />
+          )}
+        </div>
+      ) : null}
+
+      {tab === "promotions" ? (
+        <div role="tabpanel" id="env-panel-promotions" aria-labelledby="env-tab-promotions">
+          <PromotionsTab environmentId={environment.id} reloadToken={reloadToken} />
+        </div>
+      ) : null}
+
+      {tab === "overview" ? (
+        <div role="tabpanel" id="env-panel-overview" aria-labelledby="env-tab-overview" className="flex flex-col gap-4">
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4" data-env-detail-facts>
         <div className="rounded-xl border border-line bg-surface px-4 py-3">
           <p className="text-[11.5px] text-muted">Pages</p>
@@ -417,6 +512,8 @@ export function EnvironmentDetailView() {
           </div>
         )}
       </section>
+        </div>
+      ) : null}
 
       {dialog === "clone" ? (
         <div
