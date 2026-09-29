@@ -1298,6 +1298,33 @@ async function runSalesQuotes(page, report) {
   note({ step: "issue-the-customer-link", linkShown, hasToken: /\/q\/[0-9a-f-]{20,}/.test(linkText || "") });
   await shot(page, "page-sales-quote-link");
 
+  // --- the PDF: the button exists, and the bytes it downloads are a real document ----------------
+  //
+  // The button is clicked (so a dead control is caught) and the endpoint is then fetched from the
+  // same session, because Playwright cannot read a download it did not ask for: the browser takes
+  // the bytes and the harness is left with a filename. The assertions that matter are about the
+  // **bytes** — a button that downloads `{"error": …}` under a `.pdf` name is the failure this
+  // whole fetch-instead-of-navigate rule exists to prevent, and only the body can tell.
+  const pdfButton = (await page.locator("[data-qa-sales-detail-pdf]").count()) > 0;
+  await page.locator("[data-qa-sales-detail-pdf]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const pdfNotice = (await page.locator("[data-qa-sales-notice]").first().textContent().catch(() => "")) || "";
+  const pdfErrorShown = (await page.locator("[data-qa-sales-action-error]").count()) > 0;
+  await shot(page, "page-sales-quote-pdf");
+
+  // The id comes off the URL the detail screen is already sitting on, rather than from a variable
+  // this pass would have to thread through the twenty steps that came before it.
+  const quoteId = new URL(page.url()).pathname.split("/").filter(Boolean).pop();
+  const quotePdf = quoteId
+    ? await fetchAsPdf(page, URL_ADMIN, `/api/v1/sales/quotes/${quoteId}/pdf`)
+    : { fetched: false, why: "the detail URL carried no id" };
+  note({
+    step: "quote-pdf-downloads-a-real-document",
+    buttonPresent: pdfButton,
+    saidSomething: pdfNotice.trim().length > 0 || pdfErrorShown,
+    ...quotePdf,
+  });
+
   // --- the public page, as the customer -------------------------------------------------------------------------
   const token = (linkText || "").trim().split("/").pop();
   if (token) {
@@ -1453,6 +1480,27 @@ async function runSalesOrders(page, report) {
     invoiceMatches = card && orderTotal !== "" && orderTotal === invoiceTotal;
     note({ step: "invoice-draft", card, orderTotal, invoiceTotal, invoiceMatches });
   }
+
+  // The order's PDF, on the same terms as the quote's: the button is clicked and the bytes are
+  // then read. An order document has to carry the **quote number it came from** and the held stock
+  // — a confirmation a warehouse cannot reconcile is a confirmation nobody can act on — so both
+  // are asserted against the body rather than the screen.
+  const orderPdfButton = (await page.locator("[data-qa-sales-order-pdf]").count()) > 0;
+  await page.locator("[data-qa-sales-order-pdf]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const orderPdfNotice =
+    (await page.locator("[data-qa-sales-order-notice]").first().textContent().catch(() => "")) || "";
+  await shot(page, "page-sales-order-pdf");
+  const orderId = new URL(page.url()).pathname.split("/").filter(Boolean).pop();
+  const orderPdf = orderId
+    ? await fetchAsPdf(page, URL_ADMIN, `/api/v1/sales/orders/${orderId}/pdf`)
+    : { fetched: false, why: "the detail URL carried no id" };
+  note({
+    step: "order-pdf-downloads-a-real-document",
+    buttonPresent: orderPdfButton,
+    saidSomething: orderPdfNotice.trim().length > 0,
+    ...orderPdf,
+  });
 
   // Cancel: the confirm button must be dead until a reason is typed. This is the one assertion a
   // server test cannot make — the server refuses a blank reason, but what a person experiences is
@@ -7968,6 +8016,53 @@ async function runCrmKeyboardAndMobile(page, report) {
 
   report.crmKeyboardMobile = steps;
   log(`crm keyboard + mobile: ${JSON.stringify(steps)}`);
+}
+
+/**
+ * Fetch a document download from inside the signed-in page and say whether it is a real one.
+ *
+ * The harness cannot read a download Playwright did not request — the browser takes the bytes and
+ * leaves a filename — so a button that downloads a JSON error under a `.pdf` name would pass every
+ * "did it download?" check there is. The assertions are on the body: the `%PDF-` header, the
+ * `%%EOF` trailer, and the grand total **printed in the document**, which is the only way to prove
+ * the file and the screen agree.
+ *
+ * A degraded-document header is reported rather than failed: a Turkish name in a base-14 font is a
+ * real, announced limitation and the box says the *sender* is told, not that the file is refused.
+ */
+async function fetchAsPdf(page, admin, path) {
+  const result = await page.evaluate(
+    async ([url]) => {
+      const response = await fetch(url, { credentials: "same-origin" });
+      const text = await response.text();
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        disposition: response.headers.get("content-disposition"),
+        degraded: response.headers.get("x-omnion-document-degraded"),
+        head: text.slice(0, 8),
+        tail: text.slice(-8),
+        // The total is searched for in the *raw* body, not a decode: a PDF is WinAnsi, and the
+        // numbers a document is judged on are ASCII either way.
+        hasGrandTotal: text.includes("407.76"),
+        hasQuoteNumber: text.includes("Q-"),
+        bytes: text.length,
+      };
+    },
+    [`${admin}${path}`],
+  );
+  return {
+    fetched: true,
+    status: result.status,
+    isPdf: result.contentType === "application/pdf" && result.head.startsWith("%PDF-") && result.tail.includes("%%EOF"),
+    isNotAnErrorBody: !result.head.startsWith("{"),
+    namedAsAPdf: /filename\*?=[^;]*\.pdf/i.test(result.disposition || ""),
+    // The total is the point: a PDF that opens and is blank proves the format, not the document.
+    carriesTheTotal: result.hasGrandTotal,
+    carriesTheNumber: result.hasQuoteNumber,
+    degraded: result.degraded ? Number(result.degraded) : 0,
+    bytes: result.bytes,
+  };
 }
 
 /**
