@@ -3599,3 +3599,19 @@ unticked. The QA pass for this tick is queued behind a sibling writer for the si
 slice 3 only when the wizard and the dry run are *observed*. Then slice 4 part 2 — the sync-runs
 route, the retry path and the provider Sync tab.
 
+
+## 2026-09-29 · tick 8 addendum · the guard and the compiler
+
+- **A compiler whose output directory is deleted mid-run does not recover.** `disk-guard.sh`
+  drops a worktree `target/` whenever the box is under `MIN_FREE_GB` (a cron runs it at 12 GB
+  while the box sits at 2-4 GB free, so it fires every tick). A QA pass that compiles into
+  `target/` therefore dies a hundred seconds in with "could not write output to
+  `target/debug/deps/…`: No such file or directory", and its report blames the build. It cost me
+  two passes to notice the report was the liar. The fix is not a faster build: build somewhere the
+  guard's glob cannot see, and **install** the binary with a copy to a temp name plus one rename,
+  so a pass starting mid-install never reads a half-written file as a good build.
+- **A fix I cannot prove on a quiet box must still be committed as "not verified".** This tick's
+  browser pass reached `/settings/iam/authentication` and the tab died on the first IAM route
+  under load average 101. That is the documented sibling-interference case, not my change — and
+  the honest report is that the observation did not happen, not that it nearly did.
+- **Check `uptime` before queueing a browser pass, not after.** Eight consecutiv
