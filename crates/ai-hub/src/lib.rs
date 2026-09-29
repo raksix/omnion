@@ -24,6 +24,7 @@ pub mod health;
 pub mod health_store;
 pub mod model;
 pub mod protocol;
+pub mod resolve_path;
 pub mod router;
 pub mod routing;
 pub mod routing_store;
@@ -57,6 +58,7 @@ pub use model::{
     validate_token_limits,
 };
 pub use protocol::{ProtocolAdapter, ProtocolInfo, StreamPiece, adapter_for, protocol_infos};
+pub use resolve_path::{Resolved, resolve_and_record};
 pub use router::{ResolvedModel, model_id, resolve, resolve_for};
 pub use routing::{
     Candidate, Decision, DecisionSource, FeatureOverride, RULES, ResolveRequest, ResolvedCandidate,
