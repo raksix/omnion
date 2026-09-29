@@ -116,6 +116,21 @@ import {
   whatEscapeClears,
   type CanvasSelection,
 } from "./selection";
+import {
+  beginConnect,
+  cancelConnect,
+  commitConnect,
+  readKey,
+  type KeyboardConnectState,
+} from "./keyboard-path";
+import {
+  EDITOR_MIN_WIDTH,
+  LOCK_BANNER,
+  builderLayoutClass,
+  isEditorLocked,
+  isReadingKey,
+  lockPlan,
+} from "./viewport-lock";
 
 /** The snap grid the canvas draws and drops onto. */
 const GRID = 8;
@@ -296,6 +311,34 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const [linkNotice, setLinkNotice] = useState<{ tone: "ok" | "error"; text: string } | null>(
     null,
   );
+  // The keyboard connection gesture (`keyboard-path.ts`): the same three states the pointer
+  // gesture has — idle, armed, refused — kept separately because the two gestures are
+  // genuinely different. Collapsing them would mean Escape has to decide which of the two
+  // things the author might be holding, and a key that guesses is a key that cancels the
+  // wrong one.
+  const [keyConnect, setKeyConnect] = useState<KeyboardConnectState>({ kind: "idle" });
+  // The viewport width the lock reads. A `matchMedia` listener rather than a `resize`
+  // handler, because the criterion is about the *breakpoint* and matchMedia is the only
+  // source that agrees with the CSS query to the pixel; a resize handler fires on every
+  // pixel of a window drag and can be a frame behind the layout it is supposed to describe.
+  // `null` until measured, and the lock treats "unknown" as **wide**: a reader arriving on a
+  // slow device is briefly editable, which costs one stray edit, whereas locking on `null`
+  // would flash the read-only banner at a desktop author for one frame.
+  const [viewportWidth, setViewportWidth] = useState<number | null>(null);
+  useEffect(() => {
+    const query = window.matchMedia(`(max-width: ${EDITOR_MIN_WIDTH - 1}px)`);
+    const apply = () => setViewportWidth(window.innerWidth);
+    apply();
+    query.addEventListener("change", apply);
+    window.addEventListener("resize", apply);
+    return () => {
+      query.removeEventListener("change", apply);
+      window.removeEventListener("resize", apply);
+    };
+  }, []);
+
+  const locked = viewportWidth !== null && isEditorLocked(viewportWidth);
+  const lock = useMemo(() => lockPlan(viewportWidth ?? EDITOR_MIN_WIDTH * 2), [viewportWidth]);
 
   const nodeTypes = useMemo(() => {
     const map = new Map<string, GraphNodeType>();
@@ -1008,6 +1051,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       if (event.button !== 0) {
         return;
       }
+      // A locked canvas still lets a reader *select* a card, because the inspector's
+      // read-only state and the problems panel's jump links are the two ways a narrow screen
+      // answers "what is this node?". What it does not do is start a drag — that branch is
+      // below and is the one that writes positions.
       const element = canvasRef.current;
       if (!element) {
         return;
@@ -1020,13 +1067,19 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // had just given it. Two writers to one piece of state is how a node could be
       // "deselected" and still drawn as selected.
       setSelection((current) => (event.shiftKey ? toggleNode(current, node.id) : selectNode(node.id)));
+      // Selection yes, drag no. The read-only branch returns *after* the selection is
+      // recorded, which is the only order that satisfies both halves: a reader can point at
+      // a card, and no pointer gesture on a card can write a position.
+      if (locked) {
+        return;
+      }
       setDragging({
         id: node.id,
         offsetX: (event.clientX - rect.left - viewport.x) / viewport.zoom - node.position.x,
         offsetY: (event.clientY - rect.top - viewport.y) / viewport.zoom - node.position.y,
       });
     },
-    [viewport],
+    [locked, viewport],
   );
 
   const onCanvasPointerDown = useCallback(
@@ -1036,6 +1089,15 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // clicking the desk.
       if (event.button === 1 || spaceHeld.current) {
         setPanning({ x: event.clientX, y: event.clientY, vx: viewport.x, vy: viewport.y });
+        return;
+      }
+      // Narrow screen: panning already left above, so what is left here is a *mutation* — a
+      // marquee that ends in a group move, and a click that clears a selection the reader
+      // may have set from the problems panel. Both are refused, and the second one is refused
+      // *quietly* on purpose: clearing a selection is a convenience gesture, and refusing it
+      // with a message would put a toast on every tap of a screen the author was told is
+      // read-only.
+      if (locked) {
         return;
       }
       if (event.button !== 0) {
@@ -1061,7 +1123,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         additive: event.shiftKey,
       });
     },
-    [viewport],
+    [locked, viewport],
   );
 
   /** Centre the viewport on a graph point — the minimap's whole job. */
@@ -1109,6 +1171,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
       if (dragging) {
+        // A drag that started before the window narrowed must not keep writing positions.
+        // The browser will not cancel an in-flight pointer capture on a media-query change,
+        // so without this a phone rotated to landscape mid-drag finishes a move the author
+        // can no longer see or undo.
+        if (locked) {
+          return;
+        }
         moveNode(
           dragging.id,
           (event.clientX - rect.left - viewport.x) / viewport.zoom - dragging.offsetX,
@@ -1116,7 +1185,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         );
       }
     },
-    [dragging, marquee, moveNode, panning, persistLayout, viewport],
+    [dragging, locked, marquee, moveNode, panning, persistLayout, viewport],
   );
 
   /**
@@ -1184,6 +1253,25 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     next?.focus();
   }, []);
 
+  /**
+   * `I` moves focus to the inspector's first field.
+   *
+   * It is a `focus()` and not a scroll-into-view plus a class, because the criterion's last
+   * verb is *editing a parameter* and a keyboard user who has to hunt for the field cannot
+   * type into it. When there is no selection the inspector shows read-only rule settings, so
+   * the call is a no-op there rather than a focus stolen by a heading that cannot be typed
+   * into — focusing a non-input is the difference between a shortcut that works and one that
+   * leaves the caret nowhere.
+   */
+  const focusInspector = useCallback(() => {
+    const panel = document.querySelector<HTMLElement>("[data-builder-inspector]");
+    if (!panel) {
+      return;
+    }
+    const field = panel.querySelector<HTMLElement>("input, textarea, select");
+    (field ?? panel).focus();
+  }, []);
+
   const onPaletteKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLButtonElement>, key: string) => {
       const order = filteredTypes.map((nodeType) => nodeType.key);
@@ -1239,6 +1327,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const onCanvasKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      // A locked builder answers the keys that *read* and refuses the ones that write, and
+      // it is checked here — above every branch — because a shortcut is exactly the gesture
+      // a touch device cannot make and would therefore be the one that slips past a lock
+      // implemented only in the pointer handlers. Deleting a node with a hardware keyboard
+      // on a phone is the failure this prevents.
+      if (locked && !isReadingKey(event)) {
+        return;
+      }
       const step = event.shiftKey ? GRID * 5 : GRID;
 
       // ---- the clipboard and history keys, which need no selection to mean something -----
@@ -1302,6 +1398,74 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         }
         return;
       }
+
+      // ---- the single-key path (REQ-004: a keyboard-only pass) --------------------------
+      //
+      // Everything the criterion names is in this block, and the reason it is one block is
+      // the same as the ⌘A comment above: the keyboard path was previously a scatter of
+      // handlers, and the one verb it was *missing* was connecting. `readKey` owns the
+      // mapping and the Enter guard, so the rules are tested rather than re-derived here.
+      //
+      // **`preventDefault` is per-case, not per-intent**, and that is not a style choice.
+      // Escape is shared with the pointer gesture below: reading it as "ours" and preventing
+      // the default first, then deciding it was not, leaves the browser's own Escape
+      // behaviour (closing a dialog, leaving full screen) cancelled by a shortcut that did
+      // nothing. So each case claims the key itself, and the one that does not own it simply
+      // does not prevent.
+      if (!event.metaKey && !event.ctrlKey && !event.altKey) {
+        const intent = readKey({ key: event.key }, keyConnect);
+        // `cancel` is deliberately not handled here. Escape already has a handler below with
+        // a documented priority order, and two handlers for one key is a race over the same
+        // state. That handler asks `keyConnect` first, so the keyboard gesture is cancelled
+        // before the pointer's own three steps.
+        if (intent.kind !== "unhandled" && intent.kind !== "cancel") {
+          event.preventDefault();
+        }
+        switch (intent.kind) {
+          case "focus-palette":
+            if (filteredTypes.length > 0) {
+              focusPaletteItem(filteredTypes[0].key);
+            }
+            return;
+          case "begin-connect":
+            setKeyConnect(beginConnect(selected ?? null, nodeTypes));
+            return;
+          case "commit-connect": {
+            const done = commitConnect(keyConnect, selected ?? null, edges);
+            setKeyConnect(done.state);
+            if (done.edge) {
+              setLinkNotice({ tone: "ok", text: done.notice });
+              // Routed through `commit`, not `setEdges`, so a keyboard connection is one
+              // undoable step like a pointer one — the criteria ask undo to "restore
+              // add, move, connect, delete" and an edge added behind the history's back
+              // is the one case that would not be.
+              commit(
+                "edge-add",
+                currentSnapshot(),
+                graphRef.current.nodes,
+                [...graphRef.current.edges, done.edge],
+              );
+            } else if (done.state.kind === "refused") {
+              setLinkNotice({ tone: "error", text: done.state.text });
+            }
+            return;
+          }
+          case "focus-inspector":
+            focusInspector();
+            return;
+          case "validate":
+            lateActions.current.validate();
+            return;
+          case "run":
+            lateActions.current.run();
+            return;
+          case "save":
+            saveNow();
+            return;
+          default:
+            break;
+        }
+      }
       if (event.key === "Escape") {
         // One rule for the whole key, and it answers in priority order: a connection in
         // progress, then a selected edge, then the nodes. Escape is the gesture that says
@@ -1314,6 +1478,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
           event.preventDefault();
           setLinkDraft(null);
           setLinkNotice({ tone: "error", text: "Connection cancelled." });
+          return;
+        }
+        // The *keyboard* connection is asked first, because it is the more recent gesture:
+        // an author who armed one with `C` and then clicked a node has two things held, and
+        // the pointer handler's own three steps would otherwise clear the node selection they
+        // made while wiring. A refusal counts — it is a message about a gesture the author
+        // has to be able to dismiss.
+        if (keyConnect.kind !== "idle") {
+          event.preventDefault();
+          setLinkNotice({ tone: "error", text: "Connection cancelled." });
+          setKeyConnect(cancelConnect(keyConnect));
           return;
         }
         if (step === "edge") {
@@ -1377,8 +1552,20 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       );
       commit("nudge", before, nextNodes, edges);
     },
-    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusPaletteItem, nodes, pasteClipboard, removeEdge, removeNodes, saveNow, selected, selection, selectionCount],
+    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusInspector, focusPaletteItem, keyConnect, locked, nodeTypes, nodes, pasteClipboard, removeEdge, removeNodes, saveNow, selected, selection, selectionCount],
   );
+
+  // `onCanvasKeyDown` is defined before `validateNow` and `runOnce` exist, and both are
+  // `useCallback`s whose identities change with the graph — so they cannot be listed in a
+  // dependency array that is evaluated here (it would be a temporal-dead-zone read at render
+  // time) and reading them from a closure would capture whichever render happened to build
+  // the handler, which is the "works until the graph changes" bug. The ref is the honest
+  // version: the late actions are always the current ones, and the cost is one object
+  // written per render.
+  const lateActions = useRef<{ validate: () => void; run: () => void }>({
+    validate: () => undefined,
+    run: () => undefined,
+  });
 
   // ---- actions ----------------------------------------------------------------------------
 
@@ -1527,6 +1714,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     }
   }, [workflowId]);
 
+  // Keep the keyboard path pointed at the *current* validate and run, written on every render
+  // rather than in an effect: the keyboard handler is created before these two exist, and a
+  // stale `runOnce` here would be a `R` key that starts the run the graph had *before* the
+  // last edit — the one failure mode that looks like the feature working.
+  lateActions.current.validate = () => void validateNow();
+  lateActions.current.run = () => void runOnce();
+
   // ---- render -----------------------------------------------------------------------------
 
   if (loading) {
@@ -1573,7 +1767,55 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const style = canvasStyle(viewport);
 
   return (
-    <div className="flex h-[calc(100vh-2rem)] flex-col" data-builder>
+    <div
+      className={`flex h-[calc(100vh-2rem)] flex-col ${builderLayoutClass(viewportWidth ?? EDITOR_MIN_WIDTH * 2)}`}
+      data-builder
+      data-builder-locked={locked ? "true" : "false"}
+    >
+      {/* ---- the narrow-screen banner ----
+          Rendered *above* the toolbar rather than inside it: a banner that pushes the
+          toolbar down is a banner that moves the buttons the author is looking for, and the
+          criterion's "no control is unreachable" is easier to honour when the layout below
+          never moves. */}
+      {locked ? (
+        <div
+          className="flex flex-wrap items-center gap-2 border-b border-line bg-quiet-soft px-3 py-2 text-[12.5px]"
+          role="status"
+          data-builder-lock-banner
+        >
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          <strong className="font-medium">{LOCK_BANNER.title}</strong>
+          <span className="text-muted">{LOCK_BANNER.body}</span>
+          <Link
+            href={`/workflows/${workflowId}/table`}
+            className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-line bg-surface px-2 py-1 text-[12.5px]"
+            data-builder-lock-table-mode
+          >
+            <Table2 className="h-3.5 w-3.5" aria-hidden="true" />
+            {LOCK_BANNER.tableModeLabel}
+          </Link>
+        </div>
+      ) : null}
+
+      {/* The keyboard connection, stated where the pointer one is stated. A gesture with no
+          on-screen state is a gesture a keyboard author has to hold in their head, and the
+          criterion is that the whole pass is doable — including knowing what the next key
+          will do. */}
+      {keyConnect.kind !== "idle" ? (
+        <p
+          className={`border-b border-line px-3 py-1.5 text-[12px] ${
+            keyConnect.kind === "refused" ? "text-accent" : "text-muted"
+          }`}
+          data-key-connect={keyConnect.kind}
+        >
+          {keyConnect.kind === "refused"
+            ? keyConnect.text
+            : `Connecting from ${
+                nodeTypes.get(keyConnect.sourceId)?.label ?? keyConnect.sourceId
+              } · ${keyConnect.sourcePort} — move to the target with the arrows, then press Enter, or Escape to cancel.`}
+        </p>
+      ) : null}
+
       {/* ---- toolbar ---- */}
       <header
         className="flex flex-wrap items-center gap-2 border-b border-line bg-surface px-3 py-2"
@@ -1725,6 +1967,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         <aside
           className="flex w-[260px] shrink-0 flex-col border-r border-line bg-surface"
           data-builder-palette
+          // `inert` rather than a pile of `disabled` attributes: one attribute takes the whole
+          // region out of the tab order and out of hit testing, which is exactly the
+          // "no control is unreachable" half of the criterion. Twelve `disabled`s would each
+          // have to be kept in step with a new palette entry, and the thirteenth control
+          // added later would be the reachable one nobody thought about.
+          inert={lock["add-node"].hidden || undefined}
         >
           <div className="border-b border-line p-2">
             <label className="block text-[11.5px] font-medium text-muted" htmlFor="builder-palette-search">
@@ -1783,6 +2031,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         </aside>
 
         {/* ---- canvas ---- */}
+        {/*
+          The lock is applied INSIDE the handlers, not by swapping them here. Panning and
+          marquee both write to the same `panning`/`marquee` state inside
+          `onCanvasPointerDown`/`onPointerMove`, so a second set of handlers here would be a
+          second implementation of the same gesture — and the criterion's "pan/zoom stays
+          live" would depend on the two agreeing. One handler, one early return, is the only
+          way the read-only branch cannot drift from the editable one.
+        */}
         <div
           ref={canvasRef}
           className="relative min-w-0 flex-1 overflow-hidden bg-canvas"
@@ -2029,6 +2285,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         <aside
           className="w-[320px] shrink-0 overflow-y-auto border-l border-line bg-surface"
           data-builder-inspector
+          // The inspector holds the *read-only* rule settings when nothing is selected, and
+          // those must stay reachable — a lock that made the whole rail inert would hide the
+          // run-as and rate-limit facts a narrow-screen reader came for. So the region goes
+          // inert only when there is a node selected, which is the only state in which it
+          // offers something editable.
+          inert={(locked && selectedNode !== null) || undefined}
         >
           {/* *Listen for a real event* sits above the node editor, not inside it, for the
               same reason the problems panel sits below the canvas: it is a property of the
