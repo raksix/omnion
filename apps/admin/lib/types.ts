@@ -1844,3 +1844,122 @@ export type HeaderPolicySave = {
 
 /** The save's answer: the stored policy, flattened, plus the history row it wrote. */
 export type HeaderPolicySaved = HeaderPolicyDocument & { change_id: number | null };
+
+// ---------------------------------------------------------------------------------------------
+// Staging environments (REQ-017, slices 1 and 2)
+// ---------------------------------------------------------------------------------------------
+
+/** One area of a clone, with the count the panel shows next to its label. */
+export type EnvironmentAreaProgress = {
+  /** The wire name the API accepts back (`pages`, `translations`, …). */
+  name: string;
+  /** The label a person reads. */
+  label: string;
+  /** Rows expected. */
+  total: number;
+  /** Rows copied so far. */
+  done: number;
+};
+
+/** A clone job as the list row and the Overview tab see it. */
+export type EnvironmentCloneJob = {
+  id: string;
+  environment_id: string;
+  /** `pending`, `running`, `done`, `failed` or `cancelled`. */
+  status: string;
+  areas: EnvironmentAreaProgress[];
+  items_done: number;
+  items_total: number;
+  /**
+   * Completion, 0–100.
+   *
+   * Zero while the total is still unknown, which is a *different state* from zero progress on a
+   * known total. A panel that renders both as 0% shows a clone that is counting as one that is
+   * stuck, and the operator's next click is a cancel on a job that was about to finish.
+   */
+  percent: number;
+  summary: string;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_by: string | null;
+  created_at: string;
+  /** Whether a cancel button should be offered, decided by the API rather than here. */
+  cancellable: boolean;
+};
+
+/** What an environment currently holds, per area. */
+export type EnvironmentContentCounts = {
+  pages: number;
+  translations: number;
+  workflows: number;
+  settings: number;
+  revisions: number;
+  total: number;
+};
+
+/** One environment. */
+export type Environment = {
+  id: string;
+  organization_id: string;
+  key: string;
+  name: string;
+  /** `production` or `staging`. */
+  type: "production" | "staging";
+  /** `active`, `cloning`, `error` or `archived`. */
+  status: string;
+  cloned_from_environment_id: string | null;
+  cloned_at: string | null;
+  staging_host: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  content: EnvironmentContentCounts;
+  clone: EnvironmentCloneJob | null;
+  /**
+   * Whether the panel should offer a re-clone.
+   *
+   * Computed by the API, not by the panel: a button that appears on a row whose request would be
+   * refused is a dead button with a worse name than "Clone".
+   */
+  reclonable: boolean;
+};
+
+/** One checkbox in the create wizard. */
+export type EnvironmentAreaOption = {
+  name: string;
+  label: string;
+  /** What it costs, in words rather than a fake number. */
+  weight: string;
+};
+
+/** `GET /api/v1/environments`. */
+export type EnvironmentListResponse = {
+  environments: Environment[];
+  total: number;
+  areas: EnvironmentAreaOption[];
+  /** The organization's production environment key — the wizard's "clone from" line. */
+  source_key: string;
+};
+
+/** `GET /api/v1/environments/{id}`. */
+export type EnvironmentDetailResponse = {
+  environment: Environment;
+  /** The job history, newest first. */
+  jobs: EnvironmentCloneJob[];
+  /** The estimate for the next clone, in words. */
+  estimate: string;
+};
+
+/**
+ * The list filters, which live in the URL's query string so a reload keeps them.
+ *
+ * `limit` is here and not in the URL: the panel owns its page size, and a page size an operator
+ * can type into the address bar is a page size that will eventually be `10000`.
+ */
+export type EnvironmentFilters = {
+  type?: "production" | "staging" | "";
+  status?: string;
+  search?: string;
+  limit?: number;
+};
