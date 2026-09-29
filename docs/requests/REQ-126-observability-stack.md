@@ -280,6 +280,29 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
   different reasons, which is itself worth saying out loud: a stale blocker, a missing screen, and
   a saturated machine. Only the third is anybody's luck.
 
-**Next.** (a) Re-run the private-stack pass on a box below load 15 with 4 GB free; the route and
-its depth pass are in place, so the only thing owed is the screenshots. (b) Nothing else on this
-request is blocked — the remaining slices are code-complete.
+**Fifth close-gate tick: the screen is now in front of me, and the blocker is unchanged.**
+
+  The private-stack pass went **55 screens deep and produced 580 screenshots** — last tick managed
+  30. It still did not finish: the tab died with `Target page, context or browser has been closed`
+  partway through the observability block and `timeout` took the pass at 1500 s. `free -m` read
+  **128 MB free of 33000** with three other writers' passes holding Chrome at the same time; no OOM
+  in `dmesg`, so the box simply had nothing left. That is the same verdict as the previous two
+  ticks and the reason the box stays UNTICKED — a pass that ends in a browser crash is not a pass.
+
+  **But the landing screen is now proved rendered, which is what the fourth tick could not say.**
+  `page-observability-overview.png` shows it with its six stat cards carrying real values — Requests
+  9526, Error ratio 0.36 percent, p95 20.964 s, Alerts 0 firing — an active nav item, the six
+  "Everywhere else" cards, and **no NaN, no Infinity, no blank field and no error banner**. The
+  queue and AI cards render an em dash reading "no queue metrics" and "no AI calls" rather than a
+  `0`, which is the correct answer rather than a rendering gap: a counter that has never been
+  recorded is not a zero, and coercing it to one would tell an operator their queue is empty during
+  the incident they opened the page for. `clicks.jsonl` holds 133 observability-related records and
+  14 on the landing page itself with **zero** error entries; the seven nav links were clicked and the
+  route only failed on the transition after the page was already up.
+
+  The other six sub-screens still have no clean pass. Their routes are in the walkthrough table and
+  their depth passes exist, so what remains is a run at a load the box can hold.
+
+**Next.** (a) Re-run the private-stack pass when the box is below load 15 with 4 GB free; nothing in
+this request is missing a route or a binding, and the landing screen is already confirmed by
+screenshot. (b) Nothing else on this request is blocked — the remaining slices are code-complete.

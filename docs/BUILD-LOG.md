@@ -5442,3 +5442,35 @@ calls is the "documented but unreachable" shape REQ-126 produced four times.
 `Retry-After` and the three `X-RateLimit-*` headers — the first thing on REQ-127 that a request
 can observe, and therefore the first thing that can be ticked in the acceptance list. The
 private-stack walkthrough is still in flight for this tick; its result is reported next.
+
+
+## w6 · tick 21 addendum — the private-stack pass, and what it did and did not prove
+
+`QA_STACK=w6` ran 55 screens deep and produced **580 screenshots** (last tick: 30 screens). It did
+not finish: the tab died with `Target page, context or browser has been closed` partway through the
+observability block, and `timeout` took the pass at the 1500 s mark. `free -m` during the pass read
+**128 MB free of 33000**, with three other writers' passes (w2, w3, w4) holding Chrome at the same
+time. No OOM record in `dmesg`; the box simply had nothing left.
+
+**What the pass DID prove, and this is the tick's real result: `/observability` is rendered.**
+`page-observability-overview.png` shows the landing screen with its six stat cards carrying real
+values — Requests 9526, Error ratio 0.36 percent, p95 20.964 s, Alerts 0 firing — an active nav
+item, the six "Everywhere else" cards, and two honest em-dash placeholders reading "no queue
+metrics" and "no AI calls". **No NaN, no Infinity, no blank field, no error banner.** The queue and
+AI cards show an em dash rather than a `0`, which is the right answer: a counter that has never been
+recorded is not a zero. `clicks.jsonl` holds 133 observability-related click records and 14 records
+on the landing page itself with **zero** error entries among them — the seven nav links were clicked
+and the route only failed on the transition AFTER the page was up.
+
+**So the tick's fourth blocker is answered, and it was a box reason, not a product one — the same
+verdict as last tick, now with the screen in front of me instead of a screenshot count.** The
+remaining six observability sub-screens still have no clean pass. They are routes in the walkthrough
+table and their depth passes are in place, so what is owed is another run at a lower load.
+
+**Box pressure mid-tick, recorded because it nearly cost the commits.** `/mnt/apopic` hit 100% and
+`git commit` returned `unable to write loose object file: No space left on device` — the documented
+trap, where the commit fails but the index and the tree are fine. Reclaimed 1 GB from this worktree
+alone (`qa-artifacts/20260929-174300`, the Turbopack `apps/admin/.next/dev` cache, and
+`target/debug/incremental` in shm) and the three commits went through. **Never delete a QA artifact
+directory whose walkthrough is still running**: the live pass was writing into
+`qa-artifacts/20260929-183047` and only the previous run was removable.
