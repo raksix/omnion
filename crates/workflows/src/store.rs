@@ -242,6 +242,13 @@ pub async fn create_execution(
 /// The automation layer needs it: a match starts a run and advances the event cursor in ONE
 /// transaction, so a crash can never leave a cursor that skipped an event whose run never
 /// existed (and a replay can never start the same run twice).
+///
+/// **This is also the archive guard's only call site, and that placement is the point.** Every
+/// way a run starts — the manual route, the scheduler, the event matcher, a retry — passes
+/// through this one function, so "an archived project refuses new runs at the API boundary"
+/// (REQ-133) is a fact about the write rather than a promise each caller has to remember to
+/// keep. The check reads the project row in this transaction, so a run cannot slip between a
+/// read that said `active` and the insert: see [`crate::projects::ensure_run_allowed`].
 pub async fn create_execution_in(
     connection: &mut sqlx::PgConnection,
     workflow: &Workflow,
@@ -249,6 +256,8 @@ pub async fn create_execution_in(
     triggered_by: Option<Uuid>,
     steps: &[StepDefinition],
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
+    crate::projects::ensure_run_allowed(connection, workflow.project_id).await?;
+
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
          triggered_by) values ($1, $2, 'running', $3, $4) returning {}",

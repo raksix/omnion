@@ -432,6 +432,44 @@ pub async fn visible_project_filter(
     ))
 }
 
+/// Whether a run may start in this project right now.
+///
+/// **This is the archive guard, and it lives here rather than in a handler because the archive
+/// button is not the boundary — `store::create_execution_in` is.** Three of the four ways a run
+/// starts never pass through a route: the scheduler claims and starts them, the event matcher
+/// starts one inside its own transaction, and a retry starts one from the engine. A check in
+/// `run_workflow` therefore reads as "archived projects refuse manual runs", which is true, and
+/// leaves a project archiving its workflows only stopping the one kind of run an operator would
+/// notice first.
+///
+/// The answer is read in the same statement that would have created the run, so a run and the
+/// check that authorised it cannot straddle an archive that lands between them: either this
+/// transaction sees `active` and starts, or it sees `archived` and refuses. A read followed by an
+/// unconditional write is the two-statement version of that race, and it is the same shape as the
+/// round-robin cursor this module already took away from the handlers.
+pub async fn ensure_run_allowed(connection: &mut sqlx::PgConnection, project_id: Uuid) -> Result<()> {
+    let status: Option<String> = sqlx::query_scalar(
+        "select status from automation_projects where id = $1 for share",
+    )
+    .bind(project_id)
+    .fetch_optional(connection)
+    .await?;
+    match status.as_deref().map(ProjectStatus::parse) {
+        Some(Some(ProjectStatus::Archived)) => Err(WorkflowError::invalid(
+            "project_archived",
+            "this workflow's project is archived — restore it before starting new runs",
+        )),
+        // A project that is absent answers the same way it answered absent everywhere else on
+        // this module: the run is refused, because a workflow whose project nobody can see is a
+        // tenancy question, not a scheduling one.
+        None => Err(WorkflowError::invalid(
+            "project_not_found",
+            "this workflow's project no longer exists",
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The organization's default project, created on first use.
 ///
 /// A resource created without an explicit project lands here, and slice 2 makes every insert

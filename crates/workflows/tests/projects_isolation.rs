@@ -485,3 +485,214 @@ async fn a_role_change_is_one_write_and_the_row_agrees() {
         "the role change is one statement, not check-then-write"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The archive guard
+//
+// `POST /projects/{id}/archive` shipped in slice 1 and has had a column, a constraint, an audit
+// event and a screen branch since. Nothing read it: `status` was written by the archive button
+// and by nothing else, so archiving a project changed how the panel described it and nothing
+// about what the engine did. Every scheduled workflow in it kept firing, every event rule kept
+// matching, and a manual run kept starting — the archive was a label.
+//
+// The guard is at `store::create_execution_in`, which is the only function all four run-start
+// paths pass through, so these tests assert the boundary rather than one caller of it.
+// ---------------------------------------------------------------------------------------------
+
+/// Count the executions of one workflow, read straight from the table.
+///
+/// A refused run must leave *nothing* behind: no execution row, no step row. Asserting only the
+/// error would pass a guard that creates the run and then deletes it, which is the shape a
+/// "refuse at the end of the handler" implementation takes.
+async fn execution_count(pool: &PgPool, workflow_id: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from workflow_executions where workflow_id = $1")
+        .bind(workflow_id)
+        .fetch_one(pool)
+        .await
+        .expect("the execution count is answerable")
+}
+
+/// An archived project refuses a manual run, and the refusal names the state.
+#[tokio::test]
+async fn an_archived_project_refuses_a_new_run_by_name() {
+    let w = world().await;
+    let workflow = store::insert_workflow(&w.pool, definition("Nightly", w.payroll, w.acme))
+        .await
+        .expect("a workflow in the project");
+
+    // A run starts while the project is active, so the assertion that follows cannot be passing
+    // because the guard refuses everything.
+    let before = store::create_execution(&w.pool, &workflow, TriggerKind::Manual, None, &[])
+        .await
+        .expect("an active project starts runs");
+
+    projects::set_status(&w.pool, w.payroll, projects::ProjectStatus::Archived)
+        .await
+        .expect("archive")
+        .expect("the project is still there");
+
+    let err = store::create_execution(&w.pool, &workflow, TriggerKind::Manual, None, &[])
+        .await
+        .expect_err("an archived project refuses new runs");
+    assert_eq!(err.code(), "project_archived");
+    assert!(
+        err.to_string().contains("restore"),
+        "the message must name the remedy, not just the state: {err}"
+    );
+
+    // One run before the archive, none after it — the refusal wrote nothing.
+    assert_eq!(
+        execution_count(&w.pool, workflow.id).await,
+        1,
+        "a refused run must leave no execution row; the one before the archive is the only run"
+    );
+    assert!(
+        before.0.id != Uuid::nil(),
+        "the pre-archive run is a real row, not a placeholder"
+    );
+}
+
+/// Restore puts the project back into service without touching what it already recorded.
+#[tokio::test]
+async fn restoring_a_project_starts_runs_again_and_keeps_its_history() {
+    let w = world().await;
+    let workflow = store::insert_workflow(&w.pool, definition("Nightly", w.payroll, w.acme))
+        .await
+        .expect("a workflow in the project");
+
+    store::create_execution(&w.pool, &workflow, TriggerKind::Manual, None, &[])
+        .await
+        .expect("a run while active");
+    projects::set_status(&w.pool, w.payroll, projects::ProjectStatus::Archived)
+        .await
+        .expect("archive")
+        .expect("the project");
+    store::create_execution(&w.pool, &workflow, TriggerKind::Manual, None, &[])
+        .await
+        .expect_err("archived");
+
+    projects::set_status(&w.pool, w.payroll, projects::ProjectStatus::Active)
+        .await
+        .expect("restore")
+        .expect("the project");
+
+    store::create_execution(&w.pool, &workflow, TriggerKind::Manual, None, &[])
+        .await
+        .expect("a restored project starts runs again");
+    assert_eq!(
+        execution_count(&w.pool, workflow.id).await,
+        2,
+        "the run from before the archive is kept: archiving is read-only, not destructive"
+    );
+}
+
+/// An archived project does not stop the *default* project, and does not stop a sibling project.
+///
+/// Without this the guard is one `where` clause too broad, and the panel's promise that only the
+/// archived project changed is false in the loudest way: an operator archives one project and
+/// the whole installation stops scheduling.
+#[tokio::test]
+async fn archiving_one_project_leaves_the_others_running() {
+    let w = world().await;
+    let archived_workflow = store::insert_workflow(&w.pool, definition("Payroll", w.payroll, w.acme))
+        .await
+        .expect("a workflow in the project to archive");
+    let default_workflow =
+        store::insert_workflow(&w.pool, definition("Everything else", w.acme_default, w.acme))
+            .await
+            .expect("a workflow in the default project");
+
+    projects::set_status(&w.pool, w.payroll, projects::ProjectStatus::Archived)
+        .await
+        .expect("archive")
+        .expect("the project");
+
+    store::create_execution(&w.pool, &archived_workflow, TriggerKind::Schedule, None, &[])
+        .await
+        .expect_err("the archived project refuses a scheduled run too");
+    store::create_execution(&w.pool, &default_workflow, TriggerKind::Schedule, None, &[])
+        .await
+        .expect("a sibling project is unaffected — this is not an organization-wide shutdown");
+}
+
+/// The trigger kind is not a way around the guard.
+///
+/// The scheduler, the event matcher and a manual press all funnel through this function, and a
+/// guard that only covered one of them would pass a test written against that one. This asserts
+/// all three are refused from the same call, so the argument a caller controls is not the lever.
+#[tokio::test]
+async fn no_trigger_kind_starts_a_run_in_an_archived_project() {
+    let w = world().await;
+    let workflow = store::insert_workflow(&w.pool, definition("Nightly", w.payroll, w.acme))
+        .await
+        .expect("a workflow in the project");
+    projects::set_status(&w.pool, w.payroll, projects::ProjectStatus::Archived)
+        .await
+        .expect("archive")
+        .expect("the project");
+
+    for trigger in [
+        TriggerKind::Manual,
+        TriggerKind::Schedule,
+        TriggerKind::Event,
+    ] {
+        let err = store::create_execution(&w.pool, &workflow, trigger, Some(w.owner), &[])
+            .await
+            .expect_err("a trigger kind is not a way around the guard");
+        assert_eq!(
+            err.code(),
+            "project_archived",
+            "{trigger:?} is refused for the same reason as every other trigger"
+        );
+    }
+}
+
+/// A workflow whose project has been deleted is refused rather than run.
+///
+/// `automation_projects` is referenced `on delete restrict` from `workflows`, so a project cannot
+/// be deleted while a workflow still names it — **and the gate proves that rather than assuming
+/// it**: the first version of this test tried to delete the project with the workflow still in it
+/// and got `23503 … is still referenced from table "workflows"`. That refusal is the migration
+/// working, so the test empties the project first and the row it then deletes is one that
+/// genuinely has no dependents.
+///
+/// What remains is the branch nobody takes today and everybody would get wrong the day the
+/// restrict is relaxed: a project row that is *absent* must refuse the run rather than run the
+/// workflow anyway. "Run it anyway" is the answer that lets a workflow outlive the container it
+/// was filed under.
+#[tokio::test]
+async fn a_workflow_whose_project_is_gone_is_refused() {
+    let w = world().await;
+    let workflow = store::insert_workflow(&w.pool, definition("Orphan", w.payroll, w.acme))
+        .await
+        .expect("a workflow in the project");
+
+    // The restrict is real, and saying so is cheaper than a comment claiming it.
+    let blocked = sqlx::query("delete from automation_projects where id = $1")
+        .bind(w.payroll)
+        .execute(&w.pool)
+        .await
+        .expect_err("a project with a workflow in it cannot be deleted");
+    assert_eq!(
+        blocked.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23503"),
+        "the restrict is the migration's, and it is what makes the second delete legal"
+    );
+
+    store::delete_workflow(&w.pool, workflow.id)
+        .await
+        .expect("the workflow is removed");
+    sqlx::query("delete from automation_projects where id = $1")
+        .bind(w.payroll)
+        .execute(&w.pool)
+        .await
+        .expect("now the project has no dependents and goes");
+
+    // Directly: the guard answers on the project id alone, so an id with no row is the case.
+    let mut connection = w.pool.acquire().await.expect("a connection");
+    let err = omnion_workflows::projects::ensure_run_allowed(&mut connection, w.payroll)
+        .await
+        .expect_err("a project id with no row is refused");
+    assert_eq!(err.code(), "project_not_found");
+}
+

@@ -6420,3 +6420,54 @@ begins, and the `backup.restored` audit entry. (b) The `partial` box is still un
 where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
 is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
 read the price, the warnings and the phrase, so when the slot frees there is something to run.
+
+## Wave 4b / w8 tick 30 — REQ-133 acceptance 14: the archive button had never stopped a run
+
+**What.** `POST /api/v1/projects/{id}/archive` shipped in slice 1 and has had a column, a
+constraint, an audit event and a screen branch ever since. **Nothing read the column.** The
+guard is `projects::ensure_run_allowed`, called from exactly one place:
+`store::create_execution_in`. That is the only function all four run-start paths pass through —
+`run_workflow` (manual), the scheduler's claim, the event matcher's in-transaction start, and a
+retry — so a check in a handler would have covered the one kind of run an operator notices
+first and left the other three running. The read is `for share` inside the transaction that
+would have written the execution row: a check followed by an unconditional write is the
+two-statement version of a run slipping through an archive that lands between the two.
+
+**Why it survived.** The same shape this module has now met six times: the rule was computed,
+documented, constrained, audited and rendered — and no caller could put the platform in the
+state it describes. `set_status` had a column; nothing downstream ever read it.
+
+**Proof.**
+- `scripts/qa/run-project-isolation.sh` → **14/14**, and **proven to fail at 10/14** with the
+  guard call deleted (four new tests fail, all ten pre-existing stay green).
+- `run-automation-projects.sh` → 12/12, unchanged.
+- `cargo test -p omnion-workflows --lib` → 48/48.
+- `cargo clippy -p omnion-workflows --all-targets` → 0 new warnings (3 pre-existing: two unused
+  test bindings, one `#[must_use]`).
+- `cargo build -p omnion-automation` and `cargo build -p omnion-api` → clean.
+
+**Three assertions that only this fix can fail.** A run *before* the archive and none after, so an
+implementation that creates the row and deletes it again cannot pass. All three `TriggerKind`s
+refused with the same code, so the argument a caller controls is not a lever. A sibling project
+still starts runs, so the guard is not one `where` clause too broad and an archive cannot become
+an organization-wide shutdown.
+
+**The gate also proved the migration rather than trusting its comment.** Deleting a project with a
+workflow in it raises `23503 … is still referenced from table "workflows"`, verbatim — so the
+`on delete restrict` the test's first version assumed is real, and the absent-project branch is
+written as the safer default for the day somebody relaxes it.
+
+**Both failures on the first run were defects in my own test, not in the product.** `TriggerKind`
+has three variants, not the four I wrote (`Webhook` does not exist on this branch). And
+`.err().unwrap_or_else(…)` fires on `Some` and not on `None` — the panic that read as "the guard
+is broken" was the test asserting the inverse of what it read. `expect_err` is the combinator;
+`Result::unwrap_or_else` is not, and the two look identical at a glance.
+
+**Not claimed.** The two project screens are still un-walked. The QA slot is held by a live
+sibling's pass (holder cwd `/mnt/apopic/omnion-w3`) and this box has two Chromium sessions
+already; a third on ~4 GB of free RAM is not a result to trust. REQ-133 stays open on nine boxes.
+
+**Next.** (a) When the slot clears: the `QA_STACK=w8` pass, which is the only thing that closes
+REQ-118 slice 1a's acceptance 16. (b) REQ-133 slice 3 — the move with its dependency checker, the
+one slice with no external dependency. (c) REQ-133 slice 4's `transfer-ownership` and the limits
+tables, which 0164 never created.
