@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
+use omnion_workflows::expression;
 use omnion_workflows::graph::{self, Graph};
 use omnion_workflows::graph_store::{self, SaveOutcome};
 use serde::{Deserialize, Serialize};
@@ -305,6 +306,105 @@ pub async fn validate_graph(
         step_count: compiled.is_clean().then_some(compiled.steps.len()),
         issues: compiled.issues,
     }))
+}
+
+/// `POST /api/v1/workflows/{id}/graph/expressions/preview` — evaluate parameters without storing
+/// them (REQ-086 slice 3).
+///
+/// The sample data is **always** supplied by the caller, and the refusal to invent it is the
+/// design: a preview that could reach live data would be able to read a row the person editing
+/// has no permission to see, and — worse — would answer differently on every keystroke, so the
+/// number shown beside a field would not be the number the step gets. Pinned sample data is
+/// what makes a preview stable enough to trust, and the REQ asks for it by name.
+///
+/// Every field is evaluated, and the first refusal is returned with the field it belongs to, so
+/// the inspector can put the message on the row that caused it. A partial answer with a count
+/// beside it would read as "two of three fields are fine" when in fact the third was never
+/// evaluated.
+pub async fn preview_expressions(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(workflow_id): Path<Uuid>,
+    Json(body): Json<PreviewRequest>,
+) -> Result<Json<PreviewResponse>, ApiError> {
+    let stored = graph_store::find_graph(state.db().pool(), workflow_id)
+        .await?
+        .ok_or_else(graph_workflow_not_found)?;
+    crate::scope::ensure_same_organization(&current, Some(stored.organization_id))?;
+
+    if body.params.len() > MAX_PREVIEW_FIELDS {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_many_fields",
+            format!("preview at most {MAX_PREVIEW_FIELDS} fields at a time"),
+        ));
+    }
+
+    let mut previews = Vec::new();
+    for (field, value) in &body.params {
+        match expression::preview_value(field, value, &body.namespaces) {
+            Ok(Some(preview)) => previews.push(preview),
+            // A field with no expression is not an error and not a preview: there is
+            // nothing to evaluate, and a row saying so would crowd out the ones that have
+            // something to say.
+            Ok(None) => {}
+            Err(error) => {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "expression_invalid",
+                    error.message(),
+                ));
+            }
+        }
+    }
+
+    // The count is taken before the vector is moved into the response: reading `.len()` off
+    // the moved value is the borrow error that a two-line struct literal invites, and
+    // cloning the vector to satisfy it would be a copy per keystroke to save a subtraction.
+    let preview_count = previews.len();
+    Ok(Json(PreviewResponse {
+        workflow_id,
+        previews,
+        preview_count,
+        namespaces: body.namespaces.keys().cloned().collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Expression preview
+// ---------------------------------------------------------------------------------------------
+
+/// How many fields one preview may carry.
+///
+/// A cap rather than "as many as you like" because the work is proportional and the caller
+/// gains nothing from a thousand: the inspector previews the one node being edited, and a
+/// request that big is either a bug or an attempt to use this as a general evaluator.
+const MAX_PREVIEW_FIELDS: usize = 64;
+
+/// A preview request.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewRequest {
+    /// The parameters to evaluate, keyed by parameter name.
+    pub params: serde_json::Map<String, Value>,
+    /// The sample data an expression may read, keyed by namespace. Supplied by the caller
+    /// and never read from the database — see the handler's note.
+    #[serde(default)]
+    pub namespaces: expression::Namespaces,
+}
+
+/// A preview answer.
+#[derive(Debug, Serialize)]
+pub struct PreviewResponse {
+    /// The workflow the preview was asked for.
+    pub workflow_id: Uuid,
+    /// One entry per field that carried an expression.
+    pub previews: Vec<expression::Preview>,
+    /// How many there were.
+    pub preview_count: usize,
+    /// The namespaces that were available, so the canvas can offer them in autocomplete
+    /// without a second round trip.
+    pub namespaces: Vec<String>,
 }
 
 /// The revision in an `If-Match` header, when it carries one.

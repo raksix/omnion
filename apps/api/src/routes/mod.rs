@@ -698,6 +698,13 @@ pub fn router(state: AppState) -> Router {
     let workflow_graph_validate = post(workflow_graph::validate_graph)
         .layer(guards::require(&state, "workflows.read"));
 
+    // The expression preview (slice 3) sits on the *read* power for the same reason validate
+    // does, and for one more: it takes the sample data it evaluates against in the request
+    // body, so it has nothing to read that the reader has not already chosen to send. It
+    // stores nothing, and nothing it returns is derived from a row the caller cannot see.
+    let workflow_graph_preview = post(workflow_graph::preview_expressions)
+        .layer(guards::require(&state, "workflows.read"));
+
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
@@ -1475,6 +1482,10 @@ pub fn router(state: AppState) -> Router {
         .route("/workflows/{id}/run", workflow_run)
         .route("/workflows/{id}/graph", workflow_graph)
         .route("/workflows/{id}/graph/validate", workflow_graph_validate)
+        .route(
+            "/workflows/{id}/graph/expressions/preview",
+            workflow_graph_preview,
+        )
         .route("/workflows/{id}/executions", workflow_executions)
         .route("/workflow-executions/{id}", workflow_execution)
         .route(

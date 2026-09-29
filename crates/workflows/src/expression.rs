@@ -62,6 +62,11 @@ pub enum PreviewError {
     },
     /// The namespace exists but the sample carries no such path.
     UnknownPath {
+        /// The field this was found in. The route's contract is that a refusal names the
+        /// parameter it belongs to, and this variant is the most likely one to reach a
+        /// person mid-typing — which is exactly when not knowing which row is wrong is
+        /// most expensive.
+        field: String,
         /// The full expression, as written.
         expression: String,
         /// The path within the namespace that is not there.
@@ -93,12 +98,13 @@ impl PreviewError {
                 listing(available)
             ),
             Self::UnknownPath {
+                field,
                 expression,
                 path,
                 available,
             } => format!(
-                "{expression} cannot be read: the sample carries no `{path}` under its \
-                 namespace. It carries: {}",
+                "{field}: {expression} cannot be read: the sample carries no `{path}` under \
+                 its namespace. It carries: {}",
                 listing(available)
             ),
             Self::UnsupportedSyntax { fragment } => format!(
@@ -386,11 +392,13 @@ fn resolve_one<'a>(
         current = match current {
             Value::Array(items) => {
                 let index: usize = segment.parse().map_err(|_| PreviewError::UnknownPath {
+                    field: field.to_owned(),
                     expression: format!("{{{{{body}}}}}"),
                     path: path[1..].join("."),
                     available: paths_of(root),
                 })?;
                 items.get(index).ok_or_else(|| PreviewError::UnknownPath {
+                    field: field.to_owned(),
                     expression: format!("{{{{{body}}}}}"),
                     path: path[1..].join("."),
                     available: paths_of(root),
@@ -399,6 +407,7 @@ fn resolve_one<'a>(
             other => other
                 .get(*segment)
                 .ok_or_else(|| PreviewError::UnknownPath {
+                    field: field.to_owned(),
                     expression: format!("{{{{{body}}}}}"),
                     path: path[1..].join("."),
                     available: paths_of(root),
