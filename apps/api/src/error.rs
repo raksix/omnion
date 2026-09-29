@@ -750,10 +750,11 @@ impl From<MediaError> for ApiError {
             // A release with no reason is a `400`, not a `409`: the request was well-formed and
             // the refusal is about an empty field, so the caller can fix it and try again
             // without a state having changed underneath them.
-            MediaError::InvalidReleaseReason => {
-                Self::bad_request("release_reason_required", MediaError::InvalidReleaseReason.to_string())
-                    .with_details(serde_json::json!({ "field": "reason" }))
-            }
+            MediaError::InvalidReleaseReason => Self::bad_request(
+                "release_reason_required",
+                MediaError::InvalidReleaseReason.to_string(),
+            )
+            .with_details(serde_json::json!({ "field": "reason" })),
             // Same rule for the retention settings, with its own code so a client can tell a
             // bad window from a bad scanner endpoint — they are two tabs of one screen, and
             // the message is rendered under the input that caused it.
@@ -779,7 +780,9 @@ impl From<MediaError> for ApiError {
             // A purge that cannot happen: the request was legal, the file is past its window,
             // and something in the platform still resolves to it. A `400` would send an
             // operator to fix a form that was never wrong — the fix is to repoint a page.
-            MediaError::PurgeRefused { reason } => Self::new(StatusCode::CONFLICT, "purge_refused", reason),
+            MediaError::PurgeRefused { reason } => {
+                Self::new(StatusCode::CONFLICT, "purge_refused", reason)
+            }
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

@@ -1,3 +1,127 @@
+## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
+
+build media: retention policies, the run log, the hold, and the reference repair
+
+REQ-010 slice 4's remaining half, and the last piece of the slice. Slice 1 gave the
+library a trash whose countdown was always the *site's* fallback and that no worker
+ever enforced; what is here is the policy itself — scoped to a site or a folder —
+plus the sweeps that act on it, the log that records every run, and the refusal that
+stops a purge from deleting a hero image a live page still resolves to.
+
+**0049_media_retention.sql**, `crates/media/src/retention.rs`,
+`apps/api/src/routes/media_retention.rs`, `apps/api/src/retention_runner.rs`,
+`features/media/retention-view.tsx` (a **Retention** tab on `/media/settings`) and the
+file's `LegalHold` block on the detail screen.
+
+**Six decisions, each a shortcut that produces a plausible wrong answer.** The
+**current version is exempt from the version sweep by number, never by age** — the
+obvious query, "delete every version older than N days", deletes the version `media`
+is serving and leaves `storage_key` naming an object that no longer exists, and the
+current version is the highest number in `media_versions` (the same one `next_version`
+hands out under a row lock). The **hold is a column on `media` rather than a flag on
+the policy**: three destructive sweeps must respect it, a policy flag would have to be
+joined into all three, and the first one somebody edits forgets the others — the
+forgotten one is the one that deletes evidence. A **purge refuses a referenced file
+and names the referrers**, because `media_references` cascades away with the file, so
+a purge *can* silently delete a hero image a published page resolves to. **A run that
+found nothing writes a row**, because retention is the one library feature whose
+absence of activity is indistinguishable from being broken, and a run's `summary`
+separates *nothing was eligible* from *N held* from *N still referenced* from *the run
+stopped early*. The **folder policy wins and the site policy is the fallback, never
+the shortest window of everything that matches** — a campaign folder cannot be
+shortened by a site-wide rule that happens to be tighter. And the **repair scan drops
+the other kind of lie**: a reference to a page deleted during a migration refuses a
+purge for ever, and only a referent the platform can *prove* is gone is dropped, so a
+module that arrives tomorrow does not find its usage rows already deleted.
+
+The worker reaches the sweep through the **route's** `run_once`, not a second copy of
+it: two answers to "what may this file go" is how a nightly sweep and an operator's
+click start disagreeing about the same row, and the operator who reads the screen is
+the one who is misled. And the tick is **minutes, not days** — a sweep is idempotent,
+so an empty tick is a no-op, and a worker that only ran at 02:00 has exactly one
+failure mode with nothing in between to show it.
+
+**Three defects in my own crate code, all caught by the unit tests written beside it.**
+`describe()` printed "30 days day(s)" because the format string spelled the unit *and*
+`plural_days` appended it — and a `contains("30 days")` assertion passes over that
+happily, so both spellings now assert the *absence* of "day(s)". The cross-field check
+defaulted the other window to the **minimum** (1) rather than the **column default**
+(30), so a create sending `purge_after_days = 5` passed validation and was then refused
+by the database as a bare constraint name; the defaults are now named constants bound
+to the insert, so the check and the write cannot disagree about what "the default" is.
+
+**The third is serde rather than logic, and it is the one worth remembering.**
+`Option<Option<Uuid>>` with `#[serde(default)]` *looks* like it carries "absent" and
+"null" separately. It does not — and neither does `Option<Value>`, because serde's
+`Option` visitor maps a `null` to `None` whatever the inner type is. So the explicit
+`folder_id: null` — the one edit an operator most often wants, "this rule was for one
+folder, now it is for everything" — silently arrived as "leave the scope alone", and
+the screen would have reported **saved** over an unchanged scope, which is the worst
+shape a save can have. The scope is now read from the *key's presence* in the raw map,
+which is the only place the distinction exists. The walk proves the **write** happens,
+not just the decode: it clears the scope, reads `folder_id` back out of PostgreSQL, and
+then proves the other half by sending a body that omits the field and finding the scope
+untouched.
+
+**One defect no unit test could have found, and it was the trigger again.** The
+`sites` trigger inserted a policy row without a `name`, and `name` is `not null` with
+no default — so **every site creation failed** with `null value in column "name" of
+relation "media_retention_policies"`. That reads as neither a retention problem nor a
+migration problem but as *the site could not be created*, and it fires from a trigger
+two migrations away, so the only place the error names the cause is the function body.
+All five walks died on it identically before their first assertion. This is the third
+time a `sites` trigger has been the defect in this REQ (0028 presets, 0044 scan
+settings) and the fourth time the seed alone left a *new* site with a pleasant `GET`
+and a save that wrote nothing.
+
+**The environment was the other half of the tick.** MinIO refuses writes with
+`XMinioStorageFull` at 95% disk, and `/mnt/apopic` was at 95% — so three of five walks
+failed at the **upload**, not at anything retention did. `docker system df` reported
+1.2G reclaimable under "dangling" volumes and the honest reading was that four of the
+five were production data (solexx PostgreSQL, sooliva Redis and Mongo, teknofest
+Mongo) whose container merely happened to be stopped; the space came from this
+repository's own `target/debug/deps` instead — 26 stale test-binary links, 5.7G, of
+which nothing was running. **A dangling volume is not garbage**, and MinIO's threshold
+is a hard wall rather than a slow degradation.
+
+**Proof.** `--test media_retention` → **5 walks, 0 failures** over the real router and
+a real database. Both versions of a file are aged past a one-day window and the sweep
+removes **only** the superseded one, asserted by reading `media_versions` back out of
+PostgreSQL *and* by finding the served version's bytes still in the object store — a
+length check would pass by accident. A hold beats a 400-day-old trash row, a refusal
+with no reason writes nothing, the reason lands in `audit_log`, a second identical press
+reports `changed: false` rather than a second audit row that reads as a second person,
+and the release is effective on the very next run. A purge over a referenced file is
+refused naming `page <id> (hero_image_id)`; the page is deleted; a second purge is
+**still** refused; the repair removes one row; the third purge goes through. A folder
+policy outranks the site rule through the crate's own resolver; a `purge_after_days`
+inside the **stored** `trash_days` is refused and the refusal writes nothing; a policy
+of another tenant is a `404` whose refusal deletes nothing; a reader may read the policy
+and the log and may not create, edit, delete, run, repair or hold.
+`cargo test -p omnion-media --lib` → **179**, `-p omnion-api --lib` → **147**,
+`-p omnion-core --lib` → **34**; `--test media` (14), `--test media_shares` (5) and
+`--test media_retention` (5) are green against the routes this touches. `apps/admin`
+`tsc --noEmit` clean.
+
+**Not run: the browser pass.** The retention tab is walked by
+`scripts/qa/run.sh` — `runMediaRetention` opens the tab, asserts every policy states
+its consequence in a sentence and names its scope, drives the cross-field warning
+*before* the save, creates and saves a policy, runs a pass and asserts the notice is
+a sentence rather than a bare zero and that the log wrote a row even when nothing
+was eligible, and toggles the file's hold on and back off — the whole function is
+written and `node --check` passes. It did not execute: `scripts/qa/qa-slot.sh` caps
+the box at **one** concurrent pass and a sibling wave held the slot for the entire
+25-minute window, so this pass was still queued when `timeout 1500` fired and
+printed only `waiting for a QA slot`. That is scheduling contention, not a red
+result, and it is recorded as **unrun** rather than as a pass. REQ-010 therefore
+stays `in-progress` and this slice is not closed on tests alone — the gate is the
+browser pass, and the next tick runs it first.
+
+**Next.** The Usage and Activity tabs on the file detail — they answer
+`media_references` and an activity read, and the reference rows the repair scan now
+maintains are what finally give them rows to read. Then slice 4 closes and the queue
+moves to REQ-021 (notification centre), the first untouched item in wave 1.
+
 ## 2026-09-28 — REQ-010 slice 4 (scanning half + grants half) · the access layer, and a red that had been hiding for four ticks
 
 build media: folder and file grants, with a deny that wins at any depth
@@ -160,6 +284,7 @@ removes exactly the eligible rows and a purge names the resources holding a file
   refusal — and with them the Usage and Activity tabs, which finally have rows to read.
 
 
+
 ## 2026-09-28 — REQ-125 slice 3 close · three defects a green test suite could not see
 
 - **What shipped.** `e4e97c7` — the repairs the slice-3 walkthrough found, committed after the
@@ -206,7 +331,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   screenshots already on disk are the tell.
 - **Next.** Slice 4 — audit depth, denial rows everywhere, the anomaly detectors with a
   persisting acknowledge, and the filtered SIEM export that carries metadata only.
-
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
 - **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
@@ -1913,6 +2037,7 @@ removes exactly the eligible rows and a purge names the resources holding a file
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
 
+## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
 ## 2026-09-27 — REQ-125 · slice 1 · the secret key hierarchy, the rotation ceremony and its screen
 
 - **What.** The key ring (docs/requests/REQ-125, slice 1). `crates/secrets` is the pure half: an
@@ -1981,7 +2106,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   assignment model and its resolver, `/secrets/credentials` and `/secrets/slots`.
 
 
-## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
 
 - **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
   before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
@@ -2036,6 +2160,7 @@ removes exactly the eligible rows and a purge names the resources holding a file
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
+
 
 ## 2026-09-27 · omnion-wave6 · REQ-125 slice 2 — typed credentials + credential slots
 
@@ -2131,7 +2256,6 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
 - **A session cookie is bound to one origin.** The panel talks to the API on :18085 while the
   browser is on :3105, so a curl-minted cookie must be injected into the browser context; logging
   in through the form alone bounces back to `/login` in a scripted pass.
-
 ## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
 
 - **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
@@ -2243,6 +2367,7 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
 
+## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
 ## 2026-09-28 — REQ-125 slice 4: the audit trail, and the two defects that made it a lie
 
 - **What this tick was.** Slice 4 of the secrets depth request: the access trail, the four
@@ -2371,7 +2496,6 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
 - **Next.** The private-stack walkthrough on 18085/3105/3205. Green, and REQ-125 closes; then
   REQ-126 (observability stack).
 
-## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
 
 - **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
   replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
@@ -2437,6 +2561,7 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
   merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
   serve path, and EXIF extraction.
 
+
 ## 2026-09-28 — REQ-125 closes: a merge made the branch unbootable, and the gate found four real defects
 
 - **What this tick was.** The close gate for REQ-125, plus everything the gate had been hiding.
@@ -2499,7 +2624,6 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
 - **Next.** REQ-126 (observability stack), slice 1: the log schema crate, the middleware that binds
   request id and user/org context, worker propagation, the shared redaction pass and the bounded
   log explorer screen.
-
 ## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
 
 - **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
@@ -2590,6 +2714,7 @@ GET  /credential-slots/{scope}/{slot}/resolve/qa-org → 200 "The primary answer
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
 
+## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
 ## 2026-09-28 — REQ-126 slice 1: the log schema, the edge, and the redaction pass
 
 - **What shipped.** `crates/telemetry` (`schema` / `context` / `redact` / `store`), migration
@@ -2756,7 +2881,6 @@ silences and notifications, the settings screen, and the `infra/observability/` 
 dashboards, Prometheus rules, the collector example) whose mapping the now-fixed metric families
 give it a contract to import against.
 
-## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
 
 - **What.** The third third of slice 3: `0036_media_shares.sql`,
   `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
@@ -2825,6 +2949,7 @@ give it a contract to import against.
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
+
 
 ## 2026-09-28 — REQ-126 slice 3b · the flush loop, and the two screens slice 3 said it did not have
 
@@ -2938,7 +3063,6 @@ evidence. **Never another writer's `target/` or artifacts to make room.**
 evaluator with silences and notifications, the settings screen, and the `infra/observability/`
 bundle (Grafana dashboards, Prometheus rules, the collector example) whose mapping the now-fixed
 metric families give it a contract to import against.
-
 ## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
 
 - **What.** The last open item of slice 3: what the *camera* said about its own picture. The
@@ -3019,6 +3143,7 @@ metric families give it a contract to import against.
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
 
+## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
 ## 2026-09-28 · REQ-126 slice 4b — the retention sweep, and a prune that never ran once
 
 - **The finding.** Three of slice 4's components — the lifecycle, the alert evaluator and both
@@ -3118,7 +3243,6 @@ metric families give it a contract to import against.
   need a Prometheus in the QA stack), then the `observability.read`-cannot-write line, then the
   close gate: `cargo test --workspace`, `pnpm build`, and the private-stack walkthrough.
 
-## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
 
 **What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
 could render a badge and the badge could only ever read `pending`. This tick gives that column a
@@ -3180,6 +3304,7 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
+
 
 ### REQ-126 · slice 4d · the permissions line — and two of my own "proofs" turned out to be vacuous
 
@@ -3363,7 +3488,6 @@ browser pass, and the next tick runs it first.
 `media_references` and an activity read, and the reference rows the repair scan now
 maintains are what finally give them rows to read. Then slice 4 closes and the queue
 moves to REQ-021 (notification centre), the first untouched item in wave 1.
-
 ## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
 
 **What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
@@ -3602,3 +3726,175 @@ pre-existing on this box and not caused by this slice — logged rather than cla
 
 **Commits.** `cb1fd21` (the fix and its nine tests), `10d55eb` (the outage walk and the
 `exporter_flush` cast).
+
+---
+
+## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
+
+**What.** The half of the notification centre that decides **how** a record reaches somebody.
+`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
+`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
+`runNotificationSettingsDepth` in the walkthrough.
+
+**Three decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
+   user per channel and would make a channel added in slice 3 a backfill instead of a
+   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
+   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
+   valid form, not an empty one.
+2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
+   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
+   guarantee, and the panel's own form is a client like any other.
+3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
+   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
+   of them is either never quiet or always quiet, and both are silent. A window that leaves no
+   waking hours is refused by name rather than stored as "e-mail is on".
+
+**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
+`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
+legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
+`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
+
+```text
+invalid type: string "approval", expected a sequence
+```
+
+for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
+priority filter on this surface had never worked, and every filtered list fell through to the
+error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
+the list read now takes `RawQuery` and parses the string itself.
+
+**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
+`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
+bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
+its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
+error element, which that call cannot affect: the assertion could only ever have passed by
+accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
+shortcut into the drawer. All three are the class of defect this harness exists to catch —
+in itself — and none of them is visible from the report, which only says `false`.
+
+**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
+gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
+takes an explicit id list, so it does not require a selection the reader never made — and rows
+carry `data-read` so the state is assertable rather than a shade of grey.
+
+**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
+**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
+Browser pass: **running**.
+
+**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
+`report.notificationSettings` to be green and **zero high findings** from this change — in
+particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
+signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
+behind `notifications.admin`, the event router turning existing bus events into notifications,
+and the per-channel delivery rows in the drawer.
+
+## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
+
+**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
+`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
+endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
+with their guards travelling with each group.
+
+**The decision the whole slice rests on: a `permission:` recipient rule resolves through
+`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
+one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
+expired grants and explicit denials, and a notification that reaches somebody who lost the key
+is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
+`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
+cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
+that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
+zero for and the crate's resolution answers one.
+
+**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
+no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
+nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
+is asserted by serialising the body and searching the JSON for the secret.
+
+**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
+`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
+button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
+list used `filter_map`, which would answer with four channels and render a settings matrix whose
+missing column is indistinguishable from one the reader switched off. And the outbox check
+constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
+
+**The live gate found three of its own assertions were wrong**, which is the more useful half:
+the role fixture expected a survivor where the honest answer is zero; the outbox projection check
+counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
+`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
+now assertions that would fail if the code regressed.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
+`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
+`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
+and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
+moves the failed row while the delivered one stays at 1 → 1.
+
+**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
+gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
+rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
+
+**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
+assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
+and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
+before running the pass again — the no-untested-screen rule applies to a screen that does not yet
+exist as much as to one that does.
+
+## Tick 48 — the pass that had been running for an hour, and what it actually said
+
+**What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
+question the last tick left open. `report.notifications` is **green on the bell, the badge, the
+grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
+`false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
+answered with status 400."*
+
+**The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
+push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
+swallowing the static segments, which is exactly what the comment above the mount says it
+prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is from **20:39**;
+slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
+filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
+disposable by design, so the lesson is to read the binary's mtime before reading the router.
+
+**What this tick fixed instead.** Two real defects, both found by hand against the live stack
+because no existing gate could reach them:
+
+1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
+   `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
+   itself: a `500` whose body quotes `violates foreign key constraint
+   "notifications_user_id_fkey"`. Four good recipients lost to one stale one, and a constraint
+   name shipped to whoever held the response. `0707141` checks recipients before the loop
+   through a new `store::existing_users` and refuses in a sentence that names *which* id is wrong.
+2. `Escape` was documented in the file header, the REQ's QA plan and the walkthrough, and it was
+   **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
+   exactly when the list had content — and the open drawer held the focus, which is why `e`,
+   `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
+
+**And the gate that had been lying.** `run-notifications-http.sh` decided its build by
+`cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
+status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
+crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
+twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
+compiler's exit status and only reads the log when that status says something went wrong.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
+`-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
+`node --check scripts/qa/walkthrough.cjs` → clean.
+`scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
+*a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
+with one bad id writes none of the good ones*.
+
+**Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
+typechecked, but no pass has run against them — the pass that found them ran against the 20:39
+binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
+this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
+**in-progress**.
+
+**Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
+newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
+and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
+`slashFocusedFilter` to recover behind them, `report.notificationSettings.loaded` to be true, and
+`report.notificationOutbox` to be **present** — that last one is the first pass that can close
+slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
+after that.
