@@ -182,9 +182,7 @@ impl AssignmentInput {
             source_id: pick(&["source_id", "sourceId"]).and_then(|v| Uuid::parse_str(&v).ok()),
             source_name: pick(&["source_name", "source", "sourceName"]),
             language: pick(&["language", "lang", "Language"]),
-            has_email: Some(
-                pick(&["email", "e-mail", "Email"]).is_some(),
-            ),
+            has_email: Some(pick(&["email", "e-mail", "Email"]).is_some()),
         }
     }
 }
@@ -406,8 +404,8 @@ pub fn simulate(rules: &[AssignmentRule], input: &AssignmentInput) -> Assignment
                 cursor_after,
             };
         }
-        let failed_on = first_failing_key(&rule.conditions, input)
-            .unwrap_or_else(|| "conditions".to_string());
+        let failed_on =
+            first_failing_key(&rule.conditions, input).unwrap_or_else(|| "conditions".to_string());
         skipped.push(SkippedRule {
             rule_id: rule.id,
             rule_name: rule.name.clone(),
@@ -527,7 +525,11 @@ pub fn due_at(policy: &SlaPolicy, received_at: OffsetDateTime) -> OffsetDateTime
     if !policy.business_hours_only {
         return received_at + minutes;
     }
-    let window = match policy.business_hours.as_object().and_then(|_| BusinessHours::from_value(&policy.business_hours)) {
+    let window = match policy
+        .business_hours
+        .as_object()
+        .and_then(|_| BusinessHours::from_value(&policy.business_hours))
+    {
         Some(w) => w,
         None => return received_at + minutes,
     };
@@ -561,7 +563,12 @@ impl SlaState {
     /// because "15 minutes left" means something different for a 4-hour target and a
     /// 15-minute one, and a fixed threshold would mark every short-window policy breached
     /// before the operator ever saw it.
-    pub fn of(first_response_at: Option<OffsetDateTime>, due_at: Option<OffsetDateTime>, now: OffsetDateTime, window_minutes: i32) -> Self {
+    pub fn of(
+        first_response_at: Option<OffsetDateTime>,
+        due_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+        window_minutes: i32,
+    ) -> Self {
         if first_response_at.is_some() {
             return Self::Met;
         }
@@ -674,9 +681,7 @@ pub fn validate_policy(
     business_hours: &Value,
 ) -> Result<()> {
     if name.trim().is_empty() {
-        return Err(CrmIntakeError::Invalid(
-            "the policy needs a name".into(),
-        ));
+        return Err(CrmIntakeError::Invalid("the policy needs a name".into()));
     }
     if !(1..=20160).contains(&first_response_minutes) {
         return Err(CrmIntakeError::Invalid(
@@ -704,12 +709,7 @@ pub fn validate_policy(
                 ));
             }
         }
-        if !window.days.is_empty()
-            && !window
-                .days
-                .iter()
-                .all(|d| (1..=7).contains(d))
-        {
+        if !window.days.is_empty() && !window.days.iter().all(|d| (1..=7).contains(d)) {
             return Err(CrmIntakeError::Invalid(
                 "business days must be 1 (Monday) to 7 (Sunday)".into(),
             ));
@@ -791,8 +791,7 @@ fn next_open(at: OffsetDateTime, window: &BusinessHours, open: i64) -> OffsetDat
 
 fn start_of_day(at: OffsetDateTime) -> OffsetDateTime {
     let d: Date = at.date();
-    PrimitiveDateTime::new(d, time::macros::time!(00:00))
-        .assume_offset(at.offset())
+    PrimitiveDateTime::new(d, time::macros::time!(00:00)).assume_offset(at.offset())
 }
 
 /// The next free position for a new rule: one past the current maximum. Written as a pure
@@ -878,7 +877,10 @@ mod tests {
             ..Default::default()
         };
         // 1. The key is not in the document → no opinion → match.
-        assert!(conditions_match(&json!({}), &input), "no conditions matches");
+        assert!(
+            conditions_match(&json!({}), &input),
+            "no conditions matches"
+        );
         // 2. The key is present and the payload has the value → match.
         assert!(conditions_match(&json!({"country": ["TR"]}), &input));
         // 3. The key is present and the payload is silent → miss.
@@ -925,12 +927,7 @@ mod tests {
 
     #[test]
     fn the_first_matching_rule_wins_and_the_losers_name_the_key() {
-        let country_rule = rule(
-            Uuid::from_u128(1),
-            0,
-            json!({"country": ["TR"]}),
-            "queue",
-        );
+        let country_rule = rule(Uuid::from_u128(1), 0, json!({"country": ["TR"]}), "queue");
         let catch_all = rule(Uuid::from_u128(2), 1, json!({}), "queue");
         let input = AssignmentInput {
             country: Some("TR".into()),
@@ -938,7 +935,11 @@ mod tests {
         };
         let outcome = simulate(&[catch_all.clone(), country_rule.clone()], &input);
         assert_eq!(outcome.rule_id, Some(country_rule.id));
-        assert_eq!(outcome.matched_index, Some(0), "positions decide, not array order");
+        assert_eq!(
+            outcome.matched_index,
+            Some(0),
+            "positions decide, not array order"
+        );
         assert!(outcome.skipped.is_empty(), "nothing was skipped");
     }
 
@@ -958,12 +959,7 @@ mod tests {
 
     #[test]
     fn an_unmatched_payload_lands_unassigned_rather_than_on_a_wrong_rule() {
-        let country_rule = rule(
-            Uuid::from_u128(1),
-            0,
-            json!({"country": ["TR"]}),
-            "queue",
-        );
+        let country_rule = rule(Uuid::from_u128(1), 0, json!({"country": ["TR"]}), "queue");
         let outcome = simulate(&[country_rule], &AssignmentInput::default());
         assert_eq!(outcome.rule_id, None);
         assert_eq!(outcome.target_kind.as_deref(), Some("queue"));
@@ -972,11 +968,7 @@ mod tests {
     #[test]
     fn ten_leads_across_three_people_never_repeat_a_person_twice_in_a_row() {
         let mut pool = rule(Uuid::from_u128(9), 0, json!({}), "pool");
-        pool.pool_user_ids = vec![
-            Uuid::from_u128(1),
-            Uuid::from_u128(2),
-            Uuid::from_u128(3),
-        ];
+        pool.pool_user_ids = vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
         let input = AssignmentInput::default();
         let mut seen: Vec<Uuid> = Vec::new();
         // The simulator is pure: advancing the cursor here is exactly what the claim
@@ -1065,7 +1057,8 @@ mod tests {
         }
     }
 
-    const WEEKDAYS_9_17: &str = r#"{"days":[1,2,3,4,5],"start":"09:00","end":"17:00","timezone":"Europe/Istanbul"}"#;
+    const WEEKDAYS_9_17: &str =
+        r#"{"days":[1,2,3,4,5],"start":"09:00","end":"17:00","timezone":"Europe/Istanbul"}"#;
 
     #[test]
     fn a_plain_policy_is_plain_wall_clock() {
@@ -1136,7 +1129,11 @@ mod tests {
 
     #[test]
     fn a_window_that_ends_before_it_starts_is_plain_wall_clock() {
-        let p = policy(60, true, json!({"days":[1,2,3],"start":"18:00","end":"09:00"}));
+        let p = policy(
+            60,
+            true,
+            json!({"days":[1,2,3],"start":"18:00","end":"09:00"}),
+        );
         assert_eq!(
             due_at(&p, at("2026-01-05T10:00:00Z")),
             at("2026-01-05T11:00:00Z")
@@ -1147,7 +1144,12 @@ mod tests {
     fn the_state_is_met_once_answered_and_breached_once_the_deadline_passes() {
         let due = at("2026-01-05T10:00:00Z");
         assert_eq!(
-            SlaState::of(Some(at("2026-01-05T09:00:00Z")), Some(due), at("2026-01-06T00:00:00Z"), 240),
+            SlaState::of(
+                Some(at("2026-01-05T09:00:00Z")),
+                Some(due),
+                at("2026-01-06T00:00:00Z"),
+                240
+            ),
             SlaState::Met
         );
         assert_eq!(
@@ -1205,21 +1207,19 @@ mod tests {
             "zero minutes is not a target"
         );
         assert!(
-            validate_policy("p", 240, None, &json!({"days":[1],"start":"18:00","end":"09:00"}))
-                .is_err()
+            validate_policy(
+                "p",
+                240,
+                None,
+                &json!({"days":[1],"start":"18:00","end":"09:00"})
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn a_rule_with_an_unknown_condition_is_refused_by_name() {
-        let err = validate_rule(
-            "r",
-            &json!({"timezone": "TR"}),
-            "queue",
-            None,
-            &[],
-        )
-        .unwrap_err();
+        let err = validate_rule("r", &json!({"timezone": "TR"}), "queue", None, &[]).unwrap_err();
         assert!(err.to_string().contains("timezone"));
     }
 
@@ -1262,7 +1262,11 @@ mod tests {
 
     #[test]
     fn a_midnight_to_midnight_window_covers_the_whole_day() {
-        let p = policy(60, true, json!({"days":[1,2,3,4,5],"start":"00:00","end":"24:00"}));
+        let p = policy(
+            60,
+            true,
+            json!({"days":[1,2,3,4,5],"start":"00:00","end":"24:00"}),
+        );
         assert_eq!(
             due_at(&p, at("2026-01-05T23:00:00Z")),
             at("2026-01-06T00:00:00Z")
@@ -1300,7 +1304,11 @@ mod tests {
         let got = renumber(&ids, &live);
         assert_eq!(
             got,
-            vec![(Uuid::from_u128(1), 0), (Uuid::from_u128(2), 1), (Uuid::from_u128(3), 2)]
+            vec![
+                (Uuid::from_u128(1), 0),
+                (Uuid::from_u128(2), 1),
+                (Uuid::from_u128(3), 2)
+            ]
         );
     }
 
@@ -1313,5 +1321,4 @@ mod tests {
         );
         assert!(got.is_empty(), "a duplicate id is refused, not resolved");
     }
-
 }

@@ -176,12 +176,21 @@ async fn one_lead(pool: &PgPool, org: Uuid, email: &str, payload: serde_json::Va
     // reason — the row exists, it is just not a lead. Asserted here, once, where the
     // fixture is made, so the failure names the fixture rather than a conversion.
     assert_eq!(
-        captured.lead.status, "new",
+        captured.lead.status,
+        "new",
         "the fixture lead was not accepted ({}): {}",
         captured.lead.status,
-        captured.lead.rejection_reason.as_deref().unwrap_or("no reason recorded")
+        captured
+            .lead
+            .rejection_reason
+            .as_deref()
+            .unwrap_or("no reason recorded")
     );
-    assert_eq!(captured.lead.email.as_deref(), Some(email), "the mapped address");
+    assert_eq!(
+        captured.lead.email.as_deref(),
+        Some(email),
+        "the mapped address"
+    );
     captured.lead.id
 }
 
@@ -220,7 +229,13 @@ async fn the_crm_absent_path_creates_the_contact_and_says_why_not_the_deal() {
          let the present-path test cover the other half"
     );
 
-    let lead_id = one_lead(&pool, org, "absent@example.com", quote_payload("absent@example.com")).await;
+    let lead_id = one_lead(
+        &pool,
+        org,
+        "absent@example.com",
+        quote_payload("absent@example.com"),
+    )
+    .await;
     let report = convert_store::convert_lead(&pool, org, lead_id, None)
         .await
         .expect("the conversion")
@@ -229,14 +244,24 @@ async fn the_crm_absent_path_creates_the_contact_and_says_why_not_the_deal() {
     // Nothing is written, and the panel is told why. A contact is a CRM row: with no
     // `crm_contacts` there is nowhere to put one, so "create the contact, skip the deal" is
     // not a degradation — it is a description of an installation this is not.
-    assert!(report.deal_id.is_none(), "no deal can exist without the CRM tables");
-    assert!(!report.contact_created, "no contact can exist without the CRM tables");
+    assert!(
+        report.deal_id.is_none(),
+        "no deal can exist without the CRM tables"
+    );
+    assert!(
+        !report.contact_created,
+        "no contact can exist without the CRM tables"
+    );
     assert!(
         report.deal_skipped.is_some(),
         "the panel has to be told why — a silent success reads as a converted lead"
     );
     assert!(
-        report.deal_skipped.as_deref().unwrap_or_default().contains("CRM module"),
+        report
+            .deal_skipped
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CRM module"),
         "the reason names the module: {:?}",
         report.deal_skipped
     );
@@ -247,12 +272,20 @@ async fn the_crm_absent_path_creates_the_contact_and_says_why_not_the_deal() {
         .await
         .expect("the lead")
         .expect("a lead row");
-    assert_eq!(lead.contact_id, None, "no pointer to a row that cannot exist");
+    assert_eq!(
+        lead.contact_id, None,
+        "no pointer to a row that cannot exist"
+    );
     assert_eq!(lead.deal_id, None);
-    assert_eq!(lead.status, "new", "the status is not advanced by a failed conversion");
+    assert_eq!(
+        lead.status, "new",
+        "the status is not advanced by a failed conversion"
+    );
 
     // The trail carries the reason — that line is the only thing an operator has to go on.
-    let events = store::list_events(&pool, org, lead_id).await.expect("the trail");
+    let events = store::list_events(&pool, org, lead_id)
+        .await
+        .expect("the trail");
     let skipped = events
         .iter()
         .find(|event| event.kind == "conversion_skipped")
@@ -335,7 +368,13 @@ async fn with_the_crm_present_a_contact_and_an_opportunity_are_written() {
 async fn a_quotation_being_accepted_promotes_the_lead_idempotently() {
     let pool = pool().await;
     let org = fresh_org(&pool, "convert-quote").await;
-    let lead_id = one_lead(&pool, org, "quote@example.com", quote_payload("quote@example.com")).await;
+    let lead_id = one_lead(
+        &pool,
+        org,
+        "quote@example.com",
+        quote_payload("quote@example.com"),
+    )
+    .await;
     let quote_id = Uuid::new_v4();
 
     let promoted = convert_store::mark_quote_accepted(&pool, org, lead_id, quote_id)
@@ -359,7 +398,9 @@ async fn a_quotation_being_accepted_promotes_the_lead_idempotently() {
         "the instant is the first one"
     );
 
-    let trail = store::list_events(&pool, org, lead_id).await.expect("the trail");
+    let trail = store::list_events(&pool, org, lead_id)
+        .await
+        .expect("the trail");
     assert_eq!(
         trail.iter().filter(|e| e.kind == "quote_accepted").count(),
         1,
@@ -374,7 +415,13 @@ async fn another_organizations_lead_converts_to_nothing_at_all() {
     let pool = pool().await;
     let mine = fresh_org(&pool, "convert-mine").await;
     let theirs = fresh_org(&pool, "convert-theirs").await;
-    let their_lead = one_lead(&pool, theirs, "theirs@example.com", quote_payload("theirs@example.com")).await;
+    let their_lead = one_lead(
+        &pool,
+        theirs,
+        "theirs@example.com",
+        quote_payload("theirs@example.com"),
+    )
+    .await;
 
     // `None`, not a `403` and not an error: a cross-tenant id must be indistinguishable
     // from an id that does not exist, or the route is an enumeration oracle.
@@ -384,7 +431,10 @@ async fn another_organizations_lead_converts_to_nothing_at_all() {
     assert!(report.is_none(), "another tenant's lead is not convertible");
 
     let still_there: (i64,) = sqlx::query_as("select count(*) from crm_leads where id = $1")
-        .bind(their_lead).fetch_one(&pool).await.expect("the count");
+        .bind(their_lead)
+        .fetch_one(&pool)
+        .await
+        .expect("the count");
     assert_eq!(still_there.0, 1, "the refused conversion wrote nothing");
 
     drop_org(&pool, theirs).await;
@@ -395,33 +445,67 @@ async fn another_organizations_lead_converts_to_nothing_at_all() {
 async fn the_retention_sweep_clears_the_payload_and_keeps_the_row() {
     let pool = pool().await;
     let org = fresh_org(&pool, "convert-retention").await;
-    let lead_id = one_lead(&pool, org, "old@example.com", quote_payload("old@example.com")).await;
+    let lead_id = one_lead(
+        &pool,
+        org,
+        "old@example.com",
+        quote_payload("old@example.com"),
+    )
+    .await;
 
     // A row the sweep will take: aged past the window.
     sqlx::query("update crm_leads set received_at = now() - interval '900 days' where id = $1")
-        .bind(lead_id).execute(&pool).await.expect("age the lead");
+        .bind(lead_id)
+        .execute(&pool)
+        .await
+        .expect("age the lead");
     // A row it will not: yesterday.
-    let recent = one_lead(&pool, org, "new@example.com", quote_payload("new@example.com")).await;
+    let recent = one_lead(
+        &pool,
+        org,
+        "new@example.com",
+        quote_payload("new@example.com"),
+    )
+    .await;
 
     let archived = convert_store::archive_expired_payloads(&pool, org, 730)
         .await
         .expect("the sweep");
     assert_eq!(archived, 1, "exactly the aged row");
 
-    let old = store::find_lead(&pool, org, lead_id).await.expect("read").expect("row");
+    let old = store::find_lead(&pool, org, lead_id)
+        .await
+        .expect("read")
+        .expect("row");
     assert_eq!(old.payload_bytes, 0, "the submission body is gone");
-    assert!(old.payload.as_object().is_none_or(serde_json::Map::is_empty));
+    assert!(
+        old.payload
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty)
+    );
     assert!(old.message.is_none(), "the free text goes with it");
     // The row itself — and everything the operations depend on — stays.
     assert_eq!(old.status, "new", "the row is still a lead");
-    assert_eq!(old.email.as_deref(), Some("old@example.com"), "the address is kept");
+    assert_eq!(
+        old.email.as_deref(),
+        Some("old@example.com"),
+        "the address is kept"
+    );
 
-    let kept = store::find_lead(&pool, org, recent).await.expect("read").expect("row");
+    let kept = store::find_lead(&pool, org, recent)
+        .await
+        .expect("read")
+        .expect("row");
     assert!(kept.payload_bytes > 0, "a recent lead is not swept");
 
     // And the trail survived: an archived lead with no history is not an archived lead.
-    let events = store::list_events(&pool, org, lead_id).await.expect("the trail");
-    assert!(!events.is_empty(), "the trail is not part of what retention erases");
+    let events = store::list_events(&pool, org, lead_id)
+        .await
+        .expect("the trail");
+    assert!(
+        !events.is_empty(),
+        "the trail is not part of what retention erases"
+    );
 
     drop_org(&pool, org).await;
 }

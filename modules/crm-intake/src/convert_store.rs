@@ -74,7 +74,10 @@ async fn record_skipped(
     store::append_event(pool, lead_id, "conversion_skipped", actor_user_id, detail).await?;
 
     // Re-read so the answer is the row's state, and `None` if the lead went away.
-    if store::find_lead(pool, organization_id, lead_id).await?.is_none() {
+    if store::find_lead(pool, organization_id, lead_id)
+        .await?
+        .is_none()
+    {
         return Ok(None);
     }
     Ok(Some(report))
@@ -183,7 +186,15 @@ pub async fn convert_lead(
         Err(error) => return Err(error.into()),
         Ok(target) => match target {
             Some((pipeline_id, stage_id)) => {
-                let deal_id = create_deal(pool, organization_id, &lead, contact_id, pipeline_id, stage_id).await?;
+                let deal_id = create_deal(
+                    pool,
+                    organization_id,
+                    &lead,
+                    contact_id,
+                    pipeline_id,
+                    stage_id,
+                )
+                .await?;
                 ConversionReport {
                     contact_id,
                     contact_created: true,
@@ -258,10 +269,7 @@ fn report_from(lead: &Lead, report: &ConversionReport) -> ConversionReport {
 }
 
 /// Insert the contact a lead should belong to.
-async fn create_contact(
-    pool: &PgPool,
-    lead: &Lead,
-) -> Result<Conversion> {
+async fn create_contact(pool: &PgPool, lead: &Lead) -> Result<Conversion> {
     // The `crm_contacts_name_present` check requires a name, and a form that asks for nothing
     // but an e-mail is completely normal. Falling back to the local part of the address
     // gives the contact a name a person can recognize instead of refusing the conversion and
@@ -357,11 +365,10 @@ async fn create_deal(
     // The source's configured pipeline wins over the organization's default, so a site that
     // routes web leads into its own board gets them there without an operator reassigning
     // every deal afterwards.
-    let (pipeline_id, stage_id) =
-        match load_source_target(pool, lead.source_id).await? {
-            Some(target) => target,
-            None => (pipeline_id, stage_id),
-        };
+    let (pipeline_id, stage_id) = match load_source_target(pool, lead.source_id).await? {
+        Some(target) => target,
+        None => (pipeline_id, stage_id),
+    };
 
     let amount = convert::initial_amount(lead).unwrap_or(0);
     let title = convert::deal_title(lead);
@@ -437,10 +444,12 @@ pub async fn mark_quote_accepted(
             // The deal moves with it, in the same statement's shadow: a lead that is
             // converted and an opportunity still sitting in "new" is the state a board
             // review catches, weeks later.
-            let _ = sqlx::query("update crm_deals set stage_changed_at = now(), updated_at = now() where id = $1")
-                .bind(deal_id)
-                .execute(pool)
-                .await;
+            let _ = sqlx::query(
+                "update crm_deals set stage_changed_at = now(), updated_at = now() where id = $1",
+            )
+            .bind(deal_id)
+            .execute(pool)
+            .await;
         }
         store::append_event(
             pool,

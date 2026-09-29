@@ -182,21 +182,9 @@ mod tests {
         let slice2 = read_migration("0056_crm_assignment_sla.sql");
 
         for (sql, constraint, list) in [
-            (
-                &slice1,
-                "crm_leads_status_check",
-                &STATUSES[..],
-            ),
-            (
-                &slice1,
-                "crm_leads_decision_check",
-                &DECISIONS[..],
-            ),
-            (
-                &slice1,
-                "crm_intake_sources_kind_check",
-                &SOURCE_KINDS[..],
-            ),
+            (&slice1, "crm_leads_status_check", &STATUSES[..]),
+            (&slice1, "crm_leads_decision_check", &DECISIONS[..]),
+            (&slice1, "crm_intake_sources_kind_check", &SOURCE_KINDS[..]),
             (
                 &slice1,
                 "crm_intake_sources_dedupe_policy_check",
@@ -222,8 +210,9 @@ mod tests {
             "{}/../../database/migrations/{name}",
             env!("CARGO_MANIFEST_DIR")
         );
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("cannot read {name} ({error}); the closed lists are duplicated in it"))
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("cannot read {name} ({error}); the closed lists are duplicated in it")
+        })
     }
 
     /// `('a', 'b', 'c')` — how the migration writes its check-constraint values, except for

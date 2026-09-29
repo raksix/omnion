@@ -201,9 +201,11 @@ pub async fn create_rule(
     match created {
         Ok(row) => {
             reorder_rules(pool, organization_id, &[row.id]).await?;
-            find_rule(pool, organization_id, row.id).await?.ok_or_else(|| {
-                CrmIntakeError::Invalid("the rule was saved but could not be read back".into())
-            })
+            find_rule(pool, organization_id, row.id)
+                .await?
+                .ok_or_else(|| {
+                    CrmIntakeError::Invalid("the rule was saved but could not be read back".into())
+                })
         }
         Err(error) => Err(map_unique(error, "a rule with that name already exists")),
     }
@@ -247,11 +249,12 @@ pub async fn update_rule(
 /// the alternative is an operator unable to remove a rule because a source three months ago
 /// referenced it, and the lead's `assignment_reason` still says which rule decided it.
 pub async fn delete_rule(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Result<bool> {
-    let removed = sqlx::query("delete from crm_assignment_rules where organization_id = $1 and id = $2")
-        .bind(organization_id)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    let removed =
+        sqlx::query("delete from crm_assignment_rules where organization_id = $1 and id = $2")
+            .bind(organization_id)
+            .bind(id)
+            .execute(pool)
+            .await?;
     Ok(removed.rows_affected() > 0)
 }
 
@@ -290,10 +293,7 @@ pub async fn reorder_rules(
             ordered.push(rule.clone());
         }
     }
-    let plan = renumber(
-        &ordered.iter().map(|r| r.id).collect::<Vec<_>>(),
-        &ordered,
-    );
+    let plan = renumber(&ordered.iter().map(|r| r.id).collect::<Vec<_>>(), &ordered);
     if plan.is_empty() {
         return Err(CrmIntakeError::Invalid(
             "the new order names the same rule twice".into(),
@@ -508,11 +508,12 @@ pub async fn update_policy(
 /// Delete a policy. A lead already holding it keeps its deadline and reads "the policy is
 /// gone" rather than losing the clock it was promised.
 pub async fn delete_policy(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Result<bool> {
-    let removed = sqlx::query("delete from crm_sla_policies where organization_id = $1 and id = $2")
-        .bind(organization_id)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    let removed =
+        sqlx::query("delete from crm_sla_policies where organization_id = $1 and id = $2")
+            .bind(organization_id)
+            .bind(id)
+            .execute(pool)
+            .await?;
     Ok(removed.rows_affected() > 0)
 }
 
@@ -678,10 +679,7 @@ pub async fn mark_escalated(
 /// fallback, else nobody. Returning `None` is a real answer — the worker then records the
 /// breach on the timeline and moves on, which is better than notifying the person whose
 /// deadline just passed and calling it an escalation.
-pub async fn escalation_target(
-    pool: &PgPool,
-    lead_id: Uuid,
-) -> Result<Option<Uuid>> {
+pub async fn escalation_target(pool: &PgPool, lead_id: Uuid) -> Result<Option<Uuid>> {
     let target = sqlx::query_scalar::<_, Option<Uuid>>(
         "select p.escalate_to_user_id from crm_leads l \
          join crm_sla_policies p on p.id = l.sla_policy_id \

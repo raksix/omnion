@@ -116,7 +116,10 @@ pub fn step_plan(lead: &Lead, availability: Availability) -> Vec<Step> {
         Some(_) => Step {
             key: "opportunity",
             state: StepState::Done,
-            note: format!("Deal created in the source's pipeline{}", contact_note(lead)),
+            note: format!(
+                "Deal created in the source's pipeline{}",
+                contact_note(lead)
+            ),
         },
         None if lead.contact_id.is_some() => Step {
             key: "opportunity",
@@ -182,7 +185,10 @@ pub fn step_plan(lead: &Lead, availability: Availability) -> Vec<Step> {
         Step {
             key: "lead",
             state: StepState::Done,
-            note: format!("Arrived {} through its intake source.", lead.received_at.date()),
+            note: format!(
+                "Arrived {} through its intake source.",
+                lead.received_at.date()
+            ),
         },
         opportunity,
         quotation,
@@ -421,7 +427,12 @@ mod tests {
 
     #[test]
     fn a_range_becomes_its_midpoint() {
-        for dash in ["10k-50k", "10,000 - 50,000", "10 000 – 50 000", "1000 to 5000"] {
+        for dash in [
+            "10k-50k",
+            "10,000 - 50,000",
+            "10 000 – 50 000",
+            "1000 to 5000",
+        ] {
             let parsed = parse_amount_text(dash).unwrap_or_else(|| panic!("{dash} did not parse"));
             // 10k–50k is 30 000; 1 000–5 000 is 3 000. Both are the midpoint, and both are
             // the number a reader of the band would have named.

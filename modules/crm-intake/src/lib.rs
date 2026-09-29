@@ -34,6 +34,7 @@
 
 pub mod assignment;
 pub mod assignment_store;
+pub mod autoresponder;
 pub mod convert;
 pub mod convert_store;
 pub mod dedupe;
@@ -44,20 +45,20 @@ pub mod model;
 pub mod store;
 pub mod vocabulary;
 
+pub use assignment::{
+    AssignmentInput, AssignmentOutcome, AssignmentRule, BusinessHours, SlaPolicy, SlaState, due_at,
+    next_position, renumber, simulate, validate_policy, validate_rule,
+};
 pub use assignment_store::{
     Breach, NewPolicy, NewRule, claim_assignment, create_policy, create_rule, delete_policy,
     delete_rule, due_breaches, escalation_target, find_policy, find_rule, list_policies,
-    list_rules, mark_escalated, policy_for_source, reorder_rules, stamp_assignment,
-    update_policy, update_rule,
+    list_rules, mark_escalated, policy_for_source, reorder_rules, stamp_assignment, update_policy,
+    update_rule,
 };
-pub use assignment::{
-    AssignmentInput, AssignmentOutcome, AssignmentRule, BusinessHours, SlaPolicy, SlaState,
-    due_at, next_position, renumber, simulate, validate_policy, validate_rule,
+pub use convert::{
+    Availability, Conversion, STEPS, Step, StepState, deal_title, initial_amount, step_plan,
 };
 pub use dedupe::{Candidate, DedupePolicy, Match, MatchKey, Verdict, evaluate as dedupe_evaluate};
-pub use convert::{
-    Availability, Conversion, Step, StepState, STEPS, deal_title, initial_amount, step_plan,
-};
 pub use error::{CrmIntakeError, Result};
 pub use keys::{hash_key, hint_for, issue_key, verify_key};
 pub use mapping::{MappedValues, MappingEntry, apply, health, validate_required_targets};

@@ -21,7 +21,7 @@
 
 use omnion_module_crm_intake::assignment::{AssignmentInput, SlaState};
 use omnion_module_crm_intake::assignment_store::{
-    self, NewPolicy, NewRule, DEFAULT_POLICY_NAME, DEFAULT_RULE_NAME,
+    self, DEFAULT_POLICY_NAME, DEFAULT_RULE_NAME, NewPolicy, NewRule,
 };
 use omnion_module_crm_intake::{AssignmentOutcome, Result, store};
 use sqlx::PgPool;
@@ -123,7 +123,9 @@ async fn cleanup(pool: &PgPool, organization_id: Uuid) {
 async fn ten_concurrent_claims_never_repeat_a_person_twice_in_a_row() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
 
     let users = three_users(&pool, org).await;
     // Delete the seeded catch-all so only the pool rule can match, then put the pool on top.
@@ -213,7 +215,11 @@ async fn ten_concurrent_claims_never_repeat_a_person_twice_in_a_row() {
     // ten already moved the cursor round the pool once and a bit, so the concurrent ten
     // start wherever it stopped. Twenty over three is 7/7/6, and asserting 3 each is
     // arithmetic the test got wrong, not a fairness the product failed to deliver.
-    let all: Vec<Uuid> = sequential.iter().chain(concurrent.iter()).copied().collect();
+    let all: Vec<Uuid> = sequential
+        .iter()
+        .chain(concurrent.iter())
+        .copied()
+        .collect();
     // The pool's own order, not the UUID's: the cursor cycles through `pool_user_ids` in
     // order, so "the first member gets the leftover claim" is about position in the pool.
     // An earlier version sorted the counts by UUID, which made the expected distribution
@@ -231,7 +237,8 @@ async fn ten_concurrent_claims_never_repeat_a_person_twice_in_a_row() {
         // each member exactly one, and the leftover claims start the next cycle at the top.
         let expected = base + usize::from(index < remainder);
         assert_eq!(
-            *count, expected,
+            *count,
+            expected,
             "the pool is not shared evenly: {owner:?} took {count}, expected {expected} \
              (a cycle of {} over {} claims)",
             users.len(),
@@ -249,7 +256,9 @@ async fn ten_concurrent_claims_never_repeat_a_person_twice_in_a_row() {
 
     // And the cursor itself: twenty claims (ten sequential, ten concurrent) over three
     // people leaves it at 20 % 3. A cursor that lost a race would be behind this.
-    let rules = assignment_store::list_rules(&pool, org).await.expect("the chain");
+    let rules = assignment_store::list_rules(&pool, org)
+        .await
+        .expect("the chain");
     let cursor = rules
         .iter()
         .find(|r| r.target_kind == "pool")
@@ -270,7 +279,9 @@ async fn ten_concurrent_claims_never_repeat_a_person_twice_in_a_row() {
 async fn the_cursor_advances_exactly_once_per_claim() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     sqlx::query("delete from crm_assignment_rules where organization_id = $1 and name <> $2")
         .bind(org)
         .bind("Pool")
@@ -298,7 +309,9 @@ async fn the_cursor_advances_exactly_once_per_claim() {
             .await
             .expect("a claim");
     }
-    let rules = assignment_store::list_rules(&pool, org).await.expect("the chain");
+    let rules = assignment_store::list_rules(&pool, org)
+        .await
+        .expect("the chain");
     let stored = rules
         .iter()
         .find(|r| r.id == rule.id)
@@ -320,7 +333,9 @@ async fn the_cursor_advances_exactly_once_per_claim() {
 async fn a_reorder_moves_a_prefix_and_renumbers_without_gaps() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
 
     let mut ids = Vec::new();
     for name in ["One", "Two", "Three"] {
@@ -333,7 +348,9 @@ async fn a_reorder_moves_a_prefix_and_renumbers_without_gaps() {
     }
 
     // Move the third to the front; the panel's "move up" sends exactly this.
-    let reordered = assignment_store::reorder_rules(&pool, org, &[ids[2]]).await.expect("a reorder");
+    let reordered = assignment_store::reorder_rules(&pool, org, &[ids[2]])
+        .await
+        .expect("a reorder");
     let names: Vec<&str> = reordered.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names[0], "Three", "the named rule leads: {names:?}");
     assert!(
@@ -371,7 +388,9 @@ async fn a_reorder_moves_a_prefix_and_renumbers_without_gaps() {
 async fn a_rule_of_another_organization_is_a_none() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     let other = fresh_org(&pool, "tenant-other").await;
     let rule = assignment_store::create_rule(&pool, org, &NewRule::catch_all("Acme only"))
         .await
@@ -385,15 +404,10 @@ async fn a_rule_of_another_organization_is_a_none() {
         "a cross-organization rule must not be readable"
     );
     assert!(
-        assignment_store::update_rule(
-            &pool,
-            other,
-            rule.id,
-            &NewRule::catch_all("hijacked")
-        )
-        .await
-        .expect("an update")
-        .is_none(),
+        assignment_store::update_rule(&pool, other, rule.id, &NewRule::catch_all("hijacked"))
+            .await
+            .expect("an update")
+            .is_none(),
         "a cross-organization rule must not be editable"
     );
     assert!(
@@ -419,8 +433,12 @@ async fn two_organizations_evaluate_independently() {
     let pool = pool().await;
     let a = fresh_org(&pool, "tenant-a").await;
     let b = fresh_org(&pool, "tenant-b").await;
-    assignment_store::ensure_defaults(&pool, a).await.expect("defaults for a");
-    assignment_store::ensure_defaults(&pool, b).await.expect("defaults for b");
+    assignment_store::ensure_defaults(&pool, a)
+        .await
+        .expect("defaults for a");
+    assignment_store::ensure_defaults(&pool, b)
+        .await
+        .expect("defaults for b");
 
     let a_rules = assignment_store::list_rules(&pool, a).await.expect("a");
     let b_rules = assignment_store::list_rules(&pool, b).await.expect("b");
@@ -459,12 +477,16 @@ async fn an_organization_created_after_the_migration_still_gets_the_defaults() {
         .await
         .expect("an organization");
 
-    let rules = assignment_store::list_rules(&pool, org).await.expect("the chain");
+    let rules = assignment_store::list_rules(&pool, org)
+        .await
+        .expect("the chain");
     assert_eq!(rules.len(), 1, "the catch-all is seeded on first read");
     assert_eq!(rules[0].name, DEFAULT_RULE_NAME);
     assert_eq!(rules[0].target_kind, "queue");
 
-    let policies = assignment_store::list_policies(&pool, org).await.expect("the policies");
+    let policies = assignment_store::list_policies(&pool, org)
+        .await
+        .expect("the policies");
     assert_eq!(policies.len(), 1);
     assert_eq!(policies[0].name, DEFAULT_POLICY_NAME);
     assert_eq!(policies[0].first_response_minutes, 240);
@@ -475,7 +497,9 @@ async fn an_organization_created_after_the_migration_still_gets_the_defaults() {
 
     // Idempotent: a second read adds nothing, so the panel reloading does not accumulate
     // defaults and an operator sees one four-hour target rather than two.
-    let again = assignment_store::list_rules(&pool, org).await.expect("the chain");
+    let again = assignment_store::list_rules(&pool, org)
+        .await
+        .expect("the chain");
     assert_eq!(again.len(), 1, "the seed does not accumulate");
 
     let _ = sqlx::query("delete from organizations where id = $1")
@@ -494,7 +518,9 @@ async fn an_organization_created_after_the_migration_still_gets_the_defaults() {
 async fn a_breach_escalates_exactly_once() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     // The escalation target is a real user: the column is a foreign key, so a fabricated id
     // is refused at the database and the test fails on its fixture rather than on the sweep.
     let escalation = three_users(&pool, org).await.remove(0);
@@ -574,10 +600,19 @@ async fn a_breach_escalates_exactly_once() {
 async fn a_lead_inside_its_window_is_not_a_breach() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     let source = endpoint_source(&pool, org, "SLA in-window").await;
     // Due two hours from now: inside the window.
-    let lead = insert_lead_at(&pool, org, source, None, OffsetDateTime::now_utc() + time::Duration::hours(2)).await;
+    let lead = insert_lead_at(
+        &pool,
+        org,
+        source,
+        None,
+        OffsetDateTime::now_utc() + time::Duration::hours(2),
+    )
+    .await;
 
     let breaches = assignment_store::due_breaches(&pool, org, db_now(&pool).await, 50)
         .await
@@ -596,10 +631,14 @@ async fn a_lead_inside_its_window_is_not_a_breach() {
 async fn a_lead_that_was_answered_is_never_escalated() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     let source = endpoint_source(&pool, org, "SLA answered").await;
     let lead = insert_lead(&pool, org, source, None, -30).await;
-    store::record_response(&pool, org, lead, None).await.expect("a response");
+    store::record_response(&pool, org, lead, None)
+        .await
+        .expect("a response");
 
     let breaches = assignment_store::due_breaches(&pool, org, db_now(&pool).await, 50)
         .await
@@ -623,7 +662,9 @@ async fn a_lead_that_was_answered_is_never_escalated() {
 async fn the_state_the_panel_shows_comes_from_the_stored_deadline() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     let policy = assignment_store::create_policy(
         &pool,
         org,
@@ -676,7 +717,12 @@ async fn the_state_the_panel_shows_comes_from_the_stored_deadline() {
         "the deadline instant itself is breached"
     );
     assert_eq!(
-        SlaState::of(Some(received), Some(due), due + time::Duration::hours(99), 240),
+        SlaState::of(
+            Some(received),
+            Some(due),
+            due + time::Duration::hours(99),
+            240
+        ),
         SlaState::Met,
         "answered is met, whatever the clock says afterwards"
     );
@@ -690,7 +736,9 @@ async fn the_state_the_panel_shows_comes_from_the_stored_deadline() {
 async fn the_claim_stamps_the_lead_without_rewinding_its_status() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
     let users = three_users(&pool, org).await;
     let rule = assignment_store::create_rule(
         &pool,
@@ -706,21 +754,25 @@ async fn the_claim_stamps_the_lead_without_rewinding_its_status() {
     )
     .await
     .expect("a rule");
-    let policy = assignment_store::find_policy(&pool, org, assignment_store::list_policies(&pool, org).await.expect("policies")[0].id)
-        .await
-        .expect("a read")
-        .expect("a policy");
+    let policy = assignment_store::find_policy(
+        &pool,
+        org,
+        assignment_store::list_policies(&pool, org)
+            .await
+            .expect("policies")[0]
+            .id,
+    )
+    .await
+    .expect("a read")
+    .expect("a policy");
     let source = endpoint_source(&pool, org, "Claim stamp").await;
     let received = OffsetDateTime::now_utc();
     let lead = insert_lead_at(&pool, org, source, Some(policy.id), received).await;
 
-    let outcome: AssignmentOutcome = assignment_store::claim_assignment(
-        &pool,
-        org,
-        &AssignmentInput::default(),
-    )
-    .await
-    .expect("a claim");
+    let outcome: AssignmentOutcome =
+        assignment_store::claim_assignment(&pool, org, &AssignmentInput::default())
+            .await
+            .expect("a claim");
     assignment_store::stamp_assignment(&pool, lead, &outcome, Some(&policy), received)
         .await
         .expect("a stamp");
@@ -735,7 +787,10 @@ async fn the_claim_stamps_the_lead_without_rewinding_its_status() {
     .expect("the lead");
     assert_eq!(row.0, users.first().copied(), "the owner was written");
     assert_eq!(row.1, Some(rule.id), "the deciding rule was written");
-    assert_eq!(row.2, "assigned", "a new lead that got an owner is assigned");
+    assert_eq!(
+        row.2, "assigned",
+        "a new lead that got an owner is assigned"
+    );
     assert!(row.3.is_some(), "the deadline was written");
 
     // A lead that already moved on is not rewound by a later claim.
@@ -768,7 +823,9 @@ async fn the_claim_stamps_the_lead_without_rewinding_its_status() {
 async fn the_database_refuses_the_rules_the_editor_refuses() {
     let pool = pool().await;
     let org = fresh_org(&pool, "gate").await;
-    assignment_store::ensure_defaults(&pool, org).await.expect("defaults");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("defaults");
 
     let no_members: Vec<Uuid> = Vec::new();
     for (name, target_kind, pool_ids) in [
@@ -802,14 +859,17 @@ async fn the_database_refuses_the_rules_the_editor_refuses() {
     .await
     .expect_err("a reminder at the breach minute must be refused");
     assert!(
-        error.to_string().contains("crm_sla_policies_reminder_check"),
+        error
+            .to_string()
+            .contains("crm_sla_policies_reminder_check"),
         "the refusal must name the constraint: {error}"
     );
 
     // And the Rust validator refuses the same two, so the panel never sends a request the
     // database is going to turn away.
     assert!(
-        omnion_module_crm_intake::validate_rule("Pool", &serde_json::json!({}), "pool", None, &[]).is_err()
+        omnion_module_crm_intake::validate_rule("Pool", &serde_json::json!({}), "pool", None, &[])
+            .is_err()
     );
     drop_org(&pool, org).await;
 }
@@ -862,13 +922,12 @@ async fn insert_lead(
         minutes_ago < 0,
         "insert_lead takes a negative number: negative is minutes into the past"
     );
-    let received: OffsetDateTime = sqlx::query_scalar(
-        "select now() + make_interval(mins => $1::int)",
-    )
-    .bind(minutes_ago)
-    .fetch_one(pool)
-    .await
-    .expect("the database clock");
+    let received: OffsetDateTime =
+        sqlx::query_scalar("select now() + make_interval(mins => $1::int)")
+            .bind(minutes_ago)
+            .fetch_one(pool)
+            .await
+            .expect("the database clock");
     assert!(
         received <= OffsetDateTime::now_utc() + time::Duration::minutes(1),
         "the database clock and this process must agree within a minute: {received:?}"
@@ -967,10 +1026,17 @@ async fn the_seeds_have_the_uniqueness_they_conflict_on() {
 
     // Two calls in a row: the first inserts, the second must hit the constraint and do
     // nothing rather than raise 42P10.
-    assignment_store::ensure_defaults(&pool, org).await.expect("first seed");
-    assignment_store::ensure_defaults(&pool, org).await.expect("second seed");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("first seed");
+    assignment_store::ensure_defaults(&pool, org)
+        .await
+        .expect("second seed");
     assert_eq!(
-        assignment_store::list_rules(&pool, org).await.expect("the chain").len(),
+        assignment_store::list_rules(&pool, org)
+            .await
+            .expect("the chain")
+            .len(),
         1,
         "seeding twice leaves one catch-all"
     );
@@ -989,13 +1055,9 @@ async fn the_seeds_have_the_uniqueness_they_conflict_on() {
         .await
         .expect("a distinct policy");
     let other = fresh_org(&pool, "tenant-other").await;
-    assignment_store::create_policy(
-        &pool,
-        other,
-        &NewPolicy::web_default("Web default"),
-    )
-    .await
-    .expect("the same name in another organization");
+    assignment_store::create_policy(&pool, other, &NewPolicy::web_default("Web default"))
+        .await
+        .expect("the same name in another organization");
     drop_org(&pool, org).await;
     drop_org(&pool, other).await;
 }
@@ -1014,9 +1076,13 @@ async fn reading_the_chain_of_a_fresh_organization_does_not_fail() -> Result<()>
         .expect("an organization");
     let rules = assignment_store::list_rules(&pool, org).await?;
     assert_eq!(rules.len(), 1);
-    let outcome = assignment_store::claim_assignment(&pool, org, &AssignmentInput::default()).await?;
+    let outcome =
+        assignment_store::claim_assignment(&pool, org, &AssignmentInput::default()).await?;
     assert_eq!(outcome.rule_id, Some(rules[0].id));
-    assert_eq!(outcome.owner_user_id, None, "the catch-all hands to the queue");
+    assert_eq!(
+        outcome.owner_user_id, None,
+        "the catch-all hands to the queue"
+    );
     let _ = sqlx::query("delete from organizations where id = $1")
         .bind(org)
         .execute(&pool)
