@@ -34,6 +34,7 @@ import {
   runSecurityChecks,
   type ApiError,
 } from "@/lib/api";
+import { SecurityTabs } from "@/features/security/security-tabs";
 import type { SecurityCheck, SecurityCheckState, SecurityOverview } from "@/lib/types";
 
 /** The four states and how each one reads. The label is never the colour alone. */
@@ -248,6 +249,7 @@ export function SecurityOverviewScreen() {
 
   return (
     <div className="space-y-6" data-security-overview>
+      <SecurityTabs current="overview" />
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="text-[12px] text-muted">
