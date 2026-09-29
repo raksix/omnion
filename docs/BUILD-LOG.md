@@ -2828,3 +2828,19 @@ behind `/crm/settings/assignment` and `/crm/settings/sla`, which the sidebar alr
 
 **Commits.** `2efbe45` the client and the panel's vocabulary · `1d9cf05` the four screens ·
 `0e9063c` the navigation · `17b302d` the exported request helper · `7a3d09b` the depth pass.
+
+**QA pass — attempted, blocked by the box, not by the change.** The w8 pass
+(`QA_STACK=w8`, ports 18087/3107/3207) reset its own database and built the API cleanly
+(4m39s), then the walkthrough found **no admin server on :3107**: every route in the run —
+`overview` and `media` first, then the CRM screens — answered `ERR_CONNECTION_REFUSED`, and
+the vision review of `page-crm-leads.png` is the browser's "This site can't be reached" page.
+The failure is not confined to the four screens this slice added: the media, IAM and analytics
+depth passes failed with the same "the screen did not render", which is only possible if the
+server was gone for the whole run. The box was at 21/32 GB used with nine writers sharing it,
+which is the same memory-exhaustion shape recorded on 28 Sep. The pass was first queued behind
+four other writers' passes (the `QA_SLOTS=1` slot was held live by the main worktree, then w3
+and w9), and one of my own waits died mid-queue; the run that started used `QA_SLOTS=0`, the
+documented escape hatch, and still lost the servers. **So the browser gate for this slice is
+not yet run**, and the acceptance lines it would have settled are left `~`, not `x`. The fast
+gates are what is green today, and the next tick's first action is the pass again, on a box
+with room.
