@@ -1621,14 +1621,20 @@ dependencies = [
 name = "omnion-workflows"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "hmac",
  "omnion-audit",
+ "rand 0.8.8",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
+ "subtle",
  "thiserror",
  "time",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

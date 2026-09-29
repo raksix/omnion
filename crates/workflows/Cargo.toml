@@ -14,6 +14,17 @@ thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# Slice 3's OAuth flow signs its own `state` and derives PKCE challenges, so it needs
+# the same three primitives the identity crate's secret envelope is built from: a hash,
+# an HMAC and a constant-time comparison.
+sha2.workspace = true
+hmac.workspace = true
+subtle.workspace = true
+rand.workspace = true
+# The authorization URL is *parsed* and appended to, never concatenated — an endpoint that
+# already carries a query string is common and string concatenation drops it silently.
+url.workspace = true
+base64.workspace = true
 omnion-audit = { path = "../audit" }
 
 [dev-dependencies]
