@@ -44,6 +44,36 @@ use uuid::Uuid;
 
 /// A client address used only by this suite, so its counter cannot collide with anything else on
 /// the shared development Redis. `198.51.100.x` is the RFC 5737 documentation range.
+/// Remove every row a previous run of this suite left behind.
+///
+/// The suite is order-independent by giving each test its own address, but a run that is
+/// KILLED — a `timeout`, a Ctrl-C, a box that fills up — skips its own teardown and leaves its
+/// policy in the table. Those rows are then in the list `reload_from_store` re-reads, and they
+/// outrank nothing by accident: they outrank by being *specific*. The shipped `authenticated API`
+/// default is `user`-scoped at priority 50, and a stale `ip` row cannot beat it on scope, so the
+/// stale rows that actually broke the run were the ones a crashed test left at `priority: 0`.
+///
+/// The cleanup is therefore keyed on the suite's OWN policy names rather than on a blanket
+/// delete, because this database is shared with seven other writers and a walk of theirs must
+/// never lose a budget to a walk of mine. The seeded defaults are `is_default` and are never
+/// touched by this.
+async fn purge_suite_leftovers(state: &AppState) {
+    let rows: Vec<uuid::Uuid> = sqlx::query_scalar::<_, uuid::Uuid>(
+        "select id from rate_limit_policies where name like 'w6 %'",
+    )
+    .fetch_all(state.db().pool())
+    .await
+    .unwrap_or_default();
+    for id in rows {
+        let _ = omnion_reliability::store::delete_policy(state.db().pool(), id).await;
+    }
+    // Re-seed nothing: the shipped defaults come from migration 0165, and a run that deleted one
+    // of those is a run this suite should not be repairing behind the operator's back.
+    if omnion_api::reliability_middleware::installed().is_some() {
+        omnion_api::reliability_middleware::reload_from_store(state).await;
+    }
+}
+
 /// The address the suite spends its budget against.
 ///
 /// **One per test, not one for the suite.** The counter key is
@@ -207,6 +237,10 @@ async fn live_state() -> Option<AppState> {
         );
         return None;
     }
+    // A killed run leaves its policies behind, and they are in the list the next run decides by.
+    // Clearing them here — before any test installs its own — is what makes the suite
+    // re-runnable rather than only re-runnable-once.
+    purge_suite_leftovers(&state).await;
     Some(state)
 }
 
@@ -244,13 +278,20 @@ async fn sign_in(state: &AppState) -> (Uuid, String) {
         .await
         .expect("the owner role must be bound");
 
+    // A FRESH address per sign-in, for the same reason the tests have their own: the counter
+    // belongs to the subject, so two logins from one address share a budget. The shipped
+    // `sign-in` default is 10/minute, which sounds generous until eight walks each sign in from
+    // the same literal and the tenth login of a run is refused for a reason that has nothing to
+    // do with what it is testing. The address is a documentation range address and the account
+    // is created per call, so nothing is shared.
+    let login_ip = format!("198.51.100.{}", 200 + uuid::Uuid::new_v4().as_u128() % 50);
     let response = call_from(
         state,
         json_post(
             "/api/v1/auth/login",
             json!({ "email": email, "password": PASSWORD }),
         ),
-        CLIENT_IP,
+        &login_ip,
     )
     .await;
     assert_eq!(response.status, StatusCode::OK, "login: {}", response.text);
@@ -726,7 +767,7 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
         return;
     };
     let policy = install_suite_policy(&state, "198.51.100.108").await;
-    let (_user, token) = sign_in(&state).await;
+    let (user_id, token) = sign_in(&state).await;
 
     // A second, stricter policy for the same scope. `pick` orders by SPECIFICITY first and only
     // then by priority, and a policy that names a target is more specific than one that does not
@@ -736,8 +777,8 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     let stricter = LimitPolicy {
         id: None,
         name: "w6 stricter".to_owned(),
-        scope: "ip".to_owned(),
-        target_id: Some("198.51.100.108".to_owned()),
+        scope: "user".to_owned(),
+        target_id: Some(user_id.to_string()),
         route_pattern: None,
         limit_count: 1,
         window_seconds: WINDOW_SECONDS,
@@ -751,19 +792,19 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
         .expect("the stricter policy must be stored");
     omnion_api::reliability_middleware::reload_from_store(&state).await;
 
-    // `reload_from_store` re-reads the WHOLE table, so a policy an earlier test left behind —
-    // or one a sibling writer's walk put in the same database — is in the list this request is
-    // decided by. That is correct behaviour for the product (a save must reach the running
-    // process) and it is exactly why this walk has to assert WHICH policy won rather than that
-    // *something* was refused. Without the check, a broader stale policy silently outranks the
-    // strict one and the failure reads as "the save did not take effect" when the save worked.
+    // The resolution is asserted against the SUBJECT THE REQUEST ACTUALLY CARRIES, and that
+    // subject has a user in it: these two requests go out signed in, so the address scope is only
+    // half of what they are subject to. Asserting against the address alone lets the shipped
+    // `authenticated API` default (`user`, 600/50) win the check, and the failure then reads as
+    // "the save did not take effect" when the save worked and a user-scoped row is simply more
+    // specific than an address-scoped one — the same rule the unit test pins.
     let installed = omnion_api::reliability_middleware::installed()
         .expect("the layer is installed — this test installed it")
         .current();
     let winning = omnion_reliability::limits::pick(
         &installed,
         &omnion_reliability::limits::Subject {
-            user_id: None,
+            user_id: Some(user_id),
             organization_id: None,
             ip: Some("198.51.100.108".parse().expect("the literal address parses")),
             route: None,
@@ -810,10 +851,20 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     // And the dry-run agrees, because it reads the same list.
     let mut ask = json_post(
         "/api/v1/reliability/rate-limits/evaluate",
-        json!({ "scope": "ip", "ip": "198.51.100.108" }),
+        json!({ "scope": "user", "user_id": user_id }),
     );
     ask.headers_mut().insert(header::COOKIE, cookie_header(&token));
-    let evaluate = call_from(&state, ask, "127.0.0.1").await;
+    // The dry-run goes out as a DIFFERENT subject on purpose: the two requests above left this
+    // one over its own budget, and a dry-run sent by a caller the limiter is refusing would
+    // itself be refused — correctly, and for the same reason the caller is being refused. That is
+    // not a defect to work around, it is the property being proved, so the tool is asked by an
+    // operator who is not currently over budget, which is the situation the screen is for.
+    let evaluate = call_from(&state, ask, "198.51.100.129").await;
+    assert_eq!(
+        evaluate.status,
+        axum::http::StatusCode::OK,
+        "the dry-run must be answerable by an operator who is not themselves over budget"
+    );
     assert_eq!(
         evaluate.body["policy"]["id"],
         Value::String(saved.id.expect("a stored policy has an id").to_string()),

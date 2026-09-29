@@ -6332,17 +6332,46 @@ export interface ReliabilityEvaluateInput {
  * - `Allowed` / `Limited` — the two answers that carry a real measurement, and the only two the
  *   middleware is allowed to write `X-RateLimit-*` headers for.
  */
-export type ReliabilityVerdict =
-  | { Allowed: { policy_id: string | null; scope: string; remaining: number; limit: number } }
-  | { Limited: { policy_id: string | null; scope: string; retry_after: number; limit: number; ceiling: number } }
-  | { Unlimited: Record<string, never> }
-  | { Uncounted: { scope: string } }
-  | { RefusedUncounted: { scope: string } };
+/**
+ * The dry-run's verdict, as the API's `Verdict` actually serialises.
+ *
+ * It is `#[serde(tag = "decision", rename_all = "snake_case")]` — internally tagged, so every
+ * variant carries a `decision` KEY with the variant name in snake_case, and the variant's own
+ * fields sit alongside it. A client written against serde's *external* tagging (the variant as
+ * the key) parses nothing here, and nothing about the response looks wrong: every field is
+ * simply `undefined`.
+ *
+ * It is an enum rather than a flat answer because the five shapes are genuinely different and a
+ * client-side "allowed + remaining" collapses the two that matter:
+ *
+ * - `unlimited` — no policy applies. The request proceeds and there is **no budget number at
+ *   all**; rendering it as "0 remaining" sends an operator hunting for a policy that does not
+ *   exist.
+ * - `uncounted` — a policy applies, the counter was unreadable, the deployment fails **open**.
+ *   The request proceeds and nothing was counted, so `remaining` is absent on purpose: a number
+ *   here would be a measurement nobody took.
+ * - `refused_uncounted` — the same outage failing **closed**. Refused, with no `retry_after`,
+ *   because a wait the platform cannot compute is not a promise.
+ * - `allowed` / `limited` — the two answers that carry a real measurement, and the only two the
+ *   middleware is allowed to write `X-RateLimit-*` headers for.
+ */
+export interface ReliabilityVerdictBase {
+  decision: "allowed" | "limited" | "unlimited" | "uncounted" | "refused_uncounted";
+  policy_id: string | null;
+  /** Which scope answered, or `null` when no policy matched at all. */
+  scope: string | null;
+  /** Requests left in the window. Present only on the two answers with a real measurement. */
+  remaining?: number;
+  limit?: number;
+  ceiling?: number;
+  retry_after?: number;
+}
+
+export type ReliabilityVerdict = ReliabilityVerdictBase;
 
 /** The variant name, which is what the screen renders and what a test asserts on. */
 export function reliabilityVerdictKind(verdict: ReliabilityVerdict): string {
-  const [kind] = Object.keys(verdict);
-  return kind ?? "Unknown";
+  return verdict?.decision ?? "unknown";
 }
 
 export interface ReliabilityEvaluated {

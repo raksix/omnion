@@ -94,26 +94,29 @@ function humanScope(scope: string): string {
   return scope.charAt(0).toUpperCase() + scope.slice(1);
 }
 
-/** The reason the screen shows for a verdict, in the operator's language rather than the enum's. */
+/**
+ * The reason the screen shows for a verdict, in the operator's language rather than the enum's.
+ *
+ * Reads the fields directly rather than narrowing on the variant, because the API tags the
+ * variant as a `decision` KEY with the fields alongside it — a client written for serde's
+ * external tagging would find every field `undefined` and print a confident sentence about
+ * nothing.
+ */
 function verdictSentence(result: ReliabilityEvaluated): string {
-  const kind = reliabilityVerdictKind(result.verdict);
-  if (kind === "Allowed") {
-    const v = (result.verdict as { Allowed: { remaining: number; limit: number } }).Allowed;
-    return `Allowed — ${v.remaining} of ${v.limit} left in this window.`;
+  const v = result.verdict;
+  if (v.decision === "allowed") {
+    return `Allowed — ${v.remaining ?? 0} of ${v.limit ?? 0} left in this window.`;
   }
-  if (kind === "Limited") {
-    const v = (result.verdict as { Limited: { retry_after: number; ceiling: number } }).Limited;
-    return `Refused — over the ${v.ceiling}-request ceiling. Retry in ${v.retry_after}s.`;
+  if (v.decision === "limited") {
+    return `Refused — over the ${v.ceiling ?? 0}-request ceiling. Retry in ${v.retry_after ?? 0}s.`;
   }
-  if (kind === "Unlimited") {
+  if (v.decision === "unlimited") {
     return "Allowed — no policy applies, so there is no budget to spend. This is not a zero budget.";
   }
-  if (kind === "Uncounted") {
-    const v = (result.verdict as { Uncounted: { scope: string } }).Uncounted;
-    return `Allowed but NOT counted — the ${v.scope} policy applies, the counter was unreadable, and this deployment fails open. No budget was spent.`;
+  if (v.decision === "uncounted") {
+    return `Allowed but NOT counted — the ${v.scope ?? "matching"} policy applies, the counter was unreadable, and this deployment fails open. No budget was spent.`;
   }
-  const v = (result.verdict as { RefusedUncounted: { scope: string } }).RefusedUncounted;
-  return `Refused because the counter was unreadable and this deployment fails closed. No retry time is published — the platform cannot compute one.`;
+  return "Refused because the counter was unreadable and this deployment fails closed. No retry time is published — the platform cannot compute one.";
 }
 
 /** One refusal rollup, and the maximum in the table, so the bars are scaled against each other. */
@@ -402,7 +405,7 @@ function DryRun({ vocabulary }: { vocabulary: string[] }) {
   const label = "block text-[12px] font-medium text-muted";
   const kind = result ? reliabilityVerdictKind(result.verdict) : null;
   const tone =
-    kind === "Allowed" || kind === "Unlimited" || kind === "Uncounted"
+    kind === "allowed" || kind === "unlimited" || kind === "uncounted"
       ? "border-emerald-500/40 bg-emerald-500/5"
       : "border-amber-500/40 bg-amber-500/5";
 
