@@ -1111,6 +1111,14 @@ export type Credential = {
   owner_user_id: string | null;
   created_at: string;
   updated_at: string;
+  /**
+   * Set only on a create whose secret could not be written, and never on a read.
+   *
+   * The credential exists; the secret did not attach. The panel says so on the row it is
+   * about, because a reader who pasted a key and was redirected to a detail screen with no
+   * mention of it will assume the key is there.
+   */
+  secret_write_warning?: string | null;
 };
 
 /** The credential list filters. */

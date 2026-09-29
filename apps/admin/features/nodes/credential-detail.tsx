@@ -87,6 +87,10 @@ export function CredentialDetail({ id }: { id: string }) {
   const [replacing, setReplacing] = useState(false);
   const [secretDraft, setSecretDraft] = useState<Record<string, string>>({});
   const [blocked, setBlocked] = useState<string | null>(null);
+  // `?warning=1` is set by the create form when a secret was pasted but could not be attached.
+  // The API says so in the create response; the panel carries it here so the reader sees it on
+  // the row it concerns instead of as a toast about a screen they have already left.
+  const [secretWarning, setSecretWarning] = useState<string | null>(null);
 
   // The credential and its usage are two reads, and they are asked for together because the
   // screen shows both at once — a usage panel that is always empty until you scroll is a
@@ -99,6 +103,16 @@ export function CredentialDetail({ id }: { id: string }) {
       if (!alive) return;
       setCredential(row);
       setError(null);
+      // The warning is a property of the create, not of the row, so it is read from the URL
+      // once and then cleared — a reload should not keep repeating a message about a write
+      // that already happened.
+      if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("warning") === "1") {
+        setSecretWarning(
+          "The credential was created, but its secret was not stored — this build has no " +
+            "encrypted secret store yet. Use Replace secret once it does.",
+        );
+        window.history.replaceState({}, "", window.location.pathname);
+      }
       const [type, who] = await Promise.allSettled([
         fetchCredentialType(row.type),
         fetchCredentialUsage(row.id),
@@ -300,6 +314,17 @@ export function CredentialDetail({ id }: { id: string }) {
           className="rounded-xl border border-line bg-quiet-soft/60 px-4 py-3 text-[13px] text-ink"
         >
           {notice}
+        </p>
+      ) : null}
+
+      {secretWarning ? (
+        <p
+          role="status"
+          data-credential-secret-warning
+          className="flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-[13px] text-amber-800 dark:text-amber-200"
+        >
+          <TriangleAlert size={15} className="mt-0.5 shrink-0" />
+          <span>{secretWarning}</span>
         </p>
       ) : null}
 

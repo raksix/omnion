@@ -162,6 +162,9 @@ pub struct CredentialBody {
     pub created_at: OffsetDateTime,
     /// Last write instant.
     pub updated_at: OffsetDateTime,
+    /// Set only on a create whose secrets could not be written, so the panel can say so on
+    /// the row it is about rather than in a toast about a screen the reader has left.
+    pub secret_write_warning: Option<String>,
 }
 
 impl CredentialBody {
@@ -206,6 +209,7 @@ impl CredentialBody {
             owner_user_id: credential.owner_user_id,
             created_at: credential.created_at,
             updated_at: credential.updated_at,
+            secret_write_warning: None,
         }
     }
 
@@ -593,12 +597,21 @@ pub async fn create_credential(
 
     // A secret that arrived with the create is written through the store's one write path. The
     // handle is what comes back; the value never touches this schema.
-    let credential = if body.secrets.is_empty() {
-        credential
+    //
+    // A secret store that is not wired is NOT a failed create. The credential is a real row
+    // with a name, a key and a type; the secret is an attachment somebody can add afterwards
+    // from the detail screen, and the REQ's own rule is that a save is allowed without one
+    // ("Save (allowed without a passing test, marked 'not verified')"). Refusing the whole
+    // create over an attachment makes the form unusable until REQ-125 lands — and the first
+    // run of `scripts/qa/credential-screens.cjs` found exactly that: the create form could not
+    // save at all, because pasting a key was the normal thing to do.
+    let secret_warning = if body.secrets.is_empty() {
+        None
     } else {
         write_secrets(&state, &current, &credential, &body.secrets)
-            .await?
-            .unwrap_or(credential)
+            .await
+            .err()
+            .map(|failure| failure.message().to_string())
     };
 
     omnion_audit::record(
@@ -629,10 +642,11 @@ pub async fn create_credential(
     .await
     .ok();
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CredentialBody::describe(&credential)),
-    ))
+    let mut body_out = CredentialBody::describe(&credential);
+    if let Some(warning) = secret_warning {
+        body_out.secret_write_warning = Some(warning);
+    }
+    Ok((StatusCode::CREATED, Json(body_out)))
 }
 
 /// `GET /api/v1/credentials/{id}` — one credential, masked.
@@ -1430,6 +1444,15 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn a_body_starts_with_no_warning_because_a_warning_is_a_property_of_the_write() {
+        // `secret_write_warning` is not a state a row has; it is something a *create* reports
+        // once. Building the body from a stored row must therefore leave it empty, or a plain
+        // read would carry a warning about a write that happened in a previous request.
+        let body = CredentialBody::describe(&credential_stub("untested"));
+        assert!(body.secret_write_warning.is_none());
     }
 
     #[test]

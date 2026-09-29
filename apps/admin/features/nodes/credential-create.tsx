@@ -178,7 +178,15 @@ export function CredentialCreate() {
     setError(null);
     try {
       const created = await createCredential(payload);
-      router.push(`/workflows/credentials/${created.id}`);
+      // A secret that could not be attached is not a failed create — the row is real and the
+      // reader is about to be sent to it. The warning rides along so the detail screen can say
+      // it on that row; silently dropping it is how somebody ends up debugging a node that
+      // cannot authenticate for want of a key they are certain they pasted.
+      router.push(
+        `/workflows/credentials/${created.id}${
+          created.secret_write_warning ? "?warning=1" : ""
+        }`,
+      );
     } catch (cause) {
       const failure = cause as ApiError;
       // The API names the field it refused; put the message under that input rather than in a
