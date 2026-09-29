@@ -806,6 +806,95 @@ mod tests {
         }
     }
 
+    /// A group subscription has to reach the names it is supposed to cover.
+    ///
+    /// This is the test that would have caught the seventeen missing rows at the moment they
+    /// were written, rather than whenever somebody next ran the integration suite. It is a unit
+    /// test on purpose: the integration gate in `apps/api/tests/events.rs` needs a database and
+    /// a compiled API binary, so on a branch where the per-tick command is
+    /// `cargo test -p <the crate you touched> --quiet` it is exactly the gate that never runs,
+    /// and a missing catalogue row is invisible until a webhook endpoint quietly receives
+    /// nothing.
+    ///
+    /// The names are read out of this branch's own emitters rather than written out here — a
+    /// second hand-typed list would drift from the table it is supposed to check, which is the
+    /// bug this test exists to catch. `env!("CARGO_MANIFEST_DIR")` is `crates/events`, so the
+    /// routes live two levels up under `apps/api/src/routes`.
+    #[test]
+    fn the_group_wildcards_reach_the_names_this_branch_emits() {
+        // One representative per group, chosen because the emitter is on THIS branch: an
+        // event name from a module that is not shipped here would prove nothing.
+        const GROUPS: &[(&str, &str, &str)] = &[
+            (
+                "organization",
+                "tenancy",
+                "apps/api/src/routes/tenancy_members.rs",
+            ),
+            (
+                "promotion",
+                "environments",
+                "apps/api/src/routes/promotions.rs",
+            ),
+            (
+                "environment",
+                "environments",
+                "apps/api/src/routes/environments.rs",
+            ),
+        ];
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("the workspace root is two levels above crates/events");
+
+        let mut read = 0_usize;
+        for (group, area, relative) in GROUPS {
+            let path = workspace.join(relative);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
+
+            let emitted: Vec<&str> = text
+                .lines()
+                .filter_map(|line| {
+                    let rest = line.split("NewEvent::new(\"").nth(1)?;
+                    let name = rest.split('"').next()?;
+                    // A fixture asserting the validator refuses a name is not an emitter.
+                    (name.starts_with(*group)
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.'))
+                    .then_some(name)
+                })
+                .collect();
+
+            read += emitted.len();
+            assert!(
+                !emitted.is_empty(),
+                "{} emits no {group}.* name, so this test proves nothing about {group}.*",
+                path.display()
+            );
+            for name in emitted {
+                assert!(
+                    is_known(name),
+                    "{name} is emitted by {} but the catalogue does not list it, so a \
+                     {group}.* subscription cannot reach it",
+                    path.display()
+                );
+                assert_eq!(
+                    lookup(name).map(|entry| entry.area),
+                    Some(*area),
+                    "{name} is listed under the wrong area; {group}.* would expand against the \
+                     area grouping the panel shows"
+                );
+            }
+        }
+
+        assert!(
+            read >= 6,
+            "the walk read {read} emissions; a walk that sees almost nothing proves nothing"
+        );
+    }
+
     #[test]
     fn the_registry_covers_every_module_that_emits() {
         // A floor rather than an exact count: the table grows, the test only fails when a
