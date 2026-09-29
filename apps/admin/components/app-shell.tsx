@@ -35,8 +35,10 @@ import {
   Timer,
   UserCog,
   UsersRound,
+  Webhook,
   X,
 } from "lucide-react";
+
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -63,6 +65,10 @@ const NAV = [
   // platform think happened" and "who was told" — and an operator chasing a missing webhook
   // needs both on the same shelf.
   { href: "/events", label: "Events", icon: Activity },
+  // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
+  // rather than under Settings because the two are the same investigation from both ends:
+  // the feed says what happened, this says who was told and whether they got it.
+  { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },

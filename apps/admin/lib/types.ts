@@ -1433,6 +1433,107 @@ export type CatalogueEntry = {
   deliveries_24h: number;
 };
 
+/** ---------------------------------------------------------------------------------------------
+ * The webhook endpoints and their delivery history (REQ-016, slice 2).
+ * ------------------------------------------------------------------------------------------- */
+
+/** One endpoint as the API describes it. `secret` is present exactly once, at creation. */
+export type WebhookEndpoint = {
+  id: string;
+  organization_id: string;
+  name: string;
+  url: string;
+  /** Expanded subscription list, including every name a group wildcard covers. */
+  events: string[];
+  enabled: boolean;
+  /** Shown only in the creation response. Every other read omits the key entirely. */
+  secret?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Every endpoint this account may see. */
+export type WebhookList = { webhooks: WebhookEndpoint[] };
+
+/** What a test delivery queued. */
+export type WebhookTestReport = { event_id: number; deliveries: number };
+
+/** A rotation's answer: the endpoint, and the one secret it will ever show again. */
+export type WebhookRotation = WebhookEndpoint & { secret: string };
+
+/** One queued delivery, as the history read describes it. */
+export type WebhookDelivery = {
+  id: string;
+  event_id: number;
+  event_name: string;
+  status: "pending" | "delivered" | "failed";
+  attempts: number;
+  max_attempts: number;
+  next_attempt_at: string;
+  response_status: number | null;
+  error: string | null;
+  delivered_at: string | null;
+  created_at: string;
+  /** What asked for this row: the bus, an operator's test, or a forced replay. */
+  trigger: "event" | "test" | "replay";
+  /** How long the receiver took. `null` until the row has run. */
+  duration_ms: number | null;
+  redeliver_count: number;
+  replayed_at: string | null;
+};
+
+/** The keyset one page hands to the next. Both halves, or the API refuses it. */
+export type WebhookDeliveryCursor = { at: string; id: string };
+
+/** One page of a delivery history. */
+export type WebhookDeliveryPage = {
+  deliveries: WebhookDelivery[];
+  /** How many rows the filter matches, so the table can say "25 of 340". */
+  total: number;
+  has_more: boolean;
+  next_cursor: WebhookDeliveryCursor | null;
+};
+
+/** What narrows a delivery history. Set fields combine with AND; `status` and `name` are OR. */
+export type WebhookDeliveryFilters = {
+  /** Statuses, any of which may match. */
+  status?: string[];
+  /** Event names, any of which may match. */
+  name?: string[];
+  from?: string;
+  to?: string;
+  /** Substring of the delivery id or the event name. */
+  q?: string;
+  cursor_at?: string;
+  cursor_id?: string;
+  limit?: number;
+};
+
+/** One row of a bulk redelivery that did not move, and why. */
+export type WebhookRedeliverSkip = { delivery_id: string; code: string; message: string };
+
+/** A bulk redelivery's answer: what moved, and what did not with a reason each. */
+export type WebhookRedeliverBatch = { queued: number; skipped: WebhookRedeliverSkip[] };
+
+/** What an endpoint's receiver has been doing. */
+export type WebhookStats = {
+  window_hours: number;
+  /** Settled **traffic** rows the receiver accepted; test rows are excluded. */
+  delivered: number;
+  /** Settled traffic rows that ran out of attempts; test rows are excluded. */
+  failed: number;
+  /** Rows still waiting, whatever their age. */
+  pending: number;
+  /** Every row in the window, tests included. */
+  total: number;
+  /** Rows an operator asked for by hand, reported apart from the rate. */
+  tests: number;
+  /** Share of settled traffic rows accepted; `null` when none settled. */
+  success_rate: number | null;
+  /** 95th percentile receiver duration; `null` when nothing ran. */
+  p95_duration_ms: number | null;
+};
+
 /** The whole catalogue, grouped by area for the picker. */
 export type EventCatalogue = {
   areas: string[];
@@ -1440,4 +1541,50 @@ export type EventCatalogue = {
   live_count: number;
   reserved_count: number;
   max_subscriptions: number;
+};
+
+/** One sweep of the event bus's retention, as the run log records it. */
+export type RetentionRun = {
+  id: string;
+  /** `null` is the platform's own events. */
+  organization_id: string | null;
+  started_at: string;
+  finished_at: string | null;
+  /** The window that was applied, in days. */
+  window_days: number;
+  /** The instant older rows were swept. */
+  cutoff: string;
+  events_deleted: number;
+  /** Delivery rows removed with their events. */
+  deliveries_deleted: number;
+  error: string | null;
+};
+
+/**
+ * How much history this organization keeps, and the last sweeps that ran.
+ *
+ * `due` is deliberately the same predicate the sweeper uses — an event a receiver is still owed
+ * is history, not due — so a screen that says "12 due" is never contradicted by a sweep that
+ * removes nothing.
+ */
+export type RetentionStatus = {
+  organization_id: string | null;
+  window_days: number;
+  /** Shortest window the API accepts, so the input can be bounded by the server's own rule. */
+  min_days: number;
+  max_days: number;
+  events: number;
+  due: number;
+  last_run: RetentionRun | null;
+  recent_runs: RetentionRun[];
+};
+
+/** What a manual sweep removed. */
+export type SweepResult = {
+  organization_id: string | null;
+  window_days: number;
+  cutoff: string;
+  events_deleted: number;
+  deliveries_deleted: number;
+  run_id: string;
 };

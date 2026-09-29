@@ -1,3 +1,65 @@
+
+## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
+
+build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
+
+Slice 1 gave the bus a read side. This is the half an operator actually reaches for: connect a
+receiver, watch what it was sent, send it again, and find out whether it is still working.
+
+**0052_webhook_delivery_ops.sql**, four routes on `/webhooks/{id}` (`deliveries`, `redeliver`,
+`redeliver` batch, `stats`, `secret/rotate`), and four screens: `/webhooks`, `/webhooks/new`,
+`/webhooks/[id]` (Overview / Deliveries / Stats) and the edit form.
+
+**Six decisions, each a shortcut that produces a plausible wrong answer.** The **redelivery
+resets the row** rather than inserting a second one — the `(endpoint_id, event_id)` unique index
+would refuse the insert anyway, and it should: two rows for one fact means the receiver cannot
+tell a replay from a duplicate, and it is also what makes `attempts` mean "attempts in this
+round" instead of "attempts ever", which is the number compared against `max_attempts`. A
+**pending row is refused**, and its checkbox is disabled rather than offered: the runner holds
+that row's lease, so a reset would hand it to the next claim while the attempt is in flight —
+the one place this operation could double-send. **The three refusals carry three codes**, because
+"wait a moment" and "fix your receiver instead" are different advice, and the refusal travels
+*inside* `EventsError` (as a `409`, not a `400` — the row's state is the problem, not the
+request) so a store error stays an error instead of being reported as "no such delivery". The
+**success rate counts settled traffic only**: pending in the denominator would read 0% for a
+queue whose every delivery is about to succeed, and a test row in it would let an operator make
+a broken receiver look healthy by pressing the button — so a history that is only probes answers
+`null` and the screen prints "No traffic" with the excluded count underneath. The **cursor is
+`(created_at, id)`**, because the read sorts by both and a cursor on one column of a two-column
+order repeats rows whenever two deliveries share a timestamp, which is normal when the bus fans
+out; half a cursor is refused by name because a null id there is a `500` on a request the panel
+builds itself. **Rotation is a separate route from `PATCH`**, because it is the one write whose
+answer carries the secret — a receiver cannot be reconfigured with a value it never saw.
+
+**Two defects the walks found, both of the "the column exists" kind.** Migration 0052 added
+`trigger` and nothing wrote it, so every test delivery was stamped `event` and the stats read was
+counting a button press as the platform delivering something; the column is now stamped at the
+one place a test is queued. And `redeliver` originally reported its count through a follow-up
+read, which can observe a different value after somebody else pressed the same button — it now
+returns the count from the update itself.
+
+**The rotation is proved against a receiver, not a status code.** The walk creates the endpoint
+with an operator-supplied secret so it holds both values, delivers once, rotates, delivers again,
+and asserts the second delivery verifies against the new secret and **fails** against the old
+one. The receiver is `infra/mocks/webhook-receiver.mjs`, started by the depth pass and killed in
+its `finally`, so a throw mid-pass does not leave a port bound.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **45** (42 before, +3)
+- `cargo test -p omnion-api --test events` → **9/9** (6 before, +3) against real Postgres
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `cdba36e` (the store and the migration), `b826899` (the routes and the walks),
+  `17d87cd` (the screens and the depth pass)
+
+**Not done, and not claimed: no browser pass.** A sibling writer held the QA slot for the whole
+window at load 18–20, so `runWebhooksDepth` is written and **unrun** and every acceptance box
+that names a screen stays unticked with the reason written into the box. The fast gates ran
+instead and the pass is queued.
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with no `QA_STACK` override. If it is
+green, tick the screen boxes and close slice 2. Then slice 3, which is the retention sweeper
+plus the delivery-failed notification REQ-021 turns into an operator alert.
 ## 2026-09-28 — REQ-063 slice 2 (4/4) · the inline preview frame, and why "never publishes" is a route shape
 
 - **What shipped.** The API integration run that last tick could not claim is **green**, and the
@@ -4183,6 +4245,95 @@ close slice 1; if the pass finds anything, fix it in the same tick — the depth
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
+
+---
+
+## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
+
+**What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
+shows the last page, the API keeps a keyset cursor over every row, the automation matcher
+replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
+`/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
+question (what will be forgotten and when) rather than a fourth card inside the Feed.
+
+Migration `0123_event_retention.sql` puts the window on the **organization**
+(`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
+decisions carry it, and each is a place the obvious shortcut is wrong:
+
+* **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
+  and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
+  The receiver's only symptom is a delivery that never arrives with nothing in the platform
+  saying why. The store's predicate selects events with **no delivery at all** or with **only
+  settled** ones; a `pending` row pins its event for ever. An event nobody was ever queued
+  for is the bulk of the bus, which is exactly the part worth deleting.
+* **The window is a column on the organization, not on the event.** "30 days" is a policy an
+  operator sets once and then changes; storing it per event would mean a sweeper that has to
+  *compare* the two to decide what is old. The cutoff is computed per organization inside the
+  same statement, and an organization that has never set one falls back to the platform
+  default rather than to `null` — because `null` would mean "keep for ever", which is a
+  decision nobody made deliberately.
+* **A run that deletes nothing is still written to the log.** "The last sweep was at 03:00 and
+  it found nothing" is the sentence an operator needs on the day they ask why a March event is
+  still in the feed, and a table that only records activity cannot answer it on the day
+  nothing happened.
+
+**A window on the organization is also a permission split.** Reading the window, the counts and
+the last sweep rides `events.read` — describing what will be removed is reading the bus.
+**Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
+destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
+
+**`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
+literal segment registered after a parameterised sibling is read as an event id, and a request
+that is perfectly valid answers `404 no such event`.
+
+**A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
+comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
+in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
+would be quoting a number nobody can reconcile with the run log.
+
+**The panel refuses the range before the server does, because the bounds are the server's.**
+`min_days`/`max_days` arrive in the read rather than being written into the component, because
+a range written in two places is a range that will disagree, and the input that disagrees with
+the server is the one that gets a `400` nobody can act on. Out of range *disables* Save rather
+than offering a failure. And when the server does refuse, its own sentence is shown — it names
+the field and the range, and replacing that with "invalid value" throws away the only sentence
+that says which bound was crossed.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **47** (45 + 2)
+- `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
+  one-day window set through the same `PATCH` an operator uses
+- `cargo test -p omnion-api --test events` → **9/9** (the sweep must not disturb the existing
+  delivery history)
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
+  `runRetentionDepth`)
+
+**Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
+PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
+$2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
+a named argument has to land on `int`, and the error names a function that plainly exists, so
+it reads like a migration fault rather than an argument type. The second is an **assertion
+written in the same breath as the code that broke it**: the walk set the window through a
+`PATCH`, that `PATCH` recorded `webhook.retention.changed` on the same bus, and the count
+assertion still said "two aged events" while the bus honestly held three. It had passed for
+the wrong reason only because nobody had run it since the audit event was added. Counting is
+not "count the rows I set up" — a number an operator reads is a number the platform has to be
+able to explain, including the parts nobody staged.
+
+**Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
+whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
+mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
+**unrun**, so every acceptance box naming a screen stays unticked with the reason written into
+the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
+a probe that selects a hook the screen does not carry is a probe that cannot fail.
+
+**Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
+slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
+(REQ-012/013/014 — the security, backup and system-health centres).
 
 ## 2026-09-29 · REQ-064 slice 1, the pass that could reach it — `a412407`, `3177a5a`, `5269ff3`
 

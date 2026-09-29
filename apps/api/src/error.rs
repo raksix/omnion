@@ -167,6 +167,28 @@ impl From<EventsError> for ApiError {
             EventsError::Client(message) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
             }
+            // A refused redelivery is a `409`, not a `400`: the request was well formed and the
+            // row's *state* is what the operator has to change first (wait for the pending
+            // attempt, or stop forcing a delivery the receiver already refused ten times). A
+            // `400` would tell them to fix their request, which is not the problem.
+            EventsError::RedeliveryRefused { code, message } => {
+                Self::new(StatusCode::CONFLICT, code, message)
+            }
+            // A retention window outside the range is a `400` that names the field: the request
+            // is what has to change. Clamping instead would answer `200` with a number the
+            // operator did not choose, and a screen that shows the clamped value has no way to
+            // know it was not what was asked for.
+            EventsError::InvalidRetention(message) => {
+                Self::bad_request("invalid_retention_window", message)
+            }
+            // An organization that does not exist is a `404`, not a `500`: the update matched
+            // no row, which is a fact about the request rather than about the database, and a
+            // caller that cannot tell the two apart retries a write that can never succeed.
+            EventsError::OrganizationNotFound(_) => Self::new(
+                StatusCode::NOT_FOUND,
+                "organization_not_found",
+                "no organization carries that id",
+            ),
         }
     }
 }
