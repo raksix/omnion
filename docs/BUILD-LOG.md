@@ -4539,3 +4539,95 @@ Then criterion 5 (the real-event listener) and criterion 8 (Table-mode parity).
 `bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
 slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
 (REQ-012/013/014 — the security, backup and system-health centres).
+
+## 2026-09-29 · wave 3, slice 3 · REQ-004 criterion 5 — *Listen for a real event*
+
+**What.** A one-shot listener armed **for a node of a graph**, with a fifteen-minute window
+and a token that exists only in the arming's response. `0125_workflow_test_listeners.sql`,
+`crates/workflows/src/test_listener.rs`, three routes in
+`apps/api/src/routes/workflow_listener.rs`, the matcher's second capture, the builder's
+*Test event* panel, 23 panel tests and one DB walk.
+
+**The design call, which is the whole tick.** REQ-003 already has a one-shot listener
+(`automation_test_events`, `POST /automations/{id}/listen`), and reusing it would have been
+the smaller change. It cannot answer this criterion without becoming a different thing,
+for three reasons that are *shape* differences rather than missing fields:
+
+1. it is **rule-shaped** — a rule-level capture shows what arrived on the bus, and "what
+   would *this* node receive" is the payload its **upstream** produced. That is a different
+   question, and answering it here would show a payload the node never gets;
+2. it has **no expiry** — an author who arms a listener, closes the laptop and returns
+   tomorrow finds a day-old row that captures an event nobody is watching;
+3. it has **no token** — "leaving no stray token" is half the criterion, and a row with no
+   token cannot answer it.
+
+**The expiry is the half that is easy to get wrong and nothing on the screen would show
+it.** "Armed" reads most naturally as "not yet consumed", and a matcher filtering on
+`consumed_at is null` alone fills a row whose window closed and reports a capture for an
+event nobody watched. `listener_is_live` is the single definition — both clauses, boundary
+closed on both sides — and it is asserted from three directions because the predicate is
+hand-written in three places (the partial unique index, the `UPDATE`, the sweeper). The
+**read** never filters by state either: an expired row that vanishes is indistinguishable
+from one that was never armed, and only the second is actionable.
+
+**The walk is shaped so each clause fails loudly.** "Within one matcher tick" is *exactly
+one* `matcher::drain` between the arm and the capture — a second drain would still pass a
+`captured_at` check, and a listener needing two ticks is a broken one. "No stray token" is
+asserted against **the matcher's own predicate**, not a row count: a real event is driven
+through the real matcher at an expired row, and then the walk asks whether a live-listener
+query still sees it. Only that separates "the row was deleted" from "the matcher cannot see
+it", and the second is the criterion.
+
+**Three of the walk's own first drafts were wrong — the test, not the code, each time.**
+
+1. It pinned `expires_in_seconds` to 900 and the server sent 899, because the number is
+   `whole_seconds()` of a window that began microseconds before the read. Pinning it asserts
+   a **rounding rule** rather than the window. The window is the **gap between the two
+   timestamps**, and that is what the walk asserts now.
+2. It expired a row by back-dating `expires_at`, and **the migration's own
+   `expires_at > created_at` constraint refused it.** A real sweeper would hit the same
+   wall — a constraint written for correctness is also a constraint on how time may be
+   simulated — so the walk moves both columns, which is what a clock crossing the boundary
+   actually looks like to the database.
+3. It expected 404 for another tenant's rule and got 403 `cross_organization`. A 404 would
+   claim the id is unknown, which this API does not do on any scoped surface: the scope
+   check runs *after* the rule is found. The walk now asserts the status the platform
+   actually guarantees **and** that the refusal left no row behind — an arm that "failed"
+   but wrote one is the failure that paragraph exists to prevent.
+
+A fourth defect was the walk's own doing and is worth the same weight: **the timestamps I
+first sent were the default serde shape for `OffsetDateTime`, a ten-element tuple array.**
+Every other timestamp on this API is rfc3339, and the panel feeds `expires_at` to
+`Date.parse`. A panel that shows "NaN left" is indistinguishable from one that never
+ticked. `#[serde(with = "time::serde::rfc3339")]` is not decoration here; it is the wire
+contract.
+
+**Proof.**
+
+- `cargo test -p omnion-workflows --lib` → **115/115** (109 before; 6 new — the live
+  predicate from both sides of the boundary, the closed boundary, and the token's hash)
+- `cargo test -p omnion-api --test workflows` → **16/16** (15 before; the new walk included)
+  against a **freshly created** `omnion_w3_fresh`, `--test-threads=1`
+- `apps/admin` suite → **119/119** (96 before; 23 new), `tsc --noEmit` clean
+- `bun build scripts/qa/walkthrough.cjs --external playwright-core` → bundles
+
+**The disk, because it cost most of the tick and will cost the next one too.** `/dev/shm`
+hit 99% and `cargo build` died with `ENOSPC` writing `full.rmeta`, which presents as a
+compiler fault. The tmpfs is shared by eight waves' `CARGO_TARGET_DIR`s; reclaiming only my
+own freed 2.9G, and the build moved to `/mnt/apopic/omnion-w3/.w3-target` (real disk).
+Deleting `apps/admin/.next` (1.4G, rebuildable) then broke `tsc --noEmit` with a
+`validator.ts` syntax error — **the error was stale build output, not code.** `/mnt/apopic`
+is at 99% with 942M free and the box is running five writers; the next tick should assume
+it will be worse.
+
+**Browser pass: not run, and the reason is the slot, not the code.** A w3 pass started at
+04:25 was still alive and *writing* at 07:06 (it was in the IAM section), holding
+`/tmp/omnion-qa-slot`. It predates this work — it recorded **zero** `workflow-builder`
+steps — so it cannot prove this screen either way, and killing a live pass of my own stack
+to take its slot would trade one unverifiable result for another. The probe is written,
+bundles, and is in the routes path; the next tick runs it.
+
+**Next.** (a) the browser pass for criterion 5's click half, reading `listener` with
+`captureRendered`, `payloadRendered`, `windowSeconds: 900` and `tokenReturnedOnRead:
+false`; (b) the browser pass for REQ-016's retention tab and REQ-010's, which have been
+blocked on the same slot for two ticks; (c) criterion 8, Table-mode parity.
