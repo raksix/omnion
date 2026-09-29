@@ -4460,3 +4460,48 @@ close slice 1; if the pass finds anything, fix it in the same tick — the depth
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
+## 2026-09-29 · Wave 5 · tick 19 — merging `main` without losing either side
+
+Six ticks deferred the browser gate; the one thing genuinely owed was a merge, and the merge
+turned out to be the harder half of it. `main` had moved eleven commits (REQ-016 slices 1
+and 2: the event console, the webhook endpoints and their delivery history) into a branch
+that had itself appended six CDN routes to the same four files.
+
+**Five conflicts, and none of them was a real disagreement — every one was two writers adding
+to the same place.** The resolution that works here is a union with one correction, and the
+correction is the part worth writing down.
+
+* **The `<<<<<<<` / `=======` / `>>>>>>>` block is not always the whole story.** Git wrote
+  2-way markers here, not 3-way, so the text *above* the block and the text *below* it are
+  shared: an `import type {` opened the list and `} from "./types";` closed it; a `/**` opened
+  a doc comment and `return steps; }` closed the function. A resolver that emits "ours, theirs"
+  and leaves the shared envelope alone produces a file that *looks* merged and does not parse.
+* **Two shapes need opposite answers.** `lib/api.ts` and `lib/types.ts` had blocks where both
+  sides were balanced (two halves of one import list) — a plain union. `walkthrough.cjs` had
+  a block where both sides ended *mid-function* and shared the closer — each side needs its
+  own copy of the closer, and the second side additionally needs the `/**` re-opened because
+  it starts inside the comment the first side already closed.
+* **The tell is brace balance plus the presence of a shared continuation**, not the marker
+  itself. `+0/+0` with no continuation is a union; `+1/+1` with a continuation is
+  truncated-both; `+1/+1` with no continuation is a union whose sides are whole functions.
+* **The first two attempts guessed and the compiler caught it.** Consuming the shared tail
+  ate `} from "./types";` and produced four parse errors on line 33 of a 5,400-line file;
+  splicing the sides together welded a CDN function's open body onto a doc comment and
+  produced a `SyntaxError` reported 400 lines away from the merge. `bun x tsc --noEmit` and
+  `node --check` are the only things that see this — reading the file does not.
+
+**Verified after the merge.** `bun x tsc --noEmit -p apps/admin/tsconfig.json` → 0 errors.
+All seventeen types from both sides survive in `lib/types.ts` (8 CDN + 9 events/webhooks), no
+duplicates, braces balanced. `node --check scripts/qa/walkthrough.cjs` → clean, and all four
+pass functions are present (`runCdnRulesDepth`, `runCdnPurgeDepth`, `runEventsDepth`,
+`runWebhooksDepth`). `docs/BUILD-LOG.md`: 69 headings, zero duplicated, zero lost — checked by
+heading multiset, because a line count is happy to hide a dropped section.
+
+`0047_media_grants.sql` differs between the branches; main carries the `create unique index`
+fix for the `coalesce` expression that cannot be a constraint, so main's version is the one
+that survives. Migration numbering stayed unshared: ours ends at 0120, main's new file is
+0052, and the two ranges do not overlap.
+
+**Next.** `cargo test -p omnion-cdn` on the merged tree, then the browser gate — now with the
+events and webhooks routes in the inventory alongside the CDN ones, which is the first pass on
+this branch that would actually exercise both sides of this merge.
