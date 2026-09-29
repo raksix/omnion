@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, Images, Import, KeyRound, Layers, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -41,6 +41,10 @@ const NAV: readonly NavItem[] = [
   // platform think happened" and "who was told" — and an operator chasing a missing webhook
   // needs both on the same shelf.
   { href: "/events", label: "Events", icon: Activity },
+  // Staging environments (REQ-017, slice 2). Beside Sites rather than under Settings: a staging
+  // copy of a site's content is a fact about the site, and an operator who is editing pages wants
+  // "which copy am I editing" one click from the pages, not four levels down.
+  { href: "/environments", label: "Environments", icon: Layers },
   // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.

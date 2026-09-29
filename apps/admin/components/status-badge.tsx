@@ -26,6 +26,13 @@ const TONES: Record<string, string> = {
   partial: "bg-caution-soft text-caution",
   pending: "bg-quiet-soft text-muted",
   failed: "bg-accent-soft text-accent-strong",
+  // Environments (REQ-017). `cloning` is work in flight, so it wears the attention tone rather
+  // than the quiet one: without it a copying environment read exactly like a live one, and the
+  // only way to tell them apart was to open the row. `error` is a failure even though the API
+  // spells it as a state rather than a past tense, so it must not fall through to grey.
+  cloning: "bg-caution-soft text-caution",
+  error: "bg-accent-soft text-accent-strong",
+  cancelled: "bg-quiet-soft text-muted",
 };
 
 /** A small pill for a lifecycle value (`draft`, `published`, …). */
