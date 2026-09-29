@@ -4037,3 +4037,80 @@ and reports the entire base as lost. Line counts cannot verify a merge; multiset
 **Next.** Free the host (the `omnion_*` test databases are 15–20 MB each and there are dozens), then
 run the pass on the private stack and read the rotation step. After that, slice 4 part 5: the
 `iam.group_membership_synced` event, which no code path emits today.
+
+## 2026-09-29 · tick 11 · REQ-065 slice 4 part 5 — `iam.group_membership_synced`, and four events nobody could subscribe to
+
+The next item on the list was the `iam.group_membership_synced` event, which the request's own
+Events table names and no code path emits. It is the right next slice for a reason the acceptance
+criterion spells out: a `when_group` rule grants its role through `group_members`, so somebody
+joining a directory group changes their effective permissions **without a sign-in**, and nothing
+observable recorded it.
+
+Before writing it, this tick ran a gate it had not run in four ticks — the source test that walks
+the workspace and compares every emitted event name against the catalogue. It was red.
+
+**Four events the platform recorded that no operator could subscribe to.** `iam.role_rule_matched`,
+`iam.provider_enabled`, `iam.sync_retry_requested` and `iam.provisioning.token_rotated` were all
+emitted — by slices 3 and 4 of this very request — and none had a catalogue row. The bus accepted
+every one of them, because a name only has to be *shaped* to be recorded, so the event stream was
+honest and the **picker** was not: the endpoint form's grouped list never offered those four, so a
+subscriber could not have selected them even deliberately. The security centre is supposed to
+subscribe to a provider test failure and a sync retry; both of those were unlistable.
+
+**And the gate that should have caught them could not see them.** `iam_providers.rs` wrote
+`NewEvent::new(if outcome.passed() { "…_passed" } else { "…_failed" })`, and the walk greps for
+`NewEvent::new("`. A computed name is invisible to it. That is not a hypothetical: the same shape
+in `media_retention.rs` means `media.hold_placed` and `media.hold_released` have been emitted and
+unlistable since the media wave landed — a defect this branch inherited and would have shipped.
+
+The fix is **not** "never compute a name" — a two-outcome fact wants two names, and a subscriber
+that only cares about failures should be able to take just those. The fix is that every branch of a
+computed call is read out of the call and checked exactly like a direct one: `call_names` scans
+from the opening parenthesis until the brackets balance, ignoring parentheses inside string
+literals. A first attempt scanned a single line and found `media.hold_placed` but not
+`media.hold_released`, because the two branches are on separate lines — a gate that half-sees is
+worse than one that does not, so the scan became a real one. A computed call with **no** readable
+name in it is still reported, so a future refactor that moves the branches apart fails rather than
+slips through.
+
+**The event itself, and three decisions that are each one line of code.**
+
+`announce_membership` fires from both group write paths. A group created *with* members announces
+it with an empty "before" — a listener that only watched `PATCH` would never see the case a rule
+is most often waiting for. It fires on a **change**, not on a write: a `PATCH` re-sending the
+member list the group already has changes nothing, and a connector re-sends whole groups on a
+timer, so an event for that trains a subscriber to ignore the name; the walk asserts the count is
+byte-identical across a no-op. And the counts are the **diff** — a `PATCH` that adds one and
+removes one is `added: 1, removed: 1, members: 1`, because a subscriber that only wants revocations
+cannot get them from a size, and a snapshot has no "before". The payload is asserted to carry no
+member id: a member list is the directory's most personal export and an event is delivered outside
+the tenant.
+
+**One more defect, in code this branch wrote two ticks ago, found by the walk that was already
+failing.** `scim.rs`'s pre-existing test died at `500` on `DELETE /provisioning/tokens/{id}`. It
+was not caused by this slice — the baseline was proved by stashing the change and re-running — but
+the cause is mine: when `0124` added `expires_at` and `rotated_at` to `ProvisioningToken`, the
+identity queries were updated and `revoke_token`'s **hand-written column list** was not. sqlx had no
+value for two fields of the struct, so **every revoke answered 500** — on the one operation an
+operator reaches for when a credential must die. `TOKEN_COLUMNS` is now `pub` and all three route
+queries read it, because a duplicated column list is two places to forget and nothing in the type
+system connects a `FromRow` struct to a query's columns.
+
+**Proof.** `bash scripts/qa/run-media-walk.sh scim` → **2 passed** (11.4s) against a disposable
+database: the new group-membership walk and the pre-existing round trip, which was red before the
+column-list fix. `bash scripts/qa/run-media-walk.sh events every_` → **2 passed** (0.4s), both
+source gates, against the isolated database.
+`cargo test -p omnion-identity --lib` → **199 passed**. `cargo test -p omnion-api --test events` on
+the shared development database → **7 passed, 2 failed** with `PoolTimedOut`, which is the box at
+31 of 32 GB used and not the change: the two failures are database-backed tests and the two source
+gates that exercise this slice passed in the same run. `npx tsc --noEmit` in `apps/admin` → exit 0.
+
+**Not claimed.** The browser pass has still not run on this branch — the last one died at
+`ECONNREFUSED` when the admin process was OOM-killed — so slice 3 (the wizard and the dry run have
+never been *observed*) and this slice's panel half stay open. The third clause of the group
+criterion, a group rule granting the mapped role on the next request, is not built.
+
+**Next.** Run the pass on the private stack (`QA_STACK=w9`, ports 18088/3108/3208) once the host has
+room, and drive the provisioning screen — the Revoke button now has a working route behind it for
+the first time since `0124`. Then slice 4 part 6: the group rule on the request path, which is the
+last clause of the criterion this slice opens.
