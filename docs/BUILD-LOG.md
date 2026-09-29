@@ -4646,3 +4646,32 @@ walked, and the REQ stays in-progress for that reason and not for any other.
 `runCrmIntakeDepth` to open the hand-over panel and press it: the walkthrough should assert that
 `Save owner` is disabled with an empty reason, that the save writes a `reassigned` line the
 timeline renders, and that the queue round trip is visible on screen.
+
+## w8 · tick 14 · REQ-117 — the roster a hand-over is actually made of
+
+**What.** `store::list_owners` (a correlated subquery, so the list and the load counts cannot
+disagree), `GET /api/v1/crm/leads/owners` behind `crm.leads.read`, `fetchLeadOwners` in the
+admin client, and three screens rebuilt on top of it: the detail's picker is a `<select>` of
+colleagues carrying their open load instead of a free-text uuid box, the inbox's owner column
+reads a name (and its `owner` filter grew a `<option>` per colleague), and the trail names both
+people a lead moved between. `ownerLabel` falls back to `Former member <8 hex>` rather than a
+dash, because a dash reads as *nobody* and a lead with an owner id on it has somebody.
+
+**Proof.** `bash scripts/qa/run-crm-assign.sh` → `test result: ok. 9 passed; 0 failed` (up from
+5). `pnpm typecheck` → clean. `cargo build -p omnion-api` → green. The new walkthrough steps
+(`assignPanelOpen`, `pickerIsNotUuids`, `assignSaveDisabledWithoutReason`,
+`trailNamesAPerson`, `unassignVisibleWithoutReload`, `inboxOwnerNames`,
+`inboxOwnerFilterOffersPeople`) are **written but not yet executed** — this tick's pass is
+queued behind w3's, which is alive and 12 minutes into its own.
+
+**Why it matters beyond the REQ.** `crm.leads.assign` shipped last tick with a store, an
+endpoint and a 5/5 gate, and the screen asked for an **account id** in a text field. Every
+sentence in this REQ about an operator deciding whose work it is was true of the code and false
+of the control a person touches. A store gate proves the store; only the browser proves the
+panel. An id-shaped control in a human screen is unfinished work, and the test for it is
+"would somebody who does not know the schema recognise this value?"
+
+**Next.** The narrowed `QA_ROUTES=crm` pass, when the slot frees — it is the fifth tick this REQ
+has had a browser pass queued for. Then slice 2's remaining screen work: the REQ-064 form-editor
+`Lead delivery` card (the one screen of the seven still missing, and the one whose module is not
+on this branch), and the SLA list column.
