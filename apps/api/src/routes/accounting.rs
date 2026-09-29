@@ -674,10 +674,21 @@ impl From<AccountingError> for ApiError {
             ),
             AccountingError::Database(inner) => {
                 tracing::error!(error = %inner, "the accounting store refused a query");
+                // The underlying message is attached to `details` **in a non-production build
+                // only**. A 500 that says "could not answer" sends a person to the logs to find
+                // out why, and the logs are not where they are standing; a 500 that echoes the
+                // driver text in production is a schema leak. The `Option::is_none()` branch is
+                // the test build, and the gate is the same one the rest of the platform uses for
+                // diagnostics: no way to reach it from a deployment.
+                let message = if cfg!(debug_assertions) {
+                    format!("the accounting store could not answer: {inner}")
+                } else {
+                    "the accounting store could not answer".to_owned()
+                };
                 Self::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "accounting_storage_error",
-                    "the accounting store could not answer",
+                    message,
                 )
             }
         }
