@@ -6357,6 +6357,13 @@ async function main() {
     // the bare prefix here produced exactly that 404 screenshot.
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai", area: "ai" },
+    // The agent runtime (REQ-099, slice 1) — the agents table and the run history. Both are
+    // walked, clicked and measured; the depth pass below creates an agent, refuses a bad key in
+    // the field, starts a run and reads its trace back. The run *detail* screen is not listed
+    // here for the same reason the media file detail is not: its path carries a run id, and a
+    // route walked with a placeholder id only proves the 404 state renders.
+    { path: "/ai/agents", name: "ai-agents", area: "ai" },
+    { path: "/ai/runs", name: "ai-runs", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
