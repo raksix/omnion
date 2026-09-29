@@ -1367,6 +1367,7 @@ pub async fn verify_mfa_login(
 
     let secure = !state.config().env.is_development();
     let cookie = cookies::session_cookie(&token, sessions::SESSION_TTL_SECONDS, secure);
+    let csrf = cookies::csrf_cookie_for(&session.id, state.config().csrf.as_bytes(), secure);
     let remaining = mfa::remaining_recovery_codes(state.db().pool(), user.id).await?;
 
     let mut response = Json(VerifiedLoginBody {
@@ -1379,5 +1380,11 @@ pub async fn verify_mfa_login(
         SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("session cookie is valid header text"),
     );
+    if let Some(csrf) = csrf {
+        response.headers_mut().append(
+            SET_COOKIE,
+            HeaderValue::from_str(&csrf).expect("CSRF cookie is valid header text"),
+        );
+    }
     Ok(response)
 }
