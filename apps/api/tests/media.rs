@@ -11,14 +11,16 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+use omnion_api::rate_limit_middleware::RateLimiter;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::Config;
+use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_media::MAX_UPLOAD_BYTES;
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_security::RatePolicy;
 use omnion_storage::{Storage, StorageError};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -42,15 +44,66 @@ const MEDIA_PERMISSIONS: [&str; 5] = [
 /// Boundary of the multipart bodies this suite sends.
 const BOUNDARY: &str = "omnion-media-test-boundary";
 
+/// Key material this suite's own state signs its CSRF tokens with.
+///
+/// A test-only value with a test-only name: it is the fixture's *own* secret, and nothing the
+/// suite stores is protected by anything but the walls of the process. Naming it here is what
+/// keeps the distinction legible — a real secret would be a credential in a public repository.
+const CSRF_SECRET: &str = "csrf-media-walk-suite-key-material-not-a-real-secret";
+
+/// The header a cookie-authenticated write has to carry its CSRF token in.
+const CSRF_HEADER: &str = "x-omnion-csrf";
+
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
+    /// The **first** `Set-Cookie`, which is what the pre-existing assertions read.
     set_cookie: Option<String>,
+    /// Every `Set-Cookie` on the response, joined.
+    ///
+    /// Sign-in sets two: the session and the CSRF token beside it. `get` returns the first, so
+    /// a helper that reads `set_cookie` alone sees a session with no token and concludes the
+    /// deployment never issued one — which is the message the CSRF layer gives a deployment
+    /// without a secret, so the two are indistinguishable from the call site.
+    set_cookies: Vec<String>,
     content_type: Option<String>,
     content_disposition: Option<String>,
     nosniff: bool,
+    /// `Accept-Ranges` on the response — the claim that ranges are supported at all.
+    accept_ranges: Option<String>,
+    /// `Content-Range` on the response, when the answer was a window.
+    content_range: Option<String>,
     body: Value,
     bytes: Vec<u8>,
+}
+
+/// Give this suite a rate-limit budget of its own, once per process.
+///
+/// The limiter is a process-wide cell that `router()` fills from the **stored** document, and the
+/// stored `sign_in` scope is ten requests per five minutes. This suite signs in three accounts per
+/// walk and runs fifteen walks, so the eleventh sign-in is refused with `429` and every walk after
+/// it dies on a line that has nothing to do with media. The failure is worse than useless: it
+/// names a *rate limit* on a suite that was never testing rate limits, and the obvious reading —
+/// "the limiter is too strict" — is the opposite of the truth.
+///
+/// Raising the ceiling here does not weaken what the limiter suite proves, because that suite
+/// installs and asserts its own numbers: this cell is process-wide, so whichever fixture installs
+/// first wins, and a suite that needs the shipped policy is asserting the policy rather than
+/// sharing a budget with other tests.
+fn give_the_suite_its_own_rate_limit(state: &AppState) {
+    let policies: Vec<RatePolicy> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            // Only the sign-in scope needs raising. The rest of the ceilings are the ones a
+            // deployment ships, and leaving them alone keeps a suite from being the reason a
+            // genuinely over-budget request stops being refused.
+            if policy.scope == "sign_in" {
+                policy.limit = 10_000;
+            }
+            policy
+        })
+        .collect();
+    omnion_api::rate_limit_middleware::install(RateLimiter::new(state, policies));
 }
 
 /// Drive the real router without a network socket.
@@ -69,9 +122,18 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
             .map(str::to_owned)
     };
     let set_cookie = header_text(header::SET_COOKIE);
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
     let content_type = header_text(header::CONTENT_TYPE);
     let content_disposition = header_text(header::CONTENT_DISPOSITION);
     let nosniff = header_text(header::X_CONTENT_TYPE_OPTIONS).as_deref() == Some("nosniff");
+    let accept_ranges = header_text(header::ACCEPT_RANGES);
+    let content_range = header_text(header::CONTENT_RANGE);
 
     let bytes = response
         .into_body()
@@ -90,9 +152,12 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookie,
+        set_cookies,
         content_type,
         content_disposition,
         nosniff,
+        accept_ranges,
+        content_range,
         body,
         bytes,
     }
@@ -100,11 +165,13 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 
 /// Build a JSON request; `token` becomes the session cookie.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
-    let builder = Request::builder().method(method).uri(uri);
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
-        None => builder,
-    };
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header(header::COOKIE, cookie_header(token));
+        if let Some(csrf) = csrf_token(token) {
+            builder = builder.header(CSRF_HEADER, csrf);
+        }
+    }
 
     match body {
         Some(value) => builder
@@ -164,14 +231,21 @@ fn upload_request(
     content_type: &str,
     bytes: &[u8],
 ) -> Request<Body> {
-    let builder = Request::builder().method(Method::POST).uri(uri).header(
+    let mut builder = Request::builder().method(Method::POST).uri(uri).header(
         header::CONTENT_TYPE,
         format!("multipart/form-data; boundary={BOUNDARY}"),
     );
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
-        None => builder,
-    };
+    if let Some(token) = token {
+        builder = builder.header(header::COOKIE, cookie_header(token));
+        // An upload is a write, so it carries the CSRF token in the **header** as well as in the
+        // cookie. The cookie alone is a fallback the middleware accepts, but a token in the
+        // cookie and no token in the header is precisely the state a stale page is in — the layer
+        // reads the header first so that the explicit intention wins, and a suite that only set
+        // the cookie was testing the fallback path while believing it tested the normal one.
+        if let Some(csrf) = csrf_token(token) {
+            builder = builder.header(CSRF_HEADER, csrf);
+        }
+    }
 
     builder
         .body(Body::from(multipart_body(
@@ -181,6 +255,62 @@ fn upload_request(
             bytes,
         )))
         .expect("request must build")
+}
+
+/// Build a `GET` carrying a `Range` header.
+///
+/// Its own builder rather than a parameter on [`request`], because a range is only meaningful
+/// on a read: threading an `Option<&str>` through a builder that also signs people in, uploads
+/// multipart bodies and deletes files would put a header where a body is expected, and the
+/// mistake that follows is silent — a test that thinks it asked for a window and got the whole
+/// object.
+fn range_request(uri: &str, token: Option<&str>, range: &str) -> Request<Body> {
+    let builder = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::RANGE, range);
+    let builder = match token {
+        Some(token) => builder.header(header::COOKIE, cookie_header(token)),
+        None => builder,
+    };
+    builder.body(Body::empty()).expect("request must build")
+}
+
+/// The `Cookie` header for one caller, from whatever the fixture handed back.
+///
+/// A bare session id and a whole `name=value; name=value` header both have to work, because the
+/// suite has readers (which need only the session) and writers (which need the CSRF token beside
+/// it) and neither should have to know which kind it was handed. Wrapping a header that already
+/// carries `=` would produce `omnion_session=a=…; b=…`, which is a cookie named `omnion_session`
+/// with the value `"a"` and a stray pair the server ignores — a session that authenticates for
+/// nothing and a test failure that reads as a permission problem.
+fn cookie_header(token: &str) -> String {
+    let session = session_of(token);
+    let csrf = csrf_token(token);
+    match csrf {
+        Some(token) => format!("omnion_session={session}; omnion_csrf={token}"),
+        None => format!("omnion_session={session}"),
+    }
+}
+
+/// The session id inside a caller's credential.
+fn session_of(token: &str) -> &str {
+    match token.split_once('\u{1f}') {
+        Some((session, _)) => session,
+        // A bare session id, which is what a caller with no token passes.
+        None => token,
+    }
+}
+
+/// The CSRF token inside a caller's credential, when it carries one.
+///
+/// The credential the fixture hands out is `<session>\x1f<token>`: two things that must travel
+/// together on a write, packed into the one `String` the helpers already return. The separator is
+/// a unit separator rather than `;` or `=` because neither can appear in a session id or a
+/// derived token, so a helper that guesses wrong cannot silently read half a value as a whole one.
+fn csrf_token(token: &str) -> Option<String> {
+    let (_, csrf) = token.split_once('\u{1f}')?;
+    (!csrf.is_empty()).then(|| csrf.to_owned())
 }
 
 /// Connect to the compose PostgreSQL; `None` means the stack is not running.
@@ -227,7 +357,13 @@ async fn live_storage() -> Option<Storage> {
 /// A state whose database has all migrations applied, the IAM seed loaded and the object store
 /// open — everything the media surface needs.
 async fn live_state() -> Option<(AppState, Db, Storage)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // The CSRF secret is set on the **config**, not through the environment. Sign-in only issues
+    // a token when the running state carries one, and a suite that relies on `OMNION_CSRF_SECRET`
+    // being in the shell is a suite that silently stops testing writes the moment it is not —
+    // which is exactly what happened here: every upload answered `403 csrf_unavailable`, and the
+    // message names the server's configuration rather than the suite's own missing token.
+    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
     let storage = live_storage().await?;
@@ -240,6 +376,7 @@ async fn live_state() -> Option<(AppState, Db, Storage)> {
         redis,
         storage.clone(),
     );
+    give_the_suite_its_own_rate_limit(&state);
     Some((state, db, storage))
 }
 
@@ -438,6 +575,19 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
 
 /// Sign an account in and return the raw session token.
 async fn login(state: &AppState, email: &str) -> String {
+    session_cookie(state, email).await
+}
+
+/// Sign in and return the **whole cookie header**, session and CSRF token together.
+///
+/// Every `Set-Cookie` is kept rather than only the first one. The CSRF layer (tick 59) makes the
+/// session cookie *ambient* authority — anything a browser sends along on its own — so a
+/// cookie-authenticated write now has to present a token as well, and sign-in is where the token
+/// is issued. The previous helper took `.split(';').next()`, which is correct for one cookie and
+/// silently drops every cookie after it: the walks then failed on `csrf_unavailable` with a
+/// message that names the server's configuration rather than the suite's own loss of the token,
+/// and the failure looked like a broken deployment instead of a broken helper.
+async fn session_cookie(state: &AppState, email: &str) -> String {
     let response = call(
         state,
         request(
@@ -455,17 +605,32 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .clone()
-        .expect("login must set the session cookie")
+    let set_cookie = response.set_cookies.join("; ");
+    assert!(
+        set_cookie.contains("omnion_session="),
+        "sign-in must set the session cookie: {set_cookie}"
+    );
+    // A sign-in that issued no CSRF token is a deployment without `OMNION_CSRF_SECRET`, and this
+    // suite is not the place to discover that: every write below would fail identically.
+    assert!(
+        set_cookie.contains("omnion_csrf="),
+        "sign-in must issue a CSRF token, or every cookie-authenticated write is refused: \
+         {set_cookie}"
+    );
+    // The session id is the only part of the credential the *header* cannot express, so the two
+    // are handed to the builders separately: a cookie header and the token to echo in
+    // `x-omnion-csrf`.
+    let session = set_cookie
         .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+        .map(str::trim)
+        .find_map(|cookie| cookie.strip_prefix("omnion_session="))
+        .expect("the joined header carries the session");
+    let token = set_cookie
+        .split(';')
+        .map(str::trim)
+        .find_map(|cookie| cookie.strip_prefix("omnion_csrf="))
+        .map(str::to_owned);
+    format!("{session}\u{1f}{}", token.unwrap_or_default())
 }
 
 /// The `id` field of a response body, as text.
@@ -869,7 +1034,7 @@ async fn a_request_without_a_file_part_is_refused() {
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={BOUNDARY}"),
         )
-        .header(header::COOKIE, format!("omnion_session={editor}"))
+        .header(header::COOKIE, cookie_header(&editor))
         .body(Body::from(body))
         .expect("request must build");
 
@@ -1647,14 +1812,18 @@ fn replace_request(
     bytes: &[u8],
     note: &str,
 ) -> Request<Body> {
-    Request::builder()
+    let mut builder = Request::builder()
         .method(Method::POST)
         .uri(uri)
         .header(
             header::CONTENT_TYPE,
             format!("multipart/form-data; boundary={BOUNDARY}"),
         )
-        .header(header::COOKIE, format!("omnion_session={token}"))
+        .header(header::COOKIE, cookie_header(token));
+    if let Some(csrf) = csrf_token(token) {
+        builder = builder.header(CSRF_HEADER, csrf);
+    }
+    builder
         .body(Body::from(multipart_body_with_note(
             BOUNDARY,
             filename,
@@ -2590,4 +2759,272 @@ fn png(width: u32, height: u32) -> Vec<u8> {
     bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
     bytes.extend_from_slice(&0u32.to_be_bytes());
     bytes
+}
+
+/// The serve path answers a window, and the three answers a client can be given are all
+/// distinguishable from the outside.
+///
+/// This is the layer that proves REQ-010's "video plays with range requests": the parser has
+/// nineteen unit tests and would pass with the route never reading the header at all, which is
+/// exactly the shape of a green test list around a feature that is not on the request path.
+///
+/// The body is compared as **bytes** against the object that was uploaded, not by length: a
+/// length check passes by accident on an off-by-one, and the last byte of an object is precisely
+/// where a window implementation loses one.
+#[tokio::test]
+async fn a_range_request_answers_a_window_and_says_what_it_sent() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let editor = fixture.editor_token().await;
+    let library = format!("/api/v1/media?site_id={site}");
+
+    // 300 bytes of recognisable content, so a window can be checked against the source rather
+    // than against a length: every byte has a known value at a known offset.
+    let mut body = Vec::with_capacity(300);
+    for index in 0..300u32 {
+        body.push((index % 251) as u8);
+    }
+    let filename = "ranged-video.mp4";
+    let upload = call(
+        &fixture.state,
+        upload_request(&library, Some(&editor), filename, "video/mp4", &body),
+    )
+    .await;
+    assert_eq!(upload.status, StatusCode::CREATED, "body: {}", upload.body);
+    let media_id = id_of(&upload.body);
+    // `/media/{id}/raw` and not `/media/files/{id}/raw`: the file-manager read path is the preset
+    // route, which falls through to the original bytes when no `?preset=` is named. The route
+    // named `files` is the metadata route, and a 404 from it reads exactly like a broken serve
+    // path — the failure would have named the media id rather than the path that was wrong.
+    let raw = format!("/api/v1/media/{media_id}/raw");
+
+    // No header at all: the whole object, and the platform still says ranges are supported.
+    let whole = call(
+        &fixture.state,
+        request(Method::GET, &raw, Some(&editor), None),
+    )
+    .await;
+    assert_eq!(whole.status, StatusCode::OK);
+    assert_eq!(
+        whole.bytes, body,
+        "no range is the whole object, byte for byte"
+    );
+    assert_eq!(
+        whole.accept_ranges.as_deref(),
+        Some("bytes"),
+        "a client learns ranges work from the first response, not from a failed second one"
+    );
+    assert_eq!(
+        whole.content_range, None,
+        "a 200 has no Content-Range: it is not a range"
+    );
+
+    // A closed window in the middle: the bytes, the status and the header all agree.
+    let middle = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=100-149"),
+    )
+    .await;
+    assert_eq!(middle.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        middle.bytes,
+        body[100..=149].to_vec(),
+        "the window is the bytes at those offsets"
+    );
+    assert_eq!(
+        middle.content_range.as_deref(),
+        Some("bytes 100-149/300"),
+        "the reported total is the object, the end is the last byte sent"
+    );
+    assert_eq!(middle.content_type.as_deref(), Some("video/mp4"));
+    assert!(
+        middle.nosniff,
+        "a windowed answer is still a nosniff answer"
+    );
+
+    // An open window: everything from that offset to the end.
+    let open = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=290-"),
+    )
+    .await;
+    assert_eq!(open.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        open.bytes,
+        body[290..].to_vec(),
+        "the last ten bytes, compared as bytes"
+    );
+    assert_eq!(open.content_range.as_deref(), Some("bytes 290-299/300"));
+
+    // A suffix window: the tail, counted from the end rather than named.
+    let suffix = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=-10"),
+    )
+    .await;
+    assert_eq!(suffix.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(suffix.bytes, body[290..].to_vec());
+    assert_eq!(suffix.content_range.as_deref(), Some("bytes 290-299/300"));
+
+    // A single byte at each end — the first request a player makes, and the last frame of a
+    // video. An off-by-one loses one of them and neither is visible in a length check.
+    let first = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=0-0"),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(first.bytes, vec![body[0]]);
+    assert_eq!(first.content_range.as_deref(), Some("bytes 0-0/300"));
+
+    let last = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=299-299"),
+    )
+    .await;
+    assert_eq!(last.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        last.bytes,
+        vec![body[299]],
+        "the final byte is inside the object"
+    );
+    assert_eq!(last.content_range.as_deref(), Some("bytes 299-299/300"));
+
+    // An end past the object is clamped, not refused: that is a client that believes the file is
+    // longer than it is, and answering 416 to it makes a player give up on a file it could play.
+    let clamped = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=295-99999"),
+    )
+    .await;
+    assert_eq!(clamped.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(clamped.bytes, body[295..].to_vec());
+    assert_eq!(
+        clamped.content_range.as_deref(),
+        Some("bytes 295-299/300"),
+        "the header reports the bytes that arrived, not the ones asked for"
+    );
+
+    // A window that starts past the end names nothing: a 416 with the real total, and no body.
+    let past = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=5000-6000"),
+    )
+    .await;
+    assert_eq!(past.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(
+        past.bytes.is_empty(),
+        "a 416 sends no body; its header is the whole answer"
+    );
+    assert_eq!(
+        past.content_range.as_deref(),
+        Some("bytes */300"),
+        "a 416 tells the client how long the object really is"
+    );
+    assert_eq!(past.accept_ranges.as_deref(), Some("bytes"));
+
+    // An unreadable range is *ignored*: the whole object, not a refusal. RFC 9110 §14.2, and the
+    // only answer a client recovers from — a 416 here teaches a player that the file is broken.
+    for unusable in ["items=0-9", "bytes=abc-def", "bytes=5-1", "bytes=-"] {
+        let ignored = call(&fixture.state, range_request(&raw, Some(&editor), unusable)).await;
+        assert_eq!(
+            ignored.status,
+            StatusCode::OK,
+            "{unusable:?} must be ignored, not refused"
+        );
+        assert_eq!(ignored.bytes, body, "{unusable:?} is served whole");
+        assert_eq!(
+            ignored.content_range, None,
+            "{unusable:?} produced a 200, which carries no Content-Range"
+        );
+    }
+
+    // A multi-range request gets the whole object. Answering 416 to a legal request teaches the
+    // client to stop asking; there is no multipart writer in this codebase to do it properly.
+    let multi = call(
+        &fixture.state,
+        range_request(&raw, Some(&editor), "bytes=0-9,20-29"),
+    )
+    .await;
+    assert_eq!(multi.status, StatusCode::OK);
+    assert_eq!(
+        multi.bytes, body,
+        "a multi-range request is answered in full"
+    );
+
+    // The public path windows too, with no session at all: a published page's own video has to
+    // seek, and the anonymous visitor is exactly who the read path exists for.
+    let public = call(
+        &fixture.state,
+        range_request(
+            &format!("/api/v1/public/media/{media_id}"),
+            None,
+            "bytes=10-19",
+        ),
+    )
+    .await;
+    assert_eq!(public.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(public.bytes, body[10..=19].to_vec());
+    assert_eq!(public.content_range.as_deref(), Some("bytes 10-19/300"));
+
+    // The old raw route answers the same way — the two read paths must not drift apart, and the
+    // one the panel's own preview uses is the one nobody would notice breaking.
+    let legacy = call(
+        &fixture.state,
+        range_request(
+            &format!("/api/v1/media/{media_id}/raw"),
+            Some(&editor),
+            "bytes=0-9",
+        ),
+    )
+    .await;
+    assert_eq!(legacy.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(legacy.bytes, body[0..=9].to_vec());
+    assert_eq!(legacy.content_range.as_deref(), Some("bytes 0-9/300"));
+
+    // A range against the **preset** route answers the same way, because the derivative and the
+    // original are the same file to a client: a page that asked for `?preset=card` and got the
+    // original back still has to be able to seek in it.
+    //
+    // The preset named here is one that does **not** exist, which is the case that matters: the
+    // route falls back to the original, and a fallback that dropped the range would leave a
+    // client that renamed a preset unable to seek in the file it was already served. (Asking for
+    // a preset that *does* exist on a video answers `422 not_transformable` — the transform runs
+    // before the range is applied, which is the transform's own documented refusal and not this
+    // criterion's subject.)
+    let preset_raw = call(
+        &fixture.state,
+        range_request(
+            &format!("/api/v1/media/{media_id}/raw?preset=no-such-preset"),
+            Some(&editor),
+            "bytes=0-9",
+        ),
+    )
+    .await;
+    assert_eq!(preset_raw.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        preset_raw.bytes,
+        body[0..=9].to_vec(),
+        "a window through the preset route's fallback is the same window"
+    );
+    assert_eq!(preset_raw.content_range.as_deref(), Some("bytes 0-9/300"));
+
+    // And a range does not become a way around the serve gates: a reader without `media.read`
+    // is refused exactly as before, window or not.
+    let member = fixture.member_token().await;
+    let refused = call(
+        &fixture.state,
+        range_request(&raw, Some(&member), "bytes=0-9"),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "a range is not a second read path around the permission guard"
+    );
+
+    let anonymous = call(&fixture.state, range_request(&raw, None, "bytes=0-9")).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
 }
