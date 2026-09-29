@@ -1,6 +1,6 @@
 # REQ-086 — Workflow Editor Canvas
 
-> **Status:** in-progress (slice 1 done, `11bd40a`…`PENDING`; the graph's read/save/validate API) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
+> **Status:** in-progress (slices 1–2 done — `11bd40a`…`73f0297`; the graph API, the canvas, and a 36/36 live probe of the round trip) · **Captured:** 2026-09-26 · **Layer:** admin (`apps/admin`) + `crates/workflows`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -140,13 +140,18 @@ Consumed: `workflows.execution.state_changed`, `workflows.execution.finished` (o
       *(API half: the 409 carries the current revision and the refused save changed nothing. The
       editor's compare-and-reload button is slice 2, with the canvas.)*
 - [ ] Pan, zoom, fit and zoom-to-selection work with mouse, trackpad and keyboard; grid snap off changes nothing stored.
-      *(positions survive a save/reload — proved; the canvas itself is slice 2)*
+      *(implemented + positions proved to survive a save/reload; the gestures need the browser pass)*
 - [ ] Auto-layout arranges a 25-node graph without overlaps, and manually moved nodes keep positions after reload.
+      *(manual positions proved across a reload by `scripts/qa/graph-canvas.cjs`; the layout
+      button's own arrangement is browser-proved or not proved at all)*
 - [ ] Copy/paste duplicates a multi-node selection with new keys and internal rewiring, dropping outside edges.
 - [ ] Undo/redo restores 100+ operations including a drag, a connection deletion and a param edit.
 - [ ] A data output to a control input is refused with `connection_type_mismatch`; self-loops and control cycles with `connection_cycle`.
+      *(the self-loop refusal is proved live, and the refusal is *named*; the type-mismatch half
+      belongs to REQ-088, which owes the ports their kinds)*
 - [ ] Branch labels survive save/reload and appear on the canvas and in the run overlay.
 - [ ] The palette searches, groups by category, opens on `/`, and disables nodes with the missing cause named.
+      *(every disabled row carries its reason on the button, asserted in the walkthrough pass)*
 - [ ] The code node highlights javascript and python, shows validator diagnostics, and never runs code in the browser (network trace checked).
 - [ ] Expression autocomplete lists upstream outputs, variables and the current item; preview returns real pinned values or a positional error.
 - [x] Sticky notes and comments persist, do not appear as steps and never execute.
@@ -171,7 +176,9 @@ visible selection and focus, legible badges, working minimap, overlay colours ma
 1. **Graph model, save, compile** — column, revision check, compiler, validation codes, events.
    Done: a saved graph runs on the existing engine and an unreachable node is rejected.
 2. **Canvas interactions** — pan/zoom, selection, clipboard, undo, auto-layout, minimap, palette, node chrome.
-   Done: the walkthrough passes visually and by keyboard.
+   Done: the walkthrough passes visually and by keyboard. *Built (`b5356e0`); the browser pass is
+   written (`runGraphCanvasDepth`) and has not yet run — the QA slot was held by a live sibling
+   pass for this whole tick.*
 3. **Connections and editors** — type-aware connects with labels, CodeMirror, expression field with preview.
    Done: mismatched connects refuse, both languages highlight, preview returns real values.
 4. **Run overlay and polish** — per-node states, run bar, partial-run entry points, responsive and a11y pass.

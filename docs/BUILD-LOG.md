@@ -4011,6 +4011,66 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+
+## omnion-w10 · REQ-086 slice 1 (API) and slice 2 (the canvas) — and a probe that found two of its own bugs
+
+**What.** The graph's read/save/validate surface (`c5186a3`), the canvas itself (`b5356e0`) and
+the live probe of the round trip (`73f0297`).
+
+**Proof.**
+
+```
+cargo test -p omnion-api --test workflow_graph   9 passed; 0 failed
+cargo test -p omnion-api --lib                 255 passed; 0 failed
+pnpm --filter @omnion/admin typecheck           clean
+node scripts/qa/graph-canvas.cjs                 36 passed, 0 failed   (live, private w10 stack)
+```
+
+**Three things this tick that are worth more than the code.**
+
+*A guard that refuses is not a guard that skips.* REQ-012's CSRF layer **refuses** a
+cookie-authenticated mutation when no secret is configured, and the graph suite inherited that
+behaviour from the environment: every `POST` answered `403 csrf_unavailable` and the first
+reading was a broken save path. The fix is the one `apps/api/tests/csrf.rs` already had — set
+the secret on the test *state* and carry **both** cookies in one value. The lesson is the
+generality: a suite that depends on the shell for a guard is a suite that fails for a reason
+unrelated to what it tests, and it fails with a code that names the guard rather than the
+feature.
+
+*`HeaderMap::get(SET_COOKIE)` is a coin toss.* A sign-in sets **two** cookies. The helper read
+whichever arrived first, so the CSRF token was missing half the time and the failure read as
+"the login endpoint is broken". `get_all` is the only correct read, and the suite that already
+had it written was three files away.
+
+*The probe's own bugs were the interesting part.* Three assertions in `graph-canvas.cjs` would
+have reported defects that do not exist: the stale-save check emptied the node list (a
+*validity* failure, so the validator answered `422` before the revision was compared — it was
+measuring the wrong refusal); the panel-route check asserted on the HTML of a client component
+that an unauthenticated `fetch` never sees, because the route redirects to sign-in and `fetch`
+follows it; and the credentials were invented, so a database reset thirty seconds earlier
+answered `401 invalid_credentials` — which reads as "the API is broken" and is really "there is
+no owner yet". A test that cannot fail is worse than no test, and the way to find out whether
+one can is to run it.
+
+**One assertion written to pass, deliberately removed before it shipped.** The first draft of the
+route check ended in `ok("the panel build is serving", true)`. It was there to satisfy a
+count, it could never fail, and the honest version (every script the page references is actually
+served — the check that catches a stale Next cache) replaced it.
+
+**Not done, and not claimed.** The browser walkthrough for the canvas has **not** run. The single
+QA slot was held by a live w3 pass (holder 1886095, cwd `/mnt/apopic/omnion-w3`) for the whole
+tick. `runGraphCanvasDepth` is written and registered in `scripts/qa/walkthrough.cjs`; it builds
+a graph node by node, connects it by clicking a port, labels a branch, saves, reloads the page
+and reads the document back from the server, then checks the 390 px read-only rule and the
+keyboard path. The panels that carry the acceptance boxes for the *gestures* stay unticked until
+it runs.
+
+**Next.** Run `QA_STACK=w10 QA_API_PORT=18089 QA_ADMIN_PORT=3109 QA_WEB_PORT=3209 bash
+scripts/qa/run.sh` and confirm `runGraphCanvasDepth` reaches every step; then tick the gesture
+boxes. After that, REQ-086 slice 3 — connections and editors (CodeMirror, the expression field
+with a server-side preview), whose `POST …/graph/expressions/preview` is the first route the
+canvas asks for and does not yet have.
+
 # Tick 60 — the blocker was a story, not a fact
 
 Two ticks of this loop wrote into `docs/BUILD-LOG.md` and into the REQ-012 status line that
