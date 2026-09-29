@@ -5104,6 +5104,45 @@ async function runMembersDepth(page, report) {
   steps.deletedFromSql =
     qaSql(`select count(*) from cms_members where id = '${waitingId}'`) === "0";
 
+  // ------------------------------------------------------------------ the settings route, on its own
+  // The REQ lists `/members/settings` as its own route, so it is visited as its own route rather
+  // than inferred from the one embedded in `/members`. Two routes rendering the SAME component is
+  // the design, and this is the half that proves it: the policy is on screen here with no table
+  // above it, and a save made from here is the same save.
+  await page.goto(`${URL_ADMIN}/members/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.settingsRouteReady =
+    (await page.locator("[data-members-settings-state=\"ready\"]").count()) > 0;
+  steps.settingsRouteShowsThePolicy =
+    (await page.locator("[data-member-policy=\"ready\"]").count()) > 0;
+  steps.settingsRouteHasNoMemberTable =
+    (await page.locator("[data-member-row]").count()) === 0;
+  // The route has to answer the same question the embedded panel does — a screen that renders the
+  // policy and then saves somewhere else is the drift this route exists to prevent.
+  steps.settingsRouteShowsTheSameBehaviour =
+    (await page.locator("[data-member-policy-behaviour]").first().getAttribute("data-member-policy-behaviour")) ===
+    "not_found";
+
+  // A save from HERE, read back in SQL: the point is that this route writes the same row.
+  await page.locator("[data-member-policy-signup-toggle]").uncheck({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-member-policy-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.settingsRouteSaveIsInSql =
+    qaSql(`select signup_enabled from cms_member_settings where site_id = '${siteId}'`) === "f";
+  // The notice is read, not the whole screen: the screen always contains the word "signup"
+  // because the control's own label does, so a regex over the page would match a save that
+  // reported nothing.
+  steps.settingsRouteSaveSaidSo = /saved/i.test(
+    await page.locator("[data-members-notice]").first().innerText().catch(() => ""),
+  );
+  // Put it back: the next pass opens this site, and a site with signups off is a site whose
+  // public signup route is refused for reasons that have nothing to do with what is being tested.
+  await page.locator("[data-member-policy-signup-toggle]").check({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-member-policy-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.signupRestored =
+    qaSql(`select signup_enabled from cms_member_settings where site_id = '${siteId}'`) === "t";
+
   // ------------------------------------------------------------------ the mobile layout
   await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
   await page.waitForTimeout(1600);
@@ -7774,7 +7813,10 @@ async function main() {
       "blockRemovedTheSessionRow", "blockedMemberIsRefused", "behaviourInSql",
       "promptBehaviourIsReported", "promptNamesTheSignInLink", "notFoundNamesNoSignInLink",
       "behaviourRestored", "inviteDialogOpened", "deleteDialogNamesTheAddress",
-      "deletedFromSql", "noHorizontalScrollAt390",
+      "deletedFromSql", "settingsRouteReady", "settingsRouteShowsThePolicy",
+      "settingsRouteHasNoMemberTable", "settingsRouteShowsTheSameBehaviour",
+      "settingsRouteSaveIsInSql", "settingsRouteSaveSaidSo", "signupRestored",
+      "noHorizontalScrollAt390",
     ];
     const memberSteps = report.members || {};
     const missing = required.filter((key) => memberSteps[key] === undefined);

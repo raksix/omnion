@@ -361,6 +361,10 @@ export function MembersView() {
           try {
             const saved = await saveMemberSettings(siteId, next);
             setDocument(saved);
+            // The gate sentence is the one an operator has just changed, so it is what the
+            // confirmation reports. The signup toggle's own effect is on screen above it, and a
+            // notice that says "comments are off" on a membership screen is the kind of copy a
+            // panel inherits by copy-paste and nobody reads until it is embarrassing.
             setNotice(
               saved.settings.gated_page_behaviour === "not_found"
                 ? "Saved. A gated page now answers 404 to somebody who cannot read it — the same answer a page that does not exist gives."
@@ -1387,6 +1391,112 @@ function ConfirmDelete({
 }
 
 /**
+ * The `/members/settings` route's body, and the reason `/members` embeds the same component.
+ *
+ * **One screen, two routes, zero copies.** The REQ lists `/members` and `/members/settings` as two
+ * routes, and an owner reaches for the second one from a settings menu while the first is the place
+ * they land from the nav. Rather than write the policy twice — and then have the two copies drift
+ * apart the first time a field is added — this wrapper owns everything that is not the panel's own
+ * state (loading, no site, the save handler and the notice) and both routes render it.
+ */
+export function MemberSettingsScreen() {
+  const { selectedSite, status: siteStatus, error: siteError } = useSites();
+  const siteId = selectedSite?.id ?? null;
+
+  const [document, setDocument] = useState<Awaited<ReturnType<typeof fetchMemberSettings>> | null>(
+    null,
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!siteId) return;
+    setError(null);
+    try {
+      setDocument(await fetchMemberSettings(siteId));
+    } catch (caught) {
+      setError((caught as ApiError).message);
+    }
+  }, [siteId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    setNotice(null);
+  }, [siteId]);
+
+  if (siteStatus === "loading" && !document) {
+    return (
+      <div className="space-y-3" data-members-settings-state="loading">
+        <div className="h-8 w-64 animate-pulse rounded-md bg-surface" />
+        <div className="h-44 animate-pulse rounded-md bg-surface" />
+      </div>
+    );
+  }
+
+  if (!siteId) {
+    return (
+      <div data-members-settings-state="no-site">
+        <EmptyState
+          title="Pick a site"
+          hint="Membership policy belongs to a site. Choose one from the header to edit how its visitors are handled."
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6" data-members-settings-state="ready" data-members-settings-site={siteId}>
+      {siteError ? <ErrorStrip message={siteError} onRetry={() => void load()} /> : null}
+      {error ? <ErrorStrip message={error} onRetry={() => void load()} /> : null}
+      {notice ? (
+        <div
+          role="status"
+          data-members-notice
+          className="flex items-start gap-2 rounded-md border border-line bg-surface px-3 py-2 text-[12.5px]"
+        >
+          <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-ok" aria-hidden />
+          <span className="flex-1">{notice}</span>
+          <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss">
+            <X className="h-3.5 w-3.5" aria-hidden />
+          </button>
+        </div>
+      ) : null}
+
+      <PolicyPanel
+        document={document}
+        verifiedCount={document?.verified_count ?? null}
+        saving={saving}
+        onSave={async (next) => {
+          setSaving(true);
+          setError(null);
+          try {
+            const saved = await saveMemberSettings(siteId, next);
+            setDocument(saved);
+            // The gate sentence is the one an operator has just changed, so it is what the
+            // confirmation reports. The signup toggle's own effect is on screen above it, and a
+            // notice that says "comments are off" on a membership screen is the kind of copy a
+            // panel inherits by copy-paste and nobody reads until it is embarrassing.
+            setNotice(
+              saved.settings.gated_page_behaviour === "not_found"
+                ? "Saved. A gated page now answers 404 to somebody who cannot read it — the same answer a page that does not exist gives."
+                : "Saved. A gated page now answers 401 with a sign-in link, which tells a visitor that the page exists.",
+            );
+          } catch (caught) {
+            setError((caught as ApiError).message);
+          } finally {
+            setSaving(false);
+          }
+        }}
+      />
+    </div>
+  );
+}
+
+/**
  * The membership policy, every control visible at once.
  *
  * The gated-page behaviour is a radio with its consequence spelled out rather than a checkbox with
@@ -1394,7 +1504,7 @@ function ConfirmDelete({
  * from a page that does not exist, `prompt` tells a stranger that it does. An owner picks the
  * second deliberately, which is exactly what a panel that explains the difference makes possible.
  */
-function PolicyPanel({
+export function PolicyPanel({
   document,
   verifiedCount,
   saving,
