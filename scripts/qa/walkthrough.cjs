@@ -4258,12 +4258,18 @@ async function runMenusDepth(page, report) {
     // and an assertion that counts reports the working editor as broken. This version also
     // explains a nest that did not happen: if the parent's branch never opened, the child is
     // legitimately absent from the DOM and this reads false with the labels printed beside it.
+    // The child's row, reached through the parent's CHILD LIST. `[data-menu-item="<parent>"]`
+    // matched the parent's own `<li>`, and the first `[data-menu-item-row]` inside that `<li>`
+    // is the parent's own row — so this read back the parent's id, and the nest check answered
+    // "the second row has a child" by asking the second row about itself. The children are in
+    // the sibling `<ul>`, one level down, which is the only place a child row can be.
     const nestedChildId = await page
-      .locator(`[data-menu-item="${secondId}"] [data-menu-item-row]`)
+      .locator(`[data-menu-item="${secondId}"] > ul > li > [data-menu-item-row]`)
       .first()
       .getAttribute("data-menu-item-row")
       .catch(() => null);
-    steps.nestedUnderSecond = nestedChildId !== null;
+    steps.nestedChildId = nestedChildId;
+    steps.nestedUnderSecond = nestedChildId !== null && nestedChildId !== secondId;
     steps.nestedParentRowFound =
       (await page.locator(`[data-menu-item="${secondId}"]`).count()) > 0;
     if (nestedChildId) {
