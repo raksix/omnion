@@ -80,6 +80,10 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.blocks.read",
             "content.patterns.manage",
             "content.templates.manage",
+            // Navigation belongs to whoever runs the content: a manager can reshape the
+            // header, and reading the menus is part of doing that.
+            "menus.read",
+            "menus.manage",
             "media.read",
             "media.upload",
             "media.update",
@@ -136,6 +140,9 @@ const BASE_ROLES: &[BaseRole] = &[
             "content.pages.schedule",
             "content.pages.restore",
             "content.blocks.read",
+            // Read-only: a moderator checks that the navigation points at live pages, but the
+            // header itself is the manager's to change.
+            "menus.read",
             "media.read",
             "media.update",
             "ai.chat",

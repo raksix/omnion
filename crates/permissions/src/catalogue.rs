@@ -76,6 +76,22 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Create and edit page templates",
     },
+    // The CMS depth pack (REQ-064, slice 1). Menus and scheduled publishing are two separate
+    // powers: an account that may publish a page does not thereby gain the right to rewrite the
+    // site's header, and an account that may edit the header may not schedule a post. The
+    // publishing key is `content.pages.schedule`, which already existed — the queue is that
+    // permission's queue, and inventing a second one would have made "who may schedule a post"
+    // and "who may look at the schedule" different questions about the same rows.
+    PermissionDef {
+        key: "menus.read",
+        category: "content",
+        description: "Read site menus and their items",
+    },
+    PermissionDef {
+        key: "menus.manage",
+        category: "content",
+        description: "Create, edit and remove site menus",
+    },
     // Media.
     PermissionDef {
         key: "media.read",
