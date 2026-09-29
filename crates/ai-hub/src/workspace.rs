@@ -228,11 +228,19 @@ pub fn storage_key(agent_id: Uuid, checksum: &str) -> String {
 /// One aggregate query rather than a per-file loop, because the Workspace tab renders this on
 /// every load and a hundred rows of `sum` is a hundred round trips for one number.
 pub async fn usage(pool: &PgPool, agent_id: Uuid) -> Result<Usage> {
-    let row: (Option<i64>, Option<i64>) =
-        sqlx::query_as("select coalesce(sum(size_bytes), 0), count(*) from ai_agent_files where agent_id = $1")
-            .bind(agent_id)
-            .fetch_one(pool)
-            .await?;
+    // `sum(bigint)` returns **numeric** in PostgreSQL, not `bigint`: the aggregate is promoted so
+    // a sum that would overflow eight bytes errors instead of wrapping. So the cast has to be in
+    // the SQL — `coalesce(sum(size_bytes), 0)::bigint` — and a query without it decodes as
+    // `Option<i64>` and fails at run time on a perfectly good row. The `::bigint` cast of a
+    // `numeric` that exceeded the range would itself error, which is the answer we want: a
+    // workspace cannot hold 9.2 exabytes, and if it somehow did, the cap check must not pass.
+    let row: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "select coalesce(sum(size_bytes), 0)::bigint, count(*) from ai_agent_files \
+         where agent_id = $1",
+    )
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await?;
     Ok(Usage {
         used_bytes: row.0.unwrap_or_default().max(0) as u64,
         limit_bytes: MAX_AGENT_BYTES,

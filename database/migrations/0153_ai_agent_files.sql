@@ -59,6 +59,10 @@ create table if not exists ai_agent_files (
         and path !~ '[[:cntrl:]]'
         and path !~ '(^|/)\.\.(/|$)'
         and path !~ '^/'
+        -- A drive letter, restated from the Rust validator. `C:\notes.md` clears every clause
+        -- above — no slash, no leading slash, no `..` — and it is the shape a Windows client
+        -- sends when a path is concatenated by hand rather than taken from an API.
+        and path !~ '^[A-Za-z]:'
     ),
     -- A row with no storage key is a row whose bytes cannot be fetched, and a download route
     -- that answers "not found" for it is indistinguishable from a file that was deleted.

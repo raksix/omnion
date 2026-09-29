@@ -227,6 +227,33 @@ async fn the_database_also_refuses_a_traversal() {
 }
 
 #[tokio::test]
+async fn the_database_also_refuses_a_windows_drive_letter() {
+    // `C:\notes.txt` has no forward slash, no leading slash and no `..` — it cleared every clause
+    // of the constraint as it was first written, and the Rust validator was the only thing
+    // refusing it. A check that exists in one implementation is a check the next writer misses,
+    // so the constraint now carries the drive-letter rule too. This walk is what notices if a
+    // later edit drops that clause again.
+    let Some(store) = Workspace::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+
+    let error = sqlx::query(
+        "insert into ai_agent_files (agent_id, path, size_bytes, storage_key) \
+         values ($1, 'C:\\notes.txt', 10, 'agents/x/y')",
+    )
+    .bind(store.agent_id)
+    .execute(&store.pool)
+    .await
+    .expect_err("the database must refuse a drive letter");
+    assert!(
+        error.to_string().contains("ai_agent_files_path_clean"),
+        "the refusal must name the rule: {error}"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
 async fn the_database_also_refuses_an_oversized_file() {
     let Some(store) = Workspace::fresh().await else {
         eprintln!("skipping: PostgreSQL is not reachable");
@@ -365,7 +392,7 @@ async fn one_agents_files_never_count_against_another_agents_quota() {
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn re_uploading_a_path_replaces_the_row_instead_of_adding_one() {
+async fn re_uploading_a_path_updates_the_row_in_place_and_moves_its_object_key() {
     let Some(store) = Workspace::fresh().await else {
         eprintln!("skipping: PostgreSQL is not reachable");
         return;
@@ -374,7 +401,19 @@ async fn re_uploading_a_path_replaces_the_row_instead_of_adding_one() {
     let first = store.put("notes.md", 1_000).await;
     let second = store.put("notes.md", 2_000).await;
 
-    assert_ne!(first.id, second.id, "a replacement is a new row, not an update in place");
+    // The row identity is **kept**. This assertion was written the other way round — "a
+    // replacement is a new row" — and it was wrong: `put_file` upserts on `(agent_id, path)`, so
+    // the second write updates the row in place. That is the better behaviour and the test
+    // proves it: a row whose id changed would orphan every `ai_run_inputs` reference pointing at
+    // it, and the trace of a run would silently lose the input it named.
+    assert_eq!(
+        first.id, second.id,
+        "a replacement updates the row, so the references to it survive"
+    );
+    assert_ne!(
+        first.storage_key, second.storage_key,
+        "but the object key moves: new bytes, new key, or the bucket keeps serving the old one"
+    );
     let rows = workspace::list_files(&store.pool, store.agent_id).await.expect("list");
     assert_eq!(rows.len(), 1, "one path names one file");
     assert_eq!(rows[0].size_bytes, 2_000, "the newer bytes are the ones the row describes");
