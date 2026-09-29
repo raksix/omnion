@@ -29,6 +29,7 @@ pub mod etag;
 pub mod headers;
 pub mod matcher;
 pub mod provider;
+pub mod purge;
 pub mod rule;
 pub mod store;
 
