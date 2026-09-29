@@ -7919,6 +7919,97 @@ note({
     await tabTwo.close().catch(() => {});
   }
 
+  // ---- Run from here (REQ-004 slice 3) -----------------------------------------------------
+  // The criterion in three readings, and the only one that counts is the stored rows: a
+  // toast that says "Run started" proves the button was pressed, not that the prefix was
+  // skipped. The rows are read back through the API by step_no, because a run that quietly
+  // executed the prefix the author asked to skip is exactly what this has to rule out.
+  {
+    // Start from the *second* action of a live graph, so there is a prefix to skip.
+    // The *second* node in draw order, so there is a prefix to skip. A run from the first
+    // node is a whole run and would prove nothing about skipping.
+    const cards = page.locator("[data-node-id]");
+    const cardCount = await cards.count();
+    if (cardCount > 1) {
+      await cards.nth(1).click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(600);
+    }
+
+    const control = page.locator("[data-run-from-here]").first();
+    const controlCount = await control.count();
+    const canStart = controlCount > 0
+      ? await control.first().getAttribute("data-can-start")
+      : null;
+    const disabledReason =
+      canStart === "false"
+        ? ((await page.locator("[data-run-from-here-reason]").first().innerText().catch(() => ""))
+            .replace(/\s+/g, " ")
+            .trim())
+        : null;
+
+    const before = await page.evaluate(async () => {
+      const res = await fetch("/api/v1/workflows", { credentials: "same-origin" });
+      return res.ok ? res.json() : null;
+    }).catch(() => null);
+
+    let after = null;
+    if (canStart === "true") {
+      await page.locator("[data-run-from-here-button]").first().click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+      // Read the run back from the API, not from the canvas: the canvas paints what the
+      // server sent, and the criterion is about what the engine is holding.
+      after = await page.evaluate(async (workflowId) => {
+        const res = await fetch(`/api/v1/workflows/${workflowId}/executions?limit=1`, {
+          credentials: "same-origin",
+        });
+        if (!res.ok) return null;
+        const body = await res.json();
+        const latest = body.executions?.[0];
+        if (!latest) return null;
+        const detail = await fetch(`/api/v1/workflow-executions/${latest.id}`, {
+          credentials: "same-origin",
+        });
+        if (!detail.ok) return null;
+        const run = await detail.json();
+        return {
+          startedFrom: run.started_from_node ?? null,
+          steps: (run.steps ?? []).map((step) => ({
+            step_no: step.step_no,
+            status: step.status,
+            skip_reason: step.skip_reason ?? null,
+          })),
+        };
+      }, workflowId).catch(() => null);
+    }
+
+    const skippedRows = (after?.steps ?? []).filter((step) => step.status === "skipped");
+    const firstSkipped = skippedRows[0] ?? null;
+    const runnable = (after?.steps ?? []).filter((step) => step.status !== "skipped");
+
+    note({
+      step: "run-from-here",
+      controlFound: controlCount > 0,
+      cardsOnCanvas: cardCount,
+      canStart,
+      // A disabled control must say why. A greyed button with no reason is a dead
+      // button wearing a disabled attribute.
+      disabledReason: disabledReason ? disabledReason.slice(0, 160) : null,
+      skipped: skippedRows.length,
+      // The reason has to *name* the node the run started at — "skipped" alone satisfies
+      // the word and not the clause, and cannot be told apart from a lost run.
+      reasonNamesNode: firstSkipped
+        ? new RegExp(after?.startedFrom ?? "x").test(firstSkipped.skip_reason ?? "")
+        : null,
+      // The first step that actually runs is the one after the skipped prefix, and its
+      // status is not `skipped` — the node that was pressed must be the node that ran.
+      firstRunnableNo: runnable[0]?.step_no ?? null,
+      firstSkippedNo: firstSkipped?.step_no ?? null,
+      startedFrom: after?.startedFrom ?? null,
+      ruleCount: Array.isArray(before?.workflows) ? before.workflows.length : null,
+    });
+    await shot(page, "page-workflow-builder-run-from-here");
+  }
+
   // ---- Cleanup: this pass owns the rule it made --------------------------------------------
   await page.goto(`${URL_ADMIN}/automations`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);
