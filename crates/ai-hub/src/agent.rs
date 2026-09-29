@@ -150,6 +150,17 @@ pub enum StopReason {
     LoopDetected,
     /// The run failed — a provider refused, a tool threw, the model could not be reached.
     Error,
+    /// The final answer did not match the shape the caller required, and the single repair
+    /// turn did not fix it (REQ-099 slice 4's guardrails).
+    ///
+    /// **Its own variant rather than a re-use of `Error`.** An answer that fails its schema is
+    /// the one failure where the operator's next action is *different*: nothing is broken, the
+    /// model simply produced a shape nobody asked for, and a run reported as `error` sends the
+    /// reader looking at the provider, the tools and the network instead of at the rule. It is
+    /// a failure for the success-rate metric — no answer was produced — which `is_failure`
+    /// therefore says, so the reliability number does not quietly improve because we started
+    /// checking answers.
+    OutputSchema,
 }
 
 impl StopReason {
@@ -164,6 +175,7 @@ impl StopReason {
             Self::Cancelled => "cancelled",
             Self::LoopDetected => "loop_detected",
             Self::Error => "error",
+            Self::OutputSchema => "output_schema",
         }
     }
 
@@ -176,6 +188,7 @@ impl StopReason {
             "token_budget" => Some(Self::TokenBudget),
             "cancelled" => Some(Self::Cancelled),
             "loop_detected" => Some(Self::LoopDetected),
+            "output_schema" => Some(Self::OutputSchema),
             "error" => Some(Self::Error),
             _ => None,
         }
@@ -188,7 +201,10 @@ impl StopReason {
     /// reliability is the definition of a metric that gets gamed.
     #[must_use]
     pub fn is_failure(self) -> bool {
-        matches!(self, Self::Error | Self::Deadline | Self::LoopDetected)
+        matches!(
+            self,
+            Self::Error | Self::Deadline | Self::LoopDetected | Self::OutputSchema
+        )
     }
 }
 
@@ -460,6 +476,29 @@ pub enum AgentEvent {
         /// The message to show a person.
         message: String,
     },
+    /// A guardrail rule fired (REQ-099 slice 4).
+    ///
+    /// **A first-class event rather than a `note`.** The loop already has a `note` kind, and
+    /// routing guardrails through it would be cheaper — but a guardrail hit is the one loop
+    /// event a *different* system has to be able to subscribe to: the bus publishes
+    /// `ai.guardrail.blocked` from it, REQ-101's inbox lists it, and a webhook operator filters
+    /// on it. A consumer that has to string-match inside a note's JSON to find one is a
+    /// consumer that silently misses it the first time somebody renames the field.
+    ///
+    /// It also carries no payload text, on purpose. The rule exists *because* the content is
+    /// untrusted, and a trace row readable by every operator on the tenant is the last place a
+    /// hostile string should be re-served. The rule, the source and the step are enough to
+    /// investigate; the payload is in the tool's own result row, which is where it came from.
+    Guardrail {
+        /// The step the rule fired on, when it is tied to one.
+        step_no: Option<u32>,
+        /// Which rule fired, as its wire name.
+        rule: String,
+        /// The tool that produced the untrusted text, or the tool that was denied.
+        source: String,
+        /// A sentence to show a person, never the payload.
+        detail: String,
+    },
 }
 
 impl AgentEvent {
@@ -477,6 +516,13 @@ impl AgentEvent {
             | Self::Usage { step_no, .. }
             | Self::AwaitingApproval { step_no, .. }
             | Self::Error { step_no, .. } => Some(*step_no),
+            // A guardrail hit is `Option<u32>` rather than `u32` on purpose: an output-schema
+            // failure is about the run's answer, not about one turn, so the flat accessor has
+            // to be able to say "no single step". The persistence layer uses this to decide
+            // whether the event lands on an existing step row or starts its own — and a guardrail
+            // that has no step is exactly the one that must start its own, or it would be
+            // silently attributed to whatever step happened to be last.
+            Self::Guardrail { step_no, .. } => *step_no,
             Self::Done { .. } => None,
         }
     }
