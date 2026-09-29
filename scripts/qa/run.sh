@@ -39,6 +39,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+# Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+# compiling at once (see cargo-slot.sh). Without it every pass's `cargo build -p omnion-api`
+# takes all six cores and eight of them thrash at load 30+.
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 # A CSRF secret for this disposable stack only, so the panel can save anything.
 #
 # The API's CSRF layer refuses rather than skips when no secret is configured — correct in
@@ -117,9 +121,14 @@ step "API on :$API_PORT (database omnion_qa)"
 if [ ! -x target/debug/omnion-api ] \
    || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
-  cargo build -p omnion-api
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
+  # --update-env re-reads the stack's env from THIS shell, which is where the CSRF secret and
+  # the QA port come from. Without it a restarted API keeps whatever env it was first started
+  # with — a different stack's port, and no CSRF secret, so every panel write answers 403.
   pm2 restart "$API_NAME" --update-env >/dev/null
 else
   OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
