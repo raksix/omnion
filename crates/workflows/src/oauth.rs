@@ -291,8 +291,12 @@ impl StateRejection {
         match self {
             Self::Unrecognised => "the authorization state is not one this installation issued",
             Self::Expired => "the authorization request expired — start the connection again",
-            Self::WrongCredential => "the authorization state was issued for a different credential",
-            Self::WrongOrganization => "the authorization state was issued for another organization",
+            Self::WrongCredential => {
+                "the authorization state was issued for a different credential"
+            }
+            Self::WrongOrganization => {
+                "the authorization state was issued for another organization"
+            }
             Self::Used => "the authorization request was already completed",
         }
     }
@@ -721,11 +725,7 @@ impl RefreshLock {
     /// Returns `None` when the wait ran out, which the caller must surface as a *retry* rather
     /// than as a refresh failure: a credential that timed out behind a peer has not failed, and
     /// recording `needs_reauth` for it would disable nodes over a five-second queue.
-    pub fn acquire(
-        &self,
-        credential: uuid::Uuid,
-        wait: Duration,
-    ) -> Option<RefreshGuard<'_>> {
+    pub fn acquire(&self, credential: uuid::Uuid, wait: Duration) -> Option<RefreshGuard<'_>> {
         let deadline = Instant::now() + wait;
         loop {
             let mut held = self.held.lock().ok()?;
@@ -830,8 +830,8 @@ impl LocalBox {
         // Encrypt, THEN authenticate the ciphertext. This is the whole construction: the tag
         // below is computed over the nonce *and* the ciphertext, so `open` verifies before it
         // decrypts and a flipped byte is refused rather than returned as corrupted plaintext.
-        let mut full_mac = HmacSha256::new_from_slice(&self.key)
-            .expect("HMAC accepts a key of any length");
+        let mut full_mac =
+            HmacSha256::new_from_slice(&self.key).expect("HMAC accepts a key of any length");
         full_mac.update(&nonce);
         full_mac.update(&cipher);
         let full_tag = full_mac.finalize().into_bytes();
@@ -870,13 +870,10 @@ impl LocalBox {
         mac.update(&cipher);
         // Verify before decrypting: a tampered envelope must never produce plaintext, not even
         // plaintext that is then thrown away.
-        mac.verify_slice(&tag).map_err(|_| "tag mismatch".to_string())?;
+        mac.verify_slice(&tag)
+            .map_err(|_| "tag mismatch".to_string())?;
         let stream = keystream(&self.key, &nonce, cipher.len());
-        let plain: Vec<u8> = cipher
-            .iter()
-            .zip(stream)
-            .map(|(b, k)| b ^ k)
-            .collect();
+        let plain: Vec<u8> = cipher.iter().zip(stream).map(|(b, k)| b ^ k).collect();
         String::from_utf8(plain).map_err(|_| "sealed value was not utf-8".into())
     }
 }
@@ -984,7 +981,12 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let state = build_state(organization, id, &key(), now);
         assert_eq!(
-            verify_state(&state, b"a-different-installation-key-entirely!", now, Some(id)),
+            verify_state(
+                &state,
+                b"a-different-installation-key-entirely!",
+                now,
+                Some(id)
+            ),
             Err(StateRejection::Unrecognised)
         );
     }
@@ -1108,7 +1110,10 @@ mod tests {
         // RFC 7636 appendix B: verifier dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
         // has challenge E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM.
         let pair = PkcePair::derive("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
-        assert_eq!(pair.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert_eq!(
+            pair.challenge,
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
         assert!(PkcePair::verify(&pair.challenge, pair.verifier()));
         assert!(!PkcePair::verify(&pair.challenge, "not-the-verifier"));
     }
@@ -1136,8 +1141,14 @@ mod tests {
         let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
         assert_eq!(query.get("tenant").map(String::as_str), Some("acme"));
         assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
-        assert_eq!(query.get("code_challenge").map(String::as_str), Some(&pair.challenge[..]));
-        assert_eq!(query.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some(&pair.challenge[..])
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
         assert_eq!(query.get("state").map(String::as_str), Some("state-1"));
     }
 
@@ -1158,9 +1169,8 @@ mod tests {
 
     #[test]
     fn a_callback_query_reads_the_three_things_and_ignores_the_rest() {
-        let parsed = CallbackQuery::parse(
-            "code=abc&state=xyz&tracking=drop&error_description=hi%20there",
-        );
+        let parsed =
+            CallbackQuery::parse("code=abc&state=xyz&tracking=drop&error_description=hi%20there");
         assert_eq!(parsed.code.as_deref(), Some("abc"));
         assert_eq!(parsed.state.as_deref(), Some("xyz"));
         assert_eq!(parsed.refusal(), None);
@@ -1286,7 +1296,11 @@ mod tests {
         assert!(request.carries_secret());
 
         let public = TokenRequest::authorization_code(
-            "code-1", "client-1", None, "https://app.test/callback", Some("verifier-1"),
+            "code-1",
+            "client-1",
+            None,
+            "https://app.test/callback",
+            Some("verifier-1"),
         );
         assert!(!public.encode().contains("client_secret"));
     }
@@ -1306,13 +1320,22 @@ mod tests {
         let past = now - time::Duration::seconds(1);
 
         assert!(needs_refresh(Some(in_10), now), "due in 10s is due");
-        assert!(!needs_refresh(Some(in_2_minutes), now), "120s of headroom is not due");
+        assert!(
+            !needs_refresh(Some(in_2_minutes), now),
+            "120s of headroom is not due"
+        );
         assert!(!is_expired(Some(in_10), now), "but it is not expired yet");
 
         assert!(is_expired(Some(past), now));
-        assert!(!needs_refresh(Some(past), now), "expired is not 'due', it is broken");
+        assert!(
+            !needs_refresh(Some(past), now),
+            "expired is not 'due', it is broken"
+        );
 
-        assert!(!needs_refresh(None, now), "no expiry means nothing to schedule");
+        assert!(
+            !needs_refresh(None, now),
+            "no expiry means nothing to schedule"
+        );
     }
 
     #[test]
@@ -1325,7 +1348,10 @@ mod tests {
         let refused = lock.acquire(credential, Duration::from_millis(20));
         assert!(refused.is_none(), "a held lock refuses a second holder");
         // A different credential is a different lock.
-        assert!(lock.acquire(Uuid::new_v4(), Duration::from_millis(0)).is_some());
+        assert!(
+            lock.acquire(Uuid::new_v4(), Duration::from_millis(0))
+                .is_some()
+        );
 
         drop(held);
         assert!(
@@ -1358,11 +1384,18 @@ mod tests {
         // Flip one character of the ciphertext section.
         let mut parts: Vec<&str> = sealed.split('.').collect();
         let cipher = parts[2].to_string();
-        let flipped = if cipher.starts_with('A') { format!("B{}", &cipher[1..]) } else { format!("A{}", &cipher[1..]) };
+        let flipped = if cipher.starts_with('A') {
+            format!("B{}", &cipher[1..])
+        } else {
+            format!("A{}", &cipher[1..])
+        };
         parts[2] = &flipped;
         let tampered = parts.join(".");
         let error = box_key.open(&tampered).unwrap_err();
-        assert_eq!(error, "tag mismatch", "a tampered envelope must not decrypt");
+        assert_eq!(
+            error, "tag mismatch",
+            "a tampered envelope must not decrypt"
+        );
     }
 
     #[test]
@@ -1375,7 +1408,15 @@ mod tests {
     #[test]
     fn a_malformed_or_foreign_envelope_is_an_error_and_never_a_partial_value() {
         let box_key = LocalBox::from_key_material(b"an-installation-key-of-any-length");
-        for bad in ["", "s1", "s1.a", "s1.a.b", "s1.a.b.c.d", "v9.a.b.c", "not an envelope"] {
+        for bad in [
+            "",
+            "s1",
+            "s1.a",
+            "s1.a.b",
+            "s1.a.b.c.d",
+            "v9.a.b.c",
+            "not an envelope",
+        ] {
             assert!(box_key.open(bad).is_err(), "{bad:?} must not open");
         }
     }

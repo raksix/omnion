@@ -28,9 +28,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::error::WorkflowError;
-use crate::oauth::{
-    REFRESH_LEAD, RefreshLock, TokenRequest, TokenSet, is_expired, needs_refresh,
-};
+use crate::oauth::{REFRESH_LEAD, RefreshLock, TokenRequest, TokenSet, is_expired, needs_refresh};
 use crate::oauth_client::OAuthClient;
 
 /// How long a caller waits behind a peer before giving up on the lock.
@@ -271,7 +269,9 @@ mod tests {
         /// Separate from [`Self::new`] because a one-shot fixture is the right shape for
         /// "what does a single caller do" and the *wrong* shape for "what do six concurrent
         /// callers do" — there, the losers' answers are the lock's, not the fixture's.
-        fn unlimited(answer: impl Fn() -> StdResult<TokenSet, String> + Send + Sync + 'static) -> Self {
+        fn unlimited(
+            answer: impl Fn() -> StdResult<TokenSet, String> + Send + Sync + 'static,
+        ) -> Self {
             Self {
                 answer: Arc::new(Mutex::new(None)),
                 calls: Arc::new(Mutex::new(0)),
@@ -280,18 +280,27 @@ mod tests {
         }
 
         fn count(&self) -> usize {
-            *self.calls.lock().expect("the counter mutex is not poisoned")
+            *self
+                .calls
+                .lock()
+                .expect("the counter mutex is not poisoned")
         }
 
         fn take(&self) -> StdResult<TokenSet, String> {
             if let Some(always) = &self.always {
                 return always();
             }
-            match self.answer.lock().expect("the answer mutex is not poisoned").take() {
+            match self
+                .answer
+                .lock()
+                .expect("the answer mutex is not poisoned")
+                .take()
+            {
                 Some(Err(reason)) => Err(reason),
                 Some(Ok(set)) => Ok(set),
-                None => Err("the fixture was called more times than it was given answers for"
-                    .to_string()),
+                None => Err(
+                    "the fixture was called more times than it was given answers for".to_string(),
+                ),
             }
         }
     }
@@ -325,7 +334,10 @@ mod tests {
         .expect("a well-formed set")
     }
 
-    fn plan<'a>(expires_at: Option<OffsetDateTime>, refresh_token: Option<&'a str>) -> RefreshPlan<'a> {
+    fn plan<'a>(
+        expires_at: Option<OffsetDateTime>,
+        refresh_token: Option<&'a str>,
+    ) -> RefreshPlan<'a> {
         RefreshPlan {
             credential_id: uuid::Uuid::nil(),
             token_url: "https://provider.example/token",
@@ -356,7 +368,11 @@ mod tests {
         )
         .await;
         assert_eq!(outcome, RefreshOutcome::Fresh { is_current: true });
-        assert_eq!(fixture.count(), 0, "a token that is not due is not refreshed");
+        assert_eq!(
+            fixture.count(),
+            0,
+            "a token that is not due is not refreshed"
+        );
         assert!(outcome.has_token(), "the caller still has a usable token");
     }
 
@@ -369,7 +385,10 @@ mod tests {
             plan(Some(in_a_minute()), Some("rt-1")),
         )
         .await;
-        assert!(matches!(outcome, RefreshOutcome::Refreshed(_)), "{outcome:?}");
+        assert!(
+            matches!(outcome, RefreshOutcome::Refreshed(_)),
+            "{outcome:?}"
+        );
         assert_eq!(fixture.count(), 1);
         assert!(outcome.has_token());
     }
@@ -379,8 +398,12 @@ mod tests {
         // The important one. A provider that issues no refresh token is ordinary, and marking
         // this credential `needs_reauth` would render an amber chip over a working connection.
         let fixture = Fixture::new(Ok(set(Some("rt-2"))));
-        let outcome =
-            refresh_or_use(&fixture, &RefreshLock::new(), plan(Some(in_a_minute()), None)).await;
+        let outcome = refresh_or_use(
+            &fixture,
+            &RefreshLock::new(),
+            plan(Some(in_a_minute()), None),
+        )
+        .await;
         assert_eq!(outcome, RefreshOutcome::Fresh { is_current: true });
         assert_eq!(fixture.count(), 0, "there is nothing to spend");
         assert!(outcome.has_token());
@@ -411,7 +434,10 @@ mod tests {
             RefreshOutcome::Fresh { is_current: false },
             "stale and unrefreshable is not the same answer as fine"
         );
-        assert!(!outcome.has_token(), "the caller must know the token is dead");
+        assert!(
+            !outcome.has_token(),
+            "the caller must know the token is dead"
+        );
     }
 
     #[tokio::test]
@@ -443,15 +469,22 @@ mod tests {
             .expect("a free lock is acquirable");
 
         let fixture = Fixture::new(Ok(set(Some("rt-2"))));
-        let outcome = refresh_or_use(
-            &fixture,
-            &lock,
-            plan(Some(in_a_minute()), Some("rt-1")),
-        )
-        .await;
-        assert_eq!(outcome, RefreshOutcome::Busy, "a held lock is a retry, not a failure");
-        assert!(!outcome.has_token(), "the caller retries rather than using a stale token");
-        assert_eq!(fixture.count(), 0, "and the provider was never called at all");
+        let outcome =
+            refresh_or_use(&fixture, &lock, plan(Some(in_a_minute()), Some("rt-1"))).await;
+        assert_eq!(
+            outcome,
+            RefreshOutcome::Busy,
+            "a held lock is a retry, not a failure"
+        );
+        assert!(
+            !outcome.has_token(),
+            "the caller retries rather than using a stale token"
+        );
+        assert_eq!(
+            fixture.count(),
+            0,
+            "and the provider was never called at all"
+        );
         // The guard is released when it drops here, which the next test proves.
     }
 
@@ -465,13 +498,12 @@ mod tests {
                 .expect("acquired");
         }
         let fixture = Fixture::new(Ok(set(Some("rt-2"))));
-        let outcome = refresh_or_use(
-            &fixture,
-            &lock,
-            plan(Some(in_a_minute()), Some("rt-1")),
-        )
-        .await;
-        assert!(matches!(outcome, RefreshOutcome::Refreshed(_)), "{outcome:?}");
+        let outcome =
+            refresh_or_use(&fixture, &lock, plan(Some(in_a_minute()), Some("rt-1"))).await;
+        assert!(
+            matches!(outcome, RefreshOutcome::Refreshed(_)),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -570,7 +602,10 @@ mod tests {
         let pair = PkcePair::generate();
         let request = TokenRequest::refresh("rt-1", "cid", None, None);
         assert!(!request.encode().contains(pair.verifier()));
-        assert!(request.carries_secret(), "a refresh token is a secret by construction");
+        assert!(
+            request.carries_secret(),
+            "a refresh token is a secret by construction"
+        );
     }
 
     #[test]

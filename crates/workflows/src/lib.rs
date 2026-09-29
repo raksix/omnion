@@ -27,6 +27,7 @@ pub mod engine;
 pub mod error;
 pub mod handler;
 pub mod model;
+pub mod node_package;
 pub mod oauth;
 pub mod oauth_client;
 pub mod oauth_refresh;

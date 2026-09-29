@@ -249,8 +249,10 @@ pub async fn claim_flow(
     }
 
     // Nothing claimed. Distinguish "gone" from "expired" so the refusal can be a sentence.
-    let sql = format!("select {FLOW_COLUMNS} from workflow_oauth_flows \
-                       where organization_id = $1 and state_hash = $2");
+    let sql = format!(
+        "select {FLOW_COLUMNS} from workflow_oauth_flows \
+                       where organization_id = $1 and state_hash = $2"
+    );
     let existing = sqlx::query_as::<_, OAuthFlow>(&sql)
         .bind(organization_id)
         .bind(state_hash)
@@ -370,7 +372,11 @@ pub async fn expire_stale(
 }
 
 /// Drop every flow belonging to a credential, for the credential's own delete.
-pub async fn delete_flows_for(pool: &PgPool, organization_id: Uuid, credential_id: Uuid) -> Result<u64> {
+pub async fn delete_flows_for(
+    pool: &PgPool,
+    organization_id: Uuid,
+    credential_id: Uuid,
+) -> Result<u64> {
     let result = sqlx::query(
         "delete from workflow_oauth_flows where organization_id = $1 and credential_id = $2",
     )
@@ -386,18 +392,23 @@ pub async fn delete_flows_for(pool: &PgPool, organization_id: Uuid, credential_i
 /// The verifier is sealed on the way in and opened only here, on the one code path that is
 /// about to spend a code with it. Returning a pair the caller has no business having would
 /// defeat the point of sealing it.
-pub fn open_pkce(flow: &OAuthFlow, secret_box: &crate::oauth::LocalBox) -> Result<Option<PkcePair>> {
-    let (Some(encoded), Some(challenge)) = (flow.code_verifier_enc.as_deref(), flow.code_challenge.as_deref())
-    else {
+pub fn open_pkce(
+    flow: &OAuthFlow,
+    secret_box: &crate::oauth::LocalBox,
+) -> Result<Option<PkcePair>> {
+    let (Some(encoded), Some(challenge)) = (
+        flow.code_verifier_enc.as_deref(),
+        flow.code_challenge.as_deref(),
+    ) else {
         return Ok(None);
     };
-    let verifier = secret_box
-        .open(encoded)
-        .map_err(|_| WorkflowError::CredentialInvalid(format!(
+    let verifier = secret_box.open(encoded).map_err(|_| {
+        WorkflowError::CredentialInvalid(format!(
             "the PKCE verifier for this flow could not be read back; start the connection again \
              (credential {})",
             flow.credential_id
-        )))?;
+        ))
+    })?;
     let pair = PkcePair::derive(&verifier);
     if pair.challenge != challenge {
         return Err(WorkflowError::CredentialInvalid(format!(
@@ -430,7 +441,10 @@ mod tests {
         ] {
             assert_eq!(FlowStatus::parse(status.as_str()), Some(status));
         }
-        assert_eq!(FlowStatus::parse("completing"), Some(FlowStatus::Completing));
+        assert_eq!(
+            FlowStatus::parse("completing"),
+            Some(FlowStatus::Completing)
+        );
     }
 
     #[test]
@@ -504,7 +518,9 @@ mod tests {
         let mut flow = flow_stub();
         flow.code_challenge = Some(pair.challenge.clone());
         flow.code_verifier_enc = Some(crate::oauth::seal_local(&box_key, pair.verifier()));
-        let opened = open_pkce(&flow, &box_key).unwrap().expect("a pkce flow has a pair");
+        let opened = open_pkce(&flow, &box_key)
+            .unwrap()
+            .expect("a pkce flow has a pair");
         assert_eq!(opened.challenge, pair.challenge);
         assert_eq!(opened.verifier(), pair.verifier());
     }

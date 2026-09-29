@@ -93,7 +93,8 @@ pub fn token_set_from_status(status: u16, body: &Value) -> Result<TokenSet> {
 /// Whether a token set still has a refresh token worth spending.
 #[must_use]
 pub fn can_refresh(set: &TokenSet) -> bool {
-    set.refresh_token().is_some_and(|token| !token.trim().is_empty())
+    set.refresh_token()
+        .is_some_and(|token| !token.trim().is_empty())
 }
 
 /// What a provider sent back, when the provider sent a refusal.
@@ -122,7 +123,9 @@ mod tests {
     /// exact change the type's own documentation forbids.
     fn refusal(status: u16, body: &Value) -> String {
         match token_set_from_status(status, body) {
-            Ok(_) => panic!("HTTP {status} with a body this test considered invalid is a token set"),
+            Ok(_) => {
+                panic!("HTTP {status} with a body this test considered invalid is a token set")
+            }
             Err(error) => error.to_string(),
         }
     }
@@ -165,19 +168,23 @@ mod tests {
         )
         .expect("a well-formed answer");
         assert_eq!(set.access_token(), "at-1");
-        assert!(can_refresh(&set), "a set with a refresh token can be refreshed");
+        assert!(
+            can_refresh(&set),
+            "a set with a refresh token can be refreshed"
+        );
     }
 
     #[test]
     fn a_set_with_a_blank_refresh_token_is_not_refreshable() {
         // Some providers answer `"refresh_token": ""` rather than omitting it, and spending an
         // empty one produces a second refusal on every run.
-        let set = token_set_from_status(
-            200,
-            &json!({ "access_token": "at-1", "refresh_token": "" }),
-        )
-        .expect("a well-formed answer");
-        assert!(!can_refresh(&set), "a blank refresh token is not a refresh token");
+        let set =
+            token_set_from_status(200, &json!({ "access_token": "at-1", "refresh_token": "" }))
+                .expect("a well-formed answer");
+        assert!(
+            !can_refresh(&set),
+            "a blank refresh token is not a refresh token"
+        );
     }
 
     #[test]
