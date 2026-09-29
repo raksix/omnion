@@ -3926,3 +3926,69 @@ next most likely symptom (an empty build) will lie about the cause. If there is 
 pass with a **long** `QA_SLOT_WAIT` (3600) so a 25-minute queue does not cost a second attempt,
 and read the six notes named in `next_hint`. The migration is already renumbered and the suite
 database dropped, so the boot failure is gone; what remains is only the queue.
+
+## 2026-09-29 — the ⌘S half did not exist, and the obvious way to add it would have been worse
+
+Two acceptance boxes moved forward this tick, neither closed: both are proven by code and
+committed, and both are waiting on the same browser pass, which has still not had a turn.
+
+**The validation criterion had a single probe, and it was proving the wrong shape.** One
+deliberately broken graph cannot demonstrate five error classes. They overlap, one masks
+another, and — the part that makes the number a lie — a panel rendering only the *first*
+finding reports exactly the same codes as one rendering them all. Each class now gets its
+own graph, built from a valid spine with exactly one defect, plus that spine alone as a
+control: if the control is dirty, every other row is measuring the seed.
+
+Building those graphs by hand nearly cost the tick. The port key is not `next`:
+
+```rust
+const OUT: &[Port] = &[Port::new("out", "Next", false)];      // the label is "Next"
+const TASK_PORTS: &[Port] = &[Port::new("success", "Succeeded", false), ...];
+```
+
+The *label* of the port is "Next". The *key* is `out`. A probe that reads the label and
+writes it into `source_port` gets `unknown_source_port` on all six cases at once, so the
+five codes the criterion asks about can never appear — and the resulting table reports the
+validation as broken when the probe is wrong. Same class of error as `escape-clears` last
+tick, and the tell in both cases is identical: a failure that applies to *every* case at
+once is a property of the harness, not of the thing under test.
+
+**`⌘S` was not handled at all**, and the criterion is half about it. An author with unsaved
+work pressing it got the browser's save-the-page dialog. The naive fix is worse than the
+absence: pointing the key at `persist` leaves the debounce armed, so one keystroke writes
+twice, `graph_version` advances twice, and a second tab is handed a conflict no author
+caused. The second race loses data outright — a press while a write is on the wire starts a
+second request quoting the same version, and whichever loses the database race is refused
+as a conflict the author manufactured by pressing the key that was supposed to help.
+
+The order of the two checks is the whole rule, and it is the non-obvious part:
+
+```ts
+if (state.writeInFlight) return "join-in-flight";   // checked first — the one that can collide
+if (state.debounceArmed) return "write-now";        // has written nothing; cancel it instead
+```
+
+A request that has already left is the only one that can still collide on the version
+column. An armed debounce has written nothing at all, so the correct response to it is not
+"also write" — it is "cancel, then write". Reversed, the code passes the obvious tests and
+fails the criterion. 5 tests, and the reversal turns one of them red (4 pass, 1 fail).
+
+A joined press still moves the indicator to `saving`. That is not politeness: a key that
+visibly does nothing is indistinguishable from a broken one, so the author presses it
+again — and the double write returns through the front door, defeating the guard that was
+written to stop exactly that.
+
+**Proof.** `cargo test -p omnion-workflows` 84/84. `node --test` on the builder suites
+53/53 (48 before, 5 new). `pnpm typecheck` clean. The ⌘S check order reverted → 4 pass /
+1 fail, then restored → 5/5.
+
+**Not proved:** the browser pass. Both boxes state the exact note each waits on
+(`validate-classes`, `cmd-s-writes-once`). ⌘S is invisible on the screen by construction —
+a second write lands while the indicator still reads "saved" — so its probe reads
+`graph_version` three times, and only the last reading proves the criterion.
+
+**Queue note.** The waiter was re-queued at 04:02 with a 3600s budget and is still
+waiting behind w10. `df` first: 87% at the start of the tick, 90% by the end. The reaper
+only runs once *before* the wait loop, so a place that goes stale after that point is only
+cleared by w9's reaper daemon — read the holder file's pid and `/proc/<pid>/cwd` before
+concluding the queue is broken.
