@@ -249,6 +249,13 @@ pub async fn create_execution(
 /// (REQ-133) is a fact about the write rather than a promise each caller has to remember to
 /// keep. The check reads the project row in this transaction, so a run cannot slip between a
 /// read that said `active` and the insert: see [`crate::projects::ensure_run_allowed`].
+///
+/// **The limits guard is the second thing called here, and it belongs here for the same reason.**
+/// `ensure_run_within_limits` reads the day's counters and the in-flight executions; asking them
+/// through a pool would be a second connection reading what this transaction is about to change.
+/// A limit that is checked anywhere but inside the write it guards is a limit that counts a run
+/// before it exists — which, on a project one run below its cap, refuses the run that would have
+/// been the last one.
 pub async fn create_execution_in(
     connection: &mut sqlx::PgConnection,
     workflow: &Workflow,
@@ -257,6 +264,7 @@ pub async fn create_execution_in(
     steps: &[StepDefinition],
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     crate::projects::ensure_run_allowed(connection, workflow.project_id).await?;
+    crate::limits::ensure_run_within_limits(connection, workflow.project_id).await?;
 
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
