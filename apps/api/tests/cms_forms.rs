@@ -48,6 +48,10 @@ struct TestResponse {
     /// both survive. Reading only the first one loses the token and turns every write into a
     /// 403 that reads like a broken form builder.
     set_cookies: Vec<String>,
+    /// `Retry-After`, kept as the string it went out as. A suite that parsed it into a number
+    /// would pass against a response carrying `Retry-After: 0`, which is the one value a client
+    /// reads as "come straight back" — the shape the platform's own `ApiError` refuses to send.
+    retry_after: Option<String>,
     body: Value,
 }
 
@@ -72,6 +76,13 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .iter()
         .filter_map(|value| value.to_str().ok().map(str::to_owned))
         .collect();
+    // Read before the body is consumed: `into_body` moves the response, and a header read
+    // afterwards sees a body that no longer belongs to a response.
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let bytes = response
         .into_body()
         .collect()
@@ -86,6 +97,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookies,
+        retry_after,
         body,
     }
 }
@@ -776,11 +788,32 @@ async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
             "",
         )
         .await;
+    // The rate limit is the one refusal the sender is TOLD about, and it is told with a real
+    // number. The status is the criterion's 429; the header is what makes the number usable
+    // without a second round trip; and the body has to be the honest shape, not the 202 the spam
+    // refusals answer. A 429 with no wait is the same as a silent 202 to a client: it cannot act
+    // on either.
     assert_eq!(
-        third.body["stored"],
-        json!(false),
-        "the third is over the limit: {}",
+        third.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "over the limit is a 429, not a silent 202: {}",
         third.body
+    );
+    assert_eq!(
+        third.body["error"]["code"],
+        json!("form_rate_limited"),
+        "the code is the one a client branches on, and it is under the error envelope like every \
+         other error: {}",
+        third.body
+    );
+    let retry_after: i64 = third
+        .retry_after
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .expect("a Retry-After header a client can parse, as a number");
+    assert!(
+        (1..=3_600).contains(&retry_after),
+        "the wait is what is left of the window, never 0 and never over an hour: {retry_after}"
     );
 
     // A *different* sender is untouched: a per-sender limit that throttled everybody would be a
@@ -795,18 +828,69 @@ async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
         )
         .await;
     assert_eq!(
-        other.body["stored"],
-        json!(true),
+        other.status,
+        StatusCode::ACCEPTED,
         "the limit is per sender: {}",
         other.body
     );
+    assert_eq!(other.body["stored"], json!(true), "{}", other.body);
 
-    let count: i64 =
-        sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
-            .bind(Uuid::parse_str(&form_id).expect("a uuid"))
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("a count");
+    // The spam refusals must stay silent BESIDE the new 429, and the order in the store is what
+    // makes this hold: the honeypot is checked first, so a scripted sender never reaches the rate
+    // limit at all and cannot be told which of the two it tripped. A route that had simply made
+    // every refusal a 429 would pass everything above and then hand a bot the whole map.
+    let spam = fixture
+        .submit("limited", json!({ "note": "bot" }), "203.0.113.50", 9_000, "i am a bot")
+        .await;
+    assert_eq!(
+        spam.status,
+        StatusCode::ACCEPTED,
+        "a filled honeypot is still the silent shape, even from a throttled sender: {}",
+        spam.body
+    );
+    assert_eq!(spam.body["stored"], json!(false), "{}", spam.body);
+    let spam_body = spam.body.as_object().expect("a body object");
+    assert!(
+        !spam_body.contains_key("code") && !spam_body.contains_key("error"),
+        "the 202 must not name a protection: {}",
+        spam.body
+    );
+    assert!(
+        spam.retry_after.is_none(),
+        "a silent spam answer carries no wait to act on: {:?}",
+        spam.retry_after
+    );
+    assert!(
+        !spam_body.contains_key("retry_after_seconds"),
+        "the store's wait belongs in a header, not in a body a bot can diff: {}",
+        spam.body
+    );
+
+    // The too-fast floor is the same contract from the other side: same 202, same silence, and
+    // it is checked *after* the limit, so this sender is over the limit AND too fast — and the
+    // answer must be the spam one, not the 429, or the visitor who failed a race gets told to
+    // come back in an hour for a form they had not even filled in properly.
+    let raced = fixture
+        .submit("limited", json!({ "note": "too fast" }), "203.0.113.50", 5, "")
+        .await;
+    assert_eq!(
+        raced.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the limit is checked before the floor, so an over-limit sender is told the limit: {}",
+        raced.body
+    );
+    assert!(
+        raced.retry_after.is_some(),
+        "and is told when to come back: {:?}",
+        raced.retry_after
+    );
+
+    // Nothing above stored a row, so the two accepted messages are still the only two.
+    let count: i64 = sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
+        .bind(Uuid::parse_str(&form_id).expect("a uuid"))
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("a count");
     assert_eq!(
         count, 3,
         "two from the throttled sender plus one from the other"
