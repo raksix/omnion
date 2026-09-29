@@ -126,16 +126,6 @@ function asString(value: unknown): string {
   return "";
 }
 
-/** `undefined` is a value the store must not be sent, so an emptied field is removed instead. */
-function prune<T extends Record<string, unknown>>(input: T): T {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (value === undefined || value === "") continue;
-    out[key] = value;
-  }
-  return out as T;
-}
-
 export function ThemeCustomizeView() {
   const { selectedSite, status: siteStatus, error: siteError } = useSites();
   const [view, setView] = useState<ThemeSettingsView | null>(null);
@@ -222,9 +212,13 @@ export function ThemeCustomizeView() {
 
   const restoreDefaults = useCallback(() => {
     if (!view) return;
+    // Clearing the overrides — NOT copying the theme's defaults into the draft. Those two look
+    // the same in the preview and are not the same at all: a copy pins the values into this
+    // site's settings, so a later theme update would leave the site on stale tokens with no
+    // badge saying so, and every token would read as "overridden" when none of them is. Empty
+    // means the theme's own defaults apply, which is what the button says it does.
     const cleared = emptySettings(view.themeKey);
     cleared.defaultMode = form?.defaultMode ?? "system";
-    cleared.tokens = { ...(view.defaultTokens as Record<string, unknown>) };
     setForm(cleared);
     formRef.current = cleared;
     setContrastSeen(false);
@@ -278,12 +272,23 @@ export function ThemeCustomizeView() {
       setNotice(`Published revision ${next.published?.revisionNo ?? "?"}. The public site renders with it now.`);
     } catch (caught) {
       const apiError = caught as ApiError;
-      // A 422 here is the contrast guard, and it is not a failure to report as a red line: the
-      // panel shows the findings and asks for the acknowledgement, which is the product's
-      // design rather than a bug in the button.
-      if (apiError.status === 422) {
+      // Branch on the API's stable CODE, never on a regex over the English sentence: a copy
+      // edit in `apps/api/src/error.rs` must not silently turn a guard into a red line, and a
+      // screen that matches on prose is a screen that breaks in a language nobody tests.
+      //
+      // `theme_settings_contrast_required` is not a failure at all — it is the product asking a
+      // person to look, so it becomes the acknowledgement prompt. `theme_settings_draft_stale`
+      // is somebody else's write landing under this tab, so the editor re-reads the server and
+      // says so instead of quoting a code.
+      if (apiError.code === "theme_settings_contrast_required") {
         setNotice(
           "Publishing needs the contrast findings acknowledged. Read the contrast panel, then publish again.",
+        );
+        setError(null);
+      } else if (apiError.code === "theme_settings_draft_stale") {
+        await load();
+        setNotice(
+          "This draft is older than what is now live — somebody published or restored from another tab. The editor now holds the current draft; publish again if this palette is still the one you want.",
         );
         setError(null);
       } else {
@@ -292,7 +297,7 @@ export function ThemeCustomizeView() {
     } finally {
       setBusy(null);
     }
-  }, [contrastSeen, selectedSite, view]);
+  }, [contrastSeen, load, selectedSite, view]);
 
   // ------------------------------------------------------------------ states
   if (siteStatus === "error") {
