@@ -223,6 +223,28 @@ pub fn state_hash(state: &str) -> String {
     hex_encode(&hasher.finalize())
 }
 
+/// Derive a stable key from an installation secret, for the state signature.
+///
+/// **Deterministic by construction, and that is the whole point.** An HMAC key has to be the
+/// same bytes on every call in the process, so this is a keyed *hash* and not an encryption:
+/// [`LocalBox`] and the identity crate's `SecretBox` are both correct primitives for sealing a
+/// value and both attach a fresh random nonce, which is exactly right for a PKCE verifier and
+/// silently fatal for a key. A version that derived this through `encrypt` produced different
+/// bytes per call, so `build_state` and `verify_state` never agreed and every callback failed
+/// as `credential_oauth_state` — an error naming CSRF for what was really a key that never
+/// matched.
+///
+/// The label is what domain-separates this key from the seal's, so an envelope this module
+/// produced cannot be replayed as a `state` and a `state` cannot be opened as an envelope.
+#[must_use]
+pub fn derive_state_key(material: &[u8], label: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(STATE_LABEL);
+    hasher.update(label);
+    hasher.update(material);
+    hasher.finalize().to_vec()
+}
+
 /// Lower-case hex, so the stored hash is a plain string a human can compare in a `psql` session.
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -1042,6 +1064,33 @@ mod tests {
         for raw in ["", "abc", "a.b.c", "....", "not-a-state"] {
             assert!(verify_state(raw, &key(), OffsetDateTime::now_utc(), None).is_err());
         }
+    }
+
+    #[test]
+    fn the_derived_state_key_is_the_same_bytes_on_every_call() {
+        // The regression test for the bug this slice shipped and then fixed: a key derived
+        // through an encryption primitive gets a fresh nonce per call, so signing and
+        // verifying disagree and *every* callback fails as `credential_oauth_state` — an
+        // error naming CSRF for a key that never matched. One assertion, and the symptom
+        // cannot come back.
+        let material = b"an-installation-secret";
+        let first = derive_state_key(material, b"label");
+        let second = derive_state_key(material, b"label");
+        assert_eq!(first, second, "an HMAC key must be stable within a process");
+        assert_eq!(first.len(), 32, "a sha-256 digest is 32 bytes");
+    }
+
+    #[test]
+    fn the_state_key_and_the_seal_key_are_unrelated() {
+        // Domain separation, and the reason the label is a parameter rather than a constant
+        // buried in each caller: an envelope this module produced must not be replayable as a
+        // `state`, and a `state` must not open as an envelope.
+        let material = b"an-installation-secret";
+        assert_ne!(
+            derive_state_key(material, b"omnion.workflow.oauth.seal"),
+            derive_state_key(material, b"omnion.workflow.oauth.signing"),
+            "the two key spaces must not coincide"
+        );
     }
 
     #[test]
