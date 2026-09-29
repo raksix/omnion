@@ -4146,3 +4146,101 @@ close slice 1; if the pass finds anything, fix it in the same tick — the depth
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
+
+## 2026-09-29 — REQ-004 slice 3 · "Run from here" needs a sixth step state, and the three queries that read step status were already shaped for one
+
+**What.** Slice 3's first criterion. The whole thing turned out to be gated on a one-word
+hole rather than on missing code, and the hole was only visible once the criterion was read
+as a sentence: a run's steps are all `pending` when it is created and the engine claims them
+strictly in `step_no` order, so there was no way to say "these two did not run". Not
+"skipped with a flag" — a *state*, because every consumer of a step's status would otherwise
+have to learn a second question ("is this pending, or pending-and-skipped?").
+
+**The finding worth keeping: `skipped` cost no engine change at all.** Three queries read
+step status, and each was already shaped so that one more terminal state would be free:
+
+```sql
+claim_due_step:   s.status in ('pending', 'waiting')                       -- never claimed
+settle_execution: count(*) filter (where status in ('pending','running','waiting'))  -- closed
+                  count(*) filter (where status = 'failed' and not ignored) -- not a failure
+retry_step_from:  ... and status in ('failed','cancelled','pending','waiting')       -- stays skipped
+```
+
+Read them in that order and the feature is a constraint change. A state that had to be
+threaded through them would have been the tell that the schema was not ready — which is a
+cheaper test than writing the state and finding out.
+
+**The plan is made against a walk, not the step list**, and that was the second real design
+decision. The two disagree in three places and *each one decides whether a node is startable
+at all*:
+
+| node | in the step list | in the walk | what "start here" means |
+|---|---|---|---|
+| trigger | absent | present, holds no position | re-run the whole rule — a real thing an operator wants |
+| end | present, as a `stop` | present | nothing to do; a run there settles `completed` having done nothing |
+| note | absent | present, holds no position | start at the first step after it |
+
+Indexing the step list needs a special case for each, and a special case is where an
+off-by-one lives. **Which is the first thing I wrote**: `position() + 1`, so the clicked node
+itself became the first skipped step. The assertion that catches it checks the clicked node's
+own `step_no`, not the length of the skipped list — a count would have read 1 either way.
+
+Positions come off the walk, counted over *steps* and not nodes: a run's `step_no` is dense
+while the walk has holes in it, so counting while iterating would hand the engine a numbering
+the stored definition disagrees with — and `claim_due_step` orders by exactly that column.
+
+**Why the plan is made from a graph rather than from a caller-built step list.** Two
+arguments that are supposed to describe the same rule, and can disagree, are a public
+invitation to disagree; the failure mode is a plan that skips everything and runs nothing,
+which is indistinguishable from a rule whose graph is empty.
+
+**The prefix is inserted as `skipped`, not inserted pending and updated after.** A crash
+between the two writes would leave a run whose prefix the engine is about to execute — the
+exact side effect the feature exists to avoid. Inserted-as-skipped needs no reconciliation
+pass, because a skipped row is never claimed.
+
+**The two refusals carry their reason, because an empty run is the most misleading answer
+available.** The end node, and an inert node with nothing after it. The second is the case a
+test covering only "the end node" would leave live, so the panel's pure function tests it as
+its own row.
+
+**Second harness trap of its kind this month, and the same tell.** `Node`'s field is
+`node_type` in Rust and `"type"` on the wire, so a hand-built spine deserialised to a bare
+`422` with a **null body** — which reads exactly like a validation refusal and is not one.
+The tell is identical to the port key/label trap from two ticks ago: *a failure that hits
+every case at once, with no message, is the harness and not the thing under test.* The fix
+was to read the `#[serde(rename)]`, not to re-check the validator.
+
+**And a test that records a case which cannot exist.** The planner's notes said "an inert node
+in the middle is a position, not work" — and the only inert node type is `note`, which the
+validator refuses to let anything leave ("exports no port"). So an inert node is *always* a
+leaf and can never sit mid-graph. The test now asserts the shape that does exist (a note is
+inert, has no outputs, takes no step number) rather than the one I imagined. Unimplemented
+special-casing is code nobody re-reads.
+
+**Proof.**
+- `cargo test -p omnion-workflows --lib` → **95** (84 before, 11 new)
+- `cargo test -p omnion-api --test workflows` → **14/14** against a real Postgres, including
+  `run_from_here_starts_at_the_node_and_marks_the_prefix_skipped`: the test reads the **stored
+  rows**, so a handler that returned a plan-shaped body while writing a full run would fail it.
+  Step 1 `skipped`, step 2 not, the reason on step 1 naming the node, the run still settling
+  `completed`, and the skipped step holding **zero attempts** — which is what proves the engine
+  never claimed it. Both refusals proven too.
+- `node --test` on the builder suites → **61** (53 before, 8 new)
+- `tsc --noEmit` in `apps/admin` → exit 0 · `cargo check -p omnion-api --all-targets` → 0 errors
+
+**Not proved: the browser pass.** The slot was held by w10 (pid 2643862, cwd
+`/mnt/apopic/omnion-w10`) for the whole tick — a live pass, not a leak. The criterion is
+unticked until the pass reads `run-from-here` with `skipped > 0`, `reasonNamesNode: true` and
+`firstRunnableNo === firstSkippedNo + 1`. The probe reads the run back through the API after
+the press, because a toast that says "Run started" proves the button was pressed and nothing
+else.
+
+**Queue note.** `df` was the constraint this tick: `/mnt/apopic` 93% → 94%, `/dev/shm`
+94–100%, `/` at 99%, RAM 29/32, load 43. Seven writers, seven tmpfs targets.
+
+**Next.** Criterion 2 (node status pills on the canvas) and criterion 3 (*Retry this node* —
+where `store::retry_step_from`'s own comment is the spec and it says the opposite of what the
+criterion wants: it is deliberately a **tail** re-run, so a single-node retry is a different
+write and must not be built by narrowing it).
+
