@@ -36,6 +36,7 @@ import {
   CircleDot,
   Copy,
   Filter,
+  History as HistoryIcon,
   ListTree,
   RefreshCw,
   Radio,
@@ -52,6 +53,8 @@ import type {
   EventFilters,
   EventRow,
 } from "@/lib/types";
+
+import { RetentionPanel } from "./retention-panel";
 
 /** How many rows one page carries. Also the minimum: the API clamps to 1..200. */
 const PAGE = 25;
@@ -89,11 +92,12 @@ function filtersFrom(params: URLSearchParams): EventFilters {
   return filters;
 }
 
-type Tab = "feed" | "catalogue";
+type Tab = "feed" | "catalogue" | "retention";
 
 /** Read the tab and the window out of the query string. */
 function viewFrom(params: URLSearchParams): { tab: Tab; window: string } {
-  const tab = params.get("tab") === "catalogue" ? "catalogue" : "feed";
+  const raw = params.get("tab");
+  const tab: Tab = raw === "catalogue" ? "catalogue" : raw === "retention" ? "retention" : "feed";
   return { tab, window: params.get("window") ?? "" };
 }
 
@@ -311,6 +315,10 @@ export function EventConsole() {
           [
             { id: "feed", label: "Feed", icon: Activity },
             { id: "catalogue", label: "Catalogue", icon: ListTree },
+            // `History` is aliased because the identifier is also a DOM global, and the
+            // component this file imports would then be typed as whichever of the two the
+            // checker resolved first — a shadowing bug that only shows up on the icon type.
+            { id: "retention", label: "Retention", icon: HistoryIcon },
           ] as const
         ).map((entry) => {
           const Icon = entry.icon;
@@ -625,6 +633,22 @@ export function EventConsole() {
             </div>
           ) : null}
         </>
+      ) : tab === "retention" ? (
+        /* The retention tab is a sibling of the other two rather than a card inside the Feed,
+           because it answers a third question — not *what happened* and not *what could
+           happen*, but *what will be forgotten and when*. It is rendered here rather than
+           fetched alongside the feed, so an operator who only wants the policy does not pay
+           for a page of events to find it, and so the Feed's `load` — which resets the row
+           cursor and the expansion on every filter change — cannot wipe the panel's notice
+           after a sweep. */
+        <section
+          id="event-panel-retention"
+          role="tabpanel"
+          aria-labelledby="event-tab-retention"
+          className="flex flex-col gap-3"
+        >
+          <RetentionPanel />
+        </section>
       ) : (
         <section
           id="event-panel-catalogue"
@@ -779,14 +803,21 @@ export function EventConsole() {
 
       {/* The name menu is a `details` element rather than a custom popover: it opens with the
           keyboard, closes with Escape, and works without JavaScript focus management — three
-          things a hand-rolled dropdown has to re-implement and usually gets one of wrong. */}
-      <NameMenu
-        names={filterNames}
-        selected={filters.name ?? []}
-        query={nameQuery}
-        onQuery={setNameQuery}
-        onToggle={toggleName}
-      />
+          things a hand-rolled dropdown has to re-implement and usually gets one of wrong.
+
+          It is gated on the Feed tab on purpose. On the Retention tab it would be a control
+          that filters nothing: a dead menu is worse than an absent one, because a reader who
+          opens it and finds a list of names has been told the panel does something it does
+          not. */}
+      {tab === "feed" ? (
+        <NameMenu
+          names={filterNames}
+          selected={filters.name ?? []}
+          query={nameQuery}
+          onQuery={setNameQuery}
+          onToggle={toggleName}
+        />
+      ) : null}
     </div>
   );
 }

@@ -64,6 +64,29 @@ pub const DEFAULT_EVENTS_RETRY_BASE_MS: u64 = 15_000;
 /// Default ceiling of the retry backoff in milliseconds (`OMNION_EVENTS_RETRY_MAX_MS`).
 pub const DEFAULT_EVENTS_RETRY_MAX_MS: u64 = 900_000;
 
+/// Default delay between two event-retention sweeps (`OMNION_EVENT_RETENTION_POLL_MS`).
+///
+/// A **week** is the tick, and the number needs a reason. The sweep deletes nothing on almost
+/// every tick by construction — the predicate requires an event to be past *its
+/// organization's* window — so a frequent tick would be a frequent no-op. A week is longer
+/// than the shortest window the API accepts (one day) by a margin that makes the commonest
+/// sweep — an organization that set a one-day window — happen on a predictable cadence, and
+/// the run log records each of them, so "when did this last happen" is answerable.
+pub const DEFAULT_EVENT_RETENTION_POLL_MS: u64 = 604_800_000;
+
+/// How many organizations one retention sweep walks (`OMNION_EVENT_RETENTION_MAX_ORGS`).
+///
+/// The bound exists because the sweeper holds a transaction per organization: a thousand
+/// organizations in one tick is a thousand transactions competing with the delivery runner for
+/// the same connections, and the tail of the list would wait. Bounded, the rest is picked up by
+/// the next tick rather than lost.
+pub const DEFAULT_EVENT_RETENTION_MAX_ORGS: i64 = 50;
+
+/// The same bound as a `usize`, because the environment is read through `read_count`, which
+/// parses into a `usize` and refuses a negative value — a signed default there is a type error
+/// at the call site, and the fix is made in one place instead of at every read.
+const DEFAULT_EVENT_RETENTION_MAX_ORGS_US: usize = 50;
+
 /// Default delay between two automation-matcher ticks (`OMNION_AUTOMATION_POLL_MS`).
 pub const DEFAULT_AUTOMATION_POLL_MS: u64 = 2_000;
 
@@ -344,6 +367,12 @@ pub struct EventsConfig {
     pub retry_base_ms: u64,
     /// Ceiling of the retry backoff (`OMNION_EVENTS_RETRY_MAX_MS`).
     pub retry_max_ms: u64,
+    /// Whether this process sweeps the event bus (`OMNION_EVENT_RETENTION_RUNNER`).
+    pub retention_enabled: bool,
+    /// Delay between two retention sweeps (`OMNION_EVENT_RETENTION_POLL_MS`).
+    pub retention_poll_ms: u64,
+    /// How many organizations one retention sweep walks (`OMNION_EVENT_RETENTION_MAX_ORGS`).
+    pub retention_max_orgs: i64,
 }
 
 impl Default for EventsConfig {
@@ -356,6 +385,9 @@ impl Default for EventsConfig {
             request_timeout_ms: DEFAULT_EVENTS_REQUEST_TIMEOUT_MS,
             retry_base_ms: DEFAULT_EVENTS_RETRY_BASE_MS,
             retry_max_ms: DEFAULT_EVENTS_RETRY_MAX_MS,
+            retention_enabled: true,
+            retention_poll_ms: DEFAULT_EVENT_RETENTION_POLL_MS,
+            retention_max_orgs: DEFAULT_EVENT_RETENTION_MAX_ORGS,
         }
     }
 }
@@ -791,6 +823,22 @@ impl Config {
                 "OMNION_EVENTS_RETRY_MAX_MS",
                 DEFAULT_EVENTS_RETRY_MAX_MS,
             )?,
+            // The sweeper is a **separate flag from the delivery runner**, deliberately: an
+            // installation that drains the queue from a dedicated process (and not at all from
+            // the web nodes) must still be able to switch the sweeper off, and one flag for
+            // both would force it to turn the delivery runner on to get retention.
+            retention_enabled: read_flag(&read, "OMNION_EVENT_RETENTION_RUNNER", true)?,
+            retention_poll_ms: read_positive(
+                &read,
+                "OMNION_EVENT_RETENTION_POLL_MS",
+                DEFAULT_EVENT_RETENTION_POLL_MS,
+            )?,
+            retention_max_orgs: i64::try_from(read_count(
+                &read,
+                "OMNION_EVENT_RETENTION_MAX_ORGS",
+                DEFAULT_EVENT_RETENTION_MAX_ORGS_US,
+            )?)
+            .unwrap_or(DEFAULT_EVENT_RETENTION_MAX_ORGS),
         };
 
         let automation = AutomationConfig {

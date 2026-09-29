@@ -272,6 +272,95 @@ pub struct CatalogueResponse {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Retention (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// One sweep's outcome, in the shape the run log stores and the screen reads back.
+#[derive(Debug, Serialize)]
+pub struct RetentionRunBody {
+    /// Run id.
+    pub id: Uuid,
+    /// The organization swept; `null` is the platform's own events.
+    pub organization_id: Option<Uuid>,
+    /// When the sweep began.
+    pub started_at: OffsetDateTime,
+    /// When it finished.
+    pub finished_at: Option<OffsetDateTime>,
+    /// The window that was applied, days.
+    pub window_days: i32,
+    /// The instant older rows were swept.
+    pub cutoff: OffsetDateTime,
+    /// Events removed.
+    pub events_deleted: i32,
+    /// Delivery rows removed with them.
+    pub deliveries_deleted: i32,
+    /// Why the sweep could not finish, if it could not.
+    pub error: Option<String>,
+}
+
+impl RetentionRunBody {
+    fn build(run: &omnion_events::RetentionRun) -> Self {
+        Self {
+            id: run.id,
+            organization_id: run.organization_id,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            window_days: run.window_days,
+            cutoff: run.cutoff,
+            events_deleted: run.events_deleted,
+            deliveries_deleted: run.deliveries_deleted,
+            error: run.error.clone(),
+        }
+    }
+}
+
+/// `GET /api/v1/events/retention` — the window, the counts, and the last sweep.
+#[derive(Debug, Serialize)]
+pub struct RetentionStatusBody {
+    /// The organization described; `null` is the platform's own events.
+    pub organization_id: Option<Uuid>,
+    /// The window in force, days.
+    pub window_days: i32,
+    /// Shortest window the API accepts, so the screen can bound its own input.
+    pub min_days: i32,
+    /// Longest window the API accepts.
+    pub max_days: i32,
+    /// Events currently on the bus.
+    pub events: i64,
+    /// Events old enough to be swept on the next tick.
+    pub due: i64,
+    /// The last finished sweep, if this organization has ever been swept.
+    pub last_run: Option<RetentionRunBody>,
+    /// The last finished sweeps, newest first.
+    pub recent_runs: Vec<RetentionRunBody>,
+}
+
+/// What a manual sweep removed.
+#[derive(Debug, Serialize)]
+pub struct SweepBody {
+    /// The organization swept.
+    pub organization_id: Option<Uuid>,
+    /// The window that was applied.
+    pub window_days: i32,
+    /// The instant older rows were swept.
+    pub cutoff: OffsetDateTime,
+    /// Events removed.
+    pub events_deleted: i64,
+    /// Delivery rows removed with them.
+    pub deliveries_deleted: i64,
+    /// The run-log row this sweep wrote.
+    pub run_id: Uuid,
+}
+
+/// `PATCH /api/v1/events/retention` — set the window.
+#[derive(Debug, Deserialize)]
+pub struct SetRetentionRequest {
+    /// New window, days. Refused outside 1…3650 rather than clamped, because a silent clamp
+    /// answers `200` with a number the caller did not ask for.
+    pub window_days: i32,
+}
+
+// ---------------------------------------------------------------------------------------------
 // Request shapes
 // ---------------------------------------------------------------------------------------------
 
@@ -1326,6 +1415,171 @@ fn parse_instant(raw: Option<&str>, field: &'static str) -> Result<Option<Offset
                 format!("`{field}` is not an RFC 3339 timestamp"),
             )
         })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention handlers (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/// How many runs the status read returns in its `recent_runs` list.
+const RETENTION_RUN_HISTORY: i64 = 5;
+
+/// `GET /api/v1/events/retention` — the window, the counts and the last sweeps.
+///
+/// It is `events.read` like the feed, because reading how much history is kept is reading the
+/// bus. **Changing** it is `webhooks.manage`, which is the stronger of the two keys, because
+/// shortening a window is a destructive action on somebody's audit trail and a caller with
+/// only `events.read` must not be able to trigger it by accident or by a link.
+pub async fn retention_status(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<RetentionStatusBody>, ApiError> {
+    let organization_id = current.user.organization_id;
+    let status = store::retention_status(state.db().pool(), organization_id).await?;
+    let recent_runs = store::list_retention_runs(state.db().pool(), organization_id, RETENTION_RUN_HISTORY)
+        .await?;
+
+    Ok(Json(RetentionStatusBody {
+        organization_id,
+        window_days: status.window_days,
+        min_days: omnion_events::MIN_RETENTION_DAYS,
+        max_days: omnion_events::MAX_RETENTION_DAYS,
+        events: status.events,
+        due: status.due,
+        last_run: status.last_run.as_ref().map(RetentionRunBody::build),
+        recent_runs: recent_runs.iter().map(RetentionRunBody::build).collect(),
+    }))
+}
+
+/// `PATCH /api/v1/events/retention` — set the window.
+///
+/// A **platform** account (`organization_id = None`) is refused by name rather than silently
+/// writing a window onto a column it does not own: the sweeper applies each organization's own
+/// window, and a platform account has no window to set, so accepting the write would answer
+/// `200` and change nothing. The refusal says which account shape the route wants.
+pub async fn set_retention(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<SetRetentionRequest>,
+) -> Result<Json<RetentionStatusBody>, ApiError> {
+    let Some(organization_id) = current.user.organization_id else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "retention_scope_required",
+            "a retention window belongs to an organization; this account is platform level",
+        ));
+    };
+
+    // Validated before the write, so the refusal names the field and the range rather than
+    // arriving as a check-constraint violation from the database.
+    let days = validation::validate_retention_window(body.window_days)?;
+    let previous = store::retention_window(state.db().pool(), Some(organization_id)).await?;
+    let stored = store::set_retention_window(state.db().pool(), organization_id, days).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.retention.changed")
+            .target("organization", organization_id.to_string())
+            .metadata(json!({ "previous_window_days": previous, "window_days": stored }))
+            .ip_address(address.as_text())
+            .organization(Some(organization_id)),
+    )
+    .await?;
+
+    // The audit row is the record of the *change*; the bus is where the modules watch for one.
+    // The event is emitted to nobody by fan-out unless an endpoint subscribes to it, which is
+    // the same rule every other lifecycle event follows.
+    let _ = bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.retention.changed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "previous_window_days": previous,
+                "window_days": stored,
+            })),
+    )
+    .await;
+
+    let status = store::retention_status(state.db().pool(), Some(organization_id)).await?;
+    let recent_runs =
+        store::list_retention_runs(state.db().pool(), Some(organization_id), RETENTION_RUN_HISTORY)
+            .await?;
+
+    Ok(Json(RetentionStatusBody {
+        organization_id: Some(organization_id),
+        window_days: status.window_days,
+        min_days: omnion_events::MIN_RETENTION_DAYS,
+        max_days: omnion_events::MAX_RETENTION_DAYS,
+        events: status.events,
+        due: status.due,
+        last_run: status.last_run.as_ref().map(RetentionRunBody::build),
+        recent_runs: recent_runs.iter().map(RetentionRunBody::build).collect(),
+    }))
+}
+
+/// `POST /api/v1/events/retention/sweep` — run one sweep now.
+///
+/// The button exists because "the weekly worker will get to it" is not an answer an operator can
+/// act on the morning they need the disk back, and because a policy nobody can run on demand
+/// is a policy that is only ever tested by a failure. It writes the same run log the worker
+/// writes, so a manual sweep and a scheduled one are the same record — which is what makes the
+/// log trustworthy.
+pub async fn sweep_retention(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+) -> Result<Json<SweepBody>, ApiError> {
+    let Some(organization_id) = current.user.organization_id else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "retention_scope_required",
+            "a retention sweep belongs to an organization; this account is platform level",
+        ));
+    };
+
+    let window_days = store::retention_window(state.db().pool(), Some(organization_id)).await?;
+    let report = store::sweep_events(state.db().pool(), Some(organization_id), window_days).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "webhook.retention.swept")
+            .target("organization", organization_id.to_string())
+            .metadata(json!({
+                "window_days": report.window_days,
+                "events_deleted": report.events_deleted,
+                "deliveries_deleted": report.deliveries_deleted,
+            }))
+            .ip_address(address.as_text())
+            .organization(Some(organization_id)),
+    )
+    .await?;
+
+    // A manual sweep emits the same event a scheduled one would, and the answer says **no
+    // counts** were routed to endpoints rather than staying silent about it. The reason is
+    // that the counts are already in the run log the caller gets back in the response, and a
+    // payload that duplicated them is a second place for the two to disagree — but the
+    // *occurrence* is a fact a subscriber subscribed to, and a fan-out that queues nothing
+    // because a module decided the event "is only an audit fact" is a fan-out that silently
+    // drops events.
+    let _ = bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.retention.swept")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({ "window_days": report.window_days })),
+    )
+    .await;
+
+    Ok(Json(SweepBody {
+        organization_id: Some(organization_id),
+        window_days: report.window_days,
+        cutoff: report.cutoff,
+        events_deleted: report.events_deleted,
+        deliveries_deleted: report.deliveries_deleted,
+        run_id: report.run_id,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
