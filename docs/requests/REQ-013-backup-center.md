@@ -1,7 +1,12 @@
 # REQ-013 — Backup Center
 
 > **Status:** in-progress (slice 1 — run and inspect — code-complete, migration + crate + API +
-admin UI + seven walks; the browser pass has not run) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+admin UI + seven walks; the browser pass has not run). **Three product defects closed this tick**
+(`b0b4542`, `ed09dc4`, and `b17e64b` for the suite): a site with media in it could not be backed
+up at all, the prune sweep could delete every restorable backup, and the seven walks were red
+before any of it — they could not have caught either. The walks are **7 passed / 0 failed** and
+`omnion-backup --lib` is 46/0. Still open: the browser pass, which `qa-slot.sh` has kept queued
+behind a sibling wave for three consecutive ticks · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request

@@ -9382,3 +9382,58 @@ neither is a product finding.
 **Next.** Fix the two probe instruments (table-create payload, validation spine ports), then run
 the pass on the w3 stack and re-read the six notes behind this write in that order.
 
+
+### Tick 65 — the blocker is not the box: three real defects behind a red suite (2026-09-29)
+
+**What.** Last tick left a blocker in `docs/BUILD-LOG.md` and did not work around it: eight sibling
+media suites were red on `csrf_unavailable` and `rate_limited`, and the note said the fix belongs
+to the security work rather than to media. This tick took the first two of them
+(`media_shares`, `media_retention`), read the actual failure, and found that the "suite issue"
+was **three product defects**, one of them in code this loop wrote last tick.
+
+**1. A sign-in issues two cookies and twenty helpers read one.** `support/walk_auth.rs`. Sign-in
+answers with the session cookie *and* a CSRF token beside it. Twenty suites each had a `login()`
+taking `.split(';').next()` on the first `Set-Cookie` — correct for one cookie, silently lossy
+for two. Fixing the helper was not enough: the second defect sat underneath it. **Those fixtures
+never set `config.csrf` at all**, so their own sign-in could not have issued a token. The
+refusal was the product working correctly; the suites were asserting a deployment that cannot
+exist. `media_shares` **0 passed / 5 failed → 5 / 0**, `media_retention` **0 / 5 → 6 / 0**.
+
+**2. A site with media in it could not be backed up** (`b0b4542`). `document_media` read
+`coalesce(sum(size_bytes), 0)` with no cast, and the `coalesce` is the trap — the literal `0`
+adopts the other argument's type, so the result stays `numeric`. This is the **second** instance
+of the same mistake in one feature; the first was the status card, fixed last tick. A `partial`
+run with four good parts and a `media` part that never happened is a terrible way to discover it,
+and it is exactly what the build log recorded as "the media part is flaky".
+
+**3. The prune sweep could delete every restorable backup** (`ed09dc4`). `prune_candidates`
+promised four exemptions in its doc comment and implemented two. No `status = 'succeeded'` on the
+spared run, so a `partial` — not restorable as a whole — took the protection while the newest run
+that *can* be restored was offered for deletion. No `not protected` either, so a protected newest
+run consumed a second invisible exemption and the rest of the history was offered for deletion,
+and the sweep reported success. Two exemptions, one survivor.
+
+**And the one that was hiding underneath all of it** (`bfe46c3`). The retention screen answered
+`500` as soon as a site had a file actually past its restore window: `past_restore_window` summed
+`size_bytes` with no cast and the comment above it *claimed* one. Nothing exercised it, and the
+reason is the lesson — `sum()` over an empty set is `NULL`, `NULL` decodes into `Option<i64>`, and
+every existing walk stopped at a site with nothing to count. The type was confirmed against the
+database rather than assumed: `pg_typeof(sum(size_bytes))` is `numeric`, `coalesce(...,0)` is
+still `numeric`, `::bigint` is `bigint`. The new walk fails on `main` with
+`500 ... NUMERIC is not compatible with INT8` and passes with the cast.
+
+**Proof.** `omnion-backup --lib` 46/0 · `omnion-media --lib` 199/0 · `omnion-api --lib` 220/0 ·
+`--test backups` 7/0 · `--test media_retention` 6/0 · `--test media_shares` 5/0 ·
+`--test walk_auth` 6/0 (new) · `apps/admin` `tsc --noEmit` clean. Commits `b17e64b`, `bfe46c3`,
+`b0b4542`, `ed09dc4`, all pushed.
+
+**Blocker, unchanged and not worked around.** The browser pass did not run: `qa-slot.sh` has a
+live sibling holder and the box is at load 16 with **0 GB free** of 32. A pass now would add a
+third Chromium to a machine that is already swapping, and the result would be untrustworthy
+either way. `runMediaRetention` and `runSecurityDepth` are written, wired and still unrun, which
+is the only reason REQ-010, REQ-012 and REQ-013 stay open.
+
+**Next.** (a) Migrate the remaining eighteen suites to `support::walk_auth` — it is a three-line
+change per suite now, and each one is a REQ that can then be closed on its browser pass rather
+than on the note that its suite was already red. (b) The `media` part of a backup run is the
+place to look next: it counts rows, and a backup that only counts is a manifest, not a backup.
