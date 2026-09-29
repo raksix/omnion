@@ -316,9 +316,17 @@ impl Fixture {
         )
     }
 
-    /// The root a run's artifacts landed under, for a run with this prefix.
-    fn artifact(&self, prefix: &str, key: &str) -> std::path::PathBuf {
-        self.root.join(prefix.trim_matches('/')).join(key.trim_start_matches('/'))
+    /// The file a full storage key lands on for a run with this prefix.
+    ///
+    /// The prefix argument is accepted and **not** joined, and that is the fix rather than an
+    /// oversight. A key is already prefix-qualified, so the old helper produced
+    /// `<root>/<prefix>/<key>` where `<key>` began with the prefix again — the archive really
+    /// was written to `<root>/<prefix>/<prefix>/…`, and this helper agreed with it. The suite
+    /// therefore passed while every artifact sat one directory deeper than the manifest said,
+    /// which is the same failure shape as the media part this tick removed: **two halves that
+    /// make the same mistake are not a cross-check.**
+    fn artifact(&self, _prefix: &str, key: &str) -> std::path::PathBuf {
+        self.root.join(key.trim_start_matches('/'))
     }
 }
 
@@ -993,5 +1001,586 @@ async fn a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful
     assert!(
         candidate_ids.contains(&ids[0]),
         "the oldest unprotected one is the whole point of the sweep: {candidate_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the_run() {
+    // The walk that matters most in this suite, and the one that was impossible to write
+    // before the media part stopped being a count.
+    //
+    // The defect: `document_media` ran `select site_id, count(*), sum(size_bytes) from media`
+    // and wrote THAT as the part's artifact. A backup of a site with a hundred files produced
+    // a ~200-byte JSON document listing "100 files, 4 MiB", reached `succeeded`, and
+    // `verify` read the artifact back and agreed with its own checksum. Not one byte of the
+    // library had been copied anywhere. Every assertion in the walk above would have passed
+    // on that implementation, which is exactly why it needed its own.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // A site, two real objects in the suite's own store, and rows describing them. The bytes
+    // go through `state.storage()` — the same handle the upload route writes through — so the
+    // walk exercises the real driver rather than a mock of it.
+    let site: Uuid = sqlx::query_scalar(
+        "insert into sites (organization_id, key, name) values ($1, $2, $3) returning id",
+    )
+    .bind(fixture.org)
+    .bind(format!("k{}", &Uuid::new_v4().simple().to_string()[..8]))
+    .bind("Media Site")
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a site must be created");
+
+    let payload_a: &[u8] = b"\x89PNG\r\n\x1a\n the first object's bytes, long enough to matter";
+    let payload_b: &[u8] = b"the second object's bytes";
+    for (name, payload) in [("hero.png", payload_a), ("logo.png", payload_b)] {
+        let key = format!("suite/{site}/{name}");
+        fixture
+            .state
+            .storage()
+            .put(&key, payload, "image/png")
+            .await
+            .expect("the object must be storable");
+        sqlx::query(
+            "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+             checksum, created_by) values ($1, $2, $3, $4, $5, $6, null)",
+        )
+        .bind(site)
+        .bind(&key)
+        .bind(name)
+        .bind("image/png")
+        .bind(payload.len() as i64)
+        .bind(omnion_backup::bytes_checksum(payload))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the media row must be written");
+    }
+
+    let response = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
+    assert_eq!(response.status, StatusCode::CREATED, "body: {}", response.body);
+    let run = &response.body["backup"];
+    let id = Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid");
+    let prefix = run["storage_prefix"].as_str().expect("a prefix");
+    assert_eq!(run["status"], "succeeded", "body: {}", response.body);
+
+    // The part must have counted the objects it copied — the two that exist, not the two that
+    // the `count(*)` would have found, which happen to be the same here, and that is the
+    // point of the next assertion rather than this one.
+    let (status, item_count, size_bytes) = sqlx::query_as::<_, (String, i32, i64)>(
+        "select status, item_count, size_bytes from backup_parts \
+         where backup_id = $1 and part = 'media'",
+    )
+    .bind(id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a media row must exist");
+    assert_eq!(status, "done", "both objects copied");
+    assert_eq!(item_count, 2, "two library files were copied, not counted");
+    assert!(
+        size_bytes > (payload_a.len() + payload_b.len()) as i64,
+        "the part is {size_bytes} bytes; a count-only document would be about 200"
+    );
+
+    // **The assertion the old implementation could not survive.** The archive holds one file
+    // per object, and each one's bytes are the original bytes. A `media.json` describing a
+    // count satisfies every check above and fails here.
+    // The archive's location is read **out of the index the run wrote**, not recomputed here.
+    // Recomputing it is how the doubled-prefix bug stayed invisible for a whole slice: this
+    // walk and the production code would both have derived the same wrong path and agreed.
+    // Taking the path from the artifact means the two halves can actually disagree.
+    let index_path = fixture.artifact(
+        prefix,
+        &format!("{}{}", prefix.trim_start_matches('/'), omnion_backup::INDEX_FILENAME),
+    );
+    let objects_root = fixture.artifact(
+        prefix,
+        &format!(
+            "{}{}/",
+            prefix.trim_start_matches('/'),
+            omnion_backup::OBJECTS_DIR
+        ),
+    );
+    let index: Value = serde_json::from_slice(
+        &std::fs::read(&index_path).unwrap_or_else(|err| {
+            panic!("the media index must exist at {}: {err}", index_path.display())
+        }),
+    )
+    .expect("the index must be JSON");
+    assert_eq!(index["version"], omnion_backup::INDEX_VERSION);
+    let listed = index["objects"].as_array().expect("an object list");
+    assert_eq!(listed.len(), 2, "the index lists what was copied: {index}");
+
+    // Each archived object is where the index says it is, and holds the library's bytes.
+    let mut actual: Vec<Vec<u8>> = Vec::new();
+    for entry in listed {
+        assert!(
+            entry["storage_key"].as_str().unwrap_or_default().starts_with("suite/"),
+            "the index carries the live key: {entry}"
+        );
+        assert_eq!(
+            entry["checksum"].as_str().unwrap_or_default().len(),
+            64,
+            "a SHA-256, not a placeholder: {entry}"
+        );
+        let archive_key = entry["archive_key"].as_str().expect("an archive key");
+        let path = fixture.artifact(prefix, archive_key);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|err| panic!("{} must exist: {err}", path.display()));
+        assert_eq!(
+            bytes.len() as i64,
+            entry["size_bytes"].as_i64().expect("a size"),
+            "the index's size is the file's size: {path:?}"
+        );
+        assert_eq!(
+            omnion_backup::bytes_checksum(&bytes),
+            entry["checksum"].as_str().expect("a checksum"),
+            "the recorded checksum is over the bytes on disk: {path:?}"
+        );
+        assert!(
+            path.starts_with(&objects_root),
+            "the object belongs under the run's own objects directory: {}",
+            path.display()
+        );
+        actual.push(bytes);
+    }
+    let mut expected = vec![payload_b.to_vec(), payload_a.to_vec()];
+    expected.sort();
+    actual.sort();
+    assert_eq!(
+        actual, expected,
+        "the archived bytes must be the library's bytes, not a description of them"
+    );
+
+    // Now the second half: a row whose object the store does not have. The part must FAIL and
+    // the run must land on `partial` — a run that quietly backed up one of two files and said
+    // `succeeded` is the exact failure this walk exists to prevent.
+    sqlx::query(
+        "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+         checksum, created_by) values ($1, $2, $3, $4, $5, $6, null)",
+    )
+    .bind(site)
+    // A key unique to THIS walk. `media.storage_key` carries a unique constraint and the QA
+    // database is shared with every other suite that inserts media, so a fixed key fails the
+    // second time a walk runs against the same database — and it fails as a constraint
+    // violation that reads like a product defect rather than a fixture collision. Every
+    // storage key this suite writes is namespaced by something unique.
+    .bind(format!("suite/never-uploaded/gone-{}.png", Uuid::new_v4().simple()))
+    .bind("gone.png")
+    .bind("image/png")
+    .bind(11i64)
+    .bind(omnion_backup::bytes_checksum(b"never existed"))
+    .execute(fixture.db.pool())
+    .await
+    .expect("the row must be written");
+
+    let second = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
+    assert_eq!(second.status, StatusCode::CREATED, "body: {}", second.body);
+    let run = &second.body["backup"];
+    assert_eq!(
+        run["status"], "partial",
+        "a run that could not copy every object is partial, never succeeded: {run}"
+    );
+    let (status, error) = sqlx::query_as::<_, (String, Option<String>)>(
+        "select status, error from backup_parts \
+         where backup_id = $1 and part = 'media'",
+    )
+    .bind(Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid"))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a media row must exist");
+    assert_eq!(status, "failed");
+    let message = error.expect("a failed part names itself");
+    assert!(message.contains("gone.png"), "the file is named: {message}");
+    assert!(
+        message.contains("1 of 3"),
+        "the count is the whole truth, not a sample: {message}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_the_others() {
+    // The walk for the delete, and the shape of its failure is different from every other
+    // walk in this suite: **nothing was wrong with the code, the code was missing.**
+    //
+    // `DELETE /api/v1/backups/{id}` removed the row and its parts and returned `204`. The
+    // database export, the media objects, the index, the configuration document and the
+    // manifest stayed on the destination byte for byte — and the panel said so, in a
+    // sentence that was honest and was still the defect: *"Its artifacts are still on the
+    // destination until the next prune."* Prune runs on a schedule nobody set in this story,
+    // so the ordinary path was: tidy up three old runs, watch the list go green, and keep a
+    // full copy of the media library on disk with nothing pointing at it. Forever, per byte.
+    //
+    // No unit test can see this. The store's `delete_backup` deleted exactly what it claimed,
+    // the handler returned exactly the status it promised, and both halves were correct. The
+    // only thing that can see it is a walk that reads the destination **after** the delete
+    // and requires the files to be gone.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // A real media library, so the run has an artifact that is a *file* and not a document.
+    // A database.json is one file; an objects/ tree is four, and a delete that only took the
+    // first would look complete.
+    let site: Uuid = sqlx::query_scalar(
+        "insert into sites (organization_id, key, name) values ($1, $2, $3) returning id",
+    )
+    .bind(fixture.org)
+    .bind(format!("k{}", &Uuid::new_v4().simple().to_string()[..8]))
+    .bind("Delete Site")
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a site must be created");
+
+    let payload: &[u8] = b"\\x89PNG\\r\\n\\x1a\\n bytes that must be gone after the delete";
+    for name in ["hero.png", "logo.png", "banner.png"] {
+        let key = format!("suite/{site}/{name}");
+        fixture
+            .state
+            .storage()
+            .put(&key, payload, "image/png")
+            .await
+            .expect("the object must be storable");
+        sqlx::query(
+            "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+             checksum, created_by) values ($1, $2, $3, $4, $5, $6, null)",
+        )
+        .bind(site)
+        .bind(&key)
+        .bind(name)
+        .bind("image/png")
+        .bind(payload.len() as i64)
+        .bind(omnion_backup::bytes_checksum(payload))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the media row must be written");
+    }
+
+    // Two runs. The second is not a control group for its own sake — it is what turns
+    // "the directory is gone" into "THE DIRECTORY is gone". A delete that emptied the whole
+    // backup root would satisfy every other assertion in this walk.
+    let first = take_backup(&fixture.state, &token, &csrf, &["media", "configuration"]).await;
+    assert_eq!(first.status, StatusCode::CREATED, "body: {}", first.body);
+    let second = take_backup(&fixture.state, &token, &csrf, &["media", "configuration"]).await;
+    assert_eq!(second.status, StatusCode::CREATED, "body: {}", second.body);
+
+    let id_of = |response: &TestResponse| -> Uuid {
+        Uuid::parse_str(
+            response.body["backup"]["id"].as_str().expect("an id"),
+        )
+        .expect("a uuid")
+    };
+    let (first_id, second_id) = (id_of(&first), id_of(&second));
+    let first_prefix = first.body["backup"]["storage_prefix"]
+        .as_str()
+        .expect("a prefix")
+        .to_owned();
+    let second_prefix = second.body["backup"]["storage_prefix"]
+        .as_str()
+        .expect("a prefix")
+        .to_owned();
+    assert_ne!(first_prefix, second_prefix, "each run has its own directory");
+
+    // The path is read out of the run's own manifest, not recomputed — the same rule the
+    // media walk uses. A helper here that agreed with a wrong production path would make
+    // the two halves consistent and wrong.
+    let run_directory = |prefix: &str| -> std::path::PathBuf {
+        fixture.artifact(
+            prefix,
+            &format!("{}/", prefix.trim_start_matches('/')),
+        )
+    };
+    let doomed = run_directory(&first_prefix);
+    let survivor = run_directory(&second_prefix);
+    assert!(
+        doomed.exists(),
+        "the run's directory must exist before the delete: {}",
+        doomed.display()
+    );
+    let objects_before = std::fs::read_dir(
+        doomed.join(omnion_backup::OBJECTS_DIR).join(&site.to_string()),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "the objects directory for the site must exist before the delete at {}: {err}",
+            doomed.join(omnion_backup::OBJECTS_DIR).display()
+        )
+    })
+    .count();
+    assert!(
+        objects_before >= 3,
+        "the media part wrote one file per object, not one file: {objects_before}"
+    );
+    assert!(
+        survivor.join("configuration.json").exists(),
+        "the second run wrote its own artifacts: {}",
+        survivor.display()
+    );
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/backups/{first_id}"),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+
+    // The report is a `200` body rather than a `204`, because "the row is gone" and "the
+    // bytes are gone" are two facts. A walk that only checked the status would pass on the
+    // old implementation for the old implementation's own reason.
+    let report = &response.body;
+    assert_eq!(report["existed"], true, "the directory was there: {report}");
+    assert_eq!(report["failed_entries"], 0, "nothing was refused: {report}");
+    assert!(
+        report["removed_entries"].as_i64().unwrap_or_default() >= objects_before as i64,
+        "at least the object directory came off: {report}"
+    );
+    assert!(
+        report["root"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(first_prefix.trim_end_matches('/')),
+        "the report names the directory it took, so an operator can go and look: {report}"
+    );
+
+    // **The assertion the old implementation could not survive.**
+    assert!(
+        !doomed.exists(),
+        "the run's directory must be gone from the destination: {}",
+        doomed.display()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from backups where id = $1",
+        )
+        .bind(first_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the count must answer"),
+        0,
+        "the row is gone too"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "select count(*) from backup_parts where backup_id = $1",
+        )
+        .bind(first_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the count must answer"),
+        0,
+        "and its parts with it"
+    );
+
+    // The other run is untouched — byte for byte, not merely present.
+    assert!(
+        survivor.join("configuration.json").exists(),
+        "another run's archive must survive the delete: {}",
+        survivor.display()
+    );
+    assert!(
+        survivor.join(omnion_backup::INDEX_FILENAME).exists(),
+        "including its media index: {}",
+        survivor.display()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from backups where id = $1")
+            .bind(second_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must answer"),
+        1,
+        "and its row is still in the list"
+    );
+
+    // A second delete of the same run is a `404`, not a second purge of somebody else's
+    // archive: without the row there is no prefix, and a handler that re-derived one from
+    // the path would be guessing at a directory to delete.
+    let repeat = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/backups/{first_id}"),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        repeat.status, StatusCode::NOT_FOUND,
+        "a deleted run is a 404, never a second delete: {}",
+        repeat.body
+    );
+    assert!(
+        survivor.join("configuration.json").exists(),
+        "the second delete must not have touched the surviving run either"
+    );
+}
+
+/// A site for one organization, for the walks that need one organization's media to be
+/// distinguishable from another's.
+///
+/// A helper rather than a closure inside the walk, and the reason is the compiler: an
+/// `async move` closure that borrows the fixture's pool cannot be called twice, because the
+/// first call moves the borrow. Two sites means two calls, so it has to be a function.
+async fn create_site(pool: &sqlx::PgPool, organization_id: Uuid, name: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "insert into sites (organization_id, key, name) values ($1, $2, $3) returning id",
+    )
+    .bind(organization_id)
+    .bind(format!("k{}", &Uuid::new_v4().simple().to_string()[..8]))
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .expect("a site must be created")
+}
+
+#[tokio::test]
+async fn a_backups_media_part_holds_only_the_runs_own_organizations_files() {
+    // Found by the delete walk, as a side effect of its own fixture: the media part asked for
+    // `pending_objects(pool, None)` and got every `media` row on the deployment. The pre-existing
+    // media walk had been passing because every test in this suite creates media for ONE
+    // organization — so "the whole deployment" and "this organization's library" are the same
+    // set, and a data leak is invisible inside its own blind spot.
+    //
+    // The stranger's media in the failure message is the proof: `34 of 36 objects could not be
+    // copied — share-guarded.txt: no object is stored under "shares/4c70..."` are rows from a
+    // **different suite's** organization, sitting in this run's media part. Backup is the one
+    // place where an unscoped read turns into a leak with a green tick beside it, because every
+    // other read in the file is scoped by `organization_id`.
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // One object for this organization, one for the stranger's. Both rows exist; only one of
+    // them may appear in this run's archive.
+    let own_site = create_site(fixture.db.pool(), fixture.org, "Own Site").await;
+    let stranger_site = create_site(fixture.db.pool(), fixture.other_org, "Stranger Site").await;
+
+    let mut keys = Vec::new();
+    for (site, name, payload) in [
+        (own_site, "mine.png", &b"the operator's own file"[..]),
+        (stranger_site, "theirs.png", &b"another tenant's file, which must not be here"[..]),
+    ] {
+        let key = format!("suite/{site}/{name}");
+        fixture
+            .state
+            .storage()
+            .put(&key, payload, "image/png")
+            .await
+            .expect("the object must be storable");
+        sqlx::query(
+            "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+             checksum, created_by) values ($1, $2, $3, $4, $5, $6, null)",
+        )
+        .bind(site)
+        .bind(&key)
+        .bind(name)
+        .bind("image/png")
+        .bind(payload.len() as i64)
+        .bind(omnion_backup::bytes_checksum(payload))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the media row must be written");
+        keys.push((name.to_owned(), omnion_backup::bytes_checksum(payload)));
+    }
+
+    let response = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
+    assert_eq!(response.status, StatusCode::CREATED, "body: {}", response.body);
+    let run = &response.body["backup"];
+    assert_eq!(
+        run["status"], "succeeded",
+        "the run must succeed — the stranger's file is not this run's to copy: {run}"
+    );
+    let prefix = run["storage_prefix"].as_str().expect("a prefix");
+    let (item_count,) = sqlx::query_as::<_, (i32,)>(
+        "select item_count from backup_parts where backup_id = $1 and part = 'media'",
+    )
+    .bind(
+        Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid"),
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a media row must exist");
+    assert_eq!(
+        item_count, 1,
+        "exactly this organization's file, not the deployment's two"
+    );
+
+    // The index is the archive's own account of itself, so it is the right place to look for
+    // the stranger's name — and the absence of it is the assertion.
+    let index_path = fixture.artifact(
+        prefix,
+        &format!("{}{}", prefix.trim_start_matches('/'), omnion_backup::INDEX_FILENAME),
+    );
+    let index: Value = serde_json::from_slice(
+        &std::fs::read(&index_path).unwrap_or_else(|err| {
+            panic!("the media index must exist at {}: {err}", index_path.display())
+        }),
+    )
+    .expect("the index must be JSON");
+    let body = serde_json::to_string(&index).expect("the index must serialise");
+    assert!(
+        body.contains("mine.png"),
+        "this organization's file is in the archive: {index}"
+    );
+    assert!(
+        !body.contains("theirs.png"),
+        "another tenant's file is in this run's archive: {index}"
+    );
+
+    // The stranger's run holds only theirs. A "fix" that scoped by *excluding* the other
+    // org rather than by *including* this one would pass the two assertions above and still
+    // put a tenant's files in a backup.
+    //
+    // The stranger logs in for themselves and sends **their own** CSRF token: the token is
+    // bound to the session it was issued for, so reusing the operator's is a `403` that has
+    // nothing to do with tenancy — the one failure mode a test that reuses a token will
+    // misread as a product defect.
+    let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
+    let theirs = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &backups_uri(),
+            Some(&stranger_token),
+            Some(&stranger_csrf),
+            Some(json!({ "scopes": ["media"] })),
+        ),
+    )
+    .await;
+    assert_eq!(theirs.status, StatusCode::CREATED, "body: {}", theirs.body);
+    let their_prefix = theirs.body["backup"]["storage_prefix"]
+        .as_str()
+        .expect("a prefix");
+    let their_index: Value = serde_json::from_slice(
+        &std::fs::read(fixture.artifact(
+            their_prefix,
+            &format!(
+                "{}{}",
+                their_prefix.trim_start_matches('/'),
+                omnion_backup::INDEX_FILENAME
+            ),
+        ))
+        .expect("the stranger's index must exist"),
+    )
+    .expect("the index must be JSON");
+    let their_body = serde_json::to_string(&their_index).expect("the index must serialise");
+    assert!(
+        their_body.contains("theirs.png"),
+        "the stranger's own file is in their archive: {their_index}"
+    );
+    assert!(
+        !their_body.contains("mine.png"),
+        "the operator's file leaked into another tenant's archive: {their_index}"
     );
 }

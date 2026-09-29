@@ -33,18 +33,31 @@
 
 pub mod destination;
 pub mod error;
+pub mod media;
 pub mod part;
+pub mod purge;
 pub mod store;
 
 pub use destination::{
-    DestinationReport, PROBE_FILENAME, local_root_for, probe_local, storage_key, storage_prefix,
+    DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
+    storage_prefix,
 };
 pub use error::{BackupError, Result};
+pub use media::{
+    CopiedObject, INDEX_FILENAME, INDEX_VERSION, MAX_OBJECT_BYTES, MAX_REPORTED_FAILURES,
+    MediaCopyReport, MediaIndex, MediaObject, OBJECTS_DIR, ObjectFailure, SiteCount, build_index,
+    copy_objects, object_key, pending_objects, pending_objects_for_organization, roll_up_sites,
+    safe_filename,
+};
 pub use part::{
     MANIFEST_VERSION, MAX_ERROR_LENGTH, MAX_LABEL_LENGTH, Manifest, ObservedPart, PARTS, Part,
     PartStatus, RunStatus, Verification, build_manifest, bytes_checksum, canonical_json,
     manifest_checksum, normalise_scopes, summarise, truncate_error, validate_label,
     verify_manifest,
+};
+pub use purge::{
+    MAX_REPORTED_PURGE_FAILURES, PROBE_MARKER, PurgeFailure, PurgeReport, remove_run_artifacts,
+    run_directory,
 };
 pub use store::{
     Backup, BackupPage, BackupQuery, BackupSchedule, BackupSettings, NewBackup, NewPart,
