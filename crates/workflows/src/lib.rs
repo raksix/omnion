@@ -30,6 +30,11 @@ pub mod graph_store;
 pub mod guard;
 pub mod handler;
 pub mod model;
+pub mod plugin_nodes;
+
+#[cfg(test)]
+#[path = "plugin_nodes_tests.rs"]
+mod plugin_nodes_tests;
 pub mod run_from;
 pub mod retry_node;
 pub mod store;

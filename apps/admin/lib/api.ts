@@ -4940,17 +4940,30 @@ export interface GraphNodeType {
   outputs: GraphPort[];
   /** The parameter fields the inspector draws. */
   params: GraphParamField[];
-  /** `true` when the engine never runs it. */
+  /** `true` when the engine never runs it. Always `false` for a plugin node. */
   inert: boolean;
   /** The parameters a freshly dropped card starts with. */
   defaults: Record<string, unknown>;
+  /**
+   * `Plugin: <name>` for a plugin node, `undefined` for a core one.
+   *
+   * Optional rather than an empty string so the palette can tell "not a plugin" from "a
+   * plugin that failed to name itself" — and the second is refused server-side, so `undefined`
+   * is safe to treat as an ordinary node.
+   */
+  badge?: string;
+  /** The providing plugin's key, when this is a plugin node. Names the badge's tooltip. */
+  provider?: string;
 }
 
 /** The palette's whole registry. */
 export interface GraphNodeTypes {
-  /** Every node type, in rail order. */
+  /** Every node type, in rail order: core first, then plugin types. */
   node_types: GraphNodeType[];
-  /** The rail's groups, in draw order. */
+  /**
+   * The rail's groups, in draw order. `Plugins` appears **only** when a plugin contributed a
+   * node type — an organization with no plugins never sees a heading it cannot fill.
+   */
   categories: string[];
 }
 

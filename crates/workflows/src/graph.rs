@@ -44,6 +44,7 @@ use uuid::Uuid;
 use crate::branch::{MAX_FIELD, OPERATORS};
 use crate::definition::{MAX_STEPS, StepDefinition};
 use crate::error::{Result, WorkflowError};
+use crate::plugin_nodes::Resolution;
 
 /// Most nodes one graph may carry (the projection cannot exceed [`MAX_STEPS`]).
 pub const MAX_NODES: usize = MAX_STEPS + 2;
@@ -669,13 +670,53 @@ pub fn ports_of(key: &str) -> &'static [Port] {
     find_node_type(key).map_or(&[], |node_type| node_type.outputs)
 }
 
+/// Does this key have the shape a plugin node key is namespaced into?
+///
+/// Only used to choose between two sentences for the *same* finding, and that is the whole
+/// of its job: a key that looks like `plugin.<x>.<y>` and did not resolve means the plugin
+/// was disabled, which is a different problem from a typo and needs a different instruction
+/// ("re-enable it" rather than "pick a legal one"). It is deliberately not a lookup — a
+/// lookup would make the message depend on whether the plugin is *installed*, so disabling and
+/// uninstalling would say different things about the same broken rule.
+#[must_use]
+fn looks_like_plugin_key(key: &str) -> bool {
+    let mut parts = key.split('.');
+    matches!(parts.next(), Some("plugin")) && parts.next().is_some() && parts.next().is_some()
+}
+
 /// Check the graph and answer what is wrong with it.
 ///
 /// Findings, not an error: the panel shows all of them at once with a jump link each, and a
 /// save is refused only when at least one is an error. A warning is something a person may
 /// legitimately accept — a `note` with no connection, say.
+///
+/// This is the **core-only** check. An organization with plugins enabled must use
+/// [`validate_with_plugins`], or a rule using a plugin node is reported as an
+/// `unknown_node_type` — which is a false accusation against the author, and the kind that
+/// teaches people to ignore the problems panel.
 #[must_use]
 pub fn validate(graph: &Graph) -> Vec<Finding> {
+    validate_with_plugins(graph, &crate::plugin_nodes::PluginRegistry::empty())
+}
+
+/// [`validate`], against the node types this organization has enabled.
+///
+/// The plugin registry is a **parameter of the check, not of the core's knowledge**. That
+/// direction is the whole design and it is what keeps the criterion's third clause honest: a
+/// plugin node the organization has *disabled* resolves to `Unknown`, and therefore produces
+/// the same `unknown_node_type` finding a typo does — an error at edit time, with the node
+/// named, instead of a run that dies when the plugin's runner is not there.
+///
+/// Note what this function does **not** do: it does not learn to *run* a plugin node. The
+/// engine projects only core node types onto steps, so a graph that validates with a plugin
+/// node is still refused by `project` — and `project` says so in its own finding rather than
+/// this one, because a rule that validates and then cannot project would be worse than one
+/// that never validated.
+#[must_use]
+pub fn validate_with_plugins(
+    graph: &Graph,
+    plugins: &crate::plugin_nodes::PluginRegistry,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     if graph.nodes.is_empty() {
@@ -766,17 +807,39 @@ pub fn validate(graph: &Graph) -> Vec<Finding> {
                 Some(&node.id),
             ));
         }
-        match find_node_type(&node.node_type) {
-            None => findings.push(Finding::error(
-                "unknown_node_type",
-                format!(
-                    "{:?} is not a node type the platform knows — the palette lists the legal ones",
-                    node.node_type
-                ),
-                Some(&node.id),
-            )),
-            Some(node_type) => {
-                findings.extend(validate_params(node, node_type));
+        // Resolution, not a lookup: a plugin node is resolved through the registry and a
+        // core node through the `const` list, and a key that is neither is the finding. The
+        // message differs per arm on purpose — "not a node type the platform knows" is right
+        // for a typo and *wrong* for a plugin this organization has disabled, and telling an
+        // author their working rule is nonsense because an admin disabled something is the
+        // fastest way to make them stop reading the panel.
+        match plugins.resolve(&node.node_type) {
+            Resolution::Core => {
+                if let Some(node_type) = find_node_type(&node.node_type) {
+                    findings.extend(validate_params(node, node_type));
+                }
+            }
+            Resolution::Plugin(plugin_node) => {
+                findings.extend(validate_plugin_params(node, plugin_node));
+            }
+            Resolution::Unknown => {
+                let disabled = looks_like_plugin_key(&node.node_type);
+                findings.push(Finding::error(
+                    "unknown_node_type",
+                    if disabled {
+                        format!(
+                            "{:?} came from a plugin node type this organization no longer has enabled — \
+                             re-enable the plugin, or replace the node with a core one",
+                            node.node_type
+                        )
+                    } else {
+                        format!(
+                            "{:?} is not a node type the platform knows — the palette lists the legal ones",
+                            node.node_type
+                        )
+                    },
+                    Some(&node.id),
+                ));
             }
         }
     }
@@ -834,37 +897,54 @@ pub fn validate(graph: &Graph) -> Vec<Finding> {
             ));
             continue;
         };
-        if let Some(node_type) = find_node_type(&source.node_type) {
-            if node_type.outputs.is_empty() {
-                findings.push(Finding::error(
-                    "port_missing",
-                    format!(
-                        "{:?} exports no port, so nothing can leave it",
-                        source.label
-                    ),
-                    Some(&source.id),
-                ));
-            } else if !node_type
+        // Port validation resolves through the registry, because a plugin node's ports are
+        // the only thing that knows what they are. Note what is *not* here: no finding is
+        // added when the source type cannot be resolved at all. That case is already reported
+        // once per node by the `unknown_node_type` check, and saying it again per edge turns
+        // one mistake into N findings — the problems panel would show the same sentence eight
+        // times and the author would read it as noise.
+        let source_ports: Vec<String> = match plugins.resolve(&source.node_type) {
+            Resolution::Core => find_node_type(&source.node_type)
+                .map(|node_type| {
+                    node_type
+                        .outputs
+                        .iter()
+                        .map(|port| port.key.to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Resolution::Plugin(plugin_node) => plugin_node
                 .outputs
                 .iter()
-                .any(|port| port.key == edge.source_port)
-            {
+                .map(|port| port.key.clone())
+                .collect(),
+            Resolution::Unknown => Vec::new(),
+        };
+        if source_ports.is_empty() {
+            // Only a *resolved* type with no ports is a finding; an unresolved one is the
+            // node's own `unknown_node_type`, already counted.
+            if !matches!(plugins.resolve(&source.node_type), Resolution::Unknown) {
                 findings.push(Finding::error(
-                    "unknown_source_port",
-                    format!(
-                        "{:?} has no {:?} port — it exports {}",
-                        source.label,
-                        edge.source_port,
-                        node_type
-                            .outputs
-                            .iter()
-                            .map(|port| format!("{:?}", port.key))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                    "port_missing",
+                    format!("{:?} exports no port, so nothing can leave it", source.label),
                     Some(&source.id),
                 ));
             }
+        } else if !source_ports.contains(&edge.source_port) {
+            findings.push(Finding::error(
+                "unknown_source_port",
+                format!(
+                    "{:?} has no {:?} port — it exports {}",
+                    source.label,
+                    edge.source_port,
+                    source_ports
+                        .iter()
+                        .map(|key| format!("{key:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(&source.id),
+            ));
         }
         if edge.source == edge.target {
             findings.push(Finding::error(
@@ -941,10 +1021,19 @@ pub fn validate(graph: &Graph) -> Vec<Finding> {
     // Every non-terminal node needs a way out, or the run stops in the middle with nothing
     // to say about it.
     for node in &graph.nodes {
-        let Some(node_type) = find_node_type(&node.node_type) else {
-            continue;
+        // A plugin node is checked here too, and its `inert` answer is `false` — a plugin
+        // declares no behaviour, so nothing it declares can make it decoration. The port list
+        // is what decides: a plugin node with ports must be wired onward, exactly like a core
+        // one, and skipping the check would let a graph validate whose last plugin node has
+        // nowhere to go and fail mid-run instead.
+        let (inert, output_count) = match plugins.resolve(&node.node_type) {
+            Resolution::Core => find_node_type(&node.node_type)
+                .map(|node_type| (node_type.inert, node_type.outputs.len()))
+                .unwrap_or((true, 0)),
+            Resolution::Plugin(plugin_node) => (false, plugin_node.outputs.len()),
+            Resolution::Unknown => continue,
         };
-        if node_type.inert || node_type.outputs.is_empty() {
+        if inert || output_count == 0 {
             continue;
         }
         if reachable.contains(node.id.as_str()) && !graph.edges.iter().any(|e| e.source == node.id)
@@ -964,9 +1053,61 @@ pub fn validate(graph: &Graph) -> Vec<Finding> {
 }
 
 /// A node's own parameters against the registry's schema.
+///
+/// The core registry's `options` is `&'static [&'static str]`, so its iterator yields
+/// `&&str` and every one needs a deref. Written out rather than shared, because the two
+/// schemas arrive in different shapes and a clever coercion here is a `&&str` that compiles
+/// once and reads as noise forever after.
 fn validate_params(node: &Node, node_type: &NodeType) -> Vec<Finding> {
+    validate_declared_params(
+        node,
+        node_type.params.iter().map(|field| ParamCheck {
+            key: field.key,
+            label: field.label,
+            required: field.required,
+            options: field.options.iter().map(|option| *option).collect(),
+        }),
+    )
+}
+
+/// The same check for a plugin node's declared fields.
+///
+/// A second caller of one function rather than a copy of `validate_params`: the two schemas
+/// are different *types* (one is a `const` slice, one is owned strings from a manifest) but
+/// the same *question*, and a copy is where the two would start disagreeing. A plugin node
+/// that skipped the `select` check would accept a value the inspector cannot draw, and the
+/// author's only symptom would be a rule that saves and then does nothing.
+fn validate_plugin_params(
+    node: &Node,
+    node_type: &crate::plugin_nodes::ResolvedPluginNode,
+) -> Vec<Finding> {
+    validate_declared_params(
+        node,
+        node_type.params.iter().map(|field| ParamCheck {
+            key: field.key.as_str(),
+            label: field.label.as_str(),
+            required: field.required,
+            options: field.options.iter().map(String::as_str).collect(),
+        }),
+    )
+}
+
+/// One field, borrowed from either schema.
+struct ParamCheck<'a> {
+    key: &'a str,
+    label: &'a str,
+    required: bool,
+    options: Vec<&'a str>,
+}
+
+/// The shared body: a required field must be present and non-empty, and a `select` must hold
+/// one of its declared values.
+fn validate_declared_params<'a>(
+    node: &Node,
+    fields: impl Iterator<Item = ParamCheck<'a>>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for field in node_type.params {
+    for field in fields {
         if field.required {
             let present = node
                 .params
@@ -997,6 +1138,14 @@ fn validate_params(node: &Node, node_type: &NodeType) -> Vec<Finding> {
             }
         }
     }
+    // The rest of the core checks read the *node type's* identity — a `condition` bounds its
+    // field path, a `wait` bounds its seconds — and a plugin node has neither identity, so
+    // there is nothing to apply. The generic check above is the whole of what a plugin node
+    // is validated against, and that is not an oversight: it is the boundary of what the core
+    // is willing to promise about code it does not run.
+    let Some(node_type) = find_node_type(&node.node_type) else {
+        return findings;
+    };
     // A condition node's field path is the one thing the engine will read literally, so it is
     // bounded here rather than at run time.
     if node_type.key == "condition" {

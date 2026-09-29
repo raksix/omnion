@@ -27,8 +27,9 @@ use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::bus;
 use omnion_events::model::NewEvent;
-use omnion_workflows::graph::{self, Edge, Graph, Node};
+use omnion_workflows::graph::{self, Graph};
 use omnion_workflows::graph_store::{self, GraphUpdate};
+use omnion_workflows::plugin_nodes::PluginRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -151,32 +152,69 @@ impl ValidationBody {
 }
 
 /// One node type as the palette reads it.
+///
+/// `key`/`label`/… are `String` rather than `&'static str` for one reason: the same body
+/// describes a **core** type (a `const` in the binary) and a **plugin** type (a manifest a
+/// third party uploaded yesterday). The two cannot share a body that borrows from either, and
+/// the alternative — a second response type the palette has to union with — is a client that
+/// has to know which kind it is looking at before it can draw it.
 #[derive(Debug, Serialize)]
 pub struct NodeTypeBody {
     /// Registry key, stored on the node as `type`.
-    pub key: &'static str,
+    pub key: String,
     /// What the palette calls it.
-    pub label: &'static str,
+    pub label: String,
     /// Which rail group it sits in.
-    pub category: &'static str,
+    pub category: String,
     /// One line under the card.
-    pub summary: &'static str,
+    pub summary: String,
     /// Output ports, in draw order.
-    pub outputs: &'static [graph::Port],
+    pub outputs: Vec<PortBody>,
     /// The parameter fields the inspector draws.
-    pub params: &'static [graph::ParamField],
-    /// `true` when the engine never runs it.
+    pub params: Vec<ParamFieldBody>,
+    /// `true` when the engine never runs it. Always `false` for a plugin node.
     pub inert: bool,
     /// A starter node for a freshly dropped card, so the inspector has something to show.
     pub defaults: Value,
+    /// `Some("Plugin: <name>")` for a plugin node, `None` for a core one.
+    ///
+    /// Optional rather than an empty string so the client can tell "not a plugin" from "a
+    /// plugin that failed to name itself" — and the second is refused at registration, so the
+    /// client may treat `None` as an ordinary node without losing a case.
+    pub badge: Option<String>,
+    /// The provider's key, when this is a plugin node. The tooltip the criterion asks for.
+    pub provider: Option<String>,
+}
+
+/// One port as the canvas draws it.
+#[derive(Debug, Serialize)]
+pub struct PortBody {
+    pub key: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
+    pub terminal: bool,
+}
+
+/// One inspector field.
+#[derive(Debug, Serialize)]
+pub struct ParamFieldBody {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+    pub required: bool,
+    pub options: Vec<String>,
+    pub help: String,
 }
 
 /// The palette's whole registry.
 #[derive(Debug, Serialize)]
 pub struct NodeTypesBody {
-    /// Every node type, in rail order.
+    /// Every node type, in rail order. Core first, then plugin types under `Plugins`.
     pub node_types: Vec<NodeTypeBody>,
-    /// The palette rail's groups, in the order they are drawn.
+    /// The palette rail's groups, in the order they are drawn. `Plugins` is present **only**
+    /// when a plugin contributed a node type, so an organization with no plugins never sees a
+    /// group heading it cannot fill.
     pub categories: Vec<String>,
 }
 
@@ -189,38 +227,128 @@ pub struct NodeTypesBody {
 /// Deliberately not a table (REQ-004 data model): a plugin upgrade that renames a node type
 /// would leave a row behind describing a node the core can no longer explain, and a rule
 /// using it would fail at run time instead of at validation.
+///
+/// The core half is a compile-time constant and therefore the same for every organization.
+/// The plugin half is **per organization** — that is the criterion's "appears when enabled and
+/// disappears when disabled" — and it comes from `plugins_enabled_for`, which is the seam
+/// REQ-121 fills in. Until then it is an empty registry, so the response is byte-identical to
+/// what the core-only route returned and no existing client changes behaviour.
 pub async fn list_node_types(
     State(state): State<AppState>,
-    _current: CurrentSession,
+    current: CurrentSession,
 ) -> Result<Json<NodeTypesBody>, ApiError> {
-    // The registry is a compile-time constant, so the answer is the same for every
-    // organization. The route layer still guards it: a caller who cannot read the rules has
-    // no business being told what shapes a rule may take.
-    let _ = &state;
     let mut categories: Vec<String> = Vec::new();
-    let node_types: Vec<NodeTypeBody> = graph::NODE_TYPES
+    let mut node_types: Vec<NodeTypeBody> = graph::NODE_TYPES
         .iter()
         .map(|node_type| {
             if !categories.iter().any(|name| name == node_type.category) {
                 categories.push(node_type.category.to_owned());
             }
             NodeTypeBody {
-                key: node_type.key,
-                label: node_type.label,
-                category: node_type.category,
-                summary: node_type.summary,
-                outputs: node_type.outputs,
-                params: node_type.params,
+                key: node_type.key.to_owned(),
+                label: node_type.label.to_owned(),
+                category: node_type.category.to_owned(),
+                summary: node_type.summary.to_owned(),
+                outputs: node_type
+                    .outputs
+                    .iter()
+                    .map(|port| PortBody {
+                        key: port.key.to_owned(),
+                        label: port.label.to_owned(),
+                        // The core registry has no per-port help; a plugin manifest may. The
+                        // field is omitted rather than sent as null so the canvas's
+                        // `port.help && …` reads the same shape for both kinds.
+                        help: None,
+                        terminal: port.terminal,
+                    })
+                    .collect(),
+                params: node_type
+                    .params
+                    .iter()
+                    .map(|field| ParamFieldBody {
+                        key: field.key.to_owned(),
+                        label: field.label.to_owned(),
+                        kind: field.kind.to_owned(),
+                        required: field.required,
+                        options: field.options.iter().map(|o| (*o).to_owned()).collect(),
+                        help: field.help.to_owned(),
+                    })
+                    .collect(),
                 inert: node_type.inert,
                 defaults: default_params(node_type),
+                badge: None,
+                provider: None,
             }
         })
         .collect();
+
+    // The plugin half, appended after the core so the rail's group order is stable and the
+    // `Plugins` heading is always last — a group that moves position as plugins come and go
+    // makes the palette feel unstable for a reason nobody can name.
+    let plugins = plugins_enabled_for(&state, &current).await?;
+    for node in plugins.nodes() {
+        if !categories.iter().any(|name| name == &node.category) {
+            categories.push(node.category.clone());
+        }
+        node_types.push(NodeTypeBody {
+            key: node.key.clone(),
+            label: node.label.clone(),
+            category: node.category.clone(),
+            summary: node.summary.clone(),
+            outputs: node
+                .outputs
+                .iter()
+                .map(|port| PortBody {
+                    key: port.key.clone(),
+                    label: port.label.clone(),
+                    help: port.help.clone(),
+                    terminal: port.terminal,
+                })
+                .collect(),
+            params: node
+                .params
+                .iter()
+                .map(|field| ParamFieldBody {
+                    key: field.key.clone(),
+                    label: field.label.clone(),
+                    kind: field.kind.clone(),
+                    required: field.required,
+                    options: field.options.clone(),
+                    help: field.help.clone(),
+                })
+                .collect(),
+            // A plugin node is never decoration: it declares ports, so the author wired it
+            // expecting it to do something, and drawing it greyed as inert would be a lie.
+            inert: false,
+            defaults: node.defaults.clone(),
+            badge: Some(node.badge.clone()),
+            provider: Some(node.provider.plugin.clone()),
+        });
+    }
 
     Ok(Json(NodeTypesBody {
         node_types,
         categories,
     }))
+}
+
+/// The plugin node types this organization has enabled.
+///
+/// **The seam, and it is deliberately empty.** REQ-121 owns plugin enablement, its store and
+/// its `plugins.read` gate; this function is where that lands, and it is the *only* place —
+/// `crates/workflows` deliberately does not know that plugins exist as rows, so the seam is a
+/// function rather than a trait so a later reader can find it in one grep.
+///
+/// It is not a stub in the sense of returning nothing forever: it reads the real session, so
+/// the organization id is already in hand when the store arrives, and the `Result` means the
+/// error path is wired rather than added later. Until then the answer is an empty registry,
+/// which is exactly the state of an organization with no plugins — so the route is correct
+/// today rather than approximately correct.
+async fn plugins_enabled_for(
+    _state: &AppState,
+    _current: &CurrentSession,
+) -> Result<PluginRegistry, ApiError> {
+    Ok(PluginRegistry::empty())
 }
 
 /// `GET /api/v1/workflows/{id}/graph` — the definition the builder opens on.
@@ -258,7 +386,11 @@ pub async fn replace_graph(
         ));
     }
 
-    let findings = graph::validate(&input.graph);
+    // The same registry the palette was drawn from. Validating a save against a *different*
+    // set than the one the author was looking at is how a rule gets refused for a node the
+    // palette still offers.
+    let plugins = plugins_enabled_for(&state, &current).await?;
+    let findings = graph::validate_with_plugins(&input.graph, &plugins);
     if let Some(blocking) = findings.iter().find(|finding| finding.is_error()) {
         // The whole list travels with the refusal: a client that renders only the first
         // finding makes the author press Save once per problem.
@@ -347,7 +479,12 @@ pub async fn validate_graph(
             .ok_or_else(|| workflow_missing())?,
     };
 
-    let findings = graph::validate(&graph);
+    // Validated against the node types this organization actually has. Using the core-only
+    // `validate` here would report a rule using an enabled plugin as `unknown_node_type` —
+    // and that verdict is *stored* on the row, so the rule list would show a permanently
+    // "invalid" chip on a rule that is fine, with no way for the author to clear it.
+    let plugins = plugins_enabled_for(&state, &current).await?;
+    let findings = graph::validate_with_plugins(&graph, &plugins);
     // The verdict is stored so the rule list can draw "invalid" without re-validating every
     // row it renders. Only an error is remembered: the chip is about "this cannot run".
     let first_error = findings

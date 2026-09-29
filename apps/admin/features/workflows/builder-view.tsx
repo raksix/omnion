@@ -2011,9 +2011,28 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                           onKeyDown={(event) => onPaletteKeyDown(event, nodeType.key)}
                           className="w-full rounded-md border border-line bg-canvas px-2 py-1.5 text-left hover:border-accent"
                           data-palette-node={nodeType.key}
-                          title={nodeType.summary}
+                          // The badge, and the marker a probe reads. The tooltip names the
+                          // provider because "Send mail" with a badge reading "Plugin" tells
+                          // an author *that* it is a plugin and not *who* wrote it — and who
+                          // wrote it is the only thing that makes the badge actionable.
+                          data-palette-plugin={nodeType.provider ?? undefined}
+                          title={
+                            nodeType.provider
+                              ? `${nodeType.summary} — provided by the “${nodeType.badge}” node.`
+                              : nodeType.summary
+                          }
                         >
-                          <span className="block text-[12.5px] font-medium">{nodeType.label}</span>
+                          <span className="flex items-center gap-1.5">
+                            <span className="truncate text-[12.5px] font-medium">{nodeType.label}</span>
+                            {nodeType.badge ? (
+                              <span
+                                className="shrink-0 rounded border border-line px-1 text-[10.5px] text-muted"
+                                data-palette-badge
+                              >
+                                {nodeType.badge}
+                              </span>
+                            ) : null}
+                          </span>
                           <span className="block text-[11.5px] text-muted">{nodeType.summary}</span>
                         </button>
                       </li>
