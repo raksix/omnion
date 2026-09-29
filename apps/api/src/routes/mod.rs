@@ -660,6 +660,12 @@ pub fn router(state: AppState) -> Router {
     let workflow_run =
         post(workflows::run_workflow).layer(guards::require(&state, "workflows.run"));
 
+    // *Run from here* (REQ-004 slice 3) starts a run, so it is guarded by `workflows.run`
+    // and not by `workflows.manage`: a viewer who may start a rule may start part of one,
+    // and a manager who cannot start runs still cannot start this.
+    let workflow_run_from_node =
+        post(workflows::run_workflow_from_node).layer(guards::require(&state, "workflows.run"));
+
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
@@ -1277,6 +1283,11 @@ pub fn router(state: AppState) -> Router {
         .route("/workflows/node-types", workflow_node_types)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)
+        // A distinct path, not a body on `/run`: the two answers differ in *kind* — one is
+        // a whole run, the other a run with a prefix that did not run — and a client that
+        // sends `node_id` to the plain endpoint and gets a full run back would be a
+        // silent wrong answer rather than a refusal.
+        .route("/workflows/{id}/run-from-node", workflow_run_from_node)
         .route(
             "/workflows/{id}/graph",
             workflow_graph_read.merge(workflow_graph_write),

@@ -242,7 +242,9 @@ fn post_from(uri: &str, body: Value, token: &str, address: &str) -> Request<Body
     let ip: std::net::IpAddr = address.parse().expect("the address must be an IP");
     request
         .extensions_mut()
-        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(ip, 51234)));
+        .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            ip, 51234,
+        )));
     request
 }
 
@@ -371,7 +373,10 @@ fn version_id(answer: &TestResponse, number: i64) -> String {
         .find(|version| version["version"] == json!(number))
         .and_then(|version| version["id"].as_str())
         .unwrap_or_else(|| {
-            panic!("version {number} is missing from: {}", answer.body["versions"])
+            panic!(
+                "version {number} is missing from: {}",
+                answer.body["versions"]
+            )
         })
         .to_owned()
 }
@@ -538,7 +543,6 @@ async fn a_create_and_every_edit_are_written_to_the_history() {
     // The walk is done: drop its database now, while the runtime that can
     // still do the work is alive (see `Harness::close`).
     harness.close().await;
-
 }
 
 /// Restore puts an old definition back **and appends** it, keeping the rule itself.
@@ -699,7 +703,6 @@ async fn a_restore_puts_the_definition_back_without_rewinding_the_history() {
     // The walk is done: drop its database now, while the runtime that can
     // still do the work is alive (see `Harness::close`).
     harness.close().await;
-
 }
 
 /// A restore is a definition write, so only somebody who may manage rules can do one.
@@ -764,7 +767,6 @@ async fn a_restore_is_refused_to_a_caller_who_may_only_read() {
     // The walk is done: drop its database now, while the runtime that can
     // still do the work is alive (see `Harness::close`).
     harness.close().await;
-
 }
 
 /// The audit tab lists the definition changes with their actor and their summary.
@@ -924,7 +926,6 @@ async fn every_definition_change_is_listed_in_the_audit_tab() {
     // The walk is done: drop its database now, while the runtime that can
     // still do the work is alive (see `Harness::close`).
     harness.close().await;
-
 }
 
 /// The gallery serves six starters that are all real, installable definitions.
@@ -1034,7 +1035,6 @@ async fn the_gallery_serves_six_templates_that_this_installation_can_actually_sa
     // The walk is done: drop its database now, while the runtime that can
     // still do the work is alive (see `Harness::close`).
     harness.close().await;
-
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1089,11 +1089,7 @@ async fn removing_the_guard_changes_what_the_engine_does() {
     // names** on purpose — names must be unique in a definition, and the guard's fingerprint
     // deliberately ignores the name, so three steps that differ only by name are exactly the
     // "copy-pasted step, renamed" case the guard is written to still catch.
-    let repeated = json!([
-        echo_step("First"),
-        echo_step("Second"),
-        echo_step("Third")
-    ]);
+    let repeated = json!([echo_step("First"), echo_step("Second"), echo_step("Third")]);
     let rule_id = create_rule(
         &harness,
         &token,
@@ -1199,7 +1195,10 @@ async fn removing_the_guard_changes_what_the_engine_does() {
                     .collect::<Vec<_>>()
             )
         });
-    assert_eq!(repeat.step_no, 2, "the SECOND step is the repeat, not the first");
+    assert_eq!(
+        repeat.step_no, 2,
+        "the SECOND step is the repeat, not the first"
+    );
     // The step after the repeat is closed, never left claimable — otherwise the next tick
     // picks it up and the guard is defeated by a step it already knew about.
     let after = steps
@@ -1246,16 +1245,19 @@ async fn removing_the_guard_changes_what_the_engine_does() {
     let guarded_steps = omnion_workflows::store::list_steps(harness.db.pool(), execution_id)
         .await
         .expect("the guarded steps are readable");
-    let unguarded_steps = omnion_workflows::store::list_steps(harness.db.pool(), unguarded_execution)
-        .await
-        .expect("the unguarded steps are readable");
+    let unguarded_steps =
+        omnion_workflows::store::list_steps(harness.db.pool(), unguarded_execution)
+            .await
+            .expect("the unguarded steps are readable");
     assert_eq!(
         guarded_steps.len(),
         unguarded_steps.len(),
         "both runs have the same three steps on paper; the guard decides how many of them run"
     );
     assert!(
-        unguarded_steps.iter().all(|step| step.status == "succeeded"),
+        unguarded_steps
+            .iter()
+            .all(|step| step.status == "succeeded"),
         "without the guard nothing is refused: {:?}",
         unguarded_steps
             .iter()
@@ -1267,7 +1269,6 @@ async fn removing_the_guard_changes_what_the_engine_does() {
     // The walk is done: drop its database now, while the runtime that can
     // still do the work is alive (see `Harness::close`).
     harness.close().await;
-
 }
 
 /// Drive the engine until a run settles, with the guard the caller chose.

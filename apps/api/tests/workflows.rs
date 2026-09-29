@@ -1463,6 +1463,7 @@ fn the_definition_rules_are_the_engine_rules() {
         error: None,
         approval_id: None,
         event_payload: None,
+        started_from_node: None,
     };
     assert!(!execution.is_terminal());
 }
@@ -1514,7 +1515,10 @@ async fn the_graph_store_reads_a_column_the_workflows_table_actually_has() {
     // the column, which is the whole point of the guard.
     match omnion_workflows::graph_store::find_graph(db.pool(), uuid::Uuid::nil()).await {
         Ok(None) => {}
-        Ok(Some(found)) => panic!("a nil uuid must not match a workflow, got {}", found.workflow_id),
+        Ok(Some(found)) => panic!(
+            "a nil uuid must not match a workflow, got {}",
+            found.workflow_id
+        ),
         Err(err) => panic!("find_graph named a column the workflows table does not have: {err}"),
     }
 }
@@ -1549,8 +1553,16 @@ async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "create refused: {}", created.body);
-    let workflow_id = created.body["id"].as_str().expect("a created rule has an id").to_owned();
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "create refused: {}",
+        created.body
+    );
+    let workflow_id = created.body["id"]
+        .as_str()
+        .expect("a created rule has an id")
+        .to_owned();
 
     // The row the insert actually wrote.
     let stored: Value = sqlx::query_as::<_, (Value, i32)>(
@@ -1563,7 +1575,10 @@ async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
     .0;
     let graph = stored;
     let node_count = graph["nodes"].as_array().map_or(0, Vec::len);
-    assert!(node_count > 0, "a new rule was born with no graph nodes: {graph}");
+    assert!(
+        node_count > 0,
+        "a new rule was born with no graph nodes: {graph}"
+    );
 
     // The version the panel would be holding: it opens the graph, then saves what it read.
     let read = call(
@@ -1576,7 +1591,12 @@ async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
         ),
     )
     .await;
-    assert_eq!(read.status, StatusCode::OK, "reading a new rule's graph: {}", read.body);
+    assert_eq!(
+        read.status,
+        StatusCode::OK,
+        "reading a new rule's graph: {}",
+        read.body
+    );
     let current_version = read.body["graph_version"].clone();
 
     // And the server agrees: the graph it just wrote must validate, or the first save is a
@@ -1603,6 +1623,246 @@ async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
         saved.body["projection"]["valid"],
         Value::Bool(true),
         "the graph a new rule is born with does not validate: {graph}"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// REQ-004 slice 3: *Run from here* on a mid-graph node.
+///
+/// The criterion has three clauses and the response has to answer all three, so the test
+/// reads the **stored rows** rather than the response body. A handler that returned a
+/// plan-shaped payload while writing a full run would pass a body-only test and fail this
+/// one — and the failure is the one the criterion is about: a run that quietly executes
+/// the prefix the author asked to skip.
+#[tokio::test]
+async fn run_from_here_starts_at_the_node_and_marks_the_prefix_skipped() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = login(&fixture.state, &fixture.operator_email).await;
+    let runner = test_runner();
+
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&token),
+            Some(json!({
+                "name": "Run from here",
+                "organization_id": fixture.organization_a,
+                "trigger": { "kind": "manual" },
+                "steps": [ { "name": "prepare", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let workflow_id = created.body["id"]
+        .as_str()
+        .expect("a created rule has an id")
+        .to_owned();
+
+    // A four-step spine written through the real save path, so the graph the run reads is
+    // the graph the server would keep: trigger → a → b → c → end.
+    let current_version = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await
+    .body["graph_version"]
+        .clone();
+
+    let spine = json!({
+        "nodes": [
+            { "id": "trigger", "type": "trigger.manual", "label": "Trigger",
+              "params": { "kind": "manual" }, "position": { "x": 0, "y": 0 } },
+            { "id": "a", "type": "action", "label": "a",
+              "params": { "action": "noop", "parameters": {} }, "position": { "x": 1, "y": 0 } },
+            { "id": "b", "type": "action", "label": "b",
+              "params": { "action": "noop", "parameters": {} }, "position": { "x": 2, "y": 0 } },
+            { "id": "c", "type": "action", "label": "c",
+              "params": { "action": "noop", "parameters": {} }, "position": { "x": 3, "y": 0 } },
+            { "id": "end", "type": "end", "label": "End", "params": {},
+              "position": { "x": 4, "y": 0 } }
+        ],
+        "edges": [
+            { "id": "e1", "source": "trigger", "source_port": "out", "target": "a" },
+            { "id": "e2", "source": "a", "source_port": "success", "target": "b" },
+            { "id": "e3", "source": "b", "source_port": "success", "target": "c" },
+            { "id": "e4", "source": "c", "source_port": "success", "target": "end" }
+        ]
+    });
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            Some(json!({ "graph": spine, "graph_version": current_version })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "the spine was refused: {}",
+        saved.body
+    );
+    assert_eq!(
+        saved.body["projection"]["valid"],
+        Value::Bool(true),
+        "{}",
+        saved.body
+    );
+
+    // Start at `b`: the run's first step is `b`, `a` is passed over, `c` and the end run.
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/run-from-node"),
+            Some(&token),
+            Some(json!({ "node_id": "b" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::ACCEPTED,
+        "Run from here was refused: {}",
+        response.body
+    );
+    assert_eq!(response.body["started_from_node"], "b", "{}", response.body);
+
+    let execution_id = response.body["id"]
+        .as_str()
+        .expect("an accepted run has an id")
+        .to_owned();
+
+    // **The stored rows**, not the response: this is the clause that matters.
+    let rows: Vec<(i32, String, Option<String>)> = sqlx::query_as(
+        "select step_no, status, skip_reason from workflow_steps \
+         where execution_id = $1::uuid order by step_no asc",
+    )
+    .bind(Uuid::parse_str(&execution_id).expect("an id parses"))
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the run's steps are readable");
+
+    let status_of = |no: i32| {
+        rows.iter()
+            .find(|(step_no, _, _)| *step_no == no)
+            .map(|(_, status, _)| status.clone())
+    };
+    let reason_of = |no: i32| {
+        rows.iter()
+            .find(|(step_no, _, _)| *step_no == no)
+            .and_then(|(_, _, reason)| reason.clone())
+    };
+
+    assert_eq!(
+        status_of(1).as_deref(),
+        Some("skipped"),
+        "the step before the start did not stay skipped: {rows:?}"
+    );
+    assert_ne!(
+        status_of(2).as_deref(),
+        Some("skipped"),
+        "the node the run started at was itself skipped: {rows:?}"
+    );
+
+    // **The trace says why** — and the reason names the node, which is the part that
+    // distinguishes "the run was started down here on purpose" from "the engine got
+    // lost". A reason that only said "skipped" would satisfy the word and not the clause.
+    let reason = reason_of(1).expect("a skipped step must carry a reason");
+    assert!(
+        reason.contains("\"b\""),
+        "the reason must name the node the run started at: {reason:?}"
+    );
+
+    // The engine runs the tail and settles the run: a skipped prefix is closed work, not
+    // open work, so a run whose tail succeeded completes rather than waiting forever for a
+    // step that will never be claimed.
+    let settled = drive_until_settled(
+        &fixture.state,
+        &runner,
+        Uuid::parse_str(&execution_id).expect("an id parses"),
+    )
+    .await;
+    assert_eq!(
+        settled.status, "completed",
+        "a run whose prefix was skipped must still complete: {settled:?}"
+    );
+    assert_eq!(
+        status_of(1).as_deref(),
+        Some("skipped"),
+        "the engine must not have touched the skipped prefix: {rows:?}"
+    );
+    assert_eq!(
+        settled.step(1).attempts,
+        0,
+        "a skipped step is never claimed, so it spends no attempt: {:?}",
+        settled.step(1)
+    );
+
+    // The run records where it started, so a trace read months later can say so.
+    let started_from: Option<String> =
+        sqlx::query_scalar("select started_from_node from workflow_executions where id = $1::uuid")
+            .bind(Uuid::parse_str(&execution_id).expect("an id parses"))
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the run row is readable");
+    assert_eq!(started_from.as_deref(), Some("b"));
+
+    // Starting at the end is refused by name, because a run there would settle
+    // `completed` having done nothing — the one answer that must never be given.
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/run-from-node"),
+            Some(&token),
+            Some(json!({ "node_id": "end" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "starting at the end of the graph must be refused: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"], "nothing_to_run",
+        "{}",
+        refused.body
+    );
+
+    // A node the graph does not have is refused too, rather than quietly starting a full
+    // run — the failure mode of a client that lost its canvas and guessed.
+    let unknown = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/run-from-node"),
+            Some(&token),
+            Some(json!({ "node_id": "not-a-node" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "an unknown node must be refused: {}",
+        unknown.body
     );
 
     fixture.cleanup().await;

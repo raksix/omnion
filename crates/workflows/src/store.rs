@@ -393,6 +393,183 @@ pub async fn create_execution_in(
     Ok((execution, rows))
 }
 
+/// Create a run that starts at one node of a graph, and write the prefix as *skipped*.
+///
+/// The same write as [`create_execution`] with one difference, and the difference is the
+/// whole feature: the steps before the start are inserted as `skipped` rows carrying the
+/// reason, rather than as `pending` rows the engine would run. Inserting them is not
+/// optional — the criterion asks for the earlier nodes to *stay* skipped, and a trace that
+/// omits them cannot show they were passed over, only that they are missing.
+///
+/// Everything else is deliberately shared with `create_execution`: the same insert, the
+/// same columns, the same transaction. A second write of "create a run" that differed
+/// only in the prefix status would be a second place for the step numbering to drift, and
+/// the numbering is the one thing `claim_due_step` orders by.
+pub async fn create_execution_from_node(
+    pool: &PgPool,
+    workflow: &Workflow,
+    trigger: TriggerKind,
+    triggered_by: Option<Uuid>,
+    steps: &[StepDefinition],
+    plan: &crate::run_from::RunFromPlan,
+) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
+    let mut transaction = pool.begin().await?;
+
+    let execution = insert_execution(
+        &mut transaction,
+        workflow,
+        trigger,
+        triggered_by,
+        None,
+        Some(plan.node_id.clone()),
+    )
+    .await?;
+
+    let mut rows = Vec::with_capacity(steps.len() + plan.skipped.len());
+
+    // The skipped prefix first, in its stored positions, so `step_no` is written in the
+    // order the engine will read it and a partially written run is still legible.
+    for skipped in &plan.skipped {
+        let step = definition_of(steps, skipped.step_no);
+        let row = insert_skipped_step(&mut transaction, execution.id, skipped, step).await?;
+        rows.push(row);
+    }
+
+    for (index, step) in steps.iter().enumerate() {
+        let step_no = index as i32 + 1 + plan.skipped.len() as i32;
+        let row = insert_pending_step(&mut transaction, execution.id, step_no, step).await?;
+        rows.push(row);
+    }
+
+    transaction.commit().await?;
+    Ok((execution, rows))
+}
+
+/// The definition a skipped position refers to, when the caller handed one over.
+fn definition_of<'a>(steps: &'a [StepDefinition], step_no: i32) -> Option<&'a StepDefinition> {
+    steps.get((step_no - 1).max(0) as usize)
+}
+
+/// The stored action of a step, which for a control step is derived rather than authored.
+fn step_action(step: &StepDefinition) -> Option<String> {
+    match step.kind {
+        StepKind::Branch => Some(crate::branch::BRANCH_ACTION.to_owned()),
+        StepKind::Task => step.action.clone(),
+        StepKind::Wait | StepKind::Stop | StepKind::Approval => None,
+    }
+}
+
+/// Insert the run row itself, and nothing else.
+async fn insert_execution(
+    connection: &mut sqlx::PgConnection,
+    workflow: &Workflow,
+    trigger: TriggerKind,
+    triggered_by: Option<Uuid>,
+    event_payload: Option<serde_json::Value>,
+    started_from_node: Option<String>,
+) -> Result<WorkflowExecution> {
+    let sql = format!(
+        "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
+         triggered_by, event_payload, started_from_node) \
+         values ($1, $2, 'running', $3, $4, $5, $6) returning {EXECUTION_COLUMNS}"
+    );
+
+    Ok(sqlx::query_as(&sql)
+        .bind(workflow.id)
+        .bind(workflow.organization_id)
+        .bind(trigger.as_str())
+        .bind(triggered_by)
+        .bind(event_payload)
+        .bind(started_from_node)
+        .fetch_one(&mut *connection)
+        .await?)
+}
+
+/// Insert one step the engine will run.
+async fn insert_pending_step(
+    connection: &mut sqlx::PgConnection,
+    execution_id: Uuid,
+    step_no: i32,
+    step: &StepDefinition,
+) -> Result<WorkflowStep> {
+    let sql = format!(
+        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, \
+         on_error, timeout_ms, status, attempts, max_attempts) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 0, $9) returning {STEP_COLUMNS}"
+    );
+
+    Ok(sqlx::query_as(&sql)
+        .bind(execution_id)
+        .bind(step_no)
+        .bind(step.name.trim())
+        .bind(step.kind.as_str())
+        .bind(step_action(step))
+        .bind(step.params.clone())
+        .bind(step.on_error.as_str())
+        .bind(step.timeout_ms)
+        .bind(step.max_attempts)
+        .fetch_one(&mut *connection)
+        .await?)
+}
+
+/// Insert one step the run passed over, with the sentence the trace shows.
+///
+/// The step is written as `skipped` at insert time rather than inserted pending and
+/// updated afterwards. Two reasons, and the second is the whole point: a crash between
+/// the two writes would leave a run whose prefix the engine is about to run — the exact
+/// side effect *Run from here* exists to avoid — and the row is then never claimed, so
+/// "inserted as skipped" needs no reconciliation pass to be safe.
+async fn insert_skipped_step(
+    connection: &mut sqlx::PgConnection,
+    execution_id: Uuid,
+    skipped: &crate::run_from::SkippedStep,
+    step: Option<&StepDefinition>,
+) -> Result<WorkflowStep> {
+    let sql = format!(
+        "insert into workflow_steps (execution_id, step_no, name, kind, action, params, \
+         on_error, timeout_ms, status, attempts, max_attempts, skip_reason) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, 'skipped', 0, $9, $10) returning {STEP_COLUMNS}"
+    );
+
+    // A skipped step with no definition to copy is written with the shape the column
+    // constraints accept for a control step: no action, empty params. That happens only
+    // when the caller passed a step list that does not cover the whole definition, and
+    // the row is still honest — it names the position and the reason, which is all the
+    // trace needs from a step that did not run.
+    let (kind, action, params, on_error, timeout_ms, max_attempts) = match step {
+        Some(step) => (
+            step.kind.as_str().to_owned(),
+            step_action(step),
+            step.params.clone(),
+            step.on_error.as_str().to_owned(),
+            step.timeout_ms,
+            step.max_attempts,
+        ),
+        None => (
+            "wait".to_owned(),
+            None,
+            serde_json::json!({}),
+            "inherit".to_owned(),
+            0,
+            1,
+        ),
+    };
+
+    Ok(sqlx::query_as(&sql)
+        .bind(execution_id)
+        .bind(skipped.step_no)
+        .bind(skipped.name.trim())
+        .bind(kind)
+        .bind(action)
+        .bind(params)
+        .bind(on_error)
+        .bind(timeout_ms)
+        .bind(max_attempts)
+        .bind(&skipped.reason)
+        .fetch_one(&mut *connection)
+        .await?)
+}
+
 /// The armed, event-triggered workflows of one tenant that listen for one event.
 ///
 /// A rule with no site applies to the whole organization; a rule bound to a site only fires for

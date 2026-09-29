@@ -575,6 +575,176 @@ pub async fn list_executions(
     }))
 }
 
+/// `POST /api/v1/workflows/{id}/run-from-node` — *Run from here* on a canvas node.
+///
+/// The criterion it exists for (REQ-004 slice 3): "Run from here" on a mid-graph node
+/// starts a run whose **first step is that node**, the earlier nodes stay `skipped`, and
+/// **the trace says why**.
+///
+/// Three decisions live in the crate rather than here, and each of them is one this
+/// handler could have got wrong in a way the response would not have shown:
+///
+/// * **the plan** ([`omnion_workflows::run_from::plan_from_node`]) is made from the rule's
+///   own graph, so the node id is resolved against the same revision the steps come from;
+/// * **the prefix is inserted as `skipped`**, never as pending-then-updated, so a crash
+///   cannot leave a run the engine is about to execute from the top;
+/// * **an empty plan is refused** rather than answered with a run that settles
+///   `completed` having done nothing.
+///
+/// The run is `manual` even when the rule is armed for a schedule or an event: pressing
+/// *Run from here* is a person asking for this run, and the audit row has to say so.
+pub async fn run_workflow_from_node(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(workflow_id): Path<Uuid>,
+    Json(input): Json<RunFromNodeInput>,
+) -> Result<(StatusCode, Json<RunFromNodeResponse>), ApiError> {
+    let workflow = workflow_in_scope(&state, &current, workflow_id).await?;
+
+    let node_id = input.node_id.trim();
+    if node_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "node_id_required",
+            "say which node the run starts at — the builder sends the node that was clicked",
+        ));
+    }
+
+    let definition = omnion_workflows::graph_store::find_graph(state.db().pool(), workflow.id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "workflow_not_found",
+                "the workflow no longer exists — it may have been deleted while the builder \
+                 was open",
+            )
+        })?;
+
+    let plan = omnion_workflows::run_from::plan_from_node(&definition.graph, node_id)
+        .map_err(ApiError::from)?;
+
+    let steps = omnion_workflows::run_from::runnable_steps(&plan);
+    let (execution, rows) = store::create_execution_from_node(
+        state.db().pool(),
+        &workflow,
+        TriggerKind::Manual,
+        Some(current.user.id),
+        &steps,
+        &plan,
+    )
+    .await?;
+
+    // The graph a run started with is pinned on the run, so a trace resolves its node ids
+    // even after the definition moves on — and here it matters twice over, because the
+    // very act of "starting from a node" is a fact about a *version* of the graph.
+    if let Some(version) = Some(definition.graph_version) {
+        omnion_workflows::graph_store::pin_execution_graph(
+            state.db().pool(),
+            execution.id,
+            Some(version),
+        )
+        .await?;
+    }
+
+    // Stamp each row with the node it came from, so the canvas can paint this run's status
+    // per node — including the skipped prefix, which is the half a trace reads first.
+    for row in &rows {
+        let node = if plan
+            .skipped
+            .iter()
+            .any(|skipped| skipped.step_no == row.step_no)
+        {
+            plan.skipped
+                .iter()
+                .find(|skipped| skipped.step_no == row.step_no)
+                .map(|skipped| skipped.node_id.clone())
+        } else {
+            plan.runs
+                .iter()
+                .find(|entry| entry.step_no == row.step_no)
+                .map(|entry| entry.node_id.clone())
+        };
+        omnion_workflows::graph_store::set_step_node(
+            state.db().pool(),
+            row.id,
+            node.as_deref(),
+            None,
+        )
+        .await?;
+    }
+
+    let stored = store::list_steps(state.db().pool(), execution.id).await?;
+
+    let entry = NewAuditEntry::by_user(current.user.id, "workflow.run.from_node")
+        .organization(workflow.organization_id)
+        .target("workflow", workflow.id.to_string())
+        .metadata(json!({
+            "execution_id": execution.id,
+            "node_id": plan.node_id,
+            "skipped_steps": plan.skipped.len(),
+            "run_steps": plan.runs.len(),
+            "reason": plan.reason,
+        }))
+        .ip_address(address.as_text());
+    omnion_audit::record(state.db().pool(), entry).await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RunFromNodeResponse {
+            execution: ExecutionDetail::build(&execution, &stored),
+            started_from_node: plan.node_id,
+            skipped: plan.skipped.iter().map(RunFromSkipped::build).collect(),
+            reason: plan.reason,
+        }),
+    ))
+}
+
+/// The body of a *Run from here* request.
+#[derive(Debug, Deserialize)]
+pub struct RunFromNodeInput {
+    /// The node the run starts at, as the canvas draws it.
+    pub node_id: String,
+}
+
+/// What a *Run from here* press produced.
+#[derive(Debug, Serialize)]
+pub struct RunFromNodeResponse {
+    /// The run, with every step including the skipped prefix.
+    #[serde(flatten)]
+    pub execution: ExecutionDetail,
+    /// The node the run started at.
+    pub started_from_node: String,
+    /// The steps it passed over, each with the sentence the trace shows.
+    pub skipped: Vec<RunFromSkipped>,
+    /// The same sentence, once, for the run header.
+    pub reason: String,
+}
+
+/// One step a run-from-here passed over.
+#[derive(Debug, Serialize)]
+pub struct RunFromSkipped {
+    /// Its 1-based position in the run, which it keeps.
+    pub step_no: i32,
+    /// Its name.
+    pub name: String,
+    /// The node it came from.
+    pub node_id: String,
+    /// Why it did not run.
+    pub reason: String,
+}
+
+impl RunFromSkipped {
+    fn build(skipped: &omnion_workflows::run_from::SkippedStep) -> Self {
+        Self {
+            step_no: skipped.step_no,
+            name: skipped.name.clone(),
+            node_id: skipped.node_id.clone(),
+            reason: skipped.reason.clone(),
+        }
+    }
+}
+
 /// `GET /api/v1/workflow-executions/{id}` — one run with the state of every step.
 pub async fn get_execution(
     State(state): State<AppState>,
@@ -803,8 +973,12 @@ mod tests {
             finished_at: Some(OffsetDateTime::UNIX_EPOCH),
             error: None,
             event_payload: Some(serde_json::json!({ "status": "published" })),
+            started_from_node: None,
         };
         let steps = vec![WorkflowStep {
+            skip_reason: None,
+            node_id: None,
+            branch: None,
             approval_id: None,
             id: Uuid::nil(),
             execution_id: Uuid::nil(),

@@ -839,13 +839,24 @@ async fn the_bus_records_events_and_delivers_signed_webhooks() {
         );
     }
     assert_eq!(
-        names.iter().filter(|name| **name == "page.published").count(),
+        names
+            .iter()
+            .filter(|name| **name == "page.published")
+            .count(),
         3,
         "three publications were recorded: {:?}",
         feed.body
     );
-    assert_eq!(events[0]["name"], json!("webhook.delivery.failed"), "newest first");
-    assert_eq!(names.last(), Some(&"webhook.endpoint.created"), "oldest last");
+    assert_eq!(
+        events[0]["name"],
+        json!("webhook.delivery.failed"),
+        "newest first"
+    );
+    assert_eq!(
+        names.last(),
+        Some(&"webhook.endpoint.created"),
+        "oldest last"
+    );
 
     let audit = harness
         .call(get("/api/v1/iam/audit", Some(&owner_token)))
@@ -1250,8 +1261,7 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
     // Five facts to narrow: three page events on one site, one on another, and one that
     // belongs to a different organization entirely. The last one is the row a tenancy filter
     // that quietly stopped working would leak, so it is seeded deliberately.
-    let other_organization =
-        create_organization_row(&harness.db, "other", "Someone Else").await;
+    let other_organization = create_organization_row(&harness.db, "other", "Someone Else").await;
     for (name, site_id, owner) in [
         ("page.created", site, organization),
         ("page.updated", site, organization),
@@ -1259,15 +1269,17 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         ("page.created", other_site, organization),
         ("user.updated", site, other_organization),
     ] {
-        sqlx::query("insert into events (name, organization_id, site_id, actor_user_id, payload) \
-                     values ($1, $2, $3, $4, '{}'::jsonb)")
-            .bind(name)
-            .bind(owner)
-            .bind(site_id)
-            .bind(actor_id)
-            .execute(harness.db.pool())
-            .await
-            .expect("the seeded event must be inserted");
+        sqlx::query(
+            "insert into events (name, organization_id, site_id, actor_user_id, payload) \
+                     values ($1, $2, $3, $4, '{}'::jsonb)",
+        )
+        .bind(name)
+        .bind(owner)
+        .bind(site_id)
+        .bind(actor_id)
+        .execute(harness.db.pool())
+        .await
+        .expect("the seeded event must be inserted");
     }
 
     // ---- Scoping: an organization account sees its own and nothing else -------------------------
@@ -1362,7 +1374,10 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         .await;
     assert_eq!(windowed.status, StatusCode::OK, "{:?}", windowed.body);
     assert!(
-        windowed.body["events"].as_array().expect("events").is_empty(),
+        windowed.body["events"]
+            .as_array()
+            .expect("events")
+            .is_empty(),
         "a future window is honoured, not ignored: {:?}",
         windowed.body
     );
@@ -1382,7 +1397,10 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         "{:?}",
         bad_window.body
     );
-    assert_eq!(bad_window.body["error"]["code"], json!("invalid_event_window"));
+    assert_eq!(
+        bad_window.body["error"]["code"],
+        json!("invalid_event_window")
+    );
     assert!(
         bad_window.body["error"]["message"]
             .as_str()
@@ -1403,7 +1421,12 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
             Some(&reader_token),
         ))
         .await;
-    assert_eq!(bad_name.status, StatusCode::BAD_REQUEST, "{:?}", bad_name.body);
+    assert_eq!(
+        bad_name.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        bad_name.body
+    );
 
     // ---- Keyset pagination -----------------------------------------------------------------------
     let first = harness
@@ -1455,7 +1478,10 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         "and carries no cursor to follow"
     );
 
-    let overlap: Vec<&i64> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    let overlap: Vec<&i64> = first_ids
+        .iter()
+        .filter(|id| second_ids.contains(id))
+        .collect();
     assert!(
         overlap.is_empty(),
         "no row is served twice across the page boundary: {first_ids:?} then {second_ids:?}"
@@ -1527,7 +1553,13 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             !entry["area"].as_str().unwrap_or_default().is_empty(),
             "{name} belongs to no area"
         );
-        assert!(!entry["payload_fields"].as_array().expect("fields").is_empty(), "{name}");
+        assert!(
+            !entry["payload_fields"]
+                .as_array()
+                .expect("fields")
+                .is_empty(),
+            "{name}"
+        );
 
         // The group is the part a receiver can subscribe to as a whole, and it must agree
         // with the name: a `group` that does not prefix the `name` is a picker that would
@@ -1553,14 +1585,19 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             .iter()
             .find(|field| field["name"] == required)
             .unwrap_or_else(|| panic!("page.published must declare {required}"));
-        assert_eq!(field["required"], true, "{required} is promised as required");
+        assert_eq!(
+            field["required"], true,
+            "{required} is promised as required"
+        );
     }
 
     // The counts agree with the list, and the ceiling the panel enforces is published with
     // it so the form does not hardcode a number that can drift from the validator.
     assert_eq!(
         catalogue.body["live_count"].as_u64().expect("live_count") as usize
-            + catalogue.body["reserved_count"].as_u64().expect("reserved_count") as usize,
+            + catalogue.body["reserved_count"]
+                .as_u64()
+                .expect("reserved_count") as usize,
         entries.len(),
         "live + reserved is the whole list"
     );
@@ -1570,7 +1607,10 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         "the panel's ceiling is the validator's ceiling"
     );
     assert!(
-        !catalogue.body["areas"].as_array().expect("areas").is_empty(),
+        !catalogue.body["areas"]
+            .as_array()
+            .expect("areas")
+            .is_empty(),
         "the picker groups by area"
     );
 

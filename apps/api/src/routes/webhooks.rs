@@ -360,24 +360,32 @@ fn parse_events_query(raw: Option<&str>) -> Result<EventsQuery, ApiError> {
             "from" => query.from = Some(value),
             "to" => query.to = Some(value),
             "site_id" => {
-                query.site_id = Some(value.parse().map_err(|_| {
-                    invalid_query("site_id", "it is not a uuid")
-                })?)
+                query.site_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("site_id", "it is not a uuid"))?,
+                )
             }
             "actor_user_id" => {
-                query.actor_user_id = Some(value.parse().map_err(|_| {
-                    invalid_query("actor_user_id", "it is not a uuid")
-                })?)
+                query.actor_user_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("actor_user_id", "it is not a uuid"))?,
+                )
             }
             "cursor" => {
-                query.cursor = Some(value.parse().map_err(|_| {
-                    invalid_query("cursor", "it is not a row id")
-                })?)
+                query.cursor = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("cursor", "it is not a row id"))?,
+                )
             }
             "limit" => {
-                query.limit = Some(value.parse().map_err(|_| {
-                    invalid_query("limit", "it is not a whole number")
-                })?)
+                query.limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("limit", "it is not a whole number"))?,
+                )
             }
             _ => {}
         }
@@ -446,10 +454,11 @@ pub async fn list_catalogue(
     // tenant's endpoints, and a platform-wide count would tell one organization how much
     // traffic another one receives.
     let since = OffsetDateTime::now_utc() - time::Duration::hours(24);
-    let counts = store::delivery_counts_since(state.db().pool(), current.user.organization_id, since)
-        .await?
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
+    let counts =
+        store::delivery_counts_since(state.db().pool(), current.user.organization_id, since)
+            .await?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
 
     Ok(Json(CatalogueResponse {
         areas: omnion_events::catalogue::areas(),
@@ -856,7 +865,10 @@ pub async fn list_events(
 /// The error names the parameter rather than the value: `from` and `to` arrive as strings
 /// because `Query` will not do the parse for us, and a `400` that says "unparsable" without
 /// saying *which* field leaves the caller guessing between two boxes on the screen.
-fn parse_instant(raw: Option<&str>, field: &'static str) -> Result<Option<OffsetDateTime>, ApiError> {
+fn parse_instant(
+    raw: Option<&str>,
+    field: &'static str,
+) -> Result<Option<OffsetDateTime>, ApiError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
