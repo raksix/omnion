@@ -4440,3 +4440,77 @@ writer's wave.
 **Next.** The QA pass, and then criterion 3 — *Retry this node*. `store::retry_step_from`
 is deliberately a **tail** re-run, so a single-node retry is a different write and must
 not be built by narrowing it.
+
+## 2026-09-29 · wave3 tick 17 · REQ-004 slice 3, criterion 3 — *Retry this node*
+
+**What.** Criterion 3 of REQ-004: *"Retry this node" re-runs only that node without
+duplicating earlier side effects (proven with the mail sink).* Server, store, endpoint and
+inspector control, in one commit (`633b620`).
+
+**The trap the criterion names, taken seriously.** `store::retry_step_from` is a **tail**
+re-run — it re-opens `step_no >= N` — because a run whose middle failed must not be allowed
+to march on to completion with a hole in the middle. Building the node control by narrowing
+that write would re-send the earlier e-mail, which is the one outcome the criterion forbids.
+So it is a **different write**: `store::retry_single_step`, one `step_no`, and the walk
+asserts the returned row count so a later widening of the `WHERE` clause fails the walk
+rather than quietly repeating a side effect.
+
+**Why the proof is a mail count and not a status comparison.** A run whose first step
+re-runs is *indistinguishable* from one that did not on any status column — the difference
+is a message that left the process. The criterion names the instrument, and it is the right
+one: the walk spins a small SMTP sink, drives the engine with a **real** action handler
+(not `NoActionHandler`, which would fail the mail step for a reason that has nothing to do
+with retrying and make the count zero before the retry ever happened), and asserts the
+count is still 1 afterwards.
+
+**Two decisions the walk overturned, which is the part worth keeping.**
+
+1. **A plain `run` never stamped `node_id` at all.** The per-node status layer was empty for
+   the *most common* way to start a run: no pills, no click target, and a retry answering
+   *"took no part in this run"* on **every card**. The walk was written for retry and found a
+   defect that was not in retry. `graph_store::attribute_steps_to_graph` is now called from
+   the plain-run path as well, and is **best-effort** — it is a decoration, so it must never
+   fail a run that has already started; a rule whose graph does not project is left
+   *unattributed* rather than half-attributed, because a half-painted canvas reads as "those
+   nodes were skipped", which is a claim about work the engine did.
+
+2. **The attempt counter had to be reset, and my first design was wrong.** The reasoning was
+   "re-running one node is not a new budget", so the write left `attempts` alone — and
+   PostgreSQL refused it. `workflow_steps_attempts_shape` caps `attempts` at `max_attempts`
+   and `claim_due_step` *increments* on claim, so a re-queued step that had spent its budget
+   produces a row the engine is **forbidden to claim**. The retry would have been accepted,
+   audited, and then never run: a control whose stated purpose is "try this again" that
+   cannot try again. The counter is now reset, bounded by the step's own `max_attempts`, and
+   the reasoning is recorded in the store's own doc comment so the next reader does not
+   re-derive the wrong answer. **A database constraint, not a test, is what corrected the
+   design here** — the walk found it because it drove the real engine.
+
+**`plan_retry_node` is a pure function** because a branching node is **two rows** (a
+`success` and an `error` step), and a `find` would report "nothing to retry" on the very node
+the canvas is painting *diverged* red. Four refusals with four distinct codes, because only
+two of them are about the run: a node that succeeded, a node the run never reached, a live
+run, a cancelled run. The two run-level refusals deliberately do **not** name the node — that
+would point the operator at the card they clicked instead of the run that was closed.
+
+**Proof.**
+- `cargo test -p omnion-workflows --lib` → **109/109** (95 before; 14 new)
+- `cargo test -p omnion-api --test workflows retry_this_node` → **1/1**, against a
+  **freshly created** database (`omnion_w3_fresh`)
+- `apps/admin` builder suites → **96/96** (85 before; 11 new)
+- `tsc --noEmit` in `apps/admin` → clean
+
+**The migration-gap blocker, re-tested and narrowed.** Two ticks this branch reported that
+*no* `OMNION_REQUIRE_DB=1` suite can run because migrations `0019` and `0022` are absent
+and every suite dies at `VersionMissing(19)`. That is true of a **polluted** database and
+false of a fresh one: a database created from scratch applies this branch's own migration set
+in order, and the whole `workflows` suite runs green against `omnion_w3_fresh`. The gap is
+real in the repository — `0019` is owned by `origin/wave2-cms` and `origin/wave5`, `0022` by
+`origin/wave4` and `origin/wave7`, none merged into `main` — but it is a fact about *this
+branch's migration list*, not a block on testing this branch. `scripts/qa/run-media-walk.sh`
+already encodes the right shape (a disposable database per suite); the general answer is a
+disposable database per suite for the DB-bound walks, and the shared development database
+should be treated as unusable by anything that migrates.
+
+**Next.** The browser pass on the private stack, which is what criterion 2's *click* half and
+criterion 3's control both need — a criterion is not ticked on a probe that has not run.
+Then criterion 5 (the real-event listener) and criterion 8 (Table-mode parity).
