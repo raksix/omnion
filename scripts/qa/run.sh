@@ -61,6 +61,9 @@ wait_http() { # url, seconds
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
+  # Invoked through `bash` for the same reason as cargo-slot.sh below: the executable bit is
+  # not carried by every clone, and a pass that dies holding the slot blocks the other seven
+  # writers behind it.
   QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
@@ -111,7 +114,15 @@ fi
 if [ "$NEEDS_BUILD" = "1" ]; then
   # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
   # compiling at once instead of every pass grabbing all six threads for itself.
-  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
+  #
+  # `bash <script>`, not `<script>`: git records the executable bit as a MODE, so a helper
+  # added in one commit and invoked in the next arrives 100644 on every fresh clone and every
+  # worktree that merges it, and the pass dies at the build step with "Permission denied"
+  # AFTER it has reset the database and taken the QA slot. Running it through the interpreter
+  # the `set -euo pipefail` above already implies costs nothing and cannot be broken by a mode
+  # bit; a harness that only runs for the writer who happened to chmod it locally is a
+  # harness that fails on every other writer.
+  bash "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 # The CSRF secret is the one variable the platform refuses to invent: a deployment that sets
 # none still boots, and every cookie-authenticated mutation then answers 403
