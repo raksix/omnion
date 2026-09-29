@@ -4163,6 +4163,294 @@ async function runNotificationSettingsDepth(page, report) {
  * Every step writes under `steps.*` and `--only=seo` demands the list below by name, read off this
  * function rather than off the REQ's prose.
  */
+/**
+ * `runCommentsDepth` — the moderation queue, the policy and the bans (REQ-064, slice 4a).
+ *
+ * A comment is the one row a STRANGER writes, so this pass does not drive the panel alone: it
+ * seeds the database with comments nobody in the browser could have written, and then proves
+ * the screen's own verdict on them. A queue that renders only what it created is a queue whose
+ * empty state has never been checked against a real row.
+ *
+ * What it claims, and why each one is checked against SQL rather than against the screen:
+ *
+ * * **a queued comment is invisible on the page and visible in the queue.** The panel can say
+ *   "published" whether or not the renderer agrees, so the public thread is read from the API
+ *   the theme reads.
+ * * **a spam row says WHY.** The reason is the whole argument for showing spam at all, and a
+ *   reason rendered in the panel is a reason a moderator can see without opening the settings.
+ * * **the tab counts are the queue's, not the page's.** A tab bar that says "50" on a site with
+ *   four comments is a count taken from the visible rows, and only SQL can tell the difference.
+ * * **a bulk action reports its skips.** "2 moved" when both rows were already approved is the
+ *   claim the per-comment outcome exists to prevent, and it has to be read as TEXT.
+ * * **the policy is real.** Turning comments off and submitting from the public route must
+ *   refuse; a toggle that only changes a stored boolean is a decoration.
+ *
+ * Every step writes under `steps.*` and `--only=comments` demands the list below by name.
+ */
+async function runCommentsDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the screen has nothing to read";
+    return steps;
+  }
+
+  // A page to comment on. The pass creates its own rather than reusing one another pass made:
+  // a comment on somebody else's page is a comment about a different subject, and this pass's
+  // counts would then include rows it did not cause.
+  const slug = `qa-comments-${stamp}`;
+  const pageId = qaSql(
+    `insert into pages (site_id, slug, status) values ('${siteId}', '${slug}', 'published') returning id`,
+  );
+  if (!pageId) {
+    steps.reason = "could not create the page the comments are left on";
+    return steps;
+  }
+
+  // ------------------------------------------------------------------ the fixture the panel must judge
+  // Seeded through SQL, in the states the heuristics produce, so the queue is opened against
+  // rows nobody in this browser wrote. `is_staff_reply` is left false and the addresses are
+  // stamped, so two runs on one database never collide.
+  const body = (n) => `A remark from a visitor, number ${n}, long enough to be a sentence.`;
+  const pendingId = qaSql(
+    `insert into cms_comments (organization_id, site_id, page_id, author_name, author_email, body, status) ` +
+      `select organization_id, '${siteId}', '${pageId}', 'Ada Lovelace', 'ada-${stamp}@example.test', '${body(1)}', 'pending' ` +
+      `from sites where id = '${siteId}' returning id`,
+  );
+  const spamWordId = qaSql(
+    `insert into cms_comments (organization_id, site_id, page_id, author_name, author_email, body, status, spam_reason) ` +
+      `select organization_id, '${siteId}', '${pageId}', 'Promoter', 'promo-${stamp}@example.test', ` +
+      `'Buy the best CASINO tonight.', 'spam', 'contains a blocked word' from sites where id = '${siteId}' returning id`,
+  );
+  const spamLinksId = qaSql(
+    `insert into cms_comments (organization_id, site_id, page_id, author_name, author_email, body, status, spam_reason) ` +
+      `select organization_id, '${siteId}', '${pageId}', 'Link Farm', 'links-${stamp}@example.test', ` +
+      `'<a href="http://a.test">one</a> <a href="http://b.test">two</a> <a href="http://c.test">three</a>', 'spam', 'too many links' ` +
+      `from sites where id = '${siteId}' returning id`,
+  );
+  const approvedId = qaSql(
+    `insert into cms_comments (organization_id, site_id, page_id, author_name, author_email, body, status, approved_at) ` +
+      `select organization_id, '${siteId}', '${pageId}', 'Grace Hopper', 'grace-${stamp}@example.test', '${body(2)}', ` +
+      `'approved', now() from sites where id = '${siteId}' returning id`,
+  );
+  steps.fixtureRowsExist =
+    pendingId !== "" && spamWordId !== "" && spamLinksId !== "" && approvedId !== "";
+
+  // Comments on, or every submission below is refused for the wrong reason.
+  qaSql(
+    `insert into cms_comment_settings (site_id, organization_id, comments_enabled, min_fill_seconds, blocked_words, max_links_per_comment, per_ip_per_hour) ` +
+      `select id, organization_id, true, 3, array['casino'], 2, 5 from sites where id = '${siteId}' ` +
+      `on conflict (site_id) do update set comments_enabled = true, min_fill_seconds = 3, blocked_words = array['casino'], max_links_per_comment = 2`,
+  );
+
+  // ------------------------------------------------------------------ the screen
+  await page.goto(`${URL_ADMIN}/comments`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.screenReady = (await page.locator("[data-comments-state=\"ready\"]").count()) > 0;
+  steps.policyPanelIsOnScreen = (await page.locator("[data-comment-policy=\"ready\"]").count()) > 0;
+
+  // ------------------------------------------------------------------ the four tabs carry real counts
+  // Read from SQL, not from the panel: the assertion is "the tab agrees with the queue", and a
+  // number read off the panel proves only that the panel printed a number.
+  const pendingCount = qaSql(
+    `select count(*) from cms_comments where site_id = '${siteId}' and status = 'pending'`,
+  );
+  const spamCount = qaSql(
+    `select count(*) from cms_comments where site_id = '${siteId}' and status = 'spam'`,
+  );
+  steps.pendingTabShowsTheStoredCount =
+    (await page
+      .locator("[data-comment-tab-count=\"pending\"]")
+      .first()
+      .innerText()
+      .catch(() => "")) === pendingCount;
+  steps.approvedTabIsNotEmpty = (await page
+    .locator("[data-comment-tab-count=\"approved\"]")
+    .first()
+    .innerText()
+    .catch(() => "")) === "1";
+
+  // ------------------------------------------------------------------ pending: the queue's own row
+  steps.queuedRowIsOnScreen = (await page.locator(`[data-comment-row="${pendingId}"]`).count()) > 0;
+  steps.queuedRowNamesItsPage = (await page
+    .locator(`[data-comment-row="${pendingId}"]`)
+    .first()
+    .innerText()
+    .catch(() => "")).includes("Ada Lovelace");
+
+  // The thread a theme draws, read from the public API rather than from a screenshot: the
+  // screen can claim "published" whether or not the renderer agrees.
+  const threadBefore = await page
+    .request.get(`${URL_API}/api/v1/public/comments/${slug}?site=main`)
+    .then((response) => response.json())
+    .catch(() => null);
+  const beforeIds = Array.isArray(threadBefore) ? threadBefore.map((entry) => entry.id) : [];
+  steps.queuedCommentIsNotPublic = !beforeIds.includes(pendingId);
+  steps.approvedCommentIsPublic = beforeIds.includes(approvedId);
+  // The public payload carries no address and no client hint, asserted on the rendered JSON
+  // rather than on the field list: a payload is the easiest place to leak one.
+  const publicText = JSON.stringify(threadBefore ?? []);
+  steps.publicThreadCarriesNoAddress = !publicText.includes("grace-");
+
+  // ------------------------------------------------------------------ approve through the screen
+  await page.locator(`[data-comment-approve="${pendingId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.approvedInSql = qaSql(`select status from cms_comments where id = '${pendingId}'`) === "approved";
+  steps.approvedRecordedAWho = qaSql(
+    `select count(*) from cms_comments where id = '${pendingId}' and approved_at is not null and approved_by is not null`,
+  ) === "1";
+
+  const threadAfter = await page
+    .request.get(`${URL_API}/api/v1/public/comments/${slug}?site=main`)
+    .then((response) => response.json())
+    .catch(() => null);
+  const afterIds = Array.isArray(threadAfter) ? threadAfter.map((entry) => entry.id) : [];
+  steps.approvedIsNowPublic = afterIds.includes(pendingId);
+
+  // ------------------------------------------------------------------ spam, and the reason on it
+  await page.locator("[data-comment-tab=\"spam\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.spamRowsAreOnScreen =
+    (await page.locator(`[data-comment-row="${spamWordId}"]`).count()) > 0 &&
+    (await page.locator(`[data-comment-row="${spamLinksId}"]`).count()) > 0;
+  // The reason is the whole argument for showing spam at all, so it is read as TEXT — a badge
+  // that renders nothing would still satisfy a check for the element's existence.
+  steps.spamRowShowsItsReason = (await page
+    .locator(`[data-comment-reason="${spamWordId}"]`)
+    .first()
+    .innerText()
+    .catch(() => "")).includes("blocked word");
+  steps.spamTabCountMatchesSql = (await page
+    .locator("[data-comment-tab-count=\"spam\"]")
+    .first()
+    .innerText()
+    .catch(() => "")) === spamCount;
+  steps.spamIsNotPublic = !afterIds.includes(spamWordId);
+
+  // "Not spam" is the button that undoes a heuristic's verdict, so it has to work.
+  await page.locator(`[data-comment-approve="${spamWordId}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.undoneInSql = qaSql(`select status from cms_comments where id = '${spamWordId}'`) === "approved";
+
+  // ------------------------------------------------------------------ the bulk bar reports its skips
+  await page.locator("[data-comment-tab=\"approved\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  for (const id of [approvedId, pendingId]) {
+    await page.locator(`[data-comment-check="${id}"]`).first().check({ timeout: 6000 }).catch(() => {});
+  }
+  steps.bulkBarAppearedOnSelection = (await page.locator("[data-comment-bulk-bar]").count()) > 0;
+  await page.locator("[data-comment-bulk=\"approve\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const notice = await page
+    .locator("[data-comments-notice]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  // A bulk action that reports "2 moved" when both were already approved is the claim this
+  // assertion exists to refuse.
+  steps.bulkNoticeIsAPerCommentReport = /of 2 moved/.test(notice) || /2 moved/.test(notice);
+
+  // ------------------------------------------------------------------ a moderator's reply is published
+  await page.locator("[data-comment-tab=\"pending\"]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const openTarget = qaSql(
+    `select id from cms_comments where site_id = '${siteId}' and status = 'pending' and parent_id is null limit 1`,
+  );
+  if (openTarget) {
+    await page.locator(`[data-comment-detail="${openTarget}"]`).first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    steps.drawerOpened = (await page.locator(`[data-comment-drawer="${openTarget}"]`).count()) > 0;
+    steps.drawerShowsTheWholeBody = (await page
+      .locator("[data-comment-drawer-body]")
+      .first()
+      .innerText()
+      .catch(() => "")).length > 0;
+    await page.locator("[data-comment-reply-body]").fill("It does - the export is a separate archive.").catch(() => {});
+    steps.replyTextIsOnTheInput =
+      (await page.inputValue("[data-comment-reply-body]").catch(() => "")) ===
+      "It does - the export is a separate archive.";
+    await page.locator("[data-comment-reply-send]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(2400);
+    steps.replyIsInSql = qaSql(
+      `select count(*) from cms_comments where parent_id = '${openTarget}' and is_staff_reply`,
+    ) === "1";
+    steps.replyIsApproved = qaSql(
+      `select status from cms_comments where parent_id = '${openTarget}' and is_staff_reply limit 1`,
+    ) === "approved";
+  }
+
+  // ------------------------------------------------------------------ the public form, on the same site
+  // The toggle is the policy's claim; the only way to check it is to try to comment.
+  await page.locator("[data-comment-policy-enabled]").first().uncheck({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-comment-policy-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.policyOffInSql = qaSql(
+    `select comments_enabled from cms_comment_settings where site_id = '${siteId}'`,
+  ) === "f";
+
+  const refused = await page
+    .request.post(`${URL_API}/api/v1/public/comments/${slug}?site=main`, {
+      data: {
+        author_name: "Visitor",
+        author_email: `visitor-${stamp}@example.test`,
+        body: "A remark while comments are off.",
+      },
+    })
+    .then((response) => response.status())
+    .catch(() => 0);
+  steps.submissionRefusedWhileOff = refused === 400;
+  steps.submissionStoredNothing = qaSql(
+    `select count(*) from cms_comments where author_email = 'visitor-${stamp}@example.test'`,
+  ) === "0";
+
+  await page.locator("[data-comment-policy-enabled]").first().check({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-comment-policy-save]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.policyBackOn = qaSql(
+    `select comments_enabled from cms_comment_settings where site_id = '${siteId}'`,
+  ) === "t";
+
+  // ------------------------------------------------------------------ a ban is not a write-only action
+  const banEmail = `banned-${stamp}@example.test`;
+  qaSql(
+    `insert into cms_comment_bans (site_id, kind, value, reason) ` +
+      `values ('${siteId}', 'email', '${banEmail}', 'link farm') on conflict do nothing`,
+  );
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2800);
+  steps.banListShowsTheBan = (await page.locator("[data-comment-bans=\"ready\"]").count()) > 0;
+  steps.banListCarriesTheReason = (await page
+    .locator("[data-comment-bans=\"ready\"]")
+    .first()
+    .innerText()
+    .catch(() => "")).includes("link farm");
+  const bannedStatus = await page
+    .request.post(`${URL_API}/api/v1/public/comments/${slug}?site=main`, {
+      data: { author_name: "Banned", author_email: banEmail, body: "A remark from a banned address." },
+    })
+    .then((response) => response.status())
+    .catch(() => 0);
+  steps.bannedAddressIsRefused = bannedStatus === 403;
+  steps.bannedSubmissionStoredNothing = qaSql(
+    `select count(*) from cms_comments where author_email = '${banEmail}'`,
+  ) === "0";
+
+  // ------------------------------------------------------------------ the mobile layout
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const overflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.noHorizontalScrollAt390 = overflow <= 1;
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  return steps;
+}
+
 async function runSeoDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -6700,6 +6988,52 @@ async function main() {
   // effectively untested, so the pass gets its own entry point. It runs the SAME function the
   // full pass calls; what it does not do is reset the database (run.sh does that) or report a
   // `summary.json` with the whole pass's counts.
+  // `--only=comments` runs the moderation queue's own depth pass alone.
+  //
+  // Same argument as `--only=seo`, `--only=forms` and `--only=menus`: the depth pass is written
+  // and a full pass is the only thing that reaches it, forty minutes in, on a box six writers
+  // share. It runs the SAME function the full pass calls; what it does not do is reset the
+  // database (run.sh does that) or report a `summary.json` with the whole pass's counts.
+  if (process.argv.includes("--only=comments")) {
+    report.comments = await runCommentsDepth(page, report);
+    log(`comments: ${JSON.stringify(report.comments)}`);
+    const required = [
+      "fixtureRowsExist", "screenReady", "policyPanelIsOnScreen",
+      "pendingTabShowsTheStoredCount", "approvedTabIsNotEmpty", "queuedRowIsOnScreen",
+      "queuedRowNamesItsPage", "queuedCommentIsNotPublic", "approvedCommentIsPublic",
+      "publicThreadCarriesNoAddress", "approvedInSql", "approvedRecordedAWho",
+      "approvedIsNowPublic", "spamRowsAreOnScreen", "spamRowShowsItsReason",
+      "spamTabCountMatchesSql", "spamIsNotPublic", "undoneInSql",
+      "bulkBarAppearedOnSelection", "bulkNoticeIsAPerCommentReport", "drawerOpened",
+      "drawerShowsTheWholeBody", "replyTextIsOnTheInput", "replyIsInSql", "replyIsApproved",
+      "policyOffInSql", "submissionRefusedWhileOff", "submissionStoredNothing",
+      "policyBackOn", "banListShowsTheBan", "banListCarriesTheReason",
+      "bannedAddressIsRefused", "bannedSubmissionStoredNothing", "noHorizontalScrollAt390",
+    ];
+    const commentSteps = report.comments || {};
+    const missing = required.filter((key) => commentSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=comments",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: commentSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`comments depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`comments depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=seo")) {
     report.seo = await runSeoDepth(page, report);
     log(`seo: ${JSON.stringify(report.seo)}`);
@@ -6866,6 +7200,12 @@ async function main() {
     // regenerates the sitemap. Every panel is a tab on one route, so one entry covers all three
     // rather than three routes that would each need their own placeholder.
     { path: "/seo", name: "seo" },
+    // The comment queue (REQ-064, slice 4a) — walked here so the screen is in the inventory,
+    // and driven by the depth pass below, which seeds comments in three moderation states,
+    // approves one, undoes a heuristic's verdict, answers a comment as the site and proves the
+    // policy by refusing a public submission. One route covers the queue, its policy and its
+    // bans, because the panel puts all three on one page.
+    { path: "/comments", name: "comments" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -7125,6 +7465,14 @@ async function main() {
   log(`forms: ${JSON.stringify(report.forms)}`);
   report.menus = await runMenusDepth(page, report);
   log(`menus: ${JSON.stringify(report.menus)}`);
+
+  // The comment queue pass (REQ-064, slice 4a). It runs after the forms pass because the two
+  // share the public-submission surface — the form submit route and the comment submit route are
+  // the only two endpoints a stranger posts to — and a failure in either should be read with
+  // the other in view. It creates its own page and leaves the comments it seeded: a queue whose
+  // rows are cleaned up afterwards is a queue whose next pass opens on an empty screen.
+  report.comments = await runCommentsDepth(page, report);
+  log(`comments: ${JSON.stringify(report.comments)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
