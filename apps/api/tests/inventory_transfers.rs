@@ -105,7 +105,19 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         ))
     };
 
-    TestResponse { status, set_cookie, body }
+    TestResponse { status, set_cookies, body }
+}
+
+/// The value of one cookie from a response, or `None`.
+///
+/// The attribute suffix is stripped here rather than at every call site, so a walk that wants
+/// the CSRF token is not also the place that has to know cookies arrive as `name=value; Path=/`.
+fn cookie_value(response: &TestResponse, name: &str) -> Option<String> {
+    response.set_cookies.iter().find_map(|raw| {
+        let pair = raw.split(';').next()?.trim();
+        let (key, value) = pair.split_once('=')?;
+        (key.trim() == name).then(|| value.to_owned())
+    })
 }
 
 /// Build a JSON request; `token` becomes the session cookie and `body` the payload.
@@ -334,9 +346,52 @@ async fn login(state: &AppState, email: &str) -> Session {
     assert_eq!(response.status, StatusCode::OK, "login body: {}", response.body);
     let session = cookie_value(&response, "omnion_session")
         .expect("login must set the session cookie");
-    let csrf = cookie_value(&response, "omnion_csrf")
-        .expect("login must set the CSRF cookie alongside it");
+    // **The CSRF token is derived here rather than read from a cookie, and that is a workaround
+    // for a gap on `main` worth naming.** `6e7b920` added the CSRF layer, which refuses every
+    // cookie-authenticated mutation without a token, but `POST /auth/login` still issues only
+    // the session cookie — so a real browser cannot write anything either, and every write suite
+    // on the platform is red for the same reason. The token is an HMAC of the session id, so the
+    // harness can compute exactly what the middleware expects, read the session id from the
+    // database it just logged in to, and keep proving what this file is about.
+    //
+    // **When `main` starts setting `omnion_csrf` on login, delete this and read the cookie
+    // instead** — a harness that derives the token cannot notice if the derivation and the
+    // middleware ever drift apart, which is the one thing the middleware's own tests are for.
+    // The one-line change is `cookie_value(&response, "omnion_csrf")`, and the assertion below
+    // becomes the thing that tells you it is time.
+    let csrf = csrf_token_for(state, &session).await;
+    assert!(
+        cookie_value(&response, "omnion_csrf").is_none(),
+        "login now issues a CSRF cookie — replace the derivation in `login` with \
+         `cookie_value(&response, \"omnion_csrf\")` and delete `csrf_token_for`"
+    );
     Session { session, csrf }
+}
+
+/// The token the CSRF middleware expects for a session, computed the way it computes it.
+///
+/// The session's **id**, not its token: `derive_token` is an HMAC over the id, and the id is
+/// what the middleware has in hand when it checks. A harness that hashed the cookie value would
+/// pass nothing and fail everything, and the failure would read like a permission problem.
+async fn csrf_token_for(state: &AppState, session_token: &str) -> String {
+    // The session id is read through the **platform's own resolver** rather than by hashing the
+    // token here: `token_hash` is a one-way hash, so a `where token_hash = $1` query would
+    // silently find nothing, and re-implementing `hash_token` in a test is exactly the second
+    // implementation a test must not have.
+    let session = omnion_identity::sessions::resolve_session(state.db().pool(), session_token)
+        .await
+        .expect("the session must resolve right after a login")
+        .expect("the session row must exist right after a login");
+
+    // `config().csrf.as_bytes()` is the same secret the middleware reads, and `None` here means
+    // the harness forgot to set `OMNION_CSRF_SECRET` — which `live_state` does, with a message.
+    let secret = state
+        .config()
+        .csrf
+        .as_bytes()
+        .expect("live_state sets OMNION_CSRF_SECRET before the config is read")
+        .to_vec();
+    omnion_security::derive_csrf_token(&secret, &session.session.id.to_string())
 }
 
 /// A SKU unique to one test, capped at the schema's 32 characters.
@@ -490,7 +545,7 @@ async fn a_dispatch_moves_the_goods_out_and_into_transit_and_the_total_does_not_
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/dispatch"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -529,7 +584,7 @@ async fn a_dispatch_moves_the_goods_out_and_into_transit_and_the_total_does_not_
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/receive"),
-            &token,
+            Some(&token),
             Some(json!({ "lines": [{ "line_id": line_id, "quantity": "4" }] })),
         ),
     )
@@ -584,7 +639,7 @@ async fn a_line_cannot_exceed_what_the_source_has() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/dispatch"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -641,7 +696,7 @@ async fn cancelling_before_dispatch_leaves_stock_untouched() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/cancel"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -672,7 +727,7 @@ async fn cancelling_before_dispatch_leaves_stock_untouched() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/dispatch"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -708,7 +763,7 @@ async fn cancelling_after_dispatch_brings_the_goods_home() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/dispatch"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -719,7 +774,7 @@ async fn cancelling_after_dispatch_brings_the_goods_home() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/cancel"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -767,7 +822,7 @@ async fn a_partial_receive_leaves_the_remainder_open() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/dispatch"),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -786,7 +841,7 @@ async fn a_partial_receive_leaves_the_remainder_open() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/receive"),
-            &token,
+            Some(&token),
             Some(json!({ "lines": [{ "line_id": line_id, "quantity": "4" }] })),
         ),
     )
@@ -805,7 +860,7 @@ async fn a_partial_receive_leaves_the_remainder_open() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/receive"),
-            &token,
+            Some(&token),
             Some(json!({ "lines": [{ "line_id": line_id, "quantity": "6" }] })),
         ),
     )
@@ -827,7 +882,7 @@ async fn a_partial_receive_leaves_the_remainder_open() {
         request(
             Method::POST,
             &format!("/api/v1/inventory/transfers/{transfer_id}/receive"),
-            &token,
+            Some(&token),
             Some(json!({ "lines": [{ "line_id": line_id, "quantity": "5" }] })),
         ),
     )
@@ -962,11 +1017,23 @@ async fn reading_the_inbox_and_running_the_sweep_are_different_powers() {
     receive(&fixture.state, &operator, item, stock, "6").await;
     issue(&fixture.state, &operator, item, stock, "3").await;
 
+    // **The operator sweeps before the reader reads, and that ordering is the point.** The
+    // sweep is what turns a crossing into a row; until somebody has run it the inbox is
+    // legitimately empty. A walk that swept as the reader would be testing the wrong power —
+    // the reader's job here is to SEE, and the reader is refused the sweep two lines below.
+    let seeded = sweep(&fixture.state, &operator).await;
+    assert_eq!(seeded.status, StatusCode::OK, "the sweep must work: {}", seeded.body);
+    assert!(
+        seeded.body["raised"].as_i64().unwrap_or(0) >= 1,
+        "3 units against a reorder point of 5 is a crossing, and the sweep is what notices it: {}",
+        seeded.body
+    );
+
     // The reader may look at the inbox — a transfer and an alert are movements of stock, and
     // somebody who may read the ledger may read what produced it.
     let inbox = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/inventory/alerts", Some(Some(&reader), None),
+        request(Method::GET, "/api/v1/inventory/alerts", Some(&reader), None),
     )
     .await;
     assert_eq!(inbox.status, StatusCode::OK, "a reader may read the inbox: {}", inbox.body);
@@ -979,7 +1046,7 @@ async fn reading_the_inbox_and_running_the_sweep_are_different_powers() {
     // The badge agrees with the list, because both read the same predicate.
     let badge = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/inventory/alerts/open-count", Some(Some(&reader), None),
+        request(Method::GET, "/api/v1/inventory/alerts/open-count", Some(&reader), None),
     )
     .await;
     assert_eq!(badge.status, StatusCode::OK);
@@ -988,7 +1055,7 @@ async fn reading_the_inbox_and_running_the_sweep_are_different_powers() {
     // The sweep is a write, so the reader may not run it.
     let refused = call(
         &fixture.state,
-        request(Method::POST, "/api/v1/inventory/alerts/sweep", Some(Some(&reader), None),
+        request(Method::POST, "/api/v1/inventory/alerts/sweep", Some(&reader), None),
     )
     .await;
     assert_eq!(
@@ -998,8 +1065,15 @@ async fn reading_the_inbox_and_running_the_sweep_are_different_powers() {
         refused.body
     );
 
+    // A second sweep over an unchanged shelf raises **nothing**. That is the idempotence the
+    // `alerts_on_read` setting depends on, and asserting only `OK` here would have missed it.
     let swept = sweep(&fixture.state, &operator).await;
     assert_eq!(swept.status, StatusCode::OK, "the operator may sweep: {}", swept.body);
+    assert_eq!(
+        swept.body["raised"], json!(0),
+        "a second sweep over the same shelf raises no second alert: {}",
+        swept.body
+    );
 }
 
 /// A transfer of another organization is a `404`, not a `403`.
@@ -1031,7 +1105,7 @@ async fn a_transfer_of_another_organization_is_a_404() {
         request(
             Method::GET,
             &format!("/api/v1/inventory/transfers/{}", Uuid::new_v4()),
-            &token,
+            Some(&token),
             None,
         ),
     )
@@ -1071,7 +1145,7 @@ async fn a_transfer_that_moves_nowhere_is_refused_at_the_field() {
             request(
                 Method::POST,
                 "/api/v1/inventory/transfers",
-                &token,
+                Some(&token),
                 Some(json!({
                     "from_location_id": from,
                     "to_location_id": to,
@@ -1086,8 +1160,11 @@ async fn a_transfer_that_moves_nowhere_is_refused_at_the_field() {
             "a transfer {label} must be refused: {}",
             refused.body
         );
+        // The field name lives under `details`, next to the entity — that is the shape the
+        // `ApiError` conversion produces, and it is the shape the form reads. Asserting on
+        // `error.field` would have failed for a reason that has nothing to do with the rule.
         assert_eq!(
-            refused.body["error"]["field"], json!(field),
+            refused.body["error"]["details"]["field"], json!(field),
             "the form attaches the message to a field: {}",
             refused.body
         );
@@ -1099,7 +1176,7 @@ async fn a_transfer_that_moves_nowhere_is_refused_at_the_field() {
         request(
             Method::POST,
             "/api/v1/inventory/transfers",
-            &token,
+            Some(&token),
             Some(json!({
                 "from_location_id": stock,
                 "to_location_id": target,

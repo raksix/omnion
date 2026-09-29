@@ -318,6 +318,20 @@ function StatusBadge({ status }: { status: TransferStatus }) {
  */
 type DraftLine = { key: string; item_id: string; quantity: string; note: string };
 
+/**
+ * The field an error names, or `undefined`.
+ *
+ * The platform's error body carries it under `error.details.field`, beside `error.details.entity`
+ * — the two halves of "which input was wrong in what". A screen that reaches for `error.field`
+ * finds `undefined` for every refusal and quietly falls back to a banner, which is the failure
+ * mode this function exists to make impossible to write by accident.
+ */
+function readField(caught: unknown): string | undefined {
+  const error = (caught as { error?: unknown } | null)?.error;
+  const field = (error as { details?: { field?: unknown } } | null)?.details?.field;
+  return typeof field === "string" ? field : undefined;
+}
+
 function NewTransferForm({
   onCreated,
   onCancel,
@@ -392,7 +406,13 @@ function NewTransferForm({
       // beside the input that caused it rather than in a banner somebody has to read twice.
       // `describeError` is the one place that knows how to read all three shapes the failure
       // can take, so this screen does not reach for `.message` on a union of them.
-      const field = (failure as { field?: string } | null)?.field;
+      //
+      // The field is under **`details`, not at the top level** — that is where the API's error
+      // conversion puts it, beside the entity, and reading `failure.field` finds `undefined`
+      // for every refusal. A form that falls back to a banner is not broken, but the person
+      // then has to work out which of six inputs was wrong, which is the thing the field name
+      // was for.
+      const field = readField(failure);
       if (field) setFieldErrors({ [field]: describeError(screen).message });
     } finally {
       setBusy(false);
@@ -423,6 +443,14 @@ function NewTransferForm({
                 </option>
               ))}
           </select>
+          {fieldErrors.from_location_id ? (
+            <span
+              data-qa-inventory-transfer-field-error="from_location_id"
+              className="mt-1 block text-xs text-destructive"
+            >
+              {fieldErrors.from_location_id}
+            </span>
+          ) : null}
         </label>
         <label className="block text-sm">
           <span className="mb-1 block font-medium">To location</span>
@@ -441,6 +469,14 @@ function NewTransferForm({
                 </option>
               ))}
           </select>
+          {fieldErrors.to_location_id ? (
+            <span
+              data-qa-inventory-transfer-field-error="to_location_id"
+              className="mt-1 block text-xs text-destructive"
+            >
+              {fieldErrors.to_location_id}
+            </span>
+          ) : null}
         </label>
       </div>
 

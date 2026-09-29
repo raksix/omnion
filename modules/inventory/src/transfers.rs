@@ -144,6 +144,15 @@ pub struct TransferLine {
     pub quantity: Quantity,
     /// How much has landed so far — a partial receive is allowed per line.
     pub received_qty: Quantity,
+    /// **How much is still on the van**, computed here rather than by the reader.
+    ///
+    /// It was a method first, and both the screen and the walk reached for it on the wire and
+    /// found `undefined` — which is the shape of a rule that lives in three places and is
+    /// correct in one. It is serialized for the same reason `on_hand_after` is on a movement:
+    /// the number a person acts on should come from the server that owns the arithmetic, and a
+    /// client-side `quantity − received_qty` is right until the rule changes.
+    #[serde(default)]
+    pub outstanding: Quantity,
     /// The line's note.
     pub note: String,
 }
@@ -337,13 +346,20 @@ impl TransferRow {
 
 impl LineRow {
     fn into_view(self) -> Result<TransferLine> {
+        let quantity = store::quantity_from_text(&self.quantity)?;
+        let received_qty = store::quantity_from_text(&self.received_qty)?;
+        // `saturating_sub` through the same helper the method uses, so the wire value and the
+        // in-process value cannot disagree.
+        let outstanding = Quantity::from_milli(quantity.milli() - received_qty.milli())
+            .unwrap_or(Quantity::ZERO);
         Ok(TransferLine {
             id: self.id,
             item_id: self.item_id,
             sku: self.sku,
             item_name: self.item_name,
-            quantity: store::quantity_from_text(&self.quantity)?,
-            received_qty: store::quantity_from_text(&self.received_qty)?,
+            quantity,
+            received_qty,
+            outstanding,
             note: self.note,
         })
     }
@@ -499,9 +515,13 @@ pub async fn create_transfer(
     let transfer_id = Uuid::new_v4();
 
     sqlx::query(
+        // `$6::date` is **required**, not a nicety: the column is `date` and the parameter
+        // arrives as text, so an uncast bind is a `500` from PostgreSQL on the first transfer
+        // anybody writes. The cast is where the shape check above meets the column, which is
+        // the one place it belongs — a `NULL` passes through the same way.
         "insert into inventory_transfers (id, organization_id, number, from_location_id, \
              to_location_id, scheduled_on, note, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8)",
+         values ($1, $2, $3, $4, $5, $6::date, $7, $8)",
     )
     .bind(transfer_id)
     .bind(organization_id)
@@ -1030,6 +1050,7 @@ mod tests {
             item_name: "Bolt M8".into(),
             quantity: Quantity::parse(quantity).expect("quantity"),
             received_qty: Quantity::parse(received).expect("received"),
+            outstanding: Quantity::ZERO,
             note: String::new(),
         }
     }
