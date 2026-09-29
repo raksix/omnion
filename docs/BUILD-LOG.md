@@ -5358,3 +5358,67 @@ starved in `spawn_blocking` with the runtime's workers gone; it passes alone in 
 
 **Commits:** `cd66014` the migration · `b191fe7` the store · `4d61ab4` the API surface · `96a05e7`
 the ten walks · `7f4100d` the gate on the public page. Pushed.
+
+## 2026-09-29 · tick 64 — REQ-064 slice 4c, the browser half
+
+**What.** The panel for visitor memberships: `/members` (the table with its three state chips,
+the drawer with the last ten sign-ins, the operator's add-a-member form, the block dialog that
+asks for a reason, the delete confirmation that names the address) and `/members/settings` (the
+site policy, rendering the same component rather than a copy). Underneath: `0154_cms_members.sql`,
+`crates/content/src/members.rs`, twenty endpoints behind `memberships.read`/`memberships.manage`,
+the public signup/sign-in/sign-out/profile/verify/reset/gate, and `pages.visibility` enforced on
+the public route itself. `runMembersDepth` drives it in the browser — 47 steps.
+
+**Proof.**
+
+```
+cd apps/admin && ./node_modules/.bin/tsc --noEmit        -> 0 errors
+bun build scripts/qa/walkthrough.cjs --target node      -> parses (only the playwright-core resolve)
+cargo test -p omnion-content --lib                      -> 183 (unchanged; no Rust touched this tick)
+```
+
+The browser pass is **QUEUED, not passed**: `QA_STACK=w2 … QA_SLOT_WAIT=5400`, artifacts to
+`/dev/shm/w2-qa`. The slot is held by another writer and the box ran at load 44-130 with 132 MB
+of free RAM — a pass needs ~1.5 GB of browser heap plus its screenshots, so starting one would
+have killed it rather than proved anything.
+
+**Six decisions the panel records, each one a place the obvious version misleads.**
+
+A visitor account is not a panel user and the drawer says so on screen — the roles column holds
+the SITE's own names, which resolve to nothing in the permission system, and a table that
+silently implied otherwise costs an operator the assumption that granting `editor` here makes a
+panel login. `pending` renders as **Waiting**, never as a failure. `has_password` is a boolean and
+the drawer says what it distinguishes: "invited, never claimed" and "signed in yesterday" are two
+different rows and neither is answered by a hash. Blocking takes a reason; deleting names the
+address it is about to erase. Sign-out-everywhere reports how many sessions died, because
+"signed out" against a member on three devices is a claim the panel cannot support. And the
+gated-page behaviour is a radio whose consequence is written out — 404 discloses nothing, 401
+tells every stranger who guesses the URL that the page is worth a password.
+
+**Three corrections the pass forced, and none of them from review.**
+
+The gate probe answers **200 with a verdict**, not 404: a theme has to draw a prompt and a status
+code cannot carry a URL. My first draft asserted `status === 404` — which is also what a probe
+refusing *everybody* returns, so the entire "refuses, then admits" story would have passed against
+a site whose owner cannot read their own members page. Every gate assertion now reads `allowed`,
+and the admit case always follows the refuse case with the **same cookie**.
+
+The save-notice check was a regex over the whole screen for `/signup|sign up/i` — and the screen
+always contains that word, because a control is labelled "Accept signups". It now reads the
+notice element, or the assertion would survive the very failure it was written for.
+
+And `status === 201 && body && body.id` stores the id string, not a boolean; a `!== undefined`
+checklist is satisfied by any truthy value. `Boolean(...)` it.
+
+**One state a depth pass can never see on its own.** The pass creates its first row before it
+looks at anything, so the empty state — the screen every owner meets on a fresh site — is
+asserted FIRST, while the table genuinely holds nothing, and its hint is checked for the word
+"signup": "nothing here" is an answer, "here is where they come from" is the part an owner needs.
+
+**Next.** (a) Read the queued `--only=members` pass and fix what it finds; acceptance 18 closes on
+a clean run at 1440 px and 390 px. (b) Slice **4d · media reuse** (acceptance 17) is not built at
+all: featured image per page with alt, legend and focal point. (c) REQ-063 acceptance 17's last
+open item is still the `publicRendered` site-scoping question.
+
+**Commits:** `11786b5` the panel · `1f6d90e` the depth pass · `df83f68` the empty state ·
+`510285e` `/members/settings` as its own route.
