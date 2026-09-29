@@ -399,11 +399,12 @@ impl From<ContentError> for ApiError {
                 "menu_key_taken",
                 format!("this site already has a menu with the key {key:?}"),
             ),
-            ContentError::MenuLocationTaken { location, .. } => Self::new(
+            ContentError::MenuLocationTaken { location, holder_key, .. } => Self::new(
                 StatusCode::CONFLICT,
                 "menu_location_taken",
                 format!(
-                    "the {location} location is already held by another menu; move it there first"
+                    "the {location} location is already held by the {holder_key:?} menu; \
+                     move it there first"
                 ),
             ),
             ContentError::PublishingEntryNotFound => Self::new(

@@ -101,12 +101,20 @@ pub enum ContentError {
     MenuKeyTaken(String),
     /// A location is already held by another menu. The holder is named so the editor can be
     /// pointed at the menu to move, rather than guessing which of the site's menus it was.
-    #[error("the {location} location is already held by another menu; move it there first")]
+    ///
+    /// `holder` is the menu's UUID and `holder_key` is the key an editor actually recognises —
+    /// a UUID in a message is a name nobody can paste into the menu list, so the two travel
+    /// together and the API's message quotes the key.
+    #[error(
+        "the {location} location is already held by the {holder_key:?} menu; move it there first"
+    )]
     MenuLocationTaken {
         /// The contested location.
         location: String,
         /// The menu that holds it today.
         holder: Uuid,
+        /// That menu's key — what a reader can act on.
+        holder_key: String,
     },
     /// A publishing queue entry does not carry this identifier.
     #[error("no such publishing entry")]

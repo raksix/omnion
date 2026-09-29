@@ -707,8 +707,8 @@ async fn claim_locations(
     if locations.is_empty() {
         return Ok(());
     }
-    let rows = sqlx::query_as::<_, (String, Uuid)>(
-        "select unnest(locations) as location, id from cms_menus \
+    let rows = sqlx::query_as::<_, (String, Uuid, String)>(
+        "select unnest(locations) as location, id, key from cms_menus \
          where site_id = $1 and id <> $2 and locations && $3::text[]",
     )
     .bind(site_id)
@@ -716,10 +716,11 @@ async fn claim_locations(
     .bind(locations)
     .fetch_all(&mut **tx)
     .await?;
-    if let Some((location, holder)) = rows.first() {
+    if let Some((location, holder, holder_key)) = rows.first() {
         return Err(ContentError::MenuLocationTaken {
             location: location.clone(),
             holder: *holder,
+            holder_key: holder_key.clone(),
         });
     }
     Ok(())

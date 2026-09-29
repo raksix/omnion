@@ -480,6 +480,14 @@ async fn two_menus_hold_header_and_footer_and_a_third_is_refused() {
         "the message must name the contested location: {}",
         contested.body
     );
+    // The message must also name WHO holds it. `header` alone leaves the editor to guess which of
+    // the site's menus to open, and the browser pass asserts on this string — a UUID or the word
+    // "another" is not something anyone can act on, so the holder's key is required here.
+    let message = contested.body["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains("primary"),
+        "the refusal must name the holder's key so the editor knows which menu to move: {message}"
+    );
 
     // The first menu still holds it — a refusal that had already moved the location would look
     // exactly like this one from the panel.
