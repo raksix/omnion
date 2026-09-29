@@ -10,7 +10,7 @@
 #   bash scripts/qa/run-crm-intake.sh
 #
 # It answers six questions the unit tests cannot:
-#   1. does 0051 apply cleanly on top of the released set?
+#   1. does the intake migration apply cleanly on top of the released set? (0055, plus 0159)
 #   2. does a lead with neither e-mail nor phone get refused by the constraint?
 #   3. does the status/decision/kind/policy vocabulary refuse what the crate refuses?
 #   4. is a payload over the ceiling refused rather than truncated?
@@ -76,11 +76,11 @@ echo "[crm-intake] creating a disposable database"
 
 # Apply file-by-file, in filename order — the same order sqlx applies them, so a migration that
 # only works *after* a later one cannot pass here. ON_ERROR_STOP makes the first failure fatal.
-echo "[crm-intake] applying the migration set (this is the gate on 0051)"
+echo "[crm-intake] applying the migration set (this is the gate on 0055)"
 for f in database/migrations/*.sql; do
   "${PSQL[@]}" -q -f "$f" >/dev/null
 done
-echo "  applied $(find database/migrations -name '*.sql' | wc -l) migrations, 0051 included"
+echo "  applied $(find database/migrations -name '*.sql' | wc -l) migrations, 0055 included"
 
 echo "[crm-intake] the schema landed"
 assert_scalar "tables" "3" \
@@ -108,11 +108,19 @@ assert_scalar "two tenants may share a source name" "2" \
 
 echo "[crm-intake] the constraints the crate relies on"
 
-# A lead with neither e-mail nor phone cannot be contacted, so it is not a lead. The crate
-# refuses it in `contactable` before the write; the constraint refuses it if something routes
-# around the crate.
-assert_refused "a lead with no e-mail and no phone" \
+# **An OPEN lead with neither e-mail nor phone is still refused.** The crate refuses it in
+# `contactable` before the write, and the constraint refuses it if something routes around the
+# crate. This half did not move in migration 0159, and the sentence below is why the line is
+# worth keeping: the check narrowed to what it means, rather than being dropped.
+assert_refused "an open lead with no e-mail and no phone" \
   "insert into crm_leads (organization_id, first_name) values ('$ORG_ONE', 'Nobody')"
+# A VERDICT row is a different thing and is now allowed. REQ-117 requires a submission with
+# neither address to be recorded with its reason, and this is the one insert that the store's
+# `rejected` branch performs; under the old predicate it raised 23514 and the evidence was lost.
+assert_scalar "a rejected row with no address is written" "1" \
+  "insert into crm_leads (organization_id, status, first_name, rejection_reason)
+   values ('$ORG_ONE', 'rejected', 'Nobody', 'neither e-mail nor phone was submitted')
+   returning 1"
 
 # The four closed lists, both directions.
 assert_refused "status 'won'" \
