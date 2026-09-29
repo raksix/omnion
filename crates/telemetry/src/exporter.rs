@@ -468,6 +468,55 @@ impl Collector {
             .find(|buffer| buffer.name == name)
             .map(Arc::clone)
     }
+
+    /// Forget every buffered sample, KEEPING the registered exporters.
+    ///
+    /// Distinct from [`Self::clear`], and the distinction is what a walk needs. A walk's
+    /// *buffer* is state it must not inherit; its *registrations* are the thing under test. A
+    /// reset that dropped both left `status(&name)` answering `None`, so the walk's own
+    /// `expect("registered")` fired and the failure read as "the exporter was never created" —
+    /// when in fact the test had deleted it a line earlier, after creating it through the router.
+    pub fn clear_buffer(&self) {
+        for buffer in self
+            .buffers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+        {
+            buffer
+                .items
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+            // `dropped` is an `AtomicU64`, not a mutex — `store`, not `*… = 0`, or the walk
+            // that measures a fresh drop count reads the previous walk's drops instead.
+            buffer.dropped.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Forget every registered exporter and everything it has buffered.
+    ///
+    /// The global collector's own doc comment says "a test's job to use a private one, because a
+    /// test that pushes into the global is a test whose buffer state depends on test order" —
+    /// but `fan_out` and `sweep` read the *global* because that is the one the request path
+    /// pushes into, and their walks are integration walks that must exercise the real edge. So
+    /// the escape hatch has to be a reset on the global rather than a substitute collector.
+    ///
+    /// **Order matters and this is the second half of a bug that took four ticks to name.** A
+    /// walk calls `create_exporter` — itself an authenticated POST — so the request-log
+    /// middleware has already fanned a line out by the time the row exists. Resetting the TABLE
+    /// and the COLLECTOR together, before the walk fans anything of its own, leaves the buffer
+    /// holding that one registration line, and the walk's first assertion reads
+    /// `left: 6, right: 5`. Resetting before `create_exporter` is no better: the buffer is
+    /// empty and `status(&name)` is `None`, because the POST that would have re-registered it
+    /// has not run yet. The order that works is *create the row, then clear the buffer only*.
+    pub fn clear(&self) {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        buffers.clear();
+    }
 }
 
 /// The process-wide collector.

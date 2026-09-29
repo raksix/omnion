@@ -238,6 +238,79 @@ fn json_request(method: Method, path: &str, token: &str, body: Value) -> Request
         .expect("a request builds")
 }
 
+/// Start every walk from an EMPTY exporter table, and an empty in-process collector.
+///
+/// ## Why this helper exists
+///
+/// `exporter_flush::fan_out` iterates **every enabled row in `obs_exporters`** — the fan-out is
+/// not scoped to one exporter, for the same reason the alert evaluator is not scoped to one rule
+/// (see `support::walk_state::EVALUATOR_LOCK`): a pipeline is a fleet, and every configured
+/// backend must receive the line. So a walk cannot reason about "the buffer" in the singular,
+/// and it cannot start from a database that already holds rows from a previous run.
+///
+/// That second half is what this fixes, and it was invisible for four ticks because the walks
+/// pass in isolation and fail in the gate. Each of these suites builds its own per-run
+/// database, so `cargo test -p omnion-api --test exporter_flush` is 5/5 green on its own; the
+/// gate's `omnion_gate_wave6` is created **if missing** and therefore keeps its rows across
+/// invocations. By the fourth run it held four enabled exporters pointing at four mock
+/// collectors whose ports no longer exist, and every walk's own buffer was drowned by them:
+///
+/// ```text
+/// thread 'a_request_s_line_reaches_a_configured_backend' panicked at exporter_flush.rs:312:
+/// the backend received nothing after a real request wrote its line
+/// thread 'a_row_this_process_never_registered_is_registered_by_the_sweep' panicked at :525:
+/// assertion `left == right` failed: … left: "unknown", right: "ok"
+/// ```
+///
+/// The mock behind this walk is the ONLY thing that can answer "did my batch arrive", so a
+/// sibling's dead rows do not make that assertion false — they make the sweep flush four
+/// exporters, three of which block on a closed port, and this walk's own flush lands after them.
+///
+/// **Green in isolation and red in the gate is the whole shape of this defect**, which is why
+/// the gate is `--no-fail-fast` and why nothing here may be "fixed" by asserting a lower bound
+/// that a dead sibling also satisfies. Clear the table, then assert exactly.
+/// The reset, and **where it has to be called from**.
+///
+/// `sign_in` makes several authenticated calls, and the request-log middleware fans out to every
+/// enabled exporter on each one — so a reset placed before sign-in is undone by sign-in itself.
+/// That is not subtle: it is six lines already in the buffer before the walk's own first
+/// `fan_out`, which is exactly the `left: 6, right: 5` the "the fan-out did not buffer"
+/// assertion reported. Every walk therefore calls this **after** `sign_in` and before the buffer
+/// it is about to measure, never from `state_or_fail`.
+async fn reset_exporter_state(state: &AppState) {
+    sqlx::query("delete from obs_exporters")
+        .execute(state.db().pool())
+        .await
+        .expect("the exporter rows are deletable");
+    // The collector is a process-wide `OnceLock` shared by every walk in this binary, and a
+    // buffer that survived a previous walk is a buffer whose drops are counted into a row this
+    // walk is about to assert on. This drops the REGISTRATIONS as well, so it belongs only in
+    // a walk that has not created its own row yet.
+    exporter::global().clear();
+}
+
+/// Clear the collector's buffer but keep one named exporter registered.
+///
+/// The variant a walk needs once it has created its own row. `create_exporter` is itself a
+/// POST through the router, so by the time it returns the request-log middleware has already
+/// fanned one line into whatever exporters were enabled at that moment — and into the new one,
+/// because the route registers the buffer before it answers. Dropping the rows and the buffer
+/// together would also drop the row the walk is about to exercise, so the two are cleared
+/// separately here: the table is emptied of everything EXCEPT `keep`, and the in-process buffer
+/// is emptied entirely.
+async fn reset_exporter_state_keep_row(state: &AppState, keep: &str) {
+    sqlx::query("delete from obs_exporters where name <> $1")
+        .bind(keep)
+        .execute(state.db().pool())
+        .await
+        .expect("the other exporter rows are deletable");
+    // `clear_buffer`, NOT `clear`: the row this walk just created through the router is
+    // registered in the collector, and dropping the registrations would make its own
+    // `expect("registered")` fire — a failure that reads as "the exporter was never created"
+    // when the test deleted it a line earlier.
+    exporter::global().clear_buffer();
+}
+
 /// Register an exporter row through the router and return its id.
 async fn create_exporter(state: &AppState, token: &str, name: &str, endpoint: &str) -> Uuid {
     let created = call(
@@ -286,9 +359,14 @@ async fn remove_exporter(state: &AppState, token: &str, id: Uuid) {
 async fn a_request_s_line_reaches_a_configured_backend() {
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
+    reset_exporter_state(&state).await;
     let name = format!("otlp-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
     let id = create_exporter(&state, &token, &name, &collector.endpoint).await;
+    // The registration POST is itself a request, so the middleware has already fanned a line
+    // into this row. Clear the BUFFER (not the registrations) so the walk measures only what it
+    // is about to fan out itself.
+    reset_exporter_state_keep_row(&state, &name).await;
 
     // Drive real traffic so the request-log middleware runs. Each of these produces exactly one
     // stored line, and each line is what the fan-out hands the buffer.
@@ -405,10 +483,15 @@ async fn a_request_s_line_reaches_a_configured_backend() {
 async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
+    reset_exporter_state(&state).await;
     let name = format!("webhook-{}", Uuid::new_v4().simple());
     // Zero successes: the first batch is already refused.
     let collector = MockCollector::start(Some(0)).await;
     let id = create_exporter(&state, &token, &name, &collector.endpoint).await;
+    // The registration POST is itself a request, so the middleware has already fanned a line
+    // into this row. Clear the BUFFER (not the registrations) so the walk measures only what it
+    // is about to fan out itself.
+    reset_exporter_state_keep_row(&state, &name).await;
 
     // Push past the cap so the drop counter has something real to report. The cap is the crate's
     // default; the walk is deliberately larger, because "the buffer never exceeds its cap" and
@@ -490,6 +573,7 @@ async fn a_backend_that_starts_refusing_degrades_without_failing_a_request() {
 async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
+    reset_exporter_state(&state).await;
     let name = format!("restored-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
 
@@ -545,9 +629,22 @@ async fn a_row_this_process_never_registered_is_registered_by_the_sweep() {
 async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
+    reset_exporter_state(&state).await;
     let name = format!("disabled-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
     let id = create_exporter(&state, &token, &name, &collector.endpoint).await;
+    // The registration POST is itself a request, so the middleware has already fanned a line
+    // into this row. Clear the BUFFER (not the registrations) so the walk measures only what it
+    // is about to fan out itself.
+    reset_exporter_state_keep_row(&state, &name).await;
+
+    // The buffer is cleared AFTER the exporter row exists, and that ordering is the whole point.
+    // `create_exporter` is itself an authenticated POST, so the request-log middleware has
+    // already fanned one line out by the time the row is registered — and a walk that then
+    // resets the collector, or resets it before creating the row, measures somebody else's
+    // traffic. `left: 6, right: 5` is exactly that line: the sixth is the registration POST's
+    // own log, counted against a backlog the walk believes it alone produced.
+    reset_exporter_state_keep_row(&state, &name).await;
 
     for index in 0..5 {
         let _ = exporter_flush::fan_out(exporter::global(), json!({ "n": index }));
@@ -607,10 +704,15 @@ async fn switching_an_exporter_off_counts_the_backlog_it_drops() {
 async fn a_batch_interval_is_respected_between_flushes() {
     let state = support::walk_state::state_or_fail().await;
     let token = sign_in(&state).await;
+    reset_exporter_state(&state).await;
     let name = format!("paced-{}", Uuid::new_v4().simple());
     let collector = MockCollector::start(None).await;
     // The maximum interval, so the second sweep is unambiguously too early.
     let id = create_exporter(&state, &token, &name, &collector.endpoint).await;
+    // The registration POST is itself a request, so the middleware has already fanned a line
+    // into this row. Clear the BUFFER (not the registrations) so the walk measures only what it
+    // is about to fan out itself.
+    reset_exporter_state_keep_row(&state, &name).await;
     sqlx::query("update obs_exporters set batch_ms = 3600000 where id = $1")
         .bind(id)
         .execute(state.db().pool())
