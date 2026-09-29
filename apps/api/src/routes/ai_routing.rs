@@ -139,19 +139,30 @@ pub struct CandidateView {
 
 impl CandidateView {
     fn build(candidate: &Candidate) -> Self {
-        let refusal = candidate.model.as_ref().and_then(|model| {
-            if !model.enabled {
-                return Some(format!("\"{}\" is switched off", model.model_key));
-            }
-            omnion_ai_hub::task_refusal_reason(&candidate.task, model).or_else(|| {
-                candidate
-                    .requirements
-                    .iter()
-                    .find_map(|requirement| {
-                        omnion_ai_hub::requirement_refusal_reason(requirement, model)
+        // A row whose model was **removed** has to say so here. `model.as_ref().and_then(..)`
+        // returns `None` for exactly that case, and the panel then renders a candidate with a
+        // "needs attention" badge and no sentence next to it — a warning that cannot be acted
+        // on, which is the same as no warning. The resolver has said this in a walk since slice
+        // 2 ("this candidate's model has been removed from the registry"); the row the operator
+        // is looking at now says it too, in the same words.
+        let refusal = match candidate.model.as_ref() {
+            None => Some(format!(
+                "this candidate's model has been removed from the registry, so the {} task \
+                 cannot use position {}",
+                candidate.task, candidate.position
+            )),
+            Some(model) => {
+                if !model.enabled {
+                    Some(format!("\"{}\" is switched off", model.model_key))
+                } else {
+                    omnion_ai_hub::task_refusal_reason(&candidate.task, model).or_else(|| {
+                        candidate.requirements.iter().find_map(|requirement| {
+                            omnion_ai_hub::requirement_refusal_reason(requirement, model)
+                        })
                     })
-            })
-        });
+                }
+            }
+        };
 
         Self {
             position: candidate.position,
@@ -304,6 +315,16 @@ pub async fn put_routing(
     Json(body): Json<TaskMapBody>,
 ) -> Result<Json<RoutingResponse>, ApiError> {
     let (scope, mut organization_id) = scope_of(&body.scope)?;
+
+    // The task key is checked here, on the write, and not only in the preview. Without it a
+    // misspelled task is refused further down by the *candidate* validator, whose message names
+    // a model and a requirement — a complaint that reads as though the model were at fault when
+    // the operator typed `fast` instead of `cheap`. The preview has always checked; the write
+    // path is where a bad key has to be caught, because the write is what stores it.
+    //
+    // `task` is a required `String` on this body (a task map *is* a task's list), so there is no
+    // "absent" case to fold into a default the way the preview has.
+    check_task(&body.task).map_err(|_| unknown_task(&body.task))?;
 
     // A site scope's organization is the site's own, read from the database rather than trusted
     // from the payload.
