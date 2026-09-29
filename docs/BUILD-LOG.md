@@ -5157,3 +5157,53 @@ reported. The next pass should close it.
 
 **Next.** Re-run the CRM pass and read its *summary*. Then REQ-117 slice 3: the REQ-064
 form-editor card, inbox metrics, and the `request id` half of the audit line.
+
+## w8 tick 18 — REQ-117 slice 3 · the request id on an audit line (2026-09-29)
+
+**What.** Acceptance 17's third fact — *actor, before/after **and request id*** — is now code and the
+line is ticked. The id travels in a `tokio::task_local` opened once for the whole router by
+`apps/api/src/crm_request_id.rs` (`CorrelateCrm`), and `store::append_event_on` — the single funnel
+every trail line in the module goes through — stamps it into `detail`. `crm_intake::audit` stamps the
+same value, so all fourteen audit call sites are covered with no parameter for any of them to forget.
+The lead timeline renders it (`data-lead-trail-request-id`).
+
+**Why one function and not a parameter.** Threading `request_id: Option<&str>` through the store
+touches ~30 call sites plus every test, and the failure mode of forgetting is *silent*: the line is
+written, the id reads `null`, and the row looks perfectly healthy on every screen. Stamping at the
+funnel makes the omission impossible rather than merely discouraged.
+
+**Proof.**
+- `scripts/qa/run-crm-request-id.sh` **4/4** on a real database, its own `omnion_qa_w8_reqid`.
+- **Proven to fail**: neutralising `.bind(stamp_request_id(detail))` back to `.bind(detail)` gives
+  **0/4**. Restored byte-verified, re-run 4/4.
+- The gate reads the *stored row*, not the schema — because "the column exists" is precisely the
+  assertion that passes while nothing is behind it. Three states are told apart: an exchange's own id,
+  `null` for a worker sweep that belongs to no exchange, and two concurrent exchanges not writing each
+  other's id (the case a single-task test cannot reach).
+- Sibling CRM gates unchanged: assign 5 · assignment 14 · autoresponder 10 · claims 7 · convert 6 ·
+  dedupe 10.
+- `cargo test --workspace --lib` **1317 passed, 0 failed**. `omnion-module-crm-intake --lib` 150.
+  `omnion-api --lib` 242. `cargo clippy` on both crates: **0 warnings**. admin `tsc --noEmit`: clean.
+
+**The finding worth more than the feature.** **A `tokio::task_local` does not cross `tokio::spawn`.**
+The module header claimed it followed the future; the test asserting that was written *from the
+belief* and failed (`left: None`). The capture handler spawns the autoresponder off the request — a
+visitor's `202` must not wait on an SMTP handshake — and that task writes its own trail line, so the
+"obvious" design would have shipped a correlated arrival and an uncorrelated acknowledgement: exactly
+the pair an operator correlates. Fixed by capturing the id at the spawn site and moving it in. The
+test that proves the non-propagation is now in the file, named for the behaviour rather than for the
+function.
+
+**Not mine, flagged.** w4 carries `apps/api/src/request_id.rs` on `origin/wave4` (unmerged) — the
+minting and validating half of this same feature. This branch does not duplicate it: it adopts the id
+the API already puts on the request, so whichever half merges first the other still makes sense.
+
+**Not mine either.** The CRM gate scripts carry a literal `***` where the database password goes
+(`postgres://${PGPASS_USER}:***@…`), inherited byte-for-byte from `run-crm-claims.sh`; they pass
+because the container trusts local connections. One fix across all seven gates belongs to whoever
+owns them.
+
+**Next.** REQ-117 slice 3's remaining half: the REQ-064 form-editor card — blocked, because REQ-064's
+forms module is `pending` and not on this branch. **A full browser pass has still not completed on
+this branch**: the QA slot has been held by live passes of other writers for four ticks running, so
+the CRM screens remain un-walked and no line above claims otherwise.
