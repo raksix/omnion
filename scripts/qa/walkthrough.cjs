@@ -3163,6 +3163,22 @@ async function runCredentialDepth(page, report) {
 }
 
 /**
+ * The organization a signed-in platform account is reading, as the screen itself resolves it.
+ *
+ * A platform account has no primary organization, so every node-package call has to name one —
+ * without it the API refuses `organization_required` and the depth pass asserts against a
+ * screen that could not have worked for the account it signed in as. A tenant needs no
+ * qualifier at all, so this returns `null` for one and the API falls back to its own.
+ */
+async function activeOrganization(page) {
+  return page.evaluate(async () => {
+    const answer = await fetch("/api/v1/organizations", { credentials: "same-origin" });
+    const body = await answer.json().catch(() => ({}));
+    return (body?.organizations ?? [])[0]?.id ?? null;
+  });
+}
+
+/**
  * The node-package pass (REQ-087, slice 4).
  *
  * Drives `/modules/installed` through the whole lifecycle against a real package: it installs
@@ -3185,8 +3201,11 @@ async function runNodePackagesDepth(page, report) {
 
   await page.goto(`${URL_ADMIN}/modules/installed`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1600);
+  // Read once: every direct API call below has to name the same organization the screen does.
+  const organization = await activeOrganization(page);
   note({
     step: "list",
+    organization,
     rows: await page.locator("[data-package-row]").count(),
     emptyState: (await page.locator("[data-testid=packages-empty]").count()) > 0,
   });
@@ -3217,6 +3236,8 @@ async function runNodePackagesDepth(page, report) {
         outputs: [
           { name: "main", kind: "main", accepts: ["text", "json"], open: true },
         ],
+        capabilities: ["execute"],
+        credential_types: ["api_key"],
         params: [
           {
             name: "text",
@@ -3226,8 +3247,21 @@ async function runNodePackagesDepth(page, report) {
             ui: "textarea",
             placeholder: "Anything",
           },
+          // The bundled registry refuses a node that accepts a credential with no select for
+          // the palette to fill (`node_credential_not_selectable`). Without this parameter the
+          // *valid* fixture is refused, and the pass proves a refusal while claiming to prove
+          // an install.
+          {
+            name: "credential_key",
+            type: "string",
+            label: "Credential",
+            required: true,
+            ui: "select",
+            options_source: "credentials",
+            help: "Pick an API-key credential of the type this node names.",
+            secret_field: true,
+          },
         ],
-        capabilities: ["execute"],
         sandbox: "required",
         default_max_attempts: 3,
       },
@@ -3258,6 +3292,14 @@ async function runNodePackagesDepth(page, report) {
   const broken = structuredClone(manifest);
   broken.permissions = ["network"];
   broken.nodes[0].credential_types = ["oauth2"];
+  // The `400` this install provokes *is* the assertion — the criterion is that a package the
+  // validator refuses reaches no ledger row and says every finding why. Registering it means
+  // the roll-up reports it as `expectedRefusals` instead of a defect; leaving it unregistered
+  // made this pass's own negative case look like a broken screen.
+  expectRefusal(
+    "/api/v1/node-packages",
+    "the node-package install of a deliberately broken manifest, which the API refuses",
+  );
   await page
     .locator("[data-testid=package-manifest]")
     .fill(JSON.stringify(broken, null, 2))
@@ -3272,11 +3314,14 @@ async function runNodePackagesDepth(page, report) {
   await shot(page, "page-modules-installed-refused");
 
   // Nothing reached the ledger: read the API, not the screen's own claim.
-  steps.refusedReachedLedger = await page.evaluate(async () => {
-    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
+  steps.refusedReachedLedger = await page.evaluate(async (organizationId) => {
+    const response = await fetch(
+      `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
+      { credentials: "same-origin" },
+    );
     const body = await response.json().catch(() => ({}));
     return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
-  });
+  }, organization);
 
   // 2. The same package, valid, installs — and the node key is namespaced.
   await page.locator("[data-testid=package-install-clear]").click({ timeout: 5000 }).catch(() => {});
@@ -3297,18 +3342,24 @@ async function runNodePackagesDepth(page, report) {
   await shot(page, "page-modules-installed-installed");
 
   // 3. A downgrade is refused by name.
-  steps.downgradeRefused = await page.evaluate(async () => {
+  // Same reasoning as the broken manifest: the `409` is the assertion.
+  expectRefusal(
+    "/api/v1/node-packages",
+    "the downgrade of an installed package, which the ledger refuses by version",
+  );
+  steps.downgradeRefused = await page.evaluate(async (organizationId) => {
     const response = await fetch("/api/v1/node-packages", {
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         manifest: { key: "qa-fixture", version: "0.0.1", name: "x", docs_url: "https://x" },
+        organization_id: organizationId,
       }),
     });
     const body = await response.json().catch(() => ({}));
     return { status: response.status, code: body?.error?.code ?? null };
-  });
+  }, organization);
 
   // 4. Disable, then re-enable: the ledger keeps the row and the state chip changes.
   await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
@@ -3317,11 +3368,14 @@ async function runNodePackagesDepth(page, report) {
     .locator('[data-package-key="qa-fixture"] [data-testid=package-state]')
     .innerText()
     .catch(() => "")) .includes("disabled");
-  steps.ledgerRowSurvivedDisable = await page.evaluate(async () => {
-    const response = await fetch("/api/v1/node-packages", { credentials: "same-origin" });
+  steps.ledgerRowSurvivedDisable = await page.evaluate(async (organizationId) => {
+    const response = await fetch(
+      `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
+      { credentials: "same-origin" },
+    );
     const body = await response.json().catch(() => ({}));
     return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
-  });
+  }, organization);
   await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1500);
   note({

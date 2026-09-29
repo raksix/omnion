@@ -42,12 +42,13 @@ import {
 
 import {
   fetchNodePackages,
+  fetchOrganizations,
   installNodePackage,
   removeNodePackage,
   setNodePackageEnabled,
   type ApiError,
 } from "@/lib/api";
-import type { NodePackage, PackageFinding } from "@/lib/types";
+import type { NodePackage, Organization, PackageFinding } from "@/lib/types";
 import { useSession } from "@/lib/session";
 
 /** What the screen is doing, so the header never lies about it. */
@@ -76,10 +77,13 @@ const PERMISSION_LABEL: Record<string, string> = {
 
 export function InstalledPackages() {
   const { user } = useSession();
-  // A platform account has no organization of its own, so every call has to name one — the
-  // API refuses `organization_required` otherwise, and the screen renders that refusal where
-  // the ledger should be.
-  const organizationId = user?.organization_id ?? null;
+  // A tenant reads its own ledger. A platform account has no organization of its own, so it
+  // names one — the API refuses `organization_required` otherwise, and the screen would
+  // render that refusal where the ledger should be.
+  const platformAccount = user ? user.organization_id === null : false;
+  const [organizations, setOrganizations] = useState<Organization[] | null>(null);
+  const [selectedOrg, setSelectedOrg] = useState<string | null>(null);
+  const organizationId = platformAccount ? selectedOrg : (user?.organization_id ?? null);
   const [packages, setPackages] = useState<NodePackage[] | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [notice, setNotice] = useState<Notice>(null);
@@ -90,7 +94,17 @@ export function InstalledPackages() {
   const [manifestText, setManifestText] = useState("");
   const errorRef = useRef<HTMLDivElement>(null);
 
+  // A platform account's list depends on which organization is chosen, so there is nothing to
+  // read until one is — saying so is better than rendering an error the reader caused by
+  // simply arriving.
+  const needsOrganization = platformAccount && selectedOrg === null;
+
   const load = useCallback(async () => {
+    if (needsOrganization) {
+      setPackages([]);
+      setPhase("ready");
+      return;
+    }
     setPhase("loading");
     try {
       const page = await fetchNodePackages(organizationId);
@@ -100,11 +114,23 @@ export function InstalledPackages() {
       setNotice({ tone: "error", text: describe(error) });
       setPhase("error");
     }
-  }, [organizationId]);
+  }, [organizationId, needsOrganization]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // A platform account picks which organization's ledger it is reading; a tenant never sees
+  // the control, because it has exactly one ledger.
+  useEffect(() => {
+    if (!platformAccount || organizations !== null) return;
+    void fetchOrganizations()
+      .then((list) => {
+        setOrganizations(list);
+        setSelectedOrg(list[0]?.id ?? null);
+      })
+      .catch(() => setOrganizations([]));
+  }, [platformAccount, organizations]);
 
   const total = packages?.length ?? 0;
   const enabled = useMemo(
@@ -219,6 +245,23 @@ export function InstalledPackages() {
               `${permissions.length} distinct permission${permissions.length === 1 ? "" : "s"} requested`}
         </p>
         <div className="flex items-center gap-2">
+          {platformAccount && organizations && organizations.length > 0 ? (
+            <label className="flex items-center gap-2 text-[12.5px]">
+              <span className="text-muted">Organization</span>
+              <select
+                value={selectedOrg ?? ""}
+                data-testid="packages-organization"
+                onChange={(event) => setSelectedOrg(event.target.value)}
+                className="h-8 rounded-lg border border-line bg-surface px-2 text-[12.5px] text-ink outline-none focus:border-accent focus:ring-2 focus:ring-accent/15"
+              >
+                {organizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>
+                    {organization.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <button
             type="button"
             onClick={() => void load()}
@@ -411,6 +454,17 @@ export function InstalledPackages() {
           <code className="font-mono text-[12px]">*.omnion-node.json</code>. The server validates
           it before anything is recorded, and a package that fails installs nothing.
         </p>
+        {/* The install button is disabled until an organization is chosen, so the reason is
+            stated here rather than leaving a control that cannot be pressed. */}
+        {needsOrganization ? (
+          <p
+            className="mt-2 flex items-center gap-2 text-[13px] text-muted"
+            data-testid="packages-needs-organization"
+          >
+            <TriangleAlert className="h-3.5 w-3.5" aria-hidden />
+            Choose an organization above to read its ledger and install into it.
+          </p>
+        ) : null}
         <label htmlFor="package-manifest" className="mt-3 block text-[13px] font-medium">
           Manifest JSON
         </label>
@@ -428,7 +482,7 @@ export function InstalledPackages() {
           <button
             type="button"
             onClick={() => void install()}
-            disabled={installing || manifestText.trim() === ""}
+            disabled={installing || needsOrganization || manifestText.trim() === ""}
             data-testid="package-install"
             className="rounded-md bg-ink px-3 py-1.5 text-[13px] text-background disabled:opacity-50"
           >
