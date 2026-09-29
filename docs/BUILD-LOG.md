@@ -5135,3 +5135,70 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+
+### Wave 3 / tick 22 — the pass ran, and one missing env var had been faking a hundred broken screens (2026-09-29)
+
+**What.** The gates were green (9 GB available, load 7.83, my ports free), so the pass ran
+for the first time in three ticks, carrying the fourteen notes. It came back with
+`workflow-builder: rule-created found:false, workflowId:""` and `workflow-table: create
+status:403`.
+
+I had been reading that as a walkthrough defect. It is not. The panel posts the same call
+the walkthrough posts, and both answers were `403`.
+
+**The cause was printed by another writer's note, in the same pass.**
+
+```
+[walk] iam roles depth: ... "error":"cookie-authenticated changes are refused because no
+  CSRF secret is configured (set OMNION_CSRF_SECRET) (csrf_unavailable)"
+```
+
+`scripts/qa/run.sh` started the API with four environment variables and none of them was
+`OMNION_CSRF_SECRET`, so **every stack on this box — this wave's and all seven siblings —
+could not write a single row.** A guard designed to fail loudly is, inside a test harness,
+indistinguishable from a broken product: the builder, the automations editor, the webhook
+screen, role creation and SCIM provisioning all reported empty lists with no error anywhere
+on screen, and the pass called them defects.
+
+**The product is right; the harness was wrong.** `apps/api/src/headers_middleware.rs`
+refuses rather than skips, and says why: a platform that silently drops CSRF protection when
+a key is missing is worse than one that refuses writes. That file is the main writer's and its
+behaviour is the intended one, so I did not touch it. The fix is one variable in this wave's
+`run.sh`, and it is added to the **restart** branch as well — `pm2 restart` re-reads the env
+the process was created with, so a stack started before this line keeps the empty env and
+stays broken for every later pass until it is deleted.
+
+**Proof, taken before spending a second pass on a fix I had only reasoned about.** A scratch
+API on 18099 carrying the secret: `healthz` 200, login 200, the CSRF cookie minted, and the
+same create that answered 403 now answers **422 `missing field 'trigger'`** — it reached body
+validation. The refusal is gone and the guard is still standing.
+
+**The credential mask nearly cost the stack, and the lesson is about how the check was done.**
+The first patch's `old_string` contained the DSN, and it wrote the display mask into the
+file: the QA database password, gone. `git diff` could not show it — both sides print masked,
+so it read as a clean one-line change. Only a byte comparison against `HEAD` caught it (51
+bytes against 33). Two more regex rounds were wasted before I stopped guessing and located the
+block by index; both failures were visible in the raw bytes and invisible in the source I was
+reading — the env lines are shell *continuation* lines with no indent of their own, and the
+last one carries no quotes. The edit is now made in python against the committed blob, the
+credential is never named in a patch, and the result is proven by bytes.
+
+**The BUILD-LOG conflict, resolved by shape rather than by force.** `theirs` was a single
+insert at the tail and mine interleaved into the middle, so the correct merge is ours plus
+their tail. Two wrong bases first — `HEAD` is my branch tip, and only stage 1 is the merge
+base — and a line-level multiset that failed on a `---` separator, which is layout rather than
+content. The sound pair of checks: **every prose line survives**, separators excepted, and
+**every heading survives**, which is the unit a reader navigates by. Verified over 5137 lines
+and 91 headings with nothing lost from any of the three sides.
+
+**Gate status.** `cargo test -p omnion-workflows --lib` → **139 passed, 0 failed**.
+`apps/admin` `node --test` → **167 passed, 0 failed** across 9 suites. `pnpm typecheck` →
+exit 0 (web + admin). `bash -n scripts/qa/run.sh` → clean.
+
+**Not ticked, and the reason is the box.** Fourteen criteria are still "BUILT, not ticked".
+The pass that would measure them is the pass that just finished, and the fix it produced is
+one environment variable, so the next pass is where all fourteen get read for the first
+time. Load was 27.7 with 3 GB available when this entry was written, against a gate of <10
+and >8, so the re-run waits for the box rather than starting into it.
+
+**Next.** Re-run the w3 pass with the secret in place and read all fourteen notes.
