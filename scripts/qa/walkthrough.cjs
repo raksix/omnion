@@ -8259,6 +8259,7 @@ note({
         if (!detail.ok) return null;
         const run = await detail.json();
         return {
+          executionId: run.id ?? latest.id ?? null,
           startedFrom: run.started_from_node ?? null,
           steps: (run.steps ?? []).map((step) => ({
             step_no: step.step_no,
@@ -8337,6 +8338,93 @@ note({
       ruleCount: Array.isArray(before?.workflows) ? before.workflows.length : null,
     });
     await shot(page, "page-workflow-builder-run-from-here");
+
+    // ---- Clicking a node opens that step's inputs and output --------------------------------
+    // The second half of criterion 2, and the half that cannot be read from the API: the
+    // claim is about the PANEL, so the panel is what gets read. A probe that fetched the
+    // run and printed `step.output` would pass against a trace that rendered nothing.
+    //
+    // The node clicked is a node the run actually touched — read off a card that carries a
+    // pill — because clicking a node the run never reached is the `node-absent` state, and
+    // asserting on that would prove the panel has an empty-state message rather than that
+    // it opens the step.
+    {
+      const paintedNodeId = painted.painted.find((entry) => entry.status !== "skipped")?.nodeId
+        ?? null;
+      if (paintedNodeId) {
+        await page
+          .locator(`[data-node-id="${paintedNodeId}"]`)
+          .first()
+          .click({ timeout: 8000 })
+          .catch(() => {});
+        await page.waitForTimeout(500);
+      }
+
+      const trace = await page.evaluate((nodeId) => {
+        const panel = nodeId ? document.querySelector(`[data-step-trace="${nodeId}"]`) : null;
+        if (!panel) return null;
+        const blocks = (name) => {
+          const block = panel.querySelector(`[data-step-trace-payload="${name}"]`);
+          if (!block) return null;
+          return {
+            shape: block.querySelector("[data-step-trace-payload-shape]")?.textContent ?? null,
+            headline:
+              block.querySelector("[data-step-trace-payload-headline]")?.textContent?.trim() ?? null,
+            rows: block.querySelectorAll("dt").length,
+            items: block.querySelectorAll("ol li").length,
+          };
+        };
+        return {
+          kind: panel.getAttribute("data-step-trace-kind"),
+          heading: panel.querySelector("[data-step-trace-heading]")?.textContent?.trim() ?? null,
+          subheading:
+            panel.querySelector("[data-step-trace-subheading]")?.textContent?.trim() ?? null,
+          steps: panel.querySelectorAll("[data-step-trace-step]").length,
+          statuses: Array.from(panel.querySelectorAll("[data-step-trace-status]")).map((node) =>
+            node.getAttribute("data-step-trace-status"),
+          ),
+          inputs: blocks("inputs"),
+          output: blocks("output"),
+        };
+      }, paintedNodeId);
+
+      // The wire has to carry the inputs at all. Read from the API, because this is the one
+      // assertion about the SERVER: a panel that renders "no inputs" on every step is a
+      // correct-looking panel built on a field nobody sends.
+      const paramsOnWire = await page.evaluate(async (executionId) => {
+        if (!executionId) return null;
+        const res = await fetch(`/api/v1/workflow-executions/${executionId}`, {
+          credentials: "same-origin",
+        });
+        if (!res.ok) return null;
+        const run = await res.json();
+        return (run.steps ?? []).map((step) => ({
+          step_no: step.step_no,
+          hasParams: step.params !== undefined,
+        }));
+      }, after?.executionId ?? null).catch(() => null);
+
+      note({
+        step: "step-trace",
+        clickedNode: paintedNodeId,
+        panelFound: trace !== null,
+        kind: trace?.kind ?? null,
+        // Both halves rendered: the panel opened a step at all…
+        stepsShown: trace?.steps ?? 0,
+        // …and it rendered the step's two sides rather than two headings.
+        inputsRendered: (trace?.inputs?.rows ?? 0) + (trace?.inputs?.items ?? 0),
+        outputRendered: (trace?.output?.rows ?? 0) + (trace?.output?.items ?? 0),
+        inputShape: trace?.inputs?.shape ?? null,
+        outputShape: trace?.output?.shape ?? null,
+        heading: trace?.heading ?? null,
+        subheading: trace?.subheading ?? null,
+        statuses: trace?.statuses ?? [],
+        // The server half: every step reports whether its inputs were on the wire.
+        stepsWithParams: (paramsOnWire ?? []).filter((step) => step.hasParams).length,
+        stepsTotal: (paramsOnWire ?? []).length,
+      });
+      await shot(page, "page-workflow-builder-step-trace");
+    }
   }
 
   // ---- Cleanup: this pass owns the rule it made --------------------------------------------
