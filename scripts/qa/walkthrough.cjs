@@ -1001,6 +1001,54 @@ async function runDepthPass(name, pass) {
   }
 }
 
+/**
+ * A depth pass that runs on a page it is allowed to replace.
+ *
+ * `runDepthPass` reports whatever the pass throws, and on this box the most common throw is
+ * "Target page, context or browser has been closed" — nine writers share one machine, a pass is
+ * the heaviest thing any of them runs, and Chrome gets reaped under memory pressure. That message
+ * says nothing about the screen under test, and a report that counts it as a failure teaches the
+ * next tick to distrust the pass, which is worse than not running it: two ticks of this loop read
+ * "the tab died" as a product signal and then guessed at a cause.
+ *
+ * So `run` takes the page to use rather than closing over one, and when the tab it was handed is
+ * gone the pass is re-run on a fresh page — once, and visibly (`recoveredAfterClosedTab`). Only
+ * the closed-tab message is retried: a pass that throws for its own reasons — a refused save, a
+ * missing selector, a timeout waiting for a row — is a real finding and is reported as one.
+ *
+ * `adopt` receives the replacement so the rest of the run continues on a live tab; a fresh page
+ * has no session cookie problem (it is the same context) but it does need the hydration wait, and
+ * `prepare` is where that happens.
+ */
+async function runEarlyDepthPass(name, run, { context, adopt, prepare }) {
+  const closedTab = /has been closed|Target closed|Page closed|browser has been closed|most likely because of a crash/i;
+  let lastReason = "";
+  let recovered = false;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return { ...(await run(adopt.page)), recoveredAfterClosedTab: recovered };
+    } catch (cause) {
+      const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+      lastReason = reason;
+      if (attempt > 0 || !closedTab.test(reason)) break;
+      log(`depth pass ${name}: the tab was closed (${reason}) — retrying once on a fresh page`);
+      try {
+        const fresh = await context.newPage();
+        attach(fresh, "main");
+        if (prepare) await prepare(fresh);
+        adopt.page = fresh;
+        recovered = true;
+      } catch (makeError) {
+        lastReason = `${reason} · recovery failed: ${makeError instanceof Error ? makeError.message : String(makeError)}`;
+        break;
+      }
+    }
+  }
+  log(`depth pass ${name} failed: ${lastReason}`);
+  record({ page: "qa", action: "depth-pass-failed", pass: name, reason: lastReason });
+  return { ok: false, steps: 0, reason: lastReason };
+}
+
 async function runMediaFileManager(page, report) {
   const steps = [];
   const note = (step) => {
@@ -6109,7 +6157,11 @@ async function main() {
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
-  const page = markHydrationWait(await context.newPage());
+  // `let`, not `const`: a pass that finds the tab closed swaps in a fresh one (see
+  // `runEarlyDepthPass`). A closed tab is this box's memory pressure, not a product fault, and it
+  // recurs at unpredictable points — a pass that can only ever run on the page it was given has no
+  // way to say so honestly, so it reports a failure it did not observe.
+  let page = markHydrationWait(await context.newPage());
   attach(page, "main");
 
   // Reachable?
@@ -6295,6 +6347,45 @@ async function main() {
     }
   }
 
+  // The CRM depth passes (REQ-117, slices 1–2) run FIRST among the depth passes, and that is a
+  // deliberate ordering rather than a preference. Every pass after a tab that dies is an echo:
+  // a pass that reports "Target page, context or browser has been closed" has not measured its
+  // screen at all, and the reporter cannot tell that apart from a screen that is genuinely
+  // broken. On a box shared by nine writers the tab dies under memory pressure at an unpredictable
+  // point, so the passes whose assertions are hardest to reproduce by hand are put where the tab
+  // is freshest and the box is least loaded — right after the route walk.
+  //
+  // The intake pass proves: the endpoint key is revealed exactly once, `Test mapping` writes
+  // nothing, the public endpoint answers 202/401/429 as documented, a honeypot submission lands
+  // as spam, an inbox edit cannot rewrite the lead's own evidence, `Mark responded` is idempotent
+  // on the instant, the retention control counts before it erases, and the duplicate queue's
+  // decisions change the row. The assignment pass proves the simulator names the winning rule
+  // *and* the rule that lost with the key that missed, and that running it consumes no
+  // round-robin cursor.
+  //
+  // Both are wrapped in a tab-recovery retry: a closed tab is a box condition and a repeatable
+  // one, so the pass is re-run on a fresh page rather than recorded as a product failure. The
+  // replacement page is adopted as the run's own, so the passes that follow this one get a live
+  // tab too instead of inheriting the dead one.
+  const adopt = { page };
+  const prepare = async (fresh) => {
+    // A page from this context carries the session cookie, so it only needs the same
+    // hydration patience the first page got — the sign-in is already in the jar.
+    markHydrationWait(fresh);
+  };
+  report.crmIntake = await runEarlyDepthPass("crm-intake", (p) => runCrmIntakeDepth(p, report), {
+    context,
+    adopt,
+    prepare,
+  });
+  report.crmAssignment = await runEarlyDepthPass("crm-assignment", (p) => runCrmAssignmentDepth(p, report), {
+    context,
+    adopt,
+    prepare,
+  });
+  page = adopt.page;
+  log(`crm intake: ${JSON.stringify(report.crmIntake)}`);
+
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
   // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
@@ -6415,17 +6506,13 @@ async function main() {
   log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
-  // The CRM intake pass (REQ-117, slice 1): the key is revealed once, a `Test mapping` writes
-  // nothing, the public endpoint answers 202/401, a honeypot submission lands as spam, the
-  // inbox's counters and rows come from one read, a lead edit cannot rewrite its evidence,
-  // `Mark responded` is idempotent on the instant, and the duplicate queue's decisions both
-  // change the row. It creates and removes its own sources, and runs after the count-sensitive
-  // passes because it writes leads into the same inbox the metrics count.
-  report.crmIntake = await runDepthPass("crm-intake", () => runCrmIntakeDepth(page, report));
-  report.crmAssignment = await runDepthPass("crm-assignment", () =>
-    runCrmAssignmentDepth(page, report),
-  );
-  log(`crm intake: ${JSON.stringify(report.crmIntake)}`);
+  // The CRM depth passes (REQ-117, slices 1–2) now run EARLY — see the call site right after the
+  // route walk. They used to live here, last in the depth list, and on a box running five other
+  // writers' passes they were the two that never executed: the tab died somewhere in the IAM and
+  // security passes long before, and everything after the death was an echo. Nothing about a
+  // screen's value changes with the order a pass runs in, so the passes whose assertions are
+  // the hardest to reproduce belong where the tab is freshest.
+  log(`crm intake (late no-op): ${JSON.stringify(report.crmIntake)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
