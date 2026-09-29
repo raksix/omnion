@@ -27,7 +27,7 @@ use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::bus;
 use omnion_events::model::NewEvent;
-use omnion_workflows::graph::{self, Graph};
+use omnion_workflows::graph::{self, Edge, Graph, Node};
 use omnion_workflows::graph_store::{self, GraphUpdate};
 use omnion_workflows::plugin_nodes::PluginRegistry;
 use serde::{Deserialize, Serialize};
