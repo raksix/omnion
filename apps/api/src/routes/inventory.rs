@@ -2096,6 +2096,305 @@ pub async fn sweep_alerts(
 }
 
 // ---------------------------------------------------------------------------------------------
+// The stocktake (REQ-053 slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/stocktake` — the session list.
+pub async fn list_stocktakes(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<StocktakeListParams>,
+) -> Result<Json<Page<omnion_module_inventory::stocktake::StocktakeView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::stocktake::StocktakeQuery {
+        search: params.search,
+        // `?status=` repeated is a comma list in the query string, which is what a `<select
+        // multiple>` and a hand-written URL both produce.
+        statuses: split_multi(params.status),
+        open_only: params.open_only.unwrap_or(false),
+        limit: params.limit,
+        cursor: parse_cursor(params.cursor),
+    };
+    Ok(Json(
+        omnion_module_inventory::stocktake::list_stocktakes(state.db().pool(), organization_id, &query)
+            .await?,
+    ))
+}
+
+/// The list's filter.
+#[derive(Debug, Deserialize)]
+pub struct StocktakeListParams {
+    /// Free text over the number and the note.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// `open`, `closed` or `cancelled` — repeated, or comma separated.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Only the sheets still counting.
+    #[serde(default)]
+    pub open_only: Option<bool>,
+    /// How many rows.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The page cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/inventory/stocktake/{id}` — one session with its sheet.
+pub async fn get_stocktake(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    Path(stocktake_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::stocktake::StocktakeView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        omnion_module_inventory::stocktake::get_stocktake(state.db().pool(), organization_id, stocktake_id)
+            .await?,
+    ))
+}
+
+/// `GET /api/v1/inventory/stocktake/{id}/report` — the variance report.
+///
+/// **A separate route rather than a `?report=1` on the detail**, because the report is the
+/// thing somebody opens six months later: the sheet says what the counter *wrote*, and this says
+/// what the ledger *holds*. Those are two claims, and a report that derived its numbers from the
+/// sheet would agree with it by construction and prove nothing.
+pub async fn stocktake_report(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    Path(stocktake_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view =
+        omnion_module_inventory::stocktake::get_stocktake(state.db().pool(), organization_id, stocktake_id)
+            .await?;
+    let movements = omnion_module_inventory::stocktake::variance_movements(
+        state.db().pool(),
+        organization_id,
+        stocktake_id,
+    )
+    .await?;
+
+    // The header's frozen total beside the ledger's own sum: two numbers computed by different
+    // routes, and the report is only honest if they are both shown. A report that printed one
+    // of them could not fail, and a report that cannot fail is a screenshot.
+    let from_ledger: Quantity = movements
+        .iter()
+        .fold(Quantity::ZERO, |acc, movement| {
+            acc.checked_add(movement.quantity).unwrap_or(acc)
+        });
+
+    Ok(Json(json!({
+        "stocktake": view,
+        "movements": movements,
+        "variance_total": view.variance_total,
+        "ledger_total": from_ledger.to_text(),
+        "agrees": from_ledger.to_text() == view.variance_total,
+    })))
+}
+
+/// What a new count asks for.
+#[derive(Debug, Deserialize)]
+pub struct CreateStocktakeBody {
+    /// The shelves being counted.
+    #[serde(default)]
+    pub location_ids: Vec<Uuid>,
+    /// Narrow the sheet to one category.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// What the count is for.
+    #[serde(default)]
+    pub counted_on: Option<String>,
+    /// The note.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Organization to act on.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `POST /api/v1/inventory/stocktake` — open a sheet.
+pub async fn create_stocktake(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    body: Json<CreateStocktakeBody>,
+) -> Result<(StatusCode, Json<omnion_module_inventory::stocktake::StocktakeView>), ApiError> {
+    let organization_id = organization_of(&state, &current, body.0.organization_id).await?;
+    let view = omnion_module_inventory::stocktake::create_stocktake(
+        state.db().pool(),
+        organization_id,
+        &omnion_module_inventory::stocktake::NewStocktake {
+            location_ids: body.0.location_ids,
+            category: body.0.category,
+            counted_on: body.0.counted_on,
+            note: body.0.note,
+        },
+        Some(current.user.id),
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.stocktake.opened")
+            .organization(organization_id)
+            .target("inventory_stocktake", view.id.to_string())
+            .metadata(json!({
+                "number": view.number,
+                "locations": view.location_codes,
+                "lines": view.lines_counted,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// What a count asks for.
+#[derive(Debug, Deserialize)]
+pub struct CountBody {
+    /// The lines the counter saw.
+    #[serde(default)]
+    pub lines: Vec<omnion_module_inventory::stocktake::StocktakeCount>,
+    /// Organization to act on.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `POST /api/v1/inventory/stocktake/{id}/count` — write what the counter saw.
+///
+/// **A count moves nothing.** The audit row records it because the *document* changes — a
+/// number somebody typed is a fact about the count even when stock does not move yet — and the
+/// route is deliberately a write guarded by the stocktake key: an open sheet is a document other
+/// people read, and a counter who may not be trusted to close one may still be trusted to fill
+/// it in.
+pub async fn count_stocktake(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(stocktake_id): Path<Uuid>,
+    body: Json<CountBody>,
+) -> Result<Json<omnion_module_inventory::stocktake::StocktakeView>, ApiError> {
+    let organization_id = organization_of(&state, &current, body.0.organization_id).await?;
+    let view = omnion_module_inventory::stocktake::count(
+        state.db().pool(),
+        organization_id,
+        stocktake_id,
+        &body.0.lines,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.stocktake.counted")
+            .organization(organization_id)
+            .target("inventory_stocktake", stocktake_id.to_string())
+            .metadata(json!({
+                "number": view.number,
+                "counted": body.0.lines.len(),
+                "pending": view.lines_pending,
+                "variances": view.variances_count,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(view))
+}
+
+/// `POST /api/v1/inventory/stocktake/{id}/close` — post the variances and finish the sheet.
+pub async fn close_stocktake(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(stocktake_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::stocktake::StocktakeOutcome>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let outcome = omnion_module_inventory::stocktake::close_stocktake(
+        state.db().pool(),
+        organization_id,
+        stocktake_id,
+        Some(current.user.id),
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.stocktake.closed")
+            .organization(organization_id)
+            .target("inventory_stocktake", stocktake_id.to_string())
+            .metadata(json!({
+                "lines": outcome.lines,
+                "variances": outcome.variances,
+                "variance_total": outcome.variance_total,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    // **One event per close, not per variance** — the same reasoning the alert sweep gives. The
+    // automation rule wants "the count is in", and a rule that fires two hundred times for two
+    // hundred lines is a rule nobody will leave switched on. The count is in the payload so a
+    // rule can branch on it.
+    emit(
+        &state,
+        NewEvent::new("inventory.stocktake.closed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "stocktake_id": stocktake_id,
+                "lines": outcome.lines,
+                "variances": outcome.variances,
+                "variance_total": outcome.variance_total,
+            })),
+    )
+    .await;
+
+    Ok(Json(outcome))
+}
+
+/// `POST /api/v1/inventory/stocktake/{id}/cancel` — withdraw the sheet.
+///
+/// Posts nothing, and that is the difference from a transfer's cancel: nothing moved, so a
+/// ledger row would describe an event that did not happen. The audit row is still written,
+/// because a session that vanished without a trace is the sort of thing an auditor asks about.
+pub async fn cancel_stocktake(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(stocktake_id): Path<Uuid>,
+) -> Result<Json<omnion_module_inventory::stocktake::StocktakeView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let view = omnion_module_inventory::stocktake::cancel_stocktake(
+        state.db().pool(),
+        organization_id,
+        stocktake_id,
+    )
+    .await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.stocktake.cancelled")
+            .organization(organization_id)
+            .target("inventory_stocktake", stocktake_id.to_string())
+            .metadata(json!({ "number": view.number, "lines": view.lines_counted }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(view))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Permissions
 // ---------------------------------------------------------------------------------------------
 

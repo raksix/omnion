@@ -1473,6 +1473,18 @@ pub fn router(state: AppState) -> Router {
             "/inventory/alerts/open-count",
             get(inventory::open_alert_count),
         )
+        // The stocktake (slice 4). The reads sit here on `inventory.items.read` for the same
+        // reason the transfer reads do: **a stocktake is a document about stock**, so anybody
+        // who may read the ledger may read the counts that explain it, and a second key would
+        // mean a role could see a variance hit the shelf with no way to find the count that
+        // caused it. The report is a read for the same reason and for a further one — it is
+        // the document an auditor opens, and an auditor holds the read key.
+        .route("/inventory/stocktake", get(inventory::list_stocktakes))
+        .route("/inventory/stocktake/{id}", get(inventory::get_stocktake))
+        .route(
+            "/inventory/stocktake/{id}/report",
+            get(inventory::stocktake_report),
+        )
         // The adjustment inbox and its export. The inbox is a **read** key and not the approve
         // key on purpose: a manager's job is to see what is waiting, and an approver who cannot
         // see the queue has to ask for a link to it. The decision is the guarded write below.
@@ -1526,6 +1538,30 @@ pub fn router(state: AppState) -> Router {
         .route("/inventory/transfers/{id}/cancel", post(inventory::cancel_transfer))
         .route_layer(guards::require(&state, "inventory.transfers.manage"));
 
+    // The stocktake's writes (REQ-053 slice 4).
+    //
+    // **Opening a sheet and closing one sit behind the same key on purpose.** A sheet is a
+    // document other people read, and a counter who may not be trusted to close one may still
+    // be trusted to fill it in — but the *close* posts a signed adjustment to every location in
+    // the scope, so it cannot be split into "may count" and "may post" without inventing a key
+    // whose only real holder is the person who already has this one. If the separation is ever
+    // wanted, the honest split is at `close`, and it should be asked for rather than assumed.
+    let inventory_stocktake = Router::new()
+        .route("/inventory/stocktake", post(inventory::create_stocktake))
+        .route(
+            "/inventory/stocktake/{id}/count",
+            post(inventory::count_stocktake),
+        )
+        .route(
+            "/inventory/stocktake/{id}/close",
+            post(inventory::close_stocktake),
+        )
+        .route(
+            "/inventory/stocktake/{id}/cancel",
+            post(inventory::cancel_stocktake),
+        )
+        .route_layer(guards::require(&state, "inventory.stocktake.manage"));
+
     // The sweep creates rows the inbox then shows, so it is a write — but it is the sweep's
     // **judgement about a balance**, which is the same judgement the crossing already made, so it
     // sits under the movement key rather than the transfer one. `inventory.transfers.manage`
@@ -1572,6 +1608,7 @@ pub fn router(state: AppState) -> Router {
         .merge(inventory_movements_record)
         .merge(inventory_approvals)
         .merge(inventory_transfers)
+        .merge(inventory_stocktake)
         .merge(inventory_alerts_sweep)
         .merge(inventory_approvals_manage)
         .merge(inventory_approval_decisions);
