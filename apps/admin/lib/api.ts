@@ -4144,9 +4144,30 @@ export async function fetchPortKinds(): Promise<PortKindCatalogue> {
 /* ------------------------------------------------------------------ *
  * Credential instances (REQ-087, slice 2)
  * ------------------------------------------------------------------ */
-/** Build the query string of a credential list read. */
-function credentialQuery(filters: CredentialFilters): string {
+
+/**
+ * `?organization_id=…` for a read route, or an empty string.
+ *
+ * Every credential read resolves its organization with `None` on the server unless the client
+ * names one, so a platform account — which has no primary organization of its own — is refused
+ * `organization_required` before a single row is read. The suffix is empty for a tenant, whose
+ * own organization the server already knows.
+ */
+function scopeSuffix(organizationId?: string | null): string {
+  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+}
+
+/**
+ * Build the query string of a credential read.
+ *
+ * `organizationId` rides along for a platform account. It is not a filter: a tenant's call is
+ * byte-for-byte unchanged without it, and a platform account that omits it is refused
+ * `organization_required` — the refusal has nothing to do with credentials, and it happens
+ * before the list is read.
+ */
+function credentialQuery(filters: CredentialFilters, organizationId?: string | null): string {
   const params = new URLSearchParams();
+  if (organizationId) params.set("organization_id", organizationId);
   if (filters.search) params.set("search", filters.search);
   if (filters.type) params.set("type", filters.type);
   if (filters.scope) params.set("scope", filters.scope);
@@ -4158,18 +4179,27 @@ function credentialQuery(filters: CredentialFilters): string {
 /** The credential list. */
 export async function fetchCredentials(
   filters: CredentialFilters = {},
+  organizationId?: string | null,
 ): Promise<CredentialPage> {
-  return request<CredentialPage>(`/api/v1/credentials${credentialQuery(filters)}`);
+  return request<CredentialPage>(`/api/v1/credentials${credentialQuery(filters, organizationId)}`);
 }
 /** One credential, masked. */
-export async function fetchCredential(id: string): Promise<Credential> {
-  return request<Credential>(`/api/v1/credentials/${encodeURIComponent(id)}`);
+export async function fetchCredential(
+  id: string,
+  organizationId?: string | null,
+): Promise<Credential> {
+  return request<Credential>(
+    `/api/v1/credentials/${encodeURIComponent(id)}${scopeSuffix(organizationId)}`,
+  );
 }
 /** Create one. Secrets ride in `secrets[]` and are never sent anywhere else. */
-export async function createCredential(input: NewCredential): Promise<Credential> {
+export async function createCredential(
+  input: NewCredential,
+  organizationId?: string | null,
+): Promise<Credential> {
   return request<Credential>("/api/v1/credentials", {
     method: "POST",
-    body: JSON.stringify(input),
+    body: JSON.stringify({ ...input, organization_id: organizationId ?? null }),
   });
 }
 /** Update the non-secret half. Sending a secret here is refused by the API, by design. */
@@ -4182,11 +4212,15 @@ export async function updateCredential(
     owner_user_id?: string;
     settings?: Record<string, unknown>;
   },
+  organizationId?: string | null,
 ): Promise<Credential> {
-  return request<Credential>(`/api/v1/credentials/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    body: JSON.stringify(patch),
-  });
+  return request<Credential>(
+    `/api/v1/credentials/${encodeURIComponent(id)}${scopeSuffix(organizationId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ ...patch, organization_id: organizationId ?? null }),
+    },
+  );
 }
 /**
  * Remove one.
@@ -4198,20 +4232,33 @@ export async function updateCredential(
 export async function deleteCredential(
   id: string,
   force = false,
+  organizationId?: string | null,
 ): Promise<CredentialDeleteResult> {
+  const params = new URLSearchParams();
+  if (force) params.set("force", "true");
+  if (organizationId) params.set("organization_id", organizationId);
+  const query = params.toString();
   return request<CredentialDeleteResult>(
-    `/api/v1/credentials/${encodeURIComponent(id)}${force ? "?force=true" : ""}`,
+    `/api/v1/credentials/${encodeURIComponent(id)}${query ? `?${query}` : ""}`,
     { method: "DELETE" },
   );
 }
 /** Who names this credential. */
-export async function fetchCredentialUsage(id: string): Promise<CredentialUsage> {
-  return request<CredentialUsage>(`/api/v1/credentials/${encodeURIComponent(id)}/usage`);
+export async function fetchCredentialUsage(
+  id: string,
+  organizationId?: string | null,
+): Promise<CredentialUsage> {
+  return request<CredentialUsage>(
+    `/api/v1/credentials/${encodeURIComponent(id)}/usage${scopeSuffix(organizationId)}`,
+  );
 }
 /** Run the type's test hook. */
-export async function testCredential(id: string): Promise<CredentialTestResult> {
+export async function testCredential(
+  id: string,
+  organizationId?: string | null,
+): Promise<CredentialTestResult> {
   return request<CredentialTestResult>(
-    `/api/v1/credentials/${encodeURIComponent(id)}/test`,
+    `/api/v1/credentials/${encodeURIComponent(id)}/test${scopeSuffix(organizationId)}`,
     { method: "POST" },
   );
 }
@@ -4219,11 +4266,15 @@ export async function testCredential(id: string): Promise<CredentialTestResult> 
 export async function replaceCredentialSecret(
   id: string,
   secrets: { field: string; value: string }[],
+  organizationId?: string | null,
 ): Promise<Credential> {
-  return request<Credential>(`/api/v1/credentials/${encodeURIComponent(id)}/secret`, {
-    method: "POST",
-    body: JSON.stringify({ secrets }),
-  });
+  return request<Credential>(
+    `/api/v1/credentials/${encodeURIComponent(id)}/secret${scopeSuffix(organizationId)}`,
+    {
+      method: "POST",
+      body: JSON.stringify({ secrets, organization_id: organizationId ?? null }),
+    },
+  );
 }
 /**
  * The installer ledger.

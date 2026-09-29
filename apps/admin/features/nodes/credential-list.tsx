@@ -48,6 +48,7 @@ import {
   type ApiError,
 } from "@/lib/api";
 import type { Credential, CredentialFilters, CredentialType } from "@/lib/types";
+import { useOrganizationScope } from "@/lib/scope";
 
 /**
  * Chip colour per health.
@@ -95,6 +96,11 @@ export function CredentialList() {
   const router = useRouter();
   const params = useSearchParams();
   const filters = useMemo(() => filtersFrom(params), [params]);
+  // A tenant reads its own credentials and sends nothing. A platform account has no
+  // organization of its own, so it names one — the API refuses `organization_required`
+  // otherwise, and this screen would render that refusal where the list should be.
+  const { platformAccount, organizationId, organizations, setOrganizationId, needsOrganization } =
+    useOrganizationScope();
 
   const [rows, setRows] = useState<Credential[]>([]);
   const [total, setTotal] = useState(0);
@@ -145,8 +151,20 @@ export function CredentialList() {
 
   useEffect(() => {
     let alive = true;
+    if (needsOrganization) {
+      // Nothing has been chosen yet, so there is nothing to ask for. Rendering the API's
+      // refusal instead would be an error the reader caused by arriving.
+      setRows([]);
+      setTotal(0);
+      setAttention(0);
+      setError(null);
+      setLoading(false);
+      return () => {
+        alive = false;
+      };
+    }
     setLoading(true);
-    fetchCredentials(filters)
+    fetchCredentials(filters, organizationId)
       .then((page) => {
         if (!alive) return;
         setRows(page.credentials);
@@ -168,7 +186,7 @@ export function CredentialList() {
     return () => {
       alive = false;
     };
-  }, [filters]);
+  }, [filters, organizationId, needsOrganization]);
 
   const setFilter = useCallback(
     (patch: Partial<CredentialFilters>) => {
@@ -199,7 +217,7 @@ export function CredentialList() {
       setBusy(credential.id);
       setError(null);
       try {
-        const result = await deleteCredential(credential.id, force);
+        const result = await deleteCredential(credential.id, force, organizationId);
         setConfirmed(
           result.workflow_count > 0
             ? `Deleted ${credential.name}. ${result.workflow_count} workflow(s) now reference a credential that no longer exists.`
@@ -230,13 +248,34 @@ export function CredentialList() {
         setBusy(null);
       }
     },
-    [],
+    [organizationId],
   );
 
   return (
     <div className="space-y-5">
       <div className="rounded-xl border border-line bg-quiet-soft/40 p-4">
         <div className="flex flex-wrap items-end gap-3">
+          {platformAccount ? (
+            <label className="flex flex-col gap-1">
+              <span className="text-[12px] font-medium text-muted">Organization</span>
+              <select
+                data-credential-organization
+                value={organizationId ?? ""}
+                onChange={(event) => setOrganizationId(event.target.value || null)}
+                className="rounded-lg border border-line bg-surface px-3 py-2 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {(organizations ?? []).length === 0 ? (
+                  <option value="">No organization</option>
+                ) : null}
+                {(organizations ?? []).map((organization) => (
+                  <option key={organization.id} value={organization.id}>
+                    {organization.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+
           <label className="flex min-w-[220px] flex-1 flex-col gap-1">
             <span className="text-[12px] font-medium text-muted">Search</span>
             <span className="relative">

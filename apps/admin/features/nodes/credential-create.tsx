@@ -42,6 +42,7 @@ import {
 
 import { createCredential, fetchCredentialTypes, type ApiError } from "@/lib/api";
 import type { CredentialType, CredentialTypeField } from "@/lib/types";
+import { useOrganizationScope } from "@/lib/scope";
 
 /** The icon a type's card shows. */
 const TYPE_ICON: Record<string, typeof KeyRound> = {
@@ -76,6 +77,11 @@ export function CredentialCreate() {
   const router = useRouter();
   const params = useSearchParams();
   const preselected = params.get("type");
+  // A tenant creates in its own organization and names nothing. A platform account has none of
+  // its own, so it names the tenant it is creating in — the API refuses `organization_required`
+  // otherwise, and the form would report a refusal for a perfectly valid credential.
+  const { platformAccount, organizationId, organizations, setOrganizationId, needsOrganization } =
+    useOrganizationScope();
 
   const [types, setTypes] = useState<CredentialType[]>([]);
   const [chosen, setChosen] = useState<string | null>(preselected);
@@ -177,7 +183,7 @@ export function CredentialCreate() {
     setSaving(true);
     setError(null);
     try {
-      const created = await createCredential(payload);
+      const created = await createCredential(payload, organizationId);
       // A secret that could not be attached is not a failed create — the row is real and the
       // reader is about to be sent to it. The warning rides along so the detail screen can say
       // it on that row; silently dropping it is how somebody ends up debugging a node that
@@ -278,9 +284,31 @@ export function CredentialCreate() {
         All types
       </button>
 
-      <div>
-        <h2 className="text-[15px] font-medium text-ink">{definition.label}</h2>
-        <p className="mt-1 text-[13px] text-muted">{definition.description}</p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-[15px] font-medium text-ink">{definition.label}</h2>
+          <p className="mt-1 text-[13px] text-muted">{definition.description}</p>
+        </div>
+        {platformAccount ? (
+          <label className="flex flex-col gap-1">
+            <span className="text-[12px] font-medium text-muted">Organization</span>
+            <select
+              data-credential-organization
+              value={organizationId ?? ""}
+              onChange={(event) => setOrganizationId(event.target.value || null)}
+              className="rounded-lg border border-line bg-surface px-3 py-2 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              {(organizations ?? []).length === 0 ? (
+                <option value="">No organization</option>
+              ) : null}
+              {(organizations ?? []).map((organization) => (
+                <option key={organization.id} value={organization.id}>
+                  {organization.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
       </div>
 
       {error ? (
@@ -389,14 +417,19 @@ export function CredentialCreate() {
         <button
           type="submit"
           data-credential-save
-          disabled={saving}
+          // A platform account with nothing chosen has no organization to create in, and the
+          // API answers `organization_required`. Saying so on the button is better than a
+          // refusal after the reader has filled in the form.
+          disabled={saving || needsOrganization}
           className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-[13px] font-medium text-white disabled:opacity-60"
         >
           {saving ? <Loader2 size={14} className="animate-spin" /> : null}
           Save credential
         </button>
         <span className="text-[12px] text-muted">
-          Saving is fine without a test — it shows as &ldquo;Not verified&rdquo; until you run one.
+          {needsOrganization
+            ? "Choose the organization this credential belongs to."
+            : "Saving is fine without a test — it shows as “Not verified” until you run one."}
         </span>
       </div>
     </form>

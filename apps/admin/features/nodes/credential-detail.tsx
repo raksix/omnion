@@ -49,6 +49,7 @@ import {
   type ApiError,
 } from "@/lib/api";
 import type { Credential, CredentialType, CredentialUsage } from "@/lib/types";
+import { useOrganizationScope } from "@/lib/scope";
 
 /**
  * The mask a secret field renders as.
@@ -75,6 +76,11 @@ const HEALTH_LABEL: Record<string, string> = {
 
 export function CredentialDetail({ id }: { id: string }) {
   const router = useRouter();
+  // A tenant's own credential is read without a scope. A platform account has no organization
+  // of its own, so every read and every write on this screen names one — the API refuses
+  // `organization_required` before it even looks at the id, and the screen would answer "not
+  // found" for a credential that exists.
+  const { organizationId } = useOrganizationScope();
 
   const [credential, setCredential] = useState<Credential | null>(null);
   const [definition, setDefinition] = useState<CredentialType | null>(null);
@@ -99,7 +105,7 @@ export function CredentialDetail({ id }: { id: string }) {
     let alive = true;
     setLoading(true);
     try {
-      const row = await fetchCredential(id);
+      const row = await fetchCredential(id, organizationId);
       if (!alive) return;
       setCredential(row);
       setError(null);
@@ -115,7 +121,7 @@ export function CredentialDetail({ id }: { id: string }) {
       }
       const [type, who] = await Promise.allSettled([
         fetchCredentialType(row.type),
-        fetchCredentialUsage(row.id),
+        fetchCredentialUsage(row.id, organizationId),
       ]);
       if (!alive) return;
       if (type.status === "fulfilled") setDefinition(type.value);
@@ -131,7 +137,7 @@ export function CredentialDetail({ id }: { id: string }) {
     return () => {
       alive = false;
     };
-  }, [id]);
+  }, [id, organizationId]);
 
   useEffect(() => {
     void load();
@@ -143,7 +149,7 @@ export function CredentialDetail({ id }: { id: string }) {
     setError(null);
     setTestResult(null);
     try {
-      const result = await testCredential(credential.id);
+      const result = await testCredential(credential.id, organizationId);
       setCredential(result.credential);
       setTestResult({ ok: result.ok, detail: result.detail });
     } catch (cause) {
@@ -162,7 +168,7 @@ export function CredentialDetail({ id }: { id: string }) {
     setBusy("secret");
     setError(null);
     try {
-      const updated = await replaceCredentialSecret(credential.id, secrets);
+      const updated = await replaceCredentialSecret(credential.id, secrets, organizationId);
       setCredential(updated);
       setSecretDraft({});
       setReplacing(false);
@@ -179,7 +185,7 @@ export function CredentialDetail({ id }: { id: string }) {
     setBusy("delete");
     setError(null);
     try {
-      const result = await deleteCredential(credential.id, force);
+      const result = await deleteCredential(credential.id, force, organizationId);
       if (result.workflow_count > 0) {
         setNotice(
           `Deleted ${credential.name}. ${result.workflow_count} workflow(s) now reference a credential that no longer exists.`,

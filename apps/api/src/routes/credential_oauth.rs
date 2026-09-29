@@ -406,9 +406,29 @@ pub struct RefreshResponse {
     pub credential: CredentialBody,
 }
 
+/// The organization a request works on.
+///
+/// `disconnect` and the forced refresh take no body, so the organization travels in the query
+/// string — the same place the credential routes carry it. A platform account has no primary
+/// organization, so without it both are refused `organization_required` before they read the
+/// credential, which is a refusal that has nothing to do with the credential.
+#[derive(Debug, Default, Deserialize)]
+pub struct ScopeQuery {
+    /// The organization the call works on; required for an account without a primary one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
 /// The start body.
 #[derive(Debug, Default, Deserialize)]
 pub struct OAuthStartBody {
+    /// The organization the credential is connected in; a platform account names one.
+    ///
+    /// Without it this route resolved the organization with no requested value, so the very
+    /// account that connects a tenant's credential — a superuser, and the QA owner that walks
+    /// this screen — was refused `organization_required` before the flow began.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     /// Override the redirect URI, for an installation whose public base URL cannot be derived
     /// from the request host — a panel behind a path-prefixed proxy, say. Refused when it is
     /// not `https`, because a `redirect_uri` is where the code lands and a cleartext one hands
@@ -430,7 +450,7 @@ pub async fn start_oauth(
     headers: HeaderMap,
     Json(body): Json<OAuthStartBody>,
 ) -> ApiResult<Json<OAuthStartResponse>> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, body.organization_id)?;
     let credential = load(state.db().pool(), organization_id, id).await?;
     let config = oauth_config(find_credential_type(&credential.r#type), &credential.r#type)?;
     let client_id = client_id(&credential)?;
@@ -807,8 +827,9 @@ pub async fn disconnect(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
 ) -> ApiResult<Json<DisconnectResponse>> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, scope.organization_id)?;
     let credential = load(state.db().pool(), organization_id, id).await?;
     let was_connected = credential.secret_ref.is_some();
 
@@ -881,8 +902,9 @@ pub async fn refresh_credential(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
 ) -> ApiResult<(StatusCode, Json<RefreshResponse>)> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, scope.organization_id)?;
     let credential = load(state.db().pool(), organization_id, id).await?;
     let config = oauth_config(find_credential_type(&credential.r#type), &credential.r#type)?;
 
@@ -1203,6 +1225,9 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    /// A stand-in organization id, so a test can say "names one" without inventing a tenant.
+    const ORG: Uuid = Uuid::from_u128(0x0192_a1b2_c3d4_e5f6_0708_090a_0b0c_0d0f);
+
     fn headers_with(host: &str, proto: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1448,6 +1473,33 @@ mod tests {
         // The button has nothing to start, and saying "not supported" is the honest answer.
         let error = oauth_config(find_credential_type("api_key"), "api_key").expect_err("no flow");
         assert_eq!(error.code(), oauth::codes::UNSUPPORTED);
+    }
+
+    /// The three session-carrying routes resolve the organization with no requested value
+    /// before this slice, so an account without a primary organization — a superuser
+    /// connecting a tenant's credential, and the QA owner that walks these screens — was
+    /// refused `organization_required` before the flow even began. Each route now has a place
+    /// to name one, and each place is optional.
+    #[test]
+    fn every_oauth_request_can_name_the_organization_it_works_on() {
+        // `start` has a body, so the organization rides there with the redirect override.
+        let start: OAuthStartBody = serde_json::from_value(json!({
+            "organization_id": ORG, "scopes": "read",
+        }))
+        .expect("a scoped start");
+        assert_eq!(start.organization_id, Some(ORG));
+        assert_eq!(start.scopes.as_deref(), Some("read"), "the existing fields still parse");
+
+        // `disconnect` and the forced refresh have no body, so they take a query.
+        let scope: ScopeQuery =
+            serde_json::from_value(json!({ "organization_id": ORG })).expect("a scoped query");
+        assert_eq!(scope.organization_id, Some(ORG));
+        assert_eq!(ScopeQuery::default().organization_id, None, "and it stays optional");
+
+        // The tenant's own call is unchanged: no organization anywhere is the same call.
+        let tenant: OAuthStartBody =
+            serde_json::from_value(json!({ "scopes": "read" })).expect("an unscoped start");
+        assert_eq!(tenant.organization_id, None);
     }
 
     #[test]

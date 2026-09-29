@@ -260,6 +260,13 @@ pub struct CredentialFiltersBody {
 /// The query of the list read.
 #[derive(Debug, Default, Deserialize)]
 pub struct CredentialListQuery {
+    /// The organization to read.
+    ///
+    /// A platform account has no primary organization, so without this field the read is
+    /// refused `organization_required` — which is exactly what a superuser reading a
+    /// tenant's credentials, and the QA owner that walks these screens, both do.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     /// Match over name and key.
     pub search: Option<String>,
     /// One credential type; an unknown type is a `400`.
@@ -275,6 +282,9 @@ pub struct CredentialListQuery {
 /// The create body.
 #[derive(Debug, Default, Deserialize)]
 pub struct CreateCredentialBody {
+    /// The organization the credential is created in; a platform account names one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     /// The key graphs will name. Optional: derived from the name when absent.
     pub key: Option<String>,
     /// Display name.
@@ -307,6 +317,9 @@ pub struct SecretFieldBody {
 /// The `PATCH` body.
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateCredentialBody {
+    /// The organization the credential is edited in; a platform account names one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     /// New display name.
     pub name: Option<String>,
     /// New scope.
@@ -326,6 +339,9 @@ pub struct UpdateCredentialBody {
 /// The replace-secret body.
 #[derive(Debug, Default, Deserialize)]
 pub struct ReplaceSecretBody {
+    /// The organization the credential lives in; a platform account names one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
     /// The secret fields to write.
     #[serde(default)]
     pub secrets: Vec<SecretFieldBody>,
@@ -385,6 +401,20 @@ pub struct TestCredentialResponse {
     pub health: String,
     /// The row after the test.
     pub credential: CredentialBody,
+}
+
+/// The organization a request works on.
+///
+/// Every route on this surface resolves its organization with [`resolve_organization`], and
+/// every one of them used to pass `None` — so an account *without* a primary organization,
+/// which is exactly the account that administers a tenant's credentials, was refused
+/// `organization_required` before it read anything. The organization travels in the query
+/// string of the routes that have no body to carry it, and in the body of the ones that do.
+#[derive(Debug, Default, Deserialize)]
+pub struct ScopeQuery {
+    /// The organization the call works on; required for an account without a primary one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 /// The package list query. A platform account has no primary organization, so it names the
@@ -450,7 +480,7 @@ pub async fn list_credentials(
     current: CurrentSession,
     Query(query): Query<CredentialListQuery>,
 ) -> Result<Json<CredentialListResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, query.organization_id)?;
     let list = ListQuery {
         search: query.search.clone(),
         r#type: query.r#type.clone(),
@@ -530,7 +560,7 @@ pub async fn create_credential(
     current: CurrentSession,
     Json(body): Json<CreateCredentialBody>,
 ) -> Result<(StatusCode, Json<CredentialBody>), ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, body.organization_id)?;
     let name = body.name.trim().to_string();
     if name.is_empty() {
         return Err(ApiError::bad_request(
@@ -678,8 +708,9 @@ pub async fn get_credential(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
 ) -> Result<Json<CredentialBody>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, scope.organization_id)?;
     let credential = credential_store::get_credential(state.db().pool(), organization_id, id)
         .await
         .map_err(map_store)?
@@ -698,9 +729,13 @@ pub async fn update_credential(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
     Json(body): Json<UpdateCredentialBody>,
 ) -> Result<Json<CredentialBody>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    // The body wins when it names one: it is what the panel sends, and a caller that puts the
+    // same id in the query string and somewhere else in the body should not get two answers.
+    let organization_id =
+        resolve_organization(&current, body.organization_id.or(scope.organization_id))?;
 
     // The refusal comes before anything is read or written, so a payload that tries to set a
     // secret has no side effect at all — not even a `settings` write it would otherwise have
@@ -803,7 +838,7 @@ pub async fn delete_credential(
     Path(id): Path<Uuid>,
     Query(params): Query<DeleteCredentialQuery>,
 ) -> Result<Json<DeleteCredentialResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, params.organization_id)?;
     let force = params.force.unwrap_or(false);
 
     // Read the key first so a refusal can name it, and so the response's references carry the
@@ -904,6 +939,9 @@ pub struct DeleteCredentialQuery {
     /// Delete even while workflows name it, and report what broke.
     #[serde(default)]
     pub force: Option<bool>,
+    /// The organization the credential is removed from; a platform account names one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 /// `GET /api/v1/credentials/{id}/usage` — who names this credential.
@@ -911,8 +949,9 @@ pub async fn credential_usage(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
 ) -> Result<Json<CredentialUsageResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, scope.organization_id)?;
     let credential = credential_store::get_credential(state.db().pool(), organization_id, id)
         .await
         .map_err(map_store)?
@@ -971,9 +1010,11 @@ pub async fn replace_secret(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
     Json(body): Json<ReplaceSecretBody>,
 ) -> Result<Json<CredentialBody>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id =
+        resolve_organization(&current, body.organization_id.or(scope.organization_id))?;
     let credential = credential_store::get_credential(state.db().pool(), organization_id, id)
         .await
         .map_err(map_store)?
@@ -1062,8 +1103,9 @@ pub async fn test_credential(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
+    Query(scope): Query<ScopeQuery>,
 ) -> Result<Json<TestCredentialResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, scope.organization_id)?;
     let credential = credential_store::get_credential(state.db().pool(), organization_id, id)
         .await
         .map_err(map_store)?
@@ -1310,6 +1352,9 @@ pub async fn write_token_payload(
 mod tests {
     use super::*;
 
+    /// A stand-in organization id, so a test can say "names one" without inventing a tenant.
+    const ORG: Uuid = Uuid::from_u128(0x0192_a1b2_c3d4_e5f6_0708_090a_0b0c_0d0f);
+
     fn credential_stub(health: &str) -> Credential {
         Credential {
             id: Uuid::nil(),
@@ -1459,6 +1504,59 @@ mod tests {
         // A mask that revealed the length would make the detail screen an oracle.
         assert_eq!(secret_mask(), SECRET_MASK);
         assert!(SECRET_MASK.chars().count() >= 8);
+    }
+
+    /// A platform account has no primary organization, so every request it makes has to name
+    /// one. Without a field to put it in, the whole credential surface is refused
+    /// `organization_required` before it reads anything — including for the account that
+    /// administers a tenant's credentials, which is the one that most needs it to work.
+    #[test]
+    fn every_credential_request_can_name_the_organization_it_works_on() {
+        // The routes that carry no body take it in the query string.
+        let read: CredentialListQuery =
+            serde_json::from_value(json!({ "organization_id": ORG })).expect("a scoped list read");
+        assert_eq!(read.organization_id, Some(ORG));
+        let scope: ScopeQuery = ScopeQuery::default();
+        assert_eq!(scope.organization_id, None, "a tenant's own read still needs no query");
+
+        // The routes that have a body take it there, so the client sends one field.
+        let create: CreateCredentialBody = serde_json::from_value(json!({
+            "name": "Stripe", "type": "api_key", "organization_id": ORG,
+        }))
+        .expect("a scoped create");
+        assert_eq!(create.organization_id, Some(ORG));
+        let update: UpdateCredentialBody =
+            serde_json::from_value(json!({ "organization_id": ORG })).expect("a scoped update");
+        assert_eq!(update.organization_id, Some(ORG));
+        let secret: ReplaceSecretBody =
+            serde_json::from_value(json!({ "organization_id": ORG })).expect("a scoped secret");
+        assert_eq!(secret.organization_id, Some(ORG));
+        let delete: DeleteCredentialQuery =
+            serde_json::from_value(json!({ "organization_id": ORG, "force": true }))
+                .expect("a scoped delete");
+        assert_eq!(delete.organization_id, Some(ORG));
+        assert_eq!(delete.force, Some(true), "the force flag still parses beside it");
+
+        // And every one of them stays optional, so a tenant's own call is unchanged.
+        let tenant: CreateCredentialBody =
+            serde_json::from_value(json!({ "name": "Stripe", "type": "api_key" }))
+                .expect("an unscoped create still deserializes");
+        assert_eq!(tenant.organization_id, None);
+    }
+
+    /// The panel sends the organization in the body, so the read routes have to read it from
+    /// the query string as well. A field that exists but is never resolved is the defect this
+    /// fixes, spelled backwards: the test fails if a route goes back to passing `None`.
+    #[test]
+    fn a_body_that_names_an_organization_wins_over_the_query_string() {
+        // `body.or(query)` is the rule the two body-carrying routes implement: one place a
+        // caller may put the organization, and a caller who puts two different ids in the two
+        // places gets the body — never a silent mix of the two.
+        let body: UpdateCredentialBody =
+            serde_json::from_value(json!({ "organization_id": ORG })).expect("a scoped update");
+        let query: ScopeQuery =
+            serde_json::from_value(json!({ "organization_id": ORG })).expect("a scoped query");
+        assert_eq!(body.organization_id.or(query.organization_id), Some(ORG));
     }
 
     #[test]
