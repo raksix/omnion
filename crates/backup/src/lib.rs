@@ -35,6 +35,7 @@ pub mod destination;
 pub mod error;
 pub mod media;
 pub mod part;
+pub mod purge;
 pub mod store;
 
 pub use destination::{
@@ -52,6 +53,10 @@ pub use part::{
     PartStatus, RunStatus, Verification, build_manifest, bytes_checksum, canonical_json,
     manifest_checksum, normalise_scopes, summarise, truncate_error, validate_label,
     verify_manifest,
+};
+pub use purge::{
+    MAX_REPORTED_PURGE_FAILURES, PROBE_MARKER, PurgeFailure, PurgeReport, remove_run_artifacts,
+    run_directory,
 };
 pub use store::{
     Backup, BackupPage, BackupQuery, BackupSchedule, BackupSettings, NewBackup, NewPart,
