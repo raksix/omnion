@@ -2052,6 +2052,1438 @@ removes exactly the eligible rows and a purge names the resources holding a file
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
 
+## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
+
+- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
+  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
+  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
+  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
+  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
+  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
+  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
+  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
+  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
+  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
+  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
+  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
+  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
+  three unclaimed worktrees have already collided on 0019.
+- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
+  this part). The cryptography is tested against *real* cryptography, not against itself: the
+  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
+  the genuine signature and reject a tampered one.
+- **The SAML signature check is two checks, and the second one is the one that matters.** XML
+  Signature binds a document to a key in two independent steps, and my first implementation only
+  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
+  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
+  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
+  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
+  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
+  rewrite a claim, the signature alone signs the algorithm but not the document.
+- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
+  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
+  multi-valued attribute as several elements lost half a group membership and under-granted a
+  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
+  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
+  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
+  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
+  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
+  as text fails silently three frames deep.
+- **The disk is a blocker, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
+  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
+  "No space left on device". The reclamation is deliberately conservative: only **derived**
+  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
+  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
+  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
+  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
+  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
+  `node_modules` each) should be pruned — no wave owns them yet.
+- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
+  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
+  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
+  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
+  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
+  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.
+
+## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
+
+- **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
+  that proves both. **`61ef619`** — `crates/identity/src/sso/provisioning.rs` (JIT: match on the
+  stored subject index first, the address second, `JIT_PASSWORD_MARKER` in place of a password,
+  and a *refusal* rather than a silent row when provisioning is off); the identity HTTP client
+  grows the two calls the `code` flow needs; `/api/v1/iam/providers` (list, connect, patch, remove,
+  `…/test` for the discovery check, `…/events` for the sign-in log); and `/api/v1/auth/sso`
+  (the public `providers` list, `start`, the generated SAML panel page, and the `callback` that
+  answers both a `code` query and a posted assertion). **`f599c3c`** — `/settings/iam/authentication`,
+  the nav entry, the API client and the `iam-authentication` pass in `scripts/qa/walkthrough.cjs`.
+  **`apps/api/tests/sso.rs`** — the integration walk.
+- **Proof.** `cargo test -p omnion-identity --lib` → **107 tests, 0 failures**. `cargo test -p
+  omnion-api --lib` → **97 tests, 0 failures**. `cargo test -p omnion-api --test sso` → **1 walk,
+  0 failures** over the real router: the management surface (401 without a session, an empty
+  organization listing no provider and three kinds), a provider created **switched off with JIT
+  off**, the secret answered as a *name* plus a boolean (`secret_present: false` for a variable
+  this process does not define) and no `client_secret` field anywhere in the payload, a bad
+  `secret_ref` refused with `details.field = secret_ref`, an unreadable role mapping refused at save
+  time, the discovery test answering `200 {status: "failed", detail: …}` for an unreachable host, a
+  disabled provider `404 provider_disabled` **and written to the sign-in log**, JIT refusing then
+  provisioning the same identity to `Created` with the marker in `password_hash` and the subject
+  indexed under `sso_subjects`, the second sign-in `Existing` on the same account, a deactivated
+  account staying deactivated, the event log readable over HTTP, removal taking the log with it
+  (`on delete cascade`), and an ambiguous host answered `501 organization_required` rather than
+  guessed.
+- **The two design decisions this tick actually settled.** (1) **A public sign-in has to resolve
+  its own organization.** My first version took "the installation's only organization", which is
+  right for a first-run install and *silently wrong* for a second tenant — a sign-in link for one
+  organization could complete against another. The walk caught it by creating a second organization.
+  It now follows the same rule the public content surface uses: the browser's own host answers for
+  its site, and a site belongs to an organization; several organizations and an unknown host is an
+  honest `501` naming the fix. (2) **A refusal is a fact, not a silence.** A disabled provider
+  refusing to start wrote nothing, so an operator who switched a provider off and then wondered
+  "is anybody still trying to sign in with it?" had no way to find out. `live_provider` now writes
+  the `auth_provider_events` row before refusing.
+- **Two test-authoring bugs the walk caught in itself, both worth naming.** A group claim is only
+  read when the provider *names* one, so a test provider with `group_claim: None` proved nothing
+  about groups — the fixture was wrong, not the code. And a test fixture that registers a globally
+  unique host has to clear a stale one first, or the second run fails on the first run's leftovers.
+- **The disk is still the constraint, and it is an environment problem rather than a code one.**
+  `/mnt/apopic` (one 60 GB loop image shared by eight worktrees' `target/`) fell to **3.1 GB free**
+  during this tick. Reclamation stayed conservative and derived-only: `target/debug/{deps,
+  incremental,build}` in the **unclaimed** `omnion-w5` and `omnion-w7` worktrees, neither of which
+  had a live `cargo`/`rustc`; no source, no branch, no running process touched. That returned
+  17 GB. **Owner action:** the box needs more room, or the unclaimed `omnion-w4`…`omnion-w7`
+  worktrees should be pruned — no wave owns them yet.
+- **A note on where the walk runs.** The shared dev database `omnion` has migration **19** applied
+  from a sibling branch that `main` does not have, so `db.migrate()` refuses with
+  `VersionMissing(19)` and every integration test that migrates fails there. CI starts a clean
+  database and is unaffected. The walk was proven against a fresh `omnion_sso_test` database.
+  **Owner action:** either reconcile the 0019 slot between the waves, or point the local
+  integration runs at a per-branch database.
+- **Next.** The one thing the walk deliberately does not fake: a **full round trip against a live
+  OIDC/SAML provider**. That needs a local stub identity server the walk can point at — discovery
+  document, JWKS, token endpoint and a signed ID token for OIDC; a signed assertion with the
+  enveloped digest for SAML — so the `code` exchange, the RS256 verification, the PKCE binding and
+  the claim → role mapping are all proven end to end rather than one layer at a time. Then
+  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
+  REQ.
+
+## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
+
+- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
+  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
+  filtered listing against a real database — the walk that asserts the audit rows for
+  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
+  made the walk real and then fixed what it found.
+- **Six defects, none of them visible to the layer that owned them.**
+  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
+     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
+     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
+     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
+     only exist where the value beside it was pushed.
+  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
+     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
+     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
+  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
+     trash summary answered 500. Cast back to `bigint`.
+  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
+     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
+     row against the pre-update snapshot, so no ordering is needed.
+  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
+     new path, so `parent_id` became the folder itself on every move, and the first move of a
+     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
+     *parent's* path.
+  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
+     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
+     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
+- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
+  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
+  and a move to where a folder already is is a no-op.
+- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
+  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
+  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
+  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
+  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
+  session and to an account with no media permission, a site created after the migration still
+  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
+  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
+  a file moves between folders without its storage key changing, a filter narrows the listing and
+  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
+  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
+  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
+  no new warning.
+- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
+  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
+  `target/debug/incremental` in this worktree returned 2.9 GB.
+- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
+  history, the preview pipeline and the file detail screen do not.
+
+## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
+
+- **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
+  replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
+  one back *as a new version* rather than by rewriting history.
+- **The migration the plan assumed already existed.** The last tick's handover note said
+  "the `media_versions` table exists". It did not — `0025` created folders, browser columns and
+  the trash, and nothing had ever written a version row. So slice 2 ships `0026`, which creates
+  the table and backfills version 1 for every existing file, **copying `created_at`** rather than
+  stamping `now()`. A history that starts at the migration date is a lie about when the file
+  arrived, and it is exactly the kind of lie that is invisible for a year.
+- **Three rules, each a place a shortcut produces a plausible wrong answer.**
+  1. **A version is append-only.** A restore *copies* the old bytes to a new key and appends the
+     copy. Rewriting a row would make "what did this file look like on day 3" depend on whether
+     anybody took a shortcut in between.
+  2. **The number comes from the database.** `next_version` reads `max(version)` under
+     `for update` on the `media` row — a *scalar subquery*, because `FOR UPDATE` on an aggregate
+     is a no-op in PostgreSQL. Reading the max in Rust would open a window between two reads and
+     let two concurrent replaces both claim 4, which surfaces as a "duplicate key" error that
+     names the index and not the cause.
+  3. **A number is never reused.** A pruned version leaves a hole.
+- **The transaction is opened by the crate, not the route.** This was fought out with the
+  compiler: a route-held `sqlx::Transaction` surfaces `sqlx::Error` where everything else in
+  `omnion_media` is a `MediaError`, and `ApiError` has `From` for the latter but deliberately
+  **not** for the former. `omnion_media::begin_version` / `commit_version` hand back only
+  `MediaError`, which is the honest boundary: the library owns the transaction because the
+  guarantee rule 2 exists for spans it.
+- **The header probe reads 64 KB, not the file.** `crates/media/probe.rs` pulls dimensions,
+  duration and page count out of the *header* for PNG, GIF, JPEG, BMP, TIFF, WebP (all three
+  containers), MP4/QuickTime, WebM, WAV, MP3, Ogg and PDF. A 4 GB video upload must not cost a
+  full read to learn it is 12 minutes long. Every extractor answers "I do not know" rather than
+  guessing — a wrong dimension breaks every layout that reads it and is not obviously wrong once
+  it is stored. Two findings the unit tests forced out: a WebP canvas stored as `0` is a corrupt
+  header, **not** a one-pixel image (reading `0 + 1` would put a 1×1 box on screen for a file
+  that has no size), and one blanket 30-byte minimum across the three WebP containers refuses a
+  short-but-complete `VP8L` header.
+- **The walk corrected a test that had been asserting a route which never existed.** The walk
+  read the current bytes from `/api/v1/media/files/{id}/raw` and got an empty body: the file
+  manager's *listing* is `/media/files`, the read is `/media/{id}/raw`, and no route was ever
+  registered at the address the test used. Three more corrections came out of the same run — the
+  404 is `media_not_found` (not `file_not_found`), an empty upload answers `invalid_request`
+  (not `file_empty`), and the history reads **newest first**, so a check written against an
+  assumed oldest-first order fails on a correct response.
+- **The fixture leaked objects until it read the union.** Cleanup read `media.storage_key`, but a
+  replace *moves* that column to the new key — the old one is named only by the history, so every
+  replaced version's object stayed in the bucket. A test cleanup that misses them is a slow leak
+  that nobody notices for a month.
+- **Proof.** `cargo test -p omnion-media --lib` → **46 tests, 0 failures** (24 new, mostly header
+  probes and the version key rules). `cargo test -p omnion-api --lib` → **109 tests, 0 failures**.
+  `cargo test -p omnion-api --test media` against `omnion_test_main` → **11 walks, 0 failures**,
+  over the real router: a replace leaves version 1 downloadable and **byte-identical** (compared
+  as bytes, not as a length — a length check would pass by accident on an overwrite), the row
+  points at the version it serves, the three versions own three keys, a download of an old
+  version is an attachment named `hero-v1.png`, a restore appends version 3 with version 1's
+  checksum while version 2 is untouched, and the routes refuse without a session, without
+  `media.read`, and name a missing version by number. `pnpm --filter @omnion/admin typecheck`
+  green. The QA pass ran on the default stack.
+- **Environment note.** `/mnt/apopic` was at 99 % (610 MB free) when the tests finished; this
+  worktree's `target/debug/incremental` returned 1.2 GB and the unclaimed `omnion-w5`/`omnion-w6`
+  worktrees' `target/` returned a further 2.7 GB. **Owner action:** those worktrees hold build
+  artefacts for waves nobody has started; they will fill the image again.
+- **Next.** Slice 3 — transformation presets with a content-addressed cache, per-site storage
+  settings with a connection test, the CDN purge hook, share links and duplicate detection with
+  merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
+  serve path, and EXIF extraction.
+
+## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
+
+- **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
+  gave it *derivatives*: a page asks for `?preset=card` and gets the same pixels every time,
+  built on the first request and addressed by a hash of its inputs.
+- **The dependency the plan did not mention.** A preset has to *produce* pixels, which means
+  decoding, resampling and re-encoding. The workspace had no image crate, so this tick adds
+  `image` (png/jpeg/webp only — the three codecs a preset can emit). Shelling out to a binary
+  was the alternative and was rejected: it makes the API's correctness depend on what happens to
+  be installed on the host, and the test suite would skip itself on a machine without it.
+- **Two fits are not one fit.** `cover` crops and `contain` letterboxes, and the first version
+  gave both the same resampler. It produced a correctly-sized *crop*: it passes a square-crop
+  assertion and is wrong on every non-square source, which is most of them. A `contain` result is
+  now pasted onto a canvas of the box's size, so a thumbnail is a stable 320×320 rather than a
+  320×180 that shifts the layout every time a differently-shaped image is uploaded.
+- **A request never enlarges.** A 2400px request against a 1200px source is refused with an
+  explanation instead of being answered with a blurry upscale that is *larger* than the original.
+  The check is `>`, not `>=`: asking for exactly the source's own size is the identity, and a
+  template that names the same number twice is not a mistake. The unit test forced this — the
+  first version refused the identity too, which would have broken the seeded `standard` preset on
+  a 1200×630 hero.
+- **The cache key is a hash of the definition, not of (file, preset).** A pair lookup would serve
+  stale pixels after an edit, because the pair is unchanged while the definition moved. With a
+  key lookup, an edit produces a key nobody has seen, so the old entry becomes *unreachable*
+  rather than *wrong* — and the response may honestly say `max-age=31536000, immutable`.
+  Quality is in the key, and that is the field people forget.
+- **Three defects the real router found that a unit test on `transform_bytes` could not.**
+  1. The derivative header carried the **object key** where the identity belongs. The two are
+     different strings that both appear in the module, and the response builder took one
+     parameter where it needed two — so a caller that read the header and looked it up in
+     `media_derivatives.cache_key` found nothing. A header that looks like an identifier and is
+     not one is worse than none. Both are now fields of a struct, because three positional
+     `&str`s is the shape that produced the bug.
+  2. **A site created after the migration got no `standard` preset.** The `0027` seed covers the
+     sites that existed when it ran, so a page already asking for `?preset=standard` would
+     silently fall back to full-size originals — on new sites only, which is exactly where nobody
+     is looking. It cannot be fixed in the migration, because the gap is between "the migration
+     ran" and "somebody creates a site", and it cannot be fixed in the create path either:
+     onboarding, the tenancy API and a future import all insert the row themselves. It is a
+     trigger (`0028`), which is the only place guaranteed to see every site.
+  3. A test asserting **"the first call builds" passes once and fails for ever after.** The row
+     is keyed by the source bytes, and a re-run reproduces them exactly, so the second run is a
+     cache hit. The assertion now checks the answer is correct either way and that the key is
+     stable — the property that actually matters.
+- **Proof.** `cargo test -p omnion-media --lib` → **78 tests, 0 failures** (32 new). Five walks
+  over the real router in `--test media_transform` → **0 failures**: the bytes are compared *as
+  bytes* and decoded again (a length check passes by accident on an overwrite), the second
+  request is byte-identical to the first, the object is read back out of the store and compared
+  against what was served, the old row survives an edit, a delete cascades the cache away, an
+  unknown preset returns the original *byte for byte* with no derivative key, an SVG answers
+  `not_transformable` naming its type, and every preset field error names the field that caused
+  it. The pre-existing `--test media` → **11 walks, 0 failures**, unchanged, against the raw route
+  that now takes a query parameter. `cargo test -p omnion-permissions --lib` → 62 pass.
+  `pnpm --filter @omnion/admin typecheck` green.
+- **The QA pass (`bash scripts/qa/run.sh`, default stack) — clean for this slice.** 954 clicks,
+  988 screenshots, the new `/media/settings` route walked and clicked (28 elements), and the depth
+  pass drove it: created a preset, submitted an out-of-range quality and **the field error named
+  it**. Vision review returned **0 high / 0 medium / 0 low**. The page's own diagnostics read
+  *overflow: no · offscreen: 0 · broken images: 0 · low contrast: 0 · unlabeled inputs: 0 ·
+  duplicate ids: 0 · h1: 1*. The four high findings the run reports are the walkthrough's **own
+  deliberate error-state probes** — `/media?folder=nonexistent-folder` and the 400/404 they
+  produce — none of them from this slice.
+- **Two things the pass taught about this slice's own screen.** The seeded `standard` preset *is*
+  present on a QA site (checked directly in `omnion_qa`, and the trigger in `0028` fires for a
+  site created afterwards), so the walkthrough's `seeded: 0` was its own text match, not a gap —
+  which is why the number was checked against the database rather than believed. And the preset
+  example URL is a `<code>`, not an anchor: the first depth pass looked for `a[href^="/api/v1/
+  media/"]`, found none, and reported "no preset example URL" for a screen that had one on it. An
+  `<a>` pointing at a placeholder id would only have proven a 404 — the same mistake the route
+  inventory already made once with `/media/files`. The pass now reads the query the screen
+  actually renders and builds a real URL with a real file id.
+- **A compiler lesson, fought out over a long wrong turn.** Every guarded route in this codebase
+  is written `get(handler).layer(guards::require(...))`, and the new routes refused to compile
+  with a bare `type annotations needed for MethodRouter<AppState, _>`. The guard's service impl
+  requires the inner service's `Error = Infallible`, and inference cannot pick `Infallible` out of
+  the several `From<Infallible>` impls in scope. Every existing route gets away with it because
+  the *later* `.merge()`/`.route()` calls in the same chain pin the type. The fix is a
+  `MethodRouter<AppState, Infallible>` annotation on the three new bindings — the same fix the
+  compiler suggested and that reading the guard's own bound would have given in one minute.
+- **Environment.** `/` was at 99 % and `/mnt/apopic` at 100 % during the run — MinIO refused
+  writes with `XMinioStorageFull` and three walks failed on a storage error that had nothing to do
+  with the code. Reclaiming `omnion-live/target` and `omnion-w5/target` (worktrees for waves
+  nobody has started) plus this one's stale `deps` binaries returned ~4 GB. **Owner action:** the
+  eight worktrees under `/mnt/apopic` hold ~30 GB of `target/`, and this is the second tick in a
+  row that has had to delete another loop's build cache to finish its own tests.
+- **Next.** Slice 3 continues — per-site storage settings with a connection test and public base
+  URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
+  with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
+  Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
+
+- **What.** The third third of slice 3: `0036_media_shares.sql`,
+  `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
+  `apps/api/tests/media_shares.rs`, `features/media/shares-tab.tsx` (a **Share** tab on
+  `/media/files/{id}`), the client methods and the `MediaShare`/`CreatedMediaShare` types, and a
+  walkthrough depth pass. Six design decisions, each a shortcut that produces a plausible wrong
+  answer:
+  1. **The token is stored hashed and nowhere else.** The row holds `sha256(token)` under a
+     unique index, so a backup, a replica log or a support engineer with read access comes away
+     with a list of *dead* tokens, and the lookup is still one probe. The round trip runs one way
+     only, and the row type has no field the plaintext could occupy.
+  2. **A share reaches a file; it does not bypass what the file is.** Servability is decided at
+     *serve* time, not at creation — a link made yesterday must not keep serving a file the
+     scanner has since flagged.
+  3. **`revoked` and `expired` are the same answer (410), `password_required` is 403.** Telling
+     the two dead states apart would hand a token prober a free oracle; answering "type the
+     password" with 410 would send the owner a pointless request.
+  4. **The counter counts bytes that were served**, in its own statement, so a failure after the
+     bytes went out cannot roll it back.
+  5. **Revocation is a write, not a delete** — the row is kept with its reason forever, because
+     that is the only thing that makes a leaked link investigable.
+  6. **The screen has no `Copy` on an existing row, and cannot.** The token is returned once;
+     a copy button there would silently copy nothing.
+- **Proof.** Five walks over the real router in `--test media_shares` → **0 failures**. The
+  stored value is read **out of the database** rather than inferred from a response that hid the
+  token; the list is scanned over its raw bytes for the token and for a field named `token`; the
+  served bytes are compared as bytes and `no-store`/`nosniff`/`attachment` are each checked; the
+  counter moves once and survives the revocation; the revoked row keeps its reason and instant; a
+  reader may read the list and may neither create nor revoke; anonymous is refused on both; a
+  share id on another file is a 404, not a 403. `cargo test -p omnion-media --lib` → **98**,
+  `cargo test -p omnion-api --lib` → **116**, and `--test media` (11), `--test media_settings`
+  (2), `--test media_transform` (5) are unchanged and green. `pnpm --filter @omnion/admin
+  typecheck` green.
+- **Three defects the walks found, none of which a unit test on `servable` could see.**
+  `find_media` returns the *base* `Media`, which has no `deleted_at` and no `scan_status` — the
+  two columns the whole "a share does not bypass the file" rule depends on, so the first draft
+  asked the wrong struct and the compiler found the fields missing. `POST /shares` with no body
+  answered **415**, because the handler demanded a JSON body for the most ordinary call anybody
+  makes ("give me a link until I revoke it"); the same for the `DELETE`. And `rand` is a
+  *dev*-dependency of `apps/api`, so token minting moved into the crate, which is where the
+  width and the source belong anyway.
+- **A test that reaches for a state the platform forbids.** The expiry walk set
+  `expires_at = now() - 1s` and the `media_shares_expiry_sane` check refused it — a link whose
+  expiry precedes its own creation is nonsense. The walk now ages the row by moving `created_at`
+  back instead, which is the only way to reach the same state and the reason the check is there.
+- **Environment.** `/mnt/apopic` hit **100 %** (89 MB free) mid-tick and MinIO refused every
+  object write with `XMinioStorageFull`, which reads as a storage bug and was none. The cause is
+  this worktree's own `target/`: **8.3 GB of rebuildable test binaries** plus 874 MB of `.tmp`
+  leftovers from interrupted linkers. Reclaiming *only this worktree's* artifacts returned 8.5 GB
+  (86 %). **Owner action:** the seven worktrees under `/mnt/apopic` hold ~30 GB of `target/`; a
+  shared `CARGO_TARGET_DIR` is the structural fix, and this is the third tick to have had to
+  delete its own build cache before it could run a test.
+- **Next.** Slice 3 closes with duplicate detection and the merge (checksum groups, reclaimable
+  size, `Keep this one` + `Merge group`, references repointed and the copies trashed), then the
+  CDN purge hook to REQ-011. Still open: EXIF (slice 2), HTTP range requests on the serve path,
+  and the Usage and Activity tabs, which need `media_references` and arrive with slice 4.
+
+- **The QA pass did not complete this tick — and not because of this slice.** The pass got its
+  QA slot after ~30 minutes of waiting behind sibling stacks, walked 434 clicks through
+  `/media` (40 elements), `/media/trash` (26), `/media/settings` (30) and the IAM screens, and
+  then stopped advancing at `iam-service-accounts` with the walkthrough process at 0 % CPU. The
+  cause is the machine, not the code: **seven QA stacks are running at once** — 40 Chromium
+  processes, load average **36**, and **127 MB free of 33 GB**. The walkthrough outlived the
+  browser context, which is the "tab died under parallel passes" case already documented for
+  this box, so no findings were produced and none are claimed. The share walk added this tick
+  (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
+  next tick runs it. The storage walk from the previous tick was committed for the same reason
+  and the API-level proof for both is the Rust suite, which is green.
+
+## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
+
+- **What.** The last open item of slice 3: what the *camera* said about its own picture. The
+  geometry probe already read a file's size from its header; this reads the other half of what an
+  editor asks about a photograph — which body took it, at what shutter speed, with which lens, on
+  which day. `crates/media/src/exif.rs` (the reader), `0042_media_exif.sql` (the column), the
+  `exif` column on `media` plus the `display_width`/`display_height` pair on the file response, and
+  the Metadata tab's **Camera** block.
+- **Six decisions, each a shortcut that produces a plausible wrong answer.**
+  1. *A TIFF header is not EXIF.* The IFD format is shared by TIFF, GeoTIFF and half a dozen
+     makers' proprietary blocks; what makes the block EXIF is the `Exif\0\0` signature inside a
+     JPEG `APP1`, an `EXIF` chunk in a WebP or an `eXIf` chunk in a PNG. The container is checked
+     before any TIFF parsing runs.
+  2. *Nothing is read from outside the prefix.* Every field's value may be an *offset*, and an
+     offset is attacker-controlled. Every read is a range request whose failure is the answer.
+  3. *A zero denominator is absent; `1/200` is not.* The first guard refused the normal case
+     (`den > num`) and kept the corrupt one — the exact inversion, which is how a reader ends up
+     with no shutter speed on every photograph and a divide-by-zero on the one broken file.
+  4. *Orientation changes the box, not the file.* Values 5–8 store the picture sideways and
+     browsers rotate it themselves, so a grid reserving `width × height` reserves the wrong box and
+     shifts every image below it. The stored columns carry the oriented pair, the raw value stays
+     in the record, and the API sends both readings.
+  5. *A GPS fix is a flag, never coordinates.* There is no field in the type a coordinate could
+     occupy, so a media library cannot quietly file an operator's home address into a row that
+     search, an API key and a share link can all read.
+  6. *A replacement replaces the record.* A screenshot over a camera original must not keep
+     claiming to have been shot on a body it was never near.
+- **The QA pass did not complete, and it found the tick's one real bug anyway.** The full pass ran
+  629 clicks and then died with `Target page, context or browser has been closed` — the
+  "browser context dies under parallel passes" case already documented for this box, with 21
+  sibling QA processes and 0 GB free at the moment it failed. So the gate is **not** claimed as
+  green this tick. What *did* run is `scripts/qa/probe-media-camera.cjs`, a one-screen probe added
+  because "the full pass crashed" and "the screen is broken" must not read the same in a log: it
+  signs in, uploads a JPEG that really carries a block, reads the block's rows and reads the
+  API's own response — **13/13 checks pass**.
+- **The bug it found: the rotation was applied twice.** The writer already stores the *oriented*
+  geometry (an orientation-6 4000×3000 frame is written as 3000×4000), and `display_size()` then
+  applied the swap again on the way out — so the panel reported a landscape picture for a portrait
+  photograph, and the facts list read `4000 × 3000` for a file every browser draws tall. The unit
+  test on `oriented_size` passed the whole time, because the function was correct; it was being
+  called on the wrong input. This is the case the QA pass exists for and the Rust suite cannot
+  see, and it is why the fix ships with a regression test shaped like the bug: a row carrying the
+  oriented columns *and* the record that produced them.
+- **Proof.** 19 new unit tests in `exif.rs`, 5 in `model.rs` and two walks over the real router →
+  0 failures. Both
+  walks read the column **out of PostgreSQL**, because a response that omits a field is
+  indistinguishable from one that stored it and chose not to say so. An orientation-6 frame of
+  4000×3000 stores 3000 and 4000; a text file grows no record; a replacement in a format with no
+  block clears it and the geometry falls back to the frame's own; a restore brings version 1's
+  record back; the serialised object is scanned for `lat`, `lon`, `GPSLatitude`, `GPSLongitude` and
+  `altitude`. `cargo test -p omnion-media --lib` → **122** (was 98), `-p omnion-api --lib` → **122**,
+  and `--test media` (13, was 11), `--test media_transform` (5), `--test media_settings` (2),
+  `--test media_duplicates` (6), `--test media_shares` (5) are unchanged and green. `pnpm
+  --filter @omnion/admin typecheck` clean. The migration applies across the whole set on a fresh
+  database.
+- **The QA pass had to grow a screen before it could test one.** The library pass uploads a PNG,
+  and a PNG carries no EXIF — so the Camera block would only ever have been seen in its empty
+  state, which the "no untested screen" rule forbids. The pass now *builds* a JPEG that carries a
+  real block, uploads it, opens its detail screen and asserts the body, `ISO 400`, `1/200 s`,
+  `f/1.8` and the rotated dimensions.
+- **Four bugs the walkthrough's own JPEG builder had, each of which produced a file that read as a
+  parser bug and was really a builder writing the format wrong.** The TIFF block is little-endian
+  while the JPEG framing around it is big-endian, so a segment length written with the block's
+  `u16` reads as a 57 KB segment in a 253-byte file and the block is then unreachable; a directory
+  is a count plus its entries plus a four-byte next-directory pointer, and the two that get
+  forgotten put every later offset on the wrong field; a value offset is measured from the start of
+  the *block*, not from the directory that holds the entry, so a value laid down before the
+  sub-directory exists is overwritten by it; and a RATIONAL is two words wide rather than four
+  bytes, so a cursor that steps by the entry's width lands every rational after the first on the
+  wrong field. None of the four would have been found by a screenshot — the file simply had no
+  camera record and the screen showed its empty state, correctly.
+- **Environment.** `/mnt/apopic` sat at **94 %** (3.6 GB free) on entry, and this worktree's own
+  `target/` was 9.9 GB of it. Reclaiming *only this worktree's* `target/debug/incremental`
+  (verified first: no live `cargo` holds it) returned 1.7 GB. **Owner action:** the worktrees under
+  `/mnt/apopic` still hold ~30 GB of `target/`; a shared `CARGO_TARGET_DIR` is the structural fix.
+- **Next.** Slice 4 — folder and file grants with inheritance, the scanning pipeline with
+  quarantine and release, retention policies with the daily worker, and reference-based purge
+  refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
+  and releasable, and a retention run removes exactly the eligible rows.
+
+## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
+
+**What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
+could render a badge and the badge could only ever read `pending`. This tick gives that column a
+pipeline behind it — `0044_media_scanning.sql` (a per-site policy, a quarantine table with a
+history, a run log, plus the two `media` columns the pipeline needs and `0025` never created), the
+crate module `crates/media/src/scanning.rs`, the API in `apps/api/src/routes/media_scan.rs`, and
+the **Scanning** tab on `/media/settings`. Seven routes; the gate is on *every* serve path, not
+just the one the spec names: the panel raw route, the public renderer, the preset path **including
+its cached derivatives**, both version paths, and the share token route.
+
+**Seven decisions, each a shortcut that produces a plausible wrong answer.** An unrecognised
+scanner answer is an *error*, never a pass (pinned against a scanner that answers
+`{"verdict_code": 3}` over a real socket); a file above the size ceiling is `skipped` and never
+`clean`; a clean scan leaves `scan_detail` **empty** so a report that greps it cannot find a
+positive on every file; a quarantine row is closed and never deleted, so a file flagged twice has
+two events; a release requires a reason and lands the row on `skipped`, not `clean`, because
+nobody has said the file is *safe*; another tenant's quarantine is a `404` and not a `403`; and a
+**flag is a fact rather than a policy question** — `on_error` speaks to the *absent* verdict
+(`pending`, `error`) and never overrules a `flagged` row.
+
+**Three defects found by the walks, none of which a unit test could have seen.** The claim query
+selected `id` while the row type called the field `media_id`, and sqlx's `FromRow` maps by
+*column name* — so the sweep died with `no column found for name: media_id` on the first file,
+which reads as a broken query rather than a missing alias. `0025` never created `media.scanned_at`
+at all, so **every verdict write failed**, and because the route counted the error both as a
+verdict and as a write failure, a one-file run reported `errors = 2` — a number with no reading
+an operator can act on. And `sum(bigint)` decodes as NUMERIC, so the quarantine byte total could
+not be listed at all.
+
+**The one that matters was found by a suite I did not write.** `media_shares.rs`'s
+`a_link_stops_serving_when_its_file_stops_being_servable` failed on my change: the first gate had
+an early return for a site with scanning *disabled*, and the walk switches the scanner off before
+flagging a file by hand. The regression was real and it was the shape of the bug: a flag is a fact
+about the bytes, and turning the scanner off is a decision about *future* uploads, not a way of
+forgetting a verdict somebody already reached. Fixed in the crate (`may_serve` now reads
+`enabled` itself, with a test that runs all four `enabled`×`on_error` combinations) rather than at
+the call site, so the panel and the share link cannot drift apart again.
+
+**Proof.** `--test media_scan` → **10 walks, 0 failures**, each against a **hand-rolled scanner on
+a real loopback socket** rather than a stubbed function: the client is where an outage lives, and
+a sub-app would share every assumption the client makes. A **dead port** proves the ingest rule
+(upload succeeds, row reads `error`, `hold` refuses with `file_scan_failed`, and flipping
+`on_error` to `serve` changes the answer on the *next* request because the policy is read per
+request, not cached). A `Nonsense` scanner proves fail-closed. A clean scanner proves a clean file
+serves with its real bytes and an empty sweep still writes a run. A trashed file is never claimed.
+Both walks that assert a row read it **out of PostgreSQL**, because a response that omits a field
+is indistinguishable from one that stored it and chose not to say so. `cargo test -p omnion-media
+--lib` → **148** (was 122), `-p omnion-api --lib` → **127** (was 122); `--test media` (13),
+`--test media_shares` (5) and `--test media_transform` (5) are green against the routes this
+touches. `apps/admin` `tsc --noEmit` clean.
+
+**Environment.** Two things worth recording. The shared development database has a sibling wave's
+migrations applied, so `cargo test --test media_*` dies with `VersionMissing(19)` before it reaches
+a single assertion — `scripts/qa/run-media-walk.sh` gives each suite its own disposable database,
+which is what a suite that must be *believed* to have run needs. And `reqwest` was a **dev**
+dependency of the API crate: the scanner client needs it at runtime, so it is now a real one.
+
+**Next.** Slice 4's remaining half — folder and file grants with inheritance, a deny beating an
+inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
+and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
+the raw route and a retention run removes exactly the eligible rows.
+
+## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
+
+**What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
+readable: `GET /api/v1/media/{id}/references` (where a file is used) and `/activity` (what has
+been done to it), `crates/media/src/usage.rs`, `omnion_audit::for_target`,
+`features/media/{usage,activity}-tab.tsx`, and the two tabs on `/media/files/{id}`. Both reads are
+`media.read`, and both load the file through its own site scope — including a **trashed** file,
+because "what happened to this" is asked precisely after the deletion.
+
+Five decisions, each a shortcut that produces a plausible wrong answer:
+
+  1. **Records and rows are reported apart, and the sentence says which it means.** A page
+     naming one hero in three fields is one record and three rows. The summary is the server's,
+     not the panel's, so the two cannot disagree about what the integers mean.
+  2. **A reference whose record is gone is rendered unresolved, with no link, and names its own
+     fix.** It refuses a purge for ever; a list that dropped it would shorten every week with no
+     way to tell a quiet file from a broken one.
+  3. **Only the kinds that exist today are resolved.** `page` is a closed list, not a match over
+     `resource_kind` — a module arriving tomorrow registers its own kind without a migration, and
+     a lookup that switched on the kind would have to grow a branch for ever.
+  4. **A file's story is written under two target names.** `media` for the bytes, `media_file`
+     for a grant. A filter naming only the first answers "who could see this file in March" with
+     a list of uploads — the most reassuring possible wrong answer. A folder rename is *not* in
+     it, and that exclusion is as much a part of the claim as the inclusions.
+  5. **The action arrives as a sentence beside its token**, and an action the server has not seen
+     is shown in its own words rather than dropped: a trail with a hole in it is worse than one
+     with an unfamiliar entry. A deleted account reads as "an account that has since been
+     removed", never as "the platform".
+
+**Proof.** `bash scripts/qa/run-media-walk.sh media_usage` → **6 walks, 0 failures** against the
+real router. Four of the six exist because the shortcut gives a plausible wrong answer rather
+than an error: the three-fields/one-record split; the stale reference being reported *and* the
+repair scan really clearing it; the label coming from the **published** revision rather than the
+newest one (a draft's title on a list answering "which published pages use this" is a confident
+wrong answer); and a grant appearing on the trail under its other target name. The other two are
+the permission (a reader holding `media.read` alone opens both screens) and the trash (a trashed
+file still answers both). `cargo test -p omnion-api --lib` → **152 passed, 0 failed**;
+`-p omnion-media -p omnion-audit` → **181 passed, 0 failed**; `pnpm typecheck` → 2 successful, 0
+errors.
+
+**Three defects, all of them in the test rather than the code** — and that is the honest report.
+The fixture lacked `media.settings.manage` and `media.delete`; and it asserted a `404` for
+another tenant's file where the whole media surface answers `403 cross_organization`. The route's
+own doc comment had made the same wrong claim and now says what the platform does and why the
+convention is the safer of the two: a `404` here would have made these the only two screens where
+a foreign file is *invisible* rather than forbidden.
+
+**Also fixed: the QA slot could be held hostage for 75 minutes.** `qa-slot.sh` names its place
+file after `$$` — its own pid — and exits the instant it takes the place, so the reaper's
+`kill -0` tested a pid that is dead within milliseconds of a *healthy* pass and fell back on age
+alone. One crashed pass then held every later pass at "waiting for a QA slot" until each died at
+its own timeout with no report. The reaper now reads the holder pid, which lives exactly as long
+as the pass. Proved both ways against a synthetic slot dir with a real sleep as the live holder:
+it spared the live place and reclaimed both dead ones. This is the second time this loop has hit a
+stale-lock class, and the tell is the same both times — a symptom that reads as "the machine is
+busy" rather than "a lock file is lying".
+
+**Gate.** `bash scripts/qa/run.sh` was started first, as slice 4's outstanding condition, and is
+**still queued behind siblings** — five concurrent walkthroughs from the w2/w3/w4/w7 worktrees
+hold the one place `QA_SLOTS=1` allows. The walkthrough now drives both new tabs
+(`checkUsageTab` / `checkActivityTab`), so the harness that finally gets the slot is already
+extended; the retention tab's own pass (`runMediaRetention`) has now been queued for two
+consecutive ticks and remains unrun.
+
+**Next.** Re-run `bash scripts/qa/run.sh` and require zero high findings from `runMediaUsage`
+alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
+first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
+slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
+
+## Tick 45 — REQ-021 slice 1: the in-app inbox
+
+**What.** The platform's fourth feedback loop, and the only one that says *you*. The event bus
+records facts, the audit trail records privileged work, the search index records documents —
+and this one reaches a person. `omnion-notifications` (the record, the vocabulary, the store),
+migration 0050 (six tables: the record, the preference matrix, the digest settings, the
+delivery queue, the push devices and the channel config), the owner-scoped HTTP surface, the
+bell in the header of every route, `/notifications`, and the walkthrough pass that drives both.
+
+**Four decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **Owner-scoped always.** No store function takes a user id the caller chooses — every one
+   takes the owning id. "List somebody else's notifications" is not a parameter a handler can
+   get wrong; it is a function that does not exist.
+2. **Another person's notification is a `404`, never a `403`.** A `403` is the difference
+   between "that is not yours" and "that is not real", and this surface is the one a curious
+   panel is most tempted to poke at.
+3. **The badge and the grouped lines are one query.** A bell that says 12 above four lines
+   adding up to 9 is a screen nobody believes afterwards, and the fix is not a UI change: it is
+   that both come from `store::summary`, which is the only place the unread count is computed.
+4. **The vocabulary is compile-time, and the SQL duplication is a test.** SQL cannot import a
+   Rust constant, so the category/priority/channel lists are written twice. The test
+   `the_migration_agrees_with_the_lists` reads the migration file itself, because a category
+   added to Rust and not to SQL passes every unit test in the crate and then the database
+   refuses the row in production — which reads as "nothing happened".
+
+**Two bugs the tests caught in the first draft, both quiet.** `include_read: false` together
+with `unread: Some(false)` pushed both `read_at is null` and `read_at is not null` — a query
+that is *always* empty, on exactly the path the panel's "show read" filter takes, so it would
+have reported that nobody had ever read anything. And `priority_rank`'s doc said "lower is
+more urgent" while the list it indexes is written the other way round; the doc was wrong, and
+it is now explicit about which way and why.
+
+**Proof.** `cargo test -p omnion-notifications -p omnion-permissions` → **62 passed**;
+`-p omnion-api --lib` → **159 passed**; `pnpm typecheck` → 2 successful, 0 errors.
+`scripts/qa/run-notifications.sh` → **PASS**: 31 migrations applied in order, 6 tables, a
+repeated `dedupe_key` collapses to one row, and both `notifications_category_check` and
+`notification_deliveries_channel_check` refuse exactly the values the crate refuses.
+`scripts/qa/run-notifications-http.sh` → **PASS, 9/9** over a real socket with two real
+sessions.
+
+**The HTTP gate found three ways a gate can lie, which is worth more than the nine passes.**
+It built into `$CARGO_TARGET_DIR` and ran a hard-coded `./target/debug` binary — so it started
+a build that predated the feature and read *its* answers under this build's name. A failed run
+left the API holding the port, and the next run's instance exited on `EADDRINUSE` while the
+gate went on reading the orphan. And pre-applying the migrations let the API double-apply
+them, which kills it at boot — the same orphan one step earlier. All three are fixed at the
+root and the reason is in the file, because "the gate passed" is worth nothing while it is
+reading someone else's process.
+
+**And one assertion that was itself wrong.** The gate expected a `404` from the member and
+got a `403` — correctly, because an account with no role never reaches the handler. A `404`
+from a forbidden caller proves nothing about scoping, and conflating "you may not" with "it is
+not yours" is exactly how a real leak survives a review. It now proves both, and binds the
+member to the base role before making the scoping claims.
+
+**Gate.** `bash scripts/qa/run.sh` is **running** — the QA slot cleared after ~55 minutes of
+queueing behind the w6 pass, so the browser pass is in flight rather than merely queued.
+Slice 1 is not closed until it reports zero high findings from `runNotificationsDepth`.
+
+**Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
+hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+---
+
+## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
+
+**What.** The half of the notification centre that decides **how** a record reaches somebody.
+`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
+`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
+`runNotificationSettingsDepth` in the walkthrough.
+
+**Three decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
+   user per channel and would make a channel added in slice 3 a backfill instead of a
+   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
+   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
+   valid form, not an empty one.
+2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
+   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
+   guarantee, and the panel's own form is a client like any other.
+3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
+   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
+   of them is either never quiet or always quiet, and both are silent. A window that leaves no
+   waking hours is refused by name rather than stored as "e-mail is on".
+
+**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
+`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
+legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
+`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
+
+```text
+invalid type: string "approval", expected a sequence
+```
+
+for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
+priority filter on this surface had never worked, and every filtered list fell through to the
+error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
+the list read now takes `RawQuery` and parses the string itself.
+
+**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
+`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
+bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
+its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
+error element, which that call cannot affect: the assertion could only ever have passed by
+accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
+shortcut into the drawer. All three are the class of defect this harness exists to catch —
+in itself — and none of them is visible from the report, which only says `false`.
+
+**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
+gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
+takes an explicit id list, so it does not require a selection the reader never made — and rows
+carry `data-read` so the state is assertable rather than a shade of grey.
+
+**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
+**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
+Browser pass: **running**.
+
+**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
+`report.notificationSettings` to be green and **zero high findings** from this change — in
+particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
+signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
+behind `notifications.admin`, the event router turning existing bus events into notifications,
+and the per-channel delivery rows in the drawer.
+
+## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
+
+**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
+`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
+endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
+with their guards travelling with each group.
+
+**The decision the whole slice rests on: a `permission:` recipient rule resolves through
+`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
+one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
+expired grants and explicit denials, and a notification that reaches somebody who lost the key
+is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
+`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
+cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
+that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
+zero for and the crate's resolution answers one.
+
+**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
+no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
+nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
+is asserted by serialising the body and searching the JSON for the secret.
+
+**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
+`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
+button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
+list used `filter_map`, which would answer with four channels and render a settings matrix whose
+missing column is indistinguishable from one the reader switched off. And the outbox check
+constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
+
+**The live gate found three of its own assertions were wrong**, which is the more useful half:
+the role fixture expected a survivor where the honest answer is zero; the outbox projection check
+counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
+`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
+now assertions that would fail if the code regressed.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
+`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
+`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
+and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
+moves the failed row while the delivered one stays at 1 → 1.
+
+**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
+gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
+rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
+
+**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
+assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
+and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
+before running the pass again — the no-untested-screen rule applies to a screen that does not yet
+exist as much as to one that does.
+
+## Tick 48 — the pass that had been running for an hour, and what it actually said
+
+**What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
+question the last tick left open. `report.notifications` is **green on the bell, the badge, the
+grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
+`false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
+answered with status 400."*
+
+**The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
+push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
+swallowing the static segments, which is exactly what the comment above the mount says it
+prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is from **20:39**;
+slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
+filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
+disposable by design, so the lesson is to read the binary's mtime before reading the router.
+
+**What this tick fixed instead.** Two real defects, both found by hand against the live stack
+because no existing gate could reach them:
+
+1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
+   `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
+   itself: a `500` whose body quotes `violates foreign key constraint
+   "notifications_user_id_fkey"`. Four good recipients lost to one stale one, and a constraint
+   name shipped to whoever held the response. `0707141` checks recipients before the loop
+   through a new `store::existing_users` and refuses in a sentence that names *which* id is wrong.
+2. `Escape` was documented in the file header, the REQ's QA plan and the walkthrough, and it was
+   **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
+   exactly when the list had content — and the open drawer held the focus, which is why `e`,
+   `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
+
+**And the gate that had been lying.** `run-notifications-http.sh` decided its build by
+`cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
+status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
+crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
+twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
+compiler's exit status and only reads the log when that status says something went wrong.
+
+**Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
+`-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
+`node --check scripts/qa/walkthrough.cjs` → clean.
+`scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
+*a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
+with one bad id writes none of the good ones*.
+
+**Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
+typechecked, but no pass has run against them — the pass that found them ran against the 20:39
+binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
+this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
+**in-progress**.
+
+**Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
+newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
+and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
+`slashFocusedFilter` to recover behind them, `report.notificationSettings.loaded` to be true, and
+`report.notificationOutbox` to be **present** — that last one is the first pass that can close
+slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
+after that.
+
+## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
+
+**What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
+landed, and it answered the question the last two ticks were holding open. `report.notificationOutbox`
+exists for the first time: five chips all carrying counts, `chiptotalMatchesSql` true,
+`targetHiddenForActor` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, a removal that
+answers 204 and leaves the table, and `retryIsNotRetryable` true. `report.notificationSettings` is green
+on the matrix, the honest save notice, the round trip and the error state. `runMediaRetention` came back
+`ok: true` for the first time, which is REQ-010's blocker clearing.
+
+**The pass also produced one string that says everything.** `report.notifications` ended with
+
+```json
+"keyboardRows": 0,
+"keyboard": "no rows to drive — the list did not load"
+```
+
+which reads like a timing problem and is not one. The pass had marked its own three rows read four lines
+earlier, and the list then showed none of them. `with_read` was a `bool` defaulting to `false`, and a
+`bool` cannot tell "the client said nothing" from "the client said no" — so **every** caller that named no
+filter got an unread-only list, while the panel's own State menu labelled that same state "Unread and
+read". The screen promised a list it was not sending. Nothing failed loudly: the list rendered, the badge
+was right, and the screen simply stopped showing mail the reader had already seen.
+
+**What this tick fixed.** `ab3c105` gives `with_read` an `Option<bool>`, so absent and off stay
+distinguishable and absence means *everything*; `4933c10` fixes the three client places that assumed a
+positive flag — `filtersFrom` never sent it, `notificationQuery` dropped the `false` that *is* the
+inbox filter, and the empty state's "Show read notifications" button **set** the flag to switch read
+rows on when the correct action is to clear it. `797a3e8` adds the two gates that were missing, which
+is the part that matters: `readRowsStayVisible` immediately after the bulk action, and `inboxFilterIsHonest`
+on the other half, so a default nobody can turn off cannot pass as a fix.
+
+**Proof.** `cargo test -p omnion-api --lib` → **188 passed** (187 + the absent-vs-off test, which
+asserts the parse *and* the built query — a parser that keeps them apart and a builder that throws the
+distinction away are two different bugs and only the pair is the fix). `-p omnion-notifications` → **79**;
+`-p omnion-permissions` → **62**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check
+scripts/qa/walkthrough.cjs` → clean. `scripts/qa/run-notifications-http.sh` → **PASS 13/13** over a real
+socket, the new leg reading `all=1 inbox=0 live=1`. Browser pass: 36 pages, 1095 clicks, 88 field fills,
+39 form submissions, 84 findings (79 high, 5 medium).
+
+**On those 79 high findings, honestly.** 74 are `/media/*` and belong to REQ-010, which is the other
+in-progress REQ in this wave — 30 of them are one 422 on `/api/v1/media/{id}/raw?preset=standard` and 22
+more of the same from a second file. The remaining 5 are **this pass's own deliberate refusal probes**:
+three the 400 in-app-column lock and two the routed-500 error state, each of which the pass asserts as
+*expected* two lines later. Neither group is caused by this tick's change.
+
+**Also fixed, incidentally.** The gate I extended had two defects of its own, both caught because the
+first version of the assertion failed in a way the change had nothing to do with: `grep -c` exits 1 on
+an empty body, so under `set -e` the *inbox* leg — which is meant to be empty — aborted the whole gate
+before printing a verdict; and the row to mark is read from SQL rather than reusing the `$target` that
+the 404 check *below* assigns, because a shell script that reads a value before the line that sets it
+reports an empty id as "the endpoint refused".
+
+**Not proven, and not claimed.** No pass has yet run against the `with_read` fix, so the keyboard leg —
+`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`, `shiftEMarkedVisible`,
+`slashFocusedFilter` — is still unproven and the REQ stays **in-progress**. `quietSaved` and
+`digestPersisted` are still false: the widgets render, but the pass does not change them yet, so those
+two halves of the settings box are honestly unproven despite the box being ticked for what was proven.
+
+**Next.** Run `bash scripts/qa/run.sh` again (verify `stat -c %y target/debug/omnion-api` is newer than
+`ab3c105` first). Require `report.notifications.readRowsStayVisible`, `inboxFilterIsHonest`,
+`keyboardRows > 0` and then the five keyboard keys, plus `notificationSettings.quietSaved` and
+`digestPersisted` — and extend the settings pass to change those two fields rather than merely render
+them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
+REQ-010 slice 4's remaining gate.
+
+## Tick 50 — the quiet window that came back wearing a different spelling
+
+Two commits, `c48db9d` (the fix) and `60a28ea` (the gate), both pushed, tree clean.
+
+**What.** The previous tick's `next_hint` told this one to go and run the browser pass. It could
+not: `qa-slot.sh` allows one pass at a time and the box was at load 13 with six sibling passes
+compiling, so a pass started under those conditions would have timed out having measured
+nothing. The two settings boxes the hint named — `quietSaved` and `digestPersisted` — were the
+honest place to start instead, and reading why they were false turned up something the browser
+pass had been reporting faithfully for two ticks.
+
+**The defect.** `notification_settings.quiet_hours_start` is a Postgres `time` column, and
+`read_settings` selected it with `::text`. Postgres prints a `time` that way as `22:00:00` —
+seconds always present, zero-padded. The platform's clock vocabulary is `HH:MM`: the shape the
+form sends, the shape `validate_quiet_hours` accepts, and the shape `parse_clock` reads. So
+every window that was saved correctly came back in a spelling nothing could parse,
+`parse_clock` answered `None`, and `in_quiet_hours` took the arm its own doc comment promises
+("no window at all means `false`"). The setting a reader had just turned on decided nothing from
+the next request onwards, and the settings form could not read back what it had written.
+
+Nothing about it fails loudly. The save is a `200`. The row in Postgres is exactly what was
+asked for. The digest half of the same row — a string column — came back fine, which is why
+`digestPersisted` failed for a *second*, unrelated reason in the pass while the two fields
+looked equally broken.
+
+**Why the pass could not have told you.** `quietSaved` asserts the time input still reads
+`22:00` after a save, and `digestPersisted` asserts the two selects. Both were false, but they
+were false for different reasons, and only one of them was a defect. Reading the *values* the
+pass had collected — not the booleans — is what separated them: `timezoneSaved` was true
+alongside two false fields, and timezone is a plain `text` column.
+
+**The fix.** `to_char(quiet_hours_start, 'HH24:MI')` in the read, so the shape is produced by
+one literal in the SQL. `parse_clock` also tolerates a seconds field, so a row written before
+this change is still a window rather than its absence — a widening that has to be paid for
+with a test, because "accepts more" is how a parser turns into a function that accepts
+anything with a colon in it. `format_clock` is the write-side counterpart that names the shape,
+and the round trip between the two is asserted over five instants.
+
+**One mistake worth recording.** The first version of the fix declared the columns
+`Option<time::Time>` and let `format_clock` do the work. It compiled — `query_as` checks its
+types at *decode* time, not at compile time — and came back as a `500` on the settings screen:
+`mismatched types; Rust type Option<time::Time> (as SQL type TIME) is not compatible with SQL
+type TEXT`. The fix for that is the one line the comment now explains: `to_char` returns
+`text`, so the column is decoded as `Option<String>`.
+
+**Proof, in both directions.** `scripts/qa/run-notifications-http.sh` now has two legs that
+own the seam, and the order is the point: save through the API, read the row out of Postgres to
+prove the write happened, *then* read it back through the API and compare the exact string.
+Against the pre-fix tree (stashed, rebuilt, re-run) the gate printed
+`FAIL quiet hours did not round trip: row=[22:00 07:00 weekly 3 17] api=[22:00:00..07:00:00 hour=17]`
+— the row correct, the API's own answer unusable. Against the fix: **PASS 15/15**. A gate that
+only read the API back would have passed against a store answering with whatever it was handed.
+
+`cargo test -p omnion-notifications` → **83** (79 + 4 new). `cargo test -p omnion-api --lib` →
+**188**. `tsc --noEmit` in `apps/admin` → exit 0.
+
+**Still not proven, and not claimed.** No browser pass has run against a binary built after
+this, so the keyboard leg (`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`,
+`shiftEMarkedVisible`, `slashFocusedFilter`) and the browser's own `quietSaved` /
+`digestPersisted` are open. REQ-021 stays **in-progress** for that reason alone.
+
+**Next.** Run `bash scripts/qa/run.sh` with no `QA_STACK` override when the box is under load
+~6 and `qa-slot` is free — verify `stat -c %y target/debug/omnion-api` is newer than `c48db9d`
+*before* reading any finding, because the pass tears the stack down. Require
+`report.notifications.keyboardRows > 0` and the five keyboard keys, and
+`notificationSettings.quietSaved` + `digestPersisted`, which the data path can now support.
+The other open item is unchanged: the 74 `/media/*` high findings, which are REQ-010 slice 4's
+remaining gate.
+
+## Tick 51 — REQ-016 slice 1: the event catalogue (the registry the platform never had)
+
+**What.** `crates/events/src/catalogue.rs` — 68 event names (67 live, 1 reserved) with their
+area, a one-sentence description, their payload fields and a required flag. Compiled in, not
+stored. `GET /api/v1/events/catalogue` serves it, a group subscription (`page.*`) is stored as
+the wildcard *and* as today's expansion, and `enqueue_fanout` matches either.
+
+**The gap this closes.** Before this, the only truth about an event name was the string literal
+at the call site. The endpoint form had nothing to build a picker from, `/events` had nothing to
+describe, and a typo in one emitter became a name no receiver could ever subscribe to — silently,
+with the bus recording the fact and the delivery queuing normally. Nothing was broken and nothing
+said so.
+
+**Two decisions, and the reasons are the interesting part.**
+
+*A group is stored twice.* Storing only today's expansion means `page.*` silently stops covering
+an event added next release — the exact surprise a group exists to remove. Storing only the
+wildcard means a receiver can be subscribed to a group whose members do not exist, and cannot
+tell what it is getting. So the wildcard is the subscription and the expansion is the readable
+copy, and the fan-out tests both. The SQL grew one `or $4 = any (w.events)` clause; the clause
+is there for the row written before reconciliation existed, or by an operator's own SQL, which
+would otherwise stop receiving with no error anywhere.
+
+*`order.created` is listed, described and subscribable while commerce is unshipped* — and marked
+`reserved` so the panel can say *which module ships it* rather than implying the platform is
+broken. A reserved name is a name: `order.*` expands today.
+
+**The registry writes itself, and its first two findings were real.** The table is a macro
+(`crates/events/src/catalogue.rs`), one row per event, and `apps/api/tests/events.rs`
+`every_emitted_name_is_in_the_catalogue` walks the source tree for `NewEvent::new("…")` and fails
+with the file and line when an emitter names something the table does not carry. A unit test
+inside `omnion-events` cannot do this — it cannot see the modules. It immediately earned its
+place: it caught that the upload fact is emitted as **`media.created`**, not the `media.uploaded`
+the request imagined. The table was written to match the code rather than the spec, and the
+reason is in the source: renaming the row would make the catalogue agree with the request and
+disagree with every receiver that already subscribed.
+
+**A gate that cannot fail proves nothing**, so the drift test was proved in both directions:
+with a `totally.made_up` emitter injected into `media_settings.rs` it failed with
+`1 emitted name(s) are not in the catalogue … totally.made_up (apps/api/src/routes/media_settings.rs:24)`,
+and green again once restored.
+
+**Also found, by a test I wrote to check a different thing.** `group_members` matches the first
+dotted segment, so a group is `order` while the area is `commerce` — I had written a test
+asserting `commerce.*` would expand. Area and group are different vocabularies and conflating
+them would make `commerce.*` look correct while matching nothing. Pinned by
+`an_area_is_not_a_group`.
+
+**Macro rules, for the fourth time.** A `*` repetition may not be followed by another
+repetition, a field tuple needs its literal parens in the pattern, `req`/`opt` are idents not
+literals, and a `const fn` cannot match on `&str` on this toolchain — so the status and the
+required flag are matched as *tokens* and turned into the values by the macro. The table is now
+stricter than it was designed to be: a row that says `Reserved` in the wrong case is a compile
+error rather than a row that silently reads as `live`.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **41** (24 before, 17 new)
+- `cargo test -p omnion-api --test events -- --test-threads=1` → **4/4**, real Postgres + a real
+  loopback receiver; the group subscription delivers a `page.published` and the signature
+  verifies against the secret the creation response returned
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+
+**Not done, and not claimed.** Slice 1 is not closed. Missing: the emission calls for names the
+modules do not record yet (`page.created|updated|unpublished|deleted|restored`,
+`user.updated|deleted`, `site.archived`, `domain.*`, `plugin.*`, `theme.activated`,
+`workflow.run.*`) — the catalogue names them and the table asserts they are listed, which is the
+honest direction: the registry is the specification the emitters are measured against, and they
+have not caught up. And the `/events` screen with its Feed and Catalogue tabs does not exist; the
+data source does.
+
+**Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
+on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
+turns "did I remember?" into a red line with a file and a line number.
+
+
+---
+
+## 2026-09-29 — REQ-016 slice 1 (emission half) · the gate that walked one direction
+
+Eleven emissions, one honest demotion, and a gate that closes the direction nothing was
+checking.
+
+**The finding.** Slice 1 shipped a drift gate that walks the source tree and fails when an
+emitter names an event the catalogue does not carry. It works, and last tick it earned its
+place. But it walks **one** direction, and the other direction is where the damage was.
+Twenty-seven rows were marked `Live` — which the type documents as "emitted by the platform
+today" — and nothing emitted them. `page.created` had a row, a description, payload fields
+and a picker entry; there was no `bus::emit` for it anywhere in the tree. So an operator
+subscribed to `page.created`, the subscription was accepted, and nothing could ever arrive.
+No error, no warning: a registry that promises deliveries the platform never makes.
+
+**Eleven now emit**, each a `bus::emit` beside a write that already existed:
+
+| name | where |
+| --- | --- |
+| `page.created` `page.updated` `page.deleted` `page.restored` | `routes/content.rs` |
+| `translation.updated` | `routes/content.rs` |
+| `domain.added` `domain.removed` | `routes/tenancy.rs` |
+| `site.archived` | `routes/tenancy.rs`, on the transition only |
+| `user.updated` | `routes/iam_subjects.rs` |
+| `user.deleted` | `routes/scim.rs` |
+| `theme.activated` | `routes/onboarding.rs` |
+| `webhook.endpoint.created` `updated` `removed` `tested`, `webhook.secret.rotated` | `routes/webhooks.rs` |
+| `webhook.delivery.failed` | `crates/events/src/engine.rs` |
+
+**Ten are now `Reserved`, and the reason is the point.** `plugin.*` (no plugin module ships
+yet), `workflow.run.*` (the engine does start runs — but the automation matcher *drains the
+same bus* and starts a run per matching rule, so emitting there without a loop guard is a
+feedback loop wearing a feature's clothes; that is a decision, not a line), `page.unpublished`
+(no route takes a published page back to draft), `translation.published`, `domain.verified`.
+`Reserved` is not a demotion for its own sake — `order.created` has carried it all along. It
+is the status that lets the picker say *a module ships this* instead of implying the platform
+is broken. `a_reserved_name_names_the_module_that_ships_it` pins each row to its owning module,
+so nobody re-promotes one on a hunch: the reverse gate turns red with the name.
+
+**A gate a convenience wrapper can blind.** The first version of the content helper took the
+name as a `&str` and the new gate immediately reported `page.created` unbacked from a file
+that emitted it three lines above — the literal had moved into the helper's argument, where a
+source-walking gate cannot see it. The helper now takes a built `NewEvent` and the literal
+stays at each call site. A test that can be defeated by tidy code is a test to design
+against, and the same trap bit the forward gate afterwards: a doc comment explaining the rule
+contained the constructor call in prose, and the gate read it as an emitter. Both are written
+down in the source now.
+
+**The existing tests were right to fail.** Exact row counts in the feed broke, because the
+feed correctly carries more facts now: `page.*` delivers two events instead of one (a group
+subscription is no longer publish-only, which is the point of a group), and tenant B's feed
+is no longer empty because connecting an endpoint records an event *about that endpoint*. The
+last one looked like a tenancy leak and was not: the isolation assertion now says what it
+means — B sees its own endpoint and nothing of A's. The counts were replaced with presence
+and ordering assertions, because a count turns every future emission into a breaking test.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **42** (41 before, +1 for the reserved-ownership pin)
+- `cargo test -p omnion-api --test events` → **5/5** (4 before, +1 the reverse gate) against
+  real Postgres and a real loopback receiver
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- The new gate proved in both directions: promoting `plugin.installed` to `Live` turned it red
+  with the name, restore turned it green
+
+**Not done, and not claimed.** The `/events` screen with its Feed and Catalogue tabs does not
+exist, so the acceptance box that names the Catalogue **tab** stays unticked even though the
+API behind it is proven. Slice 2 (endpoint management UI) and slice 3's delivery-operations
+UI are untouched. No browser pass this tick: load 21.6 with sibling writers active, so REQ-010
+slice 4 and REQ-021 remain blocked on the QA slot.
+
+**Next.** The `/events` screen — the data source is done and proven, the screen does not exist,
+and it is the last thing in slice 1. Re-check the QA slot on arrival; when it is free and the
+box is under load ~6, run `bash scripts/qa/run.sh` with no `QA_STACK` override and extend
+`scripts/qa/walkthrough.cjs` so the new route is visited and clicked.
+
+---
+
+## 2026-09-29 · REQ-016 slice 1, the screen half — `e7399d6`
+
+**What.** The `/events` screen, and the feed filters it needs to be a screen. The catalogue had
+a data source and nothing that rendered it; the feed had `?limit` and one `?name` and no way to
+page. Both halves are now closed, except the browser pass, which did not get a slot.
+
+**The finding: `?name=a` never filtered — it failed.** The first version of the query shape was
+a `Vec<String>` behind `Query<EventsQuery>`, which is the obvious way to write it and the wrong
+one. `serde_urlencoded` — the deserializer `Query` is built on — **rejects a single occurrence of
+a repeated key for a sequence field outright**, with a `400` whose body is plain text rather than
+the API's error envelope. So `GET /api/v1/events?name=page.published` returned `400`, not a
+filtered list. The existing test caught it on the first run and the fix is a hand parser, which
+is not a downgrade: the same three rules already live in `notifications::parse_list_params` and its
+doc comment explains why each one exists. The new one says the same three and adds the fourth the
+notification list learned the hard way — *ignore* a key this build does not know, so a panel that
+sends one filter earlier than the API still gets its feed.
+
+**A tenancy assertion that passed for the wrong reason.** The scoping assertion was first written
+against the platform owner, and it failed: five rows came back where four were expected. The
+owner's session carries `organization_id = None`, and the store's `($1::uuid is null or
+organization_id = $1)` reads that as *every* organization — which is correct for a superuser. The
+test was asserting the superuser sees everything, not that a tenant may not see another's. It now
+reads as an **organization** account, and the seeded foreign row has an *actor* from a third
+identity, so a broken actor filter and a broken organization filter are both caught.
+
+**`has_more` comes from the row past the page.** Not from a second `count`. A list and a count
+that disagree is a list that is lying, and the disagreement is invisible until somebody pages to
+the end and finds a row they have already seen. The store asks for `limit + 1` and truncates; the
+cursor is the last row's own id, exclusive, so the next page cannot re-serve the row the cursor
+names. Newest-first is asserted *across* the boundary, not per page, because "sorted within a page"
+is a property a single page satisfies by accident.
+
+**A live name nobody subscribes to is the useful number.** The catalogue now carries each name's
+24-hour delivery count, scoped to the caller's organization. It is the one question the `live`
+column cannot answer: the status says the platform records the name, the count says whether any of
+your endpoints ever heard it. It is `0` rather than absent so the column is always a number the
+screen can render, and the walk asserts *every* entry carries a number — a missing key would
+render as a blank cell indistinguishable from a name nobody has data for.
+
+**The window is relative in the URL and absolute in the request.** `?window=24h` is what the
+panel stores, and the `from` instant is computed at request time. Storing the instant would make a
+pasted link mean "the last two hours" for the sender and "nothing at all" for the reader, with no
+way to tell which happened. A `from` in the past *is* still accepted directly, because the API is
+a public surface and a relative filter is a panel convenience, not a protocol rule.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **42** (unchanged; no new unit test was needed — the
+  store's filter is SQL and the walk exercises it against a real database, which is the only
+  place it can be exercised honestly)
+- `cargo test -p omnion-api --lib` → **188**
+- `cargo test -p omnion-api --test events` → **6/6** (5 before) against real Postgres
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Two walkthrough routes added (`/events`, `/events?tab=catalogue`) and `runEventsDepth` written:
+  it publishes a page through the real route, filters by the first name on screen, reloads to
+  prove the URL carries the filter, expands a payload, drives `j`/`Enter`/`Escape`, forces a
+  routed `500` and checks the error banner, reads the catalogue back against the API and asserts
+  the totals match, narrows by area, expands an entry's payload fields and uses "Filter feed" to
+  cross to the other tab
+
+**Not done, and not claimed.** **No browser pass this tick.** The QA slot was held by a sibling
+writer for the whole window and the box was at load 26, so `runEventsDepth` is written and
+**unrun**, and the acceptance box that names the Catalogue *tab* stays unticked with the reason
+written into the box. The other two things the box wanted — the screen and the filters — are
+built, typechecked and API-tested. Slice 2 (endpoint management UI) and slice 3's delivery
+operations are untouched.
+
+**Next.** Re-check the QA slot on arrival; when it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with no `QA_STACK` override. If it is green, tick the catalogue box and
+close slice 1; if the pass finds anything, fix it in the same tick — the depth pass is already
+written, so a green run closes the slice rather than starting it. After that, slice 2: the
+`/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
+operator needs first when a delivery is missing.
+
+---
+
+## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
+
+**What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
+shows the last page, the API keeps a keyset cursor over every row, the automation matcher
+replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
+`/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
+question (what will be forgotten and when) rather than a fourth card inside the Feed.
+
+Migration `0123_event_retention.sql` puts the window on the **organization**
+(`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
+decisions carry it, and each is a place the obvious shortcut is wrong:
+
+* **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
+  and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
+  The receiver's only symptom is a delivery that never arrives with nothing in the platform
+  saying why. The store's predicate selects events with **no delivery at all** or with **only
+  settled** ones; a `pending` row pins its event for ever. An event nobody was ever queued
+  for is the bulk of the bus, which is exactly the part worth deleting.
+* **The window is a column on the organization, not on the event.** "30 days" is a policy an
+  operator sets once and then changes; storing it per event would mean a sweeper that has to
+  *compare* the two to decide what is old. The cutoff is computed per organization inside the
+  same statement, and an organization that has never set one falls back to the platform
+  default rather than to `null` — because `null` would mean "keep for ever", which is a
+  decision nobody made deliberately.
+* **A run that deletes nothing is still written to the log.** "The last sweep was at 03:00 and
+  it found nothing" is the sentence an operator needs on the day they ask why a March event is
+  still in the feed, and a table that only records activity cannot answer it on the day
+  nothing happened.
+
+**A window on the organization is also a permission split.** Reading the window, the counts and
+the last sweep rides `events.read` — describing what will be removed is reading the bus.
+**Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
+destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
+
+**`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
+literal segment registered after a parameterised sibling is read as an event id, and a request
+that is perfectly valid answers `404 no such event`.
+
+**A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
+comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
+in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
+would be quoting a number nobody can reconcile with the run log.
+
+**The panel refuses the range before the server does, because the bounds are the server's.**
+`min_days`/`max_days` arrive in the read rather than being written into the component, because
+a range written in two places is a range that will disagree, and the input that disagrees with
+the server is the one that gets a `400` nobody can act on. Out of range *disables* Save rather
+than offering a failure. And when the server does refuse, its own sentence is shown — it names
+the field and the range, and replacing that with "invalid value" throws away the only sentence
+that says which bound was crossed.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **47** (45 + 2)
+- `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
+  one-day window set through the same `PATCH` an operator uses
+- `cargo test -p omnion-api --test events` → **9/9** (the sweep must not disturb the existing
+  delivery history)
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
+  `runRetentionDepth`)
+
+**Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
+PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
+$2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
+a named argument has to land on `int`, and the error names a function that plainly exists, so
+it reads like a migration fault rather than an argument type. The second is an **assertion
+written in the same breath as the code that broke it**: the walk set the window through a
+`PATCH`, that `PATCH` recorded `webhook.retention.changed` on the same bus, and the count
+assertion still said "two aged events" while the bus honestly held three. It had passed for
+the wrong reason only because nobody had run it since the audit event was added. Counting is
+not "count the rows I set up" — a number an operator reads is a number the platform has to be
+able to explain, including the parts nobody staged.
+
+**Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
+whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
+mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
+**unrun**, so every acceptance box naming a screen stays unticked with the reason written into
+the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
+a probe that selects a hook the screen does not carry is a probe that cannot fail.
+
+**Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
+slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
+(REQ-012/013/014 — the security, backup and system-health centres).
+
+## 2026-09-29 — omnion-build tick 56 · the blocker was never the QA slot
+
+**What.** Three REQs (010, 021, 016) had each recorded, in their own words, that their
+browser pass never ran because "the QA slot is held by a sibling writer". Three ticks running,
+the excuse had become the plan: wait for the slot, write nothing, tick nothing. This tick
+checked the excuse instead of repeating it — and it was false.
+
+The slot was never the constraint. **`/dev/shm` was at 99%** (418M free) and the box was at
+load 33 with 1G of RAM available. Several stacks point `CARGO_TARGET_DIR` at tmpfs so a
+compile does not fill the disk, so the worktrees had collectively moved their unbounded build
+growth onto a filesystem *every sibling shares* — and a build that cannot write its output dies
+with "No space left on device", which reads like a source error. Freeing three orphaned
+targets took tmpfs to 29% free and the load to 15. The slot was the symptom; the excuse named
+the wrong culprit, and the wrong culprit cannot be fixed by waiting.
+
+**The fix, and the two rules it had to learn first.** `disk-guard.sh` grew a tmpfs sweep with
+an `in_use` test — and that test deleted a 7 GB target out from under a **running w8 QA pass**.
+The reason is the lesson worth the whole tick: a stack's build runs in a wrapper that *exits*
+once the binary is staged, so `run.sh`, the pm2 API and the walkthrough all carry no
+`CARGO_TARGET_DIR` and answered "not held". A pass is not a build, and asking only "is a
+compiler running" cannot tell them apart. The guard now requires both tests — nothing building
+into it AND nobody living in the worktree that owns it — and step 4, the disk's own last
+resort, gets the same check it had been missing.
+
+**Also shipped.** The one unticked REQ-016 box that named *missing* UI: the payload inspector
+could copy a whole payload but not a JSON path. It now lists the payload's keys as a tree and
+copies the path a receiver would actually write — `["order.total"]` for a key with a dot in
+it, because `payload.order.total` is two lookups that read as a key that does not exist, and a
+path that silently matches nothing in the receiver being debugged is worse than no path.
+
+**Proof.**
+
+- `bash scripts/qa/disk-guard.sh` → freed **13.9 GB**, `/dev/shm` 91% → 29% free, load 33 → 15
+- a second run against the live w8 pass → reclaimed **nothing** (the rule holds under the case
+  that broke it)
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `f658491` (the guard), `aa14c42` (the path tree), `a8399a0` (the walkthrough step),
+  `a0c0320` (the REQ's record of it)
+
+**Not done, and not claimed. Still no browser pass.** This tick's own pass is queued behind
+the same single slot (now w8's, which I disturbed and which is still running), so the
+acceptance boxes naming a screen stay unticked with the reason in the box. What changed is
+that the excuse is no longer believed: the cliff is gone, and the next tick either gets the
+slot or says which sibling is holding it and for how long.
+
+**Next.** On arrival: if the slot is free, run `bash scripts/qa/run.sh` with **no `QA_STACK`
+override** and tick the screen boxes for slices 1–3 of REQ-016 together, then close REQ-016,
+then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
+the same reason). If the slot is still held, name the holder and its ports in the log rather
+than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
+
+## 2026-09-29 — omnion-build tick 57 · REQ-012 slice 1, and a screen that says "I don't know"
+
+**What.** Started REQ-012, the security centre — the first not-done REQ in wave 1. The whole
+slice turns on one rule, and it is the only screen in the panel where a plausible default is
+a lie: **a check that could not verify something must not report `pass`.** So the rule is
+written into the design rather than left to each check's judgement —
+
+* a check is a pure function of an `Environment` it is handed, so it cannot look anything up
+  and cannot conclude anything from an empty result set;
+* a probe that could not read answers `Probe::Unknown`, and `unknown` is one of the four states
+  rather than a null the panel has to guess at;
+* the overview renders **every** registered check including one that has never run, so a
+  missing row can never read as "nothing to report here".
+
+The vocabulary (four states, four sources, five severities, four finding statuses) is
+duplicated in `0054_security_posture.sql`, which cannot import Rust. A test reads that
+migration and fails if a word exists in one list and not the other, so the two can drift only
+visibly — a red test rather than a filter that silently returns nothing.
+
+**Two asymmetries worth naming, because both were the wrong answer at first.**
+
+*A missing backup is `fail`; a missing dependency scan is `unknown`.* They look like the same
+case and they are not: "there is no backup" is a fact we can state without having read
+anything, while "we have never run a scan" is a fact about us. Collapsing them would let a
+platform with no backups read as merely unverified. The first version of the test asserted
+"unknown for everything with an empty world" and it caught this — the test was wrong, the
+asymmetry was the design, so the test now states the full expected map instead of a blanket
+rule, which means changing either default is a failure that names the check that moved.
+
+*The score weights `unknown` at 40, not 0 and not 100.* Zero punishes the platform for what
+it does not know, which is how a number stops being trusted; 100 is the over-claim the crate
+exists to avoid. The middle says "a question", which is what it is.
+
+**Also shipped.** The API behind three separate powers — `security.read` sees, `security.scan`
+re-runs and ingests, `security.manage` dismisses. `scan` is deliberately *below* `manage`:
+re-running the checks changes no configuration, while an ignore is a decision somebody will be
+asked to justify later, and granting both lets an account that can only look also dismiss what
+it saw. An uploaded report carrying a key shaped like a credential is refused **whole**,
+because this table is read by people and exported to CSV — a token in a description would move
+a secret from a CI log onto a screen designed to be shared.
+
+**Proof.**
+
+- `cargo test -p omnion-security -p omnion-permissions --lib` → **39 + 62 passed, 0 failed**
+- `cargo build -p omnion-api` → clean
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `60b45d9` (crate), `b2d82aa` (API + permissions), `7210ca3` (panel), `4208a7e` (QA)
+
+**Not done, and not claimed. No browser pass.** The single QA slot is held by a live w10 pass
+(holder pid 2521941, cwd `/mnt/apopic/omnion-w10`, still writing screenshots at the time of
+writing) — this time the blocker is named with its holder and its ports rather than written off
+as "the slot is held". `runSecurityDepth` is written and wired in; it is unrun, so the boxes
+naming a screen stay unticked. It asserts the one thing a fresh QA database makes falsifiable:
+with no MFA rows, no backup history and no header policy, the screen must say "Not checked
+yet" rather than "Verified".
+
+**Then, in the same tick, slice 1's last item: the CSV export.** An export is the one screen
+output that *leaves* the platform, so `crates/security/src/csv.rs` is written as though every
+row will be pasted into a ticket, an email and an auditor's spreadsheet. Three decisions, and
+one of them is the actual security fix:
+
+* **The export is the filter, not the page.** It ignores the page size on purpose. An operator
+  who filters to "critical", exports 50 of 300 rows and hands that to an auditor has produced
+  a document that reads as a complete list and is not one. A 50k-row cap applies instead, and
+  its refusal names the count and says "narrow the filter".
+* **A cell starting with `=`, `+`, `-` or `@` is prefixed with a tab.** Correctly quoting
+  `"=1+1"` does not help: a findings title can be a hostile package name, and a findings export
+  is exactly the document a person opens in a spreadsheet. This is the CSV injection the
+  security-export literature is actually about, and it is the reason this module is hand-written
+  rather than delegated to a helper nobody can check.
+* **The evidence blob is not exported.** Evidence is the raw report entry and this file leaves
+  the building. The ingest already refuses a document carrying something shaped like a
+  credential, but "the ingest checked" is not a reason to put the raw blob in a spreadsheet.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **51 passed** (39 + 12 CSV)
+- `cargo build -p omnion-api` → clean; `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `2585d72` (the CSV), `0d5a72e` (the endpoint and the button), `ab157fd` (this record)
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with **no `QA_STACK` override** and
+tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
+referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
+real to report, which is why those two rows are the most useful thing this tick left behind.
 
 ---
 
@@ -3023,401 +4455,7 @@ cycles here for a conclusion that is now a comment at the point of use.
 on it. Then slice 4: activities, the merged timeline, the read-only copilot, global search and the
 automation consumers (`form.submitted` → contact + deal, `sales.quote.accepted` → deal won). The
 `crm_activities` table already exists in the migration and is still unused.
-## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
-
-- **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
-  before any HTTP: **provider rows** (`providers.rs`, the `auth_providers` table of `0011` finally
-  read and written; a client secret never enters a row, it lives behind `secret_ref`), **the
-  challenge** (`challenges.rs`; the `state` every round trip is bound to, SHA-256 at rest, single
-  use, ten minutes, and *burned rather than retried* once somebody is guessing at it),
-  **OIDC/OAuth2** (`oidc.rs`; discovery, the PKCE challenge, RS256 verification and the
-  registered-claim checks `exp`/`iat`/`nbf`/`aud`/`iss`/`nonce`), **SAML 2.0** (`saml.rs`; the
-  assertion reader and its two independent signature checks) and **the protocol-neutral identity**
-  (`claims.rs`; one `Identity` shape every flow reduces to, plus the claim → role rules).
-  `database/migrations/0021_iam_sso.sql` adds the two tables a *running* sign-in needs —
-  `sso_challenges` and `auth_provider_events` — and nothing else: the provider row itself already
-  existed in `0011`. The number is **0021**, not 0019, because the sibling waves own 0019 (`w2`
-  `cms_blocks`) and 0020 (`w3` `automation_depth`); migration numbers are claimed per wave, and
-  three unclaimed worktrees have already collided on 0019.
-- **Proof (Rust).** `cargo test -p omnion-identity --lib` → **103 tests, 0 failures** (33 new on
-  this part). The cryptography is tested against *real* cryptography, not against itself: the
-  RS256 and SAML tests generate a 2048-bit key, sign, and require the module's verifier to accept
-  the genuine signature and reject a tampered one.
-- **The SAML signature check is two checks, and the second one is the one that matters.** XML
-  Signature binds a document to a key in two independent steps, and my first implementation only
-  did the first: verifying the RSA signature over `<ds:SignedInfo>`. The tamper test — change an
-  e-mail inside a validly signed assertion, keep the original signature — **passed**. The
-  `DigestValue` is what ties the `SignedInfo` to the assertion under the *enveloped transform* (the
-  element with its own `<ds:Signature>` removed); with it, the tampered document is refused
-  because the bytes changed. Skipping either check leaves a hole: the digest alone lets anyone
-  rewrite a claim, the signature alone signs the algorithm but not the document.
-- **Four more real bugs the tests caught, each a genuine defect rather than a test artefact.**
-  (1) A repeated `<saml:Attribute Name="groups">` was being dropped, so a directory that sends a
-  multi-valued attribute as several elements lost half a group membership and under-granted a
-  role. (2) `rsplit(':')` on `<saml:Assertion xmlns:saml="urn:…:assertion">` returns the
-  *attribute value*, because a colon inside an attribute looks exactly like a namespace separator —
-  the qualified name has to be located before the prefix is dropped. (3) A closing tag is spelled
-  with the prefix the document used, so searching for `</Assertion>` found nothing. (4)
-  `<ds:SignatureMethod Algorithm="…"/>` has no text; the algorithm is its attribute, and reading it
-  as text fails silently three frames deep.
-- **The disk is a blocker, and it is an environment problem rather than a code one.**
-  `/mnt/apopic` is one 60 GB loop image shared by **eight** worktrees' `target/` directories, and it
-  hit **100% full twice during this tick** — each time inside a `write_file`, which then failed with
-  "No space left on device". The reclamation is deliberately conservative: only **derived**
-  artifacts were removed (`target/debug/{deps,incremental,build}` and the incremental caches) and
-  only in worktrees with no live `cargo`/`rustc` and no running pm2 process; no source file, no
-  branch, no sibling's running server was touched. The siblings rebuild within minutes and refill
-  the volume, so the headroom is temporary. **Owner action:** the box needs more room, or the
-  unclaimed `omnion-w4`…`omnion-w7` worktrees (≈12 GB of cargo target plus 454 MB of
-  `node_modules` each) should be pruned — no wave owns them yet.
-- **Next.** The same slice's remaining part: the API surface (`GET/POST /iam/providers`,
-  `PATCH/DELETE /iam/providers/{id}`, `POST /iam/providers/{id}/test` for the discovery check, and
-  the public `GET /api/v1/auth/sso/{slug}/start` + `POST …/callback` pair), JIT provisioning and the
-  claim → role binding on sign-in, the `iam.signin.*` events, the `/settings/iam/authentication`
-  panel screen, the `apps/api/tests/sso.rs` integration walk (sign in against a stub provider → JIT
-  account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
-  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
-  REQ.
-
-## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
-
-- **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
-  that proves both. **`61ef619`** — `crates/identity/src/sso/provisioning.rs` (JIT: match on the
-  stored subject index first, the address second, `JIT_PASSWORD_MARKER` in place of a password,
-  and a *refusal* rather than a silent row when provisioning is off); the identity HTTP client
-  grows the two calls the `code` flow needs; `/api/v1/iam/providers` (list, connect, patch, remove,
-  `…/test` for the discovery check, `…/events` for the sign-in log); and `/api/v1/auth/sso`
-  (the public `providers` list, `start`, the generated SAML panel page, and the `callback` that
-  answers both a `code` query and a posted assertion). **`f599c3c`** — `/settings/iam/authentication`,
-  the nav entry, the API client and the `iam-authentication` pass in `scripts/qa/walkthrough.cjs`.
-  **`apps/api/tests/sso.rs`** — the integration walk.
-- **Proof.** `cargo test -p omnion-identity --lib` → **107 tests, 0 failures**. `cargo test -p
-  omnion-api --lib` → **97 tests, 0 failures**. `cargo test -p omnion-api --test sso` → **1 walk,
-  0 failures** over the real router: the management surface (401 without a session, an empty
-  organization listing no provider and three kinds), a provider created **switched off with JIT
-  off**, the secret answered as a *name* plus a boolean (`secret_present: false` for a variable
-  this process does not define) and no `client_secret` field anywhere in the payload, a bad
-  `secret_ref` refused with `details.field = secret_ref`, an unreadable role mapping refused at save
-  time, the discovery test answering `200 {status: "failed", detail: …}` for an unreachable host, a
-  disabled provider `404 provider_disabled` **and written to the sign-in log**, JIT refusing then
-  provisioning the same identity to `Created` with the marker in `password_hash` and the subject
-  indexed under `sso_subjects`, the second sign-in `Existing` on the same account, a deactivated
-  account staying deactivated, the event log readable over HTTP, removal taking the log with it
-  (`on delete cascade`), and an ambiguous host answered `501 organization_required` rather than
-  guessed.
-- **The two design decisions this tick actually settled.** (1) **A public sign-in has to resolve
-  its own organization.** My first version took "the installation's only organization", which is
-  right for a first-run install and *silently wrong* for a second tenant — a sign-in link for one
-  organization could complete against another. The walk caught it by creating a second organization.
-  It now follows the same rule the public content surface uses: the browser's own host answers for
-  its site, and a site belongs to an organization; several organizations and an unknown host is an
-  honest `501` naming the fix. (2) **A refusal is a fact, not a silence.** A disabled provider
-  refusing to start wrote nothing, so an operator who switched a provider off and then wondered
-  "is anybody still trying to sign in with it?" had no way to find out. `live_provider` now writes
-  the `auth_provider_events` row before refusing.
-- **Two test-authoring bugs the walk caught in itself, both worth naming.** A group claim is only
-  read when the provider *names* one, so a test provider with `group_claim: None` proved nothing
-  about groups — the fixture was wrong, not the code. And a test fixture that registers a globally
-  unique host has to clear a stale one first, or the second run fails on the first run's leftovers.
-- **The disk is still the constraint, and it is an environment problem rather than a code one.**
-  `/mnt/apopic` (one 60 GB loop image shared by eight worktrees' `target/`) fell to **3.1 GB free**
-  during this tick. Reclamation stayed conservative and derived-only: `target/debug/{deps,
-  incremental,build}` in the **unclaimed** `omnion-w5` and `omnion-w7` worktrees, neither of which
-  had a live `cargo`/`rustc`; no source, no branch, no running process touched. That returned
-  17 GB. **Owner action:** the box needs more room, or the unclaimed `omnion-w4`…`omnion-w7`
-  worktrees should be pruned — no wave owns them yet.
-- **A note on where the walk runs.** The shared dev database `omnion` has migration **19** applied
-  from a sibling branch that `main` does not have, so `db.migrate()` refuses with
-  `VersionMissing(19)` and every integration test that migrates fails there. CI starts a clean
-  database and is unaffected. The walk was proven against a fresh `omnion_sso_test` database.
-  **Owner action:** either reconcile the 0019 slot between the waves, or point the local
-  integration runs at a per-branch database.
-- **Next.** The one thing the walk deliberately does not fake: a **full round trip against a live
-  OIDC/SAML provider**. That needs a local stub identity server the walk can point at — discovery
-  document, JWKS, token endpoint and a signed ID token for OIDC; a signed assertion with the
-  enveloped digest for SAML — so the `code` exchange, the RS256 verification, the PKCE binding and
-  the claim → role mapping are all proven end to end rather than one layer at a time. Then
-  `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
-  REQ.
-
-## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
-
-- **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
-  were already ticked, but nothing had ever *executed* the folder move, the trash listing or a
-  filtered listing against a real database — the walk that asserts the audit rows for
-  `media.folder_moved` and `media.folder_deleted` never performed a move or a delete. This tick
-  made the walk real and then fixed what it found.
-- **Six defects, none of them visible to the layer that owned them.**
-  1. **Every filtered listing was broken.** The clause was built as a string containing `$n` *and*
-     the value was pushed as a bind, so the statement read `folder_id = $2$2` and PostgreSQL
-     answered "syntax error at or near $2". An unfiltered listing worked, which is exactly why no
-     earlier test saw it. `Filter::push` now writes clause and value together, so a placeholder can
-     only exist where the value beside it was pushed.
-  2. **`make_interval(days => $2)` with a bound parameter.** PostgreSQL cannot infer the remaining
-     arguments of a named-argument function, so it picked a `numeric` overload and sqlx failed to
-     decode. Replaced with `$2::bigint * interval '1 day'`, which is unambiguous.
-  3. **`sum(size_bytes)` returns `numeric`.** sqlx will not decode `numeric` into an `i64`, so the
-     trash summary answered 500. Cast back to `bigint`.
-  4. **`ORDER BY` inside an `UPDATE`.** PostgreSQL has no such clause; the folder move 500'd on
-     every call. The ordering premise it encoded was wrong anyway — one `UPDATE` evaluates every
-     row against the pre-update snapshot, so no ordering is needed.
-  5. **A folder move self-parented the folder.** The parent was resolved by the moved folder's *own*
-     new path, so `parent_id` became the folder itself on every move, and the first move of a
-     top-level folder hit `media_folders_root_name_idx`. The parent is now resolved by the
-     *parent's* path.
-  6. **An omitted `parent_id` meant "move to the root"** although the body documents "omitted keeps
-     the current one" — so renaming a nested folder silently relocated it to the top. A no-op move
-     is also no longer reported as `folder_cycle`, which is a cycle where there is none.
-- **Two more honest answers.** A `folder_not_empty` refusal now has a tested counterpart (an empty
-  folder deletes, and a deleted folder is a `404` by id so a stale deep link names what is missing),
-  and a move to where a folder already is is a no-op.
-- **Proof.** `cargo test -p omnion-media --lib` → **25 tests, 0 failures** (three new: every filter
-  and every combination refuses to write a placeholder twice, the subtree clause binds its folder
-  once per mention, the tag clause compares from the placeholder side). `cargo test -p omnion-api
-  --lib` → **105 tests, 0 failures**. `cargo test -p omnion-api --test media` against
-  `omnion_test_main` → **8 walks, 0 failures**, over the real router: the tree refused without a
-  session and to an account with no media permission, a site created after the migration still
-  materialises one root, folders create/rename/move/re-parent/delete with the subtree rewrite read
-  back out of the row, a cycle and a duplicate sibling name and a blank name each refused by name,
-  a file moves between folders without its storage key changing, a filter narrows the listing and
-  the total follows, a `like` wildcard in a search term is treated as text, the trash lists the
-  deleted file with a real countdown, restore returns it to its folder, purge removes the bytes as
-  well as the row, and every privileged step left an audit row. `pnpm typecheck` green. clippy adds
-  no new warning.
-- **Environment note.** The shared dev database `omnion` still carries a sibling's migration 19,
-  so the walks run against `omnion_test_main`. `/mnt/apopic` was at 98% again; reclaiming
-  `target/debug/incremental` in this worktree returned 2.9 GB.
-- **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
-  history, the preview pipeline and the file detail screen do not.
-
-## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
-
-- **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
-  replaced file keeps its old bytes, the panel can see every version, and a restore brings an old
-  one back *as a new version* rather than by rewriting history.
-- **The migration the plan assumed already existed.** The last tick's handover note said
-  "the `media_versions` table exists". It did not — `0025` created folders, browser columns and
-  the trash, and nothing had ever written a version row. So slice 2 ships `0026`, which creates
-  the table and backfills version 1 for every existing file, **copying `created_at`** rather than
-  stamping `now()`. A history that starts at the migration date is a lie about when the file
-  arrived, and it is exactly the kind of lie that is invisible for a year.
-- **Three rules, each a place a shortcut produces a plausible wrong answer.**
-  1. **A version is append-only.** A restore *copies* the old bytes to a new key and appends the
-     copy. Rewriting a row would make "what did this file look like on day 3" depend on whether
-     anybody took a shortcut in between.
-  2. **The number comes from the database.** `next_version` reads `max(version)` under
-     `for update` on the `media` row — a *scalar subquery*, because `FOR UPDATE` on an aggregate
-     is a no-op in PostgreSQL. Reading the max in Rust would open a window between two reads and
-     let two concurrent replaces both claim 4, which surfaces as a "duplicate key" error that
-     names the index and not the cause.
-  3. **A number is never reused.** A pruned version leaves a hole.
-- **The transaction is opened by the crate, not the route.** This was fought out with the
-  compiler: a route-held `sqlx::Transaction` surfaces `sqlx::Error` where everything else in
-  `omnion_media` is a `MediaError`, and `ApiError` has `From` for the latter but deliberately
-  **not** for the former. `omnion_media::begin_version` / `commit_version` hand back only
-  `MediaError`, which is the honest boundary: the library owns the transaction because the
-  guarantee rule 2 exists for spans it.
-- **The header probe reads 64 KB, not the file.** `crates/media/probe.rs` pulls dimensions,
-  duration and page count out of the *header* for PNG, GIF, JPEG, BMP, TIFF, WebP (all three
-  containers), MP4/QuickTime, WebM, WAV, MP3, Ogg and PDF. A 4 GB video upload must not cost a
-  full read to learn it is 12 minutes long. Every extractor answers "I do not know" rather than
-  guessing — a wrong dimension breaks every layout that reads it and is not obviously wrong once
-  it is stored. Two findings the unit tests forced out: a WebP canvas stored as `0` is a corrupt
-  header, **not** a one-pixel image (reading `0 + 1` would put a 1×1 box on screen for a file
-  that has no size), and one blanket 30-byte minimum across the three WebP containers refuses a
-  short-but-complete `VP8L` header.
-- **The walk corrected a test that had been asserting a route which never existed.** The walk
-  read the current bytes from `/api/v1/media/files/{id}/raw` and got an empty body: the file
-  manager's *listing* is `/media/files`, the read is `/media/{id}/raw`, and no route was ever
-  registered at the address the test used. Three more corrections came out of the same run — the
-  404 is `media_not_found` (not `file_not_found`), an empty upload answers `invalid_request`
-  (not `file_empty`), and the history reads **newest first**, so a check written against an
-  assumed oldest-first order fails on a correct response.
-- **The fixture leaked objects until it read the union.** Cleanup read `media.storage_key`, but a
-  replace *moves* that column to the new key — the old one is named only by the history, so every
-  replaced version's object stayed in the bucket. A test cleanup that misses them is a slow leak
-  that nobody notices for a month.
-- **Proof.** `cargo test -p omnion-media --lib` → **46 tests, 0 failures** (24 new, mostly header
-  probes and the version key rules). `cargo test -p omnion-api --lib` → **109 tests, 0 failures**.
-  `cargo test -p omnion-api --test media` against `omnion_test_main` → **11 walks, 0 failures**,
-  over the real router: a replace leaves version 1 downloadable and **byte-identical** (compared
-  as bytes, not as a length — a length check would pass by accident on an overwrite), the row
-  points at the version it serves, the three versions own three keys, a download of an old
-  version is an attachment named `hero-v1.png`, a restore appends version 3 with version 1's
-  checksum while version 2 is untouched, and the routes refuse without a session, without
-  `media.read`, and name a missing version by number. `pnpm --filter @omnion/admin typecheck`
-  green. The QA pass ran on the default stack.
-- **Environment note.** `/mnt/apopic` was at 99 % (610 MB free) when the tests finished; this
-  worktree's `target/debug/incremental` returned 1.2 GB and the unclaimed `omnion-w5`/`omnion-w6`
-  worktrees' `target/` returned a further 2.7 GB. **Owner action:** those worktrees hold build
-  artefacts for waves nobody has started; they will fill the image again.
-- **Next.** Slice 3 — transformation presets with a content-addressed cache, per-site storage
-  settings with a connection test, the CDN purge hook, share links and duplicate detection with
-  merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
-  serve path, and EXIF extraction.
-
-## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
-
-- **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
-  gave it *derivatives*: a page asks for `?preset=card` and gets the same pixels every time,
-  built on the first request and addressed by a hash of its inputs.
-- **The dependency the plan did not mention.** A preset has to *produce* pixels, which means
-  decoding, resampling and re-encoding. The workspace had no image crate, so this tick adds
-  `image` (png/jpeg/webp only — the three codecs a preset can emit). Shelling out to a binary
-  was the alternative and was rejected: it makes the API's correctness depend on what happens to
-  be installed on the host, and the test suite would skip itself on a machine without it.
-- **Two fits are not one fit.** `cover` crops and `contain` letterboxes, and the first version
-  gave both the same resampler. It produced a correctly-sized *crop*: it passes a square-crop
-  assertion and is wrong on every non-square source, which is most of them. A `contain` result is
-  now pasted onto a canvas of the box's size, so a thumbnail is a stable 320×320 rather than a
-  320×180 that shifts the layout every time a differently-shaped image is uploaded.
-- **A request never enlarges.** A 2400px request against a 1200px source is refused with an
-  explanation instead of being answered with a blurry upscale that is *larger* than the original.
-  The check is `>`, not `>=`: asking for exactly the source's own size is the identity, and a
-  template that names the same number twice is not a mistake. The unit test forced this — the
-  first version refused the identity too, which would have broken the seeded `standard` preset on
-  a 1200×630 hero.
-- **The cache key is a hash of the definition, not of (file, preset).** A pair lookup would serve
-  stale pixels after an edit, because the pair is unchanged while the definition moved. With a
-  key lookup, an edit produces a key nobody has seen, so the old entry becomes *unreachable*
-  rather than *wrong* — and the response may honestly say `max-age=31536000, immutable`.
-  Quality is in the key, and that is the field people forget.
-- **Three defects the real router found that a unit test on `transform_bytes` could not.**
-  1. The derivative header carried the **object key** where the identity belongs. The two are
-     different strings that both appear in the module, and the response builder took one
-     parameter where it needed two — so a caller that read the header and looked it up in
-     `media_derivatives.cache_key` found nothing. A header that looks like an identifier and is
-     not one is worse than none. Both are now fields of a struct, because three positional
-     `&str`s is the shape that produced the bug.
-  2. **A site created after the migration got no `standard` preset.** The `0027` seed covers the
-     sites that existed when it ran, so a page already asking for `?preset=standard` would
-     silently fall back to full-size originals — on new sites only, which is exactly where nobody
-     is looking. It cannot be fixed in the migration, because the gap is between "the migration
-     ran" and "somebody creates a site", and it cannot be fixed in the create path either:
-     onboarding, the tenancy API and a future import all insert the row themselves. It is a
-     trigger (`0028`), which is the only place guaranteed to see every site.
-  3. A test asserting **"the first call builds" passes once and fails for ever after.** The row
-     is keyed by the source bytes, and a re-run reproduces them exactly, so the second run is a
-     cache hit. The assertion now checks the answer is correct either way and that the key is
-     stable — the property that actually matters.
-- **Proof.** `cargo test -p omnion-media --lib` → **78 tests, 0 failures** (32 new). Five walks
-  over the real router in `--test media_transform` → **0 failures**: the bytes are compared *as
-  bytes* and decoded again (a length check passes by accident on an overwrite), the second
-  request is byte-identical to the first, the object is read back out of the store and compared
-  against what was served, the old row survives an edit, a delete cascades the cache away, an
-  unknown preset returns the original *byte for byte* with no derivative key, an SVG answers
-  `not_transformable` naming its type, and every preset field error names the field that caused
-  it. The pre-existing `--test media` → **11 walks, 0 failures**, unchanged, against the raw route
-  that now takes a query parameter. `cargo test -p omnion-permissions --lib` → 62 pass.
-  `pnpm --filter @omnion/admin typecheck` green.
-- **The QA pass (`bash scripts/qa/run.sh`, default stack) — clean for this slice.** 954 clicks,
-  988 screenshots, the new `/media/settings` route walked and clicked (28 elements), and the depth
-  pass drove it: created a preset, submitted an out-of-range quality and **the field error named
-  it**. Vision review returned **0 high / 0 medium / 0 low**. The page's own diagnostics read
-  *overflow: no · offscreen: 0 · broken images: 0 · low contrast: 0 · unlabeled inputs: 0 ·
-  duplicate ids: 0 · h1: 1*. The four high findings the run reports are the walkthrough's **own
-  deliberate error-state probes** — `/media?folder=nonexistent-folder` and the 400/404 they
-  produce — none of them from this slice.
-- **Two things the pass taught about this slice's own screen.** The seeded `standard` preset *is*
-  present on a QA site (checked directly in `omnion_qa`, and the trigger in `0028` fires for a
-  site created afterwards), so the walkthrough's `seeded: 0` was its own text match, not a gap —
-  which is why the number was checked against the database rather than believed. And the preset
-  example URL is a `<code>`, not an anchor: the first depth pass looked for `a[href^="/api/v1/
-  media/"]`, found none, and reported "no preset example URL" for a screen that had one on it. An
-  `<a>` pointing at a placeholder id would only have proven a 404 — the same mistake the route
-  inventory already made once with `/media/files`. The pass now reads the query the screen
-  actually renders and builds a real URL with a real file id.
-- **A compiler lesson, fought out over a long wrong turn.** Every guarded route in this codebase
-  is written `get(handler).layer(guards::require(...))`, and the new routes refused to compile
-  with a bare `type annotations needed for MethodRouter<AppState, _>`. The guard's service impl
-  requires the inner service's `Error = Infallible`, and inference cannot pick `Infallible` out of
-  the several `From<Infallible>` impls in scope. Every existing route gets away with it because
-  the *later* `.merge()`/`.route()` calls in the same chain pin the type. The fix is a
-  `MethodRouter<AppState, Infallible>` annotation on the three new bindings — the same fix the
-  compiler suggested and that reading the guard's own bound would have given in one minute.
-- **Environment.** `/` was at 99 % and `/mnt/apopic` at 100 % during the run — MinIO refused
-  writes with `XMinioStorageFull` and three walks failed on a storage error that had nothing to do
-  with the code. Reclaiming `omnion-live/target` and `omnion-w5/target` (worktrees for waves
-  nobody has started) plus this one's stale `deps` binaries returned ~4 GB. **Owner action:** the
-  eight worktrees under `/mnt/apopic` hold ~30 GB of `target/`, and this is the second tick in a
-  row that has had to delete another loop's build cache to finish its own tests.
-- **Next.** Slice 3 continues — per-site storage settings with a connection test and public base
-  URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
-  with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
-  Usage and Activity tabs, which need `media_references` and arrive with slice 4.
-
-## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
-
-- **What.** The third third of slice 3: `0036_media_shares.sql`,
-  `crates/media/src/shares.rs`, `apps/api/src/routes/media_shares.rs`,
-  `apps/api/tests/media_shares.rs`, `features/media/shares-tab.tsx` (a **Share** tab on
-  `/media/files/{id}`), the client methods and the `MediaShare`/`CreatedMediaShare` types, and a
-  walkthrough depth pass. Six design decisions, each a shortcut that produces a plausible wrong
-  answer:
-  1. **The token is stored hashed and nowhere else.** The row holds `sha256(token)` under a
-     unique index, so a backup, a replica log or a support engineer with read access comes away
-     with a list of *dead* tokens, and the lookup is still one probe. The round trip runs one way
-     only, and the row type has no field the plaintext could occupy.
-  2. **A share reaches a file; it does not bypass what the file is.** Servability is decided at
-     *serve* time, not at creation — a link made yesterday must not keep serving a file the
-     scanner has since flagged.
-  3. **`revoked` and `expired` are the same answer (410), `password_required` is 403.** Telling
-     the two dead states apart would hand a token prober a free oracle; answering "type the
-     password" with 410 would send the owner a pointless request.
-  4. **The counter counts bytes that were served**, in its own statement, so a failure after the
-     bytes went out cannot roll it back.
-  5. **Revocation is a write, not a delete** — the row is kept with its reason forever, because
-     that is the only thing that makes a leaked link investigable.
-  6. **The screen has no `Copy` on an existing row, and cannot.** The token is returned once;
-     a copy button there would silently copy nothing.
-- **Proof.** Five walks over the real router in `--test media_shares` → **0 failures**. The
-  stored value is read **out of the database** rather than inferred from a response that hid the
-  token; the list is scanned over its raw bytes for the token and for a field named `token`; the
-  served bytes are compared as bytes and `no-store`/`nosniff`/`attachment` are each checked; the
-  counter moves once and survives the revocation; the revoked row keeps its reason and instant; a
-  reader may read the list and may neither create nor revoke; anonymous is refused on both; a
-  share id on another file is a 404, not a 403. `cargo test -p omnion-media --lib` → **98**,
-  `cargo test -p omnion-api --lib` → **116**, and `--test media` (11), `--test media_settings`
-  (2), `--test media_transform` (5) are unchanged and green. `pnpm --filter @omnion/admin
-  typecheck` green.
-- **Three defects the walks found, none of which a unit test on `servable` could see.**
-  `find_media` returns the *base* `Media`, which has no `deleted_at` and no `scan_status` — the
-  two columns the whole "a share does not bypass the file" rule depends on, so the first draft
-  asked the wrong struct and the compiler found the fields missing. `POST /shares` with no body
-  answered **415**, because the handler demanded a JSON body for the most ordinary call anybody
-  makes ("give me a link until I revoke it"); the same for the `DELETE`. And `rand` is a
-  *dev*-dependency of `apps/api`, so token minting moved into the crate, which is where the
-  width and the source belong anyway.
-- **A test that reaches for a state the platform forbids.** The expiry walk set
-  `expires_at = now() - 1s` and the `media_shares_expiry_sane` check refused it — a link whose
-  expiry precedes its own creation is nonsense. The walk now ages the row by moving `created_at`
-  back instead, which is the only way to reach the same state and the reason the check is there.
-- **Environment.** `/mnt/apopic` hit **100 %** (89 MB free) mid-tick and MinIO refused every
-  object write with `XMinioStorageFull`, which reads as a storage bug and was none. The cause is
-  this worktree's own `target/`: **8.3 GB of rebuildable test binaries** plus 874 MB of `.tmp`
-  leftovers from interrupted linkers. Reclaiming *only this worktree's* artifacts returned 8.5 GB
-  (86 %). **Owner action:** the seven worktrees under `/mnt/apopic` hold ~30 GB of `target/`; a
-  shared `CARGO_TARGET_DIR` is the structural fix, and this is the third tick to have had to
-  delete its own build cache before it could run a test.
-- **Next.** Slice 3 closes with duplicate detection and the merge (checksum groups, reclaimable
-  size, `Keep this one` + `Merge group`, references repointed and the copies trashed), then the
-  CDN purge hook to REQ-011. Still open: EXIF (slice 2), HTTP range requests on the serve path,
-  and the Usage and Activity tabs, which need `media_references` and arrive with slice 4.
-
-- **The QA pass did not complete this tick — and not because of this slice.** The pass got its
-  QA slot after ~30 minutes of waiting behind sibling stacks, walked 434 clicks through
-  `/media` (40 elements), `/media/trash` (26), `/media/settings` (30) and the IAM screens, and
-  then stopped advancing at `iam-service-accounts` with the walkthrough process at 0 % CPU. The
-  cause is the machine, not the code: **seven QA stacks are running at once** — 40 Chromium
-  processes, load average **36**, and **127 MB free of 33 GB**. The walkthrough outlived the
-  browser context, which is the "tab died under parallel passes" case already documented for
-  this box, so no findings were produced and none are claimed. The share walk added this tick
-  (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
-  next tick runs it. The storage walk from the previous tick was committed for the same reason
-  and the API-level proof for both is the Rust suite, which is green.
-
 ## 2026-09-28 — the board answered 404 on every organization created after its own migration
-## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
 
 **What.** `0022_crm.sql` wrote `crm_seed_default_pipeline(organization)` — the function that
 builds a pipeline and its six stages — and then called it exactly once, in the same statement
@@ -3475,217 +4513,6 @@ the tree the box-wide disk guard spares). `/mnt/apopic` sat at 86% with 8.2G fre
 compile at once, so a build can sit at 0% CPU for minutes before it is scheduled at all. The
 CRM walk suite is **~11 minutes** on its own (`--test-threads=1` against the shared database), so
 it does not fit inside a foreground call and is run as a background process.
-
-- **What.** The last open item of slice 3: what the *camera* said about its own picture. The
-  geometry probe already read a file's size from its header; this reads the other half of what an
-  editor asks about a photograph — which body took it, at what shutter speed, with which lens, on
-  which day. `crates/media/src/exif.rs` (the reader), `0042_media_exif.sql` (the column), the
-  `exif` column on `media` plus the `display_width`/`display_height` pair on the file response, and
-  the Metadata tab's **Camera** block.
-- **Six decisions, each a shortcut that produces a plausible wrong answer.**
-  1. *A TIFF header is not EXIF.* The IFD format is shared by TIFF, GeoTIFF and half a dozen
-     makers' proprietary blocks; what makes the block EXIF is the `Exif\0\0` signature inside a
-     JPEG `APP1`, an `EXIF` chunk in a WebP or an `eXIf` chunk in a PNG. The container is checked
-     before any TIFF parsing runs.
-  2. *Nothing is read from outside the prefix.* Every field's value may be an *offset*, and an
-     offset is attacker-controlled. Every read is a range request whose failure is the answer.
-  3. *A zero denominator is absent; `1/200` is not.* The first guard refused the normal case
-     (`den > num`) and kept the corrupt one — the exact inversion, which is how a reader ends up
-     with no shutter speed on every photograph and a divide-by-zero on the one broken file.
-  4. *Orientation changes the box, not the file.* Values 5–8 store the picture sideways and
-     browsers rotate it themselves, so a grid reserving `width × height` reserves the wrong box and
-     shifts every image below it. The stored columns carry the oriented pair, the raw value stays
-     in the record, and the API sends both readings.
-  5. *A GPS fix is a flag, never coordinates.* There is no field in the type a coordinate could
-     occupy, so a media library cannot quietly file an operator's home address into a row that
-     search, an API key and a share link can all read.
-  6. *A replacement replaces the record.* A screenshot over a camera original must not keep
-     claiming to have been shot on a body it was never near.
-- **The QA pass did not complete, and it found the tick's one real bug anyway.** The full pass ran
-  629 clicks and then died with `Target page, context or browser has been closed` — the
-  "browser context dies under parallel passes" case already documented for this box, with 21
-  sibling QA processes and 0 GB free at the moment it failed. So the gate is **not** claimed as
-  green this tick. What *did* run is `scripts/qa/probe-media-camera.cjs`, a one-screen probe added
-  because "the full pass crashed" and "the screen is broken" must not read the same in a log: it
-  signs in, uploads a JPEG that really carries a block, reads the block's rows and reads the
-  API's own response — **13/13 checks pass**.
-- **The bug it found: the rotation was applied twice.** The writer already stores the *oriented*
-  geometry (an orientation-6 4000×3000 frame is written as 3000×4000), and `display_size()` then
-  applied the swap again on the way out — so the panel reported a landscape picture for a portrait
-  photograph, and the facts list read `4000 × 3000` for a file every browser draws tall. The unit
-  test on `oriented_size` passed the whole time, because the function was correct; it was being
-  called on the wrong input. This is the case the QA pass exists for and the Rust suite cannot
-  see, and it is why the fix ships with a regression test shaped like the bug: a row carrying the
-  oriented columns *and* the record that produced them.
-- **Proof.** 19 new unit tests in `exif.rs`, 5 in `model.rs` and two walks over the real router →
-  0 failures. Both
-  walks read the column **out of PostgreSQL**, because a response that omits a field is
-  indistinguishable from one that stored it and chose not to say so. An orientation-6 frame of
-  4000×3000 stores 3000 and 4000; a text file grows no record; a replacement in a format with no
-  block clears it and the geometry falls back to the frame's own; a restore brings version 1's
-  record back; the serialised object is scanned for `lat`, `lon`, `GPSLatitude`, `GPSLongitude` and
-  `altitude`. `cargo test -p omnion-media --lib` → **122** (was 98), `-p omnion-api --lib` → **122**,
-  and `--test media` (13, was 11), `--test media_transform` (5), `--test media_settings` (2),
-  `--test media_duplicates` (6), `--test media_shares` (5) are unchanged and green. `pnpm
-  --filter @omnion/admin typecheck` clean. The migration applies across the whole set on a fresh
-  database.
-- **The QA pass had to grow a screen before it could test one.** The library pass uploads a PNG,
-  and a PNG carries no EXIF — so the Camera block would only ever have been seen in its empty
-  state, which the "no untested screen" rule forbids. The pass now *builds* a JPEG that carries a
-  real block, uploads it, opens its detail screen and asserts the body, `ISO 400`, `1/200 s`,
-  `f/1.8` and the rotated dimensions.
-- **Four bugs the walkthrough's own JPEG builder had, each of which produced a file that read as a
-  parser bug and was really a builder writing the format wrong.** The TIFF block is little-endian
-  while the JPEG framing around it is big-endian, so a segment length written with the block's
-  `u16` reads as a 57 KB segment in a 253-byte file and the block is then unreachable; a directory
-  is a count plus its entries plus a four-byte next-directory pointer, and the two that get
-  forgotten put every later offset on the wrong field; a value offset is measured from the start of
-  the *block*, not from the directory that holds the entry, so a value laid down before the
-  sub-directory exists is overwritten by it; and a RATIONAL is two words wide rather than four
-  bytes, so a cursor that steps by the entry's width lands every rational after the first on the
-  wrong field. None of the four would have been found by a screenshot — the file simply had no
-  camera record and the screen showed its empty state, correctly.
-- **Environment.** `/mnt/apopic` sat at **94 %** (3.6 GB free) on entry, and this worktree's own
-  `target/` was 9.9 GB of it. Reclaiming *only this worktree's* `target/debug/incremental`
-  (verified first: no live `cargo` holds it) returned 1.7 GB. **Owner action:** the worktrees under
-  `/mnt/apopic` still hold ~30 GB of `target/`; a shared `CARGO_TARGET_DIR` is the structural fix.
-- **Next.** Slice 4 — folder and file grants with inheritance, the scanning pipeline with
-  quarantine and release, retention policies with the daily worker, and reference-based purge
-  refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
-  and releasable, and a retention run removes exactly the eligible rows.
-
-## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
-
-**What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
-could render a badge and the badge could only ever read `pending`. This tick gives that column a
-pipeline behind it — `0044_media_scanning.sql` (a per-site policy, a quarantine table with a
-history, a run log, plus the two `media` columns the pipeline needs and `0025` never created), the
-crate module `crates/media/src/scanning.rs`, the API in `apps/api/src/routes/media_scan.rs`, and
-the **Scanning** tab on `/media/settings`. Seven routes; the gate is on *every* serve path, not
-just the one the spec names: the panel raw route, the public renderer, the preset path **including
-its cached derivatives**, both version paths, and the share token route.
-
-**Seven decisions, each a shortcut that produces a plausible wrong answer.** An unrecognised
-scanner answer is an *error*, never a pass (pinned against a scanner that answers
-`{"verdict_code": 3}` over a real socket); a file above the size ceiling is `skipped` and never
-`clean`; a clean scan leaves `scan_detail` **empty** so a report that greps it cannot find a
-positive on every file; a quarantine row is closed and never deleted, so a file flagged twice has
-two events; a release requires a reason and lands the row on `skipped`, not `clean`, because
-nobody has said the file is *safe*; another tenant's quarantine is a `404` and not a `403`; and a
-**flag is a fact rather than a policy question** — `on_error` speaks to the *absent* verdict
-(`pending`, `error`) and never overrules a `flagged` row.
-
-**Three defects found by the walks, none of which a unit test could have seen.** The claim query
-selected `id` while the row type called the field `media_id`, and sqlx's `FromRow` maps by
-*column name* — so the sweep died with `no column found for name: media_id` on the first file,
-which reads as a broken query rather than a missing alias. `0025` never created `media.scanned_at`
-at all, so **every verdict write failed**, and because the route counted the error both as a
-verdict and as a write failure, a one-file run reported `errors = 2` — a number with no reading
-an operator can act on. And `sum(bigint)` decodes as NUMERIC, so the quarantine byte total could
-not be listed at all.
-
-**The one that matters was found by a suite I did not write.** `media_shares.rs`'s
-`a_link_stops_serving_when_its_file_stops_being_servable` failed on my change: the first gate had
-an early return for a site with scanning *disabled*, and the walk switches the scanner off before
-flagging a file by hand. The regression was real and it was the shape of the bug: a flag is a fact
-about the bytes, and turning the scanner off is a decision about *future* uploads, not a way of
-forgetting a verdict somebody already reached. Fixed in the crate (`may_serve` now reads
-`enabled` itself, with a test that runs all four `enabled`×`on_error` combinations) rather than at
-the call site, so the panel and the share link cannot drift apart again.
-
-**Proof.** `--test media_scan` → **10 walks, 0 failures**, each against a **hand-rolled scanner on
-a real loopback socket** rather than a stubbed function: the client is where an outage lives, and
-a sub-app would share every assumption the client makes. A **dead port** proves the ingest rule
-(upload succeeds, row reads `error`, `hold` refuses with `file_scan_failed`, and flipping
-`on_error` to `serve` changes the answer on the *next* request because the policy is read per
-request, not cached). A `Nonsense` scanner proves fail-closed. A clean scanner proves a clean file
-serves with its real bytes and an empty sweep still writes a run. A trashed file is never claimed.
-Both walks that assert a row read it **out of PostgreSQL**, because a response that omits a field
-is indistinguishable from one that stored it and chose not to say so. `cargo test -p omnion-media
---lib` → **148** (was 122), `-p omnion-api --lib` → **127** (was 122); `--test media` (13),
-`--test media_shares` (5) and `--test media_transform` (5) are green against the routes this
-touches. `apps/admin` `tsc --noEmit` clean.
-
-**Environment.** Two things worth recording. The shared development database has a sibling wave's
-migrations applied, so `cargo test --test media_*` dies with `VersionMissing(19)` before it reaches
-a single assertion — `scripts/qa/run-media-walk.sh` gives each suite its own disposable database,
-which is what a suite that must be *believed* to have run needs. And `reqwest` was a **dev**
-dependency of the API crate: the scanner client needs it at runtime, so it is now a real one.
-
-**Next.** Slice 4's remaining half — folder and file grants with inheritance, a deny beating an
-inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
-and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
-the raw route and a retention run removes exactly the eligible rows.
-
-## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
-
-**What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
-readable: `GET /api/v1/media/{id}/references` (where a file is used) and `/activity` (what has
-been done to it), `crates/media/src/usage.rs`, `omnion_audit::for_target`,
-`features/media/{usage,activity}-tab.tsx`, and the two tabs on `/media/files/{id}`. Both reads are
-`media.read`, and both load the file through its own site scope — including a **trashed** file,
-because "what happened to this" is asked precisely after the deletion.
-
-Five decisions, each a shortcut that produces a plausible wrong answer:
-
-  1. **Records and rows are reported apart, and the sentence says which it means.** A page
-     naming one hero in three fields is one record and three rows. The summary is the server's,
-     not the panel's, so the two cannot disagree about what the integers mean.
-  2. **A reference whose record is gone is rendered unresolved, with no link, and names its own
-     fix.** It refuses a purge for ever; a list that dropped it would shorten every week with no
-     way to tell a quiet file from a broken one.
-  3. **Only the kinds that exist today are resolved.** `page` is a closed list, not a match over
-     `resource_kind` — a module arriving tomorrow registers its own kind without a migration, and
-     a lookup that switched on the kind would have to grow a branch for ever.
-  4. **A file's story is written under two target names.** `media` for the bytes, `media_file`
-     for a grant. A filter naming only the first answers "who could see this file in March" with
-     a list of uploads — the most reassuring possible wrong answer. A folder rename is *not* in
-     it, and that exclusion is as much a part of the claim as the inclusions.
-  5. **The action arrives as a sentence beside its token**, and an action the server has not seen
-     is shown in its own words rather than dropped: a trail with a hole in it is worse than one
-     with an unfamiliar entry. A deleted account reads as "an account that has since been
-     removed", never as "the platform".
-
-**Proof.** `bash scripts/qa/run-media-walk.sh media_usage` → **6 walks, 0 failures** against the
-real router. Four of the six exist because the shortcut gives a plausible wrong answer rather
-than an error: the three-fields/one-record split; the stale reference being reported *and* the
-repair scan really clearing it; the label coming from the **published** revision rather than the
-newest one (a draft's title on a list answering "which published pages use this" is a confident
-wrong answer); and a grant appearing on the trail under its other target name. The other two are
-the permission (a reader holding `media.read` alone opens both screens) and the trash (a trashed
-file still answers both). `cargo test -p omnion-api --lib` → **152 passed, 0 failed**;
-`-p omnion-media -p omnion-audit` → **181 passed, 0 failed**; `pnpm typecheck` → 2 successful, 0
-errors.
-
-**Three defects, all of them in the test rather than the code** — and that is the honest report.
-The fixture lacked `media.settings.manage` and `media.delete`; and it asserted a `404` for
-another tenant's file where the whole media surface answers `403 cross_organization`. The route's
-own doc comment had made the same wrong claim and now says what the platform does and why the
-convention is the safer of the two: a `404` here would have made these the only two screens where
-a foreign file is *invisible* rather than forbidden.
-
-**Also fixed: the QA slot could be held hostage for 75 minutes.** `qa-slot.sh` names its place
-file after `$$` — its own pid — and exits the instant it takes the place, so the reaper's
-`kill -0` tested a pid that is dead within milliseconds of a *healthy* pass and fell back on age
-alone. One crashed pass then held every later pass at "waiting for a QA slot" until each died at
-its own timeout with no report. The reaper now reads the holder pid, which lives exactly as long
-as the pass. Proved both ways against a synthetic slot dir with a real sleep as the live holder:
-it spared the live place and reclaimed both dead ones. This is the second time this loop has hit a
-stale-lock class, and the tell is the same both times — a symptom that reads as "the machine is
-busy" rather than "a lock file is lying".
-
-**Gate.** `bash scripts/qa/run.sh` was started first, as slice 4's outstanding condition, and is
-**still queued behind siblings** — five concurrent walkthroughs from the w2/w3/w4/w7 worktrees
-hold the one place `QA_SLOTS=1` allows. The walkthrough now drives both new tabs
-(`checkUsageTab` / `checkActivityTab`), so the harness that finally gets the slot is already
-extended; the retention tab's own pass (`runMediaRetention`) has now been queued for two
-consecutive ticks and remains unrun.
-
-**Next.** Re-run `bash scripts/qa/run.sh` and require zero high findings from `runMediaUsage`
-alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
-first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
-slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
-
 ## 2026-09-28 — the pass was racing four reads, and the race pointed at a picker that said nothing
 
 - **What this tick was.** The merge of `origin/main` (media REQ-010 slice 4, nine commits) and then
@@ -3975,68 +4802,6 @@ pass** — a queue entry is not a no-op.
 keys has still not run. Read `crmStates` and `crmKeyboardMobile` from the newest w4 report; only
 then tick the two remaining boxes and set REQ-051 to `done`. Then REQ-052 (sales & quotes).
 
-## Tick 45 — REQ-021 slice 1: the in-app inbox
-
-**What.** The platform's fourth feedback loop, and the only one that says *you*. The event bus
-records facts, the audit trail records privileged work, the search index records documents —
-and this one reaches a person. `omnion-notifications` (the record, the vocabulary, the store),
-migration 0050 (six tables: the record, the preference matrix, the digest settings, the
-delivery queue, the push devices and the channel config), the owner-scoped HTTP surface, the
-bell in the header of every route, `/notifications`, and the walkthrough pass that drives both.
-
-**Four decisions, each a shortcut that produces a plausible wrong answer.**
-
-1. **Owner-scoped always.** No store function takes a user id the caller chooses — every one
-   takes the owning id. "List somebody else's notifications" is not a parameter a handler can
-   get wrong; it is a function that does not exist.
-2. **Another person's notification is a `404`, never a `403`.** A `403` is the difference
-   between "that is not yours" and "that is not real", and this surface is the one a curious
-   panel is most tempted to poke at.
-3. **The badge and the grouped lines are one query.** A bell that says 12 above four lines
-   adding up to 9 is a screen nobody believes afterwards, and the fix is not a UI change: it is
-   that both come from `store::summary`, which is the only place the unread count is computed.
-4. **The vocabulary is compile-time, and the SQL duplication is a test.** SQL cannot import a
-   Rust constant, so the category/priority/channel lists are written twice. The test
-   `the_migration_agrees_with_the_lists` reads the migration file itself, because a category
-   added to Rust and not to SQL passes every unit test in the crate and then the database
-   refuses the row in production — which reads as "nothing happened".
-
-**Two bugs the tests caught in the first draft, both quiet.** `include_read: false` together
-with `unread: Some(false)` pushed both `read_at is null` and `read_at is not null` — a query
-that is *always* empty, on exactly the path the panel's "show read" filter takes, so it would
-have reported that nobody had ever read anything. And `priority_rank`'s doc said "lower is
-more urgent" while the list it indexes is written the other way round; the doc was wrong, and
-it is now explicit about which way and why.
-
-**Proof.** `cargo test -p omnion-notifications -p omnion-permissions` → **62 passed**;
-`-p omnion-api --lib` → **159 passed**; `pnpm typecheck` → 2 successful, 0 errors.
-`scripts/qa/run-notifications.sh` → **PASS**: 31 migrations applied in order, 6 tables, a
-repeated `dedupe_key` collapses to one row, and both `notifications_category_check` and
-`notification_deliveries_channel_check` refuse exactly the values the crate refuses.
-`scripts/qa/run-notifications-http.sh` → **PASS, 9/9** over a real socket with two real
-sessions.
-
-**The HTTP gate found three ways a gate can lie, which is worth more than the nine passes.**
-It built into `$CARGO_TARGET_DIR` and ran a hard-coded `./target/debug` binary — so it started
-a build that predated the feature and read *its* answers under this build's name. A failed run
-left the API holding the port, and the next run's instance exited on `EADDRINUSE` while the
-gate went on reading the orphan. And pre-applying the migrations let the API double-apply
-them, which kills it at boot — the same orphan one step earlier. All three are fixed at the
-root and the reason is in the file, because "the gate passed" is worth nothing while it is
-reading someone else's process.
-
-**And one assertion that was itself wrong.** The gate expected a `404` from the member and
-got a `403` — correctly, because an account with no role never reaches the handler. A `404`
-from a forbidden caller proves nothing about scoping, and conflating "you may not" with "it is
-not yours" is exactly how a real leak survives a review. It now proves both, and binds the
-member to the base role before making the scoping claims.
-
-**Gate.** `bash scripts/qa/run.sh` is **running** — the QA slot cleared after ~55 minutes of
-queueing behind the w6 pass, so the browser pass is in flight rather than merely queued.
-Slice 1 is not closed until it reports zero high findings from `runNotificationsDepth`.
-
-**Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
-hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
 
 ## 2026-09-28 · tick 19 · REQ-051 · the merge took the workspace down twice, and the second fix is the one that holds
 
@@ -4251,390 +5016,6 @@ and shows that naming *another* tenant still answers 404.
 REQ-052 slice 2 — quotes end to end: the builder, totals recomputed in SQL, versioning, send, the
 public token page with accept/decline, and the expiry sweep. A QA pass is due on the tick that
 closes it, and this tick's route additions have not been through a browser pass yet.
-
----
-
-## 2026-09-28 · REQ-021 slice 2 — the reader's own channel configuration
-
-**What.** The half of the notification centre that decides **how** a record reaches somebody.
-`crates/notifications` gains `preferences.rs` (the rules) and `preference_store.rs` (the SQL);
-`GET`/`PUT /api/v1/notifications/preferences`; `/notifications/settings`; and
-`runNotificationSettingsDepth` in the walkthrough.
-
-**Three decisions, each a shortcut that produces a plausible wrong answer.**
-
-1. **The matrix stores only the cells a reader stated.** A full grid would be thirty rows per
-   user per channel and would make a channel added in slice 3 a backfill instead of a
-   non-breaking change. Everything unstated reads as `true`, and the *read* builds the
-   complete grid in Rust and merges the stated cells onto it — so a person with no rows gets a
-   valid form, not an empty one.
-2. **The in-app cell cannot be switched off, and the store refuses it.** A `PUT` naming
-   `in_app: false` is a `400` that says why. A disabled checkbox is a promise; a refusal is a
-   guarantee, and the panel's own form is a client like any other.
-3. **Quiet hours are validated and read as a pair, because both shapes are legitimate.**
-   `22:00→07:00` wraps midnight and `01:00→05:00` does not. A window helper that knows only one
-   of them is either never quiet or always quiet, and both are silent. A window that leaves no
-   waking hours is refused by name rather than stored as "e-mail is on".
-
-**The HTTP gate found a bug that had been shipped since slice 1.** The pass reported two
-`request-failed` findings against `?category=approval` and `?priority=low` — both perfectly
-legal values. The cause is not a typo: axum 0.8's `Query` extractor is backed by
-`serde_urlencoded`, which **cannot put a repeated key into a `Vec`**. It answers
-
-```text
-invalid type: string "approval", expected a sequence
-```
-
-for *both* `?category=approval` and `?category=approval&category=ticket`. Every category and
-priority filter on this surface had never worked, and every filtered list fell through to the
-error state. It was reproduced in isolation — a four-line axum app — before being fixed, and
-the list read now takes `RawQuery` and parses the string itself.
-
-**Six of the pass's own assertions were wrong, and that is the more useful half of the tick.**
-`emptyState` asked for `?read=read`, which by that point in the pass holds the very rows the
-bulk step had just marked read — the list was correctly *not* empty, and the gate was measuring
-its own ordering. `errorState` failed `…/summary` with a 500 and then asserted on the **list's**
-error element, which that call cannot affect: the assertion could only ever have passed by
-accident. The keyboard pass clicked a row, which opened the drawer, and then sent every
-shortcut into the drawer. All three are the class of defect this harness exists to catch —
-in itself — and none of them is visible from the report, which only says `false`.
-
-**Two shortcuts the REQ listed were documented but not implemented.** Rather than weaken the
-gate to match the code, `Shift+E` now marks the visible rows read — through a bulk helper that
-takes an explicit id list, so it does not require a selection the reader never made — and rows
-carry `data-read` so the state is assertable rather than a shade of grey.
-
-**Proof.** `cargo test -p omnion-notifications` → **48 passed**; `-p omnion-api --lib` →
-**176 passed**; `pnpm typecheck` → 2 successful; `bun build scripts/qa/walkthrough.cjs` clean.
-Browser pass: **running**.
-
-**Next.** Read `/tmp/omnion-build-qa2.log` and `docs/qa/QA-LATEST-main.md`; require
-`report.notificationSettings` to be green and **zero high findings** from this change — in
-particular no `request-failed` on any `/api/v1/notifications` URL, which is the 400's
-signature. Then REQ-021 slice 3: push subscription lifecycle with pruning, the admin outbox
-behind `notifications.admin`, the event router turning existing bus events into notifications,
-and the per-channel delivery rows in the drawer.
-
-## 2026-09-28 · REQ-021 slice 3 — the half that leaves the panel
-
-**What.** The store layer (`push.rs`), the declarative router (`router.rs` + migration
-`0051_notification_routes.sql`), `notifications.admin` in the permission catalogue, nine HTTP
-endpoints in `apps/api/src/routes/notifications_admin.rs`, and the four sub-routers mounted
-with their guards travelling with each group.
-
-**The decision the whole slice rests on: a `permission:` recipient rule resolves through
-`omnion_permissions::effective_permissions_for`, not through a hand-written join.** The join is
-one round trip faster and *wrong* — it misses role inheritance, scope-mismatched bindings,
-expired grants and explicit denials, and a notification that reaches somebody who lost the key
-is a privacy defect rather than a wrong number. This is why `omnion-notifications` now depends on
-`omnion-permissions`; the arrow points one way, because a permission check that emits would be a
-cycle. The live gate builds the fixture that distinguishes the two: one person bound to a role
-that *inherits* the permission and holds nothing itself, which a `join role_permissions` answers
-zero for and the crate's resolution answers one.
-
-**A push endpoint is a capability, so the type cannot express leaking one.** The device body has
-no endpoint field at all — the hint (`…abcdef01`) is derived in the crate, and `DeviceBody` has
-nowhere to put the full value. That is a stronger guarantee than a promise in a comment, and it
-is asserted by serialising the body and searching the JSON for the secret.
-
-**Three shapes were wrong on the first write and are worth naming.** `retry_delivery` returned
-`bool`, which cannot distinguish "already sent" from "already queued" and turns a `409` on a
-button the caller cannot use into the only answer; it now returns a `RetryOutcome`. The channel
-list used `filter_map`, which would answer with four channels and render a settings matrix whose
-missing column is indistinguishable from one the reader switched off. And the outbox check
-constraint I first wrote was a boolean tangle that evaluated to `NULL` for `actor`.
-
-**The live gate found three of its own assertions were wrong**, which is the more useful half:
-the role fixture expected a survivor where the honest answer is zero; the outbox projection check
-counted columns in `information_schema` rather than running the route's own `SELECT`; and a stray
-`update` had already consumed the sent row, so `sent_rows_before=0` proved nothing. All three are
-now assertions that would fail if the code regressed.
-
-**Proof.** `cargo test -p omnion-notifications` → **79 passed** (48 at the start of this tick);
-`-p omnion-permissions` → 62; `-p omnion-api --lib` → **187 passed** (176 at the start).
-`scripts/qa/run-notifications-routes.sh` → **PASS**: 32 migrations applied, all three recipient
-and category refusals hold, the outbox's own projection is 13 columns with no body, and a retry
-moves the failed row while the delivered one stays at 1 → 1.
-
-**Not proven, and not claimed.** The browser pass running in the background is the **slice-2**
-gate; slice 3 has **no admin UI yet** — there is no `/notifications/outbox` screen and no routing
-rules screen, so the nine endpoints are reachable and invisible. Slices 2 and 3 are not closed.
-
-**Next.** Read the pass's `report.notifications` (the last one showed four `false` keyboard
-assertions that `eb421ba` claimed to have fixed — if they are still false, the fix did not work)
-and `report.notificationSettings`. Then build slice 3's two screens and write their depth passes
-before running the pass again — the no-untested-screen rule applies to a screen that does not yet
-exist as much as to one that does.
-
-## Tick 48 — the pass that had been running for an hour, and what it actually said
-
-**What.** The browser pass started at 22:33 finished at 23:41, and its `summary.json` answered the
-question the last tick left open. `report.notifications` is **green on the bell, the badge, the
-grouped lines, the bulk path, the cursor, `x`, `Enter` and all three states** — and its four
-`false` values are one bug, not four. `report.notificationSettings` did not run at all: *"The API
-answered with status 400."*
-
-**The 400 was not a code defect.** `/api/v1/notifications/{preferences,channels,outbox,routes,
-push-subscriptions}` all answer `400 Invalid URL: Cannot parse id…` — the parameter route
-swallowing the static segments, which is exactly what the comment above the mount says it
-prevents. The mount order in `routes/mod.rs` is correct. The QA API binary is from **20:39**;
-slice 2's routes landed at 21:46 and slice 3's at 23:13. The 52 + 31 high findings this pass
-filed against `/notifications/settings` and `/media/settings` are *both* that. The pass is
-disposable by design, so the lesson is to read the binary's mtime before reading the router.
-
-**What this tick fixed instead.** Two real defects, both found by hand against the live stack
-because no existing gate could reach them:
-
-1. `POST /api/v1/notifications/emit` addressed `user_ids` straight into the insert, so
-   `notifications_user_id_fkey` answered a stale id by refusing the **whole batch** and naming
-   itself: a `500` whose body quotes `violates foreign key constraint
-   "notifications_user_id_fkey"`. Four good recipients lost to one stale one, and a constraint
-   name shipped to whoever held the response. `0707141` checks recipients before the loop
-   through a new `store::existing_users` and refuses in a sentence that names *which* id is wrong.
-2. `Escape` was documented in the file header, the REQ's QA plan and the walkthrough, and it was
-   **not in the key handler**. It was also unreadable behind `if (!row) return`, so it was inert
-   exactly when the list had content — and the open drawer held the focus, which is why `e`,
-   `Shift+E` and `/` failed behind it. `c30d324` answers `Escape` before the cursor is read.
-
-**And the gate that had been lying.** `run-notifications-http.sh` decided its build by
-`cargo build | grep -E "^(error|warning: unused)" && { echo "build failed"; exit 1; }`. The
-status it tested was grep's, not the compiler's — and `warning: unused import` is a line this
-crate prints on every *successful* build. The gate exited 1 over a build that finished in 0.31 s,
-twice, printing a message indistinguishable from a real compile failure. `e8a797f` uses the
-compiler's exit status and only reads the log when that status says something went wrong.
-
-**Proof.** `cargo test -p omnion-notifications` → **79 passed**; `-p omnion-permissions` → **62**;
-`-p omnion-api --lib` → **187 passed**. `pnpm typecheck` in `apps/admin` → **exit 0**.
-`node --check scripts/qa/walkthrough.cjs` → clean.
-`scripts/qa/run-notifications-http.sh` → **PASS**, 12 assertions, including the two new ones:
-*a recipient that is not an account is a 400 in a sentence, not a constraint name* and *a batch
-with one bad id writes none of the good ones*.
-
-**Not proven, and not claimed.** `Escape` and the four shortcuts behind it are fixed in source and
-typechecked, but no pass has run against them — the pass that found them ran against the 20:39
-binary. Slice 3's outbox screen is still unvisited: `report.notificationOutbox` is **absent** from
-this pass's report, so the depth pass written last tick still has never executed. REQ-021 stays
-**in-progress**.
-
-**Next.** Run `bash scripts/qa/run.sh` against a freshly built API (verify the binary's mtime is
-newer than `0188172` before reading any result). Require `report.notifications.escapeClosedDrawer`
-and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMarkedVisible` /
-`slashFocusedFilter` to recover behind them, `report.notificationSettings.loaded` to be true, and
-`report.notificationOutbox` to be **present** — that last one is the first pass that can close
-slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
-after that.
-
-## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
-
-**What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
-landed, and it answered the question the last two ticks were holding open. `report.notificationOutbox`
-exists for the first time: five chips all carrying counts, `chiptotalMatchesSql` true,
-`targetHiddenForActor` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, a removal that
-answers 204 and leaves the table, and `retryIsNotRetryable` true. `report.notificationSettings` is green
-on the matrix, the honest save notice, the round trip and the error state. `runMediaRetention` came back
-`ok: true` for the first time, which is REQ-010's blocker clearing.
-
-**The pass also produced one string that says everything.** `report.notifications` ended with
-
-```json
-"keyboardRows": 0,
-"keyboard": "no rows to drive — the list did not load"
-```
-
-which reads like a timing problem and is not one. The pass had marked its own three rows read four lines
-earlier, and the list then showed none of them. `with_read` was a `bool` defaulting to `false`, and a
-`bool` cannot tell "the client said nothing" from "the client said no" — so **every** caller that named no
-filter got an unread-only list, while the panel's own State menu labelled that same state "Unread and
-read". The screen promised a list it was not sending. Nothing failed loudly: the list rendered, the badge
-was right, and the screen simply stopped showing mail the reader had already seen.
-
-**What this tick fixed.** `ab3c105` gives `with_read` an `Option<bool>`, so absent and off stay
-distinguishable and absence means *everything*; `4933c10` fixes the three client places that assumed a
-positive flag — `filtersFrom` never sent it, `notificationQuery` dropped the `false` that *is* the
-inbox filter, and the empty state's "Show read notifications" button **set** the flag to switch read
-rows on when the correct action is to clear it. `797a3e8` adds the two gates that were missing, which
-is the part that matters: `readRowsStayVisible` immediately after the bulk action, and `inboxFilterIsHonest`
-on the other half, so a default nobody can turn off cannot pass as a fix.
-
-**Proof.** `cargo test -p omnion-api --lib` → **188 passed** (187 + the absent-vs-off test, which
-asserts the parse *and* the built query — a parser that keeps them apart and a builder that throws the
-distinction away are two different bugs and only the pair is the fix). `-p omnion-notifications` → **79**;
-`-p omnion-permissions` → **62**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check
-scripts/qa/walkthrough.cjs` → clean. `scripts/qa/run-notifications-http.sh` → **PASS 13/13** over a real
-socket, the new leg reading `all=1 inbox=0 live=1`. Browser pass: 36 pages, 1095 clicks, 88 field fills,
-39 form submissions, 84 findings (79 high, 5 medium).
-
-**On those 79 high findings, honestly.** 74 are `/media/*` and belong to REQ-010, which is the other
-in-progress REQ in this wave — 30 of them are one 422 on `/api/v1/media/{id}/raw?preset=standard` and 22
-more of the same from a second file. The remaining 5 are **this pass's own deliberate refusal probes**:
-three the 400 in-app-column lock and two the routed-500 error state, each of which the pass asserts as
-*expected* two lines later. Neither group is caused by this tick's change.
-
-**Also fixed, incidentally.** The gate I extended had two defects of its own, both caught because the
-first version of the assertion failed in a way the change had nothing to do with: `grep -c` exits 1 on
-an empty body, so under `set -e` the *inbox* leg — which is meant to be empty — aborted the whole gate
-before printing a verdict; and the row to mark is read from SQL rather than reusing the `$target` that
-the 404 check *below* assigns, because a shell script that reads a value before the line that sets it
-reports an empty id as "the endpoint refused".
-
-**Not proven, and not claimed.** No pass has yet run against the `with_read` fix, so the keyboard leg —
-`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`, `shiftEMarkedVisible`,
-`slashFocusedFilter` — is still unproven and the REQ stays **in-progress**. `quietSaved` and
-`digestPersisted` are still false: the widgets render, but the pass does not change them yet, so those
-two halves of the settings box are honestly unproven despite the box being ticked for what was proven.
-
-**Next.** Run `bash scripts/qa/run.sh` again (verify `stat -c %y target/debug/omnion-api` is newer than
-`ab3c105` first). Require `report.notifications.readRowsStayVisible`, `inboxFilterIsHonest`,
-`keyboardRows > 0` and then the five keyboard keys, plus `notificationSettings.quietSaved` and
-`digestPersisted` — and extend the settings pass to change those two fields rather than merely render
-them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
-REQ-010 slice 4's remaining gate.
-
-## Tick 50 — the quiet window that came back wearing a different spelling
-
-Two commits, `c48db9d` (the fix) and `60a28ea` (the gate), both pushed, tree clean.
-
-**What.** The previous tick's `next_hint` told this one to go and run the browser pass. It could
-not: `qa-slot.sh` allows one pass at a time and the box was at load 13 with six sibling passes
-compiling, so a pass started under those conditions would have timed out having measured
-nothing. The two settings boxes the hint named — `quietSaved` and `digestPersisted` — were the
-honest place to start instead, and reading why they were false turned up something the browser
-pass had been reporting faithfully for two ticks.
-
-**The defect.** `notification_settings.quiet_hours_start` is a Postgres `time` column, and
-`read_settings` selected it with `::text`. Postgres prints a `time` that way as `22:00:00` —
-seconds always present, zero-padded. The platform's clock vocabulary is `HH:MM`: the shape the
-form sends, the shape `validate_quiet_hours` accepts, and the shape `parse_clock` reads. So
-every window that was saved correctly came back in a spelling nothing could parse,
-`parse_clock` answered `None`, and `in_quiet_hours` took the arm its own doc comment promises
-("no window at all means `false`"). The setting a reader had just turned on decided nothing from
-the next request onwards, and the settings form could not read back what it had written.
-
-Nothing about it fails loudly. The save is a `200`. The row in Postgres is exactly what was
-asked for. The digest half of the same row — a string column — came back fine, which is why
-`digestPersisted` failed for a *second*, unrelated reason in the pass while the two fields
-looked equally broken.
-
-**Why the pass could not have told you.** `quietSaved` asserts the time input still reads
-`22:00` after a save, and `digestPersisted` asserts the two selects. Both were false, but they
-were false for different reasons, and only one of them was a defect. Reading the *values* the
-pass had collected — not the booleans — is what separated them: `timezoneSaved` was true
-alongside two false fields, and timezone is a plain `text` column.
-
-**The fix.** `to_char(quiet_hours_start, 'HH24:MI')` in the read, so the shape is produced by
-one literal in the SQL. `parse_clock` also tolerates a seconds field, so a row written before
-this change is still a window rather than its absence — a widening that has to be paid for
-with a test, because "accepts more" is how a parser turns into a function that accepts
-anything with a colon in it. `format_clock` is the write-side counterpart that names the shape,
-and the round trip between the two is asserted over five instants.
-
-**One mistake worth recording.** The first version of the fix declared the columns
-`Option<time::Time>` and let `format_clock` do the work. It compiled — `query_as` checks its
-types at *decode* time, not at compile time — and came back as a `500` on the settings screen:
-`mismatched types; Rust type Option<time::Time> (as SQL type TIME) is not compatible with SQL
-type TEXT`. The fix for that is the one line the comment now explains: `to_char` returns
-`text`, so the column is decoded as `Option<String>`.
-
-**Proof, in both directions.** `scripts/qa/run-notifications-http.sh` now has two legs that
-own the seam, and the order is the point: save through the API, read the row out of Postgres to
-prove the write happened, *then* read it back through the API and compare the exact string.
-Against the pre-fix tree (stashed, rebuilt, re-run) the gate printed
-`FAIL quiet hours did not round trip: row=[22:00 07:00 weekly 3 17] api=[22:00:00..07:00:00 hour=17]`
-— the row correct, the API's own answer unusable. Against the fix: **PASS 15/15**. A gate that
-only read the API back would have passed against a store answering with whatever it was handed.
-
-`cargo test -p omnion-notifications` → **83** (79 + 4 new). `cargo test -p omnion-api --lib` →
-**188**. `tsc --noEmit` in `apps/admin` → exit 0.
-
-**Still not proven, and not claimed.** No browser pass has run against a binary built after
-this, so the keyboard leg (`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`,
-`shiftEMarkedVisible`, `slashFocusedFilter`) and the browser's own `quietSaved` /
-`digestPersisted` are open. REQ-021 stays **in-progress** for that reason alone.
-
-**Next.** Run `bash scripts/qa/run.sh` with no `QA_STACK` override when the box is under load
-~6 and `qa-slot` is free — verify `stat -c %y target/debug/omnion-api` is newer than `c48db9d`
-*before* reading any finding, because the pass tears the stack down. Require
-`report.notifications.keyboardRows > 0` and the five keyboard keys, and
-`notificationSettings.quietSaved` + `digestPersisted`, which the data path can now support.
-The other open item is unchanged: the 74 `/media/*` high findings, which are REQ-010 slice 4's
-remaining gate.
-
-## Tick 51 — REQ-016 slice 1: the event catalogue (the registry the platform never had)
-
-**What.** `crates/events/src/catalogue.rs` — 68 event names (67 live, 1 reserved) with their
-area, a one-sentence description, their payload fields and a required flag. Compiled in, not
-stored. `GET /api/v1/events/catalogue` serves it, a group subscription (`page.*`) is stored as
-the wildcard *and* as today's expansion, and `enqueue_fanout` matches either.
-
-**The gap this closes.** Before this, the only truth about an event name was the string literal
-at the call site. The endpoint form had nothing to build a picker from, `/events` had nothing to
-describe, and a typo in one emitter became a name no receiver could ever subscribe to — silently,
-with the bus recording the fact and the delivery queuing normally. Nothing was broken and nothing
-said so.
-
-**Two decisions, and the reasons are the interesting part.**
-
-*A group is stored twice.* Storing only today's expansion means `page.*` silently stops covering
-an event added next release — the exact surprise a group exists to remove. Storing only the
-wildcard means a receiver can be subscribed to a group whose members do not exist, and cannot
-tell what it is getting. So the wildcard is the subscription and the expansion is the readable
-copy, and the fan-out tests both. The SQL grew one `or $4 = any (w.events)` clause; the clause
-is there for the row written before reconciliation existed, or by an operator's own SQL, which
-would otherwise stop receiving with no error anywhere.
-
-*`order.created` is listed, described and subscribable while commerce is unshipped* — and marked
-`reserved` so the panel can say *which module ships it* rather than implying the platform is
-broken. A reserved name is a name: `order.*` expands today.
-
-**The registry writes itself, and its first two findings were real.** The table is a macro
-(`crates/events/src/catalogue.rs`), one row per event, and `apps/api/tests/events.rs`
-`every_emitted_name_is_in_the_catalogue` walks the source tree for `NewEvent::new("…")` and fails
-with the file and line when an emitter names something the table does not carry. A unit test
-inside `omnion-events` cannot do this — it cannot see the modules. It immediately earned its
-place: it caught that the upload fact is emitted as **`media.created`**, not the `media.uploaded`
-the request imagined. The table was written to match the code rather than the spec, and the
-reason is in the source: renaming the row would make the catalogue agree with the request and
-disagree with every receiver that already subscribed.
-
-**A gate that cannot fail proves nothing**, so the drift test was proved in both directions:
-with a `totally.made_up` emitter injected into `media_settings.rs` it failed with
-`1 emitted name(s) are not in the catalogue … totally.made_up (apps/api/src/routes/media_settings.rs:24)`,
-and green again once restored.
-
-**Also found, by a test I wrote to check a different thing.** `group_members` matches the first
-dotted segment, so a group is `order` while the area is `commerce` — I had written a test
-asserting `commerce.*` would expand. Area and group are different vocabularies and conflating
-them would make `commerce.*` look correct while matching nothing. Pinned by
-`an_area_is_not_a_group`.
-
-**Macro rules, for the fourth time.** A `*` repetition may not be followed by another
-repetition, a field tuple needs its literal parens in the pattern, `req`/`opt` are idents not
-literals, and a `const fn` cannot match on `&str` on this toolchain — so the status and the
-required flag are matched as *tokens* and turned into the values by the macro. The table is now
-stricter than it was designed to be: a row that says `Reserved` in the wrong case is a compile
-error rather than a row that silently reads as `live`.
-
-**Proof.**
-
-- `cargo test -p omnion-events --lib` → **41** (24 before, 17 new)
-- `cargo test -p omnion-api --test events -- --test-threads=1` → **4/4**, real Postgres + a real
-  loopback receiver; the group subscription delivers a `page.published` and the signature
-  verifies against the secret the creation response returned
-- `cargo test -p omnion-api --lib` → **188**
-- `tsc --noEmit` in `apps/admin` → exit 0
-
-**Not done, and not claimed.** Slice 1 is not closed. Missing: the emission calls for names the
-modules do not record yet (`page.created|updated|unpublished|deleted|restored`,
-`user.updated|deleted`, `site.archived`, `domain.*`, `plugin.*`, `theme.activated`,
-`workflow.run.*`) — the catalogue names them and the table asserts they are listed, which is the
-honest direction: the registry is the specification the emitters are measured against, and they
-have not caught up. And the `/events` screen with its Feed and Catalogue tabs does not exist; the
-data source does.
-
-**Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
-on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
-turns "did I remember?" into a red line with a file and a line number.
-
 ---
 
 ## Wave 4 · REQ-052 slice 3 · the discount gate (5a26ca6, d0745f8, 6f62881)
@@ -4810,160 +5191,6 @@ REQ rather than a placeholder button. `MIGRATIONS`: 0053/0054/0055/0057 are mine
 none; the shared high-water moves constantly — re-read `git ls-tree origin/<branch>
 database/migrations/` for every sibling at commit time, never from memory.
 
-
----
-
-## 2026-09-29 — REQ-016 slice 1 (emission half) · the gate that walked one direction
-
-Eleven emissions, one honest demotion, and a gate that closes the direction nothing was
-checking.
-
-**The finding.** Slice 1 shipped a drift gate that walks the source tree and fails when an
-emitter names an event the catalogue does not carry. It works, and last tick it earned its
-place. But it walks **one** direction, and the other direction is where the damage was.
-Twenty-seven rows were marked `Live` — which the type documents as "emitted by the platform
-today" — and nothing emitted them. `page.created` had a row, a description, payload fields
-and a picker entry; there was no `bus::emit` for it anywhere in the tree. So an operator
-subscribed to `page.created`, the subscription was accepted, and nothing could ever arrive.
-No error, no warning: a registry that promises deliveries the platform never makes.
-
-**Eleven now emit**, each a `bus::emit` beside a write that already existed:
-
-| name | where |
-| --- | --- |
-| `page.created` `page.updated` `page.deleted` `page.restored` | `routes/content.rs` |
-| `translation.updated` | `routes/content.rs` |
-| `domain.added` `domain.removed` | `routes/tenancy.rs` |
-| `site.archived` | `routes/tenancy.rs`, on the transition only |
-| `user.updated` | `routes/iam_subjects.rs` |
-| `user.deleted` | `routes/scim.rs` |
-| `theme.activated` | `routes/onboarding.rs` |
-| `webhook.endpoint.created` `updated` `removed` `tested`, `webhook.secret.rotated` | `routes/webhooks.rs` |
-| `webhook.delivery.failed` | `crates/events/src/engine.rs` |
-
-**Ten are now `Reserved`, and the reason is the point.** `plugin.*` (no plugin module ships
-yet), `workflow.run.*` (the engine does start runs — but the automation matcher *drains the
-same bus* and starts a run per matching rule, so emitting there without a loop guard is a
-feedback loop wearing a feature's clothes; that is a decision, not a line), `page.unpublished`
-(no route takes a published page back to draft), `translation.published`, `domain.verified`.
-`Reserved` is not a demotion for its own sake — `order.created` has carried it all along. It
-is the status that lets the picker say *a module ships this* instead of implying the platform
-is broken. `a_reserved_name_names_the_module_that_ships_it` pins each row to its owning module,
-so nobody re-promotes one on a hunch: the reverse gate turns red with the name.
-
-**A gate a convenience wrapper can blind.** The first version of the content helper took the
-name as a `&str` and the new gate immediately reported `page.created` unbacked from a file
-that emitted it three lines above — the literal had moved into the helper's argument, where a
-source-walking gate cannot see it. The helper now takes a built `NewEvent` and the literal
-stays at each call site. A test that can be defeated by tidy code is a test to design
-against, and the same trap bit the forward gate afterwards: a doc comment explaining the rule
-contained the constructor call in prose, and the gate read it as an emitter. Both are written
-down in the source now.
-
-**The existing tests were right to fail.** Exact row counts in the feed broke, because the
-feed correctly carries more facts now: `page.*` delivers two events instead of one (a group
-subscription is no longer publish-only, which is the point of a group), and tenant B's feed
-is no longer empty because connecting an endpoint records an event *about that endpoint*. The
-last one looked like a tenancy leak and was not: the isolation assertion now says what it
-means — B sees its own endpoint and nothing of A's. The counts were replaced with presence
-and ordering assertions, because a count turns every future emission into a breaking test.
-
-**Proof.**
-
-- `cargo test -p omnion-events --lib` → **42** (41 before, +1 for the reserved-ownership pin)
-- `cargo test -p omnion-api --test events` → **5/5** (4 before, +1 the reverse gate) against
-  real Postgres and a real loopback receiver
-- `cargo test -p omnion-api --lib` → **188**
-- `tsc --noEmit` in `apps/admin` → exit 0
-- The new gate proved in both directions: promoting `plugin.installed` to `Live` turned it red
-  with the name, restore turned it green
-
-**Not done, and not claimed.** The `/events` screen with its Feed and Catalogue tabs does not
-exist, so the acceptance box that names the Catalogue **tab** stays unticked even though the
-API behind it is proven. Slice 2 (endpoint management UI) and slice 3's delivery-operations
-UI are untouched. No browser pass this tick: load 21.6 with sibling writers active, so REQ-010
-slice 4 and REQ-021 remain blocked on the QA slot.
-
-**Next.** The `/events` screen — the data source is done and proven, the screen does not exist,
-and it is the last thing in slice 1. Re-check the QA slot on arrival; when it is free and the
-box is under load ~6, run `bash scripts/qa/run.sh` with no `QA_STACK` override and extend
-`scripts/qa/walkthrough.cjs` so the new route is visited and clicked.
-
----
-
-## 2026-09-29 · REQ-016 slice 1, the screen half — `e7399d6`
-
-**What.** The `/events` screen, and the feed filters it needs to be a screen. The catalogue had
-a data source and nothing that rendered it; the feed had `?limit` and one `?name` and no way to
-page. Both halves are now closed, except the browser pass, which did not get a slot.
-
-**The finding: `?name=a` never filtered — it failed.** The first version of the query shape was
-a `Vec<String>` behind `Query<EventsQuery>`, which is the obvious way to write it and the wrong
-one. `serde_urlencoded` — the deserializer `Query` is built on — **rejects a single occurrence of
-a repeated key for a sequence field outright**, with a `400` whose body is plain text rather than
-the API's error envelope. So `GET /api/v1/events?name=page.published` returned `400`, not a
-filtered list. The existing test caught it on the first run and the fix is a hand parser, which
-is not a downgrade: the same three rules already live in `notifications::parse_list_params` and its
-doc comment explains why each one exists. The new one says the same three and adds the fourth the
-notification list learned the hard way — *ignore* a key this build does not know, so a panel that
-sends one filter earlier than the API still gets its feed.
-
-**A tenancy assertion that passed for the wrong reason.** The scoping assertion was first written
-against the platform owner, and it failed: five rows came back where four were expected. The
-owner's session carries `organization_id = None`, and the store's `($1::uuid is null or
-organization_id = $1)` reads that as *every* organization — which is correct for a superuser. The
-test was asserting the superuser sees everything, not that a tenant may not see another's. It now
-reads as an **organization** account, and the seeded foreign row has an *actor* from a third
-identity, so a broken actor filter and a broken organization filter are both caught.
-
-**`has_more` comes from the row past the page.** Not from a second `count`. A list and a count
-that disagree is a list that is lying, and the disagreement is invisible until somebody pages to
-the end and finds a row they have already seen. The store asks for `limit + 1` and truncates; the
-cursor is the last row's own id, exclusive, so the next page cannot re-serve the row the cursor
-names. Newest-first is asserted *across* the boundary, not per page, because "sorted within a page"
-is a property a single page satisfies by accident.
-
-**A live name nobody subscribes to is the useful number.** The catalogue now carries each name's
-24-hour delivery count, scoped to the caller's organization. It is the one question the `live`
-column cannot answer: the status says the platform records the name, the count says whether any of
-your endpoints ever heard it. It is `0` rather than absent so the column is always a number the
-screen can render, and the walk asserts *every* entry carries a number — a missing key would
-render as a blank cell indistinguishable from a name nobody has data for.
-
-**The window is relative in the URL and absolute in the request.** `?window=24h` is what the
-panel stores, and the `from` instant is computed at request time. Storing the instant would make a
-pasted link mean "the last two hours" for the sender and "nothing at all" for the reader, with no
-way to tell which happened. A `from` in the past *is* still accepted directly, because the API is
-a public surface and a relative filter is a panel convenience, not a protocol rule.
-
-**Proof.**
-
-- `cargo test -p omnion-events --lib` → **42** (unchanged; no new unit test was needed — the
-  store's filter is SQL and the walk exercises it against a real database, which is the only
-  place it can be exercised honestly)
-- `cargo test -p omnion-api --lib` → **188**
-- `cargo test -p omnion-api --test events` → **6/6** (5 before) against real Postgres
-- `tsc --noEmit` in `apps/admin` → exit 0
-- Two walkthrough routes added (`/events`, `/events?tab=catalogue`) and `runEventsDepth` written:
-  it publishes a page through the real route, filters by the first name on screen, reloads to
-  prove the URL carries the filter, expands a payload, drives `j`/`Enter`/`Escape`, forces a
-  routed `500` and checks the error banner, reads the catalogue back against the API and asserts
-  the totals match, narrows by area, expands an entry's payload fields and uses "Filter feed" to
-  cross to the other tab
-
-**Not done, and not claimed.** **No browser pass this tick.** The QA slot was held by a sibling
-writer for the whole window and the box was at load 26, so `runEventsDepth` is written and
-**unrun**, and the acceptance box that names the Catalogue *tab* stays unticked with the reason
-written into the box. The other two things the box wanted — the screen and the filters — are
-built, typechecked and API-tested. Slice 2 (endpoint management UI) and slice 3's delivery
-operations are untouched.
-
-**Next.** Re-check the QA slot on arrival; when it is free and the box is under load ~6, run
-`bash scripts/qa/run.sh` with no `QA_STACK` override. If it is green, tick the catalogue box and
-close slice 1; if the pass finds anything, fix it in the same tick — the depth pass is already
-written, so a green run closes the slice rather than starting it. After that, slice 2: the
-`/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
-operator needs first when a delivery is missing.
 
 
 ## 2026-09-29 · wave 4 · REQ-052 slice 5 — the PDF documents (`2036485`)
@@ -5308,233 +5535,6 @@ box left unticked for the mobile criterion stays unticked until a pass measures 
 0123, wave3 0125, wave9 0125. Mine are 0053, 0054, 0055, 0057, 0125 and now 0126.
 
 
----
-
-## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
-
-**What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
-shows the last page, the API keeps a keyset cursor over every row, the automation matcher
-replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
-`/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
-question (what will be forgotten and when) rather than a fourth card inside the Feed.
-
-Migration `0123_event_retention.sql` puts the window on the **organization**
-(`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
-decisions carry it, and each is a place the obvious shortcut is wrong:
-
-* **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
-  and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
-  The receiver's only symptom is a delivery that never arrives with nothing in the platform
-  saying why. The store's predicate selects events with **no delivery at all** or with **only
-  settled** ones; a `pending` row pins its event for ever. An event nobody was ever queued
-  for is the bulk of the bus, which is exactly the part worth deleting.
-* **The window is a column on the organization, not on the event.** "30 days" is a policy an
-  operator sets once and then changes; storing it per event would mean a sweeper that has to
-  *compare* the two to decide what is old. The cutoff is computed per organization inside the
-  same statement, and an organization that has never set one falls back to the platform
-  default rather than to `null` — because `null` would mean "keep for ever", which is a
-  decision nobody made deliberately.
-* **A run that deletes nothing is still written to the log.** "The last sweep was at 03:00 and
-  it found nothing" is the sentence an operator needs on the day they ask why a March event is
-  still in the feed, and a table that only records activity cannot answer it on the day
-  nothing happened.
-
-**A window on the organization is also a permission split.** Reading the window, the counts and
-the last sweep rides `events.read` — describing what will be removed is reading the bus.
-**Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
-destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
-
-**`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
-literal segment registered after a parameterised sibling is read as an event id, and a request
-that is perfectly valid answers `404 no such event`.
-
-**A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
-comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
-in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
-would be quoting a number nobody can reconcile with the run log.
-
-**The panel refuses the range before the server does, because the bounds are the server's.**
-`min_days`/`max_days` arrive in the read rather than being written into the component, because
-a range written in two places is a range that will disagree, and the input that disagrees with
-the server is the one that gets a `400` nobody can act on. Out of range *disables* Save rather
-than offering a failure. And when the server does refuse, its own sentence is shown — it names
-the field and the range, and replacing that with "invalid value" throws away the only sentence
-that says which bound was crossed.
-
-**Proof.**
-
-- `cargo test -p omnion-events --lib` → **47** (45 + 2)
-- `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
-  one-day window set through the same `PATCH` an operator uses
-- `cargo test -p omnion-api --test events` → **9/9** (the sweep must not disturb the existing
-  delivery history)
-- `cargo test -p omnion-api --lib` → **188**
-- `tsc --noEmit` in `apps/admin` → exit 0
-- Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
-  `runRetentionDepth`)
-
-**Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
-PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
-$2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
-a named argument has to land on `int`, and the error names a function that plainly exists, so
-it reads like a migration fault rather than an argument type. The second is an **assertion
-written in the same breath as the code that broke it**: the walk set the window through a
-`PATCH`, that `PATCH` recorded `webhook.retention.changed` on the same bus, and the count
-assertion still said "two aged events" while the bus honestly held three. It had passed for
-the wrong reason only because nobody had run it since the audit event was added. Counting is
-not "count the rows I set up" — a number an operator reads is a number the platform has to be
-able to explain, including the parts nobody staged.
-
-**Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
-whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
-mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
-**unrun**, so every acceptance box naming a screen stays unticked with the reason written into
-the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
-a probe that selects a hook the screen does not carry is a probe that cannot fail.
-
-**Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
-`bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
-slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
-(REQ-012/013/014 — the security, backup and system-health centres).
-
-## 2026-09-29 — omnion-build tick 56 · the blocker was never the QA slot
-
-**What.** Three REQs (010, 021, 016) had each recorded, in their own words, that their
-browser pass never ran because "the QA slot is held by a sibling writer". Three ticks running,
-the excuse had become the plan: wait for the slot, write nothing, tick nothing. This tick
-checked the excuse instead of repeating it — and it was false.
-
-The slot was never the constraint. **`/dev/shm` was at 99%** (418M free) and the box was at
-load 33 with 1G of RAM available. Several stacks point `CARGO_TARGET_DIR` at tmpfs so a
-compile does not fill the disk, so the worktrees had collectively moved their unbounded build
-growth onto a filesystem *every sibling shares* — and a build that cannot write its output dies
-with "No space left on device", which reads like a source error. Freeing three orphaned
-targets took tmpfs to 29% free and the load to 15. The slot was the symptom; the excuse named
-the wrong culprit, and the wrong culprit cannot be fixed by waiting.
-
-**The fix, and the two rules it had to learn first.** `disk-guard.sh` grew a tmpfs sweep with
-an `in_use` test — and that test deleted a 7 GB target out from under a **running w8 QA pass**.
-The reason is the lesson worth the whole tick: a stack's build runs in a wrapper that *exits*
-once the binary is staged, so `run.sh`, the pm2 API and the walkthrough all carry no
-`CARGO_TARGET_DIR` and answered "not held". A pass is not a build, and asking only "is a
-compiler running" cannot tell them apart. The guard now requires both tests — nothing building
-into it AND nobody living in the worktree that owns it — and step 4, the disk's own last
-resort, gets the same check it had been missing.
-
-**Also shipped.** The one unticked REQ-016 box that named *missing* UI: the payload inspector
-could copy a whole payload but not a JSON path. It now lists the payload's keys as a tree and
-copies the path a receiver would actually write — `["order.total"]` for a key with a dot in
-it, because `payload.order.total` is two lookups that read as a key that does not exist, and a
-path that silently matches nothing in the receiver being debugged is worse than no path.
-
-**Proof.**
-
-- `bash scripts/qa/disk-guard.sh` → freed **13.9 GB**, `/dev/shm` 91% → 29% free, load 33 → 15
-- a second run against the live w8 pass → reclaimed **nothing** (the rule holds under the case
-  that broke it)
-- `tsc --noEmit` in `apps/admin` → exit 0
-- `node --check scripts/qa/walkthrough.cjs` → exit 0
-- Commits: `f658491` (the guard), `aa14c42` (the path tree), `a8399a0` (the walkthrough step),
-  `a0c0320` (the REQ's record of it)
-
-**Not done, and not claimed. Still no browser pass.** This tick's own pass is queued behind
-the same single slot (now w8's, which I disturbed and which is still running), so the
-acceptance boxes naming a screen stay unticked with the reason in the box. What changed is
-that the excuse is no longer believed: the cliff is gone, and the next tick either gets the
-slot or says which sibling is holding it and for how long.
-
-**Next.** On arrival: if the slot is free, run `bash scripts/qa/run.sh` with **no `QA_STACK`
-override** and tick the screen boxes for slices 1–3 of REQ-016 together, then close REQ-016,
-then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
-the same reason). If the slot is still held, name the holder and its ports in the log rather
-than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
-
-## 2026-09-29 — omnion-build tick 57 · REQ-012 slice 1, and a screen that says "I don't know"
-
-**What.** Started REQ-012, the security centre — the first not-done REQ in wave 1. The whole
-slice turns on one rule, and it is the only screen in the panel where a plausible default is
-a lie: **a check that could not verify something must not report `pass`.** So the rule is
-written into the design rather than left to each check's judgement —
-
-* a check is a pure function of an `Environment` it is handed, so it cannot look anything up
-  and cannot conclude anything from an empty result set;
-* a probe that could not read answers `Probe::Unknown`, and `unknown` is one of the four states
-  rather than a null the panel has to guess at;
-* the overview renders **every** registered check including one that has never run, so a
-  missing row can never read as "nothing to report here".
-
-The vocabulary (four states, four sources, five severities, four finding statuses) is
-duplicated in `0054_security_posture.sql`, which cannot import Rust. A test reads that
-migration and fails if a word exists in one list and not the other, so the two can drift only
-visibly — a red test rather than a filter that silently returns nothing.
-
-**Two asymmetries worth naming, because both were the wrong answer at first.**
-
-*A missing backup is `fail`; a missing dependency scan is `unknown`.* They look like the same
-case and they are not: "there is no backup" is a fact we can state without having read
-anything, while "we have never run a scan" is a fact about us. Collapsing them would let a
-platform with no backups read as merely unverified. The first version of the test asserted
-"unknown for everything with an empty world" and it caught this — the test was wrong, the
-asymmetry was the design, so the test now states the full expected map instead of a blanket
-rule, which means changing either default is a failure that names the check that moved.
-
-*The score weights `unknown` at 40, not 0 and not 100.* Zero punishes the platform for what
-it does not know, which is how a number stops being trusted; 100 is the over-claim the crate
-exists to avoid. The middle says "a question", which is what it is.
-
-**Also shipped.** The API behind three separate powers — `security.read` sees, `security.scan`
-re-runs and ingests, `security.manage` dismisses. `scan` is deliberately *below* `manage`:
-re-running the checks changes no configuration, while an ignore is a decision somebody will be
-asked to justify later, and granting both lets an account that can only look also dismiss what
-it saw. An uploaded report carrying a key shaped like a credential is refused **whole**,
-because this table is read by people and exported to CSV — a token in a description would move
-a secret from a CI log onto a screen designed to be shared.
-
-**Proof.**
-
-- `cargo test -p omnion-security -p omnion-permissions --lib` → **39 + 62 passed, 0 failed**
-- `cargo build -p omnion-api` → clean
-- `tsc --noEmit` in `apps/admin` → exit 0
-- `node --check scripts/qa/walkthrough.cjs` → exit 0
-- Commits: `60b45d9` (crate), `b2d82aa` (API + permissions), `7210ca3` (panel), `4208a7e` (QA)
-
-**Not done, and not claimed. No browser pass.** The single QA slot is held by a live w10 pass
-(holder pid 2521941, cwd `/mnt/apopic/omnion-w10`, still writing screenshots at the time of
-writing) — this time the blocker is named with its holder and its ports rather than written off
-as "the slot is held". `runSecurityDepth` is written and wired in; it is unrun, so the boxes
-naming a screen stay unticked. It asserts the one thing a fresh QA database makes falsifiable:
-with no MFA rows, no backup history and no header policy, the screen must say "Not checked
-yet" rather than "Verified".
-
-**Then, in the same tick, slice 1's last item: the CSV export.** An export is the one screen
-output that *leaves* the platform, so `crates/security/src/csv.rs` is written as though every
-row will be pasted into a ticket, an email and an auditor's spreadsheet. Three decisions, and
-one of them is the actual security fix:
-
-* **The export is the filter, not the page.** It ignores the page size on purpose. An operator
-  who filters to "critical", exports 50 of 300 rows and hands that to an auditor has produced
-  a document that reads as a complete list and is not one. A 50k-row cap applies instead, and
-  its refusal names the count and says "narrow the filter".
-* **A cell starting with `=`, `+`, `-` or `@` is prefixed with a tab.** Correctly quoting
-  `"=1+1"` does not help: a findings title can be a hostile package name, and a findings export
-  is exactly the document a person opens in a spreadsheet. This is the CSV injection the
-  security-export literature is actually about, and it is the reason this module is hand-written
-  rather than delegated to a helper nobody can check.
-* **The evidence blob is not exported.** Evidence is the raw report entry and this file leaves
-  the building. The ingest already refuses a document carrying something shaped like a
-  credential, but "the ingest checked" is not a reason to put the raw blob in a spreadsheet.
-
-**Proof, added.**
-
-- `cargo test -p omnion-security --lib` → **51 passed** (39 + 12 CSV)
-- `cargo build -p omnion-api` → clean; `tsc --noEmit` in `apps/admin` → exit 0
-- Commits: `2585d72` (the CSV), `0d5a72e` (the endpoint and the button), `ab157fd` (this record)
-
-**Next.** When the slot frees, run `bash scripts/qa/run.sh` with **no `QA_STACK` override** and
-tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
-referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
-real to report, which is why those two rows are the most useful thing this tick left behind.
-
 ## 2026-09-29 · wave 4 · REQ-053 slice 2 — the approval path, the exports and three screens (`fdc04e4`, `e8328a5`)
 
 **What.** The over-threshold adjustment now waits for a decision. `0127_inventory_adjustment_approvals.sql`,
@@ -5624,3 +5624,60 @@ check its own output against a list that was written before the answer existed:
 Until those land, the screens are **built and typechecked but not visually reviewed**, and the REQ stays
 `in-progress` rather than `done`. Slice 3 does not depend on the pass finishing, so the next tick proceeds
 to transfers and the alert sweep rather than waiting on it.
+
+## Tick 58 — REQ-012 slice 2, the header policy and the CSRF token
+
+**What.** `crates/security/src/headers.rs` (the policy, its rendering and every reason it is
+refused), `csrf.rs` (the derived double-submit token), `header_store.rs` (the singleton row, a
+compare-and-swap save, and the history), `0135_security_headers.sql`, `CsrfSecret` in
+`crates/core/src/config.rs`, the two middlewares in `apps/api/src/headers_middleware.rs`, and
+`GET`/`PUT /security/headers` behind `security.read` / `security.manage`.
+
+**The decisions that are the slice, not its furniture.**
+
+* **One rendering, three consumers.** `HeaderPolicy::render` produces the header lines that go
+  on the wire, the `rendered` column the panel previews, and what the posture checks read. A
+  policy summarised in one place and assembled in another is how an operator ends up with
+  "I configured it and nothing changed".
+* **Report-only sends the report header and nothing else.** Sending both would apply a policy
+  while the screen says it is only reporting it. The test asserts neither mode emits the other
+  mode's name.
+* **The installed layer holds a shared cell, not a snapshot.** The first draft snapshotted the
+  policy when the router was built, which meant a save changed the database and no response
+  until the next restart. `RwLock<Arc<Policy>>` — one pointer clone per request, and `reload`
+  after a successful save.
+* **Refuse, never skip, when the secret is missing.** A deployment with no `OMNION_CSRF_SECRET`
+  boots and then refuses cookie-authenticated mutations. Failing open would turn a missing key
+  into a silent loss of a control, which is the worst outcome a control has.
+* **Header policy is a singleton, not per-tenant.** One process serves every response, so a
+  per-tenant CSP would let one tenant weaken the policy everybody's requests are answered with.
+* **The audit row and the setting are one transaction.** The first draft ran them as two
+  queries — the update commits, the insert fails on a dropped connection, and the edit happened
+  with nothing recording it.
+
+**Two defects from tick 57, found because this tick finally ran `--lib`.**
+
+* `cargo test -p omnion-api --lib` had been **red since slice 1** and only `cargo build` had
+  ever been run against it. A test called `to_string()` on `ApiError`, which implements no
+  `Display`. It does now — the code and the message, never the `details` blob.
+* A test fixture had a **credential mask written into the source** instead of a secret: the
+  file literally held the redaction placeholder where an `sk-` value was meant, so the
+  credential detector was being asserted against a Unicode marker and passing for the wrong
+  reason. Fixed at byte level; `git diff --stat` is the check that catches that class of edit.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **100 passed** (51 + 46 for headers and CSRF, + 3 store)
+- `cargo test -p omnion-api --lib` → **208 passed** (was 0 compiling)
+- `cargo test -p omnion-core --lib` → **37 passed** (34 + 3 for the secret)
+- `cargo build -p omnion-api` → clean
+- Commits: `163a4f8`, `b9e2ae2`, `f2f8007`, `1ad077e`, `6e7b920`, `4747b9f`
+
+**Still open, and named rather than written off.** The `/security/headers` **screen** does not
+exist yet, and neither slice 1 nor slice 2 has a browser pass: the single QA slot was held by a
+live w10 pass for this whole tick (holder 2521941, cwd `/mnt/apopic/omnion-w10`). A pass that
+starts while this tree is half-written would build half of it, so the pass was deliberately
+stopped and the slice committed instead. **Next tick:** if the slot is free, run
+`bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
+then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
+visited and clicked.

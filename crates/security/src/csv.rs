@@ -197,7 +197,8 @@ mod tests {
 
     #[test]
     fn a_comma_in_a_title_does_not_add_a_column() {
-        let document = render(&[finding("Buffer overflow, remotely exploitable")]).expect("renders");
+        let document =
+            render(&[finding("Buffer overflow, remotely exploitable")]).expect("renders");
         let row = document.trim_end().split("\r\n").nth(1).expect("a row");
         assert_eq!(split_csv(row).len(), COLUMNS.len());
         assert!(row.contains("\"Buffer overflow, remotely exploitable\""));
@@ -207,7 +208,10 @@ mod tests {
     fn a_quote_in_a_title_is_doubled_not_dropped() {
         let document = render(&[finding("The \"fixed\" version is 2.0")]).expect("renders");
         let row = document.trim_end().split("\r\n").nth(1).expect("a row");
-        assert!(row.contains("\"The \"\"fixed\"\" version is 2.0\""), "got: {row}");
+        assert!(
+            row.contains("\"The \"\"fixed\"\" version is 2.0\""),
+            "got: {row}"
+        );
         assert_eq!(split_csv(row)[2], "The \"fixed\" version is 2.0");
     }
 
@@ -222,11 +226,7 @@ mod tests {
         // Two physical lines inside a quoted cell, but still one logical row: the reader below
         // splits on quotes, not newlines, which is exactly what a spreadsheet does.
         let logical_rows = document.trim_end().split("\r\n").count();
-        let last = document
-            .trim_end()
-            .rsplit("\r\n")
-            .next()
-            .expect("a row");
+        let last = document.trim_end().rsplit("\r\n").next().expect("a row");
         let cells = split_csv(last);
         assert_eq!(cells.len(), COLUMNS.len());
         assert_eq!(cells[10], "first line\nsecond line");

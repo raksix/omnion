@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 hex.workspace = true
+# The CSRF token is an HMAC over the session id (REQ-012, slice 2): derived rather than stored,
+# so there is no table to rotate and nothing to leak from a dump.
+hmac.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
