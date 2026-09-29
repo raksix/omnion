@@ -6,9 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-// UNION of both sides: the secrets/observability nav (wave 5b) and the
-// notifications nav (main) are both live, so the import carries both sets.
-import { Activity, BarChart3, BadgeCheck, Bell, BellRing, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Network, Scale, ScrollText, Send, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Waypoints, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -23,6 +21,11 @@ const NAV = [
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },
+  // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
+  // Settings because both answer the same question from the bus's side — "what does the
+  // platform think happened" and "who was told" — and an operator chasing a missing webhook
+  // needs both on the same shelf.
+  { href: "/events", label: "Events", icon: Activity },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
@@ -39,23 +42,6 @@ const NAV = [
   { href: "/settings/iam/sessions", label: "Sessions", icon: Timer },
   { href: "/settings/iam/devices", label: "Devices", icon: Fingerprint },
   { href: "/settings/search", label: "Search settings", icon: SlidersHorizontal },
-  { href: "/secrets/root-key", label: "Key ring", icon: KeyRound },
-  { href: "/secrets/credentials", label: "Credentials", icon: BadgeCheck },
-  { href: "/secrets/slots", label: "Credential slots", icon: Network },
-  { href: "/secrets/leases", label: "Leases", icon: Timer },
-  { href: "/secrets/deploy-keys", label: "Deployment keys", icon: KeyRound },
-  { href: "/secrets/audit", label: "Audit & flags", icon: ShieldCheck },
-  // The observability centre (REQ-126). The metric catalogue is the entry point: the log explorer
-  // (slice 1) has no screen of its own yet and lands with the rest of the screens, and the other
-  // routes in this request are named in the plan rather than being half-linked here.
-  { href: "/observability/metrics", label: "Observability", icon: Activity },
-  { href: "/observability/traces", label: "Traces", icon: Waypoints },
-  { href: "/observability/exporters", label: "Exporters", icon: Send },
-  // Alerts before exporters in the reading order: "is anything wrong" is the question an operator
-  // arrives with, and the answer is here rather than in a metric family. Settings last, because it
-  // is the one screen in the centre an operator opens deliberately rather than urgently.
-  { href: "/observability/alerts", label: "Alerts", icon: BellRing },
-  { href: "/observability/settings", label: "Obs. settings", icon: SlidersHorizontal },
 ] as const;
 
 /// Screens whose own path also prefixes their children (`/settings/iam` against

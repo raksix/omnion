@@ -7,7 +7,7 @@
 //! work up, because everything it needs is a durable row (`apps/api/src/event_runner.rs` drives
 //! this loop in the API process).
 
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use sqlx::PgPool;
 use time::Duration;
@@ -19,6 +19,19 @@ use crate::{sender, store};
 
 /// How much of a failure travels into the delivery row.
 const MAX_ERROR_CHARS: usize = 500;
+
+/// How long one delivery's HTTP round trip took, in whole milliseconds.
+///
+/// A receiver that never answers is bounded by the request timeout (10s by default), so this
+/// cannot grow without limit; it is still clamped, because the delivery row's own check demands
+/// a non-negative integer and a saturated conversion would be a value the column refuses.
+fn elapsed_millis(started: StdInstant) -> Option<i32> {
+    let millis = started
+        .elapsed()
+        .as_millis()
+        .min(i32::MAX as u128);
+    i32::try_from(millis).ok()
+}
 
 /// Knobs of one delivery tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,9 +114,22 @@ async fn deliver_one(
     job: DeliveryJob,
     report: &mut RunReport,
 ) -> Result<()> {
-    match sender::deliver(client, &job).await {
+    // Timed around the send, not around the write: the number an operator wants is how long
+    // their *receiver* took, and folding the database round trip into it would make a fast
+    // receiver on a busy database look slow.
+    let started = StdInstant::now();
+    let outcome = sender::deliver(client, &job).await;
+    let duration_ms = elapsed_millis(started);
+
+    match outcome {
         DeliveryOutcome::Delivered { status } => {
-            store::mark_delivered(pool, job.delivery_id, Some(i32::from(status))).await?;
+            store::mark_delivered(
+                pool,
+                job.delivery_id,
+                Some(i32::from(status)),
+                duration_ms,
+            )
+            .await?;
             report.delivered += 1;
 
             tracing::info!(
@@ -126,6 +152,7 @@ async fn deliver_one(
                     status.map(i32::from),
                     &message,
                     store::now() + delay,
+                    duration_ms,
                 )
                 .await?;
                 report.retried += 1;
@@ -141,7 +168,14 @@ async fn deliver_one(
                     "webhook delivery failed; another attempt is queued"
                 );
             } else {
-                store::mark_failed(pool, job.delivery_id, status.map(i32::from), &message).await?;
+                store::mark_failed(
+                    pool,
+                    job.delivery_id,
+                    status.map(i32::from),
+                    &message,
+                    duration_ms,
+                )
+                .await?;
                 report.failed += 1;
 
                 // Giving up is the one delivery outcome an operator cannot see anywhere else:
@@ -217,6 +251,13 @@ mod tests {
             }
             .is_idle()
         );
+    }
+
+    #[test]
+    fn a_measured_round_trip_is_never_negative() {
+        // A monotonic clock cannot go backwards, so the only way this is exercised is the
+        // clamp: a value the column's own check would refuse must not reach the column.
+        assert!(elapsed_millis(StdInstant::now()).is_some_and(|ms| ms >= 0));
     }
 
     #[test]

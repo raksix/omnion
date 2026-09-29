@@ -189,6 +189,350 @@ pub async fn delete_endpoint(pool: &PgPool, id: Uuid) -> Result<bool> {
     Ok(result.rows_affected() == 1)
 }
 
+/// What a delivery history read is narrowed to.
+///
+/// Every field is a conjunction except [`Self::statuses`], which is a disjunction: an operator
+/// looking at "what broke" asks for `failed` *and* the `pending` rows that are about to break
+/// the same way, and reading that as a list of alternatives is the only shape where the
+/// question is answerable in one request.
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryFilter {
+    /// Statuses to keep; empty keeps all of them.
+    pub statuses: Vec<String>,
+    /// Exact event names, any of which may match. Empty matches everything.
+    pub names: Vec<String>,
+    /// Only deliveries queued at or after this instant.
+    pub from: Option<OffsetDateTime>,
+    /// Only deliveries queued at or before this instant.
+    pub to: Option<OffsetDateTime>,
+    /// Substring of the delivery id or the event name, as the operator typed it.
+    pub search: Option<String>,
+    /// Exclusive upper bound of the page: the created_at of the previous page's last row.
+    pub before: Option<(OffsetDateTime, Uuid)>,
+    /// How many rows this read may return.
+    pub limit: i64,
+}
+
+/// One page of a delivery history.
+#[derive(Debug)]
+pub struct DeliveryPage {
+    /// The rows, newest first.
+    pub deliveries: Vec<Delivery>,
+    /// Whether a further page exists behind the last row of this one.
+    pub has_more: bool,
+    /// How many rows the filter matches in total.
+    ///
+    /// A separate count from the list, and that is a deliberate trade: the list answers
+    /// "what is on screen" and the count answers "how much of the history does this filter
+    /// cover", and a delivery table whose header claims 40 of 40 while showing 25 rows is the
+    /// number an operator checks first. The count is taken over the same predicate, so the two
+    /// cannot describe different filters.
+    pub total: i64,
+}
+
+/// The deliveries of one endpoint, newest first, narrowed by [`DeliveryFilter`].
+///
+/// The cursor is `(created_at, id)` rather than the id alone, and the reason is the ordering:
+/// this read sorts by `created_at desc, id desc` because `created_at` is what a human thinks
+/// in, and a cursor on a column that is not in the sort can skip or repeat rows whenever two
+/// deliveries share a timestamp. The pair is unique, so `(<, =)` on it is a total order and
+/// the boundary is exact.
+pub async fn list_deliveries_filtered(
+    pool: &PgPool,
+    endpoint_id: Uuid,
+    filter: &DeliveryFilter,
+) -> Result<DeliveryPage> {
+    let base = format!(
+        "from webhook_deliveries d join events e on e.id = d.event_id \
+         where d.endpoint_id = $1 \
+           and (cardinality($2::text[]) = 0 or d.status = any ($2)) \
+           and (cardinality($3::text[]) = 0 or e.name = any ($3)) \
+           and ($4::timestamptz is null or d.created_at >= $4) \
+           and ($5::timestamptz is null or d.created_at <= $5) \
+           and ($6::text is null or d.id::text like $6 or e.name ilike '%' || $6 || '%') \
+           and ($7::timestamptz is null or (d.created_at, d.id) < ($7, $8))"
+    );
+
+    let search = filter
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (cursor_at, cursor_id) = filter
+        .before
+        .map(|(at, id)| (Some(at), Some(id)))
+        .unwrap_or((None, None));
+
+    let sql = format!(
+        "select {DELIVERY_COLUMNS} {base} \
+         order by d.created_at desc, d.id desc \
+         limit {}",
+        (filter.limit.max(1) + 1).to_string()
+    );
+
+    let rows: Vec<Delivery> = sqlx::query_as(&sql)
+        .bind(endpoint_id)
+        .bind(&filter.statuses)
+        .bind(&filter.names)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(search)
+        .bind(cursor_at)
+        .bind(cursor_id)
+        .fetch_all(pool)
+        .await?;
+
+    // One row past the page is what makes `has_more` honest: a second count would be a second
+    // query that could disagree with the list, and the disagreement is invisible until somebody
+    // pages to the end.
+    let has_more = rows.len() as i64 > filter.limit.max(1);
+    let mut deliveries = rows;
+    if has_more {
+        deliveries.truncate(filter.limit.max(1) as usize);
+    }
+
+    let count_sql = format!(
+        "select count(*) from webhook_deliveries d join events e on e.id = d.event_id \
+         where d.endpoint_id = $1 \
+           and (cardinality($2::text[]) = 0 or d.status = any ($2)) \
+           and (cardinality($3::text[]) = 0 or e.name = any ($3)) \
+           and ($4::timestamptz is null or d.created_at >= $4) \
+           and ($5::timestamptz is null or d.created_at <= $5) \
+           and ($6::text is null or d.id::text like $6 or e.name ilike '%' || $6 || '%')"
+    );
+    let total: i64 = sqlx::query_scalar(&count_sql)
+        .bind(endpoint_id)
+        .bind(&filter.statuses)
+        .bind(&filter.names)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(search)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(DeliveryPage {
+        deliveries,
+        has_more,
+        total,
+    })
+}
+
+/// What one endpoint's delivery history says about its receiver.
+///
+/// Three windows rather than one, because "is it working" and "was it working an hour ago" are
+/// different questions and an operator comparing them is usually chasing a regression.
+// No `Eq`: `success_rate` is an `f64`, and `Eq` is not implemented for floats. `PartialEq` is
+// all a summary of counts needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeliveryStats {
+    /// Rows the receiver accepted, in the window.
+    pub delivered: i64,
+    /// Rows that ran out of attempts, in the window.
+    pub failed: i64,
+    /// Rows still waiting, in the window. Counted regardless of window: a queue that stopped
+    /// draining is the failure a success rate cannot show, and it must not disappear from a
+    /// 7-day window because it started five minutes ago.
+    pub pending: i64,
+    /// Rows queued, in the window.
+    pub total: i64,
+    /// Share of settled rows that were accepted, 0.0–1.0; `None` when nothing settled yet.
+    pub success_rate: Option<f64>,
+    /// 95th percentile receiver duration in the window; `None` when nothing ran.
+    pub p95_duration_ms: Option<i32>,
+}
+
+/// Summarise one endpoint's history since `since`.
+///
+/// `success_rate` counts only **settled** rows (`delivered` + `failed`). Including `pending`
+/// in the denominator is the single most misleading thing a webhook dashboard can do: a queue
+/// that just took a thousand deliveries shows 0% while every one of them is about to succeed,
+/// which sends the operator to debug a receiver that is working perfectly.
+pub async fn endpoint_stats(
+    pool: &PgPool,
+    endpoint_id: Uuid,
+    since: OffsetDateTime,
+) -> Result<DeliveryStats> {
+    // Four counts, no `max`: the slowest single delivery is not a number anybody acts on, and
+    // the percentile below is computed from the full sample where it is.
+    let row: (i64, i64, i64, i64) = sqlx::query_as(
+        "select \
+             count(*) filter (where status = 'delivered'), \
+             count(*) filter (where status = 'failed'), \
+             count(*) filter (where status = 'pending'), \
+             count(*) \
+         from webhook_deliveries \
+         where endpoint_id = $1 and created_at >= $2",
+    )
+    .bind(endpoint_id)
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
+
+    // The percentile is a second, smaller read rather than a window function: the 95th
+    // percentile of the *delivered* rows is the number, and filtering to delivered first means
+    // a pile of slow failures cannot drag it — a slow failure is a retry, not a latency budget.
+    let durations: Vec<i32> = sqlx::query_scalar(
+        "select duration_ms from webhook_deliveries \
+         where endpoint_id = $1 and status = 'delivered' and duration_ms is not null \
+           and created_at >= $2 \
+         order by duration_ms asc",
+    )
+    .bind(endpoint_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+
+    let p95 = percentile_95(&durations);
+
+    let settled = row.0 + row.1;
+    Ok(DeliveryStats {
+        delivered: row.0,
+        failed: row.1,
+        pending: row.2,
+        total: row.3,
+        success_rate: (settled > 0).then(|| row.0 as f64 / settled as f64),
+        p95_duration_ms: p95,
+    })
+}
+
+/// The 95th percentile of a sorted sample, nearest-rank.
+///
+/// Nearest-rank rather than an interpolation because every value here is a measured
+/// millisecond count: reporting `1_047ms` as a latency would be a number no receiver ever
+/// produced. An empty sample has no percentile, and `None` is honest where `0` would be a
+/// claim.
+#[must_use]
+pub fn percentile_95(sorted: &[i32]) -> Option<i32> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+    sorted.get(rank.clamp(1, sorted.len()) - 1).copied()
+}
+
+/// Why one redelivery was refused, when it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedeliverRefusal {
+    /// No delivery with that id on this endpoint.
+    Unknown,
+    /// The row is `pending`: the runner already owns it or is about to, and resetting it would
+    /// let a second runner pick up the same row.
+    AlreadyPending,
+    /// The row has been forced again ten times already.
+    OverCap,
+}
+
+impl RedeliverRefusal {
+    /// Stable, machine-readable code — the API hands this to the panel.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unknown => "delivery_not_found",
+            Self::AlreadyPending => "delivery_already_pending",
+            Self::OverCap => "redeliver_limit_reached",
+        }
+    }
+
+    /// The sentence the operator reads.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Unknown => "no such delivery on this endpoint",
+            Self::AlreadyPending => "this delivery is already queued for another attempt",
+            Self::OverCap => "this delivery has already been sent again ten times",
+        }
+    }
+}
+
+/// How many times one delivery may be forced again.
+pub const MAX_REDELIVERIES: i32 = 10;
+
+/// Force one delivery again.
+///
+/// This **resets** the row rather than inserting a second one. The `(endpoint_id, event_id)`
+/// unique index would refuse the insert anyway, and it should: a queue holding two rows for the
+/// same fact sends it twice and the receiver cannot tell a replay from a duplicate. Resetting
+/// is also what makes `attempts` mean "attempts in the current round" rather than "attempts
+/// ever", which is the number an operator is comparing against `max_attempts`.
+///
+/// A `pending` row is refused rather than reset, and that is the one place this operation could
+/// double-send: the runner has already claimed it and is holding a lease, so a reset would hand
+/// the same row to the next claim while the first attempt is still in flight.
+pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> Result<()> {
+    let updated = sqlx::query(
+        "update webhook_deliveries \
+         set status = 'pending', attempts = 0, next_attempt_at = now(), \
+             claimed_at = null, response_status = null, error = null, \
+             delivered_at = null, duration_ms = null, \
+             trigger = 'replay', \
+             redeliver_count = redeliver_count + 1, replayed_at = now() \
+         where id = $1 and endpoint_id = $2 \
+           and status <> 'pending' \
+           and redeliver_count < $3",
+    )
+    .bind(delivery_id)
+    .bind(endpoint_id)
+    .bind(MAX_REDELIVERIES)
+    .execute(pool)
+    .await?;
+
+    if updated.rows_affected() == 1 {
+        return Ok(());
+    }
+
+    // Nothing was updated, so find out which of the three reasons it was — the operator's next
+    // move differs completely for each ("it is not there" vs "wait a moment" vs "fix your
+    // receiver instead of retrying"), and one opaque refusal would make all three look the same.
+    //
+    // The store error stays an error rather than becoming a fourth refusal: "the database did
+    // not answer" is not one of the three answers, and folding it into `Unknown` would tell an
+    // operator their delivery does not exist when in fact the platform could not look.
+    let current: Option<(String, i32)> = sqlx::query_as(
+        "select status, redeliver_count from webhook_deliveries where id = $1 and endpoint_id = $2",
+    )
+    .bind(delivery_id)
+    .bind(endpoint_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(EventsError::Store)?;
+
+    let refusal = match current {
+        None => RedeliverRefusal::Unknown,
+        Some((status, _)) if status == "pending" => RedeliverRefusal::AlreadyPending,
+        Some(_) => RedeliverRefusal::OverCap,
+    };
+
+    // The refusal is carried *inside* the crate's error rather than in place of it, because
+    // the API needs the code (`delivery_already_pending` is not `invalid_webhook_endpoint`) and
+    // the panel needs the sentence — three distinct refusals behind one generic code would
+    // leave all three looking the same in the error banner.
+    Err(EventsError::RedeliveryRefused {
+        code: refusal.code(),
+        message: refusal.message(),
+    })
+}
+
+/// Force several deliveries again, reporting each one separately.
+///
+/// Per-id outcomes rather than a batch that stops at the first refusal: an operator who
+/// selected twenty rows and fixed one receiver wants to know which eleven moved, and a single
+/// all-or-nothing answer makes them check the table by hand anyway. The refusals are values
+/// rather than errors so one row's `pending` does not stop the other nineteen from moving.
+pub async fn redeliver_many(
+    pool: &PgPool,
+    endpoint_id: Uuid,
+    delivery_ids: &[Uuid],
+) -> Result<Vec<(Uuid, Result<()>)>> {
+    let mut outcomes = Vec::with_capacity(delivery_ids.len());
+    for id in delivery_ids {
+        // A store error (the database not answering) does stop the batch, because nothing
+        // after it could be reached either. A *refusal* does not: those are per-row answers
+        // and the point of the batch is to report them individually.
+        outcomes.push((*id, redeliver(pool, endpoint_id, *id).await));
+    }
+    Ok(outcomes)
+}
+
 /// The deliveries of one endpoint, newest first.
 pub async fn list_deliveries(
     pool: &PgPool,
@@ -210,27 +554,111 @@ pub async fn list_deliveries(
     Ok(deliveries)
 }
 
-/// Recorded events, newest first, optionally filtered by organization and exact name.
-pub async fn list_events(
-    pool: &PgPool,
-    organization_id: Option<Uuid>,
-    name: Option<&str>,
-    limit: i64,
-) -> Result<Vec<Event>> {
+/// What the event feed is narrowed to.
+///
+/// Every field is optional and every field is a *conjunction*: a name list plus a site plus a
+/// window together mean all three, which is the only reading an operator can predict without a
+/// manual. `before` is a keyset cursor on the row id rather than a timestamp, because the id is
+/// a monotonic sequence: two events recorded inside the same microsecond are still ordered, and
+/// a page that arrives late cannot skip a row that landed behind it — exactly the failure a
+/// timestamp cursor invites on a bus as fast as this one.
+#[derive(Debug, Clone, Default)]
+pub struct EventFilter {
+    /// Organization the events belong to; `None` reads every organization's.
+    pub organization_id: Option<Uuid>,
+    /// Exact event names, any of which may match. An empty list matches everything.
+    pub names: Vec<String>,
+    /// Site the event happened on.
+    pub site_id: Option<Uuid>,
+    /// Account that caused it.
+    pub actor_user_id: Option<Uuid>,
+    /// Only events recorded at or after this instant.
+    pub from: Option<OffsetDateTime>,
+    /// Only events recorded at or before this instant.
+    pub to: Option<OffsetDateTime>,
+    /// Exclusive upper bound of the page: the id of the previous page's last row.
+    pub before: Option<i64>,
+    /// How many rows this read may return.
+    pub limit: i64,
+}
+
+/// One page of the event feed.
+#[derive(Debug)]
+pub struct EventPage {
+    /// The rows, newest first.
+    pub events: Vec<Event>,
+    /// Whether a further page exists behind the last row of this one.
+    pub has_more: bool,
+}
+
+/// Recorded events, newest first, narrowed by [`EventFilter`].
+///
+/// One row more than asked for is selected, so the caller can say whether a further page
+/// exists without a second `count` query — and without the possibility of the count and the
+/// list disagreeing, which is a list that is lying.
+pub async fn list_events(pool: &PgPool, filter: &EventFilter) -> Result<EventPage> {
     let sql = format!(
         "select {EVENT_COLUMNS} from events \
          where ($1::uuid is null or organization_id = $1) \
-           and ($2::text is null or name = $2) \
+           and (cardinality($2::text[]) = 0 or name = any ($2)) \
+           and ($3::uuid is null or site_id = $3) \
+           and ($4::uuid is null or actor_user_id = $4) \
+           and ($5::timestamptz is null or created_at >= $5) \
+           and ($6::timestamptz is null or created_at <= $6) \
+           and ($7::bigint is null or id < $7) \
          order by id desc \
-         limit $3"
+         limit $8"
     );
-    let events = sqlx::query_as(&sql)
-        .bind(organization_id)
-        .bind(name)
-        .bind(limit)
+    let mut rows = sqlx::query_as(&sql)
+        .bind(filter.organization_id)
+        .bind(&filter.names)
+        .bind(filter.site_id)
+        .bind(filter.actor_user_id)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(filter.before)
+        .bind(filter.limit + 1)
         .fetch_all(pool)
         .await?;
-    Ok(events)
+
+    let has_more = rows.len() as i64 > filter.limit;
+    // The extra row is the existence proof, not content: keeping it would show the operator a
+    // row the "next page" button is about to show again.
+    if has_more {
+        rows.truncate(filter.limit.max(0) as usize);
+    }
+
+    Ok(EventPage {
+        events: rows,
+        has_more,
+    })
+}
+
+/// How many deliveries each event name collected since an instant.
+///
+/// The number is per *name* and not per id because the catalogue is about names: an operator
+/// looking at `page.published` wants to know whether the name is alive on their own endpoints,
+/// not how many rows one instance of it produced. The join keeps both ends honest — a delivery
+/// whose event was swept by retention stops counting rather than leaving behind a number
+/// nothing can explain.
+pub async fn delivery_counts_since(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    since: OffsetDateTime,
+) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "select e.name as name, count(*) as deliveries \
+         from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where d.created_at >= $2 \
+           and ($1::uuid is null or e.organization_id = $1) \
+         group by e.name",
+    )
+    .bind(organization_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Claim up to `batch` deliveries that are due, and return them with everything needed to send.
@@ -299,15 +727,26 @@ pub async fn cancel_pending_for_disabled(pool: &PgPool, lease_seconds: f64) -> R
 }
 
 /// Record that a receiver accepted a delivery.
-pub async fn mark_delivered(pool: &PgPool, id: Uuid, response_status: Option<i32>) -> Result<()> {
+pub async fn mark_delivered(
+    pool: &PgPool,
+    id: Uuid,
+    response_status: Option<i32>,
+    duration_ms: Option<i32>,
+) -> Result<()> {
+    // `duration_ms` is written on the delivered branch and on the retry branch, and *cleared*
+    // by `redeliver`. It is not written by `mark_failed` because a failed attempt still has a
+    // duration and throwing it away would make a receiver that fails fast and one that times
+    // out look identical in the stats.
     sqlx::query(
         "update webhook_deliveries \
          set status = 'delivered', delivered_at = now(), response_status = $2, \
+             duration_ms = coalesce($3, duration_ms), \
              error = null, claimed_at = null \
          where id = $1",
     )
     .bind(id)
     .bind(response_status)
+    .bind(duration_ms)
     .execute(pool)
     .await?;
 
@@ -321,16 +760,22 @@ pub async fn mark_retry(
     response_status: Option<i32>,
     error: &str,
     next_attempt_at: OffsetDateTime,
+    duration_ms: Option<i32>,
 ) -> Result<()> {
+    // The duration is kept on a retry: a receiver that is timing out rather than refusing is
+    // the case an operator needs to see, and clearing it on every retry would hide it behind
+    // the very row that proves it.
     sqlx::query(
         "update webhook_deliveries \
-         set next_attempt_at = $2, response_status = $3, error = $4, claimed_at = null \
+         set next_attempt_at = $2, response_status = $3, error = $4, claimed_at = null, \
+             duration_ms = coalesce($5, duration_ms) \
          where id = $1",
     )
     .bind(id)
     .bind(next_attempt_at)
     .bind(response_status)
     .bind(error)
+    .bind(duration_ms)
     .execute(pool)
     .await?;
 
@@ -343,15 +788,18 @@ pub async fn mark_failed(
     id: Uuid,
     response_status: Option<i32>,
     error: &str,
+    duration_ms: Option<i32>,
 ) -> Result<()> {
     sqlx::query(
         "update webhook_deliveries \
-         set status = 'failed', response_status = $2, error = $3, claimed_at = null \
+         set status = 'failed', response_status = $2, error = $3, claimed_at = null, \
+             duration_ms = coalesce($4, duration_ms) \
          where id = $1",
     )
     .bind(id)
     .bind(response_status)
     .bind(error)
+    .bind(duration_ms)
     .execute(pool)
     .await?;
 
@@ -390,6 +838,44 @@ fn name_conflict(error: sqlx::Error, name: &str) -> EventsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_percentile_never_invents_a_number() {
+        // An empty sample has no percentile, and `None` is the honest answer: `0` would render
+        // as "the receiver answered instantly" for an endpoint that has not run at all.
+        assert_eq!(percentile_95(&[]), None);
+        assert_eq!(percentile_95(&[42]), Some(42));
+
+        // Nearest-rank over a hundred samples: the 95th value, not an interpolation between the
+        // 95th and 96th, because every sample here is a measured millisecond count.
+        let hundred: Vec<i32> = (1..=100).collect();
+        assert_eq!(percentile_95(&hundred), Some(95));
+
+        // A small sample must not reach past its end: `ceil(4 * 0.95) = 4`, and index 3 is the
+        // last element, so the clamp is what makes a four-delivery history answerable at all.
+        assert_eq!(percentile_95(&[1, 3, 5, 9]), Some(9));
+    }
+
+    #[test]
+    fn the_refusals_name_three_different_problems() {
+        // The whole point of the enum: three refusals whose next step differs, so they must not
+        // collapse into one code on the way out.
+        let codes = [
+            RedeliverRefusal::Unknown.code(),
+            RedeliverRefusal::AlreadyPending.code(),
+            RedeliverRefusal::OverCap.code(),
+        ];
+        assert_eq!(codes.len(), 3);
+        for (index, code) in codes.iter().enumerate() {
+            assert!(
+                !codes[index + 1..].contains(code),
+                "refusal codes must be distinct: {code}"
+            );
+        }
+
+        // And the cap is a real number, so a row that has been forced ten times says so.
+        assert_eq!(MAX_REDELIVERIES, 10);
+    }
 
     #[test]
     fn the_backoff_ladder_doubles_and_caps() {

@@ -6,8 +6,11 @@
  */
 import type {
   CreatedMediaShare,
+  EventCatalogue,
+  EventFilters,
+  EventPage,
+  NewMediaGrant,
   Media,
-  MediaActivity,
   MediaBulkResult,
   MediaCrossSiteReport,
   MediaDuplicateReport,
@@ -16,12 +19,23 @@ import type {
   MediaFilters,
   MediaFolder,
   MediaFolderTree,
+  MediaMergeResult,
+  MediaPreset,
   MediaGrant,
   MediaGrantSubject,
   MediaGrantsResponse,
-  MediaMergeResult,
-  MediaPreset,
+  MediaShare,
+  MediaActivity,
+  MediaUsage,
+  MediaStorageProbe,
+  MediaStorageSettings,
   MediaQuarantineList,
+  MediaScanProbe,
+  MediaScanRunList,
+  MediaScanSettings,
+  MediaScanSettingsInput,
+  MediaSweepResult,
+  MediaStorageSettingsInput,
   MediaReplaceResult,
   MediaRetentionList,
   MediaRetentionPolicy,
@@ -29,19 +43,12 @@ import type {
   MediaRetentionRepair,
   MediaRetentionRunList,
   MediaRetentionRunResult,
-  MediaScanProbe,
-  MediaScanRunList,
-  MediaScanSettings,
-  MediaScanSettingsInput,
-  MediaShare,
-  MediaStorageProbe,
-  MediaStorageSettings,
-  MediaStorageSettingsInput,
-  MediaSweepResult,
   MediaTrash,
-  MediaUsage,
   MediaVersionList,
-  NewMediaGrant,
+  OnboardingStatus,
+  Organization,
+  OwnerSetupResult,
+  Page,
   NotificationBulkResult,
   NotificationChannelReadiness,
   NotificationDevice,
@@ -56,10 +63,6 @@ import type {
   NotificationRow,
   NotificationSettingsRow,
   NotificationSummary,
-  OnboardingStatus,
-  Organization,
-  OwnerSetupResult,
-  Page,
   Site,
   User,
 } from "./types";
@@ -3548,279 +3551,6 @@ export function fetchIamProvisioningLog(input: {
   return request(`/api/v1/iam/provisioning/log${query ? `?${query}` : ""}`);
 }
 
-
-/* ------------------------------------------------------------------------------------------
- * The secret key ring (docs/requests/REQ-125, slice 1).
- *
- * Nothing in this block ever carries a secret value: the ring exposes fingerprints, coverage
- * counters and a re-wrap job's progress, and the only response in the whole request that may
- * ever hold a value is the loopback redemption of slice 3.
- * ---------------------------------------------------------------------------------------- */
-
-/** One key in the installation ring. Metadata only — no material, no checksum. */
-export type RootKey = {
-  key_id: string;
-  status: "active" | "retiring" | "retired";
-  fingerprint: string;
-  version_count: number;
-  created_at: string;
-  retired_at: string | null;
-  retired_reason: string | null;
-};
-
-/** The seal self-check's verdict, in the panel's words. */
-export type SealReport = {
-  healthy: boolean;
-  sealed: number;
-  unsealed: [string, string][];
-  source: string | null;
-  guidance: string;
-};
-
-/** A re-wrap job and its real counter. */
-export type RewrapJob = {
-  id: string;
-  status: "pending" | "running" | "paused" | "completed" | "failed";
-  from_key_id: string;
-  to_key_id: string;
-  rewrapped_count: number;
-  total_count: number;
-  progress: number;
-  resume_note: string | null;
-  pause_reason: string | null;
-  last_error: string | null;
-  started_at: string;
-  completed_at: string | null;
-};
-
-/** Everything the key ring screen needs in one read. */
-export type RootKeyState = {
-  keys: RootKey[];
-  seal: SealReport;
-  job: RewrapJob | null;
-  recent_jobs: RewrapJob[];
-  versions_to_rewrap: number;
-  has_active_key: boolean;
-};
-
-/** Read the ring, the self-check and the live job. */
-export function fetchRootKeyState(): Promise<RootKeyState> {
-  return request<RootKeyState>("/api/v1/secrets/root-key");
-}
-
-/** Start the rotation ceremony. Answers the job it opened. */
-export function rotateRootKey(): Promise<RewrapJob> {
-  return request<RewrapJob>("/api/v1/secrets/root-key/rotate", { method: "POST" });
-}
-
-/** One re-wrap job's counter. */
-export function fetchRewrapJob(id: string): Promise<RewrapJob> {
-  return request<RewrapJob>(
-    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}`,
-  );
-}
-
-/** Pause a running walk; the counter and cursor are kept. */
-export function pauseRewrapJob(id: string): Promise<RewrapJob> {
-  return request<RewrapJob>(
-    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/pause`,
-    { method: "POST" },
-  );
-}
-
-/** Resume a paused walk from its cursor. */
-export function resumeRewrapJob(id: string): Promise<RewrapJob> {
-  return request<RewrapJob>(
-    `/api/v1/secrets/root-key/rewrap-jobs/${encodeURIComponent(id)}/resume`,
-    { method: "POST" },
-  );
-}
-
-/* ---------------------------------------------------------------------------------------
- * Typed credential profiles and credential slots (REQ-125, slice 2).
- *
- * Nothing in this block can hold a secret value: the API's serializers have no such field, and
- * these types mirror them exactly. A credential is an address (`id`) plus metadata; the value
- * travels only through a lease, which is slice 3's job.
- * ---------------------------------------------------------------------------------------- */
-
-/** One typed credential profile, as `/secrets/credentials` returns it. */
-export type Credential = {
-  id: string;
-  name: string;
-  kind: string;
-  kind_description: string;
-  offline_checkable: boolean;
-  fields: Record<string, unknown>;
-  field_pairs: [string, string][];
-  validation_state: "unknown" | "valid" | "invalid" | "stale";
-  validation_message: string;
-  validation_checked_at: string | null;
-  validation_interval_days: number;
-  next_validation_at: string | null;
-  provider: "local" | "file" | "env";
-  provider_locator: string | null;
-  read_only: boolean;
-  version: number;
-  created_at: string;
-  slots: string[];
-};
-
-/** One kind, as the create wizard offers it. The panel builds its picker from this. */
-export type CredentialKindOption = {
-  kind: string;
-  description: string;
-  fields: string[];
-  offline: boolean;
-};
-
-/** Everything the credentials screen needs in one read. */
-export type CredentialsResponse = {
-  credentials: Credential[];
-  kinds: CredentialKindOption[];
-  total: number;
-  valid: number;
-  invalid: number;
-  unknown: number;
-};
-
-/** The verdict of one validator run. */
-export type ValidationResult = {
-  id: string;
-  validation_state: string;
-  validation_message: string;
-  checked_at: string;
-  valid: boolean;
-};
-
-/** One slot assignment row. */
-export type CredentialSlot = {
-  id: string;
-  scope_type: string;
-  scope_id: string;
-  slot: string;
-  description: string;
-  consumers: string;
-  primary_secret_id: string | null;
-  primary_name: string | null;
-  primary_version: number | null;
-  fallback_secret_id: string | null;
-  fallback_name: string | null;
-  fallback_version: number | null;
-  last_resolved_by: string | null;
-  last_resolved_at: string | null;
-  empty_reason: string;
-};
-
-/** One catalogue entry for the slot picker. */
-export type SlotDef = { slot: string; description: string; consumers: string };
-
-/** A credential a slot can be pointed at. */
-export type AssignableCredential = {
-  id: string;
-  name: string;
-  kind: string;
-  read_only: boolean;
-  provider: string;
-};
-
-/** Everything the slot screen needs in one read. */
-export type SlotsResponse = {
-  slots: CredentialSlot[];
-  catalog: SlotDef[];
-  assignable: AssignableCredential[];
-  assigned: number;
-};
-
-/** What a slot resolves to — metadata only, exactly like the API. */
-export type SlotResolution = {
-  scope_type: string;
-  scope_id: string;
-  slot: string;
-  secret_id: string;
-  name: string;
-  version: number;
-  fell_back: boolean;
-  summary: string;
-};
-
-/** Read the typed credentials, the kinds and the counters. */
-export function fetchCredentials(): Promise<CredentialsResponse> {
-  return request<CredentialsResponse>("/api/v1/secrets/credentials");
-}
-
-/** One profile with its detail field list. */
-export function fetchCredential(id: string): Promise<Credential> {
-  return request<Credential>(`/api/v1/secrets/credentials/${encodeURIComponent(id)}`);
-}
-
-/**
- * Pin a secret to a kind and record its non-secret fields.
- *
- * The API refuses a field that carries the value, so this never has to worry about one leaking:
- * there is no place to put it that survives the request.
- */
-export function attachCredentialProfile(
-  id: string,
-  kind: string,
-  fields: Record<string, string>,
-): Promise<Credential> {
-  return request<Credential>(`/api/v1/secrets/${encodeURIComponent(id)}/credential`, {
-    method: "POST",
-    body: JSON.stringify({ kind, fields }),
-  });
-}
-
-/** Run the kind validator now. A failure comes back as a chip, not an error. */
-export function validateCredential(id: string): Promise<ValidationResult> {
-  return request<ValidationResult>(`/api/v1/secrets/${encodeURIComponent(id)}/validate`, {
-    method: "POST",
-    body: JSON.stringify({}),
-  });
-}
-
-/** Read the slot matrix, the catalogue and the assignable credentials. */
-export function fetchSlots(): Promise<SlotsResponse> {
-  return request<SlotsResponse>("/api/v1/credential-slots");
-}
-
-/**
- * Assign a primary and an optional fallback, or clear the assignment with a null primary.
- *
- * A self-referencing fallback comes back as `409 credential_slot_self_reference`, which the
- * editor renders inline next to the fallback picker rather than as a page-level error.
- */
-export function assignSlot(
-  scopeType: string,
-  slot: string,
-  scopeId: string,
-  primarySecretId: string | null,
-  fallbackSecretId: string | null,
-): Promise<CredentialSlot> {
-  return request<CredentialSlot>(
-    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}`,
-    {
-      method: "PUT",
-      body: JSON.stringify({
-        scope_id: scopeId,
-        primary_secret_id: primarySecretId,
-        fallback_secret_id: fallbackSecretId,
-      }),
-    },
-  );
-}
-
-/** Ask what a consumer would resolve. Metadata only — the route exists to show the fallback. */
-export function resolveSlot(
-  scopeType: string,
-  slot: string,
-  scopeId: string,
-): Promise<SlotResolution> {
-  return request<SlotResolution>(
-    `/api/v1/credential-slots/${encodeURIComponent(scopeType)}/${encodeURIComponent(slot)}/resolve/${encodeURIComponent(scopeId)}`,
-  );
-}
-
 /* ---------------------------------------------------------------------------------------------
  * Enterprise sign-in providers (REQ-006, slice 4b-2; docs/07-IAM.md §11)
  *
@@ -3968,342 +3698,6 @@ export function fetchSsoProviders(): Promise<{
   providers: { slug: string; name: string; kind: string; start_url: string }[];
 }> {
   return request("/api/v1/auth/sso/providers");
-
-}
-
-/* ---------------------------------------------------------------------------------------------
- * Credential leases and deployment keys (REQ-125, slice 3; docs/requests/REQ-125).
- *
- * Two bindings in this block carry a sensitive-looking field, and the difference matters:
- *
- * - `issueLease` returns a **lease token**, which is an opaque handle. It is not a secret value
- *   and the API never makes it one — the issuing handler does not open the envelope at all.
- * - `createDeploymentKey` returns the key **value**, exactly once, in the same shape the gateway
- *   keys use (REQ-040). The row keeps a hash; nothing else can ever read it back.
- *
- * There is deliberately no `redeemLease` binding here. Redemption is a loopback helper path
- * authenticated by a machine identity, not something a browser session may do — so the panel
- * cannot call it even if a future bug wanted to.
- */
-
-/** One lease, as `/secret-leases` returns it. No token, no value. */
-export type SecretLease = {
-  id: string;
-  secret_id: string;
-  name: string;
-  consumer: string;
-  environment: string;
-  state: "live" | "spent" | "expired" | "revoked" | string;
-  max_uses: number;
-  uses: number;
-  expires_in_seconds: number;
-  expires_at: string;
-  issued_at: string;
-  revoked_at: string | null;
-  revoke_reason: string | null;
-  last_redeemed_at: string | null;
-  last_address: string | null;
-  deployment_key_id: string | null;
-  version: number;
-};
-
-/** The leases screen in one read, with the counters and the filter values. */
-export type LeasesResponse = {
-  leases: SecretLease[];
-  total: number;
-  live: number;
-  spent: number;
-  revoked: number;
-  environments: string[];
-};
-
-/** A freshly issued lease: the row plus the one-time token. */
-export type IssuedLease = SecretLease & {
-  token: string;
-  expires_in_seconds: number;
-};
-
-/** One deployment key. Metadata only — no field of this shape can hold the value. */
-export type DeploymentKey = {
-  id: string;
-  name: string;
-  environment: string;
-  scopes: string[];
-  state: "active" | "revoked" | "expired" | string;
-  expires_at: string;
-  expires_in_seconds: number;
-  uses: number;
-  last_used_at: string | null;
-  allowed_ips: string[];
-  key_prefix: string;
-  fingerprint: string;
-  created_at: string;
-  revoked_at: string | null;
-  revoke_reason: string | null;
-  deletable: boolean;
-};
-
-/** The deployment keys screen in one read. */
-export type DeploymentKeysResponse = {
-  keys: DeploymentKey[];
-  total: number;
-  active: number;
-  expired: number;
-  revoked: number;
-  header: string;
-  guidance: string;
-};
-
-/** A minted key: the row plus the value, shown once. */
-export type CreatedDeploymentKey = DeploymentKey & { value: string; header: string };
-
-/** One presentation of a deployment key, in the use log. */
-export type DeploymentKeyUse = {
-  action: "lease" | "denied" | "revoke" | string;
-  lease_id: string | null;
-  identity: string;
-  address: string | null;
-  result: string;
-  created_at: string;
-};
-
-/** Read the leases, live first. */
-export function fetchSecretLeases(): Promise<LeasesResponse> {
-  return request<LeasesResponse>("/api/v1/secret-leases");
-}
-
-/**
- * Issue a lease to a consumer.
- *
- * The answer carries an opaque token, not a value: the issuing path never opens the envelope.
- * TTL and use cap are clamped by the API, so the panel sends what the operator asked for and
- * renders what came back rather than pre-validating a window the server owns.
- */
-export function issueLease(
-  secretId: string,
-  input: { consumer: string; environment?: string; ttlSeconds?: number; maxUses?: number },
-): Promise<IssuedLease> {
-  return request<IssuedLease>(`/api/v1/secrets/${encodeURIComponent(secretId)}/lease`, {
-    method: "POST",
-    body: JSON.stringify({
-      consumer: input.consumer,
-      environment: input.environment,
-      ttl_seconds: input.ttlSeconds,
-      max_uses: input.maxUses,
-    }),
-  });
-}
-
-/** Revoke a lease with a reason. A revoke is a fact, so the reason is not optional in the UI. */
-export function revokeLease(id: string, reason: string): Promise<SecretLease> {
-  return request<SecretLease>(`/api/v1/secret-leases/${encodeURIComponent(id)}/revoke`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/** Read the deployment keys. */
-export function fetchDeploymentKeys(): Promise<DeploymentKeysResponse> {
-  return request<DeploymentKeysResponse>("/api/v1/deployment-keys");
-}
-
-/**
- * Mint a scoped, expiring machine credential. The value is in the response and nowhere else.
- *
- * `expiresAt` is required by the API on purpose — a deployment key that never expires is a
- * liability — so the type makes it non-optional and the drawer has to ask for a date.
- */
-export function createDeploymentKey(input: {
-  name: string;
-  environment: string;
-  scopes: string[];
-  expiresAt: string;
-  allowedIps?: string | null;
-}): Promise<CreatedDeploymentKey> {
-  return request<CreatedDeploymentKey>("/api/v1/deployment-keys", {
-    method: "POST",
-    body: JSON.stringify({
-      name: input.name,
-      environment: input.environment,
-      scopes: input.scopes,
-      expires_at: input.expiresAt,
-      allowed_ips: input.allowedIps ?? null,
-    }),
-  });
-}
-
-/** Revoke a key immediately. Revoking also revokes the leases it minted. */
-export function revokeDeploymentKey(id: string, reason: string): Promise<DeploymentKey> {
-  return request<DeploymentKey>(`/api/v1/deployment-keys/${encodeURIComponent(id)}/revoke`, {
-    method: "POST",
-    body: JSON.stringify({ reason }),
-  });
-}
-
-/** Delete a revoked key's record. A live key is refused, so this never removes a working key. */
-export function deleteDeploymentKey(id: string): Promise<{ deleted: boolean }> {
-  return request<{ deleted: boolean }>(
-    `/api/v1/deployment-keys/${encodeURIComponent(id)}`,
-    { method: "DELETE" },
-  );
-}
-
-/** The use log: which pipeline presented the key, from where, for which lease, with what result. */
-export function fetchDeploymentKeyUses(
-  id: string,
-  limit = 50,
-): Promise<{ key_id: string; uses: DeploymentKeyUse[] }> {
-  return request(`/api/v1/deployment-keys/${encodeURIComponent(id)}/uses?limit=${limit}`);
-}
-
-/* ── the secrets audit trail (REQ-125, slice 4) ─────────────────────────────────────────────────
- *
- * Nothing in this block can return a credential value, and the type shapes are the reason: there
- * is no field on `SecretAuditEntry` that could hold one. The API answers with an explicit field
- * allowlist rather than redacting a whole row, so a column added to the trail later cannot appear
- * in the feed unasked.
- */
-
-/** One row of the access trail. Metadata only. */
-export type SecretAuditEntry = {
-  id: number;
-  action: string;
-  target_type: string | null;
-  target_id: string | null;
-  actor_user_id: string | null;
-  /** `user`, `agent`, `service` or `system` — the chip that separates a person from a pipeline. */
-  actor_type: string;
-  ip_address: string | null;
-  /** The id the caller was handed in its error banner, so a refusal joins to the row. */
-  request_id: string | null;
-  lease_id: string | null;
-  deployment_key_id: string | null;
-  pipeline: string | null;
-  metadata: Record<string, unknown>;
-  created_at: string;
-};
-
-/** The detector thresholds, plus the sentence that explains them. */
-export type SecretAuditDetectors = {
-  business_hours_start: number;
-  business_hours_end: number;
-  reveal_burst_per_hour: number;
-  detect_new_network: boolean;
-  /** Always `false` in this build, and rendered as such rather than hidden. */
-  hard_rule_enforced: boolean;
-  explanation: string;
-};
-
-/** One advisory flag. Never a gate: acknowledging it is the only write the screen can make. */
-export type SecretAnomaly = {
-  id: number;
-  pattern: string;
-  severity: string;
-  secret_id: string | null;
-  secret_name: string | null;
-  actor_user_id: string | null;
-  address: string | null;
-  detail: Record<string, unknown>;
-  request_id: string | null;
-  created_at: string;
-  acknowledged_by: string | null;
-  acknowledged_at: string | null;
-};
-
-/** The audit screen in one read: the trail, the open-flag count and the thresholds. */
-export type SecretAuditResponse = {
-  entries: SecretAuditEntry[];
-  open_anomalies: number;
-  /** The action names the filter offers, generated server-side from what is actually written. */
-  filters: string[];
-  detectors: SecretAuditDetectors;
-  /** The installation's local hour, which is what "off hours" is measured against. */
-  local_hour: number;
-};
-
-/** The filters the trail can be narrowed by. Every field is optional; empty means "no narrowing". */
-export type SecretAuditFilter = {
-  actions?: string[];
-  secretId?: string;
-  actorUserId?: string;
-  address?: string;
-  requestId?: string;
-  since?: string;
-  limit?: number;
-};
-
-/**
- * Build the query string.
- *
- * `action` repeats rather than joining: a collector reading the request line can see each
- * selected action, and a single comma-joined value would have to be re-split with a guess about
- * whether a name could contain a comma.
- */
-function auditQuery(filter: SecretAuditFilter = {}): string {
-  const query = new URLSearchParams();
-  for (const action of filter.actions ?? []) query.append("action", action);
-  if (filter.secretId) query.set("secret_id", filter.secretId);
-  if (filter.actorUserId) query.set("actor_user_id", filter.actorUserId);
-  if (filter.address) query.set("address", filter.address);
-  if (filter.requestId) query.set("request_id", filter.requestId);
-  if (filter.since) query.set("since", filter.since);
-  if (filter.limit) query.set("limit", String(filter.limit));
-  const text = query.toString();
-  return text ? `?${text}` : "";
-}
-
-/** Read the access trail. The filters the screen offers come back in `filters`. */
-export function fetchSecretAudit(
-  filter: SecretAuditFilter = {},
-): Promise<SecretAuditResponse> {
-  return request<SecretAuditResponse>(`/api/v1/secrets/audit${auditQuery(filter)}`);
-}
-
-/** Read the flags on their own, for the popover on the header count. */
-export function fetchSecretAnomalies(): Promise<{ anomalies: SecretAnomaly[] }> {
-  return request<{ anomalies: SecretAnomaly[] }>("/api/v1/secrets/audit/anomalies");
-}
-
-/**
- * Clear one flag.
- *
- * The API answers `already_acknowledged` rather than a change that did not happen, because a
- * second click on a row is a normal thing for a panel to do.
- */
-export function acknowledgeSecretAnomaly(
-  id: number,
-): Promise<{ state: "acknowledged" | "already_acknowledged"; id: number }> {
-  return request(`/api/v1/secrets/audit/anomalies/${id}/acknowledge`, {
-    method: "PATCH",
-    body: JSON.stringify({}),
-  });
-}
-
-/**
- * The SIEM feed, as newline-delimited JSON.
- *
- * This one does not go through `request`: that helper insists on a JSON answer and would have
- * needed a second shape for the identical bytes. The endpoint is a plain download and the browser
- * gets it as one — which is also why the trail it writes about the export is worth having.
- */
-export async function downloadSecretAuditExport(filter: SecretAuditFilter = {}): Promise<string> {
-  const response = await fetch(`/api/v1/secrets/audit/export${auditQuery(filter)}`, {
-    credentials: "same-origin",
-    headers: { accept: "application/x-ndjson" },
-  });
-  if (!response.ok) {
-    // Parsed with the same helper so an export refusal renders the same error card as a listing
-    // refusal, request id and all, rather than as a blank download.
-    const body = await response.json().catch(() => null);
-    throw new ApiError(
-      response.status,
-      (body as { error?: { code?: string; message?: string } } | null)?.error?.code ??
-        "export_failed",
-      (body as { error?: { code?: string; message?: string } } | null)?.error?.message ??
-        "The audit export could not be produced.",
-    );
-  }
-  return response.text();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4556,464 +3950,6 @@ export function releaseMediaQuarantine(
   );
 }
 
-/* ── the metric catalogue and the chart behind it (REQ-126, slice 2) ─────────────────────────── */
-
-/** One declared metric family, as `/observability/metrics/catalog` returns it. */
-export interface MetricFamily {
-  name: string;
-  kind: "counter" | "gauge" | "histogram";
-  unit: string;
-  description: string;
-  labels: string[];
-  source: "core" | "module" | "worker";
-  cardinality_estimate: number;
-  cardinality_budget: number;
-  budgeted: boolean;
-  last_seen_at: string | null;
-  /** `true` when this build emits the family (a module's row can outlive its build). */
-  live: boolean;
-  /** `true` when the family is folding samples into its `other` series. */
-  over_budget: boolean;
-}
-
-/** The label positions a family declares and the values the registry has actually seen. */
-export interface MetricLabelCatalogue {
-  metric: string;
-  labels: string[];
-  values: string[][];
-  bounded_set_cap: number;
-}
-
-/** The catalogue response. */
-export interface MetricCatalogResponse {
-  families: MetricFamily[];
-  label_catalogues: MetricLabelCatalogue[];
-  over_budget: string[];
-  global_budget: number;
-  max_points: number;
-}
-
-/** One minute bucket on a chart. */
-export interface MetricPoint {
-  at: string;
-  value: number;
-}
-
-/** One series, with its label values and its minute buckets. */
-export interface MetricSeries {
-  labels: string[];
-  total: number;
-  observations: number;
-  points: MetricPoint[];
-}
-
-/** One chart's worth of data. */
-export interface MetricQueryResponse {
-  metric: string;
-  kind: "counter" | "gauge" | "histogram";
-  unit: string;
-  labels: string[];
-  window_minutes: number;
-  max_points: number;
-  series: MetricSeries[];
-  promql: string;
-  /** `true` when the family is declared but has never recorded a sample in this process. */
-  no_samples: boolean;
-}
-
-/** The documented families, with the live series counts and the over-budget list. */
-export function fetchMetricCatalog(): Promise<MetricCatalogResponse> {
-  return request<MetricCatalogResponse>("/api/v1/observability/metrics/catalog");
-}
-
-/**
- * One family's bounded chart.
- *
- * The window is sent in minutes and clamped by the API at `max_points`; the response carries the
- * clamp back so the screen can say so rather than drawing a chart that quietly resampled.
- */
-export function fetchMetricQuery(
-  metric: string,
-  windowMinutes: number,
-): Promise<MetricQueryResponse> {
-  const query = new URLSearchParams({ metric, window_minutes: String(windowMinutes) });
-  return request<MetricQueryResponse>(`/api/v1/observability/metrics/query?${query}`);
-}
-
-/** Re-seed the catalogue from the registry. A write: it audits, and it takes `observability.manage`. */
-export function syncMetricCatalog(): Promise<MetricCatalogResponse> {
-  return request<MetricCatalogResponse>("/api/v1/observability/metrics/sync", { method: "POST" });
-}
-
-
-/* ── the trace search, the trace detail and the exporter centre (REQ-126, slice 3) ─────────── */
-
-/** One row of the trace index, as `/observability/traces` returns it. */
-export interface TraceSummary {
-  trace_id: string;
-  root_name: string;
-  service: string;
-  route: string | null;
-  request_id: string | null;
-  started_at: string;
-  duration_ms: number;
-  span_count: number;
-  spans_kept: number;
-  spans_truncated: boolean;
-  status: "ok" | "error";
-  sampled: boolean;
-  /** WHY a trace is here: `error`, `ratio`, `upstream` or `always`. */
-  sampling: string;
-}
-
-/** The trace search's response. */
-export interface TracesResponse {
-  traces: TraceSummary[];
-  total: number;
-  window_minutes: number;
-}
-
-/** One span of a waterfall, already redacted. */
-export interface TraceSpan {
-  trace_id: string;
-  span_id: string;
-  parent_span_id: string | null;
-  name: string;
-  service: string;
-  offset_ms: number;
-  duration_ms: number;
-  failed: boolean;
-  attributes: Record<string, unknown>;
-  root: boolean;
-}
-
-/** One trace with its bounded waterfall. */
-export interface TraceDetail extends TraceSummary {
-  spans: TraceSpan[];
-  /** The operator's tracing backend, when one is configured. `null` means there is none. */
-  backend_trace_url: string | null;
-}
-
-/** One exporter as the screen reads it. */
-export interface ExporterRow {
-  id: string;
-  name: string;
-  kind: "otlp" | "prometheus_remote_write" | "syslog" | "webhook";
-  endpoint: string;
-  protocol: string | null;
-  /** `true` when a secret is REFERENCED. The secret itself never comes here. */
-  auth_configured: boolean;
-  batch_ms: number;
-  timeout_ms: number;
-  enabled: boolean;
-  health: "unknown" | "ok" | "degraded" | "down";
-  buffered: number;
-  capacity: number;
-  dropped_total: number;
-  last_flush_at: string | null;
-  last_error: string | null;
-}
-
-/** The exporter list, with the egress statement the request requires on the payload. */
-export interface ExportersResponse {
-  exporters: ExporterRow[];
-  kinds: string[];
-  egress_notice: string;
-}
-
-/** The body of a create or edit. */
-export interface ExporterInput {
-  name: string;
-  kind: string;
-  endpoint: string;
-  protocol?: string | null;
-  /** A secret id from the store — never a value. */
-  auth_secret_id?: string | null;
-  batch_ms?: number;
-  timeout_ms?: number;
-  enabled?: boolean;
-}
-
-/** What a `Test` reported. */
-export interface ExporterTestResult {
-  name: string;
-  kind: string;
-  ok: boolean;
-  detail: string;
-  health: string;
-}
-
-/** Search the trace index. Every filter is optional and the API validates each one. */
-export function fetchTraces(filters: {
-  request_id?: string;
-  route?: string;
-  status?: "ok" | "error";
-  min_duration_ms?: number;
-  window_minutes?: number;
-  limit?: number;
-}): Promise<TracesResponse> {
-  const query = new URLSearchParams();
-  for (const [key, value] of Object.entries(filters)) {
-    if (value !== undefined && value !== "") query.set(key, String(value));
-  }
-  return request<TracesResponse>(`/api/v1/observability/traces?${query}`);
-}
-
-/** One trace with its waterfall. */
-export function fetchTrace(traceId: string): Promise<TraceDetail> {
-  return request<TraceDetail>(`/api/v1/observability/traces/${encodeURIComponent(traceId)}`);
-}
-
-/** The exporter rows, their health and their drop counters. */
-export function fetchExporters(): Promise<ExportersResponse> {
-  return request<ExportersResponse>("/api/v1/observability/exporters");
-}
-
-/** Add an exporter. A write: it audits, and it takes `observability.exporters.manage`. */
-export function createExporter(input: ExporterInput): Promise<{ id: string; name: string }> {
-  return request<{ id: string; name: string }>("/api/v1/observability/exporters", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Edit an exporter, including switching it off — which drains and counts its backlog. */
-export function updateExporter(id: string, input: ExporterInput): Promise<{ id: string; name: string }> {
-  return request<{ id: string; name: string }>(`/api/v1/observability/exporters/${id}`, {
-    method: "PATCH",
-    body: JSON.stringify(input),
-  });
-}
-
-/** Remove an exporter and its buffer. */
-export function deleteExporter(id: string): Promise<{ deleted: string }> {
-  return request<{ deleted: string }>(`/api/v1/observability/exporters/${id}`, {
-    method: "DELETE",
-  });
-}
-
-/**
- * Send a synthetic batch to the endpoint and report the backend's own answer.
- *
- * A failure is a `200` with `ok: false` and the backend's words, not an error page: the button
- * exists to tell the operator what the backend said, and an error page tells them nothing they
- * could not have learned by waiting.
- */
-export function testExporter(id: string): Promise<ExporterTestResult> {
-  return request<ExporterTestResult>(`/api/v1/observability/exporters/${id}/test`, {
-    method: "POST",
-  });
-}
-
-/* ── alert rules, the alert timeline and the settings row (REQ-126, slice 4) ────────────────── */
-
-/** One rule, with the state the evaluator's last pass left it in. */
-export interface AlertRuleRow {
-  id: string;
-  name: string;
-  /** The stored expression, verbatim — the form edits what is stored, not a re-render. */
-  expr: string;
-  /** The expression as the evaluator understood it, or `null` when it does not parse. */
-  parsed: string | null;
-  severity: "info" | "warning" | "critical";
-  for_seconds: number;
-  summary: string;
-  runbook_url: string | null;
-  labels: Record<string, unknown>;
-  /** `bundled` rules are re-seeded at every boot and cannot be deleted. */
-  source: "bundled" | "custom";
-  enabled: boolean;
-  state: "pending" | "firing" | null;
-  value: number | null;
-  silenced: boolean;
-  silenced_until: string | null;
-  /** `false` means the stored expression stopped parsing — a rule that looks configured. */
-  expression_valid: boolean;
-  expression_error: string | null;
-}
-
-/** The rules, plus what a rule may name. */
-export interface AlertRulesResponse {
-  rules: AlertRuleRow[];
-  families: string[];
-  severities: string[];
-  max_for_seconds: number;
-}
-
-/** The body of a create. */
-export interface AlertRuleInput {
-  name: string;
-  expr: string;
-  severity: string;
-  for_seconds?: number;
-  summary?: string;
-  runbook_url?: string | null;
-  labels?: Record<string, unknown>;
-}
-
-/** One open or resolved event. */
-export interface AlertEventRow {
-  id: number;
-  rule_id: string;
-  state: "pending" | "firing" | "resolved";
-  value: number | null;
-  firing_value: number | null;
-  started_at: string;
-  ended_at: string | null;
-  fired_at: string | null;
-  /** `true` once a notification was claimed — the "notifies once" line, made visible. */
-  notified: boolean;
-  /** `threshold`, `dwell` or `silenced`. */
-  reason: string;
-  context: Record<string, unknown>;
-}
-
-/** One silence window. */
-export interface SilenceRow {
-  id: string;
-  rule_id: string | null;
-  reason: string;
-  starts_at: string | null;
-  ends_at: string;
-  active: boolean;
-  minutes_remaining: number;
-}
-
-/** The firing / pending / resolved states and the silences. */
-export interface AlertsResponse {
-  counts: {
-    firing: number;
-    pending: number;
-    silenced: number;
-    worst_severity: string | null;
-  };
-  firing: AlertEventRow[];
-  pending: AlertEventRow[];
-  resolved: AlertEventRow[];
-  silences: SilenceRow[];
-}
-
-/** What a preview found, without saving anything. */
-export interface AlertPreview {
-  rendered: string;
-  family: string;
-  value: number | null;
-  series: number;
-  breaching: boolean;
-  /**
-   * `true` when the family has no samples at all.
-   *
-   * This is the distinction the screen has to make out loud: `breaching: false` because the
-   * value is under the threshold and `breaching: false` because nothing is being recorded look
-   * identical on a chip, and only one of them is the operator's to fix.
-   */
-  no_data: boolean;
-}
-
-/** The one settings row, with the caps it is held to. */
-export interface ObservabilitySettings {
-  sampling_ratio: number;
-  logs_retention_days: number;
-  traces_retention_days: number;
-  log_level_default: string;
-  log_level_overrides: Record<string, unknown>;
-  cardinality_budget: number;
-  prometheus_public: boolean;
-  caps: {
-    logs_retention_max: number;
-    traces_retention_max: number;
-    sampling_max: number;
-    cardinality_max: number;
-    log_levels: string[];
-  };
-  egress_note: string;
-  level_overrides: {
-    target: string;
-    level: string;
-    expires_at: string | null;
-    expired: boolean;
-  }[];
-}
-
-/** The body of a settings save. */
-export interface ObservabilitySettingsInput {
-  sampling_ratio: number;
-  logs_retention_days: number;
-  traces_retention_days: number;
-  log_level_default: string;
-  log_level_overrides?: Record<string, unknown>;
-  cardinality_budget: number;
-  prometheus_public?: boolean;
-}
-
-/** The probe contract, and where this process is in it. */
-export interface LifecycleResponse {
-  draining: boolean;
-  in_flight: number;
-  drain_timeout_ms: number;
-  probes: {
-    liveness: { path: string; alias: string; fails_on_drain: boolean };
-    readiness: { path: string; fails_on_drain: boolean };
-  };
-  note: string;
-  summary: Record<string, unknown> | null;
-}
-
-export function fetchAlertRules(): Promise<AlertRulesResponse> {
-  return request<AlertRulesResponse>("/api/v1/observability/alert-rules");
-}
-
-export function createAlertRule(input: AlertRuleInput): Promise<AlertRuleRow> {
-  return request<AlertRuleRow>("/api/v1/observability/alert-rules", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
-export function updateAlertRule(
-  id: string,
-  patch: Partial<AlertRuleInput> & { enabled?: boolean },
-): Promise<AlertRuleRow> {
-  return request<AlertRuleRow>(`/api/v1/observability/alert-rules/${id}`, {
-    method: "PATCH",
-    body: JSON.stringify(patch),
-  });
-}
-
-export function deleteAlertRule(id: string): Promise<{ deleted: string }> {
-  return request<{ deleted: string }>(`/api/v1/observability/alert-rules/${id}`, {
-    method: "DELETE",
-  });
-}
-
-/**
- * Evaluate an expression against live data, saving nothing.
- *
- * A POST and not a GET: it evaluates a caller-supplied expression, and every proxy, cache and
- * browser in the path treats a GET as safe to replay.
- */
-export function previewAlertRule(expr: string): Promise<AlertPreview> {
-  return request<AlertPreview>("/api/v1/observability/alert-rules/preview", {
-    method: "POST",
-    body: JSON.stringify({ expr }),
-  });
-}
-
-export function fetchAlerts(): Promise<AlertsResponse> {
-  return request<AlertsResponse>("/api/v1/observability/alerts");
-}
-
-export function createSilence(input: {
-  rule_id: string | null;
-  reason: string;
-  ends_at: string;
-}): Promise<SilenceRow> {
-  return request<SilenceRow>("/api/v1/observability/silences", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-}
-
 
 // ---------------------------------------------------------------------------------------------
 // Notifications (docs/requests/REQ-021, slice 1)
@@ -5123,30 +4059,6 @@ export function emitNotification(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
-}
-
-
-export function deleteSilence(id: string): Promise<{ deleted: string }> {
-  return request<{ deleted: string }>(`/api/v1/observability/silences/${id}`, {
-    method: "DELETE",
-  });
-}
-
-export function fetchObservabilitySettings(): Promise<ObservabilitySettings> {
-  return request<ObservabilitySettings>("/api/v1/observability/settings");
-}
-
-export function saveObservabilitySettings(
-  input: ObservabilitySettingsInput,
-): Promise<ObservabilitySettings> {
-  return request<ObservabilitySettings>("/api/v1/observability/settings", {
-    method: "PUT",
-    body: JSON.stringify(input),
-  });
-}
-
-export function fetchLifecycle(): Promise<LifecycleResponse> {
-  return request<LifecycleResponse>("/api/v1/observability/lifecycle");
 }
 
 /**
@@ -5300,4 +4212,47 @@ export function runNotificationRoute(input: {
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The event feed and the catalogue (REQ-016, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build the feed's query string from its filters.
+ *
+ * `name` is repeated rather than joined: `?name=a&name=b` is the only shape that survives a
+ * value containing a comma, and an event name is a controlled vocabulary that will never
+ * contain one — but a filter that quietly mis-splits on a comma the day somebody registers a
+ * plugin's own name is a filter that will be debugged from the wrong end.
+ */
+function eventQuery(filters: EventFilters = {}): string {
+  const search = new URLSearchParams();
+  for (const name of filters.name ?? []) {
+    if (name) search.append("name", name);
+  }
+  if (filters.site_id) search.set("site_id", filters.site_id);
+  if (filters.actor_user_id) search.set("actor_user_id", filters.actor_user_id);
+  if (filters.from) search.set("from", filters.from);
+  if (filters.to) search.set("to", filters.to);
+  if (filters.cursor && filters.cursor > 0) search.set("cursor", String(filters.cursor));
+  if (filters.limit) search.set("limit", String(filters.limit));
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+/** One page of the platform's recent events, newest first. */
+export function fetchEvents(filters: EventFilters = {}): Promise<EventPage> {
+  return request<EventPage>(`/api/v1/events${eventQuery(filters)}`);
+}
+
+/**
+ * Every event name the platform knows, with its area, description and payload fields.
+ *
+ * The counts (`live_count`, `reserved_count`, `max_subscriptions`) are part of the answer
+ * rather than something the screen recomputes: they are the registry's own totals, and a
+ * screen that counted the rows it happened to receive would report a number that changes with
+ * a filter the user cannot see.
+ */
+export function fetchEventCatalogue(): Promise<EventCatalogue> {
+  return request<EventCatalogue>("/api/v1/events/catalogue");
 }

@@ -1,25 +1,24 @@
 # REQ-016 — Webhook + Event Bus
 
-> **Status:** in-progress — **slices 1 and the emission half of slice 3 are code-complete and
-> verified.** The registry is `crates/events/src/catalogue.rs`: 68 names (57 live, 11 reserved)
-> with their area, a one-sentence description, their payload fields and a required flag,
-> compiled in rather than stored. `GET /api/v1/events/catalogue` serves it; a group
-> subscription (`page.*`) is stored as the wildcard **and** as today's expansion, and the
-> fan-out tests the wildcard, so an event added next release reaches an endpoint nobody edited.
-> **Slice 1's second half found a lie in the registry and fixed it:** the drift gate only
-> walked emitted → catalogue, so nothing asked whether a name marked *live* was emitted at
-> all. Twenty-seven were not. Eleven now emit (`page.created|updated|deleted|restored`,
-> `translation.updated`, `domain.added|removed`, `site.archived`, `user.updated|deleted`,
-> `theme.activated`, `webhook.endpoint.created|updated|removed|tested`,
-> `webhook.secret.rotated`, `webhook.delivery.failed`), and the ten that have no write path
-> anywhere are marked **reserved** with the module that owes each one, pinned by
-> `a_reserved_name_names_the_module_that_ships_it`. Proof: `cargo test -p omnion-events --lib`
-> **42**, `cargo test -p omnion-api --test events` **5/5** against real Postgres and a real
-> loopback receiver, `omnion-api --lib` **188**, `tsc --noEmit` exit 0. The new gate
-> `every_live_name_has_an_emitter` was proved in both directions (promoting `plugin.installed`
-> to live turned it red with the name). **Not done:** the `/events` screen with its Feed and
-> Catalogue tabs — the catalogue's data source exists, its screen does not. Slice 2 (endpoint
-> management UI) and slice 3's delivery-operations UI are untouched. · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
+> **Status:** in-progress — **slice 1 is now code-complete, API and screen.** The registry
+> is `crates/events/src/catalogue.rs`: 68 names with their area, description, payload fields
+> and a required flag, compiled in rather than stored, with a drift gate in each direction
+> (an emitted name must be catalogued; a name marked *live* must have an emitter, and the ten
+> with no write path anywhere are `reserved` with the module that owes each one). The feed
+> grew the filters the screen offers — name list, site, actor, from/to window — and answers
+> with a keyset cursor whose `has_more` is read from the row past the page. The catalogue read
+> carries each name's 24-hour delivery count. **`/events` now exists** with its Feed and
+> Catalogue tabs: filters in the query string, a payload inspector, `j`/`k`/`Enter`/`Esc`/`/`
+> on the keyboard, copy helpers, and a catalogue whose total is the API's total. **The parser
+> is hand-written because the generic one is wrong for this shape**: `serde_urlencoded`
+> refuses `?name=a` for a `Vec<String>` with a plain-text 400, so the filter the panel was
+> about to ship would have failed rather than filtered — the walk caught it before the screen
+> did. Proof: `omnion-events --lib` **42**, `omnion-api --lib` **188**, `omnion-api --test
+> events` **6/6** (5 before, +1 the filter/keyset walk) against real Postgres, `tsc --noEmit`
+> exit 0. **Not done, and not claimed:** no browser pass — the QA slot was held by a sibling
+> writer and the box was at load 26, so the walkthrough now visits `/events` and
+> `/events?tab=catalogue` and has a depth pass written but **unrun**. Slice 2 (endpoint
+> management UI) and slice 3's delivery-operations UI are untouched · **Captured:** 2026-09-25 · **Layer:** core (`crates/webhooks`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -147,11 +146,19 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
 
 - [ ] `GET /api/v1/events/catalogue` returns every event name in the registry with area, description and payload fields, and the `/events` Catalogue tab renders
   it.
-      — **Left unticked on purpose: the screen half does not exist.** The API half is done and
-      proven — the endpoint serves the whole table (area, description, payload fields with their
-      kind and required flag) and the endpoint form's picker is built from it. Ticking a box whose
-      second clause is unbuilt is how a checklist stops meaning anything, so the box waits for the
-      `/events` Catalogue tab.
+      — **Both halves are built; the box stays unticked, for the browser pass.** The API
+      serves the whole table (area, description, payload fields with their kind and required
+      flag, and now each name's 24-hour delivery count) and the endpoint form's picker is
+      built from it. The Catalogue tab renders all of it, expands an entry's payload fields,
+      narrows by area and by text, marks `live` and `reserved` differently on the row, and
+      its "Filter feed" button carries a name across to the Feed tab. The integration walk
+      proves the endpoint against real Postgres and asserts the registry's own invariants
+      (live + reserved is the whole list, a group's prefix agrees with the name,
+      `page.published` declares its four required fields). What is missing is the one thing
+      tests cannot stand in for: the `runEventsDepth` pass, which visits the tab in a browser
+      and is written but **unrun** because the QA slot was held by a sibling writer. A
+      checklist that claims a screen is right before anyone has looked at it is the thing
+      this file exists to prevent.
 - [x] Publishing a page records `page.published` with `page_id`, `site_id`, `revision_no` and `slug` in the payload; creating, updating, unpublishing and
   restoring a page record their own names.
       — `page.published` (pre-existing), `page.created`, `page.updated`, `page.deleted` and
