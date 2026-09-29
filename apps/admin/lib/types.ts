@@ -2387,6 +2387,69 @@ export interface BackupStrandedArtifact {
   reason: string;
 }
 
+/** How loudly a restore warning is. `danger` is drawn as a refusal, not a decoration. */
+export type RestoreWarningSeverity = "notice" | "caution" | "danger";
+
+/** The machine-readable warning kinds, so the UI can react to one and the audit can query it. */
+export type RestoreWarningCode =
+  | "stale_archive"
+  | "not_the_newest"
+  | "data_loss"
+  | "part_unavailable"
+  | "run_incomplete"
+  | "manifest_version"
+  | "passphrase_required";
+
+/** One thing an operator must know before restoring. */
+export interface RestoreWarning {
+  severity: RestoreWarningSeverity;
+  code: RestoreWarningCode;
+  message: string;
+}
+
+/** What one archived part does to live data when it is restored. */
+export type RestoreMode = "replace" | "merge" | "advisory";
+
+/** One part of an archive, as the wizard renders it. */
+export interface RestorablePart {
+  part: string;
+  /** Whether the artifact was re-read and agrees with the manifest. */
+  available: boolean;
+  /** Why it is not available, in the store's words, when it is not. */
+  reason: string | null;
+  item_count: number;
+  size_bytes: number;
+  checksum: string | null;
+  /** Live rows or objects this part would overwrite. */
+  live_matches: number;
+  /** Live rows or objects this part would drop, because they are not in the archive. */
+  live_dropped: number;
+  mode: RestoreMode;
+}
+
+/**
+ * What a restore of one run would do.
+ *
+ * `total_live_dropped` is the number the whole screen exists to show: how much the operator
+ * loses by choosing this restore point. It is not derivable from the manifest, which is why
+ * the preview re-reads the destination and counts the live side rather than rendering the
+ * archive's own numbers.
+ */
+export interface RestorePreview {
+  backup_id: string;
+  label: string;
+  finished_at: string | null;
+  age_days: number;
+  parts: RestorablePart[];
+  warnings: RestoreWarning[];
+  restorable_bytes: number;
+  total_live_dropped: number;
+  total_live_matches: number;
+  /** The phrase the operator must type; empty when nothing is restorable. */
+  confirm_phrase: string;
+  restorable: boolean;
+}
+
 /**
  * What one retention sweep did.
  *

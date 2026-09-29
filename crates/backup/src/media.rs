@@ -105,6 +105,22 @@ pub const OBJECTS_DIR: &str = "objects";
 /// The name of the per-object index, beside the objects rather than inside them.
 pub const INDEX_FILENAME: &str = "media-index.json";
 
+/// The index's key under a run's prefix.
+///
+/// Beside the objects rather than inside them, and normalised through
+/// [`crate::destination::storage_prefix`] for the reason every key in this crate is: a
+/// prefix that arrived as `2026-09-29/x` and one that arrived as `/2026-09-29/x/` name the
+/// same directory, and an index read from the wrong one is an empty index — which the
+/// preview would then read as "the archive holds no media" and price as "every live file is
+/// dropped". A wrong key is the most expensive possible silence in this feature.
+#[must_use]
+pub fn index_key(prefix: &str) -> String {
+    format!(
+        "{}{INDEX_FILENAME}",
+        crate::destination::storage_prefix(prefix)
+    )
+}
+
 /// Where one archived object lives, as the key an operator sees and the restore path reads.
 ///
 /// The layout mirrors the library rather than flattening it: `<site>/<id>-<name>`. The id is

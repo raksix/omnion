@@ -95,6 +95,7 @@ import type {
   BackupPurge,
   BackupPurgeFailure,
   BackupSweepReport,
+  RestorePreview,
   BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
@@ -5979,6 +5980,18 @@ export function createBackup(input: {
  */
 export function verifyBackup(id: string): Promise<BackupVerification> {
   return request<BackupVerification>(`/api/v1/backups/${id}/verify`, { method: "POST" });
+}
+
+/**
+ * What a restore of this run would do — without doing it.
+ *
+ * A `GET` on purpose: the preview re-reads every artifact off the destination and counts the
+ * live side, and neither of those writes anything. Putting it behind the destructive
+ * permission would mean the first time an operator meets this screen is a 403 that never
+ * showed them what they were agreeing to.
+ */
+export function previewRestore(id: string): Promise<RestorePreview> {
+  return request<RestorePreview>(`/api/v1/backups/${id}/restore-preview`, { method: "GET" });
 }
 
 /**
