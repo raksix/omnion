@@ -4988,10 +4988,31 @@ true. A reader looks at the question to decide whether it was answered.
 - `cargo build -p omnion-api` → clean, 5 pre-existing warnings from the merge, none new
 - `node --check scripts/qa/walkthrough.cjs` → clean
 
-**Not proved, and not claimed: the browser pass.** `--only=comments` is WRITTEN (33 required steps,
-seeded from SQL so the panel is judged on rows no browser could have written) but has NOT run: the
-global QA slot is held by another writer, `/dev/shm` is 91% full of six other writers' cargo targets
-and the box is at load 48–144 with 3 GB of free RAM. **Queued, not passed.** No browser box is ticked.
+**The browser pass: the slot was waited for, the pass RAN, and it died before my screen.**
+`--only=comments` is WRITTEN (33 required steps, seeded from SQL so the panel is judged on rows no
+browser could have written). The private pass was started with `QA_STACK=w2 QA_SLOT_WAIT=900`; the
+global slot stayed held for the full 900 s (`[qa-slot] no place after 900s, proceeding without one`),
+the database was reset, the three processes came up, and the pass died at its **first** step:
+
+```
+[walk] wizard: not in setup (http://127.0.0.1:3101/login) — installation already exists
+[walk] FATAL: could not sign in after wizard
+```
+
+**This is a pre-existing harness problem, not a defect in slice 4a.** `reset-db.sh` drops the
+database, so the panel lands on `/`; the wizard only runs when `/` routes to `/setup`, and on this
+box `/` routed to `/login` because **no account exists** — the API logged `no accounts exist yet —
+set OMNION_ADMIN_EMAIL and OMNION_ADMIN_PASSWORD to seed the first administrator`, and `run.sh` sets
+neither. So the pass needs an account that the reset it just performed has deleted, and it dies
+before reaching a single one of my 33 steps. `ensureSignedIn` then cannot sign in because the
+`CREDS` account the pass expects was never created.
+
+The fix belongs in the harness, not in a feature: `run.sh` should either export the admin pair it
+already knows in `CREDS` (so the boot log seeds it) or drive `/setup` explicitly when the users
+table is empty. **A pass whose first step needs state it just deleted is not a pass that reports on
+the screens after it** — it reports on its own setup, which is the same class as the `summary.json`
+with a `fatal` and no counts. **No browser box is ticked, and the depth pass is written but
+unproven.**
 
 **One environment lesson, the hard way.** I ran `rm -rf target/debug/{deps,build,incremental}` to free
 3.5 GB on a volume that had reached 100% — the move my own ledger recommends — and did it **while a

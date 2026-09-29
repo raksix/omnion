@@ -38,6 +38,13 @@ QA_DB_NAME="omnion_qa"
 [ "$STACK" != "main" ] && QA_DB_NAME="omnion_qa_$STACK"
 QA_DB="$QA_DB_NAME"
 export QA_DB
+# The database URL and the first account, in one place: `run.sh` and `walkthrough.cjs` must
+# agree on both. A pass that resets the database and then cannot sign in to it is a pass that
+# dies before its first screen.
+QA_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME"
+QA_ADMIN_EMAIL="qa-owner@omnion.test"
+QA_ADMIN_PASSWORD="OmnionQa-Passw0rd-2026!"
+export QA_DATABASE_URL QA_ADMIN_EMAIL QA_ADMIN_PASSWORD
 export NODE_PATH="${QA_NODE_PATH:-/root/test-hermes/node_modules}"
 export QA_CHROME="${QA_CHROME:-/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -179,10 +186,20 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+  # `OMNION_ADMIN_EMAIL` / `OMNION_ADMIN_PASSWORD` seed the FIRST account on an empty
+  # database (apps/api/src/main.rs `bootstrap_admin`). Without them the API boots onto a
+  # database `reset-db.sh` has just emptied, logs "no accounts exist yet", and the panel
+  # routes `/` to `/login` instead of `/setup` — so the walkthrough skips its wizard step as
+  # "installation already exists" and `ensureSignedIn` then cannot sign in, because the
+  # account the pass knows about is the one the reset deleted. It died on that on 2026-09-29
+  # before reaching a single screen. These are the same values `walkthrough.cjs` signs in
+  # with (`CREDS`), and both scripts must agree on them.
+  OMNION_DATABASE_URL="$QA_DATABASE_URL" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
+  OMNION_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
+  OMNION_ADMIN_PASSWORD="$QA_ADMIN_PASSWORD" \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
