@@ -33,6 +33,8 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Square,
+  SquareCheckBig,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -47,6 +49,7 @@ import {
 } from "@/features/iam/provider-deletion-dialog";
 import {
   ApiError,
+  bulkIamProviders,
   createIamProvider,
   disableIamProvider,
   enableIamProvider,
@@ -56,6 +59,7 @@ import {
   testIamProvider,
   updateIamProvider,
   type IamAuthProvider,
+  type IamProviderBulkResult,
   type IamProviderEvent,
   type IamProviderTest,
 } from "@/lib/api";
@@ -235,6 +239,17 @@ export function AuthenticationView() {
   // log and the sync history are different questions, and one disclosure closing the other is
   // how a screen ends up showing neither.
   const [showSync, setShowSync] = useState<string | null>(null);
+  /* The ticked provider ids, for the bulk enable/disable. Kept as a set-like string array and
+   * pruned against the loaded list on every render rather than cleared on each load: an operator
+   * who has ticked three rows, opened the drawer by accident and closed it should not come back
+   * to a selection they have to rebuild. What the selection is FOR is the reason the bar only
+   * appears above a non-empty one — a control that is always on screen and usually does nothing
+   * is a control nobody learns to read. */
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  /* The last bulk answer, kept so the operator can read *which* provider was refused after the
+   * list has re-rendered. A notice that says "2 were refused" and cannot name them is the same
+   * number-in-a-sentence problem the revocation count had: it is not actionable. */
+  const [bulk, setBulk] = useState<IamProviderBulkResult | null>(null);
 
   // A platform account names the organization it manages providers for; an organization account
   // never sees the picker, because it can only ever work inside its own.
@@ -405,7 +420,50 @@ export function AuthenticationView() {
     }
   };
 
-  /* What the dialog reports back. The list is re-read either way, because a reassignment and a
+  /** Switch a whole selection on or off, and say per provider what happened. */
+  const runBulk = async (action: "enable" | "disable") => {
+    if (selectedIds.length === 0) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setBulk(null);
+    try {
+      const outcome = await bulkIamProviders(action, selectedIds);
+      setBulk(outcome);
+      // The list is re-read rather than patched from the answer: the API reports what it did,
+      // and the row also carries the status chip, the untested marker and the sign-in count,
+      // so a locally patched list would disagree with the next reload in three ways.
+      await load(activeOrg);
+      const verb = action === "enable" ? "switched on" : "switched off";
+      if (outcome.refused === 0 && outcome.missing.length === 0) {
+        setNotice(
+          `${outcome.results.length} provider${outcome.results.length === 1 ? "" : "s"} ${verb}.`,
+        );
+        setSelectedIds([]);
+      } else {
+        // The selection is deliberately KEPT when something was refused: the refused providers
+        // are the ones that still need work, and clearing the ticks would make the operator
+        // tick them again by hand to find out which they were.
+        setNotice(
+          `${outcome.applied} ${verb}, ${outcome.refused} refused` +
+            (outcome.missing.length > 0 ? `, ${outcome.missing.length} not found` : "") +
+            " — see the list below.",
+        );
+      }
+    } catch (cause) {
+      setError(cause instanceof ApiError ? cause.message : "The providers could not be changed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleSelection = (id: string) => {
+    setSelectedIds((current) =>
+      current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id],
+    );
+  };
+
+  /* The dialog reports back. The list is re-read either way, because a reassignment and a
    * deletion change different things but neither of them can be reflected in the row that was
    * rendered before the click. */
   const finishDeletion = async (outcome: ProviderDeletionOutcome) => {
@@ -521,6 +579,75 @@ export function AuthenticationView() {
         </div>
       ) : null}
 
+      {status === "ready" && providers.length > 0 ? (
+        /* The bulk bar. It is *above* the list and only exists when something is ticked, which
+           is the whole reason it can be trusted: a permanent toolbar of actions that mostly
+           apply to nothing teaches operators to click before reading. */
+        <div
+          data-provider-bulk
+          className="sticky top-0 z-10 flex flex-wrap items-center gap-2 rounded-lg border border-accent/30 bg-accent-soft px-3 py-2"
+        >
+          <span className="text-[12.5px] text-ink" data-provider-bulk-count>
+            {selectedIds.length} selected
+          </span>
+          <button
+            type="button"
+            data-provider-bulk-enable
+            disabled={busy}
+            onClick={() => void runBulk("enable")}
+            className="flex h-8 items-center gap-1.5 rounded-lg bg-accent px-3 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-50"
+          >
+            <CheckCircle2 className="size-3.5" aria-hidden />
+            Switch on
+          </button>
+          <button
+            type="button"
+            data-provider-bulk-disable
+            disabled={busy}
+            onClick={() => void runBulk("disable")}
+            className="flex h-8 items-center gap-1.5 rounded-lg border border-line bg-surface px-3 text-[12.5px] text-ink transition hover:bg-panel disabled:opacity-50"
+          >
+            <CircleSlash className="size-3.5" aria-hidden />
+            Switch off
+          </button>
+          <button
+            type="button"
+            data-provider-bulk-clear
+            onClick={() => setSelectedIds([])}
+            className="ml-auto text-[12px] text-muted transition hover:text-ink"
+          >
+            Clear
+          </button>
+        </div>
+      ) : null}
+
+      {/* The per-provider outcome of the last batch. A refusal is listed by slug, not counted:
+          "1 refused" sends the operator hunting, and the whole point of asking the gate per row
+          is that the operator learns WHICH row needs a test before they can act. */}
+      {bulk && (bulk.refused > 0 || bulk.missing.length > 0) ? (
+        <div
+          role="status"
+          data-provider-bulk-report
+          className="flex flex-col gap-1 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12.5px] text-amber-900"
+        >
+          {bulk.refused > 0 ? (
+            <span>
+              {bulk.refused} could not be switched {bulk.action === "enable" ? "on" : "off"}:{" "}
+              {bulk.results
+                .filter((row) => row.error)
+                .map((row) => `${row.slug} (${row.message ?? row.error})`)
+                .join(", ")}
+            </span>
+          ) : null}
+          {bulk.missing.length > 0 ? (
+            <span data-provider-bulk-missing>
+              {bulk.missing.length} provider{bulk.missing.length === 1 ? " was" : "s were"} not
+              found in this organization.
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
       {status === "ready" && providers.length === 0 ? (
         <div
           data-providers-empty
@@ -558,6 +685,27 @@ export function AuthenticationView() {
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex min-w-0 flex-col gap-1">
                     <div className="flex flex-wrap items-center gap-2">
+                      {/* The selection tick, first in the row because it is the only control
+                          that acts on something other than this one row. A screen reader
+                          announces it as the provider's name and its checked state, which is
+                          the sentence a screen reader user needs and would otherwise have to
+                          assemble from the row's contents. */}
+                      <button
+                        type="button"
+                        role="checkbox"
+                        aria-checked={selectedIds.includes(provider.id)}
+                        aria-label={`Select ${provider.name}`}
+                        data-provider-select={provider.slug}
+                        data-selected={selectedIds.includes(provider.id) ? "true" : "false"}
+                        onClick={() => toggleSelection(provider.id)}
+                        className="flex size-6 shrink-0 items-center justify-center rounded-md border border-line text-muted transition hover:border-accent hover:text-accent"
+                      >
+                        {selectedIds.includes(provider.id) ? (
+                          <SquareCheckBig className="size-3.5 text-accent" aria-hidden />
+                        ) : (
+                          <Square className="size-3.5" aria-hidden />
+                        )}
+                      </button>
                       <span className="text-[13.5px] font-medium text-ink">{provider.name}</span>
                       <span className="rounded-full border border-line bg-panel px-2 py-0.5 text-[11px] text-muted">
                         {KIND_LABELS[provider.kind] ?? provider.kind}
