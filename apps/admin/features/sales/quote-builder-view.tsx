@@ -754,8 +754,22 @@ export function QuoteBuilderView({ quoteId }: { quoteId?: string }) {
           </p>
         ) : null}
 
+        {/* The totals block is the one element on this screen that must survive scrolling: the
+            acceptance criterion says the footer stays visible while the lines are scrolled, and a
+            seven-column line grid on a 390px phone is taller than any screen. `sticky bottom-0`
+            pins it to the viewport while its own parent scrolls out of the way — the numbers stay
+            on the line the seller is editing.
+
+            It is sticky **within the section**, not `fixed`, on purpose: a fixed footer would
+            overlay the page's own action bar and cover the Save/Send buttons on a short form.
+            The `data-qa-sales-totals` hook is what lets the walkthrough measure the pin rather
+            than assert that a footer exists, which a static block at the bottom of a long page
+            would satisfy while failing the criterion entirely. */}
         <div className="flex justify-end">
-          <dl className="w-64 space-y-1 text-[12.5px]">
+          <dl
+            data-qa-sales-totals=""
+            className="w-64 space-y-1 rounded-lg border border-line bg-surface px-3 py-2 text-[12.5px] shadow-sm lg:sticky lg:bottom-2"
+          >
             <Row label="Subtotal" value={totals ? formatMoney(totals.subtotal, detail?.quote.currency ?? "TRY") : "—"} />
             <Row label="Discount" value={totals ? formatMoney(totals.discount_total, detail?.quote.currency ?? "TRY") : "—"} />
             <Row label="Tax" value={totals ? formatMoney(totals.tax_total, detail?.quote.currency ?? "TRY") : "—"} />

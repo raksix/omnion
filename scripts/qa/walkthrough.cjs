@@ -1378,7 +1378,93 @@ async function runSalesQuotes(page, report) {
     .catch(() => -1);
   note({ step: "mobile", overflow: mobileOverflow });
   await shot(page, "mobile-sales-quotes");
+
+  // The builder at 390 is a different screen from the list, and it is where a narrow viewport
+  // actually breaks: a line grid is seven columns, and the totals block sits under it. The
+  // acceptance criterion is not "the page does not scroll sideways" — it is that the **totals
+  // footer stays visible while the lines are scrolled**, which is a measurement about the
+  // footer's own box, not about the document's. A footer that merely exists at the bottom of a
+  // 2,000px page satisfies an overflow check and fails the criterion.
+  await page.goto(`${URL_ADMIN}/sales/quotes/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const builderOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  const footerStaysPut = await page
+    .evaluate(() => {
+      const footer = document.querySelector("[data-qa-sales-totals]");
+      if (!footer) return null;
+      const box = footer.getBoundingClientRect();
+      return {
+        // Visible without scrolling to it: inside the viewport, and pinned to the bottom rather
+        // than drifting up the page as the lines above it are scrolled away.
+        onScreen: box.top < window.innerHeight && box.bottom > 0,
+        bottomGap: Math.round(window.innerHeight - box.bottom),
+        position: getComputedStyle(footer).position,
+      };
+    })
+    .catch(() => null);
+  // Scroll the lines and read the same box again: a footer that is `static` scrolls away with
+  // them, and one that is pinned does not move.
+  const beforeScroll = footerStaysPut ? footerStaysPut.bottomGap : null;
+  await page.evaluate(() => window.scrollTo(0, 600));
+  await page.waitForTimeout(400);
+  const afterScroll = await page
+    .evaluate(() => {
+      const footer = document.querySelector("[data-qa-sales-totals]");
+      if (!footer) return null;
+      const box = footer.getBoundingClientRect();
+      return {
+        onScreen: box.top < window.innerHeight && box.bottom > 0,
+        bottomGap: Math.round(window.innerHeight - box.bottom),
+      };
+    })
+    .catch(() => null);
+  note({
+    step: "mobile-builder",
+    overflow: builderOverflow,
+    footer: footerStaysPut,
+    afterScroll,
+    stuck: Boolean(afterScroll && beforeScroll !== null && Math.abs(afterScroll.bottomGap - beforeScroll) <= 2),
+  });
+  await shot(page, "mobile-sales-quote-builder");
   await page.setViewportSize({ width: 1440, height: 900 });
+
+  // The public page is the customer's phone, not the seller's, and it is the one screen a
+  // stranger opens on a phone with no panel session: an Accept button that is off the right
+  // edge of a 390 viewport is a quote nobody accepts.
+  if (token) {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`${URL_ADMIN}/q/${token}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1400);
+    const publicOverflow = await page
+      .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+      .catch(() => -1);
+    // The Accept button is the point of this screen: a customer on a phone either reaches it or
+    // gives up, and an overflow check on the document does not see a button that is inside the
+    // page but below a stack of two hundred pixels of scroll. It has to be **inside the
+    // viewport**, not merely present in the DOM.
+    const publicUsable = await page
+      .evaluate(() => {
+        const body = document.querySelector("[data-qa-public-quote]");
+        const accept = document.querySelector("[data-qa-public-quote-accept]");
+        if (!body) return { found: false };
+        const box = accept ? accept.getBoundingClientRect() : null;
+        return {
+          found: true,
+          reads: (body.innerText || "").trim().length > 40,
+          acceptPresent: Boolean(accept),
+          // The link is already consumed by this point in the pass, so "no button" is the
+          // correct answer here; the measurement matters on the *first* read, which the desktop
+          // step above captured. What this asserts is that the screen itself is on screen.
+          withinViewport: box ? box.top < window.innerHeight && box.bottom > 0 : null,
+        };
+      })
+      .catch(() => null);
+    note({ step: "mobile-public", overflow: publicOverflow, ...publicUsable });
+    await shot(page, "mobile-public-quote");
+    await page.setViewportSize({ width: 1440, height: 900 });
+  }
 
   report.salesQuotes = {
     ok:
