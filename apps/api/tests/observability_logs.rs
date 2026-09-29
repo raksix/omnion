@@ -92,10 +92,10 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+fn request(method: Method, uri: &str, session: Option<&Session>, body: Option<Value>) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(token) = token {
-        builder = builder.header(header::COOKIE, format!("omnion_session={token}"));
+    if let Some(session) = session {
+        builder = builder.header(header::COOKIE, session.cookie());
     }
     let body = match body {
         Some(value) => {
@@ -151,7 +151,28 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
     (user.id, email)
 }
 
-async fn login(state: &AppState, email: &str) -> String {
+/// What a sign-in hands back: the session cookie AND the CSRF token minted beside it.
+///
+/// Both, because the CSRF layer refuses a cookie-authenticated mutation that presents only the
+/// session. A walk that captured the session alone drove a layer that is correct in production
+/// and unwalkable in a test — the panel receives both cookies, so a walk holding one of the two
+/// is no longer a request the panel can make. The token is derived from the session id and the
+/// configured secret, so it is read from the response rather than recomputed here: recomputing
+/// it would let a walk pass while the sign-in stopped issuing one.
+#[derive(Clone)]
+struct Session {
+    token: String,
+    csrf: String,
+}
+
+impl Session {
+    /// The `Cookie` header a browser would send for this sign-in.
+    fn cookie(&self) -> String {
+        format!("omnion_session={}; omnion_csrf={}", self.token, self.csrf)
+    }
+}
+
+async fn login(state: &AppState, email: &str) -> Session {
     let response = routes::router(state.clone())
         .oneshot(
             Request::builder()
@@ -170,14 +191,25 @@ async fn login(state: &AppState, email: &str) -> String {
         StatusCode::OK,
         "the account must sign in"
     );
-    response
+    let set_cookie: Vec<&str> = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| cookie.split(';').next())
-        .and_then(|pair| pair.split_once('='))
-        .map(|(_, token)| token.to_owned())
-        .expect("login must set a session cookie")
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    let pick = |name: &str| {
+        set_cookie
+            .iter()
+            .filter_map(|raw| raw.split(';').next())
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_owned())
+    };
+    Session {
+        token: pick("omnion_session").expect("login must set a session cookie"),
+        csrf: pick("omnion_csrf")
+            .expect("login must set the CSRF cookie beside the session cookie"),
+    }
 }
 
 #[tokio::test]
@@ -214,7 +246,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
     seed::bind_owner(db.pool(), user_id)
         .await
         .expect("the owner binding must be created");
-    let token = login(&state, &email).await;
+    let session = login(&state, &email).await;
 
     // ── 1. the header and the row agree, and the row is findable by it ──────────────────────────
     let read = call(
@@ -222,7 +254,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             "/api/v1/observability/logs?limit=5",
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -327,7 +359,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             &format!("/api/v1/observability/logs/requests/{producer_request}"),
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -360,7 +392,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             &format!("/api/v1/observability/logs?since={too_wide}"),
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -385,7 +417,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             "/api/v1/observability/logs?level=verbose",
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -399,7 +431,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             "/api/v1/observability/logs?level=info",
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -416,7 +448,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             "/api/v1/observability/logs?limit=1000000",
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -447,7 +479,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::GET,
             "/api/v1/observability/logs/settings",
-            Some(&token),
+            Some(&session),
             None,
         ),
     )
@@ -460,7 +492,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::PUT,
             "/api/v1/observability/logs/settings",
-            Some(&token),
+            Some(&session),
             Some(json!({
                 "log_level_default": "info",
                 "logs_retention_days": 365
@@ -484,7 +516,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::PUT,
             "/api/v1/observability/logs/settings",
-            Some(&token),
+            Some(&session),
             Some(json!({
                 "log_level_default": "info",
                 "retention_days": 7
@@ -503,7 +535,7 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
         request(
             Method::PUT,
             "/api/v1/observability/logs/settings",
-            Some(&token),
+            Some(&session),
             Some(json!({
                 "log_level_default": "debug",
                 "logs_retention_days": 7
