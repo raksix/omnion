@@ -4124,6 +4124,344 @@ async function runNotificationSettingsDepth(page, report) {
  *      visitor and present for a member;
  *   7. a queue entry can be rescheduled and cancelled, and a non-pending row cannot be.
  */
+/**
+ * The forms depth pass (REQ-064, slice 2).
+ *
+ * Appended to `walkthrough.cjs` as a self-contained function. It builds a form through the
+ * *builder* — the palette, the inspector, Save, Publish — submits to it through the *public*
+ * route, and then reads it back in the inbox. Three properties the store tests cannot see are the
+ * reason it exists at all:
+ *
+ * * the builder's own refusals (a duplicate key, a choice field with no options, publish with no
+ *   fields) happen in the screen, before the round trip;
+ * * the public submit route answers 202 for a spam refusal, and a screen that showed the refusal
+ *   would be a screen teaching a bot what to work around — so the pass asks *through the browser*
+ *   and requires the same answer shape a visitor gets;
+ * * the inbox's export is the *filtered* inbox, which is only checkable from the button.
+ *
+ * Every step writes under `steps.*` and `--only=forms` demands the list below by name, read off
+ * this function rather than off the REQ's prose: a checklist written from the prose asks for
+ * `rescheduled` when the pass says `rescheduleMoved`, and the mode then reports every check
+ * missing forever.
+ */
+async function runFormsDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const formKey = `qa-form-${stamp}`;
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+
+  // ---------------------------------------------------------------- the list and its empty state
+  await page.goto(`${ADMIN}/forms`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.listReady = (await page.locator("[data-forms-state]").count()) > 0;
+  steps.listSeesTheNewForm = false;
+
+  // ---------------------------------------------------------------- create through the panel
+  await page.locator("[data-forms-create]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.createFormOpened = (await page.locator("[data-forms-create-form]").count()) > 0;
+  await page
+    .locator("[data-forms-name]")
+    .fill(`QA form ${stamp}`)
+    .catch(() => {});
+  await page.waitForTimeout(300);
+  // Verify the fill by reading it BACK: a `fill()` that lands while a React branch is still
+  // mounting is reported as a success and every selector that names the typed value then matches
+  // nothing.
+  steps.nameIsOnTheInput = await page.inputValue("[data-forms-name]").catch(() => "");
+  steps.keyFollowsName = (await page.inputValue("[data-forms-key]").catch(() => "")).length > 0;
+  await page.locator("[data-forms-key]").fill(formKey).catch(() => {});
+  await page.locator("[data-forms-create-submit]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.rowLanded = (await page.locator(`[data-form-row="${formKey}"]`).count()) > 0;
+  steps.listSeesTheNewForm = steps.rowLanded;
+  steps.rowOnScreen = await page
+    .locator(`[data-form-row="${formKey}"]`)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  steps.draftIsLabelled = (await page.locator(`[data-form-row="${formKey}"] [data-form-status="draft"]`).count()) > 0;
+
+  const editHref = await page
+    .locator(`[data-form-row="${formKey}"] [data-form-edit]`)
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  steps.editLinkHasAnId = typeof editHref === "string" && /\/forms\/[0-9a-f-]{36}\/edit/.test(editHref);
+  if (!editHref) {
+    steps.reason = "the new form row has no editor link, so the builder cannot be driven";
+    return steps;
+  }
+
+  // ---------------------------------------------------------------- the builder's own refusals
+  await page.goto(`${ADMIN}${editHref}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.editorReady = (await page.locator(`[data-form-builder="${formKey}"]`).count()) > 0;
+
+  // A choice field with no options is refused by the store; the builder refuses it before the
+  // round trip, with the reason on the field. This is the check that a builder wired to a second
+  // authority would fail.
+  await page.locator('[data-form-add="select"]').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.paletteAddsAField = (await page.locator('[data-form-field="plan"]').count()) > 0;
+  steps.choiceFieldOpenedInspector = (await page.locator("[data-form-inspector-for]").count()) > 0;
+  await page.locator("[data-form-inspector-options]").fill("").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-form-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.optionlessChoiceRefused = (await page.locator('[data-form-field-error="plan"]').count()) > 0;
+  steps.optionlessChoiceRefusalText = await page
+    .locator('[data-form-field-error="plan"]')
+    .first()
+    .textContent()
+    .catch(() => null);
+  steps.optionlessChoiceWasNotStored =
+    qaSql(`select count(*) from cms_form_fields where key = 'plan'`) === "0";
+
+  // Give it options and save for real.
+  await page.locator("[data-form-inspector-options]").fill("Gold\nSilver").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-form-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.savedFields = qaSql(
+    `select count(*) from cms_form_fields where form_id in (select id from cms_forms where key = '${formKey}')`,
+  );
+  steps.optionsWereStored =
+    qaSql(
+      `select options::text from cms_form_fields where key = 'plan' and form_id in (select id from cms_forms where key = '${formKey}')`,
+    ) ?? "";
+  steps.optionsCarriedBothChoices = /gold/i.test(steps.optionsWereStored) && /silver/i.test(steps.optionsWereStored);
+
+  // A duplicate key is refused where the editor is looking at it.
+  await page.locator('[data-form-add="text"]').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator("[data-form-inspector-key]").fill("plan").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-form-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.duplicateKeyRefused = (await page.locator("[data-form-field-error]").count()) > 0;
+  steps.duplicateKeyMessage = await page
+    .locator("[data-form-field-error]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  // Undo it so the rest of the pass has a saveable form.
+  await page.locator(`[data-form-field="plan"] [data-form-field-remove]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-form-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  // ---------------------------------------------------------------- the preview runs the same rules
+  await page.locator("[data-form-preview-toggle]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.previewOpened = (await page.locator("[data-form-preview]").count()) > 0;
+  steps.previewHasTheCanvasFields =
+    (await page.locator('[data-form-preview-field="plan"]').count()) > 0;
+  await page.locator('[data-form-preview-submit]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  // The starter form's name and message are required, so an empty check must produce errors.
+  steps.previewRefusedAnEmptyRequired = (await page.locator("[data-form-preview-error]").count()) > 0;
+  steps.previewErrorNamesAField = await page
+    .locator("[data-form-preview-error]")
+    .first()
+    .getAttribute("data-form-preview-error")
+    .catch(() => null);
+  await page.locator('[data-form-preview-input="name"]').fill("Ada").catch(() => {});
+  await page.locator('[data-form-preview-input="message"]').fill("Hello there").catch(() => {});
+  await page.locator('[data-form-preview-input="plan"]').selectOption("gold").catch(() => {});
+  await page.waitForTimeout(300);
+  await page.locator('[data-form-preview-submit]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.previewAcceptedAFilledForm = (await page.locator("[data-form-preview-success]").count()) > 0;
+  // And a value the field never offered must be refused, so the preview is not decoration.
+  await page.locator('[data-form-preview-input="plan"]').selectOption("gold").catch(() => {});
+  await page.locator('[data-form-preview-input="message"]').fill("").catch(() => {});
+  await page.locator('[data-form-preview-submit]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.previewRefusedAnEmptyMessage = (await page.locator('[data-form-preview-error="message"]').count()) > 0;
+
+  // ---------------------------------------------------------------- publish
+  await page.locator("[data-form-publish]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.published =
+    qaSql(`select status from cms_forms where key = '${formKey}'`) === "published";
+  steps.publishIsLabelled = (await page.locator(`[data-form-builder="${formKey}"][data-form-status="published"]`).count()) > 0;
+
+  // ---------------------------------------------------------------- the settings drawer
+  await page.locator("[data-form-settings-toggle]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  steps.settingsOpened = (await page.locator("[data-form-settings]").count()) > 0;
+  steps.settingsCarriesTheStoredValues =
+    (await page.locator("[data-form-settings-message]").inputValue().catch(() => "")) === "Thank you.";
+  // Both inputs stay visible and one is inert: the form has exactly one behaviour.
+  steps.redirectInertWhileShowingAMessage =
+    await page.locator("[data-form-settings-redirect]").isDisabled().catch(() => false);
+  await page.locator('[data-form-settings-action="redirect"]').check({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.messageInertWhileRedirecting =
+    await page.locator("[data-form-settings-message]").isDisabled().catch(() => false);
+  // A redirect with no URL is refused by the store, and the drawer shows the refusal.
+  await page.locator("[data-form-settings-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.redirectWithoutUrlRefused = (await page.locator("[data-form-settings-error]").count()) > 0;
+  steps.redirectWithoutUrlMessage = await page
+    .locator("[data-form-settings-error]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  await page.locator('[data-form-settings-action="message"]').check({ timeout: 6000 }).catch(() => {});
+  await page.locator("[data-form-settings-save]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.settingsSaved = (await page.locator("[data-form-settings-notice]").count()) > 0;
+
+  // ---------------------------------------------------------------- the public route, from the browser
+  //
+  // Posted through the panel's own origin so the session cookie rides along, which is exactly how
+  // a visitor's browser reaches it. The two refusals are asked for here because the *answer shape*
+  // is the product decision: 202 with `stored: false`, never a 4xx and never an error object.
+  const submitThroughBrowser = async (answers, extra) =>
+    page.evaluate(
+      async ([key, payload]) => {
+        const response = await fetch(
+          `/api/v1/public/forms/${key}/submit?site=${encodeURIComponent(window.__qaSiteKey ?? "")}`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.99" },
+            body: JSON.stringify(payload),
+          },
+        );
+        return { status: response.status, body: await response.json().catch(() => ({})) };
+      },
+      [formKey, { answers, filled_at_ms: 9000, source_path: "/qa", ...extra }],
+    );
+
+  await page.evaluate((key) => {
+    window.__qaSiteKey = key;
+  }, CREDS.siteKey);
+
+  const good = await submitThroughBrowser({ name: "Ada", message: "Hello from the pass", plan: "gold" });
+  steps.validSubmissionStatus = good.status;
+  steps.validSubmissionStored = good.body?.stored === true;
+
+  const honeypot = await submitThroughBrowser(
+    { name: "Bot", message: "buy now", plan: "gold" },
+    { honeypot: "http://spam.example" },
+  );
+  steps.honeypotStatus = honeypot.status;
+  steps.honeypotLooksAccepted = honeypot.body?.stored === false;
+  steps.honeypotLeaksNoFieldErrors = honeypot.body?.error === undefined && honeypot.body?.errors === undefined;
+  steps.honeypotStoredNothing =
+    qaSql(
+      `select count(*) from cms_form_submissions where answers::text ilike '%buy now%' and form_id in (select id from cms_forms where key = '${formKey}')`,
+    ) === "0";
+
+  const tooFast = await submitThroughBrowser(
+    { name: "Robot", message: "instant", plan: "gold" },
+    { filled_at_ms: 10 },
+  );
+  steps.tooFastLooksAccepted = tooFast.body?.stored === false;
+
+  const invalid = await submitThroughBrowser({ name: "ab", message: "", plan: "bronze" });
+  // The one refusal a visitor IS told about, and it must be a 422 carrying every wrong field.
+  steps.invalidStatus = invalid.status;
+  const invalidErrors = invalid.body?.error?.details?.errors ?? null;
+  steps.invalidCarriesFieldErrors = invalidErrors !== null && Object.keys(invalidErrors).length >= 2;
+  steps.invalidNamesTheChoiceField = Boolean(invalidErrors?.plan);
+  steps.invalidNamesTheShortName = Boolean(invalidErrors?.name);
+  steps.invalidStoredNothing =
+    qaSql(
+      `select count(*) from cms_form_submissions where answers::text ilike '%ab%' and form_id in (select id from cms_forms where key = '${formKey}')`,
+    ) === "0";
+
+  // ---------------------------------------------------------------- the inbox
+  const inboxHref = await page
+    .locator(`[data-form-row="${formKey}"] [data-form-inbox]`)
+    .first()
+    .getAttribute("href")
+    .catch(() => null);
+  await page.goto(`${ADMIN}/forms`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  const inboxLink = inboxHref ?? (await page.locator(`[data-form-row="${formKey}"] [data-form-inbox]`).first().getAttribute("href").catch(() => null));
+  steps.inboxHasItsOwnRoute = typeof inboxLink === "string" && /\/submissions$/.test(inboxLink);
+  if (inboxLink) {
+    await page.goto(`${ADMIN}${inboxLink}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(2500);
+    steps.inboxReady = (await page.locator("[data-inbox]").count()) > 0;
+    steps.inboxTabCounts = (await page.locator("[data-inbox-count]").count()) === 4;
+    steps.inboxShowsTheSubmission = (await page.locator("[data-inbox-row]").count()) > 0;
+    steps.unreadIsOne =
+      (await page.locator('[data-inbox-count="new"]').textContent().catch(() => ""))?.trim() === "1";
+    // The spam tab is empty *and says why*: a refused submission leaves no row, so an empty
+    // table with no explanation reads as "nothing was refused".
+    await page.locator('[data-inbox-tab-button="spam"]').click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.spamTabIsEmpty = (await page.locator("[data-inbox-empty]").count()) > 0;
+    steps.spamTabExplainsTheCounter = (await page.locator("[data-inbox-empty]").textContent().catch(() => "")) ?? "";
+    steps.spamTabNamesTheProtections =
+      /honeypot|minimum time|hourly limit/i.test(steps.spamTabExplainsTheCounter);
+
+    // Back to unread and open the drawer: the consent text is shown, not a tick.
+    await page.locator('[data-inbox-tab-button="new"]').click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    await page.locator("[data-inbox-open]").first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    steps.drawerOpened = (await page.locator("[data-inbox-drawer]").count()) > 0;
+    steps.drawerShowsTheAnswers = (await page.locator("[data-inbox-answer]").count()) > 0;
+    steps.drawerShowsTheName = (await page.locator('[data-inbox-answer="name"]').count()) > 0;
+    steps.openingMarkedItRead =
+      qaSql(
+        `select status from cms_form_submissions where answers::text ilike '%Hello from the pass%' and form_id in (select id from cms_forms where key = '${formKey}')`,
+      ) === "read";
+    await page.locator("[data-inbox-drawer-close]").click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(800);
+
+    // The export is the FILTERED inbox. Asked directly because a download through a headless
+    // browser lands in a download directory nothing here reads; the URL and the row count are
+    // what matter, and both are checkable.
+    const csv = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/forms/${id}/submissions/export?status=read`, {
+        credentials: "same-origin",
+      });
+      return { status: response.status, text: await response.text() };
+    }, editHref.split("/")[2]);
+    steps.exportStatus = csv.status;
+    steps.exportIsCsv = (csv.text.split("\n")[0] ?? "").startsWith("received,status");
+    steps.exportHasTheFilteredRow = csv.text.includes("Hello from the pass");
+    steps.exportHasNoOtherState =
+      !csv.text.split("\n").slice(1).some((line) => line.includes(",spam,"));
+    steps.exportRowCount = csv.text.split("\n").filter((line) => line.trim() !== "").length - 1;
+  }
+
+  // ---------------------------------------------------------------- the list again
+  await page.goto(`${ADMIN}/forms`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.listStillCarriesTheRow = (await page.locator(`[data-form-row="${formKey}"]`).count()) > 0;
+  steps.listShowsItPublished = (await page.locator(`[data-form-row="${formKey}"] [data-form-status="published"]`).count()) > 0;
+
+  // The delete confirmation names what goes with it: the submissions are the record of what the
+  // form asked people, and they cascade.
+  await page.locator(`[data-form-row="${formKey}"] [data-form-delete]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.deleteConfirmOpened = (await page.locator("[data-forms-delete-confirm]").count()) > 0;
+  steps.deleteConfirmNamesTheSubmissions =
+    ((await page.locator("[data-forms-delete-confirm]").textContent().catch(() => "")) ?? "")
+      .toLowerCase()
+      .includes("submission");
+  await page.locator("[data-forms-delete-confirm]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.deletedFromTheList = (await page.locator(`[data-form-row="${formKey}"]`).count()) === 0;
+  steps.deletedFromSql = qaSql(`select count(*) from cms_forms where key = '${formKey}'`) === "0";
+  steps.submissionsCascaded =
+    qaSql(`select count(*) from cms_form_submissions where form_id not in (select id from cms_forms)`) === "0";
+
+  // ---------------------------------------------------------------- cleanup
+  qaSql(`delete from cms_form_submissions where form_id in (select id from cms_forms where key like 'qa-form-%')`);
+  qaSql(`delete from cms_form_fields where form_id in (select id from cms_forms where key like 'qa-form-%')`);
+  qaSql(`delete from cms_forms where key like 'qa-form-%'`);
+  return steps;
+}
+
 async function runMenusDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -6020,6 +6358,57 @@ async function main() {
   // point. It runs the SAME function the full pass calls, so a green run here means the full pass
   // would agree; what it does not do is reset the database (run.sh does that) or report a
   // `summary.json` with the whole pass's counts, and the report below says so.
+  // `--only=forms` runs the form builder's own depth pass alone.
+  //
+  // Same argument as `--only=menus` and `--only=block-editor`: the depth pass is written and a
+  // full pass is the only thing that reaches it, forty minutes in, on a box five writers share.
+  // A screen that can only be proved by a pass that usually dies before reaching it is a screen
+  // that is effectively untested, so the pass gets its own entry point. It runs the SAME function
+  // the full pass calls; what it does not do is reset the database (run.sh does that) or report a
+  // `summary.json` with the whole pass's counts.
+  if (process.argv.includes("--only=forms")) {
+    report.forms = await runFormsDepth(page, report);
+    log(`forms: ${JSON.stringify(report.forms)}`);
+    // The list below is the pass's own vocabulary, read off the function rather than guessed.
+    const required = [
+      "listReady", "createFormOpened", "nameIsOnTheInput", "keyFollowsName", "rowLanded",
+      "rowOnScreen", "draftIsLabelled", "editLinkHasAnId", "editorReady",
+      "paletteAddsAField", "choiceFieldOpenedInspector", "optionlessChoiceRefused",
+      "optionlessChoiceWasNotStored", "savedFields", "optionsCarriedBothChoices",
+      "duplicateKeyRefused", "previewOpened", "previewHasTheCanvasFields",
+      "previewRefusedAnEmptyRequired", "previewAcceptedAFilledForm",
+      "previewRefusedAnEmptyMessage", "published", "publishIsLabelled", "settingsOpened",
+      "settingsCarriesTheStoredValues", "redirectInertWhileShowingAMessage",
+      "messageInertWhileRedirecting", "redirectWithoutUrlRefused", "settingsSaved",
+      "validSubmissionStatus", "validSubmissionStored", "honeypotStatus",
+      "honeypotLooksAccepted", "honeypotLeaksNoFieldErrors", "honeypotStoredNothing",
+      "tooFastLooksAccepted", "invalidStatus", "invalidCarriesFieldErrors",
+      "invalidNamesTheChoiceField", "invalidNamesTheShortName", "invalidStoredNothing",
+      "inboxHasItsOwnRoute", "inboxReady", "inboxTabCounts", "inboxShowsTheSubmission",
+      "unreadIsOne", "spamTabIsEmpty", "spamTabNamesTheProtections", "drawerOpened",
+      "drawerShowsTheAnswers", "drawerShowsTheName", "openingMarkedItRead",
+      "exportStatus", "exportIsCsv", "exportHasTheFilteredRow", "exportHasNoOtherState",
+      "listStillCarriesTheRow", "listShowsItPublished", "deleteConfirmOpened",
+      "deleteConfirmNamesTheSubmissions", "deletedFromTheList", "deletedFromSql",
+      "submissionsCascaded",
+    ];
+    // The form pass writes into a flat `steps` object — there is no nested key, and reading one
+    // into existence would demand checks the function never writes.
+    const formSteps = report.forms || {};
+    const missing = required.filter((key) => formSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ mode: "forms-only", netFailures, forms: formSteps, missing }, null, 2),
+    );
+    console.log(`FORMS_JSON=${JSON.stringify(formSteps)}`);
+    console.log(`FORMS_MISSING=${missing.length === 0 ? "none" : missing.join(",")}`);
+    console.log(
+      `FORMS_CONSOLE_ERRORS=${(report.consoleErrors || []).length} NET_FAILURES=${netFailures.length}`,
+    );
+    await browser.close();
+    process.exit(0);
+  }
+
   if (process.argv.includes("--only=menus")) {
     report.menus = await runMenusDepth(page, report);
     log(`menus: ${JSON.stringify(report.menus)}`);
@@ -6092,6 +6481,12 @@ async function main() {
     // and a route walked with a placeholder id would only prove the 404 state renders.
     { path: "/menus", name: "menus" },
     { path: "/publishing/queue", name: "publishing-queue" },
+    // The form list and its inbox (REQ-064, slice 2) — no untested screen: the list is walked
+    // here and the depth pass below creates a real form, builds it, publishes it and drives the
+    // inbox it fills. The builder is NOT in this list for the same reason the menu editor is not:
+    // its address carries a form id, and a route walked with a placeholder id would only prove
+    // that the 404 state renders.
+    { path: "/forms", name: "forms" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -6347,6 +6742,8 @@ async function main() {
   // The navigation and queue pass (REQ-064, slice 1). It runs after the content passes because
   // `Add pages…` needs a published page to point at, and it cleans up every menu and entry it
   // creates — a QA database whose header menu grows a row per pass stops proving anything.
+  report.forms = await runFormsDepth(page, report);
+  log(`forms: ${JSON.stringify(report.forms)}`);
   report.menus = await runMenusDepth(page, report);
   log(`menus: ${JSON.stringify(report.menus)}`);
 
