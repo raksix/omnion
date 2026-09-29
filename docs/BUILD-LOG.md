@@ -4921,3 +4921,86 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+## 2026-09-29 · REQ-064 slice 4a — page comments, and the six defects the gates found
+
+**What shipped.** The first half of slice 4, and the half that matters most to get right, because a
+comment is the only row on this platform a **stranger** writes. `0141_cms_page_comments.sql` (the
+moderation ledger, the per-site policy and the ban table), `crates/content/src/page_comments.rs` (the
+store, with the heuristics as a named `Decision` and a stored reason), thirteen endpoints in
+`apps/api/src/routes/comments.rs` behind two NEW permissions, the public thread and submission under
+`/api/v1/public/comments/{page}`, and `/comments` — the queue, its policy and its bans on one screen.
+Slice 4 is now **4a (comments, done)** and **4b (newsletter, memberships, media reuse)**; four
+modules behind one migration and one status line is how a REQ starts claiming things nobody built.
+
+**Three decisions worth writing down, each a place the obvious answer is wrong.**
+
+- **The visitor's route answers 202 and never says which state it chose.** A submission lands
+  `pending` or `approved`, and the visitor is told neither — because telling an unauthenticated caller
+  "yours is pending" tells it exactly which heuristic fired, and a spam rule that can be probed from
+  outside is a rule that can be tuned by whoever is attacking the site. The banned case is the one
+  refusal the visitor IS told about, because it is a decision about a *person* and they are entitled
+  to know one was made.
+- **Two levels, enforced by the SCHEMA and named by the STORE.** A self-referencing `parent_id` with
+  no bound is a hundred-deep chain no inbox can render, and a CHECK cannot express it (the parent is
+  another row, and PostgreSQL forbids subqueries in CHECK). So the rule is a trigger, and the store
+  asks the question in SQL that can tell "wrong id" from "this platform does not do that" — two codes,
+  because the two mean opposite things to a caller.
+- **`ip_hint` is a fingerprint, and a ban is stored as the same token.** The forms module already
+  hashed its sender for this reason; the ban table matches on the same value, so a moderator typing an
+  address ends up banning it without the database ever holding an address. The panel says so on the
+  ban dialog rather than pretending it can display something it deliberately does not have.
+
+**Six real defects, none of them from review.**
+
+1. **A moderator's reply could not be written at all.** `staff_reply` stored an empty
+   `author_email` — a panel account has no public address — and the schema's not-blank CHECK refused
+   every `Reply as site`. The check now discriminates on `is_staff_reply`, so a blank address is
+   legal on a reply and still illegal on a visitor's comment.
+2. **`moderator_for` joined `user_site_roles`**, a table this platform has never had. `auto_approve_after_comments > 0` was a **500 on the first trusted comment** — a feature nobody touches until the day somebody does, and the day they do it is a 500.
+3. **A unique index made the duplicate rule self-defeating.** The obvious design — unique on
+   `(page, author, body)` — means the second insert is exactly what the index forbids, so the
+   evidence a moderator needs (that somebody submitted twice) cannot be stored at all. It is a plain
+   lookup index now, and the row is written with `spam_reason` set. *A constraint that forbids the
+   write a rule needs is the rule, cancelled.*
+4. **`InvalidComment` had no arm in `apps/api/src/error.rs`**, so "this site is not accepting
+   comments" answered `invalid_request` — the platform's least specific message. This is the exact
+   trap slice 2 recorded for the forms module, and it was still open: **a lesson in the ledger is not
+   a fix, and a variant is wired up when the STATUS is added, not when the variant is.**
+5. **The two-level refusal answered `comment_not_found`** — "there is no such comment" for a comment
+   that exists. A caller that gets the wrong one of those cannot decide whether to re-read the thread
+   or to give up.
+6. **The error translator matched a SQLSTATE instead of the rule's own text.** `23514` is a category,
+   and translating the whole category turned the `author_email` CHECK into "no such comment to answer".
+   *Match on the message the rule raises; the code says which class of thing happened and the text
+   says which rule.*
+
+Plus one the walkthrough would have caught if it had run: **the thread's `has_staff_reply` badge was
+copied onto whichever row carried the flag**, so the question said `false` while its own reply said
+true. A reader looks at the question to decide whether it was answered.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test cms_comments` → **11 passed, 0 failed**, real PostgreSQL in
+  `omnion_w2_comments_test`, `--test-threads=4`, fresh database
+- `cargo test -p omnion-content --lib` → **168 passed** (154 before, 14 new)
+- `bash scripts/qa/sql-check.sh` → **ALL MIGRATIONS APPLY CLEAN** (140 files, 7 s)
+- `pnpm typecheck` (apps/admin, `tsc --noEmit`) → clean
+- `cargo build -p omnion-api` → clean, 5 pre-existing warnings from the merge, none new
+- `node --check scripts/qa/walkthrough.cjs` → clean
+
+**Not proved, and not claimed: the browser pass.** `--only=comments` is WRITTEN (33 required steps,
+seeded from SQL so the panel is judged on rows no browser could have written) but has NOT run: the
+global QA slot is held by another writer, `/dev/shm` is 91% full of six other writers' cargo targets
+and the box is at load 48–144 with 3 GB of free RAM. **Queued, not passed.** No browser box is ticked.
+
+**One environment lesson, the hard way.** I ran `rm -rf target/debug/{deps,build,incremental}` to free
+3.5 GB on a volume that had reached 100% — the move my own ledger recommends — and did it **while a
+`cargo test` was running**, which killed the build with `could not write output to
+target/debug/deps/tracing_subscriber-…rcgu.o: No such file or directory`. The rule is not "pruning is
+safe"; it is "pruning is safe when you are not inside the thing you are pruning", and the two are
+different claims that read the same at the moment you decide. `CARGO_TARGET_DIR=/dev/shm/w2-…` is
+immune to the volume and is the answer on a day like this one.
+
+**Next.** The moment a slot frees: `node scripts/qa/walkthrough.cjs --only=comments --db omnion_qa_w2`
+on the w2 stack, then tick the browser half of acceptance 14. Then slice 4b — newsletter double
+opt-in, visitor memberships and the featured image.
