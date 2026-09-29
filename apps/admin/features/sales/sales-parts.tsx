@@ -33,8 +33,16 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { fetchMe } from "@/lib/api";
 import { fetchSalesVocabulary, type SalesVocabulary } from "@/lib/sales";
 
-/** The screens slice 1 ships. The rest arrive with their own slices, not as dead tabs. */
+/**
+ * The screens the shipped slices provide. The rest arrive with their own slices, not as dead tabs.
+ *
+ * `Quotes` is first because it is where a seller spends the day; the catalog and the price lists
+ * are the two screens it draws its lines from, and the settings row is what every one of them
+ * reads. `Orders`, `Reports` and the rest are absent on purpose: a nav entry that leads nowhere is
+ * worse than no entry, and slice 4 is what adds them.
+ */
 export const SALES_NAV = [
+  { href: "/sales/quotes", label: "Quotes", shortcut: "q" },
   { href: "/sales/catalog", label: "Catalog", shortcut: "c" },
   { href: "/sales/pricelists", label: "Price lists", shortcut: "p" },
   { href: "/sales/settings", label: "Settings", shortcut: "s" },
@@ -50,6 +58,7 @@ const SHORTCUTS: Shortcut[] = [
   { keys: "Enter", what: "Open the selected row" },
   { keys: "e", what: "Edit the selected row" },
   { keys: "n", what: "New record" },
+  { keys: "g then q", what: "Go to the quotes" },
   { keys: "g then c", what: "Go to the catalog" },
   { keys: "g then p", what: "Go to the price lists" },
   { keys: "?", what: "Show or hide this sheet" },
@@ -279,19 +288,13 @@ export function useSalesKeyboard(
       // a minute later.
       if (pendingG.current) {
         pendingG.current = false;
-        if (event.key === "c") {
+        // The four screens, matched by the single key each nav entry advertises. Written as a
+        // lookup rather than four `if`s so adding a tab is one line here and cannot forget the
+        // handler — which is how a nav entry ends up pointing at a screen nothing navigates to.
+        const target = SALES_NAV.find((item) => item.shortcut === event.key);
+        if (target) {
           event.preventDefault();
-          router.push("/sales/catalog");
-          return;
-        }
-        if (event.key === "p") {
-          event.preventDefault();
-          router.push("/sales/pricelists");
-          return;
-        }
-        if (event.key === "s") {
-          event.preventDefault();
-          router.push("/sales/settings");
+          router.push(target.href);
           return;
         }
       }
