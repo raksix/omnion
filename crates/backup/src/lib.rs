@@ -46,7 +46,8 @@ pub use error::{BackupError, Result};
 pub use media::{
     CopiedObject, INDEX_FILENAME, INDEX_VERSION, MAX_OBJECT_BYTES, MAX_REPORTED_FAILURES,
     MediaCopyReport, MediaIndex, MediaObject, OBJECTS_DIR, ObjectFailure, SiteCount, build_index,
-    copy_objects, object_key, pending_objects, roll_up_sites, safe_filename,
+    copy_objects, object_key, pending_objects, pending_objects_for_organization, roll_up_sites,
+    safe_filename,
 };
 pub use part::{
     MANIFEST_VERSION, MAX_ERROR_LENGTH, MAX_LABEL_LENGTH, Manifest, ObservedPart, PARTS, Part,

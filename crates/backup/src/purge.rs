@@ -242,30 +242,38 @@ pub async fn remove_run_artifacts(root: &str, prefix: &str) -> Result<PurgeRepor
     report.existed = true;
     let mut failures = Vec::new();
 
+    // Counted **before** the removal, not after. Counting afterwards is the obvious way to
+    // answer "is anything left?" and it is wrong here: a successful `remove_dir_all` leaves
+    // nothing, so the after-count is always zero and a delete that took 4 000 files reports
+    // "Removed 0 entries" — a number the operator cannot reconcile with a disk that just
+    // emptied. The count that means something to an operator is the one taken before.
+    let before = count_entries(&directory).await;
+
     match tokio::fs::remove_dir_all(&directory).await {
         Ok(()) => {
-            report.removed_entries = count_entries(&directory).await;
+            report.removed_entries = before;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // Removed by someone else between the check and the call. The end state is the
             // one the delete wanted, so this is a success with nothing to report, not a
             // failure that leaves the operator guessing.
-            report.existed = true;
-            report.removed_entries = 0;
+            report.removed_entries = before;
         }
         Err(error) => {
             // A directory that could not be removed whole is walked entry by entry, because
             // "the directory is non-empty" and "the directory is not there" are the same
             // error to a caller that only asked "is it gone" — and only the walk can tell
-            // them apart, by actually leaving nothing behind.
+            // them apart, by actually leaving nothing behind. The count starts from what
+            // survived the failed `remove_dir_all`, not from the pre-removal total, so a
+            // partial delete never claims to have removed more than it did.
             failures.push(PurgeFailure {
                 path: directory.display().to_string(),
                 reason: error.to_string(),
             });
-            let mut remaining = 0;
+            let mut removed = 0;
             let mut failed = 0;
-            walk_and_remove(&directory, &mut remaining, &mut failed, &mut failures).await;
-            report.removed_entries = remaining;
+            walk_and_remove(&directory, &mut removed, &mut failed, &mut failures).await;
+            report.removed_entries = removed;
             report.failed_entries = failed;
         }
     }
@@ -506,6 +514,36 @@ mod tests {
         assert!(
             report.summary().contains("already gone"),
             "the summary must say the directory was already gone, got: {}",
+            report.summary()
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// The count has to be taken **before** the removal. This is the assertion the integration
+    /// walk forced out of the first implementation, which counted what was left afterwards
+    /// and therefore reported `Removed 0 entries` on a delete that had just taken the whole
+    /// archive — the number a green operator screen is least able to explain. "The directory
+    /// is gone" and "zero entries were removed" are true together and useless together.
+    #[tokio::test]
+    async fn a_successful_removal_reports_what_it_actually_took_with_it() {
+        let root = temp_root("counts-before");
+        let run = "2026-09-29/run-a";
+        let directory = root.join(run);
+        std::fs::create_dir_all(directory.join("objects/site-1")).expect("the objects directory");
+        for name in ["one.png", "two.png", "three.png"] {
+            std::fs::write(directory.join("objects/site-1").join(name), b"x").expect("a file");
+        }
+        std::fs::write(directory.join("manifest.json"), b"{}").expect("a manifest");
+        // Six entries: the `objects` directory, the `site-1` directory, the three objects,
+        // and the manifest. Directories count as entries too — they are files, and the count
+        // is about what the delete took off the disk, not about what an operator opens.
+        let report = remove_run_artifacts(root.to_str().expect("utf-8"), &format!("/{run}"))
+            .await
+            .expect("the removal must succeed");
+        assert!(report.is_complete());
+        assert_eq!(
+            report.removed_entries, 6,
+            "the count is what came off, not what is left: {}",
             report.summary()
         );
         std::fs::remove_dir_all(&root).expect("cleanup");
