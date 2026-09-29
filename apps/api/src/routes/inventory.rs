@@ -1685,6 +1685,127 @@ pub async fn export_approvals(
 /// browser's text view, and the operator's next click is "save as" on a page that looks like
 /// the platform. The date is in the name because a file called `stock.csv` is the one from last
 /// Tuesday by Friday.
+/// The reports screen's query string.
+///
+/// Every field is optional and every default is the module's, so `GET /reports` with
+/// no query string is a real answer rather than an error page: the last 30 days, every
+/// warehouse, 30-day idle. A report that demands a period before it will show one is
+/// a report nobody opens on a Monday.
+#[derive(Debug, Default, Deserialize)]
+pub struct ReportParams {
+    /// First day of the window, inclusive, as `YYYY-MM-DD`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Last day of the window, inclusive, as `YYYY-MM-DD`.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// One warehouse, to narrow every block.
+    #[serde(default)]
+    pub warehouse_id: Option<Uuid>,
+    /// One category, to narrow every block.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// The days of silence that make a row idle. Defaults to 30.
+    #[serde(default)]
+    pub idle_days: Option<i32>,
+    /// Rows in the idle block.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+impl From<ReportParams> for omnion_module_inventory::reports::ReportQuery {
+    fn from(params: ReportParams) -> Self {
+        Self {
+            from: params.from,
+            to: params.to,
+            warehouse_id: params.warehouse_id,
+            category: params.category,
+            idle_days: params.idle_days,
+            limit: params.limit,
+        }
+    }
+}
+
+/// The global search's query string.
+#[derive(Debug, Default, Deserialize)]
+pub struct SearchParams {
+    /// The term. Required, and an empty one is refused rather than matching everything.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Rows to return.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// `GET /api/v1/inventory/reports` — value-lite, the period's movements and idle stock.
+///
+/// **No permission key of its own**: the three blocks are all reads of stock this
+/// organization owns, so they sit under `inventory.items.read` with the stock list.
+/// Inventing `inventory.reports.read` would give an operator a key to grant that
+/// decides nothing — a role could hold it and still see nothing, which is the
+/// confusingest possible permission.
+pub async fn reports(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<ReportParams>,
+) -> Result<Json<Value>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::reports::ReportQuery::from(params);
+    let report =
+        omnion_module_inventory::reports::build_report(state.db().pool(), organization_id, &query)
+            .await?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_else(|_| json!({}))))
+}
+
+/// `GET /api/v1/inventory/reports/export` — the same report as a CSV.
+///
+/// The file is produced from **the report the screen rendered**, not from a second
+/// query: the route builds the report once and hands it to the writer, so the numbers
+/// in the file and the numbers on the page cannot disagree. A report whose CSV is its
+/// own query is a file that is trusted, and a trusted file that disagrees is worse than
+/// no file.
+pub async fn export_report(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<ReportParams>,
+) -> Result<Response, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = omnion_module_inventory::reports::ReportQuery::from(params);
+    let report =
+        omnion_module_inventory::reports::build_report(state.db().pool(), organization_id, &query)
+            .await?;
+    csv_response(omnion_module_inventory::reports::report_csv(&report), "report")
+}
+
+/// `GET /api/v1/inventory/search` — items by SKU, barcode or name.
+///
+/// One statement over the items and the stock, so the ⌘K path pays one round trip and
+/// the two surfaces are ranked by one expression. A barcode is compared with its
+/// separators stripped and its case folded, exactly as `items/lookup` does, because a
+/// scanner and a search box describing one label two ways is the bug that walk caught.
+pub async fn global_search(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Value>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let term = params.q.unwrap_or_default();
+    let results = omnion_module_inventory::reports::global_search(
+        state.db().pool(),
+        organization_id,
+        &term,
+        params.limit.unwrap_or(20),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!({}))))
+}
+
 fn csv_response(body: String, stem: &str) -> Result<Response, ApiError> {
     let day = time::OffsetDateTime::now_utc().date().to_string();
     Ok(Response::builder()
@@ -2458,6 +2579,18 @@ impl From<InventoryError> for ApiError {
             InventoryError::InvalidQuery(message) => {
                 Self::bad_request("invalid_inventory_query", message)
             }
+            // A `422` and not a `400`: nothing about the request was malformed, the
+            // organization simply cannot be valued as one number. The currencies
+            // travel in `details` so the screen can list them.
+            InventoryError::MixedCurrency { currencies } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "inventory_mixed_currency",
+                format!(
+                    "this scope prices stock in {} currencies, so it has no single value",
+                    currencies.len()
+                ),
+            )
+            .with_details(json!({ "currencies": currencies })),
             InventoryError::NotFound(kind) => Self::new(
                 StatusCode::NOT_FOUND,
                 match kind {

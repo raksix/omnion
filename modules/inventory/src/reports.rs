@@ -336,7 +336,6 @@ pub(crate) async fn stock_value(
     pool: &PgPool,
     organization_id: Uuid,
     scope: &Scope,
-    currency: &str,
 ) -> Result<StockValue> {
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
         "select \
@@ -345,7 +344,9 @@ pub(crate) async fn stock_value(
            count(*) as scoped_lines, \
            coalesce(sum(s.on_hand) filter (where i.cost is not null), 0)::text as valued_quantity, \
            coalesce(sum(s.on_hand * i.cost) filter (where i.cost is not null), 0)::text as valued_amount, \
-           coalesce(sum(s.reserved), 0)::text as reserved_quantity \
+           coalesce(sum(s.reserved), 0)::text as reserved_quantity, \
+           array_agg(distinct i.currency) filter (where i.cost is not null and s.on_hand <> 0) \
+             as currencies \
          from inventory_stock s \
          join inventory_items i on i.id = s.item_id \
          join inventory_locations l on l.id = s.location_id \
@@ -358,6 +359,7 @@ pub(crate) async fn stock_value(
     let priced_lines: i64 = row.get("priced_lines");
     let unpriced_lines: i64 = row.get("unpriced_lines");
     let scoped_lines: i64 = row.get("scoped_lines");
+    let currencies: Option<Vec<String>> = row.get("currencies");
 
     // The share is computed from the **line** counts, not from the amount: the amount
     // is what the unpriced rows would have added had they been costed, which nobody
@@ -370,8 +372,30 @@ pub(crate) async fn stock_value(
         Some(format!("{share:.1}"))
     };
 
+    // The currency is **read from the scope, not passed in**. `inventory_items.currency`
+    // is a per-item column, so an organization that has priced some lines in EUR and
+    // left others at the default cannot be reported as one currency without choosing
+    // which — and the honest answer for that state is the item's own currency. When
+    // every priced line agrees (the overwhelmingly common case) this is that one
+    // currency; when they disagree the report says so instead of summing them.
+    let mut currencies: Vec<String> = currencies.unwrap_or_default();
+    currencies.sort();
+    currencies.dedup();
+    let currency = match currencies.as_slice() {
+        [] => "—".to_string(),
+        [one] => one.clone(),
+        many => {
+            // Several currencies are a **fact about the data**, reported rather than
+            // resolved: a total across two currencies is not a number, and the number
+            // a person would then quote to a customer is the expensive part.
+            return Err(InventoryError::MixedCurrency {
+                currencies: many.to_vec(),
+            });
+        }
+    };
+
     Ok(StockValue {
-        currency: currency.to_string(),
+        currency,
         valued_quantity: row.get::<&str, _>("valued_quantity").to_string(),
         valued_amount: row.get::<&str, _>("valued_amount").to_string(),
         unpriced_lines,
@@ -562,14 +586,13 @@ fn line_value(on_hand: &str, cost: &str) -> Option<String> {
 pub async fn build_report(
     pool: &PgPool,
     organization_id: Uuid,
-    currency: &str,
     query: &ReportQuery,
 ) -> Result<InventoryReport> {
     let (from, to) = query.window()?;
     let days = query.idle_window()?;
     let scope = Scope::new(query);
 
-    let value = stock_value(pool, organization_id, &scope, currency).await?;
+    let value = stock_value(pool, organization_id, &scope).await?;
     let movements = movement_summary(pool, organization_id, from, to, &scope).await?;
     let idle = idle_stock(pool, organization_id, days, &scope, query.row_cap()).await?;
 
@@ -1013,6 +1036,43 @@ mod tests {
         // A term with nothing special in it is untouched — escaping everything would
         // make an ordinary search find nothing.
         assert_eq!(escape_like("bolt"), "bolt");
+    }
+
+    #[test]
+    fn a_line_value_is_thousandths_times_hundredths_over_a_thousand() {
+        // 12.500 units at 1.99 is 24.875 -> 24.88, and getting the scale wrong by
+        // 1000 here produces a number nobody checks twice.
+        assert_eq!(line_value("12.500", "1.99").as_deref(), Some("24.88"));
+        // Exactly divisible: 10.000 at 2.50 is 25.00, no rounding involved.
+        assert_eq!(line_value("10.000", "2.50").as_deref(), Some("25.00"));
+        // A half-cent remainder rounds away from zero rather than always favouring
+        // the warehouse: 0.001 units at 0.50 is 0.0005, which is 0.00 as a
+        // half-up of the magnitude, and the sign branch must not swallow it.
+        assert_eq!(line_value("0.001", "0.50").as_deref(), Some("0.01"));
+        // A negative on-hand (a correction) keeps its sign through the product.
+        assert_eq!(line_value("-4.000", "1.25").as_deref(), Some("-5.00"));
+    }
+
+    #[test]
+    fn an_uncosted_line_has_no_value_rather_than_a_zero_one() {
+        // The distinction the whole block is built on: a costed zero and an uncosted
+        // line are different facts, and merging them is how an operator writes off
+        // stock that was merely never priced.
+        assert_eq!(line_value("10.000", "0.00").as_deref(), Some("0.00"));
+        assert_eq!(line_value("garbage", "1.00"), None);
+        assert_eq!(line_value("1.000", "garbage"), None);
+    }
+
+    #[test]
+    fn the_mixed_currency_refusal_names_the_currencies_it_found() {
+        // A total across two currencies is arithmetically correct and commercially
+        // meaningless, and the person who quotes it to a customer is who finds out.
+        let error = InventoryError::MixedCurrency {
+            currencies: vec!["EUR".into(), "TRY".into()],
+        };
+        let sentence = error.to_string();
+        assert!(sentence.contains("EUR"), "the operator has to see which item: {sentence}");
+        assert!(sentence.contains("TRY"), "{sentence}");
     }
 
     #[test]

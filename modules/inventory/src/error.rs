@@ -34,6 +34,18 @@ pub enum InventoryError {
     /// A list query the platform refuses (an unknown sort column, a bad page size).
     #[error("invalid list query: {0}")]
     InvalidQuery(String),
+    /// The scope mixes currencies, so there is no total to report.
+    ///
+    /// A module that summed across two currencies would produce a number that is
+    /// arithmetically correct and commercially meaningless, and the person who quotes
+    /// it to a customer is the one who finds out. Refusing is the honest answer; the
+    /// currencies travel with the error so the screen can name them and the operator
+    /// can see which item to re-price.
+    #[error("this scope prices stock in more than one currency ({currencies:?}), so it has no single value")]
+    MixedCurrency {
+        /// The currencies the priced rows actually carry, sorted and deduplicated.
+        currencies: Vec<String>,
+    },
     /// The record does not exist in this organization.
     ///
     /// The message carries the kind and nothing else: a caller must not be able to learn that a

@@ -1495,6 +1495,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/inventory/approvals/export", get(inventory::export_approvals))
         .route("/inventory/stock/export", get(inventory::export_stock))
+        // The reports screen and the global search (slice 4b). Both are **reads**, so
+        // they sit here on `inventory.items.read` with the stock list rather than
+        // growing a key: a report is a question about stock this organization owns,
+        // and a permission called `inventory.reports.read` would let a role hold it
+        // and still see nothing, which is the confusingest permission there is.
+        .route("/inventory/reports", get(inventory::reports))
+        .route("/inventory/reports/export", get(inventory::export_report))
+        .route("/inventory/search", get(inventory::global_search))
         .route(
             "/inventory/movements/export",
             get(inventory::export_movements),
