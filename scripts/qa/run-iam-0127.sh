@@ -276,6 +276,64 @@ case "$indexdef" in
   *) fail "the provenance index is not the partial one the migration describes" ;;
 esac
 
+echo "== the foreign key is RESTRICT, and deleting a provider with accounts is refused =="
+# `on delete set null` is the safe-looking choice and it cannot work here: the referential action
+# would null the provider and leave the external id, which is exactly the half-written provenance
+# `users_provenance_paired_check` refuses — so the delete would die as 23514 instead of reaching
+# the guard that can name the count. Asserted by reading the rule back, then by deleting for real.
+fkdef="$(psql_ -t -A -c "
+  select confdeltype from pg_constraint
+   where conrelid = 'users'::regclass
+     and contype = 'f'
+     and conkey = array[(select attnum from pg_attribute
+                          where attrelid = 'users'::regclass
+                            and attname = 'provisioned_by_provider_id')]")"
+echo "   confdeltype = '$fkdef' (r = restrict, a = no action, n = set null, d = set default)"
+test "$fkdef" = "r" || fail "the provider link is not ON DELETE RESTRICT (confdeltype=$fkdef)"
+
+if psql_ -q -c "delete from auth_providers where slug = 'okta' and id = (
+       select provisioned_by_provider_id from users where email = 'one@omnion.test')" \
+     >/dev/null 2>&1; then
+  fail "deleting a provider that provisioned accounts was allowed to reach the database"
+fi
+survivors="$(psql_ -t -A -c "select count(*) from auth_providers where slug = 'okta'")"
+test "$survivors" = "2" || fail "a refused provider delete removed a row: $survivors left"
+attributed="$(psql_ -t -A -c "
+  select external_id from users where email = 'one@omnion.test'")"
+test "$attributed" = "sub-one" \
+  || fail "a refused provider delete rewrote the provenance: external_id is '$attributed'"
+
+echo "== after reassignment the database allows the delete =="
+# **Every** account of that provider, not just the one the refusal named. Reassigning one and then
+# deleting is a state the database must still refuse, and the walk proved it does — the gate
+# originally reassigned a single row and the delete died on the second, which reads as a broken
+# gate rather than as a working rule.
+psql_ -q -c "update users set identity_source='local', provisioned_by_provider_id=null, \
+                     external_id=null \
+                where provisioned_by_provider_id = (
+                    select p.id from auth_providers p, organizations o
+                     where p.organization_id = o.id
+                       and o.slug = 'prov-tenant-one' and p.slug = 'okta')"
+stale="$(psql_ -t -A -c "
+  select count(*) from users u
+    join auth_providers p on p.id = u.provisioned_by_provider_id
+   join organizations o on o.id = p.organization_id
+   where o.slug = 'prov-tenant-one' and p.slug = 'okta'")"
+test "$stale" = "0" || fail "$stale account(s) still claim that provider after reassignment"
+
+psql_ -q -c "delete from auth_providers where slug = 'okta' and id = (
+       select p.id from auth_providers p, organizations o
+        where p.organization_id = o.id and o.slug = 'prov-tenant-one' and p.slug = 'okta')"
+gone="$(psql_ -t -A -c "
+  select count(*) from auth_providers p join organizations o on o.id = p.organization_id
+   where o.slug = 'prov-tenant-one' and p.slug = 'okta'")"
+test "$gone" = "0" || fail "a provider with nothing depending on it could not be deleted"
+read -r src prov ext <<<"$(psql_ -t -A -F' ' -c "
+  select identity_source, coalesce(provisioned_by_provider_id::text,'-'),
+         coalesce(external_id,'-') from users where email = 'one@omnion.test'")"
+test "$src$prov$ext" = "local--" \
+  || fail "the reassigned account is '$src / $prov / $ext', expected a fully local row"
+
 echo "== re-applying 0127 is refused =="
 if psql_ -q -f - < database/migrations/0127_user_identity_provenance.sql >/dev/null 2>&1; then
   fail "0127 applied twice without a complaint"
@@ -287,4 +345,7 @@ echo "                        organizations did not cross tenants; a local accou
 echo "                        SCIM-pushed account is marked and left unattributed rather than"
 echo "                        invented for; an account whose provider is gone stays local; an"
 echo "                        unknown source, a half-written pair and a duplicate directory id are"
-echo "                        all refused; the index is per-provider and partial; a second apply fails."
+echo "                        all refused; the index is per-provider and partial; the provider link"
+echo "                        is ON DELETE RESTRICT, so the database refuses a delete the guard"
+echo "                        also refuses, and permits it once the account is reassigned; a"
+echo "                        second apply fails."

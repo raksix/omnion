@@ -32,7 +32,7 @@ alter table users
     add column identity_source text not null default 'local';
 
 alter table users
-    add column provisioned_by_provider_id uuid references auth_providers (id) on delete set null;
+    add column provisioned_by_provider_id uuid references auth_providers (id) on delete restrict;
 
 alter table users
     add column external_id text;
@@ -53,6 +53,19 @@ alter table users
 -- `identity_source = 'scim'` and a **null** `external_id`; the legacy key remains the fallback
 -- the reader uses, and the visible set of unattributable rows is therefore enumerable instead of
 -- hiding inside everybody's attributes.
+--
+-- This constraint and the `on delete restrict` above are **the same rule seen from two sides**,
+-- and the walk is what made that visible. `on delete set null` was the original choice and it is
+-- the safe-looking one, but it cannot be implemented against this constraint: the referential
+-- action nulls the provider and leaves the external id, and the row is then exactly the
+-- half-written provenance this check exists to refuse — so *deleting a provider with even one
+-- provisioned account raised a constraint violation and the transaction rolled back*. The delete
+-- was blocked, which is the right outcome, but by an error nobody can read: 23514 with the
+-- constraint's name, instead of the refusal that names the count and what to do about it.
+--
+-- `restrict` makes the foreign key refuse the same delete, with the same answer, at the layer
+-- that owns the rule. The application guard runs first and gets to be the good error; this is
+-- what is left if somebody reaches past the API.
 alter table users
     add constraint users_provenance_paired_check
         check ((external_id is null) = (provisioned_by_provider_id is null));
