@@ -1656,6 +1656,16 @@ pub async fn send_quote(
     let status = QuoteStatus::parse(&row.status)
         .ok_or_else(|| SalesError::invalid("quote", "status", "this quote has an unknown status"))?;
     if status != QuoteStatus::Draft && status != QuoteStatus::Approved {
+        // A quote waiting for a decision is the case the discount gate exists for, so the
+        // refusal names the request and the manager who has it rather than saying "wrong
+        // status". The builder shows the same sentence before the button is pressed.
+        if status == QuoteStatus::PendingApproval {
+            if let Some(requirement) =
+                crate::approvals::requirement(pool, organization_id, quote_id).await?
+            {
+                return Err(SalesError::ApprovalNotGranted(requirement));
+            }
+        }
         return Err(SalesError::InvalidStatusChange(format!(
             "a {status} quote cannot be sent — only a draft or an approved one can"
         )));
@@ -1758,11 +1768,18 @@ async fn fetch_quote_row_tx(
 }
 
 /// `POST /sales/quotes/{id}/cancel` — withdraw a quote that is not decided.
+///
+/// Withdrawing a quote that is waiting for a manager also **closes that request**: leaving an
+/// open request behind would put a decision in somebody's inbox about a document that no longer
+/// exists, and the manager's only honest options would be to decide a dead quote or to guess what
+/// "cancelled" meant. The request row survives with `decision = 'cancelled'`, so the history
+/// still says who asked and why it stopped.
 pub async fn cancel_quote(
     pool: &PgPool,
     organization_id: Uuid,
     quote_id: Uuid,
     reason: Option<String>,
+    actor: Uuid,
 ) -> Result<QuoteDetail> {
     let existing = fetch_quote_row(pool, organization_id, quote_id).await?;
     let status = QuoteStatus::parse(&existing.status)
@@ -1773,6 +1790,8 @@ pub async fn cancel_quote(
         )));
     }
     let reason = clean_bounded("quote", "cancel_reason", reason, MAX_REASON_LENGTH)?;
+    let closed = crate::approvals::cancel_open_request(pool, organization_id, quote_id, actor).await?;
+    let _ = closed;
     sqlx::query(
         "update sales_quotes set status = 'cancelled', cancel_reason = $3, cancelled_at = now(),
                 updated_at = now()

@@ -8,6 +8,7 @@
 //! they are asking for something the module will not do.
 
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Everything the sales module can refuse to do.
 #[derive(Debug, Error)]
@@ -62,6 +63,45 @@ pub enum SalesError {
     /// all three, so a caller cannot use the error to learn which tokens exist.
     #[error("this link is no longer valid")]
     InvalidPublicToken,
+    /// A second approval request for a quote that already has one waiting.
+    ///
+    /// The **existing** request travels with the error rather than just its id: the seller who
+    /// pressed the button twice must be shown the request that is already open, not a message
+    /// telling them to go and find it, and a form that loses the state it just created is the
+    /// bug this variant exists to prevent.
+    #[error("quote {quote_number} is already waiting on an approval decision")]
+    AlreadyAwaitingApproval {
+        /// The open request's id.
+        request_id: Uuid,
+        /// The quote's number, so the message names the document.
+        quote_number: String,
+        /// The request that is already open, rendered by the form as the row to show.
+        existing: crate::approvals::ApprovalView,
+    },
+    /// Somebody tried to approve their own quote.
+    ///
+    /// Its own variant because the recovery is not in the form: the seller has to ask **somebody
+    /// else**. Reporting this as a plain `400` would put the message under a discount field and
+    /// suggest the number is wrong, when the number is the whole point.
+    #[error("you cannot decide your own approval request — ask someone else to review quote ({quote_status})")]
+    SelfApproval {
+        /// The quote's status, so the seller is told what to do next with it.
+        quote_status: crate::model::QuoteStatus,
+    },
+    /// Somebody other than the requester tried to withdraw a request.
+    #[error("only the person who raised this request can withdraw it (raised by {requester})")]
+    NotRequester {
+        /// The account that raised it.
+        requester: Uuid,
+    },
+    /// A quote over the discount threshold was sent before anybody approved it.
+    ///
+    /// It is a `409` and not a `400` because nothing the caller typed is wrong: the document is
+    /// fine, it is waiting for a decision. The **requirement travels with the error** so the form
+    /// can print the discount, the limit and the open request — a bare "cannot send" would make
+    /// the seller hunt for the button that clears it.
+    #[error("{}", .0.message())]
+    ApprovalNotGranted(crate::approvals::ApprovalRequired),
     /// An amount or quantity the platform will not accept, carrying the module's own reason.
     #[error("invalid {entity}.{field}: {source}")]
     InvalidNumber {

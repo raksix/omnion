@@ -13,6 +13,8 @@
 //! * [`quotes`] — the document a seller writes: the grid, the totals computed from the stored
 //!   lines, the versions the customer saw, the per-organization numbering, and the public link
 //!   whose token is stored only as a hash.
+//! * [`approvals`] — the discount gate: ask a manager, decide the request, and let the quote be
+//!   sent afterwards.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature the platform can carry behind the
 //! `sales.*` permission family, not infrastructure the core depends on. It talks to PostgreSQL
@@ -20,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approvals;
 pub mod catalog;
 pub mod dates;
 pub mod error;
@@ -31,6 +34,10 @@ pub mod store;
 pub use error::{Result, SalesError};
 pub use model::{QuoteStatus, Settings, Unit};
 pub use money::{LineTotals, QuoteTotals};
+pub use approvals::{
+    ApprovalDecision, ApprovalQuery, ApprovalRequest, ApprovalRequired, ApprovalScope,
+    ApprovalStatus, ApprovalView, DecisionView,
+};
 pub use quotes::{
     NewQuote, NewQuoteLine, PublicQuote, QuoteDetail, QuoteLineView, QuotePatch, QuoteQuery,
     QuoteTotalsView, QuoteView,
