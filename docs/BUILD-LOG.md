@@ -9027,3 +9027,51 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
+
+### Wave 3 / tick 23 — the pass could never create a rule, and the database knew why (2026-09-29)
+
+**What.** Three defects, found by reading notes instead of trusting the last pass. The
+`qa-artifacts/20260929-102936` pass **started 10:29, an hour before the CSRF fix landed at
+13:02**, so all 208 of its highs describe a stack that no longer exists; its directory mtime is
+when the pass *finished*, and reading it as the pass's identity would have made me "confirm" a
+fix that was never measured.
+
+The blocker under every builder note was not the builder. `reset-db.sh` drops the database, the
+wizard creates the owner and stops, so `organizations` is **empty** and the owner has no
+tenant. Every rule belongs to a tenant: the editor refuses its own save with "Choose an
+organization before saving a rule.", the list renders empty, and the tenant picker is gated on
+`organizations.length > 1` so it does not render at all — a probe had nothing to click. run.sh
+now seeds the tenant through `POST /onboarding/organization`, which refuses once one exists, so
+the step is idempotent in both directions (`925eac9`).
+
+Second, `apps/api/src/error.rs` mapped every `WorkflowError::Invalid` to 400, which made the
+`409 graph_version_conflict` that `workflow_graph.rs` documents unreachable. A conflict is the
+row being ahead of the client's copy, not a bad request. Fixed with one match arm plus two
+tests, one per half, because a special case that swallows its neighbours is the failure mode
+(`62014b0`).
+
+Third, `cargo test -p omnion-api --lib` had been failing for whole ticks on three E0422/E0425
+errors: `workflow_graph.rs`'s tests push `Node` and bind `Edge` but the module imported only
+`Graph`. The binary target stays green, which is how a broken lib-test gate hides behind a
+passing build. Proven pre-existing by stashing my own change and reproducing the identical
+three errors (`42efeb6`).
+
+**Proof.** `cargo test -p omnion-api --lib` **232 passed / 0 failed** (including the two new
+conflict-status tests); `cargo test -p omnion-workflows --lib` 139 passed; admin `tsc --noEmit`
+exit 0; `bash -n run.sh` clean. The CSRF fix is proven from **both** sides: a session with the
+`omnion_csrf` cookie deleted and no header answers `403 csrf_failed`, and the same jar's GET
+answers 200 — one-sided evidence ("the error is gone") is satisfied just as well by deleting
+the check. `ensure-organization.mjs` is proven in both directions live: `organization created`
+from an empty table, `already present` with one.
+
+**Not ticked.** No acceptance box moved: the pass that reads them has not completed under a
+loaded box. The first re-run of `--only=workflowbuilder` against the seeded stack already read
+`rule-created found:true`, `escape-clears cleared:true` and `shift-click-multi ok:true` — three
+criteria that had never once been provable — but `autosave saveState:"error"` came back with
+`pool timed out while waiting for an open connection` across every runner at loadavg 88, which
+is eight writers sharing one Postgres, not a product finding.
+
+**Next.** Re-run `--only=workflowbuilder` on a box below load 10 with more than 8 GB available,
+then read the remaining notes: `validate-classes`, `cmd-s-writes-once`, `two-tab-conflict` /
+`two-tab-keep-mine` (now that the conflict is a 409), `edge-delete`, `run-from-here`,
+`step-trace`, `pillsPainted`, `plugin-palette`, `keyboard-pass`, `narrow-lock`, `listener`.
