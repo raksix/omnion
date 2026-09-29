@@ -23,6 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use omnion_identity::provisioning::{self, ProvisioningToken};
+use omnion_identity::provenance::mark_scim_provisioned;
 use omnion_identity::sso::scim_runs;
 use omnion_identity::users;
 use omnion_permissions::groups;
@@ -814,6 +815,16 @@ pub async fn create_user(
             if let Some(external_id) = payload.external_id.as_deref() {
                 set_external_id(&state, existing.id, Some(external_id)).await?;
             }
+            // An address that already exists is claimed by this connector, not merely echoed
+            // back. A connector that provisions people by e-mail is authoritative about the
+            // fact that it provisioned them, and the delete guard's count comes from this
+            // column — so a connector that adopted an account on its second sweep would be
+            // the one sweep the guard could not see. Marked here rather than only on the
+            // create path, and idempotently: a re-send changes nothing, which is what keeps
+            // the log from claiming a change on every sweep.
+            mark_scim_provisioned(state.db().pool(), existing.id)
+                .await
+                .map_err(internal)?;
             let external = external_id_of(&state, existing.id).await?;
             log(
                 &state,
@@ -870,6 +881,17 @@ pub async fn create_user(
     if let Some(external_id) = payload.external_id.as_deref() {
         set_external_id(&state, created.id, Some(external_id)).await?;
     }
+
+    // The create path's own provenance write. `0127` backfilled the rows that already existed at
+    // migration time and then nothing wrote the column again, so an account a connector created
+    // afterwards was `local` for the rest of its life — and `local` is the one value the delete
+    // guard's query excludes. The guard was therefore counting a directory that had just created
+    // eight people as zero, which is the exact failure the criterion it was built for names.
+    // Written here rather than inside `users::create_user` so that a person who signs up through
+    // the panel is never labelled as somebody else's directory's account.
+    mark_scim_provisioned(state.db().pool(), created.id)
+        .await
+        .map_err(internal)?;
 
     if payload.active == Some(false) {
         // A connector may create an account already deactivated. The status setter that revokes
@@ -996,6 +1018,14 @@ async fn apply_user_changes(
     if let Some(external_id) = payload.external_id.as_deref() {
         set_external_id(state, user.id, Some(external_id)).await?;
     }
+
+    // A replace/patch from a connector is also a claim, not only a create is. A directory that
+    // creates nobody and only ever patches the accounts it found already in the table would
+    // otherwise be invisible to the delete guard — the count reads this column, and an account
+    // the connector actively maintains is at least as much its own as one it created.
+    mark_scim_provisioned(state.db().pool(), user.id)
+        .await
+        .map_err(internal)?;
 
     let mut outcome = "updated";
     let mut revoked_sessions = 0_u64;
