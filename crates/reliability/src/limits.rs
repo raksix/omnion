@@ -206,6 +206,14 @@ pub enum Verdict {
         limit: i64,
         /// How many requests the window allows in total, for the `X-RateLimit-Limit` header.
         ceiling: i64,
+        /// What is LEFT of the budget, which for a refusal is zero.
+        ///
+        /// Not derived by the caller, and not `ceiling - limit` arithmetic guessed at the edge: a
+        /// refusal always leaves zero, and a variant that could not say so would force every
+        /// consumer to decide what a refused caller's remainder is. The `429` is the response
+        /// that most needs it — a client told to back off is the one that has to know it has
+        /// nothing left, which is the difference between "wait" and "give up on this window".
+        remaining: i64,
     },
     /// No policy applies, so the budget is not finite. Allowed, and *not* zero.
     ///
@@ -288,8 +296,11 @@ impl Verdict {
     #[must_use]
     pub fn remaining(&self) -> Option<i64> {
         match self {
-            Self::Allowed { remaining, .. } => Some(*remaining),
-            _ => None,
+            Self::Allowed { remaining, .. } | Self::Limited { remaining, .. } => Some(*remaining),
+            // The three answers with no measurement behind them. `Unlimited` has no budget to
+            // count down and the other two have no counter, so publishing a number here would be
+            // inventing the measurement the header is supposed to report.
+            Self::Unlimited | Self::Uncounted { .. } | Self::RefusedUncounted { .. } => None,
         }
     }
 
@@ -439,6 +450,9 @@ pub fn decide(policy: &LimitPolicy, count: i64, now: OffsetDateTime, window_star
             retry_after,
             limit: i64::from(policy.limit_count),
             ceiling,
+            // A refusal is only reachable when the counter is already at or past the ceiling, so
+            // there is nothing left — stated here rather than left to each consumer to infer.
+            remaining: 0,
         }
     } else {
         Verdict::Allowed {

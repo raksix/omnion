@@ -276,24 +276,30 @@ where
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|axum::extract::ConnectInfo(address)| address.ip());
             let outcome = decide_request(&limiter, &parts.method, &parts.uri, &parts.headers, peer).await;
-            if let Decision::Refused(refusal) = outcome {
-                return Ok(refusal.into_response());
-            }
-            // The ALLOWED path still owes the caller its budget. `apply_headers` was split out and
-            // documented for exactly this, and returning only a refusal discarded the verdict that
-            // carries the numbers: a client that can see what it has left does not have to spend
-            // the ceiling discovering it, which is the difference between a client that backs off
-            // and one that retries into the refusal. The verdict is returned rather than a bool
-            // because `Unlimited` (no policy) and `Uncounted` (a policy, an unreadable counter)
-            // are both "allowed" and both carry no publishable number — a header here would be a
-            // measurement nobody took, and `apply_headers` refuses to invent one.
-            let response = inner.call(Request::from_parts(parts, body)).await?;
-            Ok(match outcome {
-                Decision::Allowed { verdict, policy } => {
-                    apply_headers(response, &verdict, policy.as_ref(), OffsetDateTime::now_utc())
+            // BOTH paths owe the caller the headers, and they were separate for a reason: a
+            // refusal is a body an operator reads and a served request is a number a client
+            // paces itself by. The refusal used to be answered by `into_response()` alone, which
+            // meant the `429` — the one response where the caller most needs to know the
+            // ceiling, the reset and the policy that decided it — was the only response the
+            // limiter left bare.
+            match outcome {
+                Decision::Refused { refusal, verdict, policy } => {
+                    // A `429` is exactly where the ceiling, the reset and the deciding policy
+                    // matter most, so the headers go on the refusal too — from the same function,
+                    // off the same verdict, so the two paths cannot disagree about the numbers.
+                    let now = OffsetDateTime::now_utc();
+                    Ok(apply_headers(refusal.into_response(), &verdict, policy.as_ref(), now))
                 }
-                Decision::Refused(_) => response,
-            })
+                Decision::Allowed { verdict, policy } => {
+                    let response = inner.call(Request::from_parts(parts, body)).await?;
+                    Ok(apply_headers(
+                        response,
+                        &verdict,
+                        policy.as_ref(),
+                        OffsetDateTime::now_utc(),
+                    ))
+                }
+            }
         })
     }
 }
@@ -315,8 +321,14 @@ pub(crate) enum Decision {
         verdict: Verdict,
         policy: Option<LimitPolicy>,
     },
-    /// The request is refused, with the error to answer it.
-    Refused(ApiError),
+    /// The request is refused. The verdict and the policy travel with the error because the
+    /// `429` is the response that most needs `X-RateLimit-Limit/Remaining/Reset`: a client that
+    /// is being told to back off is the one that has to know what the ceiling was.
+    Refused {
+        refusal: ApiError,
+        verdict: Verdict,
+        policy: Option<LimitPolicy>,
+    },
 }
 
 /// What this layer decided about one request: it may proceed (with the verdict the headers need),
@@ -403,13 +415,8 @@ pub(crate) async fn decide_request(
         record_rollup(limiter, rollup).await;
     }
 
-    Decision::Refused(refusal_error(
-        &verdict,
-        &policies,
-        &subject,
-        counted,
-        now_stamp,
-    ))
+    let refusal = refusal_error(&verdict, &policies, &subject, counted, now_stamp);
+    Decision::Refused { refusal, verdict, policy }
 }
 
 /// Count the refusal into this window's rollup, and emit on the window's first one.
@@ -705,6 +712,7 @@ mod tests {
             retry_after: 42,
             limit: 10,
             ceiling: 10,
+            remaining: 0,
         };
         let error = refusal_error(
             &limited,

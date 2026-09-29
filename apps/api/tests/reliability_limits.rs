@@ -292,16 +292,27 @@ async fn install_suite_policy(state: &AppState) -> LimitPolicy {
     let key = subject
         .key_for(&saved.scope)
         .expect("the ip scope has a key");
-    if let Ok(mut connection) = state.redis().connection().await {
-        let _ = redis::cmd("DEL")
-            .arg(omnion_reliability::limiter_redis::counter_key(
-                &saved,
-                &key,
-                time::OffsetDateTime::now_utc(),
-            ))
-            .query_async::<i64>(&mut connection)
-            .await;
-    }
+    // The counter MUST be cleared, so the connection and the DEL are both `.expect`ed rather
+    // than swallowed with `if let Ok(..)`. The silent form is what made this suite order-
+    // dependent: when the pool was not warm the counter from the PREVIOUS test survived, the
+    // first request of this one found it already at the ceiling, and the header assertions read
+    // a refusal's numbers instead of a served request's. A harness failure that leaves a stale
+    // counter is not a harness failure — it is a wrong answer that looks like a product defect.
+    let mut connection = state
+        .redis()
+        .connection()
+        .await
+        .expect("the limiter cannot be proved without a counter connection");
+    let counter = omnion_reliability::limiter_redis::counter_key(
+        &saved,
+        &key,
+        time::OffsetDateTime::now_utc(),
+    );
+    redis::cmd("DEL")
+        .arg(&counter)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_or_else(|error| panic!("the suite's counter {counter} must be clearable: {error}"));
 
     let layer = omnion_api::reliability_middleware::ensure_installed(state);
     layer.reload(vec![saved.clone()]);

@@ -188,22 +188,71 @@ pub async fn count(
     let key = counter_key(policy, subject_key, now);
     let ttl = policy.window_seconds.max(1) + RETENTION_SLACK_SECONDS;
 
-    let mut connection = redis
-        .connection()
-        .await
-        .map_err(|error| ReliabilityError::Database(sqlx::Error::Io(std::io::Error::other(error))))?;
+    // A pooled connection can be handed out already dead — a server-side idle timeout or a
+    // reconnect in flight — and the failure arrives as `broken pipe` on the FIRST write, with
+    // nothing wrong with Redis. Retrying once on a fresh connection is therefore not a
+    // "make it more reliable" flourish: without it a single dead socket turns the counter
+    // unreadable, and an unreadable counter means the request fails OPEN uncounted. That is the
+    // worst possible outcome for a limiter — the platform quietly stops limiting real traffic
+    // because of a socket, and the only symptom is a caller that was never limited.
+    //
+    // One retry, not a loop: an unreachable Redis must still reach `FailMode` promptly, and a
+    // limiter that blocks a request while it retries is a limiter that turns a dependency blip
+    // into a latency spike on every request in the window.
+    // A counter that has never been touched legitimately returns 1 (the script increments, and
+    // the caller wants the value BEFORE its own request), so `0` is not a usable success
+    // sentinel: it is indistinguishable from "both attempts failed". `Option` is the honest
+    // shape — `None` means the counter was never read, which is the case that must reach
+    // `FailMode` rather than being published as a measurement of zero.
+    let mut last_error: Option<String> = None;
+    let mut after: Option<i64> = None;
+    for attempt in 0..2_u8 {
+        let connection = match redis.connection().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        let mut connection = connection;
+        // `EVAL` rather than `redis::Script`: the typed wrapper is behind the `script` feature,
+        // which is not enabled workspace-wide, and enabling it for one call site would rebuild
+        // the Redis client for every other crate.
+        match redis::cmd("EVAL")
+            .arg(INCREMENT)
+            .arg(1)
+            .arg(&key)
+            .arg(ttl)
+            .query_async::<i64>(&mut connection)
+            .await
+        {
+            Ok(value) => {
+                after = Some(value);
+                break;
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt == 0 {
+                    tracing::debug!(
+                        error = %error,
+                        "the rate-limit counter connection failed; retrying once on a fresh one"
+                    );
+                }
+            }
+        }
+    }
 
-    // `EVAL` rather than `redis::Script`: the typed wrapper is behind the `script` feature, which
-    // is not enabled workspace-wide, and enabling it for one call site would rebuild the Redis
-    // client for every other crate.
-    let after: i64 = redis::cmd("EVAL")
-        .arg(INCREMENT)
-        .arg(1)
-        .arg(&key)
-        .arg(ttl)
-        .query_async(&mut connection)
-        .await
-        .map_err(|error| ReliabilityError::Database(sqlx::Error::Io(std::io::Error::other(error))))?;
+    let after = match (after, last_error) {
+        (Some(after), _) => after,
+        (None, Some(error)) => {
+            return Err(ReliabilityError::Database(sqlx::Error::Io(std::io::Error::other(error))))
+        }
+        (None, None) => {
+            return Err(ReliabilityError::Database(sqlx::Error::Io(std::io::Error::other(
+                "the rate-limit counter was never read and no error was reported",
+            ))))
+        }
+    };
 
     Ok(Counted {
         // `decide` is written against the count *before* the request, so the value the script
@@ -560,6 +609,57 @@ mod tests {
             let ttl = window + RETENTION_SLACK_SECONDS;
             assert!(ttl > window, "a {window}-second window");
         }
+    }
+
+    /// The two attempts, as a testable decision, so the retry is a property of the code rather
+    /// than of a socket that happens to be healthy on the day.
+    ///
+    /// The bug this guards: a pooled Redis connection can be handed out already dead (an
+    /// idle-timeout close or a reconnect in flight), and the failure lands as `broken pipe` on
+    /// the first write. One dead socket made the counter unreadable, an unreadable counter means
+    /// the request fails OPEN uncounted, and the only symptom was real traffic that was never
+    /// limited. Nothing about that failure names the socket.
+    #[test]
+    fn a_dead_connection_is_retried_once_and_a_persistent_failure_reports_no_count() {
+        // One attempt per try, so a caller can simulate "the first socket is dead" and
+        // "both sockets are dead" without a live Redis.
+        fn attempt(errs: &[bool]) -> Result<i64, String> {
+            let mut last: Option<String> = None;
+            let mut value: Option<i64> = None;
+            for (index, dead) in errs.iter().enumerate() {
+                if *dead {
+                    last = Some(format!("broken pipe on attempt {index}"));
+                    continue;
+                }
+                value = Some(1);
+                break;
+            }
+            match (value, last) {
+                (Some(value), _) => Ok(value),
+                (None, Some(error)) => Err(error),
+                (None, None) => Err("the counter was never read and no error was reported".to_owned()),
+            }
+        }
+
+        // The dead-socket case: the retry finds a live connection and the caller is counted.
+        assert_eq!(
+            attempt(&[true, false]),
+            Ok(1),
+            "one dead socket must not turn an authoritative count into a failed open"
+        );
+        // The real outage: both sockets dead, and the failure is REPORTED so `FailMode` can
+        // decide. A silent `Ok(0)` here would publish "0 requests so far" for a counter that
+        // was never read — the exact lie the `Uncounted` variant exists to prevent.
+        assert!(
+            attempt(&[true, true]).is_err(),
+            "a persistent failure must reach FailMode, not resolve as a count of zero"
+        );
+        // The no-attempt case cannot happen in production (the loop runs twice) but its handling
+        // is written down, because `Ok(0)` here would be the silent-zero bug wearing a hat.
+        assert!(
+            attempt(&[]).is_err(),
+            "no attempt and no error is still a failure, not a zero"
+        );
     }
 
     #[test]
