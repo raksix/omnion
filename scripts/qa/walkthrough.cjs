@@ -6474,7 +6474,25 @@ async function runWorkflowBuilderDepth(page, report) {
   await page
     .goto(`${URL_ADMIN}/workflows/${workflowId}/builder`, { waitUntil: "domcontentloaded" })
     .catch(() => {});
-  const opened = (await page.locator("[data-builder]").count()) > 0;
+  // The builder's own root marker is `data-builder-state` ("loading" | "error" | the
+  // workspace), not a bare `data-builder`: the component never renders the latter, so a
+  // check for it reports "the builder did not open" for a page that opened fine — which is
+  // how the palette drag, the connect gesture and the marquee all sat unproven for a tick.
+  // Read the state so an error screen is distinguished from a missing screen.
+  const builderState = await page
+    .locator("[data-builder-state]")
+    .first()
+    .evaluate((el) => el.getAttribute("data-builder-state"))
+    .catch(() => null);
+  const opened = builderState === null || builderState === "loading" ? false : true;
+  if (builderState === "error") {
+    const message = await page
+      .locator("[data-builder-state='error']")
+      .first()
+      .innerText()
+      .catch(() => "");
+    note({ step: "builder-state", state: builderState, message: message.slice(0, 200) });
+  }
   await page.waitForSelector("[data-builder-palette] [data-palette-node]", { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(1200);
 
