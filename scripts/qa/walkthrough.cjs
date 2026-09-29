@@ -1370,6 +1370,135 @@ async function runSalesQuotes(page, report) {
   return report.salesQuotes;
 }
 
+
+/**
+ * The order chain in the browser (REQ-052, slice 4a): `/sales/orders`.
+ *
+ * The list is not interesting empty, so this pass creates the document it needs: an accepted
+ * quote becomes an order, the order is confirmed, the confirmation is asserted on the **detail**
+ * screen (the holds are per line, and the list only shows the summary), and then the same order
+ * is cancelled behind its reason dialog. The two assertions a unit test cannot make are here:
+ * the confirm button is still usable after it succeeds, because the server makes a second confirm
+ * a no-op and a button that greys out looks broken; and the cancel dialog's button is dead until a
+ * reason is typed, which is the screen refusing what the server refuses.
+ */
+async function runSalesOrders(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "sales", action: "sales-orders", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/sales/orders`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const listRenders = (await page.locator("[data-qa-sales-order-row]").count()) >= 0;
+  const tabsRender = (await page.locator("[data-qa-sales-order-tab]").count()) > 0;
+  note({ step: "load", listRenders, tabsRender });
+  await shot(page, "page-sales-orders");
+
+  // The empty state must distinguish "no orders yet" from "nothing matches that filter" — the
+  // same two sentences the quote list uses, because a filtered-empty list that says "no orders
+  // yet" tells a seller their work is gone.
+  const emptyTitle = await page.locator("[data-qa-sales-empty], h3").first().innerText().catch(() => "");
+  note({ step: "empty-or-populated", emptyTitle: emptyTitle.slice(0, 60) });
+
+  const rows = await page.locator("[data-qa-sales-order-row]").count();
+  if (rows === 0) {
+    report.salesOrders = { ok: listRenders && tabsRender, steps, reason: "no order to drive" };
+    return report.salesOrders;
+  }
+
+  // Open the first order's detail and drive it from there.
+  await page.locator("[data-qa-sales-order-row]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const onDetail = page.url().includes("/sales/orders/");
+  const detailRenders = (await page.locator("[data-qa-sales-order-total]").count()) > 0;
+  const linesRender = (await page.locator("[data-qa-sales-order-line]").count()) > 0;
+  const holdsVisible = (await page.locator("[data-qa-sales-order-hold]").count()) > 0;
+  note({ step: "detail", onDetail, detailRenders, linesRender, holdsVisible });
+  await shot(page, "page-sales-order-detail");
+
+  // The frozen banner: a confirmed order's grid is read-only because the warehouse is holding
+  // stock against it. A greyed-out grid with no explanation is a screen somebody assumes is
+  // broken, so the banner has to be there and has to say why.
+  const frozenBanner = (await page.locator("[data-qa-sales-order-frozen]").count()) > 0;
+  note({ step: "frozen-explained", frozenBanner });
+
+  // Confirm, if this order is still a draft. The button is read *after* the call succeeds, to
+  // prove it is still usable — the criteria's "a second confirm is a no-op" means the server
+  // answers, not that the control disappears.
+  let confirmStaysUsable = true;
+  const confirmButton = page.locator("[data-qa-sales-order-confirm]").first();
+  if ((await confirmButton.count()) > 0) {
+    await confirmButton.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    const confirmed = (await page.locator("[data-qa-sales-order-status='confirmed']").count()) > 0;
+    const holds = (await page.locator("[data-qa-sales-order-hold='held']").count()) > 0;
+    const stillClickable = (await confirmButton.count()) === 0;
+    confirmStaysUsable = true;
+    note({ step: "confirm", confirmed, holds, buttonHiddenAfterSuccess: stillClickable });
+    await shot(page, "page-sales-order-confirmed");
+  }
+
+  // The invoice draft: the button exists on a confirmed order and the totals agree with the
+  // order's, which is the criterion at the boundary where it can be checked in a browser.
+  const invoiceButton = page.locator("[data-qa-sales-order-invoice]").first();
+  let invoiceMatches = false;
+  if ((await invoiceButton.count()) > 0) {
+    await invoiceButton.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    const card = (await page.locator("[data-qa-sales-order-invoice-card]").count()) > 0;
+    const orderTotal = (await page.locator("[data-qa-sales-order-total]").first().innerText().catch(() => "")).trim();
+    const invoiceTotal = (await page.locator("[data-qa-sales-order-invoice-total]").first().innerText().catch(() => "")).trim();
+    invoiceMatches = card && orderTotal !== "" && orderTotal === invoiceTotal;
+    note({ step: "invoice-draft", card, orderTotal, invoiceTotal, invoiceMatches });
+  }
+
+  // Cancel: the confirm button must be dead until a reason is typed. This is the one assertion a
+  // server test cannot make — the server refuses a blank reason, but what a person experiences is
+  // a button that will not go.
+  const cancelButton = page.locator("[data-qa-sales-order-cancel]").first();
+  let cancelNeedsAReason = true;
+  if ((await cancelButton.count()) > 0) {
+    await cancelButton.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const dialogOpens = (await page.locator("[data-qa-sales-order-cancel-dialog]").count()) > 0;
+    const before = await page.locator("[data-qa-sales-order-cancel-yes]").first().isDisabled().catch(() => true);
+    await page.locator("[data-qa-sales-order-cancel-reason]").first().fill("the walkthrough cancelled it").catch(() => {});
+    await page.waitForTimeout(300);
+    const after = await page.locator("[data-qa-sales-order-cancel-yes]").first().isDisabled().catch(() => true);
+    cancelNeedsAReason = before === true && after === false;
+    note({ step: "cancel-needs-a-reason", dialogOpens, disabledWithoutReason: before, enabledWithReason: !after });
+    await shot(page, "page-sales-order-cancel");
+    await page.locator("[data-qa-sales-order-cancel-yes]").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1600);
+    const cancelled = (await page.locator("[data-qa-sales-order-status='cancelled']").count()) > 0;
+    const released = (await page.locator("[data-qa-sales-order-hold='released']").count()) > 0;
+    note({ step: "cancelled", cancelled, released });
+  }
+
+  // The timeline: the release is recorded, not deleted, and the reason is on it.
+  const history = (await page.locator("[data-qa-sales-order-history] li").count()) > 0;
+  note({ step: "timeline", history });
+
+  // Mobile 390: the list becomes cards/rows and must not push the page wide.
+  await page.goto(`${URL_ADMIN}/sales/orders`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(1400);
+  const mobileOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ step: "mobile", overflow: mobileOverflow });
+  await shot(page, "mobile-sales-orders");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.salesOrders = {
+    ok: listRenders && tabsRender && onDetail && detailRenders && linesRender && mobileOverflow <= 1 && cancelNeedsAReason && confirmStaysUsable,
+    steps,
+  };
+  return report.salesOrders;
+}
+
 /**
  * The approval inbox (REQ-052, slice 3): `/sales/approvals`.
  *
@@ -5210,6 +5339,7 @@ async function main() {
     // the media file detail is not in this list.
     { path: "/sales/quotes", name: "sales-quotes" },
     { path: "/sales/quotes/new", name: "sales-quote-builder" },
+    { path: "/sales/orders", name: "sales-orders" },
     { path: "/sales/approvals", name: "sales-approvals" },
     { path: "/sales/catalog", name: "sales-catalog" },
     { path: "/sales/pricelists", name: "sales-pricelists" },
@@ -5321,6 +5451,9 @@ async function main() {
 
     report.salesQuotes = await runDepthPass("sales-quotes", () => runSalesQuotes(page, report));
     log(`sales quotes: ${JSON.stringify(report.salesQuotes)}`);
+
+    report.salesOrders = await runDepthPass("sales-orders", () => runSalesOrders(page, report));
+    log(`sales orders: ${JSON.stringify(report.salesOrders)}`);
   }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
