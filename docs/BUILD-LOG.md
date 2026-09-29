@@ -5155,3 +5155,69 @@ request path, and prove a scripted burst returns `429` with `Retry-After` over H
 `evaluate_lockout` from the sign-in route so five failures actually lock an account. Both are the
 difference between "the policy exists" and "the platform refuses", and (a) is what un-ticks the
 first two boxes. Then take the browser pass the moment the slot frees.
+
+## 2026-09-29 · wave2-cms · tick 21 — slice 4b, the newsletter, and a test that was wrong rather than the code
+
+**The interrupted slice was coherent, and keeping it was the decision that mattered.** The tree
+arrived with 4 121 untracked lines of newsletter work and no commit. The instruction is to finish
+a slice rather than start one, so the first job was to establish whether the half-written work
+was sound rather than to abandon it for a tidier tick. It was: 183 content tests green on the
+first run, and the migration applied cleanly across all 141.
+
+**Two real defects, and one of them was in the test, not the product.** The cross-tenant walk
+demanded `404` for a list addressed through **another tenant's site**. `ensure_same_organization`
+answers `403 cross_organization` there, platform-wide, and `media_usage.rs` pins that
+deliberately so a change to it would be a conscious one — so the ROUTE was right and the walk was
+wrong. It also read `body["lists"]` on a route that answers a bare array, meaning the "empty
+list" assertion would have failed inside `.expect()` for a wire-shape reason and proved nothing
+about tenancy at all. **Two different rules were being tested as one:** a foreign *site* is a 403
+from the tenancy layer, while a foreign *row inside your own site* is the 404 the concealment
+helper exists for. The walk now asserts both, separately — a test covering only one of the two
+boundaries is the same as testing neither.
+
+The second defect was mine and one the compiler caught for free: the panel's list type had no
+`counts` field, so `counts?.confirmed ?? 0` printed **"0 subscribed"** for a list whose counts
+were merely absent from that response. A `?? 0` on an optional is a claim the panel cannot
+support, made silently.
+
+**What the screen refuses to say.** `pending` is the *correct* state of a double opt-in and is
+never drawn as a failure — an owner who reads "Awaiting confirmation" as "broken" turns the
+confirmation off. The tab prints how long each link has left, because "4 pending" and "4 pending,
+all past their window" are different situations wearing the same number. The import report is
+shown in full rather than as a count, and it *names* every skipped address with the state it was
+found in — including the unsubscribed rows it refused to revive, which is exactly the one an
+owner most needs to see and exactly what a count hides.
+
+**The pass is written and has NOT run.** `runNewsletterDepth` demands 39 steps and drives the
+whole flow from outside the screen: a public signup, the confirmation link, its replay, its
+expiry (the row's own expiry moved into the past in SQL, because a test that sleeps two days is a
+test that never runs), the unsubscribe, a bounce with a stored reason, a CSV import, and the
+archive. Its two load-bearing assertions read SQL and the raw response text rather than the
+panel: `pendingIsNotDeliverable`, because a screen showing a pending row under "Subscribed"
+would pass every other check, and `signupCarriesNoToken`, because "we did not name it in our
+type" is not the claim — "it is not in the bytes" is. It stays queued: the global slot is held
+and the box is at load 22 with **0 MB free**, which is the state the 2026-09-28 OOM happened in.
+Nothing was forced, and acceptance 13's browser box stays unticked.
+
+**One mistake of my own, recorded because the ledger is where it belongs.** I read two dead-pid
+files in `/tmp/omnion-qa-slot-holders/` as stale slots and deleted them. They were other writers'
+holder records — a holder is a `sleep` loop that lives exactly as long as its pass, and it is the
+only liveness signal the reaper trusts. No harm followed (the files were orphans and the reaper
+would have reclaimed the same places) but the shared slot is not mine to tidy, and a directory
+listing without reading the script that owns it is not evidence about its meaning.
+
+**Proof, all real:**
+- `cargo test -p omnion-api --test cms_newsletter` → **13 passed, 0 failed** against real
+  PostgreSQL in a fresh disposable database (`omnion_w2_newsletter_test`, `--test-threads=4`)
+- `cargo test -p omnion-content --lib` → **183 passed** (168 + 15)
+- `bash scripts/qa/sql-check.sh` → **ALL MIGRATIONS APPLY CLEAN** (141)
+- `pnpm typecheck` (apps/admin) → clean · `node --check scripts/qa/walkthrough.cjs` → clean
+
+**Commits:** `f23c291` migration + store + routes + permissions + the thirteen walks ·
+`5bfb671` the typed client, the `/newsletter` screen, the nav entry and the depth pass. Pushed.
+
+**Next tick:** run `--only=newsletter` on the w2 stack the moment the slot frees — the login fix
+from `8139d16` is still unobserved, and a pass that cannot sign in proves nothing, so that is the
+first thing to confirm. Then tick acceptance 13's browser half and close 4b. Then slice 4c
+(visitor memberships: `cms_members`, strictly separate from panel identities) for acceptance 16
+and 18.
