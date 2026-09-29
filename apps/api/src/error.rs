@@ -511,6 +511,36 @@ impl From<ContentError> for ApiError {
             ContentError::SiteNotFound => {
                 Self::new(StatusCode::NOT_FOUND, "site_not_found", "no such site")
             }
+            // A comment-shaped refusal keeps its OWN code rather than falling through to
+            // `invalid_request`. This is the exact defect slice 2 recorded for the forms
+            // module — a `ContentError` variant with no arm is not "unmapped", it is 400 with
+            // the platform's least specific message, so a visitor who typed a bad address and a
+            // panel that turned comments off both answered "your request was malformed".
+            ContentError::InvalidComment(message) => {
+                Self::bad_request("invalid_comment", message)
+            }
+            // Comments (REQ-064, slice 4a). The three statuses are load-bearing in three
+            // different ways and the panel offers a different next step for each: a missing
+            // comment is 404, a comment that is ALREADY in the state the request asked for is a
+            // 409 (it is a stale page or a race, not an error to retry), and a banned sender is
+            // 403 — a person is being refused, and the message says which ban.
+            ContentError::CommentNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "comment_not_found", "no such comment")
+            }
+            ContentError::CommentAlreadyInState(message) => {
+                Self::new(StatusCode::CONFLICT, "comment_already_in_state", message)
+            }
+            ContentError::CommentBanned(message) => {
+                Self::new(StatusCode::FORBIDDEN, "comment_banned", message)
+            }
+            // 400, and the same code the trigger's `check_violation` translates to in
+            // `comments::api_error_from_comment_write` — the store's pre-check and the schema's
+            // trigger answer the same question and must answer it identically, or a client
+            // sees two codes for one rule depending on which half caught it.
+            ContentError::CommentThreadTooDeep => Self::bad_request(
+                "comment_thread_too_deep",
+                "a reply cannot answer another reply",
+            ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

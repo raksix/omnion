@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod blocks;
 pub mod commands;
+pub mod comments;
 pub mod content;
 pub mod forms;
 pub mod health;
@@ -1066,6 +1067,32 @@ pub fn router(state: AppState) -> Router {
     let public_robots = get(seo::public_robots);
     let public_redirect = get(seo::public_redirect);
 
+    // Comments (REQ-064, slice 4a). Two powers and one public surface. `comments.read` opens
+    // the inbox, `comments.manage` changes a row and edits the policy — and the two are
+    // deliberately separate, because the value of the split is exactly the case where a site
+    // hands the inbox to somebody who should not be able to approve a defamatory comment and
+    // hand the policy to somebody who should not be able to turn moderation off.
+    let comments_inbox = get(comments::list_comments).layer(guards::require(&state, "comments.read"));
+    let comments_bulk = post(comments::bulk_moderate).layer(guards::require(&state, "comments.manage"));
+    let comment_read = get(comments::get_comment).layer(guards::require(&state, "comments.read"));
+    let comment_write = patch(comments::moderate_comment)
+        .layer(guards::require(&state, "comments.manage"))
+        .merge(delete(comments::delete_comment).layer(guards::require(&state, "comments.manage")));
+    let comment_reply =
+        post(comments::reply).layer(guards::require(&state, "comments.manage"));
+    let comment_settings_read =
+        get(comments::get_settings).layer(guards::require(&state, "comments.read"));
+    let comment_settings_write =
+        put(comments::put_settings).layer(guards::require(&state, "comments.manage"));
+    let comment_ban_create =
+        post(comments::add_ban).layer(guards::require(&state, "comments.manage"));
+    let comment_ban_write =
+        delete(comments::remove_ban).layer(guards::require(&state, "comments.manage"));
+    // The two public routes carry no guard at all: a comment thread and the form that posts it
+    // are read and written by browsers that have no account on this installation.
+    let public_comment_thread = get(comments::public_thread);
+    let public_comment_submit = post(comments::public_submit);
+
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
     // resolve the site through the caller's own organization. The collection endpoint is the
@@ -1428,6 +1455,20 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/seo/broken-links", seo_broken_read.merge(seo_broken_scan))
         .route("/seo/broken-links/{id}", seo_broken_write)
+        // Comments (REQ-064, slice 4a). The inbox is `/comments`, the policy hangs off the site
+        // it belongs to (`/sites/{id}/comment-settings`, beside the other per-site surfaces) and
+        // the visitor's two routes live under `/public` where every unauthenticated surface on
+        // this platform already lives.
+        .route("/comments", comments_inbox)
+        .route("/comments/bulk", comments_bulk)
+        .route("/comments/{id}", comment_read.merge(comment_write))
+        .route("/comments/{id}/reply", comment_reply)
+        .route("/sites/{site_id}/comment-settings", comment_settings_read)
+        .route("/sites/{site_id}/comment-settings", comment_settings_write)
+        .route("/sites/{site_id}/comment-bans", comment_ban_create)
+        .route("/sites/{site_id}/comment-bans/{id}", comment_ban_write)
+        .route("/public/comments/{page}", public_comment_thread)
+        .route("/public/comments/{page}", public_comment_submit)
         .route("/media", media)
         .merge(media_upload)
         .route("/media/{id}", media_entry)

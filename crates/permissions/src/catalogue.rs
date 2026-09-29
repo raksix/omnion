@@ -126,6 +126,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Edit page SEO, redirects, sitemap settings and robots.txt",
     },
+    // Comments (REQ-064, slice 4a). Two powers, and the split is the same one the forms
+    // inbox drew for the same reason: reading the queue is not the power to approve what is in
+    // it. A site that hands the inbox to a community manager should be able to keep the policy
+    // — the blocked words, the link limit, whether comments are on at all — with somebody else,
+    // and a deployment that folds both into one key cannot offer that.
+    PermissionDef {
+        key: "comments.read",
+        category: "content",
+        description: "Read the comment inbox and the moderation policy",
+    },
+    PermissionDef {
+        key: "comments.manage",
+        category: "content",
+        description: "Approve, spam, trash, reply, ban and change the comment policy",
+    },
     // Media.
     PermissionDef {
         key: "media.read",
