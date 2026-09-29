@@ -5512,3 +5512,81 @@ not committed, not reverted.
 **Next.** (1) The REQ-064 form-editor card — the last screen of slice 3. (2) A full QA pass on the
 private stack now that the roll-up is fixed, to get real high/medium counts. (3) `git status` first:
 the dirty `run.sh` is a gate precondition, and that is a one-command check.
+
+## 2026-09-29 · REQ-117 slice 2 — the assignment chain had no caller, and two defects were stacked in it
+
+**The finding.** `claim_assignment`, `stamp_assignment` and `policy_for_source` were exported, documented,
+unit-tested and gated. `scripts/qa/run-crm-assignment.sh` carries nine assertions about them and has been green
+for twenty-four ticks — **all nine call those functions directly.** Not one begins at `store::capture`, and
+`capture` never called any of the three. So the whole slice-2 routing chain had no road to a submission: a lead
+arriving through the public endpoint or a bound form was never assigned, never got an owner, and never got a
+`first_response_due_at`. An operator created a country rule, watched the simulator name the winner, and every
+lead in the inbox read `Unassigned` with no due time — while the SLA editor's escalation target described a breach
+the sweep can never detect, because `due_breaches` filters on a null column.
+
+**Two more defects, stacked in the same function.** Wiring the call site reached both in one run:
+
+1. `crm_intake_sources` has **never had** an `sla_policy_id` column. `0055` created the source table without it,
+   `0056` created the *lead*-side `sla_policy_id`, and the two were never joined up — while `policy_for_source`
+   opens with `join crm_intake_sources s on s.sla_policy_id = p.id`. Every execution raised `42703`.
+2. That joined query reads `select p.{POLICY_COLUMNS_SCALAR}` from a constant that **already carried its own `p.`
+   prefixes**, so the expansion was `select p.p.id, …` and PostgreSQL refused it with `invalid reference to
+   FROM-clause entry for table "p"`.
+
+Either defect alone would have hidden the other: fixing only the column turns a `42703` into a `42P01`, which reads
+as a different bug in the same line of code. That is the shape worth keeping — **a stacked defect survives review
+because the first fix changes the error rather than removing it.**
+
+**The fix.** `route_captured_lead` in `store.rs`, called after the verdict. Three decisions, each with a wrong
+obvious alternative: it reads the **mapped** values rather than the payload (four of the eight condition keys
+exist only on the submission, and a source mapping `country` from a field called `land` must still route on
+`country` — the same two-names-one-value trap the first-touch merge fell into one slice earlier in the same file);
+it takes the **source's** policy, else the organization's first, else `None` rather than an invented 24-hour
+default; and it is **never fatal**, because a routing chain that cannot evaluate must not be the reason a business
+stops taking enquiries. It also returns the *routed* lead — `stamp_assignment` is a second `update`, so the
+public endpoint's response would otherwise say `new` while the row said `assigned`.
+
+**The gate.** `scripts/qa/run-crm-capture-routing.sh` → `modules/crm-intake/tests/crm_capture_routing.rs`.
+Eight assertions, each driving `store::capture` and reading the **stored row** back. **8/8, proven to fail: 2/8
+with the routing call removed**, `owner_user_id` reading `None` on the five positive assertions while the two
+negative ones (a verdict is never routed; one tenant's lead never reaches another's rules) stay green — which is
+what shows the gate names the defect rather than its neighbourhood.
+
+**The lesson, and it is the sixth instance of this shape** (the round-robin cursor, the autoresponder
+reservation, the SLA reminder, the binding-health check, the first-touch lookup, and now an entire chain):
+
+> **A gate that begins at the function proves the function.**
+
+Every gate in this module starts mid-stack. That is what makes them fast, and it is exactly what makes them blind
+to wiring. The first five misses were found by reading callers out of definitions by hand; the repeatable version
+is one entry-point assertion per feature, and the mid-stack gates keep doing what they are good at.
+
+**The gate also caught two wrong assertions of mine before it caught anything of the product's**, which is worth
+recording because both were *confident*:
+
+* `no policy ⇒ no deadline` is **unreachable** through `capture`: `claim_assignment` reads the chain through
+  `list_rules`, which calls `ensure_defaults`, so the seed is on the read path and every organization has a
+  policy by the time routing looks. The test now deletes every policy, submits, and asserts the length is still
+  the policy's own — the claim a fallback constant in the routing path cannot pass.
+* A tenancy assertion expecting `rule == None` was wrong: a winning catch-all legitimately records **itself**
+  while routing to nobody, because "which rule decided this waits in the queue" is what the trail is built to
+  answer. It now asserts *not the other organization's rule*.
+
+**Proof.** `run-crm-capture-routing.sh` 8/8 (2/8 without the fix) · `run-crm-assignment.sh` 14/14 ·
+`run-crm-claims.sh` 7/7 · `run-crm-attribution.sh` 4/4 · `run-crm-intake.sh` PASS · `cargo test -p
+omnion-module-crm-intake --lib` **159 passed** · `apps/admin bun x tsc --noEmit` clean.
+
+**Commits.** `b4b67c0` migration 0163 · `38f3a0f` the `select p.p.id` query · `dd37e50` the missing caller ·
+`ceba69d` the entry-point gate. Migration number `0163` checked free across **all ten** branches (0160 is wave2,
+0161 wave5, 0162 wave6) — the high-water is a shared namespace, and the collision that matters is with whoever
+merges second.
+
+**No browser pass this tick.** The QA slot is held by another writer's live pass (holder pid alive, load ~24,
+free RAM ~130 MB of 32 G). Starting a fifth Chromium under those numbers produces a tab that dies mid-route, and a
+partial pass that reports as a product failure — which is the same trap `runCrmIntakeDepth` recorded earlier. So
+the CRM screens remain un-walked and no line in the REQ claims otherwise.
+
+**Next.** (1) The REQ-064 form-editor card — slice 3's one missing screen, and the reason REQ-117 cannot close.
+(2) A full `scripts/qa/run.sh` on the private stack once the slot clears, now that the roll-up fix has landed and
+the routing chain is actually wired for it to observe. (3) Check `git status` first: `scripts/qa/run.sh` and
+`scripts/qa/cargo-slot{,-test}.sh` belong to a parallel session in this worktree — untouched, uncommitted.
