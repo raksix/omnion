@@ -5032,3 +5032,79 @@ is a shared component with its own provider registry, and a sales provider in it
 not a line in this module. Then REQ-052's `Order → invoice draft` box, which stays unticked **on
 purpose** — REQ-054 is not built, and the criterion is a hand-off to a module that does not exist.
 After that, REQ-053 inventory, the first of the nine untouched wave-4 requests.
+
+## 2026-09-29 · wave 4 · REQ-052 slice 6 — the palette, and three providers that had been indexing into the dark
+
+**What.** Merged `origin/main` (one conflict, `app-shell.tsx`'s lucide import — both sides' nav
+entries had auto-merged, so the resolution is the union of both icon sets, not a choice), then
+registered **quotes** and **orders** as search providers and gave the module its four ⌘K
+commands. Commits `600e9c7` and `3491ecd`.
+
+**The defect this slice found is the one worth the tick.** A search provider is registered in
+**two places**: `crates/search/src/providers.rs` decides what the indexer reads and writes, and
+`apps/admin/lib/search-palette.ts` decides whether the panel renders a section for it. A
+provider present in only the first is not an error anywhere — the index upserts its rows, the
+query answers, the API returns `hits: []`, and the section renders **nothing at all**, because
+`paletteProvider` answers `null` and a group with no screen contributes no rows, no error and no
+dead end. That is by design; it is also how a provider disappears without a trace.
+
+`contacts`, `companies` and `deals` were in exactly that state. REQ-051 shipped them, the CRM
+tests passed, the indexer upserted them on every reindex, and **no CRM row had ever appeared in
+the ⌘K box** — because the panel registry, which is TypeScript, was never told about them. My own
+two providers would have shipped the same way, which is why the lesson is the two-place
+registration rather than the missing entries.
+
+The same split exists a third time, in `intent.rs`: the domain vocabulary that decides which
+provider a *phrase* narrows to knew no word that mapped to a business provider, so "deals for
+Northwind" narrowed to nothing rather than to the board. Three registries, one feature, and each
+one is silent when it is wrong.
+
+**Two providers rather than one behind an "any of" guard.** The quote desk and the order book are
+separate screens behind separate keys, so somebody who may price an offer without seeing the
+delivery book gets one section and not the other; merging them would hand whichever half they
+hold a list of rows the other half covers.
+
+**The number is the title, not the customer** — the inversion the CRM provider deliberately does
+not make. A seller with a printed `Q-2026-0007` in front of them wants that one row; the customer
+name is the second-ranked question, so it sits at weight D. An order carries **its quote's
+number** at weight C, because somebody chasing "what happened to Q-2026-0007" types the quote
+number, and answering with the frozen quote beside the order sends the reader to a document that
+can no longer change. `notes`, `payment_terms`, `reference` and `decline_reason` are deliberately
+absent from both vectors: the CRM keeps a contact's notes out for the same reason, and a decline
+reason is stronger still, since "too expensive" is the seller's most valuable sentence and the one
+a competitor's account must never search into. **The index cannot answer a per-role question
+about a vector**, so the rule the module states is the rule the index keeps.
+
+**The second half of the slice was a criterion that could not be met.** REQ-052's mobile box asks
+that the totals footer stay visible while the lines are scrolled; the footer was a plain `<dl>` at
+the bottom of a seven-column line grid, which on a 390px phone is taller than any screen. It is
+now `lg:sticky bottom-2` — **sticky, not `fixed`**: a fixed footer overlays the page's own action
+bar and covers Save and Send on a short form. The pass now reads the footer's box, scrolls 600px
+and reads it again, because *an overflow check on the document cannot see this defect at all* — a
+static footer at the bottom of a long page satisfies "no horizontal scroll" while failing the
+criterion outright. Same shape as slice 5's PDF: a button that saved an error body under a `.pdf`
+name passed every "did it download?" check available.
+
+**Proof.**
+
+```
+cargo test -p omnion-search --lib                     51 passed, 0 failed   (+7)
+cargo test -p omnion-api --lib                       249 passed, 0 failed
+apps/admin + apps/web  tsc --noEmit                  2/2 clean
+node --check scripts/qa/walkthrough.cjs               clean
+```
+
+The walkthrough grew two assertions rather than a route: `business-sections` records which of
+the five business providers answered, so a regression is a **line in the report** instead of an
+absence nobody can see, and `mobile-builder` measures the pin. The **browser pass is running
+against `3491ecd` and is not yet part of this tick's claim.**
+
+**Next.** REQ-052's last box that can be closed is its own — `Order → invoice draft` stays
+**unticked on purpose**, because REQ-054 is not built and the criterion is a hand-off to a module
+that does not exist. Then **REQ-053 inventory**, the first of the nine untouched wave-4 requests
+and the one with the most downstream weight: sales currently records the *intent to hold* stock as
+a row per line, and inventory is what turns that into a ledger.
+
+**Migrations.** None this slice — a search provider is an entry in a registry, not a schema. The
+shared high-water still reads: main 0051, wave2 0052, wave3 0056, w5 0054, w6 0051, w7 0055,
+w8 0058, wave9 0119; mine are 0053/0054/0055/0057.

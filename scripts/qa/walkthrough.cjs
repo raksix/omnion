@@ -1406,8 +1406,26 @@ async function runSalesQuotes(page, report) {
     .catch(() => null);
   // Scroll the lines and read the same box again: a footer that is `static` scrolls away with
   // them, and one that is pinned does not move.
-  const beforeScroll = footerStaysPut ? footerStaysPut.bottomGap : null;
-  await page.evaluate(() => window.scrollTo(0, 600));
+  //
+  // The `scrolled` measurement is the part the first version of this assertion was missing, and it
+  // is why that version reported `stuck: true` on a `position: static` footer. An **empty** quote
+  // builder is shorter than a 844px viewport, so `window.scrollTo(0, 600)` moved nothing: the
+  // footer's gap was identical before and after, and "did not move" is trivially true for an
+  // element on a page that never scrolled. A sticky assertion that cannot fail is worse than no
+  // assertion, because it is read as evidence. So the pass first adds enough lines for the grid
+  // to exceed the viewport, and records how far the document actually moved.
+  await page.locator("[data-qa-sales-line-add]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page.locator("[data-qa-sales-line-add]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(350);
+  const scrolled = await page
+    .evaluate(() => {
+      const foot = document.querySelector("[data-qa-sales-totals]");
+      const start = foot ? Math.round(foot.getBoundingClientRect().bottom) : null;
+      window.scrollTo(0, 600);
+      return { start, doc: document.documentElement.scrollHeight, view: window.innerHeight };
+    })
+    .catch(() => null);
   await page.waitForTimeout(400);
   const afterScroll = await page
     .evaluate(() => {
@@ -1417,6 +1435,7 @@ async function runSalesQuotes(page, report) {
       return {
         onScreen: box.top < window.innerHeight && box.bottom > 0,
         bottomGap: Math.round(window.innerHeight - box.bottom),
+        y: Math.round(window.scrollY),
       };
     })
     .catch(() => null);
@@ -1425,7 +1444,14 @@ async function runSalesQuotes(page, report) {
     overflow: builderOverflow,
     footer: footerStaysPut,
     afterScroll,
-    stuck: Boolean(afterScroll && beforeScroll !== null && Math.abs(afterScroll.bottomGap - beforeScroll) <= 2),
+    // The document has to have moved for "the footer did not move" to mean anything.
+    pageScrolled: Boolean(afterScroll && afterScroll.y > 0),
+    stuck: Boolean(
+      afterScroll &&
+        footerStaysPut &&
+        afterScroll.y > 0 &&
+        Math.abs(afterScroll.bottomGap - footerStaysPut.bottomGap) <= 2,
+    ),
   });
   await shot(page, "mobile-sales-quote-builder");
   await page.setViewportSize({ width: 1440, height: 900 });

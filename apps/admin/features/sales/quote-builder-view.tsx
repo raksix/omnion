@@ -762,13 +762,19 @@ export function QuoteBuilderView({ quoteId }: { quoteId?: string }) {
 
             It is sticky **within the section**, not `fixed`, on purpose: a fixed footer would
             overlay the page's own action bar and cover the Save/Send buttons on a short form.
+            The pin is **not** behind a `lg:` breakpoint. The first version of this was
+            `lg:sticky lg:bottom-2` — desktop only — which is exactly backwards for a criterion
+            that says *mobile 390x844*, and the walkthrough measured `position: static` and
+            reported `stuck: true` anyway, because the assertion compared the footer's gap before
+            and after a scroll on a page that never scrolled. Both halves of that are fixed here
+            and in the pass.
             The `data-qa-sales-totals` hook is what lets the walkthrough measure the pin rather
             than assert that a footer exists, which a static block at the bottom of a long page
             would satisfy while failing the criterion entirely. */}
         <div className="flex justify-end">
           <dl
             data-qa-sales-totals=""
-            className="w-64 space-y-1 rounded-lg border border-line bg-surface px-3 py-2 text-[12.5px] shadow-sm lg:sticky lg:bottom-2"
+            className="sticky bottom-2 w-64 space-y-1 rounded-lg border border-line bg-surface px-3 py-2 text-[12.5px] shadow-sm"
           >
             <Row label="Subtotal" value={totals ? formatMoney(totals.subtotal, detail?.quote.currency ?? "TRY") : "—"} />
             <Row label="Discount" value={totals ? formatMoney(totals.discount_total, detail?.quote.currency ?? "TRY") : "—"} />
