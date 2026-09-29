@@ -60,13 +60,47 @@ fn fixture_host() -> String {
 /// The name of the environment variable the provider's client secret lives under.
 const SECRET_REF: &str = "OMNION_SSO_LIVE_STUB_SECRET";
 
+/// The CSRF secret this file's walks run under.
+///
+/// Every write in this file that authenticates with a **session cookie** — connecting a
+/// provider, publishing one, saving role rules, minting a provisioning token — is refused
+/// `403 csrf_unavailable` unless the platform has a CSRF secret configured, and the layer
+/// *refuses* rather than skipping when it has none. That is the right production behaviour: a
+/// platform that silently drops CSRF protection when the key is missing is worse than one that
+/// refuses writes, because the refusal is visible and the skip is not.
+///
+/// The cost is that a walk which only sets up its OAuth client secret fails at the *first
+/// provider POST* with a message about CSRF, which names neither the walk nor the fix. The
+/// secret belongs in the test file, next to the code that depends on it — not in a CI profile,
+/// and certainly not defaulted in the platform.
+///
+/// The SCIM half of the new walk does **not** need this: a provisioning token is a bearer
+/// credential, not ambient authority, and the layer deliberately skips bearer requests. That
+/// asymmetry is the reason the two halves of this file look so different.
+const CSRF_SECRET: &str = "qa-walkthrough-csrf-secret-not-a-real-credential";
+
 struct TestResponse {
     status: StatusCode,
     set_cookie: Option<String>,
+    /// **Every** `Set-Cookie` header, in order.
+    ///
+    /// `set_cookie` keeps only the first, which is right for the session and wrong for anything
+    /// that comes after it: login sets `omnion_session` and `omnion_csrf` as two separate
+    /// headers, so a walk that reads only the first sees no CSRF token and concludes — from a
+    /// `403` on its first write — that the platform is misconfigured. Collected by name at the
+    /// point of use rather than index, so the two can swap places without breaking anything.
+    raw_set_cookies: Vec<String>,
     location: Option<String>,
     body: Value,
     /// The raw bytes, for the one route that answers HTML rather than JSON.
     raw: String,
+}
+
+/// A signed-in owner: the session cookie, and the CSRF token that authenticates writes made with
+/// it. The two travel together because that is what the platform issues them as.
+struct Session {
+    session: String,
+    csrf: String,
 }
 
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
@@ -76,7 +110,14 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = header_text(&response, header::SET_COOKIE);
+    let raw_set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let set_cookie = raw_set_cookies.first().cloned();
     let location = header_text(&response, header::LOCATION);
     let bytes = response
         .into_body()
@@ -93,6 +134,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookie,
+        raw_set_cookies,
         location,
         body,
         raw,
@@ -135,6 +177,47 @@ fn public_request(method: Method, uri: &str, host: &str) -> Request<Body> {
         .header(header::HOST, host)
         .body(Body::empty())
         .expect("request must build")
+}
+
+/// A request carrying a **provisioning token** — the credential a directory connector uses, and
+/// the one thing a session cookie must never be able to stand in for.
+///
+/// It is a separate constructor rather than a flag on `session_request` on purpose: the SCIM
+/// extractor answers `401` for a cookie *and* for a session, and a walk that built its requests
+/// with the session helper would be testing the wrong credential for every SCIM assertion.
+fn bearer_request(method: Method, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    match body {
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .expect("request must build"),
+        None => builder.body(Body::empty()).expect("request must build"),
+    }
+}
+
+/// A cookie-authenticated write, carrying the CSRF token the session was issued with.
+///
+/// The header form rather than the cookie form, because that is what a browser sends and the
+/// point of a walk is to be the browser. Sending the cookie instead would pass here and say
+/// nothing about whether the header path works, which is the one an `admin` client library
+/// actually uses.
+fn owner_write(session: &Session, method: Method, uri: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::COOKIE, session.session.clone())
+        .header("x-omnion-csrf", session.csrf.clone());
+    match body {
+        Some(value) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .expect("request must build"),
+        None => builder.body(Body::empty()).expect("request must build"),
+    }
 }
 
 /// A form POST — the shape a SAML response arrives in.
@@ -228,6 +311,10 @@ impl Fixture {
         // mutex rather than `std::sync::Mutex`, because this guard lives across `.await` points
         // and a blocking lock there would pin a runtime worker for the length of the test.
         let _guard = FIXTURE_LOCK.lock().await;
+        // Set **before** `Config::from_env`, because the CSRF secret is read when the config is
+        // built. Set in the fixture rather than in each walk so a new walk cannot reintroduce
+        // the `403 csrf_unavailable` that has nothing to do with SSO; see `CSRF_SECRET`.
+        unsafe { std::env::set_var("OMNION_CSRF_SECRET", CSRF_SECRET) };
         let config = Config::from_env().expect("environment must be valid");
         let db = match Db::connect(&config.database).await {
             Ok(db) => db,
@@ -349,8 +436,17 @@ impl Fixture {
         })
     }
 
-    /// Sign in as the Owner and answer the full `Cookie` header value.
-    async fn owner_session(&self) -> String {
+    /// Sign in as the Owner and answer the session cookie **and** the CSRF token with it.
+    ///
+    /// What makes this a pair rather than a bare cookie is the mechanism: a session cookie is *ambient* authority, so every
+    /// cookie-authenticated write must also carry a token derived from the **resolved session
+    /// id** — not from the cookie value, which is opaque, and derives a token that looks
+    /// plausible and fails `csrf_failed`. The platform hands that token out as an
+    /// `omnion_csrf` cookie on the same login response, deliberately not `HttpOnly` so a
+    /// browser can echo it in a header; this walk reads it off that response the way the browser
+    /// would, rather than reimplementing the derivation — a walk that reimplemented it would be
+    /// testing its own copy of the rule.
+    async fn owner_session_with_csrf(&self) -> Session {
         let email: String = sqlx::query_scalar(
             "select email from users where organization_id = $1 order by created_at limit 1",
         )
@@ -370,10 +466,33 @@ impl Fixture {
         )
         .await;
         assert_eq!(response.status, StatusCode::OK, "login: {}", response.body);
-        format!(
-            "omnion_session={}",
-            session_value(&response.set_cookie.expect("login sets the session cookie"))
-        )
+
+        let headers = response.set_cookie.expect("login sets the session cookie");
+        let session = format!("omnion_session={}", session_value(&headers));
+        // The `Set-Cookie` helper keeps only the first header, so the CSRF cookie — a second
+        // header on the same response — is recovered from the raw header list. Finding it by
+        // name rather than by position is what keeps this honest if the order ever changes.
+        let csrf = response
+            .raw_set_cookies
+            .iter()
+            .find(|value| value.starts_with("omnion_csrf="))
+            .map(|value| value.split(';').next().expect("cookie has a value"))
+            .map(|value| {
+                value
+                    .split_once('=')
+                    .expect("cookie is name=value")
+                    .1
+                    .to_owned()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "login did not hand out a CSRF token, so no cookie-authenticated write in this \
+                     file can be made: {:?}",
+                    response.raw_set_cookies
+                )
+            });
+
+        Session { session, csrf }
     }
 
     /// The `state` the newest challenge of a provider issued, read the way the callback reads it.
@@ -495,15 +614,10 @@ async fn authorization_target(url: &str) -> String {
 }
 
 /// Connect a provider, publish it, and return its id.
-async fn connect(fixture: &Fixture, cookie: &str, body: Value) -> (Uuid, Uuid) {
+async fn connect(fixture: &Fixture, owner: &Session, body: Value) -> (Uuid, Uuid) {
     let created = call(
         &fixture.state,
-        session_request(
-            Method::POST,
-            "/api/v1/iam/providers",
-            Some(cookie),
-            Some(body),
-        ),
+        owner_write(&owner, Method::POST, "/api/v1/iam/providers", Some(body)),
     )
     .await;
     assert_eq!(
@@ -528,13 +642,13 @@ async fn connect(fixture: &Fixture, cookie: &str, body: Value) -> (Uuid, Uuid) {
 /// whose connection test has never passed, so a walk that published first was testing a gate it
 /// had not yet satisfied — and the refusal it got back was the gate working, not a broken test.
 /// Publishing is now *after* the test below, which is also the order the wizard uses.
-async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
+async fn publish(fixture: &Fixture, owner: &Session, provider_id: Uuid) {
     let response = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::PATCH,
             &format!("/api/v1/iam/providers/{provider_id}"),
-            Some(cookie),
             Some(json!({ "enabled": true })),
         ),
     )
@@ -548,13 +662,17 @@ async fn publish(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
 }
 
 /// The gate, on its own: a provider that has never passed a test stays off.
-async fn assert_untested_providers_stay_off(fixture: &Fixture, cookie: &str, provider_id: Uuid) {
+async fn assert_untested_providers_stay_off(
+    fixture: &Fixture,
+    owner: &Session,
+    provider_id: Uuid,
+) {
     let response = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::PATCH,
             &format!("/api/v1/iam/providers/{provider_id}"),
-            Some(cookie),
             Some(json!({ "enabled": true })),
         ),
     )
@@ -592,6 +710,13 @@ const EDITOR: Subject = Subject {
     display_name: "Live Directory Person",
     groups: &["editors"],
 };
+
+/// The directory group the stored-membership walk keys its rule on.
+///
+/// A constant rather than a literal in the rule *and* in the group write, because the two have
+/// to be the same string and a pair of identical literals in different halves of a test is the
+/// classic way for a test to keep passing after one of them is edited.
+const STOREFRONT: &str = "Storefront";
 
 /// Walk a full OIDC sign-in: `start` → the provider's own authorization endpoint → `callback`.
 ///
@@ -652,7 +777,8 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let cookie = fixture.owner_session().await;
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
 
     // The client secret lives in the environment, never in the row — the walk puts it there the
     // way an operator would, so `secret_present` becomes true and the exchange is confidential.
@@ -663,7 +789,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     // ---- 1. The discovery test reaches the provider and reports what it actually found -------
     let (provider_id, _) = connect(
         &fixture,
-        &cookie,
+        &owner,
         json!({
             "slug": "stub-oidc",
             "kind": "oidc",
@@ -692,14 +818,14 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
          the value ever leaving the process"
     );
 
-    assert_untested_providers_stay_off(&fixture, &cookie, provider_id).await;
+    assert_untested_providers_stay_off(&fixture, &owner, provider_id).await;
 
     let tested = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::POST,
             &format!("/api/v1/iam/providers/{provider_id}/test"),
-            Some(&cookie),
             None,
         ),
     )
@@ -717,7 +843,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
             .is_some_and(|uri| uri.ends_with("/jwks"))
     );
 
-    publish(&fixture, &cookie, provider_id).await;
+    publish(&fixture, &owner, provider_id).await;
 
     // ---- 2. The browser is sent to the provider, and comes back with a session ---------------
     let start = call(
@@ -941,12 +1067,13 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let cookie = fixture.owner_session().await;
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
     let idp = StubIdp::start().await;
 
     let (provider_id, _) = connect(
         &fixture,
-        &cookie,
+        &owner,
         json!({
             "slug": "stub-saml",
             "kind": "saml",
@@ -970,17 +1097,17 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
     // reader to parse a response — a certificate it cannot use fails here, not at a real sign-in.
     let tested = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::POST,
             &format!("/api/v1/iam/providers/{provider_id}/test"),
-            Some(&cookie),
             None,
         ),
     )
     .await;
     assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
 
-    publish(&fixture, &cookie, provider_id).await;
+    publish(&fixture, &owner, provider_id).await;
 
     // `start` redirects to the relay page, which now carries the challenge in its URL. This is
     // the half that was broken: the page used to post the *return path* as `RelayState`, which
@@ -1223,13 +1350,14 @@ async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let cookie = fixture.owner_session().await;
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
     unsafe { std::env::set_var(SECRET_REF, CLIENT_SECRET) };
     let idp = StubIdp::start().await;
 
     let (provider_id, _) = connect(
         &fixture,
-        &cookie,
+        &owner,
         json!({
             "slug": "stub-rules",
             "kind": "oidc",
@@ -1249,16 +1377,16 @@ async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
 
     let tested = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::POST,
             &format!("/api/v1/iam/providers/{provider_id}/test"),
-            Some(&cookie),
             None,
         ),
     )
     .await;
     assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
-    publish(&fixture, &cookie, provider_id).await;
+    publish(&fixture, &owner, provider_id).await;
 
     // Two roles to rule between, and the rules are ordered so that the *first* one is the narrow
     // one. A set evaluated last-to-first would grant the moderator and the test would say so.
@@ -1273,10 +1401,10 @@ async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
 
     let saved = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::PUT,
             &format!("/api/v1/iam/providers/{provider_id}/role-rules"),
-            Some(&cookie),
             Some(json!({
                 "rules": [
                     {
@@ -1296,7 +1424,8 @@ async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
                         "scope_type": "organization",
                     },
                 ]
-            })),
+            }),
+        ),
         ),
     )
     .await;
@@ -1310,11 +1439,12 @@ async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
     // ---- 1. The dry run and the callback are asked the same question, before the sign-in -----
     let preview = call(
         &fixture.state,
-        session_request(
+        owner_write(
+            &owner,
             Method::POST,
             &format!("/api/v1/iam/providers/{provider_id}/role-rules/preview"),
-            Some(&cookie),
-            Some(json!({ "sample": { "groups": ["analytics"], "sub": "stub-user-rules" } })),
+            Some(json!({ "sample": { "groups": ["analytics"], "sub": "stub-user-rules" } }),
+        ),
         ),
     )
     .await;
@@ -1477,4 +1607,301 @@ async fn role_of(fixture: &Fixture, user_id: Uuid) -> Option<String> {
         "this walk asserts a single role, and the person holds {roles:?}"
     );
     roles.pop()
+}
+
+
+/// The last unproven half of the group-membership criterion, and the one no unit test can reach.
+///
+/// Two walks in this file already exist and neither covers this. `sso_live`'s main walk signs a
+/// person in through a real authorization code against the stub provider, and it grants the role
+/// from the **claim** — the provider's own `groups` assertion. `iam_group_membership` proves the
+/// other source, the stored row a connector wrote, and it does it with a **pasted sample**, not a
+/// real sign-in. So each source is proven and the *binding* — the one thing the sign-in path has
+/// to do for a provisioned account — is proven by neither, and the two walks are green
+/// simultaneously with a callback that grants the default role to a SCIM-provisioned person.
+///
+/// That is the case this feature exists for, and it is why the criterion stayed unticked. This
+/// walk joins the two: a real OIDC round trip, by an account a **connector** created, whose
+/// token carries **no** group claim at all, where the only thing that can grant the role is a
+/// `group_members` row.
+///
+/// Four things are pinned, because the obvious implementation satisfies three of them and
+/// silently fails the fourth:
+///
+/// 1. **The provider asserts no group.** Not "an unrelated group" — the `groups` claim is empty,
+///    so the claim arm of the union has nothing to offer. A walk that asserted a *different*
+///    group would pass even if only the claim were ever consulted.
+/// 2. **The role is granted anyway**, read back from `role_bindings` rather than from the
+///    response body, so the assertion cannot be satisfied by a response echoing a request.
+/// 3. **No second account.** A provisioned account re-created on sign-in is a duplicate-directory
+///    bug, and the sign-in "succeeding" would hide it. The row count before and after is equal.
+/// 4. **The audit names the rule**, so an operator can tell a grant apart from a default.
+#[tokio::test]
+async fn a_scim_provisioned_account_is_granted_its_stored_group_on_a_live_sign_in() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // The CSRF-aware session, not the bare cookie: connecting a provider, saving its rules and
+    // minting a token are all cookie-authenticated writes, and the platform refuses every one of
+    // them without the token it issued alongside the cookie. See `CSRF_SECRET` and `owner_write`.
+    let owner = fixture.owner_session_with_csrf().await;
+    let cookie = &owner.session;
+
+    unsafe { std::env::set_var(SECRET_REF, CLIENT_SECRET) };
+    let idp = StubIdp::start().await;
+
+    // ---- 1. The provider, with a rule keyed on a group the token will never carry -----------
+    let (provider_id, _) = connect(
+        &fixture,
+        &owner,
+        json!({
+            "slug": "stub-oidc",
+            "kind": "oidc",
+            "name": "Live Stub Directory",
+            "config": {
+                "issuer": idp.issuer(),
+                "client_id": CLIENT_ID,
+            },
+            "secret_ref": SECRET_REF,
+            "group_claim": "groups",
+            "jit_enabled": true,
+        }),
+    )
+    .await;
+    let tested = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::POST,
+            &format!("/api/v1/iam/providers/{provider_id}/test"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
+    publish(&fixture, &owner, provider_id).await;
+
+    let editor: Uuid = sqlx::query_scalar("select id from roles where key = 'editor'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the platform seeds a base editor role");
+
+    // A rule that can only be satisfied by a stored membership. The value is the group's **name**,
+    // not an id: a rule comparing ids would be a different feature, and a walk that used one
+    // would not exercise the name resolution the panel writes.
+    let saved = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::PUT,
+            &format!("/api/v1/iam/providers/{provider_id}/role-rules"),
+            Some(json!({
+                "rules": [{
+                    "when_kind": "group",
+                    "when_key": "groups",
+                    "when_operator": "equals",
+                    "when_value": STOREFRONT,
+                    "role_id": editor,
+                    "scope_type": "organization",
+                }]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "role rules: {}", saved.body);
+
+    // ---- 2. A connector pushes the account, and puts it in a group ----------------------------
+    // A real provisioning token, minted through the real route, because the whole point is that
+    // this is how a directory creates people: no panel involved.
+    let minted = call(
+        &fixture.state,
+        owner_write(
+            &owner,
+            Method::POST,
+            "/api/v1/iam/provisioning/tokens",
+            Some(json!({ "name": "Storefront connector" })),
+        ),
+    )
+    .await;
+    assert_eq!(minted.status, StatusCode::CREATED, "mint: {}", minted.body);
+    let secret = minted.body["secret"].as_str().expect("a secret").to_owned();
+
+    let email = format!("scim-live-{}@omnion.test", Uuid::new_v4().simple());
+    let pushed = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/scim/v2/Users",
+            &secret,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": email,
+                "displayName": "Storefront Person",
+                "externalId": "connector-1",
+                "active": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "push: {}", pushed.body);
+    let user_id = Uuid::parse_str(pushed.body["id"].as_str().expect("id")).expect("a uuid");
+
+    // The account carries no role yet. Asserted **before** the sign-in, so "the sign-in granted
+    // the role" is a claim about a change this walk watched happen rather than about a state that
+    // was already true.
+    assert_eq!(
+        role_of(&fixture, user_id).await,
+        None,
+        "a freshly pushed account holds no role"
+    );
+
+    // The connector creates the group and adds the member — a SCIM-shaped write, so the
+    // membership is a row a real connector made rather than a fixture that inserted one.
+    let group = call(
+        &fixture.state,
+        bearer_request(
+            Method::POST,
+            "/api/v1/scim/v2/Groups",
+            &secret,
+            Some(json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                "displayName": STOREFRONT,
+                "members": [{ "value": user_id.to_string() }],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(group.status, StatusCode::CREATED, "group: {}", group.body);
+
+    // The membership is **stored**, which is the whole claim: read the table the evaluator
+    // consults, rather than trusting that the group write implied it.
+    let stored_member: bool = sqlx::query_scalar(
+        "select exists(select 1 from group_members m \
+         join groups g on g.id = m.group_id \
+         where g.organization_id = $1 and m.user_id = $2)",
+    )
+    .bind(fixture.organization_id)
+    .bind(user_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the membership must be readable");
+    assert!(
+        stored_member,
+        "the connector's group write left a real membership row"
+    );
+
+    let accounts_before: i64 =
+        sqlx::query_scalar("select count(*) from users where organization_id = $1")
+            .bind(fixture.organization_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must run");
+
+    // ---- 3. The person signs in, and the token says nothing about their group -----------------
+    // `groups: &[]` is the load-bearing part of this walk. The provider asserts **no** group, so
+    // every role this sign-in can grant has to come from the database.
+    //
+    // `Subject` holds `&'static str`s, which is right for the file's constant identities and
+    // wrong for this one: the address is generated per run so the walk is re-runnable. The values
+    // are leaked deliberately rather than made `'static` by accident — one small allocation per
+    // run, freed with the process. Widening `Subject` to a lifetime would touch the other walks
+    // for no gain.
+    let subject: &'static str = Box::leak("stub-scim-user".into());
+    let leaked_email: &'static str = Box::leak(email.clone().into_boxed_str());
+    let who = Subject {
+        subject,
+        email: leaked_email,
+        display_name: "Storefront Person",
+        groups: &[],
+    };
+    let response = oidc_sign_in(&fixture, &idp, "stub-oidc", &who).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "a provisioned account can sign in through the directory: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["user"]["email"],
+        json!(email),
+        "and the session belongs to the person the connector pushed"
+    );
+
+    // ---- 4. The role came from the stored row, not from a claim --------------------------------
+    assert_eq!(
+        role_of(&fixture, user_id).await.as_deref(),
+        Some("editor"),
+        "the sign-in granted the role its stored group maps to — the claim carried no group at all"
+    );
+
+    // The sign-in did not create a second account for the same address.
+    let accounts_after: i64 =
+        sqlx::query_scalar("select count(*) from users where organization_id = $1")
+            .bind(fixture.organization_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must run");
+    assert_eq!(
+        accounts_after, accounts_before,
+        "signing in a provisioned account must not create another one"
+    );
+
+    // ---- 5. The audit answers "why does this person hold that role" ----------------------------
+    // Two surfaces, because they carry different halves and conflating them is how a grant
+    // becomes unattributable. The **provider event** says what the sign-in did and which roles it
+    // applied; the **audit entry** says which rule decided, and an operator reads the audit.
+    //
+    // The rule sentence is in the audit's `metadata`, not in the event's `detail` — a walk that
+    // looked in the wrong column gets a passable-looking failure and the wrong fix.
+    let events = call(
+        &fixture.state,
+        session_request(
+            Method::GET,
+            &format!("/api/v1/iam/providers/{provider_id}/events?limit=20"),
+            Some(cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(events.status, StatusCode::OK, "events: {}", events.body);
+    let first = &events.body["events"][0];
+    assert_eq!(first["outcome"], json!("success"), "{}", first);
+    assert_eq!(
+        first["external_subject"],
+        json!("stub-scim-user"),
+        "the event is the provider's own record of the sign-in: {first}"
+    );
+    assert!(
+        first["roles_applied"]
+            .as_str()
+            .is_some_and(|roles| roles.contains("editor")),
+        "the event names the role the rule attached: {first}"
+    );
+
+    let (metadata,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'iam.sso_sign_in' \
+         and actor_user_id = $1 order by created_at desc limit 1",
+    )
+    .bind(user_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the sign-in audit entry must exist");
+    assert!(
+        metadata.contains("role via rule #1"),
+        "the audit says a rule decided, not a default: {metadata}"
+    );
+    assert!(
+        metadata.contains("editor"),
+        "and names what it granted: {metadata}"
+    );
+    // The rule's *condition* is the operator's configuration, not the person's record, and the
+    // audit is delivered outside the tenant. The stored-membership case makes that concrete: the
+    // condition is a group name, and a group name is directory data.
+    assert!(
+        !metadata.contains(STOREFRONT),
+        "and does not leak the directory group the rule was written against: {metadata}"
+    );
+
+    unsafe { std::env::remove_var(SECRET_REF) };
+    fixture.cleanup().await;
 }
