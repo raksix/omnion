@@ -42,6 +42,8 @@ use uuid::Uuid;
 
 use omnion_audit::{ActorType, NewAuditEntry};
 use omnion_events::{NewEvent, bus};
+use omnion_module_crm_intake::autoresponder::Delivery;
+use omnion_module_crm_intake::autoresponder_store;
 use omnion_module_crm_intake::model::{IntakeSource, Lead, LeadEvent};
 use omnion_module_crm_intake::store::{self, LeadQuery, SourcePatch};
 use omnion_module_crm_intake::{CrmIntakeError, LeadMetrics, MappingEntry, NewIntakeSource};
@@ -49,6 +51,7 @@ use omnion_module_crm_intake::{CrmIntakeError, LeadMetrics, MappingEntry, NewInt
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
+use crate::workflow_runner;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -757,6 +760,13 @@ pub async fn capture(
 
     emit_received(pool, &captured, &source).await;
 
+    // The autoresponder is deliberately *not* awaited into the response. A visitor's `202`
+    // must not wait on an SMTP handshake: a relay that takes four seconds to refuse turns
+    // every form submission on the site into a four-second form submission. The send is
+    // spawned and the trail records what it did, which is the same contract the conversion
+    // and the assignment already use for work that must not sit in the request.
+    spawn_autoresponder(state.clone(), captured.lead.clone(), source.clone());
+
     Ok((
         StatusCode::ACCEPTED,
         Json(CaptureResponse {
@@ -764,6 +774,72 @@ pub async fn capture(
             state: word.to_string(),
         }),
     ))
+}
+
+/// Hand the new lead to the autoresponder, off the request's path.
+///
+/// A spawn failure is not fatal and is not swallowed either: the lead is already stored and
+/// the visitor is already answered with `202`, so there is nothing to roll back — but a lost
+/// autoresponder is a lead nobody is ever going to hear back on, and that has to be visible.
+fn spawn_autoresponder(state: AppState, lead: Lead, source: IntakeSource) {
+    tokio::spawn(async move {
+        let pool = state.db().pool().clone();
+        let outcome = match autoresponder_store::prepare(&pool, &lead, &source, OffsetDateTime::now_utc())
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::warn!(lead_id = %lead.id, error = %error, "autoresponder could not be prepared");
+                return;
+            }
+        };
+
+        let message = match &outcome.verdict {
+            Delivery::Ready(message) if !message.delayed => message,
+            // A delayed message is the worker's to send, and every other verdict is a
+            // deliberate silence. Both leave a line so the detail page can say which.
+            other => {
+                if !matches!(other, Delivery::Disabled) {
+                    if let Err(error) = autoresponder_store::record_skip(
+                        &pool,
+                        &lead,
+                        &source,
+                        other.reason(),
+                        serde_json::json!({}),
+                    )
+                    .await
+                    {
+                        tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder's skip could not be recorded");
+                    }
+                }
+                return;
+            }
+        };
+
+        let settings = workflow_runner::mail_settings(state.config());
+        let email = omnion_automation::Email::new(
+            message.to.clone(),
+            message.subject.clone(),
+            message.body.clone(),
+        );
+        match omnion_automation::mail::send(&settings, &email).await {
+            Ok(()) => {
+                // The claim was taken *before* the send, so a crash in between leaves a
+                // pending line that the detail page reads as "reserved", not "sent".
+                if let Err(error) = autoresponder_store::mark_sent(&pool, lead.id, OffsetDateTime::now_utc()).await {
+                    tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder went out but was not recorded as sent");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder could not be sent");
+                // Release the claim so the next worker tick may answer this lead: a mailer
+                // that refused must not leave a lead that is permanently "already sent".
+                if let Err(release) = autoresponder_store::release_claim(&pool, lead.id, &message.to).await {
+                    tracing::warn!(lead_id = %lead.id, error = %release, "the autoresponder's claim could not be released");
+                }
+            }
+        }
+    });
 }
 
 /// The client-supplied idempotency key, when the caller sent one.

@@ -92,6 +92,12 @@ pub const DEFAULT_RETENTION_MAX_SITES: i64 = 50;
 /// parses into a `u64` and refuses a negative or zero value.
 const DEFAULT_RETENTION_MAX_SITES_U64: u64 = 50;
 
+/// How often the CRM autoresponder worker sends what has come due (REQ-117, slice 3).
+///
+/// A send delay is a promise measured in minutes, so the tick is measured in minutes: a
+/// source configured to answer after ten minutes must not be waiting for a nightly sweep.
+pub const DEFAULT_CRM_AUTORESPONDER_POLL_MS: u64 = 60_000;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -465,6 +471,31 @@ impl Default for RetentionConfig {
     }
 }
 
+/// The CRM autoresponder worker of `apps/api` reads these: each tick sends the reservations
+/// whose configured send delay has elapsed (REQ-117, slice 3).
+///
+/// The worker exists because a send delay is a promise about *when*, and a promise with no
+/// clock behind it is a promise nobody keeps. A source configured to answer after an hour
+/// reserves the slot at capture and relies on this worker to complete it, so the tick is
+/// minutes rather than days: the worst case an operator can observe is one tick of lateness
+/// on a delay they chose, never a reply that never arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrmAutoresponderConfig {
+    /// Whether this process sends due autoresponders (`OMNION_CRM_AUTORESPONDER_RUNNER`).
+    pub runner_enabled: bool,
+    /// Delay between two passes (`OMNION_CRM_AUTORESPONDER_POLL_MS`).
+    pub poll_ms: u64,
+}
+
+impl Default for CrmAutoresponderConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_CRM_AUTORESPONDER_POLL_MS,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -568,6 +599,8 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     /// Retention worker knobs (REQ-010, slice 4).
     pub retention: RetentionConfig,
+    /// CRM autoresponder worker knobs (REQ-117, slice 3).
+    pub crm_autoresponder: CrmAutoresponderConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// Logging.
@@ -735,6 +768,15 @@ impl Config {
             .unwrap_or(DEFAULT_RETENTION_MAX_SITES),
         };
 
+        let crm_autoresponder = CrmAutoresponderConfig {
+            runner_enabled: read_flag(&read, "OMNION_CRM_AUTORESPONDER_RUNNER", true)?,
+            poll_ms: read_positive(
+                &read,
+                "OMNION_CRM_AUTORESPONDER_POLL_MS",
+                DEFAULT_CRM_AUTORESPONDER_POLL_MS,
+            )?,
+        };
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -767,6 +809,7 @@ impl Config {
             search,
             analytics,
             retention,
+            crm_autoresponder,
             mail,
             log,
         };
@@ -806,6 +849,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             analytics: AnalyticsConfig::default(),
             retention: RetentionConfig::default(),
+            crm_autoresponder: CrmAutoresponderConfig::default(),
             mail: MailConfig::default(),
             log: LogConfig::new(DEFAULT_LOG_FILTER, LogFormat::Pretty),
         }
@@ -896,6 +940,44 @@ mod tests {
             config.http.bind_address().expect("default host must bind"),
             "0.0.0.0:8080".parse().expect("literal address")
         );
+    }
+
+    #[test]
+    fn the_autoresponder_worker_ticks_in_minutes_not_days() {
+        // The worker's whole reason to exist is a promise measured in minutes: a source
+        // configured to answer after ten minutes must be inside a tick, not inside a nightly
+        // sweep. A default of an hour would make the feature work on paper and never in use.
+        let config = config_from(&[]).expect("defaults are valid");
+        assert_eq!(
+            config.crm_autoresponder.poll_ms,
+            DEFAULT_CRM_AUTORESPONDER_POLL_MS
+        );
+        assert!(
+            config.crm_autoresponder.poll_ms <= 5 * 60_000,
+            "a send delay of minutes must be honoured within minutes, got {}ms",
+            config.crm_autoresponder.poll_ms
+        );
+        assert!(config.crm_autoresponder.runner_enabled);
+    }
+
+    #[test]
+    fn a_malformed_autoresponder_tick_is_a_boot_error_not_a_silent_default() {
+        // A worker that silently keeps its default after being told to tick every second is
+        // a worker that hammers the database for ever, and nothing in the log says so.
+        let error = config_from(&[("OMNION_CRM_AUTORESPONDER_POLL_MS", "0")])
+            .expect_err("a zero tick must be refused");
+        assert_eq!(error.key, "OMNION_CRM_AUTORESPONDER_POLL_MS");
+    }
+
+    #[test]
+    fn the_autoresponder_worker_can_be_switched_off_without_touching_the_others() {
+        let config = config_from(&[
+            ("OMNION_CRM_AUTORESPONDER_RUNNER", "false"),
+            ("OMNION_RETENTION_RUNNER", "true"),
+        ])
+        .expect("flags are valid");
+        assert!(!config.crm_autoresponder.runner_enabled);
+        assert!(config.retention.runner_enabled);
     }
 
     #[test]

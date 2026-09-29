@@ -11,7 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, search_runner, workflow_runner,
+    analytics_runner, automation_runner, crm_autoresponder_runner, event_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -133,6 +134,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _rollups = analytics_runner::spawn(state.clone());
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
+    }
+
+    // The autoresponder worker (REQ-117, slice 3) sends the acknowledgements whose configured
+    // send delay has elapsed. A source that sets a delay relies on this worker: the slot was
+    // reserved at capture, and without the sweep the reservation is a promise with no clock
+    // behind it — the reply simply never goes out, on exactly the sources that asked for it
+    // to wait.
+    if state.config().crm_autoresponder.runner_enabled {
+        let _autoresponder = crm_autoresponder_runner::spawn(state.clone());
+    } else {
+        tracing::info!(
+            "the crm autoresponder worker is disabled (OMNION_CRM_AUTORESPONDER_RUNNER=false)"
+        );
     }
 
     let app = routes::router(state);
