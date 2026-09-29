@@ -572,6 +572,47 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "notifications",
         description: "Read the organization-wide delivery outbox and manage routing rules",
     },
+    // Automation projects (docs/requests/REQ-133, slice 1). The powers are split by *what a
+    // power is over*, and the split that matters most is the one the route table is built on:
+    //
+    // * `projects.read` — the list, the detail and the switcher. Holding it proves the caller
+    //   may read projects inside their OWN organization; the store then narrows that to the
+    //   rows they are a member of, so this key alone is not a way to see a colleague's team.
+    // * `projects.manage` — creating, renaming, archiving and restoring a project. It is NOT
+    //   membership: on a delegated team the person who renames the project is very often not
+    //   the person who adds its colleagues, and one key would let either do the other's job.
+    // * `projects.members.manage` — adding, removing and re-roling people. This is the key
+    //   that eventually has to be satisfiable by a project owner *without* any instance-wide
+    //   role, which is why it exists separately rather than as a wing of `manage`.
+    // * `projects.admin` — the instance-wide override. It is the only thing that makes an
+    //   administrator see every project in the organization rather than only their own
+    //   memberships, and it is deliberately absent from every base role (see `seed.rs`), so an
+    //   installation that never grants it has fully delegated projects and nothing else.
+    //
+    // `projects.limits.manage`, `projects.audit.read`, `workflows.move` and the project owner
+    // role itself are slice 4's and slice 3's, and are not here for the same reason
+    // `notifications.admin` was absent for two slices: a catalogued key with no route behind it
+    // is a role entry granting a promise the platform cannot keep.
+    PermissionDef {
+        key: "projects.read",
+        category: "projects",
+        description: "Read the automation projects you can see, their detail and the switcher",
+    },
+    PermissionDef {
+        key: "projects.manage",
+        category: "projects",
+        description: "Create, rename, archive and restore automation projects",
+    },
+    PermissionDef {
+        key: "projects.members.manage",
+        category: "projects",
+        description: "Add, remove and change the role of an automation project's members",
+    },
+    PermissionDef {
+        key: "projects.admin",
+        category: "projects",
+        description: "Instance-wide power over every project in the organization, including the ones you are not a member of",
+    },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each
     // provider's own read permission; `search.manage` is index maintenance, not searching.
@@ -799,6 +840,32 @@ mod tests {
                 Some("analytics"),
                 "{key} belongs to the analytics category"
             );
+        }
+    }
+
+    #[test]
+    fn the_projects_family_is_catalogued() {
+        // REQ-133 slice 1. The assertion that matters is the *absence*: `projects.admin` is
+        // the key that would let one account read another account's team, so it must be
+        // catalogued (the route table asks the guard for it) while remaining ungrantable
+        // through any base role. If a later slice folds it into `owner`, the seed test in
+        // `seed.rs` is what should fail first — not this one.
+        for key in [
+            "projects.read",
+            "projects.manage",
+            "projects.members.manage",
+            "projects.admin",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("projects"),
+                "{key} belongs to the projects category"
+            );
+        }
+        // Slice 3 and slice 4's keys must NOT exist yet: cataloguing a key with no route
+        // behind it is a promise the platform cannot keep.
+        for key in ["projects.limits.manage", "projects.audit.read", "workflows.move"] {
+            assert!(get(key).is_none(), "{key} has no route yet and must stay uncatalogued");
         }
     }
 

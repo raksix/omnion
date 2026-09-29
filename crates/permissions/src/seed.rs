@@ -618,6 +618,23 @@ mod tests {
             !keys.contains(&"notifications.admin"),
             "reading everybody's delivery log is not a member's power"
         );
+        // REQ-133 slice 1: no base role that *enumerates* its permissions holds
+        // `projects.admin`. The two instance-wide roles are `BasePermissions::All` and hold it
+        // by construction — that is what "all" means, and asserting otherwise would be
+        // asserting the role system does not work. The claim worth locking is the narrower
+        // one: a manager, an editor or a member cannot read a project they are not a member
+        // of, however many project keys they accumulate, because the one key that overrides
+        // membership is not in a hand-written list.
+        for base in BASE_ROLES {
+            if matches!(base.permissions, BasePermissions::All) {
+                continue;
+            }
+            assert!(
+                !base.permissions.keys().contains(&"projects.admin"),
+                "the base role {} must not carry the instance-wide project power",
+                base.key
+            );
+        }
 
         let editor = BASE_ROLES
             .iter()
