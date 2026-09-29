@@ -79,6 +79,23 @@ import {
   type HistorySnapshot,
 } from "./builder-history";
 import { decideConnection } from "./connect-edge";
+import {
+  clearSelection,
+  deleteTarget,
+  EMPTY_SELECTION,
+  extendGroup,
+  isNodeSelected,
+  membersOf,
+  pruneSelection,
+  selectAll,
+  selectEdge,
+  selectGroup,
+  selectNode,
+  selectionSize,
+  toggleNode,
+  whatEscapeClears,
+  type CanvasSelection,
+} from "./selection";
 
 /** The snap grid the canvas draws and drops onto. */
 const GRID = 8;
@@ -126,7 +143,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const [edges, setEdges] = useState<GraphEdge[]>([]);
   const [viewport, setViewport] = useState({ x: 0, y: 0, zoom: 1 });
 
-  const [selected, setSelected] = useState<string | null>(null);
+  // ---- selection ---------------------------------------------------------------------------
+  // ONE owner (see `selection.ts`): a click, a Shift+click, a marquee, `⌘A` and an edge click
+  // all return a new `CanvasSelection` through a named transition, and the outline, the
+  // minimap, the status bar, `Del` and Escape all read the same object. Before this, the
+  // answer lived in three pieces of state and each writer assembled its own — which is how
+  // Shift+click could deselect a node and leave it drawn as selected, and how `Del` on an
+  // edge was a branch in a key handler that nothing could assert.
+  const [selection, setSelection] = useState<CanvasSelection>(EMPTY_SELECTION);
+  const selected = selection.focus;
+  const selectedEdge = selection.edge;
+  const selectionCount = selectionSize(selection);
   const [findings, setFindings] = useState<GraphFinding[]>([]);
   const [save, setSave] = useState<SaveState>({ kind: "clean" });
   const [loading, setLoading] = useState(true);
@@ -152,10 +179,6 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   // the change that armed it, and by then the state it would have closed over is stale.
   const graphRef = useRef<{ nodes: GraphNode[]; edges: GraphEdge[] }>({ nodes: [], edges: [] });
   graphRef.current = { nodes, edges };
-  // The multi-selection, held in a ref so a marquee drag does not re-render the canvas on
-  // every pointer move; `selected` is the single-selection answer the inspector reads.
-  const selectionRef = useRef<Set<string>>(new Set());
-  const [selectionCount, setSelectionCount] = useState(0);
   // The in-tab clipboard. Deliberately not the system clipboard — see `copySelection`.
   const clipboardRef = useRef<{ nodes: GraphNode[]; edges: GraphEdge[] }>({ nodes: [], edges: [] });
   const [clipboardCount, setClipboardCount] = useState(0);
@@ -175,10 +198,8 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   } | null>(null);
   // The minimap's own rectangle, and whether the author wants to see it.
   const [minimapOpen, setMinimapOpen] = useState(true);
-  // The selected *edge*, held apart from the node selection on purpose: the inspector is
-  // driven by `selected`, and an edge selected for deletion must not replace the node the
-  // user was editing with an inspector panel that has nothing to say about a line.
-  const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
+  // The selected *edge* and the node selection now live in one object (`selection.ts`), so an
+  // edge chosen for deletion cannot be half-remembered by a handler that missed the state.
   // A connection being drawn: the source node and the port the user picked. Kept as state
   // rather than a ref because the canvas has to paint the in-flight line, and because the
   // reason a drop was refused has to survive the click that produced it long enough to be
@@ -397,7 +418,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         position: { x: snap(position.x), y: snap(position.y) },
       };
       setNodes((current) => [...current, node]);
-      setSelected(node.id);
+      setSelection(selectNode(node.id));
       // The graph ref is written directly as well as through state: `pushHistory` reads the
       // ref, and a ref updated in a render body would be one render behind the change.
       graphRef.current = { nodes: [...graphRef.current.nodes, node], edges: graphRef.current.edges };
@@ -434,7 +455,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     };
     const nextNodes = [...nodes, copy];
     commit(`duplicate:${copy.id}`, before, nextNodes, edges);
-    setSelected(copy.id);
+    setSelection(selectNode(copy.id));
   }, [commit, currentSnapshot, edges, nodes, selected]);
 
   /**
@@ -446,8 +467,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
    * wants — a workflow graph is not something you paste into a text field.
    */
   const copySelection = useCallback(() => {
-    const wanted = selectionRef.current.size > 0 ? selectionRef.current : new Set(selected ? [selected] : []);
-    const chosen = nodes.filter((node) => wanted.has(node.id));
+    const chosen = nodes.filter((node) => membersOf(selection).includes(node.id));
     if (chosen.length === 0) {
       return;
     }
@@ -459,7 +479,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       edges: edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)),
     };
     setClipboardCount(clipboardRef.current.nodes.length);
-  }, [edges, nodes, selected]);
+  }, [edges, nodes, selection]);
 
   const pasteClipboard = useCallback(() => {
     const source = clipboardRef.current;
@@ -499,10 +519,9 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     }
     commit("paste", before, nextNodes, nextEdges);
     const first = [...remap.values()][0];
-    setSelected(first ?? null);
-    if (first) {
-      selectionRef.current = new Set([first]);
-    }
+    // The pasted group is selected as a group, not collapsed onto its first member: a paste
+    // that highlights one card leaves the rest of the copy looking like it did not land.
+    setSelection(selectGroup([...remap.values()]));
   }, [commit, currentSnapshot, edges, nodes]);
 
   const moveNode = useCallback(
@@ -614,9 +633,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         nextNodes,
         nextEdges,
       );
-      selectionRef.current = new Set();
-      setSelectionCount(0);
-      setSelected((current) => (current && doomed.has(current) ? null : current));
+      // Prune rather than clear: a group delete should leave the nodes that survived
+      // *selected* only if they were selected before, and the focus must land on a node
+      // that still exists. The old code cleared the group and guarded the focus
+      // independently, so deleting a focused node left the inspector holding a dead id and
+      // the toolbar's Duplicate button still enabled.
+      setSelection((current) => pruneSelection(current, nextNodes.map((node) => node.id)));
     },
     [commit, currentSnapshot, edges, nodes],
   );
@@ -670,7 +692,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       if (nextEdges.length === graphRef.current.edges.length) {
         return;
       }
-      setSelectedEdge((current) => (current === id ? null : current));
+      setSelection((current) => (current.edge === id ? clearSelection() : current));
       commit("edge-remove", before, graphRef.current.nodes, nextEdges);
     },
     [commit],
@@ -768,7 +790,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
       const rect = element.getBoundingClientRect();
-      setSelected(node.id);
+      // Selection is decided HERE, on pointer-down, and nowhere else. It used to be decided
+      // twice — once here (`setSelected(node.id)`, unconditionally) and again in `onClick`
+      // (the Shift+click toggle) — so a Shift+click first erased the group and then toggled
+      // against an empty one, and a de-selected node kept the focus the plain pointer-down
+      // had just given it. Two writers to one piece of state is how a node could be
+      // "deselected" and still drawn as selected.
+      setSelection((current) => (event.shiftKey ? toggleNode(current, node.id) : selectNode(node.id)));
       setDragging({
         id: node.id,
         offsetX: (event.clientX - rect.left - viewport.x) / viewport.zoom - node.position.x,
@@ -795,12 +823,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
       // Shift keeps the existing selection, so a second marquee adds to the first instead of
-      // replacing it — the one modifier every drawing tool agrees on.
+      // replacing it — the one modifier every drawing tool agrees on. The marquee that
+      // follows decides the group; this only decides whether it *extends*.
       if (!event.shiftKey) {
-        selectionRef.current = new Set();
-        setSelectionCount(0);
+        setSelection(clearSelection());
       }
-      setSelected(null);
       setMarquee({
         x: event.clientX - rect.left,
         y: event.clientY - rect.top,
@@ -904,9 +931,9 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       // whatever happens to overlap the pixel it landed on.
       const travelled = Math.abs(marquee.w) > 4 || Math.abs(marquee.h) > 4;
       if (travelled && caught.length > 0) {
-        const next = new Set(marquee.additive ? [...selectionRef.current, ...caught] : caught);
-        selectionRef.current = next;
-        setSelectionCount(next.size);
+        setSelection((current) =>
+          marquee.additive ? extendGroup(current, caught) : selectGroup(caught),
+        );
       }
       setMarquee(null);
       return;
@@ -1040,53 +1067,49 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         // still lands somewhere the user can act on rather than clearing everything.
         if (nodes.length > 0) {
           event.preventDefault();
-          selectionRef.current = new Set(nodes.map((node) => node.id));
-          setSelectionCount(nodes.length);
-          setSelected(nodes[nodes.length - 1].id);
+          setSelection(selectAll(nodes.map((node) => node.id)));
         }
         return;
       }
       if (event.key === "Escape") {
-        // Escape cancels a connection in progress before it clears anything else: a half-drawn
-        // line is the one piece of state the user is actively holding, and clearing the node
-        // selection instead leaves them still mid-gesture with no idea why.
-        if (linkDraft) {
+        // One rule for the whole key, and it answers in priority order: a connection in
+        // progress, then a selected edge, then the nodes. Escape is the gesture that says
+        // "I did not mean that", and it has to reach the thing the user is actually holding
+        // rather than whatever happened to be selected three gestures ago. With nothing
+        // selected the key is *not* consumed, so the browser still closes the palette's
+        // search box or a dialog.
+        const step = whatEscapeClears(selection, linkDraft !== null);
+        if (step === "connection") {
           event.preventDefault();
           setLinkDraft(null);
           setLinkNotice({ tone: "error", text: "Connection cancelled." });
           return;
         }
-        // Escape clears the selection, which is also the only way out of a marquee that the
-        // user started by accident and cannot see the end of. An edge is cleared with it:
-        // Escape is the gesture that says "I did not mean that", and it has to reach the
-        // thing that is currently drawn as selected.
-        if (selectedEdge) {
+        if (step === "edge") {
           event.preventDefault();
-          setSelectedEdge(null);
+          setSelection(clearSelection());
           return;
         }
-        if (selectionCount > 0 || selected) {
+        if (step === "nodes") {
           event.preventDefault();
-          selectionRef.current = new Set();
-          setSelectionCount(0);
-          setSelected(null);
+          setSelection(clearSelection());
         }
         return;
       }
 
       if (event.key === "Delete" || event.key === "Backspace") {
-        // An edge wins over the node selection: a selected edge means the user is pointing at
-        // a line, and pressing Delete should remove the line they are pointing at rather than
-        // every node they happened to have selected earlier.
-        if (selectedEdge) {
+        // What `Del` removes is one decision, made in `selection.ts` and asserted there: an
+        // edge wins over a node selection (the user is pointing at a line and means the
+        // line), and a group goes in one press so one undo brings the whole thing back.
+        const target = deleteTarget(selection);
+        if (target.kind === "edge") {
           event.preventDefault();
-          removeEdge(selectedEdge);
+          removeEdge(target.id);
           return;
         }
-        const doomed = selectionRef.current.size > 0 ? [...selectionRef.current] : selected ? [selected] : [];
-        if (doomed.length > 0) {
+        if (target.kind === "nodes") {
           event.preventDefault();
-          removeNodes(doomed);
+          removeNodes(target.ids);
         }
         return;
       }
@@ -1105,8 +1128,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       }
       event.preventDefault();
       // A multi-selection moves as one: nudging only the node the inspector is showing would
-      // leave a marquee-selected group half moved and the user with no way to say so.
-      const moving = new Set(selectionRef.current.size > 0 ? [...selectionRef.current] : [selected]);
+      // leave a marquee-selected group half moved and the user with no way to say so. The
+      // set is the *drawn* selection, so an arrow key moves every outlined card — which is
+      // what the user can see, and therefore what they expect to move.
+      const moving = new Set(membersOf(selection));
       const before = currentSnapshot();
       const nextNodes = nodes.map((node) =>
         moving.has(node.id)
@@ -1121,7 +1146,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       );
       commit("nudge", before, nextNodes, edges);
     },
-    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusPaletteItem, nodes, pasteClipboard, removeEdge, removeNodes, selected, selectedEdge, selectionCount],
+    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusPaletteItem, nodes, pasteClipboard, removeEdge, removeNodes, selected, selection, selectionCount],
   );
 
   // ---- actions ----------------------------------------------------------------------------
@@ -1456,7 +1481,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
             />
           ) : null}
 
-          {minimapOpen ? <Minimap nodes={nodes} viewport={viewport} selectionRef={selectionRef} selectionCount={selectionCount} onJump={jumpTo} /> : null}
+          {minimapOpen ? <Minimap nodes={nodes} viewport={viewport} selection={selection} onJump={jumpTo} /> : null}
 
           <div className="absolute inset-0" style={style}>
             <svg className="absolute left-0 top-0 overflow-visible" width="1" height="1">
@@ -1481,8 +1506,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                       style={{ pointerEvents: "stroke", cursor: "pointer" }}
                       onPointerDown={(event) => {
                         event.stopPropagation();
-                        setSelectedEdge(edge.id);
-                        setSelected(null);
+                        setSelection((current) => selectEdge(current, edge.id));
                       }}
                     />
                     <path
@@ -1521,9 +1545,9 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
             {nodes.map((node) => {
               const nodeType = nodeTypes.get(node.type);
-              // A multi-selected card is drawn exactly like the single selection: a marquee
-              // that highlights nothing reads as a marquee that did not work.
-              const isMultiSelected = selectionCount > 1 && selectionRef.current.has(node.id);
+              // One predicate decides the outline, the minimap dot and the status bar, so a
+              // card cannot be drawn as selected in one place and unselected in another.
+              const isSelected = isNodeSelected(selection, node.id);
               const hasProblems = findings.some(
                 (finding) =>
                   finding.severity === "error" && finding.node_id === node.id,
@@ -1539,10 +1563,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                     minHeight: CARD_H,
                     borderColor: hasProblems
                       ? "var(--color-accent)"
-                      : isMultiSelected || selected === node.id
+                      : isSelected
                         ? "var(--color-ink)"
                         : "var(--color-line)",
-                    outline: isMultiSelected || selected === node.id ? "2px solid var(--color-ink)" : "none",
+                    outline: isSelected ? "2px solid var(--color-ink)" : "none",
                     outlineOffset: 2,
                   }}
                   onPointerDown={(event) => {
@@ -1557,27 +1581,19 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                       connect(linkDraft.nodeId, linkDraft.port, node.id);
                       return;
                     }
-                    // Shift+click extends the multi-selection, which is what every canvas
-                    // does and what the marquee's additive mode already implies. Without it
-                    // a user who marquee-selects a group and then adds one more node has to
-                    // start the whole selection over.
-                    if (event.shiftKey) {
-                      const next = new Set(selectionRef.current);
-                      if (next.has(node.id)) {
-                        next.delete(node.id);
-                      } else {
-                        next.add(node.id);
-                      }
-                      selectionRef.current = next;
-                      setSelectionCount(next.size);
-                      setSelected(node.id);
-                      return;
-                    }
-                    setSelectedEdge(null);
-                    setSelected(node.id);
+                    // Selection is *not* decided here. `onNodePointerDown` already made the
+                    // call — including the Shift+click toggle — and a second writer to the
+                    // same state is what let a node be de-selected by one gesture and drawn as
+                    // selected by the next. A click that started on empty canvas arrives here
+                    // too, but the canvas handler owns that outcome.
                   }}
                   data-node-id={node.id}
                   data-node-type={node.type}
+                  // A real marker, not a CSS string a probe has to parse. The QA pass used to
+                  // read `style.includes("outline")`, which matches the `outline: none` React
+                  // writes on *every* card — so "stillSelected: 3" after Escape was three
+                  // unselected cards counted as selected, and the product was never wrong.
+                  data-node-selected={isSelected ? "true" : "false"}
                   role="button"
                   tabIndex={-1}
                 >
@@ -1608,7 +1624,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                         }
                         onClick={(event) => {
                           event.stopPropagation();
-                          setSelected(node.id);
+                          // Pressing a port focuses the node that owns it, so the inspector
+                          // shows the card whose connection is being drawn — a connection
+                          // started from a node nobody can see described is a gesture with no
+                          // context.
+                          setSelection(selectNode(node.id));
                           // Pressing a port starts a connection; pressing it again (or
                           // pressing Escape) cancels it. Without the toggle, a mis-click has
                           // no way out except finishing the link somewhere sensible.
@@ -1722,6 +1742,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               : "No problems"}
           <span className="ml-auto text-[11.5px] text-muted">
             {nodes.length} nodes · {edges.length} connections · v{definition?.graph_version ?? 0}
+            {/* The selection, stated in words. A group highlight with nothing to say how
+                many cards it covers is a status bar that cannot answer "what is this going to
+                delete?" — and the count is read from the same predicate that draws them. */}
+            {selectionCount > 0 || selectedEdge ? (
+              <span data-builder-selection>
+                {" · "}
+                {selectedEdge
+                  ? "1 connection selected (Del removes it)"
+                  : `${selectionCount} selected`}
+              </span>
+            ) : null}
           </span>
         </button>
         {problemsOpen ? (
@@ -1748,7 +1779,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                   {finding.node_id ? (
                     <button
                       type="button"
-                      onClick={() => setSelected(finding.node_id)}
+                      onClick={() => setSelection(selectNode(finding.node_id as string))}
                       className="shrink-0 rounded-md border border-line px-1.5 py-0.5 text-[11.5px] hover:bg-quiet-soft"
                       data-finding-jump={finding.node_id}
                     >
@@ -2167,14 +2198,12 @@ function isTypingTarget(target: EventTarget | null): boolean {
 function Minimap({
   nodes,
   viewport,
-  selectionRef,
-  selectionCount,
+  selection,
   onJump,
 }: {
   nodes: GraphNode[];
   viewport: { x: number; y: number; zoom: number };
-  selectionRef: React.RefObject<Set<string>>;
-  selectionCount: number;
+  selection: CanvasSelection;
   onJump: (x: number, y: number) => void;
 }) {
   const W = 180;
@@ -2212,14 +2241,17 @@ function Minimap({
   const viewWidth = (W - PAD * 2) / scale;
   const viewHeight = (H - PAD * 2) / scale;
   const view = project(-viewport.x / viewport.zoom, -viewport.y / viewport.zoom);
-  const selected = selectionRef.current;
+  // The same predicate the canvas outline uses, so a card cannot be highlighted on the map
+  // and unhighlighted on the board. The map only needs to know *that* something is selected,
+  // which is why it renders the count as an attribute.
+  const selected = new Set(membersOf(selection));
 
   return (
     <div
       className="absolute bottom-3 right-3 rounded-md border border-line bg-panel/90 p-1"
       data-minimap
       data-minimap-state="ready"
-      data-minimap-selection={selectionCount}
+      data-minimap-selection={selectionSize(selection)}
     >
       <button
         type="button"
