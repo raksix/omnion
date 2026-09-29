@@ -85,6 +85,12 @@ trap release EXIT INT TERM
 stop_stack
 
 step "resetting the QA database"
+# Free this worktree's own build space BEFORE the build, not after a failure. `/dev/shm` is 32 G
+# shared between seven writers, and a full one does not report "no space": the linker bus-errors
+# with a note asking for a bug report, which reads as a defect in whatever crate was being built.
+# Two ticks of REQ-126 logged a passing suite as "aborts with exit 101, pre-existing, not claimed"
+# because of exactly that. Only this worktree's target/ is trimmed — never a sibling writer's.
+bash scripts/qa/shm-guard.sh || { echo "[qa] not enough shared build space to run a pass"; exit 1; }
 # Stop this stack's API *before* the reset, not after. A process that is already running (or
 # crash-looping, as it does when the binary and the migration set disagree) reconnects to the
 # moment the database comes back and applies whatever migration set *it* was compiled with. The
