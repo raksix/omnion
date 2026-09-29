@@ -9075,3 +9075,72 @@ is eight writers sharing one Postgres, not a product finding.
 then read the remaining notes: `validate-classes`, `cmd-s-writes-once`, `two-tab-conflict` /
 `two-tab-keep-mine` (now that the conflict is a 409), `edge-delete`, `run-from-here`,
 `step-trace`, `pillsPainted`, `plugin-palette`, `keyboard-pass`, `narrow-lock`, `listener`.
+
+### Wave 3 / tick 23 — the stack could not write, and a second writer's branch proved it (2026-09-29)
+
+**What.** The pass finally ran end to end, and the first note it produced was the one two ticks of
+work had been aimed at: `workflow-builder: rule-created found: true`. Creating a rule was impossible
+on every previous pass, and the reason was the harness, not the builder — `ensure-organization.mjs`
+signed in with `qa-owner@omnion.test` on a database `reset-db.sh` had just dropped, so the step
+answered `401 invalid_credentials` and printed "rule screens will report empty" over a stack that
+was about to be seeded correctly by the wizard one step later. The step was not merely failing, it
+was **guaranteed** to fail on every pass. It now asks `GET /onboarding` — the one endpoint here
+that needs no session — and treats "no account yet" as the wizard's job, not a broken stack
+(`708e352`).
+
+**Proof of the harness fix, in all four directions, on a scratch database** (`omnion_qa_probe_org`,
+a scratch API on :18099, both dropped afterwards): fresh database → `no account yet …`, exit 0;
+account without a tenant → `organization created`, exit 0; already seeded → `already present`,
+exit 0; and the negative control, a **wrong password on the repair path**, → `an account exists but
+sign-in failed (401)`, exit 1. The last one matters: a step that returns 0 for everything is a
+step that can no longer report a real fault, and the previous version had exactly that property
+whenever the org already existed.
+
+**The two real defects the notes found, both of which I did not expect.**
+
+1. **The panel's own save fails while a raw `fetch` to the same route succeeds.** `autosave`
+   read `saveState: "error"` and `two-tab-conflict` read `state: "error"`, yet the `conflict` note
+   — which is a raw probe against the same endpoint — read a clean `409 graph_version_conflict`
+   with the version named. The server is fine. Reproducing it by hand found the contract the panel
+   is not meeting: `POST /workflows` requires `steps` **and** a structured `trigger`
+   (`{"kind": "manual"}`, not the string `"manual"`), and the created row's `graph_version` is
+   **not in the list response at all** — `GET /workflows` returns
+   `conditions, created_at, description, enabled, id, last_triggered_at, name, next_run_at,
+   organization_id, schedule, site_id, step_count, steps, trigger, trigger_count, trigger_event,
+   updated_at` and no version. A client that saves straight from a list row has nothing to quote,
+   which is the 409 the author cannot resolve.
+2. **`workflow-table: create 422`.** The probe posts `{name, description}`; the API answers
+   `missing field 'steps'`, then `trigger: invalid type: string, expected struct Trigger`, then
+   `a workflow needs at least one step`. That is the **probe** being wrong, and it is the third
+   time in this REQ that the instrument, not the product, is the finding: the table runner never
+   reached the table, so every table claim in this pass is unmeasured rather than red.
+
+**What the pass actually proved, criterion by criterion.** Ticked: multi-select (criterion 3) on
+`escape-clears {cleared: true, stillSelected: 0}` + `shift-click-multi {ok: true, selected: 2}` +
+`select-all {selected: 3}` — three claims that had never once been provable. Left **unticked with
+the real numbers recorded**: the two-tab conflict (server half proven twice, client half measurably
+red — a box claiming two halves with one red is a claim nobody can check), `validate-classes`
+(control `valid: null`, all five classes `found: false` — the probe's spine still does not build),
+`edge-delete` (`the click missed the curve`), `run-from-here` and `step-trace` (both blocked behind
+the failed save, so the graph never reached the server), `listener` (`panelFound: false`),
+`plugin-palette` (no plugin is installed, so three of its four claims are unmeasurable) and
+`keyboard-pass` (`edgeCommitted: false` — same cause).
+
+**Also worth recording: a sibling writer is committing into this worktree.** Partway through the
+pass, `git status` showed `M scripts/qa/run.sh` plus two untracked `cargo-slot*.sh` files that I
+had not written, and their diff **removes the CSRF fix from run.sh** — the one env var that makes
+every write work. I did not revert it and did not commit it: the work is in
+`stash@{0}` labelled `SIBLING-WIP`, intact, for whoever owns it. Eight writers on one repo makes
+"is this line mine?" a question with a real cost, and the answer was to leave it alone.
+
+**Gates.** `cargo test -p omnion-workflows --lib` 139 passed · `cargo test -p omnion-api --lib`
+240 passed · admin `tsc --noEmit` exit 0. The pass itself **died at the end** —
+`page.evaluate: Execution context was destroyed, most likely because of a navigation`, written to
+`summary.json` as a `fatal` — after all fourteen builder notes were already logged, so the notes
+are trustworthy and the summary/counters are not.
+
+**Next.** Fix the panel's save path first: the create payload must carry `steps` and a structured
+`trigger`, and the graph write must quote a version the read path actually sends — either
+`graph_version` joins the list projection or the builder stops saving from a list row. Everything
+downstream of it (`run-from-here`, `step-trace`, `cmd-s-writes-once`, `keyboard-pass`) is
+blocked behind that one write, which is why four notes read empty rather than red.
