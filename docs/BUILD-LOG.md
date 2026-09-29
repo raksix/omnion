@@ -9495,3 +9495,58 @@ notes), `two-tab-conflict` (`refused` / `reloadOffered` / `localNodesKept`, then
 `firstRunnableNo === firstSkippedNo + 1`) and `step-trace` (`panelFound`, `kind: "node"`,
 `stepsWithParams === stepsTotal > 0`). A note that still reads empty after this is a product
 defect, because the instrument behind it has been fixed and committed.
+
+
+### Wave 3 / tick 26 — the QA semaphore had been held by a dead pass for 1h48m (2026-09-29)
+
+**What.** This tick was going to be a REQ-004 slice. It became a repair of the instrument every
+slice depends on, because the block was not capacity: the queue reported "waiting for a QA slot"
+and never got one, and four consecutive ticks spent themselves concluding that the pass could not
+run. The holder was **mine**. `/proc/142641/cwd` was `/mnt/apopic/omnion-w3` and its only child was
+a `sleep 30`; the pid in the place filename (142551) had been gone for over an hour. The holder is
+`while :; do sleep 30; done`, reparented to init when its pass died, and `kill -0` on it is
+therefore **always true**.
+
+**The trap, stated once because it is the general shape.** `run.sh` freed the place from
+`trap release EXIT INT TERM`. EXIT does not fire for SIGKILL — which is precisely how this loop's
+passes end (OOM killer, terminal timeout). So the owner died and the thing that survives is
+exactly the thing the reaper is *required* to test. The reaper's own comment says the liveness
+test has to read the holder "or a reaper that tested it would either reclaim every live place or
+fall back on age alone". The holder test was made mandatory; the holder was made immortal. **A
+liveness check that consults a process designed never to exit cannot fail, and so cannot inform.**
+That single property is the whole outage: one place held for the life of the box, every writer
+behind it.
+
+**Fix (2 files, `963c4e3`).** The holder now watches the **owner** — `QA_SLOT_OWNER_PID`, which is
+`$$` of the pass, not of `qa-slot.sh`, since a subshell's `$$` is the parent's and the pass is
+what dies. When the owner is gone the holder removes its own place and holder file and exits.
+Self-cleaning matters as much as self-terminating: leaving the place for the reaper means every
+hard kill costs the queue `QA_SLOT_REAP_GRACE` (2 min by default) at a place nobody holds. A
+writer that passes no owner keeps the old holder, so `run.sh` always passes one. Recovery is then
+two vectors — the holder, for a killed pass, and the reaper, for everything else.
+
+**Proof.** `scripts/qa/qa-slot-test.sh` is new and green in **5/5** directions: capacity (empty
+queue takes the only place), the documented give-up, the dead-holder reap, **the regression** (a
+real owner takes a place, is `kill -9`ed, and the place frees itself and the holder exits), and a
+queue behind that owner being served. Test 5 asserts serving and cleanup separately, because the
+first version passed on "it got through" alone. The 17 processes I had read as *sibling writers
+queued behind my leak* were not that at all: `/proc/<pid>/environ` shows `QA_SLOT_DIR=/tmp/tmp.*/slot`
+and `QA_SLOT_WAIT=3` — private directories, i.e. **sibling unit tests of this same semaphore**, in
+flights of 3 s. I was about to publish a box-wide stall that was three test cases.
+
+**Also this tick: the box, honestly.** `/dev/shm` was at **100 % (4 KB free)** and RAM at 0 free
+of 32 with load 46. `target` is a symlink into `/dev/shm/w3-target`, so nothing could compile, and
+a third Chromium on a swapping machine produces notes no reader could trust. I removed my own
+`w3-target/debug/incremental` (my worktree's cache, nobody else's) and left the rest alone.
+
+**Not ticked, and the reason is unchanged.** No acceptance box is ticked. The six notes behind the
+last three ticks (`workflow-table`, `validate-classes`, `cmd-s-writes-once`, `two-tab-conflict`,
+`run-from-here`, `step-trace`) remain unmeasured. The instrument behind the first four is fixed and
+committed; the instrument behind **this** tick was the blocker for all of them, and it was the
+blocker for every other writer on the box too.
+
+**Next.** Re-check the queue the way the environment tells you to: `/tmp/omnion-qa-slot/` places
+plus a `kill -0` on each **holder** pid. If it is free, run the pass and read the notes in the
+dependency order the last three ticks agreed on. If the box is still at load 40+ with 0 free RAM,
+`cargo test -p <crate> --lib` and `bun x tsc --noEmit` are the tick's honest debt: a note read off a
+swapping machine is worse than a note deferred.
