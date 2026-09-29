@@ -368,7 +368,9 @@ static CALLERS: tokio::sync::OnceCell<
 > = tokio::sync::OnceCell::const_new();
 
 async fn login(state: &AppState, email: &str) -> Caller {
-    let cache = CALLERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache = CALLERS
+        .get_or_init(|| async { std::sync::Mutex::new(std::collections::HashMap::new()) })
+        .await;
     let cached = cache
         .lock()
         .expect("the caller cache is not poisoned")
