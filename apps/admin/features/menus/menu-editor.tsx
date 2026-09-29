@@ -395,6 +395,44 @@ export function MenuEditor({ menuId }: { menuId: string }) {
     if (detail) void refreshPreview();
   }, [detail, refreshPreview]);
 
+  /**
+   * One row's buttons, closed over that row's id.
+   *
+   * The recursion in `TreeRow` hands every child *its own* factory rather than the parent's
+   * callbacks. Passing the parent's handlers down is the version of this that looks right and is
+   * wrong: the handler closes over the top-level item, so clicking "delete" on a third-level row
+   * deletes the first-level row the editor can no longer see.
+   *
+   * It sits ABOVE the early returns on purpose. This hook was below them, which is legal
+   * JavaScript and a runtime crash: the first render took the skeleton branch and ran three
+   * hooks, the second render (the document had arrived) ran four, and React reported "Rendered
+   * more hooks than during the previous render" — the editor never painted, and the walkthrough
+   * read that as a screen that did not load rather than as a rules-of-hooks violation.
+   */
+  const actionsFor = useCallback(
+    (id: string): RowActions => ({
+      select: () => setSelected((current) => (current === id ? null : id)),
+      toggle: () =>
+        setExpanded((current) => {
+          const next = new Set(current);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        }),
+      addChild: () => addItem(id),
+      remove: () => removeItem(id),
+      move: (direction) => move(id, direction),
+      dragStart: () => {
+        dragId.current = id;
+      },
+      dragEnter: (nest) => setDropHint({ id, nest }),
+      drop: () => onDrop(id, dropHint?.nest ?? false),
+    }),
+    // `dropHint` is read at click time, so it belongs here: a factory memoized without it would
+    // drop a row as a sibling when the pointer said "nest" half a second earlier.
+    [addItem, removeItem, move, onDrop, dropHint],
+  );
+
   // ------------------------------------------------------------------ the states
   if (error && !detail) {
     return (
@@ -420,38 +458,6 @@ export function MenuEditor({ menuId }: { menuId: string }) {
 
   const topLevel = childrenOf.get(null) ?? [];
   const selectedItem = selected ? (byId.get(selected) ?? null) : null;
-
-  /**
-   * One row's buttons, closed over that row's id.
-   *
-   * The recursion in `TreeRow` hands every child *its own* factory rather than the parent's
-   * callbacks. Passing the parent's handlers down is the version of this that looks right and is
-   * wrong: the handler closes over the top-level item, so clicking "delete" on a third-level row
-   * deletes the first-level row the editor can no longer see.
-   */
-  const actionsFor = useCallback(
-    (id: string): RowActions => ({
-      select: () => setSelected((current) => (current === id ? null : id)),
-      toggle: () =>
-        setExpanded((current) => {
-          const next = new Set(current);
-          if (next.has(id)) next.delete(id);
-          else next.add(id);
-          return next;
-        }),
-      addChild: () => addItem(id),
-      remove: () => removeItem(id),
-      move: (direction) => move(id, direction),
-      dragStart: () => {
-        dragId.current = id;
-      },
-      dragEnter: (nest) => setDropHint({ id, nest }),
-      drop: () => onDrop(id, dropHint?.nest ?? false),
-    }),
-    // `dropHint` is read at click time, so it belongs here: a factory memoized without it would
-    // drop a row as a sibling when the pointer said "nest" half a second earlier.
-    [addItem, removeItem, move, onDrop, dropHint],
-  );
 
   return (
     <div className="space-y-6" data-menu-editor-state="ready">
