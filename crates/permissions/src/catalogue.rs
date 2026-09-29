@@ -441,6 +441,43 @@ pub const CATALOGUE: &[PermissionDef] = &[
     // * `notifications.manage` is the reader's own channel configuration and preferences.
     // * `notifications.admin` is the organization-wide delivery log and the router's rules
     //   (below — it arrived with slice 3, the first build with routes behind it).
+    // Security centre (docs/requests/REQ-012). Three powers, and the split is drawn where
+    // the request draws it: *looking* is not the same power as *dismissing*, and they are
+    // certainly not the same power as *changing the policy that produced the finding*.
+    //
+    // * `security.read` is the posture overview and the findings list. It is deliberately NOT
+    //   in the base role: this screen is the platform's own account of itself, and an account
+    //   that can read it by default learns the deployment's posture without ever being given
+    //   the job of maintaining it.
+    // * `security.scan` re-runs the checks and ingests a CI report. It changes no
+    //   configuration, so it sits below `manage` on purpose — an account that may look may
+    //   also ask for a fresher look, and nothing more.
+    // * `security.manage` acknowledges, ignores and marks findings fixed. This is the key
+    //   somebody will be asked to justify later, so it is granted on purpose and never
+    //   inferred from `read`.
+    // * `security.ip.manage` (slice 4) is the allow/deny lists. It is separate because an
+    //   IP rule can lock an operator out of their own platform, and that is a different kind
+    //   of power from deciding what is worth looking at.
+    PermissionDef {
+        key: "security.read",
+        category: "security",
+        description: "Read the security posture and the findings list",
+    },
+    PermissionDef {
+        key: "security.scan",
+        category: "security",
+        description: "Re-run the security checks and ingest a dependency report",
+    },
+    PermissionDef {
+        key: "security.manage",
+        category: "security",
+        description: "Acknowledge, ignore and resolve security findings",
+    },
+    PermissionDef {
+        key: "security.ip.manage",
+        category: "security",
+        description: "Change the IP allow and deny lists",
+    },
     PermissionDef {
         key: "notifications.read",
         category: "notifications",
