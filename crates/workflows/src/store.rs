@@ -24,14 +24,16 @@ fn workflow_columns() -> &'static str {
 /// Insert a workflow definition.
 pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow> {
     let sql = format!(
-        "insert into workflows (organization_id, site_id, name, description, enabled, \
-         trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning {}",
+        "insert into workflows (organization_id, project_id, site_id, name, description, \
+         enabled, trigger_kind, schedule, trigger_event, conditions, next_run_at, steps, \
+         created_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) returning {}",
         workflow_columns()
     );
 
     let workflow: Workflow = sqlx::query_as(&sql)
         .bind(new.organization_id)
+        .bind(new.project_id)
         .bind(new.site_id)
         .bind(new.name)
         .bind(new.description)
@@ -50,15 +52,27 @@ pub async fn insert_workflow(pool: &PgPool, new: NewWorkflow) -> Result<Workflow
 }
 
 /// List workflows, newest first; `organization_id` and `site_id` filter when given.
+///
+/// `project_id` filters too (REQ-133), and the parameter is `Option<Uuid>` on purpose even
+/// though the column is `not null`: the column being non-nullable is a statement about *rows in
+/// the table*, and this function is a statement about *which rows a caller may see*. A caller who
+/// passes `None` is not writing a workflow without a project — they are asking for everything
+/// they can see, which is the question the project list and the instance-wide views ask.
+///
+/// The filter is a `where` clause rather than a caller-side partition because a caller-side one is
+/// a leak: the rows still cross the wire, and slice 2's rule is that a workflow the caller may not
+/// see is never *fetched*, not merely never displayed.
 pub async fn list_workflows(
     pool: &PgPool,
     organization_id: Option<Uuid>,
     site_id: Option<Uuid>,
+    project_id: Option<Uuid>,
 ) -> Result<Vec<Workflow>> {
     let sql = format!(
         "select {} from workflows \
          where ($1::uuid is null or organization_id = $1) \
            and ($2::uuid is null or site_id = $2) \
+           and ($3::uuid is null or project_id = $3) \
          order by created_at desc, id",
         workflow_columns()
     );
@@ -66,6 +80,7 @@ pub async fn list_workflows(
     let workflows: Vec<Workflow> = sqlx::query_as(&sql)
         .bind(organization_id)
         .bind(site_id)
+        .bind(project_id)
         .fetch_all(pool)
         .await?;
 
@@ -306,17 +321,34 @@ pub async fn list_event_rules<'e>(
     Ok(workflows)
 }
 
-/// The event-triggered workflows of a scope, for the automations surface.
-pub async fn list_event_workflows(
+/// The definitions a caller may see: organization, site, and an explicit set of projects.
+///
+/// This is the query a scoped list actually runs, and it is separate from [`list_workflows`]
+/// rather than a flag on it because the id set is a **closure that is already computed**: the
+/// caller asked `visible_project_ids` once and narrowed it. The alternative — a nullable
+/// `project_id = any($3)` where `null` means "no filter" — is a filter that silently stops
+/// applying the moment a variable is wrong, and the one place that must never silently stop is
+/// the scoping filter.
+///
+/// `project_ids` is `&[Uuid]`, so an empty slice is a real, answerable question ("which workflows
+/// are in none of the projects you can see?" → none) rather than an accident.
+pub async fn list_workflows_in_projects(
     pool: &PgPool,
     organization_id: Option<Uuid>,
     site_id: Option<Uuid>,
+    project_ids: &[Uuid],
 ) -> Result<Vec<Workflow>> {
+    if project_ids.is_empty() {
+        // Answered without a round trip, and the shortcut is safe precisely because the caller's
+        // set is already empty: there is no project in it, so no workflow in it either.
+        return Ok(Vec::new());
+    }
+
     let sql = format!(
         "select {} from workflows \
-         where trigger_kind = 'event' \
-           and ($1::uuid is null or organization_id = $1) \
+         where ($1::uuid is null or organization_id = $1) \
            and ($2::uuid is null or site_id = $2) \
+           and project_id = any($3) \
          order by created_at desc, id",
         workflow_columns()
     );
@@ -324,6 +356,38 @@ pub async fn list_event_workflows(
     let workflows: Vec<Workflow> = sqlx::query_as(&sql)
         .bind(organization_id)
         .bind(site_id)
+        .bind(project_ids)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(workflows)
+}
+
+/// The event-triggered workflows of a scope, for the automations surface.
+///
+/// Carries the project filter for the same reason as [`list_workflows`]: the automations list is
+/// a screen the project switcher scopes, and a rule in another project is not a rule this caller
+/// may run.
+pub async fn list_event_workflows(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+) -> Result<Vec<Workflow>> {
+    let sql = format!(
+        "select {} from workflows \
+         where trigger_kind = 'event' \
+           and ($1::uuid is null or organization_id = $1) \
+           and ($2::uuid is null or site_id = $2) \
+           and ($3::uuid is null or project_id = $3) \
+         order by created_at desc, id",
+        workflow_columns()
+    );
+
+    let workflows: Vec<Workflow> = sqlx::query_as(&sql)
+        .bind(organization_id)
+        .bind(site_id)
+        .bind(project_id)
         .fetch_all(pool)
         .await?;
 
