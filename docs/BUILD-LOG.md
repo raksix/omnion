@@ -1,3 +1,89 @@
+## 2026-09-29 · Wave 5 · tick 33 — the seventeen event names no webhook could subscribe to
+
+**What.** Not a REQ slice. A defect the tick found while reading what tick 32's "263 passed"
+had actually covered, and it is the reason that number was smaller than it looked.
+
+`crates/events/src/catalogue.rs` is the platform's registry of every event name. Three jobs hang
+off it: the endpoint form's picker renders from it, `reconcile` expands a group subscription
+(`promotion.*`) against it, and `GET /api/v1/events/catalogue` describes it. **Seventeen names
+this branch emits were in none of those three** — everything from REQ-005's tenant lifecycle and
+REQ-011's purges to REQ-017's staging and promotions.
+
+The product was not visibly broken, and that is precisely why it survived five REQs.
+`enqueue_fanout` matches `event.name` against the endpoint's stored list with `= any (w.events)`
+and does not consult the catalogue at all, so delivery worked the whole time. What was broken is
+everything an operator *reaches for*: the picker offers nothing to pick, and a name typed by
+hand is **kept** (reconcile refuses only an unknown *group*, not an unknown concrete name), so
+the subscription looks accepted and simply never fires for anyone who guessed. Seventeen silent
+no-ops in the integration surface.
+
+**The gate that would have caught it never ran.** `apps/api/tests/events.rs::
+every_emitted_name_is_in_the_catalogue` walks the tree for `NewEvent::new("…")` and fails on an
+unlisted name — and it is an *integration* test. The per-tick command is
+`cargo test -p <the crate you touched> --quiet`, which is a lib test. Tick 32 recorded
+`cargo test -p omnion-api --lib` → 263 passed and read it as a green gate; `--lib` cannot reach
+an integration test in another file. Same class as the lesson about a batch run under load: a
+gate that was never executed is not evidence, whatever it says when it does run.
+
+So the fix is two commits and the second one is the point:
+
+* `16f2ed3` adds the seventeen rows, written from each emitter's actual `payload(json!{…})`
+  rather than from the REQ's Events table — the table names the facts but not their shapes. Two
+  calls worth recording. `organization.member.role_changed` is **one name with two payload
+  shapes**: a membership binding emits `user_id`/`scope`/`change`, a department binding emits
+  `department_id`/`department_key`/`action`. Marking either side required would be a promise an
+  emitter does not keep, so both are optional and the row documents it. And `cdn.rule.changed`
+  / `cdn.settings.updated` stay **out** despite REQ-011 listing them: they are written to
+  `audit_log`, never to the bus, so a row would put a name in the picker that no delivery can
+  carry. `promotion.approved`/`failed`/`conflict` are out for the same reason — no emitter yet.
+* `afe832c` moves the check to a **unit** test in the crate the tick already runs, reading the
+  emitters off disk rather than restating them (a hand-typed list would drift from the table it
+  checks — the bug itself). It asserts each name is listed *and* filed under the area its group
+  expects, because `promotion.*` and `environment.*` both live in area `environments`: an
+  existence-only check would pass a name that is unreachable from the group the panel renders.
+
+Verified the new test can fail: deleting the `promotion.requested` row turns it red naming the
+emitting file and the unreachable subscription — `"promotion.requested is emitted by
+apps/api/src/routes/promotions.rs but the catalogue does not list it"`.
+
+**Proof.** `cargo test -p omnion-events -p omnion-environment --quiet` → **48 + 50 passed,
+0 failed** (run again after the merge with main, still green). `cargo test -p omnion-api
+--test events` was run twice and is **red on this branch for a reason that is not mine**:
+`webhooks_are_scoped_per_organization_and_permission_guarded` and the other cookie-auth suites
+fail with `csrf_unavailable` / `csrf_failed` because `events.rs` predates the CSRF middleware and
+has no token plumbing. The fix for that (`2beb34d fix(forms): the form suite was measuring a
+403, not a form`) is on `wave2-cms` and is **not** an ancestor of this branch —
+`git merge-base --is-ancestor 2beb34d HEAD` is false. So the 8 failures are a known suite that
+waits for main, not a regression from these two commits; claiming otherwise would be the same
+mistake as reading `--lib` as a gate.
+
+**One environmental find worth the space.** 54 orphaned `omnion_events_*` databases had
+accumulated in Postgres — each test creates a throwaway database and disposes it, and a pass
+killed mid-run leaves it. At load 124 with 11 concurrent suites each trying to `create
+database`, the pool exhausted and the suite reported FAILED with no assertion output at all, which
+reads exactly like a product bug. Dropped them and the same command got as far as printing the
+real `csrf_failed` message. The signature of contention is a failure with **no panic message**.
+
+**Merge.** `origin/main` moved 5 commits (REQ-013's backup-media half). One conflict, in this
+append-only log, and it was resolved by keeping both sides whole — the multiset check reports
+zero lost lines and no fence survives. Worth recording that the first `git diff --stat` looked
+alarming: 152 files, **-56,976 lines**. That was not main deleting work. It was the diff between
+main and a branch that has 184 commits and 2,096 extra lines in `walkthrough.cjs`, computed in a
+direction that counts my additions as main's deletions. `git rev-list --count merge-base..HEAD`
+= 184 against 5 for main is the number that settles it; all seven `runOrganization*` /
+`runEnvironmentsDepth` passes survive the merge.
+
+**Still owed on REQ-017, unchanged.** The QA slot has been held by a sibling (`omnion-w3`, pid
+142641) for the whole tick, so `runEnvironmentsDepth`'s four new claims are still unexecuted and
+the walkthrough box stays unticked. Boxes still open: media blobs are not copied (storage object
+count before/after), `promotion.*` webhook arrival — which this tick just gave a real answer to,
+since a subscribed endpoint can now reach those names — and the header environment chip with
+`X-Robots-Tag: noindex` on staging hosts.
+
+**Next.** Run the pass on the w5 stack (`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104
+QA_WEB_PORT=3204`) as the first thing the slot frees. Then slice 4's `noindex` on staging hosts
+and the header chip, which are the two remaining items on the spec's screen list.
+
 
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
