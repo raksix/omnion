@@ -419,6 +419,56 @@ fn member_ids(members: &[ScimMember]) -> Result<Vec<Uuid>, ScimError> {
     Ok(ids)
 }
 
+/// Record that a group write changed who belongs to it.
+///
+/// The event is the whole point of a group-based role rule: a `when_group` rule grants its role
+/// through `group_members`, so a person who joins a directory group has their effective
+/// permissions change **without any sign-in happening**. Automation (REQ-003) and the security
+/// centre subscribe to this to re-evaluate a subject, and a cached rule result has to be dropped
+/// when it fires — otherwise a revoked group still reads as granted until the next sign-in.
+///
+/// Two decisions, each with a test saying so:
+///
+/// * **It fires on a change, not on a write.** A PATCH that re-sends the same member list
+///   changes nothing, and an event for it would train a subscriber to ignore the name. A
+///   connector re-sending a full group on a timer would otherwise produce a fire every time.
+/// * **The counts are the diff, not the size.** `added`/`removed` are how many people crossed in
+///   each direction; `members` alone would make a subscriber that only cares about removals
+///   diff two snapshots itself, and a snapshot has no "before".
+///
+/// The payload names ids and counts only. A group's member list is the directory's most
+/// personal export, and an event is delivered to subscribers outside the tenant.
+async fn announce_membership(
+    state: &AppState,
+    organization_id: Uuid,
+    group: &groups::Group,
+    before: &[Uuid],
+    after: &[Uuid],
+) {
+    let added = after.iter().filter(|id| !before.contains(id)).count();
+    let removed = before.iter().filter(|id| !after.contains(id)).count();
+    if added == 0 && removed == 0 {
+        return;
+    }
+
+    if let Err(error) = omnion_events::bus::emit(
+        state.db().pool(),
+        omnion_events::NewEvent::new("iam.group_membership_synced")
+            .organization(Some(organization_id))
+            .payload(json!({
+                "group_id": group.id,
+                "group_name": group.name,
+                "added": added,
+                "removed": removed,
+                "members": after.len(),
+            })),
+    )
+    .await
+    {
+        tracing::warn!(error = %error, "the group membership event could not be recorded");
+    }
+}
+
 /// The SCIM document of one account.
 fn user_json(user: &users::User, external_id: Option<&str>, location_base: &str) -> Value {
     json!({
@@ -1280,6 +1330,15 @@ pub async fn create_group(
         .await
         .map_err(internal)?;
 
+    // A group created *with* members has just changed that group's membership, so the event
+    // fires here with nothing as the "before". A group whose members arrive with it is the
+    // case a `when_group` rule is most often waiting for, and it is the one a create-only
+    // listener would otherwise miss entirely.
+    if !ids.is_empty() {
+        let now: Vec<Uuid> = members.iter().map(|member| member.user_id).collect();
+        announce_membership(&state, organization_id, &group, &[], &now).await;
+    }
+
     log(
         &state,
         organization_id,
@@ -1457,6 +1516,13 @@ pub async fn patch_group(
     let members = groups::list_members(state.db().pool(), group.id)
         .await
         .map_err(internal)?;
+
+    // The diff is computed from the member list read *before* the write against the one read
+    // after, so the event counts the people who actually crossed the boundary in this request
+    // rather than the size of the group. `current` is the pre-image the patch already had in
+    // hand; comparing against a fresh read would make a concurrent write look like this one.
+    let applied: Vec<Uuid> = members.iter().map(|member| member.user_id).collect();
+    announce_membership(&state, principal.organization_id(), &group, &current, &applied).await;
 
     log(
         &state,
