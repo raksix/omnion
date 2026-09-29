@@ -4981,3 +4981,73 @@ otherwise.
 half. Then the live OIDC round trip against the stub IdP with a SCIM-provisioned subject, which
 `115cce4` still rests on unit tests and a dry run for — and after that REQ-066 (MFA/passkeys and
 device trust).
+# Tick 60 — the blocker was a story, not a fact
+
+Two ticks of this loop wrote into `docs/BUILD-LOG.md` and into the REQ-012 status line that
+`main`'s migration-ledger gap `0018 → 0021` makes `migrate()` fail on **any fresh database**,
+and therefore stops `scripts/qa/run.sh` at step 1. One of those ticks used it to defer a browser
+pass, which is the expensive kind of wrong: not a broken build, but a screen that was finished
+and left unproven.
+
+The claim was never tested. It is about a third-party library's behaviour, and a claim about a
+library is a hypothesis until someone has run it. **This tick ran it.**
+
+`apps/api/tests/migration_gap.rs`, two walks against throwaway databases:
+
+```
+running 2 tests
+test fresh_database_migrates_despite_a_gap ... ok
+test restored_ledger_must_be_contiguous ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.58s
+```
+
+**The fresh install is fine.** sqlx's `validate_applied_migrations`
+(`sqlx-core-0.8.6/src/migrate/migrator.rs`) iterates the **applied** rows and rejects one whose
+version is not in the embedded set. A fresh database has no applied rows, so the loop has
+nothing to reject. The gap is inert on a clean install, and the QA pass — which always starts
+from a dropped database — was never blocked by it.
+
+**What the gap does break is a restore.** A database carried over from a branch that had a
+`0019` holds an applied row this binary cannot see, so the runner refuses. That is correct
+behaviour, not a bug, and it is the second test: the refusal must *name* the version rather
+than merely fail, because "migration failed" is not an actionable message and "migration 19 is
+not in this build" is. Both halves are now pinned, so the note can no longer drift in either
+direction, and the test asserts that `0019` is still absent so a future merge of a sibling's
+`0019` has to be a deliberate edit rather than a silent premise change.
+
+Each test creates and drops its own database and reads the server URL from the same environment
+the other suites use, so no credential appears in the test and a run can never touch the
+development database — a test that quietly did would pass for the wrong reason.
+
+**The pass is not blocked; it is queued.** The box allows one walkthrough at a time, and a
+sibling wave (w3) has held that slot since 10:36 and is genuinely progressing — its
+walkthrough is stepping through screens. This pass is waiting its turn behind it, which is the
+slot doing its job. Forcing a second Chrome onto a box that already shows load 11 and 6 GB free
+is how the 2026-09-28 crash happened, so the queue is the right answer, not an obstacle to route
+around.
+
+**A trap in the slot itself, worth the twenty minutes it cost.** A place file is named after
+the *taking* script's pid, and that script exits the moment it takes the place — so the pid in
+the filename is always dead within milliseconds of a perfectly healthy pass. Liveness is the
+**holder** pid, written to a sibling directory. I read the filename pid first, concluded both
+places were stale, and was one command away from stealing a live sibling's slot. `ps` on the
+holder showed a pass twelve minutes into a real walkthrough. `qa-slot.sh` documents this, and
+the lesson generalises: a lock whose name encodes the *waiter* is not a lock; check the thing
+that stays alive.
+
+**Second trap: `nohup … &` inside a backgrounded tool call still dies with its shell.** The
+first pass attempt left a place file and a dead holder behind — indistinguishable, from the
+outside, from a pass that had run. It had done nothing at all. Launch the command *as* the
+background process, and clear any place you orphan, or the next tick inherits a phantom.
+
+**Other gates, this tick:**
+
+- `cargo test -p omnion-security --quiet` → **100 passed**
+- `pnpm typecheck` (apps/admin) → clean
+- `cargo build -p omnion-api --test migration_gap` → clean
+
+**Next tick:** take the pass when the slot frees, confirm `runSecurityDepth` reaches
+`/security/headers` and clicks it, and tick the screen boxes for slices 1 and 2. If the slot is
+again occupied, build slice 3 (rate limiting + lockout) rather than idling — the schema and the
+policy can land and be tested without a browser.
