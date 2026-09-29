@@ -7610,6 +7610,13 @@ async function runAutomationsOperationsDepth(page, report) {
  * a pass that reads the save state 200ms too early reports "Unsaved changes" and looks like
  * a broken autosave.
  */
+// `draftOpenLocked` is a named helper rather than a bare `draftWhileLocked > 0` in the note
+// because the note is a record, not a computation: a reader comparing two notes should be
+// able to see the same *value*, not the same expression evaluated under different readings.
+function draftOpenLocked(count) {
+  return count > 0;
+}
+
 async function runWorkflowBuilderDepth(page, report) {
   const steps = [];
   const note = (entry) => {
@@ -8597,6 +8604,408 @@ note({
       });
       await shot(page, "page-workflow-builder-step-trace");
     }
+  }
+
+  // ---- The keyboard-only pass, driven with no pointer event at all -------------------------
+  // REQ-004: "A keyboard-only pass adds two nodes, connects them, edits a parameter,
+  // validates and runs, with the pointer untouched."
+  //
+  // The criterion is a *sequence*, and the file has one thing to say about sequences: a list
+  // is data (`KEYBOARD_PASS` in keyboard-path.ts) so the probe replays the order the
+  // criterion states instead of inventing one. Two rules about what may be asserted:
+  //
+  //  * **No `page.mouse`, no `locator.click`, no `dragTo`.** A single pointer event anywhere
+  //    in this block makes the whole note untrustworthy — the criterion is about the path,
+  //    and a path that quietly fell back to a mouse passes every assertion below.
+  //  * **The edge and the parameter are read from the SERVER.** A keyboard path that draws
+  //    an edge without committing it passes every DOM assertion, because the canvas shows
+  //    the edge it is holding. The server's copy is the only witness, and it is the copy the
+  //    runner will execute.
+  const readGraphAgain = async () =>
+    page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
+      if (!response.ok) return null;
+      return await response.json();
+    }, workflowId);
+
+  {
+    // Start from a known graph, so the assertions are about what this block does.
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(300);
+    const graphBeforeKb = (await readGraphAgain()) ?? null;
+    const nodesBeforeKb = graphBeforeKb?.graph?.nodes?.length ?? null;
+    const edgesBeforeKb = graphBeforeKb?.graph?.edges?.length ?? null;
+
+    // `--the canvas has focus and nothing else--`. The shortcuts hang off the canvas's
+    // onKeyDown, so a pass that pressed keys while a field had focus would be testing
+    // `isTypingTarget` and nothing else. Focus is moved by keyboard only.
+    await page.locator("[data-builder-canvas]").first().focus().catch(() => {});
+    await page.waitForTimeout(200);
+    const focusIsCanvas = await page.evaluate(() =>
+      document.activeElement?.getAttribute("data-builder-canvas") !== null,
+    );
+
+    // Two nodes. ⌘P focuses the palette's first card, Enter adds it — and Enter is also the
+    // commit key of the connect gesture, which is why the gesture guard has to be right.
+    await page.keyboard.press("Control+p");
+    await page.waitForTimeout(400);
+    const paletteFocused = await page.evaluate(() => {
+      const active = document.activeElement;
+      return active?.getAttribute("data-palette-node") ?? null;
+    });
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    await page.keyboard.press("Control+p");
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(600);
+    const canvasAfterAdds = await page.locator("[data-node-id]").count();
+
+    // The two cards just added, in the order the keyboard put them there.
+    const kbNodeIds = await page.locator("[data-node-id]").evaluateAll((cards) =>
+      cards.map((card) => card.getAttribute("data-node-id")),
+    );
+    const newNodeIds = (graphBeforeKb?.graph?.nodes ?? []).map((node) => node.id);
+    const added = kbNodeIds.filter((id) => !newNodeIds.includes(id));
+
+    // The connect gesture: C arms the source, the arrows walk to the target, Enter commits.
+    // `C` needs a *selected* source, and the last Enter left the new card selected — the
+    // probe asserts that rather than assuming it, because "a shortcut whose first step
+    // depends on a state the previous step did not set" is the failure being designed against.
+    const selectedAfterAdd = await page.locator("[data-node-selected='true']").count();
+    await page.keyboard.press("c");
+    await page.waitForTimeout(400);
+    const draftOpen = await page.locator("[data-link-draft]").count();
+    const draftRefusal = await page.locator("[data-refusal]").first().innerText().catch(() => null);
+
+    // Walk the selection. Tab is the documented route; a graph walk stops rather than wraps,
+    // so two presses is the most this fixture can need and the note says so.
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(900);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(1600);
+
+    // The edge, from the server.
+    const graphAfterKb = (await readGraphAgain()) ?? null;
+    const serverEdges = graphAfterKb?.graph?.edges ?? [];
+    const committedEdge = serverEdges.find(
+      (edge) => !edgesBeforeKb || !serverEdges.slice(0, edgesBeforeKb).some((before) => before.id === edge.id),
+    );
+    const newEdgeCount = serverEdges.length - (edgesBeforeKb ?? 0);
+
+    // A parameter, typed into the inspector with `I`, and read back from the server.
+    await page.keyboard.press("i");
+    await page.waitForTimeout(400);
+    const inspectorFieldFocused = await page.evaluate(() => {
+      const active = document.activeElement;
+      return active?.tagName === "INPUT" || active?.tagName === "TEXTAREA" || active?.tagName === "SELECT";
+    });
+    let paramReadBack = null;
+    if (inspectorFieldFocused) {
+      await page.keyboard.press("Control+a");
+      await page.keyboard.type("31");
+      await page.waitForTimeout(500);
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(400);
+      await page.keyboard.press("Control+s");
+      await page.waitForTimeout(1600);
+      const graphAfterParam = (await readGraphAgain()) ?? null;
+      const waited = (graphAfterParam?.graph?.nodes ?? []).find((node) => node.node_type === "wait");
+      paramReadBack = waited?.params?.seconds ?? null;
+    }
+
+    // Validate, then run — both are single keys, and both are read from the screen and the
+    // API rather than from a toast.
+    await page.keyboard.press("v");
+    await page.waitForTimeout(1200);
+    const problemsRendered = await page.evaluate(() => {
+      const panel = document.querySelector("[data-builder-problems]");
+      if (!panel) return null;
+      const none = panel.querySelector("[data-problems-none]");
+      return {
+        panelFound: true,
+        saysNoProblems: none !== null,
+        findings: panel.querySelectorAll("[data-finding]").length,
+      };
+    });
+    await shot(page, "page-workflow-builder-keyboard");
+
+    await page.keyboard.press("r");
+    await page.waitForTimeout(3000);
+    const runAfterKey = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/workflows/${id}/runs?limit=5`, { credentials: "same-origin" });
+      if (!response.ok) return null;
+      return await response.json();
+    }, workflowId).catch(() => null);
+
+    note({
+      step: "keyboard-pass",
+      // The precondition the whole note rests on.
+      focusIsCanvas,
+      paletteFocused: paletteFocused !== null,
+      // Step 1 of the criterion: two nodes.
+      nodesBefore: nodesBeforeKb,
+      nodesOnCanvas: canvasAfterAdds,
+      addedNodes: added.length,
+      addedTwo: added.length === 2,
+      // Step 2: the connect gesture, and its own state machine.
+      selectedAfterAdd,
+      draftOpened: draftOpen > 0,
+      draftRefusal: draftRefusal ? draftRefusal.slice(0, 120) : null,
+      // …committed, which only the server can witness.
+      edgesBefore: edgesBeforeKb,
+      edgesAfter: serverEdges.length,
+      newEdges: newEdgeCount,
+      edgeCommitted: newEdgeCount >= 1,
+      committedEdgeSource: committedEdge?.source ?? null,
+      committedEdgeTarget: committedEdge?.target ?? null,
+      // Step 3: a parameter, typed and read back from the server.
+      inspectorFocusedByKey: inspectorFieldFocused,
+      paramReadBack,
+      paramWrote: paramReadBack === 31 || paramReadBack === "31",
+      // Steps 4 and 5.
+      problemsPanel: problemsRendered,
+      runsAfterKey: Array.isArray(runAfterKey?.runs) ? runAfterKey.runs.length : null,
+      startedFromKey:
+        Array.isArray(runAfterKey?.runs) && runAfterKey.runs.length > 0
+          ? runAfterKey.runs[0].trigger_kind ?? runAfterKey.runs[0].status ?? null
+          : null,
+    });
+    await shot(page, "page-workflow-builder-keyboard-final");
+  }
+
+  // ---- The narrow-screen lock (REQ-004) ----------------------------------------------------
+  // "Below 1024px the builder is read-only with the banner, Table mode stays editable, and
+  // no control is unreachable."
+  //
+  // Four claims, and the interesting one is the *second* pair: a lock implemented in the
+  // pointer handlers has a hole exactly the size of a Bluetooth keyboard, so a phone with a
+  // case gets `Del` and deletes a node on a screen the banner calls read-only. The probe
+  // therefore presses **keys**, not clicks, for two of the five mutations, and reads the
+  // server's copy — because a canvas that refused to draw a drag looks identical to a canvas
+  // that refused to *commit* one, and only the stored graph tells them apart.
+  {
+    const width = 900;
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForTimeout(1200);
+    const locked = await page.evaluate(() => {
+      const root = document.querySelector("[data-builder]");
+      return root?.getAttribute("data-builder-locked") ?? null;
+    });
+    const banner = await page.locator("[data-builder-lock-banner]").first().innerText().catch(() => null);
+    const bannerLinksTable = await page.locator("[data-builder-lock-table-mode]").count();
+
+    const beforeLock = (await readGraphAgain()) ?? null;
+    const beforeNodes = beforeLock?.graph?.nodes?.length ?? null;
+    const beforeEdges = beforeLock?.graph?.edges?.length ?? null;
+    const beforeVersion = beforeLock?.graph_version ?? null;
+
+    // Five mutations, three by pointer and two by key. Each one is followed by a read of the
+    // server's copy, and a lock that refused them all leaves every number identical.
+    await page.locator("[data-palette-node='wait']").first().click({ timeout: 4000, force: true }).catch(() => {});
+    await page.waitForTimeout(600);
+    const afterAddAttempt = await page.locator("[data-node-id]").count();
+
+    await page.keyboard.press("Delete");
+    await page.waitForTimeout(600);
+    const afterDeleteKey = await page.locator("[data-node-id]").count();
+
+    await page.keyboard.press("c");
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(800);
+    const draftWhileLocked = await page.locator("[data-link-draft]").count();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(800);
+
+    // And the control the criterion names at the end: a locked builder must still be
+    // *readable*, so a card can be selected and the inspector still shows the node's state.
+    const kbNodeIds = await page.locator("[data-node-id]").evaluateAll((cards) =>
+      cards.map((card) => card.getAttribute("data-node-id")),
+    );
+    let selectable = null;
+    let inspectorStillReads = null;
+    if (kbNodeIds.length > 0) {
+      await page.locator(`[data-node-id="${kbNodeIds[0]}"]`).first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      selectable = await page.locator("[data-node-selected='true']").count();
+      inspectorStillReads = await page
+        .locator(`[data-inspector="${kbNodeIds[0]}"]`)
+        .first()
+        .innerText()
+        .then((text) => text.replace(/\s+/g, " ").trim().slice(0, 120))
+        .catch(() => null);
+    }
+    await shot(page, "page-workflow-builder-locked");
+
+    const afterLock = (await readGraphAgain()) ?? null;
+    const afterNodes = afterLock?.graph?.nodes?.length ?? null;
+    const afterEdges = afterLock?.graph?.edges?.length ?? null;
+    const afterVersion = afterLock?.graph_version ?? null;
+
+    // The banner's own escape route has to *work*, and a lock that locked Table mode too
+    // would satisfy "read-only" and fail the criterion in the same breath. So the link is
+    // followed and a value is changed there.
+    let tableSaves = null;
+    if (bannerLinksTable > 0) {
+      await page.locator("[data-builder-lock-table-mode]").first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      const onTable = page.url().includes("/table");
+      const editableOnTable = await page.locator("[data-workflow-table-edit], [data-table-edit]").count();
+      tableSaves = { landedOnTable: onTable, editControls: editableOnTable };
+      await shot(page, "page-workflow-builder-locked-table");
+    }
+
+    note({
+      step: "narrow-lock",
+      width,
+      lockedAttr: locked,
+      locked: locked === "true",
+      bannerPresent: banner !== null,
+      bannerText: banner ? banner.replace(/\s+/g, " ").trim().slice(0, 160) : null,
+      bannerLinksTable: bannerLinksTable > 0,
+      // Nothing may move in the server's copy.
+      nodesBefore: beforeNodes,
+      nodesAfterAddAttempt: afterAddAttempt,
+      nodesAfter: afterNodes,
+      nodesUnchanged: beforeNodes === afterNodes,
+      addRefused: afterAddAttempt === beforeNodes,
+      deleteKeyRefused: afterDeleteKey === afterAddAttempt,
+      draftWhileLocked: draftOpenLocked(draftWhileLocked),
+      edgesBefore: beforeEdges,
+      edgesAfter,
+      edgesUnchanged: beforeEdges === afterEdges,
+      undoRefused: beforeVersion === afterVersion,
+      versionBefore: beforeVersion,
+      versionAfter: afterVersion,
+      // Read-only is not unusable.
+      cardStillSelectable: selectable,
+      inspectorStillReads,
+      tableMode: tableSaves,
+    });
+    // Put the viewport back so every later step runs at the width the rest of the pass
+    // assumes. A pass that leaves the browser at 900px reports the next screen's layout as
+    // broken, which is a finding about the probe.
+    await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
+
+  // ---- A plugin node in the palette, and gone when the plugin is disabled ----------------
+  // REQ-004: "A plugin node appears in the palette with its badge when the plugin is enabled
+  // and disappears when it is disabled; a definition using it then reports an honest
+  // validation error instead of failing at run time."
+  //
+  // **This probe is honest about the first claim, and that is the point.** `plugins_enabled_for`
+  // is a seam REQ-121 fills: today it returns an empty registry, so *no* plugin node can
+  // appear in any browser. A probe that asserted `badgeRendered: true` would be asserting a
+  // store that does not exist, and it would go on asserting it after REQ-121 lands.
+  //
+  // So the first two claims are read from the **API's own registry** — the endpoint the
+  // palette is drawn from — and the third is driven against a graph that uses the key, which
+  // is the state a real author reaches. When REQ-121's store lands, `enabledNow` flips from
+  // false to true on its own and the same note measures the palette.
+  {
+    const registry = await page
+      .evaluate(async () => {
+        const response = await fetch("/api/v1/workflows/node-types", { credentials: "same-origin" });
+        if (!response.ok) return null;
+        return await response.json();
+      })
+      .catch(() => null);
+    const apiTypes = registry?.node_types ?? [];
+    const apiPluginTypes = apiTypes.filter((entry) => entry.provider);
+    const palettePlugin = await page
+      .evaluate(() => {
+        const entries = Array.from(document.querySelectorAll("[data-palette-plugin]"));
+        return entries.map((entry) => ({
+          key: entry.getAttribute("data-palette-node"),
+          provider: entry.getAttribute("data-palette-plugin"),
+          badgeRendered: entry.querySelector("[data-palette-badge]") !== null,
+          // The tooltip has to name the provider, not just the badge: "Send mail · Plugin"
+          // says *that* it is a plugin and not *who* wrote it.
+          tooltipNamesProvider: (entry.getAttribute("title") ?? "").includes(
+            entry.getAttribute("data-palette-plugin") ?? "\u0000",
+          ),
+        }));
+      })
+      .catch(() => []);
+
+    // The third claim, driven for real: a graph that uses a plugin key is put through the
+    // validate endpoint, and the answer has to be the *plugin* sentence — "re-enable" — and
+    // not the *typo* sentence. The two are the whole criterion, and a refactor that made
+    // the disabled plugin read as a typo would satisfy "reports an honest validation error"
+    // in the loosest reading of the words.
+    const pluginKey = "plugin.mailer.send";
+    const disabledRead = await page
+      .evaluate(
+        async ({ workflowId: id, key }) => {
+          const graphResponse = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
+          if (!graphResponse.ok) return null;
+          const current = await graphResponse.json();
+          const nodes = (current.graph?.nodes ?? []).map((node) =>
+            node.node_type === key
+              ? node
+              : { ...node, node_type: node.node_type === "end" ? "end" : node.node_type },
+          );
+          // Put the key on the node that is not the trigger and not the end, so the finding
+          // is about the node type and not about an orphaned graph.
+          const target = nodes.find((node) => !node.node_type.startsWith("trigger.") && node.node_type !== "end");
+          if (!target) return { skipped: "no non-trigger, non-end node to rename" };
+          target.node_type = key;
+          const validateResponse = await fetch(`/api/v1/workflows/${id}/graph/validate`, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ graph: { nodes, edges: current.graph?.edges ?? [] } }),
+          });
+          const body = await validateResponse.json().catch(() => null);
+          return {
+            status: validateResponse.status,
+            findings: (body?.findings ?? []).map((finding) => ({
+              code: finding.code,
+              message: finding.message,
+              nodeId: finding.node_id ?? null,
+            })),
+          };
+        },
+        { workflowId, key: pluginKey },
+      )
+      .catch(() => null);
+
+    const unknownFindings = (disabledRead?.findings ?? []).filter((finding) => finding.code === "unknown_node_type");
+    const pluginSentence = unknownFindings.find((finding) => /re-enable/i.test(finding.message));
+    const typoSentence = unknownFindings.find((finding) => /not a node type the platform knows/i.test(finding.message));
+
+    note({
+      step: "plugin-palette",
+      // The honest first half: today there is no plugin store, so the palette has nothing to
+      // draw. Recorded rather than assumed, because a note that hard-codes `false` here is a
+      // note that will still be asserting the store is empty after REQ-121 lands.
+      enabledNow: apiPluginTypes.length > 0,
+      apiPluginTypes: apiPluginTypes.map((entry) => entry.key),
+      apiCategoriesIncludePlugins: (registry?.categories ?? []).includes("Plugins"),
+      palettePluginNodes: palettePlugin.length,
+      palettePlugin,
+      badgeRendered: palettePlugin.length > 0 && palettePlugin.every((entry) => entry.badgeRendered),
+      tooltipNamesProvider: palettePlugin.length > 0 && palettePlugin.every((entry) => entry.tooltipNamesProvider),
+      absentWhenDisabled: palettePlugin.length === 0,
+      // The third claim, measured against a graph that uses the key.
+      pluginKey,
+      validateStatus: disabledRead?.status ?? null,
+      unknownFindings: unknownFindings.length,
+      namesNode: unknownFindings.some((finding) => typeof finding.nodeId === "string"),
+      // The two sentences must not collapse into each other; a test asserts this in Rust too.
+      saysReEnable: Boolean(pluginSentence),
+      saysTypo: Boolean(typoSentence),
+      sentinelsStayApart: Boolean(pluginSentence) && !typoSentence,
+    });
   }
 
   // ---- Listen for a real event (REQ-004 slice 3, criterion 5) ----------------------------
