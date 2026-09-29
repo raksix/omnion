@@ -5051,3 +5051,84 @@ background process, and clear any place you orphan, or the next tick inherits a 
 `/security/headers` and clicks it, and tick the screen boxes for slices 1 and 2. If the slot is
 again occupied, build slice 3 (rate limiting + lockout) rather than idling — the schema and the
 policy can land and be tested without a browser.
+
+## Tick 19 — wave 5b (REQ-065) — the pass died in a script, and the script was ours
+
+**What.** No new slice: the tick opened by reading tick 18's pass log, which ended at
+
+```
+cp: cannot create regular file 'target/debug/.omnion-api.new': No such file or directory
+```
+
+after a full `Finished dev profile … in 1m 47s` compile. No guard, no slot, no writer's name —
+the message a compiler produces when its output directory is deleted mid-run. The hunt went
+through three layers and each one was a real defect rather than a red herring.
+
+**Proof, and the shape of the diagnosis.**
+
+1. The per-worktree ceiling in `scripts/qa/disk-guard.sh` deleted `target/` with **no liveness
+   question at all**, and a QA pass is precisely the case it destroys: `run.sh` builds into a
+   tmpfs `CARGO_TARGET_DIR` and *then* copies the binary into `target/debug/`, so that
+   `target/` is over the 6000 MB ceiling precisely **because the pass just filled it**. The
+   guard ran in the window between the two. Reproduced on a decoy root: a 41 MB target in a
+   worktree with a live process in it, ceiling 20 MB → `target 41M over the 20M ceiling —
+   dropping: omnion-live`. That is the incident, reproduced.
+2. `worktree_busy` — the liveness test the other steps were already using — could not name the
+   worktree. It stripped `-target` off the **basename** and looked for `omnion-<token>`, which
+   is right for a tmpfs cache (`w9-target` → `omnion-w9`) and wrong for a worktree's own
+   `target/`, where the token is the literal string `target`: `/mnt/apopic/omnion-target` does
+   not exist, and the loop fell through to its last candidate — **the main checkout**. So the
+   one directory whose own liveness mattered most resolved to a tree nobody was in, and the
+   fallthrough additionally pinned the main writer's `target/` whenever anything lived in it.
+   Printed from the box: `worktree_of /mnt/apopic/omnion-w9/target` → `omnion-target`
+   (missing) → `omnion`. Fixed with `worktree_of`, which derives the worktree from the
+   directory itself, and a prefix test so a process one level below the root counts.
+3. `in_use` compared a bare `CARGO_TARGET_DIR=.tmp-target` against an absolute path, so a
+   relative target was resolved against the **guard's** cwd. A shell that exported
+   `.tmp-target` and then `cd`'d into a worktree was reported as unused. A relative path means
+   the carrying process's cwd, and it is now resolved against each candidate's own.
+
+**A fourth defect, mine, found by the test in the same tick.** Writing the pressure step as
+`reclaimable "$t" && continue` is the **inverse** of its intent: `reclaimable` returns true when
+a target *may* be deleted, so that line skips every idle target — the ones the step exists to
+reclaim — and nominates every busy one as a victim. On a box under pressure it would have
+deleted a running pass. The ceiling above it is `reclaimable && { drop }` and is correct. The
+two call sites read in opposite directions **on purpose**, and the comment saying so is longer
+than the line it guards, which is the point.
+
+**Proof of the fix.** `scripts/qa/test-disk-guard.sh` (new) runs the guard against a decoy
+`OMNION_ROOT` — **13 passed, 0 failed**. *Before/after:* stashing **only** `disk-guard.sh` and
+re-running gives **6 passed, 7 failed**, and the first failure is verbatim the incident:
+
+```
+FAIL target/ was deleted out from under a running pass — output: target 41M over the 20M ceiling — dropping: omnion-live
+```
+
+That asymmetry is the diagnosis: the test is not asserting a shape the new code happens to have,
+it fails on exactly the line the old code reached. The leak guard is asserted too (an idle
+worktree is still dropped, and still named), because a liveness test that always answers "busy"
+would pass every protection assertion while leaking the disk for ever.
+
+**A test-hygiene bug the first run of that test caused.** Exporting the decoy `OMNION_ROOT` is
+the only way to reach the guard as a child, and it stays set in the calling shell — so the next
+*real* `bash scripts/qa/disk-guard.sh` swept a deleted tmpdir, printed `integer expression
+expected` twice and reported a free count of nothing. `restore_env` replaces the plain `rm -rf`
+trap and unsets both variables on the way out.
+
+**The box, in passing.** `/dev/shm` was at **100%** (load average 100.5) when the first
+`cargo test` died with `No space left on device` — a sibling's orphaned 3.4 GB
+`/dev/shm/omnion-build-target`, invisible to the tmpfs sweep because it is not named
+`*-target`. The **fixed** guard reclaimed it on the next run (that step needs no change; it is
+the same `reclaimable` test, and it worked). Recorded because the fix was verified on the real
+root within a minute of being written, which is the strongest evidence available that the
+decoy-root test is testing the real thing.
+
+**Other gates, this tick:** `cargo test -p omnion-identity --lib` → **227 passed**;
+`cargo test -p omnion-api --lib` → **221 passed**; `tsc --noEmit` (apps/admin) → clean.
+
+**Next tick:** the pass is queued behind a sibling (`/tmp/omnion-qa-tick19.log`, stack w9,
+`QA_SLOTS=1`). When it lands, read `page-iam-provider-deletion-blocked` and
+`-reassigned` — `722ac57`'s assertions still have not executed — and only then consider
+REQ-065 closed. The live OIDC round trip against the stub IdP with a SCIM-provisioned subject
+(`115cce4`) remains the one half of the group-membership criterion that a unit test cannot
+close, and REQ-066 MFA/passkeys is the next request.
