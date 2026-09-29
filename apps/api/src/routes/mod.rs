@@ -70,6 +70,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
+pub mod ai_agents;
 pub mod ai_decisions;
 pub mod ai_routing;
 pub mod analytics;
@@ -762,6 +763,36 @@ pub fn router(state: AppState) -> Router {
     let ai_last_resolved = get(ai_decisions::last_resolved)
         .layer(guards::require(&state, "ai.providers.read"));
 
+    // The agent runtime (REQ-099 slice 1). Three powers, because the three are genuinely
+    // different: *seeing* an agent is knowing how the installation's AI is configured, *changing*
+    // one is a write, and *running* one spends the installation's money and acts on its behalf.
+    // Collapsing run into read would let anybody who can see a prompt also press Run; collapsing
+    // manage into read would let a reader re-point an agent at a different model.
+    let ai_agents = get(ai_agents::list_agents_route)
+        .layer(guards::require(&state, "ai.agents.read"))
+        .merge(
+            post(ai_agents::create_agent_route).layer(guards::require(&state, "ai.agents.manage")),
+        );
+    let ai_agent = get(ai_agents::get_agent_route)
+        .layer(guards::require(&state, "ai.agents.read"))
+        .merge(
+            patch(ai_agents::patch_agent_route).layer(guards::require(&state, "ai.agents.manage")),
+        )
+        .merge(
+            delete(ai_agents::delete_agent_route).layer(guards::require(&state, "ai.agents.manage")),
+        );
+    let ai_agent_runs =
+        post(ai_agents::start_run).layer(guards::require(&state, "ai.agents.run"));
+    let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run_events = get(ai_agents::run_events).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run_agent = get(ai_agents::run_agent_link).layer(guards::require(&state, "ai.agents.read"));
+    let ai_run_cancel =
+        post(ai_agents::cancel_run).layer(guards::require(&state, "ai.agents.run"));
+    let ai_run_resume =
+        post(ai_agents::resume_run).layer(guards::require(&state, "ai.agents.run"));
+
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
     // `webhooks.manage`, and the platform's event feed is read with `events.read`. Every
@@ -1399,6 +1430,21 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/logs/decisions/{id}", ai_decision)
         .route("/ai/routing/unresolved", ai_unresolved)
         .route("/ai/routing/last-resolved", ai_last_resolved)
+        // The agent runtime (REQ-099). `/ai/agents/{id}/runs` is a POST that answers as an event
+        // stream, and `/ai/runs/{id}/events` re-attaches to a run that is still going — the two
+        // are the only GET/POST pair here that share a path prefix, so they are registered in
+        // order rather than merged: `axum` matches a literal segment before a capture, and
+        // `/ai/runs/{id}` would otherwise swallow `/ai/runs/{id}/events`.
+        .route("/ai/agents", ai_agents)
+        .route("/ai/agents/{id}", ai_agent)
+        .route("/ai/agents/{id}/runs", ai_agent_runs)
+        .route("/ai/runs", ai_runs)
+        .route("/ai/runs/{id}", ai_run)
+        .route("/ai/runs/{id}/steps", ai_run_steps)
+        .route("/ai/runs/{id}/events", ai_run_events)
+        .route("/ai/runs/{id}/agent", ai_run_agent)
+        .route("/ai/runs/{id}/cancel", ai_run_cancel)
+        .route("/ai/runs/{id}/resume", ai_run_resume)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
