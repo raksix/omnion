@@ -106,12 +106,20 @@ pub async fn find_graph(pool: &PgPool, workflow_id: Uuid) -> Result<Option<Graph
 /// is not the stored one is [`WorkflowError::Invalid`] with code `graph_version_conflict`
 /// and the current definition's version in the message, so the client can show "Reload"
 /// rather than guess.
+///
+/// **`plugins` is the same registry the route validated against, and passing it is not
+/// optional bookkeeping.** A `None` here would project with the core registry while the
+/// caller validated with the organization's own, so the two could disagree about one graph —
+/// and the disagreement is a save that is accepted and then refused, with a sentence
+/// pointing at the wrong problem. `None` therefore means *no plugins* explicitly, not
+/// "caller forgot".
 pub async fn replace_graph(
     pool: &PgPool,
     workflow_id: Uuid,
     update: GraphUpdate,
+    plugins: Option<&crate::plugin_nodes::PluginRegistry>,
 ) -> Result<Option<GraphDefinition>> {
-    let steps = project_steps(&update.graph)?;
+    let steps = project_steps(&update.graph, plugins)?;
 
     let sql = format!(
         "update workflows \
@@ -299,8 +307,14 @@ pub async fn set_step_node(
 ///
 /// A private helper because the projection must be reached from exactly one place per save:
 /// two call sites would be two ways for a rule's graph and its steps to disagree.
-fn project_steps(graph: &Graph) -> Result<Value> {
-    let projected = crate::graph::project(graph)?;
+fn project_steps(
+    graph: &Graph,
+    plugins: Option<&crate::plugin_nodes::PluginRegistry>,
+) -> Result<Value> {
+    let projected = match plugins {
+        Some(registry) => crate::graph::project_with_plugins(graph, registry)?,
+        None => crate::graph::project(graph)?,
+    };
     if projected.len() > MAX_PROJECTED_STEPS {
         return Err(WorkflowError::invalid(
             "too_many_steps",
@@ -379,7 +393,7 @@ mod tests {
 
     #[test]
     fn a_graph_projects_to_the_step_json_the_runner_reads() {
-        let steps = project_steps(&linear()).expect("a linear graph projects");
+        let steps = project_steps(&linear(), None).expect("a linear graph projects");
         let array = steps.as_array().expect("steps are a JSON array");
         assert_eq!(array.len(), 2);
         // The same shape `update_workflow` writes for the linear editor — the engine reads
@@ -401,7 +415,7 @@ mod tests {
             source_port: "default".to_owned(),
             target: "a1".to_owned(),
         });
-        let error = project_steps(&graph).expect_err("a cycle does not project");
+        let error = project_steps(&graph, None).expect_err("a cycle does not project");
         assert_eq!(error.code(), "graph_invalid");
     }
 
@@ -413,6 +427,6 @@ mod tests {
             nodes: vec![node("trigger", "trigger.manual")],
             edges: Vec::new(),
         };
-        assert!(project_steps(&graph).is_err());
+        assert!(project_steps(&graph, None).is_err());
     }
 }

@@ -1261,8 +1261,21 @@ pub fn find_cycle(graph: &Graph) -> Option<Vec<String>> {
 ///
 /// A node the projection cannot express is refused here, not skipped: silently dropping a
 /// node would leave a rule that runs and does not do what its canvas shows.
+///
+/// **This is the core-only wrapper**, for the same reason [`project_walk`] is one: the
+/// registry the caller validated against must be the registry the projection walks, or the
+/// two answer different things about one graph.
 pub fn project(graph: &Graph) -> Result<Vec<(String, StepDefinition)>> {
-    project_walk(graph).map(|walk| walk.steps)
+    project_with_plugins(graph, &crate::plugin_nodes::PluginRegistry::empty())
+}
+
+/// [`project`], against the node types this organization has enabled.
+#[must_use]
+pub fn project_with_plugins(
+    graph: &Graph,
+    plugins: &crate::plugin_nodes::PluginRegistry,
+) -> Result<Vec<(String, StepDefinition)>> {
+    project_walk_with_plugins(graph, plugins).map(|walk| walk.steps)
 }
 
 /// One node of a graph, and what it contributes to a run.
@@ -1295,15 +1308,52 @@ pub struct Walk {
     pub steps: Vec<(String, StepDefinition)>,
 }
 
-/// The graph's walk order, and the steps it projects to.
+/// The graph's walk order, and the steps it projects to, against the core registry alone.
 ///
 /// One traversal, two answers. *Run from here* needs the walk order because the node an
 /// operator clicks is often one that projects to no step — the end node, a note, a second
 /// trigger — and "start here" is a position in the walk, not a row in the step list.
 /// Deriving that from `project` alone is what would make those nodes unstartable, and
 /// deriving it from a second walk is what would let the two disagree about order.
+///
+/// **This is the core-only wrapper.** An organization with a plugin node must use
+/// [`project_walk_with_plugins`], for the same reason `validate` is a wrapper around
+/// `validate_with_plugins`: the registry is a parameter of the *check*, and a check that
+/// silently uses a different one than the caller is a check that can answer two different
+/// things about one graph.
 pub fn project_walk(graph: &Graph) -> Result<Walk> {
-    let findings: Vec<Finding> = validate(graph)
+    project_walk_with_plugins(graph, &crate::plugin_nodes::PluginRegistry::empty())
+}
+
+/// [`project_walk`], against the node types this organization has enabled.
+///
+/// **This function exists because the core-only wrapper was not enough, and the reason is
+/// worth writing down because it is the same reason `validate_with_plugins` exists, seen
+/// from the other side.** The save path validates with the organization's registry and then
+/// calls the store, which projects with the *core* registry. So a graph the route accepted
+/// was refused one function later with a different sentence — and the two sentences were
+/// exactly backwards:
+///
+/// * the route said "that node type is fine" (it resolved through the plugin registry), and
+/// * the store said `"plugin.mailer.send" does not project onto a step`, which reads as
+///   *"you configured a node type that does not exist"* rather than *"the core cannot
+///   execute what you drew"*.
+///
+/// The author is right either way — a rule whose node the core cannot project is a rule
+/// that does not run — but the *fix* differs: one is "re-enable the plugin", the other is
+/// "replace the node". A save that says the wrong one costs the author a round trip
+/// through a problems panel that has just told them their working rule is nonsense.
+///
+/// So the projection resolves through the same registry the palette was drawn from, and a
+/// plugin node is refused **with the sentence that names the actual reason**: the core does
+/// not execute plugin nodes, and no manifest makes that change. That is a product decision
+/// REQ-121 revises when a sandboxed runner exists (docs/09 §13, lesson 14); until then the
+/// honest answer is a refusal at save time, not a run that dies at 03:00.
+pub fn project_walk_with_plugins(
+    graph: &Graph,
+    plugins: &crate::plugin_nodes::PluginRegistry,
+) -> Result<Walk> {
+    let findings: Vec<Finding> = validate_with_plugins(graph, plugins)
         .into_iter()
         .filter(Finding::is_error)
         .collect();
@@ -1346,27 +1396,61 @@ pub fn project_walk(graph: &Graph) -> Result<Walk> {
             )
         })?;
 
-        match find_node_type(&node.node_type) {
-            // A trigger is where the run starts, not something the runner steps through, and
-            // a note is decoration. Neither contributes a step.
-            Some(node_type) if node_type.inert || is_trigger_type(&node.node_type) => {
-                nodes.push(WalkedNode {
-                    node_id: node.id.clone(),
-                    step: None,
-                    step_no: None,
-                });
+        match plugins.resolve(&node.node_type) {
+            Resolution::Core => {
+                let node_type = find_node_type(&node.node_type).ok_or_else(|| {
+                    // `is_reserved_key` is what produced this arm, so a core key with no
+                    // `NodeType` would mean the two disagree about the registry. Saying so
+                    // beats a `None` that reads like a typo.
+                    WorkflowError::invalid(
+                        "unknown_node_type",
+                        format!(
+                            "{:?} is listed as a core node type but the registry has no \
+                             definition for it — this is a platform defect, not your rule",
+                            node.node_type
+                        ),
+                    )
+                })?;
+                // A trigger is where the run starts, not something the runner steps through,
+                // and a note is decoration. Neither contributes a step.
+                if node_type.inert || is_trigger_type(&node.node_type) {
+                    nodes.push(WalkedNode {
+                        node_id: node.id.clone(),
+                        step: None,
+                        step_no: None,
+                    });
+                } else {
+                    let step = step_for(node, node_type, graph)?;
+                    step_no += 1;
+                    nodes.push(WalkedNode {
+                        node_id: node.id.clone(),
+                        step: Some(step.clone()),
+                        step_no: Some(step_no),
+                    });
+                    steps.push((node.id.clone(), step));
+                }
             }
-            Some(node_type) => {
-                let step = step_for(node, node_type, graph)?;
-                step_no += 1;
-                nodes.push(WalkedNode {
-                    node_id: node.id.clone(),
-                    step: Some(step.clone()),
-                    step_no: Some(step_no),
-                });
-                steps.push((node.id.clone(), step));
+            // **The clause the criterion's third state is actually about, seen from the run
+            // side.** `validate_with_plugins` above already refused everything the registry
+            // cannot resolve *at all* (a typo, a plugin that is not enabled), so reaching
+            // here with a plugin key means the plugin IS enabled and the node still cannot
+            // run. The sentence has to say that, because the reader who just installed the
+            // plugin will otherwise go looking for a typo that is not there.
+            Resolution::Plugin(plugin_node) => {
+                return Err(WorkflowError::invalid(
+                    "plugin_node_not_executable",
+                    format!(
+                        "{:?} is a {} node and the platform does not execute plugin nodes yet — \
+                         the core engine runs core node types only. Replace it with a core node, \
+                         or wait for a sandboxed plugin runner.",
+                        node.label, plugin_node.badge,
+                    ),
+                ));
             }
-            None => {
+            // Unreachable in practice: the error findings above return before the walk
+            // starts. Kept so a future refactor that drops the early return gets a sentence
+            // rather than a panic.
+            Resolution::Unknown => {
                 return Err(WorkflowError::invalid(
                     "unknown_node_type",
                     format!("{:?} is not a node type the platform knows", node.node_type),

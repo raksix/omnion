@@ -410,6 +410,10 @@ pub async fn replace_graph(
             ui_state: input.ui_state,
             graph_version: input.graph_version,
         },
+        // The same registry the findings above came from. Validating against one set and
+        // projecting against another is how a graph gets accepted by one function and
+        // refused by the next with a sentence about a different problem.
+        Some(&plugins),
     )
     .await?;
 
