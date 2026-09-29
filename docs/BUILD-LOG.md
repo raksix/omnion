@@ -2964,3 +2964,67 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 `report.notificationOutbox` to be **present** — that last one is the first pass that can close
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
+
+**Tick 3 opened on a merge, not on a slice — and the merge was the work.**
+
+`origin/main` had moved 23 commits (notifications slice 3, the media routes) and four files
+this writer owns all conflicted at once: `apps/api/src/routes/mod.rs`, `apps/admin/lib/api.ts`,
+`apps/admin/lib/types.ts` and `docs/BUILD-LOG.md`. A shared-namespace merge is normally UNION —
+both sides only ever add — so the resolution is mechanical, and that is exactly what makes it
+dangerous: the obvious splice of both sides' "insert" opcodes re-emits lines the base already
+had whenever both sides merely *reordered* a block. The first attempt produced three copies of
+`pub mod media_duplicates;` and a file that did not parse.
+
+**A union merge needs three different verifications, and a line count is not one of them.** The
+multiset check on non-blank lines said "0 missing" while the crate had three duplicate module
+declarations, because the duplicates *were* lines from both sides. What actually found them was
+(a) a duplicate-declaration scan over `pub mod`/`export function`/`export interface` and
+(b) the compiler, which is the only authority. The second attempt also lost a closing `);` when
+I de-duplicated on *every* line — `}` and `);` occur dozens of times, and dropping one because a
+splice already emitted an identical one breaks the parse. De-duplicating only *declaration*
+lines is the safe form.
+
+**Two interleaves survived the mechanical pass and only `cargo build` found them.** Main's
+`.merge(delete(notifications::delete)…)` line landed inside `notifications_preferences` (giving
+axum's one-argument `.merge` two arguments), and a stale `let notifications_read` from the base
+survived 60 lines below main's own re-declaration of it. Both are exactly what a "take the union"
+resolution looks like when a *statement* was rewritten rather than added.
+
+**Then the slice: REQ-087 slice 3, OAuth.** The algebra came first, and its four pieces are each
+a place the obvious version is wrong:
+
+| Piece | What the obvious version does | What shipped |
+|---|---|---|
+| `state` | a random string compared to a column | HMAC-signed, credential-bound, 10-minute window, four distinct refusals |
+| PKCE | challenge generated, verifier regenerated | `S256` derived, and the *same* verifier comes back; verified before the code is spent |
+| token set | `#[derive(Debug, Serialize)]` on a struct with an access token | neither derive, enforced by a compile-time test |
+| refresh | every node refreshes when it notices expiry | `RefreshLock`, single-flight per credential, because a refresh invalidates the old refresh token |
+
+**A test caught a real defect in the seal, and it was the kind that ships silently.** `seal`
+computed its tag over the version and nonce but *not* the ciphertext, so flipping one ciphertext
+byte opened successfully and returned corrupted plaintext — the test's own panic message was
+`" he-verifier"`, one character off the original. Encrypt-then-MAC is only that if the MAC runs
+over the ciphertext; a header-only tag authenticates the envelope's shape and nothing about what
+is inside it. The store's `open_pkce` re-derives the challenge from the opened verifier and
+refuses a mismatch, so a row edited by somebody holding the key still cannot produce a token
+request a provider will accept.
+
+`claim_flow` is one `update ... where status = 'pending' returning ...` rather than a `select`
+then an `update`, because the two-round-trip version has a race a double-clicked "Allow" button
+wins, and the single-statement version is the only shape where the database — not the
+application's timing — decides who won.
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-workflows --lib` | **110 passed** (was 75) |
+| `cargo build -p omnion-api` | clean |
+| `pnpm typecheck` | 2 successful, 0 errors |
+| `git status` | clean |
+
+Commits `7edd4fa` (the flow's algebra) and `f2a4b97` (its persistence, and the seal fix), pushed
+to `wave10`.
+
+**Next.** REQ-087 slice 3's API half: `POST /credentials/{id}/oauth/start`,
+`GET /public/oauth/callback`, `POST /credentials/{id}/disconnect`, the refresh behind
+`RefreshLock`, and the `needs_reauth` event reaching the canvas. Then the fixture provider and
+the contract probe that drives a real round trip.

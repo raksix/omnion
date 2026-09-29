@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** in-progress (slice 2, `88ce5e3`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slice 3, `7edd4fa` + `f2a4b97`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -225,6 +225,23 @@ match the tested state, usage data is real.
    inventing a scheme — and the referenced-delete refusal, which needs a fixture graph and
    arrives with the canvas.*
 3. **OAuth and health** — start/callback, single-flight refresh, reauth state, canvas integration. Done: a fixture provider round-trips tokens and a forced refresh failure degrades correctly.
+   *Shipped so far (`7edd4fa`, `f2a4b97`): the flow's own algebra and its persistence.*
+   `crates/workflows/src/oauth.rs` — the signed `state` (HMAC-SHA256 over a
+   `credential:issued:nonce` payload, ten-minute window, four *distinct* refusals so a client
+   can tell a CSRF attempt from a person who was slow), PKCE derived `S256` and verified before
+   the code is spent, the authorization URL built by *parsing* the endpoint so a `?tenant=` on a
+   provider's endpoint survives, `TokenSet` (neither `Debug` nor `Serialize`, enforced by a
+   compile-time test), and `RefreshLock` — single-flight per credential, because a refresh
+   invalidates the old refresh token on most providers, so six concurrent nodes must produce
+   one exchange. `LocalBox` seals the PKCE verifier for the length of one flow.
+   `0054_workflow_oauth_flows.sql` + `oauth_store.rs` — the flow table with **no token column
+   and no foreign key to the credential**, `state_hash` rather than the state (a state is a
+   bearer value), and `claim_flow` as one `update … where status = 'pending'` so the database
+   decides who spent it rather than the application's timing. `release_flow` exists so a
+   provider timeout does not strand a flow in `completing` forever.
+   35 new tests; `cargo test -p omnion-workflows --lib` 75 → 110.
+   **Still open on this slice:** the four endpoints, the fixture provider, the refresh
+   *caller* that uses `RefreshLock`, and `needs_reauth` reaching the canvas.
 4. **Node packages and SDK** — ledger, install/remove via REQ-044, scaffold/validate/pack CLI, fixtures. Done: a fixture package installs, appears in the palette, and removal degrades instead of breaking.
 
 ### Risks / notes
