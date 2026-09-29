@@ -290,9 +290,18 @@ async fn persist(
     row: &Configured,
     status: &exporter::ExporterStatus,
 ) -> Result<(), crate::TelemetryError> {
+    // The explicit cast is load-bearing. `last_flush_at` is a `timestamptz` column and
+    // `ExporterStatus` carries an RFC 3339 `String`, because `due()` parses that string back and
+    // an unparseable stamp must read as "never flushed" rather than as an error. Binding the
+    // string straight into the column made PostgreSQL refuse the statement with "column
+    // last_flush_at is of type timestamp with time zone but expression is of type text" — on
+    // EVERY sweep, for every exporter, the moment the backend answered and a real timestamp had
+    // to be written. The first flush of a healthy exporter writes no timestamp, so the path that
+    // needed it was the one a never-failing backend never reached, and the flush loop reported a
+    // database error for an exporter that was working.
     sqlx::query(
-        "update obs_exporters set health = $2, last_flush_at = $3, last_error = $4, dropped_total = $5 \
-         where name = $1",
+        "update obs_exporters set health = $2, last_flush_at = $3::timestamptz, last_error = $4, \
+         dropped_total = $5 where name = $1",
     )
     .bind(&row.name)
     .bind(&status.health)
