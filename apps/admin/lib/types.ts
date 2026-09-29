@@ -1266,6 +1266,87 @@ export type NotificationRouteReport = {
  * it holds — nested ones included, because a menu with two rows on screen and eleven entries is
  * not a menu with two entries.
  */
+// ---------------------------------------------------------------------------------------------
+// Forms (REQ-064, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One field of a form, as the builder's inspector reads it.
+ *
+ * `rules` and `options` are free-shaped because they are per-field and never queried — the same
+ * reason the store keeps them as JSON inside the field rather than as columns.
+ */
+export type FormField = {
+  id: string;
+  key: string;
+  label: string;
+  field_type: string;
+  required: boolean;
+  placeholder: string | null;
+  help_text: string | null;
+  width: string;
+  rules: Record<string, unknown>;
+  options: unknown;
+};
+
+/** The closed vocabularies the palette and inspector draw from. */
+export type FormsVocabulary = {
+  field_types: string[];
+  statuses: string[];
+  submit_actions: string[];
+  max_fields: number;
+  max_answer_length: number;
+};
+
+/** A form as the list reads it. */
+export type Form = {
+  id: string;
+  site_id: string;
+  site_key: string;
+  key: string;
+  name: string;
+  status: string;
+  field_count: number;
+  unread_count: number;
+  spam_count: number;
+  updated_at: string;
+};
+
+/** A form with its fields and its settings: the builder's document. */
+export type FormDetail = Form & {
+  fields: FormField[];
+  vocabulary: FormsVocabulary;
+};
+
+/**
+ * A submission as the inbox reads it.
+ *
+ * `summary` is derived by the API from the form's *field keys*, not from the first text field:
+ * a form whose first field is a subject line would otherwise show that subject in the Name
+ * column, which reads as bad data rather than as a guess.
+ */
+export type Submission = {
+  id: string;
+  answers: Record<string, unknown>;
+  consent_text: string | null;
+  source_path: string | null;
+  status: string;
+  spam_score: number;
+  created_at: string;
+  summary?: {
+    name?: string;
+    email?: string;
+    text: string;
+  };
+};
+
+/** One page of the inbox. */
+export type Inbox = {
+  submissions: Submission[];
+  total: number;
+  counts: { new: number; read: number; spam: number; archived: number };
+};
+
 export type Menu = {
   id: string;
   site_id: string;
