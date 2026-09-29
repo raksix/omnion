@@ -25,6 +25,7 @@ use omnion_api::state::AppState;
 use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -353,6 +354,16 @@ async fn a_price_edit_never_re_prices_a_call_that_already_happened() {
     // What a call costs is derived from the price *at the moment it ran*. This row is the
     // evidence that a later price edit cannot reach back into it: the token counts are stored,
     // and nothing recomputes them from the catalog.
+    //
+    // **What this walk does not prove, and where the real proof is.** It asserts the count of
+    // usage rows is unchanged by a price edit, and it does so on a provider that has served
+    // *nothing* — `before.0 == 0` right below. A table with no rows cannot be retro-edited, so
+    // the assertion would also pass against an implementation that re-derived every cost from
+    // the current price. The half that actually matters — a row written *before* the edit still
+    // totalling what it was billed — is
+    // `a_price_edit_moves_new_requests_and_leaves_a_written_history_alone`, which writes one.
+    // Both walks stay: this one proves a price edit touches no usage row at all, which is the
+    // other half of "only new requests".
     let before: (i64, Option<i64>) = sqlx::query_as(
         "select count(*)::bigint, sum(prompt_tokens)::int from ai_provider_usage \
          where provider_id = $1",
@@ -714,6 +725,253 @@ async fn the_catalog_asks_for_a_session() {
         StatusCode::UNAUTHORIZED
     );
     harness.dispose().await;
+}
+
+/// REQ-098 slice 5 — **a price edit moves new requests only.** A usage row that was *written*
+/// keeps the
+/// cost it was billed, and the row after the edit is priced at the new number.
+///
+/// This is the acceptance criterion the whole cost snapshot exists for, and the way to prove it
+/// is to make the two sides of the claim in one walk: the *old* row's stored total is read back
+/// after the catalog's own PATCH has changed the price, and compared to a figure computed by
+/// hand from the old rate. A screen that re-derived history would render the new number here, so
+/// asserting only "the old row still exists" would pass against the exact implementation the
+/// criterion forbids.
+///
+/// The two calls go through `record_usage` with an explicit snapshot rather than a live chat,
+/// because the criterion is about the *store* and a live call would couple it to a mock
+/// provider's token reporting. The snapshot is passed the way the runtime passes it, so the
+/// arithmetic under test is the same one production uses.
+#[tokio::test]
+async fn a_price_edit_moves_new_requests_and_leaves_a_written_history_alone() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let (base_url, _mock) = mock_provider().await;
+    let (token, provider, small, _large) = connected(&harness, &base_url).await;
+
+    // The operator prices the model for the first time: 1_000 micros in, 3_000 out.
+    let priced = harness
+        .call(patch(
+            &format!("/api/v1/ai/models/{small}"),
+            json!({
+                "input_cost_micros_per_mtok": 1_000,
+                "output_cost_micros_per_mtok": 3_000
+            }),
+            &token,
+        ))
+        .await;
+    assert_eq!(priced.status, StatusCode::OK, "{:?}", priced.body);
+
+    let provider_uuid = Uuid::parse_str(&provider).expect("a provider id is a uuid");
+    let price_at_call_time = omnion_ai_hub::cost::ModelPrice {
+        input_micros_per_mtok: Some(1_000),
+        output_micros_per_mtok: Some(3_000),
+    };
+
+    // One call, 200_000 prompt and 100_000 completion tokens: 200_000/1e6 * 1_000 = 200 micros
+    // in, 100_000/1e6 * 3_000 = 300 micros out, 500 in total. The counts are chosen so both
+    // sides are whole numbers and the total is a figure a human can re-derive by hand — the
+    // point of the assertion is that the stored value did not change, not that the arithmetic
+    // is hard.
+    let first = record_cost(
+        &harness,
+        provider_uuid,
+        "mock-small",
+        price_at_call_time,
+        Some(200_000),
+        Some(100_000),
+    )
+    .await;
+
+    // The operator notices the output price was a factor of three too high.
+    let corrected = harness
+        .call(patch(
+            &format!("/api/v1/ai/models/{small}"),
+            json!({ "output_cost_micros_per_mtok": 30_000 }),
+            &token,
+        ))
+        .await;
+    assert_eq!(corrected.status, StatusCode::OK, "{:?}", corrected.body);
+
+    // The next identical call is billed at the new price: 200 in + 3_000 out = 3_200 micros.
+    let second = record_cost(
+        &harness,
+        provider_uuid,
+        "mock-small",
+        omnion_ai_hub::cost::ModelPrice {
+            input_micros_per_mtok: Some(1_000),
+            output_micros_per_mtok: Some(30_000),
+        },
+        Some(200_000),
+        Some(100_000),
+    )
+    .await;
+
+    // The load-bearing assertion: the row written BEFORE the edit still totals what it was
+    // billed. Reading it after the edit is the whole point — a reader that joined the catalog
+    // for the current price would now report 3 here.
+    let first_cost = stored_cost(&harness, first).await;
+    assert_eq!(
+        first_cost["cost_total_micros"],
+        json!(500),
+        "the historical row keeps the price that was in force when it was made: {first_cost}"
+    );
+    assert_eq!(
+        first_cost["cost_input_micros_per_mtok"],
+        json!(1_000),
+        "the snapshot carries the rate too, so the total can be re-derived and audited"
+    );
+    assert_eq!(
+        first_cost["cost_output_micros_per_mtok"],
+        json!(3_000),
+        "the corrected rate must not reach back into a row that was already written: {first_cost}"
+    );
+
+    // And the new row is genuinely at the new price — otherwise the assertion above would also
+    // pass against an implementation that never prices anything.
+    let second_cost = stored_cost(&harness, second).await;
+    assert_eq!(
+        second_cost["cost_total_micros"],
+        json!(3_200),
+        "the new call is billed at the edited price: {second_cost}"
+    );
+    assert_eq!(second_cost["cost_output_micros_per_mtok"], json!(30_000));
+
+    harness.dispose().await;
+}
+
+/// An unpriced model and a call whose endpoint reported no usage both store a **null** cost, and
+/// a free model stores a **zero**. These are three different sentences in a costs screen, and
+/// collapsing any two of them is the failure this test exists to prevent — in particular,
+/// `unwrap_or(0)` on the token counts would make "unknown" render as "free".
+#[tokio::test]
+async fn an_unknown_cost_is_null_and_a_free_one_is_zero() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let (base_url, _mock) = mock_provider().await;
+    let (token, provider, small, _large) = connected(&harness, &base_url).await;
+    let provider_uuid = Uuid::parse_str(&provider).expect("a provider id is a uuid");
+
+    // A stream that ended without a usage frame, on a model that *is* priced.
+    harness
+        .call(patch(
+            &format!("/api/v1/ai/models/{small}"),
+            json!({ "input_cost_micros_per_mtok": 1_000, "output_cost_micros_per_mtok": 3_000 }),
+            &token,
+        ))
+        .await;
+    let unpriced_call = record_cost(
+        &harness,
+        provider_uuid,
+        "mock-small",
+        omnion_ai_hub::cost::ModelPrice {
+            input_micros_per_mtok: Some(1_000),
+            output_micros_per_mtok: Some(3_000),
+        },
+        None,
+        None,
+    )
+    .await;
+
+    let stored = stored_cost(&harness, unpriced_call).await;
+    assert_eq!(
+        stored["cost_total_micros"],
+        json!(null),
+        "no usage block means the cost is unknown, and unknown is not zero: {stored}"
+    );
+    // The instant is still stamped: "we priced this and the answer was unknown" is a different
+    // statement from "nobody ever looked".
+    assert_ne!(
+        stored["cost_calculated_at"],
+        json!(null),
+        "the attempt is recorded even when it produced no number: {stored}"
+    );
+
+    // A model with an explicit price of zero is *known* and free — a real measurement.
+    let free = record_cost(
+        &harness,
+        provider_uuid,
+        "mock-small",
+        omnion_ai_hub::cost::ModelPrice {
+            input_micros_per_mtok: Some(0),
+            output_micros_per_mtok: Some(0),
+        },
+        Some(1_000_000),
+        Some(1_000_000),
+    )
+    .await;
+    assert_eq!(
+        stored_cost(&harness, free).await["cost_total_micros"],
+        json!(0),
+        "a free model is a measurement of zero, which is not the same as an absent cost"
+    );
+
+    harness.dispose().await;
+}
+
+/// Write one usage row through the store, exactly as the runtime does, and return its id.
+async fn record_cost(
+    harness: &Harness,
+    provider: Uuid,
+    model_key: &str,
+    price: omnion_ai_hub::cost::ModelPrice,
+    prompt_tokens: Option<i32>,
+    completion_tokens: Option<i32>,
+) -> i64 {
+    omnion_ai_hub::health_store::record_usage(
+        harness.db.pool(),
+        omnion_ai_hub::health_store::NewUsage {
+            provider_id: provider,
+            model_key: Some(model_key.to_owned()),
+            task: "chat".to_owned(),
+            outcome: "ok".to_owned(),
+            http_status: Some(200),
+            prompt_tokens,
+            completion_tokens,
+            latency_ms: 120,
+            substituted_from: None,
+            first_byte_at: None,
+            cost: omnion_ai_hub::cost::call_cost(price, prompt_tokens, completion_tokens),
+        },
+    )
+    .await
+    .expect("the usage row records");
+    // `record_usage` returns `()` — the store's contract is deliberately about the write, not
+    // the id — so the row is found by its own ordering. `max(id)` per provider is unambiguous
+    // here because the two calls in each walk are strictly ordered by the assertions between
+    // them, and it is read *after* the insert rather than guessed before it.
+    sqlx::query_scalar("select max(id) from ai_provider_usage where provider_id = $1")
+        .bind(provider)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the newest row id reads")
+}
+
+/// One stored usage row's cost columns, read back as JSON so the assertions can distinguish
+/// `null` from `0` — which `json!(0)` and `json!(null)` do, and which a `try_get::<i64,_>` on the
+/// nullable column cannot.
+async fn stored_cost(harness: &Harness, id: i64) -> Value {
+    let row = sqlx::query(
+        "select cost_input_micros_per_mtok, cost_output_micros_per_mtok, cost_total_micros, \
+         cost_calculated_at from ai_provider_usage where id = $1",
+    )
+    .bind(id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the cost columns read");
+
+    let total: Option<i64> = sqlx::Row::get(&row, "cost_total_micros");
+    // Built by hand rather than through serde so the value's own nullness survives: a
+    // `Value::Null` here is the assertion's subject, not an accident of decoding.
+    json!({
+        "cost_input_micros_per_mtok": row.get::<Option<i64>, _>("cost_input_micros_per_mtok"),
+        "cost_output_micros_per_mtok": row.get::<Option<i64>, _>("cost_output_micros_per_mtok"),
+        "cost_total_micros": total,
+        "cost_calculated_at": row.get::<Option<time::OffsetDateTime>, _>("cost_calculated_at")
+            .map(|at| at.to_string()),
+    })
 }
 
 // -------------------------------------------------------------------------------------------

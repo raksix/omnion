@@ -1491,6 +1491,12 @@ async function exerciseHealthPanels(page) {
     return {
       present: true,
       figures: [...root.querySelectorAll("[data-figure]")].map((node) => `${node.getAttribute("data-figure")}=${node.textContent?.trim() ?? ""}`),
+      // REQ-098 slice 5: the cost figure and the "could not be priced" notice. A screenshot can
+      // show a number being rendered but cannot tell `—` (unknown) from `0` (free) at a glance,
+      // and that difference is the whole claim of the snapshot — so the pass reads both as text.
+      costFigure:
+        root.querySelector('[data-testid="usage-cost"]')?.textContent?.replace(/\s+/g, " ").trim() ?? "",
+      uncosted: root.querySelector("[data-usage-uncosted]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
       days: root.querySelectorAll("[data-usage-day]").length,
       empty: root.querySelectorAll("[data-usage-empty]").length,
       missing: root.querySelector("[data-usage-missing]")?.textContent?.replace(/\s+/g, " ").trim() ?? "",
