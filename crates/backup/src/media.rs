@@ -173,6 +173,24 @@ pub fn safe_filename(name: &str) -> String {
 
 /// The rows a run's media part will attempt, newest first within a site.
 ///
+/// # `site_id: None` means "every site on this deployment", and that is a real answer
+///
+/// It is the answer for a single-tenant installation, where the platform operator is backing
+/// up the whole platform and every site is theirs. It is **not** an answer on a deployment
+/// that serves more than one organization, and the reason is worth stating because the
+/// signature invites the mistake: a `None` here reads like "no filter" and behaves like
+/// "no scope".
+///
+/// The run is tenant-scoped everywhere else — the list, the detail, the delete, the audit
+/// entry all carry `organization_id` — and an unscoped media part makes the backup the one
+/// place where tenant A's archive contains tenant B's files. That is a data leak with a
+/// green tick next to it, and it is invisible in a single-org deployment, which is why it
+/// survives a test suite that only ever creates one organization's media.
+///
+/// So the part asks for the **sites of the run's own organization**, and this function keeps
+/// the unscoped form for the single-tenant case where it is correct. The caller is the only
+/// place that knows which case it is in, and the API route resolves it there.
+///
 /// `deleted_at is null` and `purged_at is null` on purpose: a soft-deleted file is still a file
 /// the operator may have to recover, and a purged one has been promised to be gone. Copying
 /// either would be a surprise; skipping both is the promise.
@@ -187,6 +205,29 @@ pub async fn pending_objects(
          order by site_id, created_at desc",
     )
     .bind(site_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(objects)
+}
+
+/// The rows a run's media part will attempt, **for one organization**.
+///
+/// Same rows as [`pending_objects`] with a `None` site, joined through `sites` so the
+/// organization's own sites are the only ones in the archive. This is the call a multi-tenant
+/// deployment must make, and it is a separate function rather than an extra parameter so the
+/// unsafe form cannot be reached by forgetting an argument.
+pub async fn pending_objects_for_organization(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<Vec<MediaObject>> {
+    let objects = sqlx::query_as::<_, MediaObject>(
+        "select m.id, m.site_id, m.storage_key, m.filename, m.content_type, m.size_bytes, \
+         m.checksum from media m join sites s on s.id = m.site_id \
+         where m.deleted_at is null and m.purged_at is null \
+           and (s.organization_id is not distinct from $1) \
+         order by m.site_id, m.created_at desc",
+    )
+    .bind(organization_id)
     .fetch_all(pool)
     .await?;
     Ok(objects)
