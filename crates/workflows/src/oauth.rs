@@ -171,25 +171,83 @@ impl PendingFlow {
 
 /// Mint a signed `state` for one flow.
 ///
-/// The value is `<payload>.<signature>`, where the payload is `credential_id:issued_at:nonce`
-/// and the signature is `HMAC-SHA256(key, label || payload)`. The key is the installation's,
-/// so a `state` this function did not mint — one from another installation, or one edited in
-/// the query string — does not verify.
+/// The value is `<organization>.<credential>:<issued_at>:<nonce>.<signature>`, where the
+/// signature is `HMAC-SHA256(key, label || payload)`. The key is the installation's, so a
+/// `state` this function did not mint — one from another installation, or one edited in the
+/// query string — does not verify.
+///
+/// The organization is in the payload because the callback has no session to scope its lookup
+/// with. Putting it in the *signed* bytes is what makes that safe: an attacker who edits the
+/// organization in the query string invalidates the signature, so the tenant cannot be
+/// swapped. The tenant is not a secret, but an unsigned field in a value whose whole job is
+/// to be unforgeable is a field somebody will eventually forget to check.
 #[must_use]
-pub fn build_state(credential_id: uuid::Uuid, key: &[u8], now: OffsetDateTime) -> String {
+pub fn build_state(
+    organization_id: uuid::Uuid,
+    credential_id: uuid::Uuid,
+    key: &[u8],
+    now: OffsetDateTime,
+) -> String {
     let payload = format!(
-        "{credential_id}:{}:{}",
+        "{organization_id}.{credential_id}:{}:{}",
         now.unix_timestamp_nanos(),
         URL_SAFE_NO_PAD.encode(random_bytes(STATE_NONCE_BYTES))
     );
     format!("{payload}.{}", sign(key, &payload))
 }
 
+/// What a verified `state` proves.
+///
+/// Returned as a pair rather than a bare id so the callback cannot accidentally scope its
+/// lookup to the wrong tenant: it receives the organization the state was *minted* for, not
+/// one it chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedState {
+    /// The organization the flow was started in.
+    pub organization_id: uuid::Uuid,
+    /// The credential the flow will attach to.
+    pub credential_id: uuid::Uuid,
+}
+
+/// `SHA-256` of a state, lower-case hex — what `workflow_oauth_flows.state_hash` holds.
+///
+/// The state is a bearer value: anything able to read that table could otherwise replay a
+/// callback. Hashing costs nothing (a callback is single-use and dies in ten minutes) and
+/// removes the class entirely, and the hash lives here rather than in the store so the
+/// *hashing* of a state is one function in the crate that owns states — the alternative is
+/// two copies of a scheme whose only requirement is that they agree.
+#[must_use]
+pub fn state_hash(state: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(state.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Lower-case hex, so the stored hash is a plain string a human can compare in a `psql` session.
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 /// Why a `state` was refused.
 ///
-/// The three cases a caller must tell apart are deliberately distinct: "this is not ours" is a
-/// CSRF attempt, "this expired" is a person who took too long, and "this is not yours" is
-/// somebody replaying their own valid state against a different credential.
+/// The four cases a caller must tell apart are deliberately distinct: "this is not ours" is a
+/// CSRF attempt, "this expired" is a person who took too long, "this is not yours" is somebody
+/// replaying their own valid state against a different credential, and "this is spent" is a
+/// double-submitted consent screen.
+///
+/// [`WrongOrganization`](Self::WrongOrganization) exists because the state payload carries
+/// the organization as well as the credential id. The callback runs with **no session** — the
+/// browser is at the provider — so the organization has to come from the state, and a state
+/// that names only a credential id would leave the handler with a credential id it could not
+/// look up in any tenant. Minting the id alone is what makes the obvious version of the
+/// callback either guess an organization or query without a scope, and both are worse than
+/// carrying the tenant in the signed payload where it cannot be swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateRejection {
     /// Absent, malformed, or signed with a different key.
@@ -198,6 +256,8 @@ pub enum StateRejection {
     Expired,
     /// Names a different credential than the one being connected.
     WrongCredential,
+    /// Names an organization other than the one being connected into.
+    WrongOrganization,
     /// Already spent.
     Used,
 }
@@ -210,6 +270,7 @@ impl StateRejection {
             Self::Unrecognised => "the authorization state is not one this installation issued",
             Self::Expired => "the authorization request expired — start the connection again",
             Self::WrongCredential => "the authorization state was issued for a different credential",
+            Self::WrongOrganization => "the authorization state was issued for another organization",
             Self::Used => "the authorization request was already completed",
         }
     }
@@ -221,17 +282,22 @@ impl StateRejection {
     }
 }
 
-/// Check a returned `state` and pull the credential it was issued for back out.
+/// Check a returned `state` and pull the credential *and organization* it was issued for.
 ///
 /// This verifies the signature and the window; it does **not** know whether the flow was
 /// already spent — that is the store's job, because only the store can know atomically. The
 /// two together are what make the callback safe.
+///
+/// Both halves come back because the callback has no session: an organization that is not in
+/// the signed payload leaves the handler holding a credential id it cannot look up in any
+/// tenant, and the two tempting workarounds — guessing the tenant, or querying without a
+/// scope — are exactly the shapes this module exists to rule out.
 pub fn verify_state(
     raw: &str,
     key: &[u8],
     now: OffsetDateTime,
-    expected: Option<uuid::Uuid>,
-) -> Result<uuid::Uuid, StateRejection> {
+    expected_credential: Option<uuid::Uuid>,
+) -> Result<VerifiedState, StateRejection> {
     let Some((payload, signature)) = raw.rsplit_once('.') else {
         return Err(StateRejection::Unrecognised);
     };
@@ -245,13 +311,23 @@ pub fn verify_state(
         .map_err(|_| StateRejection::Unrecognised)?;
 
     let mut parts = payload.split(':');
-    let (Some(id), Some(issued), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
+    let (Some(scope), Some(issued), Some(_)) = (parts.next(), parts.next(), parts.next()) else {
         return Err(StateRejection::Unrecognised);
     };
     if parts.next().is_some() {
         return Err(StateRejection::Unrecognised);
     }
-    let Ok(credential_id) = id.parse::<uuid::Uuid>() else {
+    // `<organization>.<credential>`. A payload without the dot is a state minted by a build
+    // that predates the organization being carried, and it is refused rather than parsed with
+    // a guessed tenant: the whole reason the tenant is in here is that a guess is the failure
+    // mode.
+    let Some((organization, credential)) = scope.split_once('.') else {
+        return Err(StateRejection::Unrecognised);
+    };
+    let (Ok(organization_id), Ok(credential_id)) = (
+        organization.parse::<uuid::Uuid>(),
+        credential.parse::<uuid::Uuid>(),
+    ) else {
         return Err(StateRejection::Unrecognised);
     };
     let issued = issued
@@ -267,12 +343,15 @@ pub fn verify_state(
     if now < issued_at || now - issued_at > STATE_TTL {
         return Err(StateRejection::Expired);
     }
-    if let Some(expected) = expected
+    if let Some(expected) = expected_credential
         && expected != credential_id
     {
         return Err(StateRejection::WrongCredential);
     }
-    Ok(credential_id)
+    Ok(VerifiedState {
+        organization_id,
+        credential_id,
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -313,7 +392,13 @@ pub fn authorization_url(
 }
 
 /// What a provider sent back on the callback.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Deserialize` as well as a hand parser: the parser ([`Self::parse`]) exists for the
+/// *token-request* side and for tests, but an HTTP callback arrives as a query string and
+/// axum's extractor wants a `Deserialize`. Both spellings are kept in one struct on purpose —
+/// two types for "the four things a callback carries" is one type too many, and they would
+/// disagree about the first thing a provider does, which is rename a field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct CallbackQuery {
     /// The authorization code, when the provider granted one.
     pub code: Option<String>,
@@ -859,18 +944,23 @@ mod tests {
     }
 
     #[test]
-    fn a_state_round_trips_and_names_its_credential() {
+    fn a_state_round_trips_and_names_its_credential_and_its_organization() {
+        // The callback has no session, so the organization has to travel inside the signed
+        // value or the handler is left holding an id it cannot look up in any tenant.
+        let organization = Uuid::new_v4();
         let id = Uuid::new_v4();
         let now = OffsetDateTime::now_utc();
-        let state = build_state(id, &key(), now);
-        assert_eq!(verify_state(&state, &key(), now, Some(id)).unwrap(), id);
+        let state = build_state(organization, id, &key(), now);
+        let verified = verify_state(&state, &key(), now, Some(id)).expect("our own state");
+        assert_eq!(verified.credential_id, id);
+        assert_eq!(verified.organization_id, organization);
     }
 
     #[test]
     fn a_state_signed_with_another_key_is_not_recognised() {
-        let id = Uuid::new_v4();
+        let (organization, id) = (Uuid::new_v4(), Uuid::new_v4());
         let now = OffsetDateTime::now_utc();
-        let state = build_state(id, &key(), now);
+        let state = build_state(organization, id, &key(), now);
         assert_eq!(
             verify_state(&state, b"a-different-installation-key-entirely!", now, Some(id)),
             Err(StateRejection::Unrecognised)
@@ -879,12 +969,12 @@ mod tests {
 
     #[test]
     fn a_tampered_state_is_refused_and_the_reason_is_stable() {
-        let id = Uuid::new_v4();
+        let (organization, id) = (Uuid::new_v4(), Uuid::new_v4());
         let now = OffsetDateTime::now_utc();
-        let state = build_state(id, &key(), now);
+        let state = build_state(organization, id, &key(), now);
         let (payload, signature) = state.rsplit_once('.').unwrap();
         // Swap in a different credential, keep the signature: the payload no longer matches.
-        let forged = format!("{}:{payload}:x.{signature}", Uuid::nil());
+        let forged = format!("{organization}.{}:{payload}:x.{signature}", Uuid::nil());
         let rejection = verify_state(&forged, &key(), now, None).unwrap_err();
         assert_eq!(rejection, StateRejection::Unrecognised);
         assert_eq!(rejection.code(), codes::STATE);
@@ -892,10 +982,28 @@ mod tests {
     }
 
     #[test]
-    fn a_state_past_its_window_is_expired_not_unrecognised() {
+    fn a_state_whose_organization_was_swapped_is_refused() {
+        // The reason the organization is in the *signed* bytes. An attacker who edits it in
+        // the query string invalidates the signature, so a state minted for tenant A can
+        // never be replayed into tenant B — and the refusal is "not ours", not "wrong
+        // organization", because a forged value never got far enough to be compared.
+        let (mine, theirs) = (Uuid::new_v4(), Uuid::new_v4());
         let id = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        let state = build_state(mine, id, &key(), now);
+        let (payload, signature) = state.rsplit_once('.').unwrap();
+        let forged = format!("{theirs}.{payload}.{signature}");
+        assert_eq!(
+            verify_state(&forged, &key(), now, Some(id)).unwrap_err(),
+            StateRejection::Unrecognised
+        );
+    }
+
+    #[test]
+    fn a_state_past_its_window_is_expired_not_unrecognised() {
+        let (organization, id) = (Uuid::new_v4(), Uuid::new_v4());
         let issued = OffsetDateTime::now_utc() - STATE_TTL - Duration::from_secs(5);
-        let state = build_state(id, &key(), issued);
+        let state = build_state(organization, id, &key(), issued);
         assert_eq!(
             verify_state(&state, &key(), OffsetDateTime::now_utc(), Some(id)),
             Err(StateRejection::Expired)
@@ -904,13 +1012,28 @@ mod tests {
 
     #[test]
     fn a_state_for_another_credential_names_that_rather_than_pretending() {
-        let mine = Uuid::new_v4();
-        let theirs = Uuid::new_v4();
+        let (organization, mine, theirs) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let now = OffsetDateTime::now_utc();
-        let state = build_state(theirs, &key(), now);
+        let state = build_state(organization, theirs, &key(), now);
         assert_eq!(
             verify_state(&state, &key(), now, Some(mine)),
             Err(StateRejection::WrongCredential)
+        );
+    }
+
+    #[test]
+    fn a_state_with_no_organization_in_its_payload_is_refused_rather_than_guessed() {
+        // A payload minted before the organization was carried. The obvious fallback — treat
+        // the bare id as a credential in whatever tenant the session names — is the failure
+        // mode the organization being in the signature exists to prevent.
+        let id = Uuid::new_v4();
+        let now = OffsetDateTime::now_utc();
+        let payload = format!("{id}:{}:nonce", now.unix_timestamp_nanos());
+        let legacy = format!("{payload}.{}", sign(&key(), &payload));
+        assert_eq!(
+            verify_state(&legacy, &key(), now, None).unwrap_err(),
+            StateRejection::Unrecognised,
+            "a state with no tenant is not one this release can scope"
         );
     }
 
@@ -923,9 +1046,12 @@ mod tests {
 
     #[test]
     fn two_states_for_one_credential_differ() {
-        let id = Uuid::new_v4();
+        let (organization, id) = (Uuid::new_v4(), Uuid::new_v4());
         let now = OffsetDateTime::now_utc();
-        assert_ne!(build_state(id, &key(), now), build_state(id, &key(), now));
+        assert_ne!(
+            build_state(organization, id, &key(), now),
+            build_state(organization, id, &key(), now)
+        );
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub mod error;
 pub mod handler;
 pub mod model;
 pub mod oauth;
+pub mod oauth_client;
+pub mod oauth_refresh;
 pub mod oauth_store;
 pub mod registry;
 pub mod store;
