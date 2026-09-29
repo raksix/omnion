@@ -5207,3 +5207,65 @@ owns them.
 forms module is `pending` and not on this branch. **A full browser pass has still not completed on
 this branch**: the QA slot has been held by live passes of other writers for four ticks running, so
 the CRM screens remain un-walked and no line above claims otherwise.
+
+## 2026-09-29 — w8 tick 19 · REQ-117 slice 3, the SLA worker
+
+**What.** The acceptance line that says a breach "notifies the escalation target exactly once"
+had a store, a validator, a screen, a badge and a *test* — and no timer. `due_breaches`,
+`mark_escalated` and `escalation_target` shipped two slices earlier and every caller of them was
+a test; the reminder had no caller at all, only a column and an editor control.
+
+**Why this tick exists, in one sentence.** An exported, unit-tested store function reads as a
+feature, and every screen that renders the number it feeds is evidence of nothing. The inbox
+badge counted breaches no timer acted on; the SLA editor rendered a reminder that could not
+fire; and the panel was *correct about everything it displayed* — which is exactly why nobody
+could have told. That last clause is the dangerous one: there is no screen a reviewer would
+have flagged.
+
+**The work.**
+- `0156_crm_lead_sla_reminder_claim.sql` — a partial unique index on `crm_lead_events (lead_id)
+  where kind = 'sla_reminded'`. "Exactly once" was a `where not exists` predicate, which is
+  correct for one caller and wrong for two: the read that drives the notification happens before
+  the line that would make the filter true, so two workers both see "no reminder yet" and both
+  notify. The owner sees the deadline twice and learns to ignore it, which is the outcome the
+  column exists to prevent. **This module has now met this shape three times** — the round-robin
+  cursor, the autoresponder reservation, and this — and both previous answers were the same
+  sentence: *make the claim an insert whose row count is the decision.*
+- `assignment_store::{organizations_with_leads, due_reminders, mark_reminded}`.
+- `apps/api/src/crm_sla_runner.rs` — the worker. Claims before it notifies; counts an untargeted
+  breach separately from an escalation; logs an empty tick at `debug`.
+- `CrmSlaConfig` — a **separate** switch from the autoresponder's, because they answer two
+  different promises and a shared flag is an installation that stops emailing acknowledgements
+  and silently stops escalating its own overdue leads, with no log line.
+- `crates/events/src/catalogue.rs` — the five CRM intake event names, absent for six slices
+  while the bus recorded them.
+
+**Proof.**
+- `scripts/qa/run-crm-sla.sh` **12/12** (module 7, worker 5) on its own database.
+- **Proven to fail, twice, and the two failures are different shapes.** Turning the claim into
+  `do update` gives eight released claimers **eight** reminders (`left: 8, right: 1`) — the exact
+  double-notification. Dropping the index does not merely weaken the gate, it makes the claim a
+  hard `42P10`, so the schema is load-bearing rather than decorative.
+- **A third thing worth recording: the read predicate is not load-bearing.** Deleting the
+  `not exists (… kind = 'sla_reminded')` filter from `due_reminders` leaves the racing test
+  **green**. The filter is an optimisation that keeps the read narrow; the index is the
+  guarantee. Believing otherwise is how a "I removed a redundant check" commit quietly deletes
+  a correctness property — here the test answered the question before anyone had to.
+- `omnion-module-crm-intake --lib` 150, `omnion-api --lib` 247, `omnion-events --lib` 47.
+  admin `tsc --noEmit` clean. 0 clippy warnings in the files this tick touched.
+- The due-time countdown was already in the inbox (`lead-inbox.tsx:667`); acceptance 11's
+  "visible in the list" clause is therefore true on the panel and does not depend on this tick.
+
+**The two event names are `Live`, not `Reserved`.** The first draft marked them reserved,
+which would have been the optimistic version of the very drift those rows exist to fix: the
+picker says "planned", an operator wires an automation to it, and nothing is ever recorded. A
+name whose emitter is in the same commit is live the moment that commit lands.
+
+**Not done, and not claimed.** No full browser pass has completed on this branch — the QA slot
+was held by a live pass of another writer for the whole tick and free RAM was 387 MB, which is
+not a margin to start a Chromium in. The CRM screens remain un-walked. Slice 3's remaining half
+(the REQ-064 form-editor card) is still blocked on a module that is not on this branch.
+
+**Next.** Try the pass the moment the slot frees; it is the only thing standing between this
+branch and a walkthrough. Then the inbox's live breached-count badge, which the worker has just
+made meaningful for the first time.
