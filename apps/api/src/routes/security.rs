@@ -489,7 +489,12 @@ pub async fn patch_status(
     .await
     .map_err(map_store)?;
 
-    record_audit(
+    // The status change is already stored above, and the audit entry is the only record that
+    // somebody resolved a finding rather than leaving it open — so a failure here is logged,
+    // not swallowed. `.ok()` reads as deliberate and is not: it makes a missing audit trail
+    // indistinguishable from one that was never asked for, and the request that would have
+    // written it answered 200.
+    if let Err(error) = record_audit(
         state.db().pool(),
         NewAuditEntry::by_user(session.user.id, "security.finding.resolved")
             .organization(session.user.organization_id)
@@ -497,7 +502,13 @@ pub async fn patch_status(
             .metadata(json!({ "status": body.status })),
     )
     .await
-    .ok();
+    {
+        tracing::warn!(
+            error = %error,
+            finding = %id,
+            "the finding status was stored but the transition was not audited"
+        );
+    }
 
     Ok(Json(FindingBody::from(finding)))
 }
