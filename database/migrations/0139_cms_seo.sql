@@ -83,7 +83,10 @@ create table cms_seo_redirects (
     status_code integer not null default 301,
     pattern text not null default 'literal',
     enabled boolean not null default true,
-    hits integer not null default 0,
+    -- `bigint`, not `integer`: the store's `Redirect.hits` is an `i64` because it is bound as a
+    -- `i64` in the incrementing UPDATE, and sqlx refuses to decode INT4 into one. The column
+    -- type and the Rust type have to agree exactly or every read of the list is a 500.
+    hits bigint not null default 0,
     last_hit_at timestamptz,
     created_by uuid references users (id) on delete set null,
     created_at timestamptz not null default now(),
@@ -121,7 +124,12 @@ create table cms_seo_settings (
     site_id uuid primary key references sites (id) on delete cascade,
     organization_id uuid not null references organizations (id) on delete cascade,
     sitemap_types text[] not null default '{}',
-    default_priority numeric(2,1) not null default 0.5,
+    -- `double precision`, not `numeric` and not `real`: the workspace carries no decimal crate, so
+    -- a NUMERIC column cannot be decoded into the `f64` the settings row declares, and `real` is
+    -- FLOAT4 where `f64` is FLOAT8 — both answer 500 on every read. A sitemap priority has one
+    -- decimal place and no arithmetic beyond a bound check, so double precision loses nothing,
+    -- and a type the store cannot read is worth less than a type that is exact.
+    default_priority double precision not null default 0.5,
     default_change_frequency text not null default 'weekly',
     sitemap_xml text,
     sitemap_last_generated_at timestamptz,

@@ -30,6 +30,7 @@ use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_security::{CSRF_HEADER, derive_csrf_token};
 use serde_json::{Value, json};
 use sqlx::Row;
 use tower::ServiceExt;
@@ -38,9 +39,21 @@ use uuid::Uuid;
 /// Password used for the accounts this suite creates.
 const PASSWORD: &str = "correct horse battery";
 
+/// The CSRF secret this suite runs with. It must match the `OMNION_CSRF_SECRET` the run script
+/// exports, because the token is derived from it and a suite whose two halves disagree fails as
+/// `csrf_failed` on every write.
+const CSRF_SECRET: &str = "w2-seo-suite-csrf-secret";
+
+/// A signed-in session: the cookie the browser sends, and the UUID the CSRF token is derived
+/// from. The two are different values and the middleware needs both.
+struct Auth {
+    token: String,
+    session_id: String,
+}
+
 /// What the reader may do. Note what is absent: no `seo.manage`, which is the point of the last
 /// test in this file.
-const READER_PERMISSIONS: [&str; 3] = ["seo.read", "content.pages.read", "content.pages.manage"];
+const READER_PERMISSIONS: [&str; 2] = ["seo.read", "content.pages.read"];
 
 /// What the editor adds on top.
 const EDITOR_EXTRA: [&str; 1] = ["seo.manage"];
@@ -87,10 +100,21 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+fn request(method: Method, uri: &str, token: Option<&Auth>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(auth) => {
+            let token = auth.token.as_str();
+            let builder = builder.header(header::COOKIE, format!("omnion_session={token}"));
+            // The CSRF layer (merged from main today) refuses a cookie-authenticated write with
+            // no token, because the session cookie is ambient authority: any page the browser
+            // visits could make the browser POST it. The token is derived from the session's
+            // **UUID**, not from the cookie value, so a suite that sends `derive_token(secret,
+            // cookie)` fails as `csrf_failed` with the message "does not belong to this session" —
+            // which reads like a wrong secret and is really a wrong subject. `Auth` carries both.
+            let csrf = derive_csrf_token(CSRF_SECRET.as_bytes(), &auth.session_id);
+            builder.header(CSRF_HEADER, csrf)
+        }
         None => builder,
     };
     match body {
@@ -149,7 +173,12 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
     (user.id, email)
 }
 
-async fn login(state: &AppState, email: &str) -> String {
+/// Sign in and return both halves of the session.
+///
+/// The session id comes from `sessions.token_hash`, which is `hash_token(cookie)` — the same
+/// lookup `CurrentSession::resolve` performs, so a test derives its token from exactly the id the
+/// server will derive it from.
+async fn login(state: &AppState, db: &Db, email: &str) -> Auth {
     let response = call(
         state,
         request(
@@ -172,14 +201,23 @@ async fn login(state: &AppState, email: &str) -> String {
         .find(|(name, _)| name == "set-cookie")
         .map(|(_, value)| value.clone())
         .expect("login must set the session cookie");
-    cookie
+    let token = cookie
         .split(';')
         .next()
         .expect("the cookie has a value")
         .split_once('=')
         .expect("the cookie is name=value")
         .1
-        .to_owned()
+        .to_owned();
+    let session_id: Uuid = sqlx::query_scalar("select id from sessions where token_hash = $1")
+        .bind(omnion_identity::sessions::hash_token(&token))
+        .fetch_one(db.pool())
+        .await
+        .expect("the session row the cookie names must exist");
+    Auth {
+        token,
+        session_id: session_id.to_string(),
+    }
 }
 
 async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], label: &str) {
@@ -265,24 +303,24 @@ impl Fixture {
             .expect("the site must be created");
 
         let host = format!("{}.example.test", &Uuid::new_v4().simple().to_string()[..8]);
-        sqlx::query(
-            "insert into site_domains (site_id, host, is_primary) values ($1, $2, true)",
-        )
-        .bind(site)
-        .bind(&host)
-        .execute(db.pool())
-        .await
-        .expect("the site domain must be created");
+        sqlx::query("insert into site_domains (site_id, host, is_primary) values ($1, $2, true)")
+            .bind(site)
+            .bind(&host)
+            .execute(db.pool())
+            .await
+            .expect("the site domain must be created");
 
         let page = published_page(&db, site, "about", "About the studio").await;
         let draft = published_page(&db, site, "secret-plan", "Secret plan").await;
         // The second page becomes a draft, so "a draft is not in the sitemap" is proved by a row
         // that exists rather than by an absence.
-        sqlx::query("update pages set status = 'draft', published_revision_id = null where id = $1")
-            .bind(draft)
-            .execute(db.pool())
-            .await
-            .expect("the page must become a draft");
+        sqlx::query(
+            "update pages set status = 'draft', published_revision_id = null where id = $1",
+        )
+        .bind(draft)
+        .execute(db.pool())
+        .await
+        .expect("the page must become a draft");
 
         let (editor_id, editor_email) = create_account(&db, Some(org)).await;
         let mut editor_keys = READER_PERMISSIONS.to_vec();
@@ -304,14 +342,13 @@ impl Fixture {
         })
     }
 
-    async fn editor(&self) -> String {
-        login(&self.state, &self.editor_email).await
+    async fn editor(&self) -> Auth {
+        login(&self.state, &self.db, &self.editor_email).await
     }
 
-    async fn reader(&self) -> String {
-        login(&self.state, &self.reader_email).await
+    async fn reader(&self) -> Auth {
+        login(&self.state, &self.db, &self.reader_email).await
     }
-
 }
 
 /// Insert a page with its first revision and publish it, returning its id.
@@ -398,7 +435,9 @@ async fn a_page_with_metadata_emits_the_right_tags_and_lands_in_the_sitemap() {
     assert_eq!(tags["og_type"], "website");
     assert_eq!(tags["robots"], "index,follow");
     assert!(
-        tags["og_image"].as_str().is_some_and(|url| url.starts_with("/media/")),
+        tags["og_image"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("/media/")),
         "the OG card points at the media row: {}",
         tags["og_image"]
     );
@@ -431,7 +470,10 @@ async fn a_page_with_metadata_emits_the_right_tags_and_lands_in_the_sitemap() {
     )
     .await;
     assert_eq!(regenerated.status, StatusCode::OK);
-    assert_eq!(regenerated.body["sitemap_url_count"], 1, "one published page");
+    assert_eq!(
+        regenerated.body["sitemap_url_count"], 1,
+        "one published page"
+    );
 
     let xml = regenerated.body["sitemap_xml"]
         .as_str()
@@ -491,7 +533,12 @@ async fn a_noindex_page_is_emitted_with_the_directive_and_kept_out_of_the_sitema
         ),
     )
     .await;
-    assert_eq!(saved.status, StatusCode::OK, "a minimal payload is accepted: {}", saved.body);
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "a minimal payload is accepted: {}",
+        saved.body
+    );
     // A minimal payload must NOT be refused: this is the defect the unit test caught, where
     // `#[serde(default)]` handed the store a JSON `null` and the object check called it malformed.
     assert_eq!(saved.body["seo"]["robots"], "noindex,follow");
@@ -579,7 +626,10 @@ async fn a_redirect_fires_counts_its_hit_and_a_rule_that_closes_a_loop_is_refuse
         .fetch_one(fixture.db.pool())
         .await
         .expect("the counter must read");
-    assert_eq!(hits, 2, "both resolutions of the literal counted, the 302 did not");
+    assert_eq!(
+        hits, 2,
+        "both resolutions of the literal counted, the 302 did not"
+    );
 
     // The loop refusal, BEFORE the rule exists: /loop-a → /loop-b and /loop-b → /loop-a.
     call(
@@ -619,12 +669,11 @@ async fn a_redirect_fires_counts_its_hit_and_a_rule_that_closes_a_loop_is_refuse
         "the message says what would happen: {}",
         refused.body["error"]["message"]
     );
-    let stored: i64 = sqlx::query_scalar(
-        "select count(*) from cms_seo_redirects where from_path = '/loop-b'",
-    )
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the count must read");
+    let stored: i64 =
+        sqlx::query_scalar("select count(*) from cms_seo_redirects where from_path = '/loop-b'")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must read");
     assert_eq!(stored, 0, "the refused rule was never written");
 }
 
@@ -649,7 +698,10 @@ async fn a_path_two_rules_match_is_reported_as_ambiguous_and_a_test_does_not_cou
         ),
     )
     .await;
-    let rule_id = literal.body["id"].as_str().expect("the rule has an id").to_owned();
+    let rule_id = literal.body["id"]
+        .as_str()
+        .expect("the rule has an id")
+        .to_owned();
 
     let broad = call(
         &fixture.state,
@@ -659,7 +711,7 @@ async fn a_path_two_rules_match_is_reported_as_ambiguous_and_a_test_does_not_cou
             Some(&token),
             Some(json!({
                 "site_id": fixture.site,
-                "from_path": "/promo/.*",
+                "from_path": "/promo.*",
                 "to_path": "/about",
                 "pattern": "regex"
             })),
@@ -668,8 +720,12 @@ async fn a_path_two_rules_match_is_reported_as_ambiguous_and_a_test_does_not_cou
     .await;
     assert_eq!(broad.status, StatusCode::CREATED, "{}", broad.body);
 
-    // Both rules answer `/promo`. The resolver takes the literal, and the panel's test says so
-    // rather than letting the owner believe one rule owns the path.
+    // Both rules answer `/promo`: the literal is checked first, and `/promo.*` (the pattern an
+    // owner reaches for when they mean "everything under /promo") also covers it. The resolver
+    // takes the literal, and the panel's test says so rather than letting the owner believe one
+    // rule owns the path. The pattern is `/promo.*` and not `/promo/.*` because `.*` repeats the
+    // character BEFORE it, so `/promo/.*` needs the slash and would not match `/promo` at all —
+    // an ambiguity that does not exist is as misleading as one that is not reported.
     let tested = call(
         &fixture.state,
         request(
@@ -694,8 +750,11 @@ async fn a_path_two_rules_match_is_reported_as_ambiguous_and_a_test_does_not_cou
     // The test did not count. This is the reason it is a separate entry point, so it is asserted
     // rather than assumed: an owner trying three candidate rules must not leave three hits in
     // the column they are reading.
+    // `sum()` over a `bigint` returns NUMERIC, which sqlx will not decode into an `i64`; the
+    // cast is what makes the assertion readable. (The same trap cost a `500` in the store when a
+    // column type and a Rust type disagreed — here it is the *aggregate* that disagrees.)
     let hits: i64 = sqlx::query_scalar(
-        "select coalesce(sum(hits), 0) from cms_seo_redirects where site_id = $1",
+        "select coalesce(sum(hits), 0)::bigint from cms_seo_redirects where site_id = $1",
     )
     .bind(fixture.site)
     .fetch_one(fixture.db.pool())
@@ -810,10 +869,14 @@ async fn a_robots_txt_that_blocks_the_whole_site_is_saved_with_the_warning_namin
         ),
     )
     .await;
-    let warnings = overview.body["robots_warnings"].as_array().expect("warnings are an array");
+    let warnings = overview.body["robots_warnings"]
+        .as_array()
+        .expect("warnings are an array");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(
-        warnings[0].as_str().is_some_and(|w| w.contains("not to read it")),
+        warnings[0]
+            .as_str()
+            .is_some_and(|w| w.contains("not to read it")),
         "the warning says what it does: {warnings:?}"
     );
 
@@ -838,7 +901,10 @@ async fn a_robots_txt_that_blocks_the_whole_site_is_saved_with_the_warning_namin
         "robots.txt is plain text: {:?}",
         served.headers
     );
-    assert_eq!(String::from_utf8_lossy(&served.raw), "User-agent: *\nDisallow: /\n");
+    assert_eq!(
+        String::from_utf8_lossy(&served.raw),
+        "User-agent: *\nDisallow: /\n"
+    );
 
     // A frequency the sitemap does not understand is refused with a message naming it.
     let refused = call(
@@ -888,13 +954,19 @@ async fn the_broken_link_crawl_finds_a_link_to_a_page_that_does_not_exist() {
     .await;
     assert_eq!(scanned.status, StatusCode::OK, "{}", scanned.body);
     let rows = scanned.body.as_array().expect("the scan returns a list");
-    assert_eq!(rows.len(), 1, "exactly the one internal link is broken: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly the one internal link is broken: {rows:?}"
+    );
     assert_eq!(rows[0]["target_url"], "/gone-forever");
     assert_eq!(rows[0]["anchor_text"], "the old page");
     assert_eq!(rows[0]["source_slug"], "about");
     // The off-site link and the link to a real page are both left alone.
     assert!(
-        !rows.iter().any(|row| row["target_url"] == "https://elsewhere.example/x"),
+        !rows
+            .iter()
+            .any(|row| row["target_url"] == "https://elsewhere.example/x"),
         "an off-site link is not this tool's business"
     );
 
@@ -912,7 +984,12 @@ async fn the_broken_link_crawl_finds_a_link_to_a_page_that_does_not_exist() {
         ),
     )
     .await;
-    assert_eq!(dismissed.status, StatusCode::NO_CONTENT, "{}", dismissed.body);
+    assert_eq!(
+        dismissed.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        dismissed.body
+    );
 
     call(
         &fixture.state,
@@ -960,7 +1037,11 @@ async fn the_broken_link_crawl_finds_a_link_to_a_page_that_does_not_exist() {
         ),
     )
     .await;
-    assert_eq!(rescan.body.as_array().map(Vec::len), Some(0), "the fixed link left the list");
+    assert_eq!(
+        rescan.body.as_array().map(Vec::len),
+        Some(0),
+        "the fixed link left the list"
+    );
 }
 
 /// Resolve a path through the public redirect surface, returning (status, location).
