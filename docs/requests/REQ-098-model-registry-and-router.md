@@ -1,11 +1,13 @@
 # REQ-098 — Model Registry & Router
 
-> **Status:** in-progress (slices 1–3 shipped; slice 3 closing) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slices 1–4 shipped; QA pass owed) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > Slice 1 shipped (`a417ce9` · `13c3146` · `32e4442`): the price columns and their two vocabularies,
 > the narrowable listing, the price write path and the catalog screen. Slice 2 (`0244b29` · `7fa1f89` ·
 > `b0a3a25` · `1a14298`): the task maps, the feature pins, the resolution order and the dry run.
 > Slice 3 (`7ec57bd` · `2741cea` · `7e4a33c` · `f8e68c4`): the decision log, its CSV export, the
-> retention pruner and the screen that reads them.
+> retention pruner and the screen that reads them. Slice 4 (this tick): the **live call path** —
+> `resolve_and_record`, the unresolved refusal and the `ai.route.unresolved` event — plus the
+> repair of two write-path defects slice 3 had left behind and one this slice's tests exposed.
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -180,13 +182,15 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
   *`a_resolved_request_leaves_a_decision_with_its_walk` asserts the walk entry by entry: entry 1 `chosen`, entry 2 `skipped` **with** the reason "not reached". A walk that lists only the winner cannot answer
   "why not the second model", which is the question that brings an operator to the screen. The run link is rendered from `run_id` when the decision carries one and omitted when it does not — a link to a
   null run is a dead button.*
-- [~] Removing a model a route references leaves the route row with a null candidate and an `ai.route.unresolved` event, and the panel marks the row as needing attention.
+- [x] Removing a model a route references leaves the route row with a null candidate and an `ai.route.unresolved` event, and the panel marks the row as needing attention.
   *Split honestly, because "half" and "done" are different answers. **Proved:** the row survives with a null candidate and the panel marks it — `a_removed_model_leaves_a_null_candidate_the_panel_marks` deletes a
   model a route names, re-reads the routing screen and asserts the candidate row carries `needs_attention: true` with a null `model_id`, and the foreign key is `on delete set null` precisely so the row does.
-  **Not yet:** the `ai.route.unresolved` **event**. The event belongs to the *resolve* path, not to the delete path: the walk already refuses and explains itself, and a decision row with `rule = 'unresolved'` is
-  written the moment a request cannot be answered — which is the moment the event should fire. The slice that owns the resolve-time wiring is the one that dials the provider, and it does not exist yet (the AI
-  engine's live call path is REQ-001's, and this request explicitly excludes provider connection). Boxing this as done would claim a webhook no code emits. Left open on purpose: the next slice on this
-  request wires `record` into the call path, and the event rides the same line.*
+  **Also proved this slice:** the `ai.route.unresolved` **event**, which the previous revision of this box
+  said was not yet emitted. It is emitted now, from the resolve path it belongs to: `an_unresolved_task_is_answered_with_422_and_announced` writes
+  a `tools` requirement against a model that cannot claim it, sends a real chat, and asserts three things at once — the request is refused **422** (not 500,
+  because nothing inside the platform failed; the maps simply hold nothing that can answer), a decision row exists with `rule = 'unresolved'` and the walk's
+  reasons, and the event carries the **requesting organization** rather than the installation's. That last one is the part worth asserting: an event that fires
+  without a scope becomes every tenant's event, which is a webhook that is correct for exactly one subscriber and wrong for all the others.*
 - [x] Decision rows older than the retention window are pruned by the runner while usage counters for the same window stay complete (test asserts counts).
   *`pruning_drops_old_decisions_and_keeps_the_usage_counters` ages **one** row by moving `created_at` back — not by shrinking the retention to zero, which would also delete the row the test wants to keep — then
   asserts exactly one row went, the fresh decision is still readable through the endpoint, and the aged one is now a 404. A stale bookmark is a 404 and not an empty body, because a row that is not there is
@@ -242,6 +246,14 @@ The visual check must see: numeric columns right-aligned (context window, costs)
    owns `ai_usage` and it is not on this branch, so the migration adds the column the day that table
    appears and is a no-op before that. The first applier wins; a race surfaces as a duplicate-column
    error, which is visible, rather than a silent divergence.
+
+4. **Live call path** — `resolve_and_record` on the real request path, the `unresolved` refusal, the `ai.route.unresolved` event, and the repairs slice 3's own walks could not see.
+   *Done when:* a real chat leaves a decision row **before** the provider is dialled, a request nothing can answer is refused with its reasons on the row and announced once, and no write to the routing maps answers 500.
+   *Shipped (this tick).* `crates/ai-hub/src/resolve_path.rs` is the call site, `apps/api/tests/ai_live_path.rs` proves it in four walks over the real router, and the events go out from `announce_unresolved`.
+   Three defects were found and fixed, and **two of the three were in the product, not the test**:
+   - `set_override` still named `scope_key` in its INSERT, so **every feature pin answered 500** — the sibling fix in `44b85c9` corrected the route write in the same file and missed this one. A generated column may be *read* by an index, a constraint or a conflict target and may not be *written*; that asymmetry is what made the two writes disagree.
+   - `put_routing` never called `check_task`, so a misspelled task was refused further down by the *candidate* validator, whose message names a model and a requirement — a complaint that reads as though the model were at fault when the operator typed `fast` instead of `cheap`.
+   - `CandidateView::build` used `model.as_ref().and_then(..)` for its refusal, so a row whose model had been **removed** rendered a "needs attention" badge with **no sentence** next to it. A warning with nothing to act on is not a warning.
 
 ### Risks / notes
 

@@ -3204,3 +3204,61 @@ consecutive ticks and remains unrun.
 alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
 first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
 slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
+
+---
+
+## 2026-09-28 · REQ-098 slice 4 (the live call path) + the routing write repairs
+
+**What.** `crates/ai-hub/src/resolve_path.rs` — the missing call site. Slice 3 shipped a decision
+log that only a test could write to, which is a log that stays empty in production and is
+indistinguishable from a broken one. `resolve_and_record` resolves against the maps, **records the
+decision before the provider is dialled**, and hands back the pair; a walk that cannot answer still
+returns (the caller decides what a refusal means) and fires `ai.route.unresolved` once, scoped to
+the requesting organization. `POST /ai/chat` moves onto it: the routing requirements are derived
+from what the request *is* (a conversation carrying an image is a vision request whatever the
+caller called it), `Chat`/`Streaming` are re-checked on the chosen model because they are properties
+of the endpoint rather than of the request, and an unanswerable request is `422` rather than `500` —
+nothing failed inside the platform; the maps hold nothing that can answer, and the fix is one row
+on the routing screen.
+
+**Three defects, two of them in the product.** The walks that found them had been green for a tick.
+
+- `set_override` named `scope_key` in its INSERT, so **every feature pin answered 500**. The
+  sibling fix (`44b85c9`) corrected the route write in the same file and missed this one. The
+  asymmetry that let it through: a generated column may be *read* by an index, a constraint or a
+  conflict target, and may not be *written* — so `on conflict (scope_key, feature)` was never the
+  problem and the column list was.
+- `put_routing` never called `check_task`. A misspelled task fell through to the *candidate*
+  validator, whose message names a model and a requirement — a complaint that reads as though the
+  model were at fault when the operator typed `fast` instead of `cheap`.
+- `CandidateView::build` computed its refusal with `model.as_ref().and_then(..)`, so a row whose
+  model had been **removed** rendered a "needs attention" badge with no sentence beside it. The
+  resolver has said this in a walk since slice 2; the row the operator is looking at said nothing.
+
+**The fourth was the loudest, and it was a merge artifact.** Merging `origin/main` collided on
+migration `0047`, and git silently kept *both* files — the phantom-migration failure that kills
+`live_state` with `VersionMismatch(47)` and presents as a wall of unrelated red. Renumbering the
+branch's three new migrations to `0051`–`0053` (past main's high-water mark, read at commit time)
+went from **11/11 failing** to 5/11, which is how the rename was proved a real fix rather than a
+plausible one.
+
+**And the six that remained were a test lying, not a resolver choosing wrong.** Every one of them
+asserted `small` and read `large`, which reads as a routing bug. The truth: slice 1 (`a417ce9`)
+made `critical` and `coding` require the tools flag, so `PUT /ai/routing` was **refusing** those
+walks' `large` candidates with a `400` — and the walks **never asserted that the PUT succeeded**,
+so a rejected write left the map empty and the next preview fell through to the installation
+default. `Fixture::put_map` now asserts the write, with `try_put_map` beside it for the walks whose
+subject *is* a refusal. Two more things that hid in the same file: four walks read the error message
+from `body["message"]` when the envelope is `{"error": {"message": …}}` — always `null` — and the
+fixture's three models did not span the capability profiles its walks needed, so fixing the first
+silently disarmed a second (`a_capability_incompatible_…` pointed at `large`, which had just become
+tools-capable). A fourth model, `plain`, now exists for that walk alone.
+
+**Proof.** `cargo test -p omnion-ai-hub --quiet` → **151 passed, 0 failed**.
+`cargo test -p omnion-api --test ai_routing -- --test-threads=1` → **11/11** (was 5/11; the 6 were
+proved real by isolating each and by an A/B against a stashed tree, not by blaming concurrency).
+`--test ai_decisions` → **11/11** · `--test ai_catalog` → **9/9** · `--test ai_live_path` → **4/4**.
+`npx turbo run typecheck --force` → **2 successful, 0 errors**.
+
+**Next.** `bash scripts/qa/run.sh` on the private `QA_STACK=w7` stack — the log screen and the
+routing screen have never had a pass since slice 3 — and only then the closing box.
