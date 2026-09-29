@@ -25,6 +25,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCheck,
+  Download,
   Filter,
   Loader2,
   RefreshCw,
@@ -39,6 +40,7 @@ import {
   bulkSecurityFindingStatus,
   fetchSecurityFindings,
   importSecurityReport,
+  securityFindingsExportUrl,
   setSecurityFindingStatus,
   type ApiError,
 } from "@/lib/api";
@@ -534,6 +536,18 @@ export function SecurityFindingsScreen() {
             }}
             data-findings-import
           />
+          <a
+            href={securityFindingsExportUrl({
+              ...filter,
+              search: searchDraft.trim() || undefined,
+            })}
+            className="inline-flex items-center gap-1.5 rounded border border-line px-2.5 py-1 text-[12px] text-ink"
+            data-findings-export
+            title="Exports every finding this filter matches, not just this page"
+          >
+            <Download aria-hidden className="h-3.5 w-3.5" />
+            Export CSV
+          </a>
           <button
             type="button"
             onClick={() => fileRef.current?.click()}

@@ -4496,6 +4496,29 @@ export function fetchSecurityFinding(id: string): Promise<SecurityFinding> {
 }
 
 /**
+ * The URL the export button points at, carrying the *current* filter.
+ *
+ * A plain href rather than a fetch: the answer is a file, and a client that fetched it and
+ * built a blob URL would have to get the filename, the content type and the error case right
+ * on its own. The filter travels in the query string, which is what makes "export what I am
+ * looking at" true by construction rather than by two parsers agreeing — and the server
+ * deliberately ignores `limit` here, because an export that respects the page size is how a
+ * 50-row file gets read as a 300-row platform's whole posture.
+ */
+export function securityFindingsExportUrl(
+  filter: SecurityFindingFilter = {},
+): string {
+  const params = new URLSearchParams();
+  if (filter.severity) params.set("severity", filter.severity);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.component) params.set("component", filter.component);
+  if (filter.search) params.set("search", filter.search);
+  const query = params.toString();
+  return `/api/v1/security/findings.csv${query ? `?${query}` : ""}`;
+}
+
+/**
  * Change one finding's status.
  *
  * `ignore_reason` is **required by the server** for an ignore and the refusal names the field,

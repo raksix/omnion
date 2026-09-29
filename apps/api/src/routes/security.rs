@@ -22,6 +22,7 @@
 use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use omnion_audit::{NewAuditEntry, record as record_audit};
 use omnion_events::{NewEvent, bus};
 use omnion_security::{
@@ -371,6 +372,57 @@ pub async fn list(
         offset: page.offset,
         findings: page.findings.into_iter().map(FindingBody::from).collect(),
     }))
+}
+
+/// `GET /security/findings.csv` — the current filter as a CSV document.
+///
+/// A separate path rather than a query flag on the list, because the two answers have
+/// different content types and a client that asks for CSV and gets JSON has to guess. The
+/// filter is read by the same parser the list uses, so "export what I am looking at" is true
+/// by construction rather than by two parsers agreeing.
+pub async fn export(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
+    let mut query = parse_findings_params(raw.as_deref())?;
+    // The page size is deliberately dropped: the export is the whole filter. `limit` on the
+    // query is still *parsed* (so a nonsense value is still refused by name) and then
+    // ignored, rather than being an unknown parameter that is silently dropped.
+    query.limit = 0;
+    query.offset = 0;
+
+    let rows = omnion_security::export_findings(state.db().pool(), session.user.organization_id, &query)
+        .await
+        .map_err(map_store)?;
+    let document = omnion_security::render_findings_csv(&rows).map_err(map_store)?;
+
+    let stamp = time::OffsetDateTime::now_utc().date().to_string();
+    let filename = format!("security-findings-{stamp}.csv");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/csv; charset=utf-8"
+            .parse()
+            .expect("a literal content type always parses"),
+    );
+    // `attachment` rather than `inline`: a CSV served inline from the panel's own origin is
+    // one click away from being opened as a document on the API origin.
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        format!("attachment; filename=\"{filename}\"")
+            .parse()
+            .expect("an ASCII filename always parses"),
+    );
+    // The export is a file that leaves the platform, so it carries the one header that stops a
+    // browser from deciding it is something else.
+    headers.insert(
+        "x-content-type-options",
+        "nosniff"
+            .parse()
+            .expect("a literal header value always parses"),
+    );
+    Ok((StatusCode::OK, headers, document).into_response())
 }
 
 /// `GET /security/findings/{id}` — one finding, with its evidence.
