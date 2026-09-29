@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { SecurityTabs } from "@/features/security/security-tabs";
 import {
   bulkSecurityFindingStatus,
   fetchSecurityFindings,
@@ -50,7 +51,6 @@ import type {
   SecurityFindingStatus,
   SecuritySeverity,
 } from "@/lib/types";
-import { SecurityTabs } from "@/features/security/security-tabs";
 
 const SEVERITIES: SecuritySeverity[] = ["critical", "high", "medium", "low", "info"];
 const STATUSES: SecurityFindingStatus[] = ["open", "acknowledged", "fixed", "ignored"];

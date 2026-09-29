@@ -1730,6 +1730,7 @@ export type SecurityImportReport = {
   rejected: string[];
 };
 
+// Security centre (REQ-012, slice 2) — the header policy
 /**
  * Whether the CSP is enforced or only reported.
  *
@@ -1761,7 +1762,6 @@ export const CSP_DIRECTIVE_NAMES = [
   "block-all-mixed-content",
   "require-trusted-types-for",
 ] as const;
-
 /** The `Referrer-Policy` values browsers implement. An empty choice sends no header. */
 export const REFERRER_POLICIES = [
   "no-referrer",
@@ -1781,7 +1781,6 @@ export const REFERRER_POLICIES = [
  * the browser silently drops", and an operator setting 3600 deserves to be told before saving.
  */
 export const MIN_HSTS_MAX_AGE = 15_768_000;
-
 /**
  * One CSP directive row.
  *

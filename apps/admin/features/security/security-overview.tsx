@@ -34,8 +34,8 @@ import {
   runSecurityChecks,
   type ApiError,
 } from "@/lib/api";
-import type { SecurityCheck, SecurityCheckState, SecurityOverview } from "@/lib/types";
 import { SecurityTabs } from "@/features/security/security-tabs";
+import type { SecurityCheck, SecurityCheckState, SecurityOverview } from "@/lib/types";
 
 /** The four states and how each one reads. The label is never the colour alone. */
 const STATE_LABEL: Record<SecurityCheckState, string> = {
