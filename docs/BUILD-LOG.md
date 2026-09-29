@@ -5977,8 +5977,9 @@ the tab strip, `5c8870d` the browser claims, `ab32a41` the REQ's own record. `pn
    one the operator cannot uncheck and the promotion would freeze a row that is not on screen.
 
 **Proof.** `pnpm typecheck` → 2/2 packages green. `cargo test -p omnion-environment --quiet` → **50
-passed, 0 failed**. `cargo test -p omnion-api --lib` was started and is still compiling the API
-dependency tree under load 17; it is not claimed as green here.
+passed, 0 failed**. `cargo test -p omnion-api --lib` → **263 passed, 0 failed** (it finished after
+this entry was first written, at about two minutes of compile under load 17 — the two gates are the
+contract for a build tick and both are green).
 
 **The gate did not run, and that is what keeps slice 3 open.** A sibling writer held the QA slot for
 the whole tick (holder pid 3490157, alive at the end), `/dev/shm` sat at 94% and load at 17. Starting
