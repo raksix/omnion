@@ -4078,6 +4078,67 @@ pass reports — read `crmStates` and `crmKeyboardMobile` from the first w4 repo
 `56464c4` and only then tick them.
 
 
+## 2026-09-28 · tick 21 · REQ-052 slice 2 — quotes end to end, and the four defects the walk found
+
+**What.** The document a seller writes: the line grid, the header, the versions the customer saw,
+the per-organization numbering, the public link whose token is stored only as a hash — plus five
+screens and a browser walk that reads the builder's total off the screen and requires it to be the
+number the module computed.
+
+**Why the rule set lives in the module and not the handler.** Slice 2 added two callers with no
+session and no actor: the public accept/decline and the expiry sweep. A rule written in a handler
+is a rule those two writers do not have.
+
+**Proof.**
+
+| gate | result |
+|---|---|
+| `cargo test -p omnion-module-sales` | 102/102 (87 from slice 1, 15 new) |
+| `cargo test -p omnion-api --test sales_quotes` | 16/16 walks |
+| `cargo test -p omnion-api --test sales` | 17/17 unchanged after the migration edit |
+| `cargo clippy -p omnion-module-sales --all-targets` | 0 warnings |
+| `pnpm typecheck` | 2/2 packages clean |
+| `scripts/qa/walkthrough.cjs` | parses; the `sales-quotes` pass is written |
+
+**Four defects the walks found in the slice** — two in the product and two in the walk itself,
+which is the useful outcome, because a test that only ever agrees with the code proves nothing.
+
+1. **The first version was numbered 2.** The column read `default 1` with `check (version >= 1)`
+   and `send` incremented it, so the first snapshot of the first document anybody was ever sent
+   said "v2" — a gap in a sequence whose whole point is that it has none, and a number the
+   customer reads. Now `default 0`, `check (version >= 0)`: 0 is a real state (never sent).
+2. **A cancelled draft was refused by its own table.** The constraint read
+   `(status = 'draft') = (sent_at is null)`, which forbids a draft that was withdrawn — the cancel
+   sets the status and leaves `sent_at` null. One direction now: `sent_at is null or status <> 'draft'`.
+3. **The version snapshot never bound `organization_id`**, so `send` was a 500 on the not-null
+   constraint. Bound explicitly, not defaulted.
+4. **A frozen version carried its totals as JSON numbers** while the live quote carried text, so
+   the version history would have needed a second formatter and a browser would have parsed a
+   `numeric` as a float.
+
+The walk's own two: the hand-written fixture's grand total was 417.71 where the per-line column
+says 407.76, and three tests called `issue_link` on a draft and were surprised by a 400 — which was
+the product being right.
+
+**Merge.** `origin/main` moved 21 commits; two conflicts, resolved by splicing both sides' non-equal
+chunks into the base (`SequenceMatcher` opcodes) and then verifying that **every** chunk from both
+sides survives in the output — 4244 lines, 0 chunks lost. The first verification formula
+(`base + ours + theirs` as a multiset) was wrong: shared lines legitimately appear once, and it
+reported 2480 "missing". The line-count check alone is not enough either — it hides a duplicated
+block.
+
+**Migration numbers.** `0051_sales.sql` collided with main's `0051_notification_routes`, and my
+`0052` collided with wave9's. Both moved to **0053** and **0054**. The shared namespace is the
+lesson from the earlier incident, repeated: take the next free number *above every sibling's
+high-water mark*, not the next free number on your own branch.
+
+**Next.** The QA pass is queued behind another writer's. When it lands, read its findings, fix any
+high caused by these screens, and tick the two boxes the pass can prove. Then slice 3: the
+**approval gate** — the threshold check is already on the screen (the banner) and already on the
+server (`Settings::needs_approval`); what is missing is the REQ-059 request, the approve/reject
+handling and the notifications to both sides.
+
+
 ## 2026-09-28 — tick 20 · REQ-052 slice 1 · the catalog API, the dates it could not have carried, and the screens
 
 Slice 1 of REQ-052 closed end to end: the migration, the module, the routes, the five screens and
