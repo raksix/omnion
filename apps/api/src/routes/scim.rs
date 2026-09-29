@@ -865,7 +865,11 @@ pub async fn create_user(
     }
 
     if payload.active == Some(false) {
-        users::set_status(state.db().pool(), created.id, "disabled")
+        // A connector may create an account already deactivated. The status setter that revokes
+        // is the one used here, not the display-only one: a brand-new account has no sessions,
+        // but "it has none today" is not a property that stays true, and this write path is the
+        // same one that deactivates a live account further down.
+        users::set_status_and_end_sessions(state.db().pool(), created.id, "disabled", "scim_deactivated")
             .await
             .map_err(internal)?;
     }
@@ -986,12 +990,24 @@ async fn apply_user_changes(
     }
 
     let mut outcome = "updated";
+    let mut revoked_sessions = 0_u64;
     if let Some(active) = payload.active {
         let status = if active { "active" } else { "disabled" };
         if status != user.status {
-            users::set_status(state.db().pool(), user.id, status)
-                .await
-                .map_err(internal)?;
+            // The revoking setter, because this is the path a directory takes a *live* person
+            // out of service on, and `resolve_session` reading `status = 'active'` is a filter,
+            // not a revocation: the tokens stay in the browser and stop working again the moment
+            // a later sync re-activates the account. See `users::set_status_and_end_sessions`.
+            let change = users::set_status_and_end_sessions(
+                state.db().pool(),
+                user.id,
+                status,
+                "scim_deactivated",
+            )
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| ScimError::not_found(format!("no account {}", user.id)))?;
+            revoked_sessions = change.1.revoked_sessions;
             if !active {
                 outcome = "deactivated";
             }
@@ -1012,7 +1028,19 @@ async fn apply_user_changes(
             outcome,
             external_id: payload.external_id.as_deref(),
             entity_id: Some(updated.id),
-            detail: format!("{} now reads {}", updated.email, updated.status),
+            detail: if revoked_sessions > 0 {
+                // The count is in the log because it is the number an operator needs and cannot
+                // get anywhere else: "deactivated" says the account is out, and this says how
+                // many live tokens went with it. A directory that reports one deactivated account
+                // while three people are still holding working sessions is the failure this
+                // slice removes, and it is invisible from the account row alone.
+                format!(
+                    "{} now reads {} — {revoked_sessions} session(s) ended",
+                    updated.email, updated.status
+                )
+            } else {
+                format!("{} now reads {}", updated.email, updated.status)
+            },
         },
     )
     .await;
@@ -1197,9 +1225,14 @@ pub async fn delete_user(
     .await
     .map_err(internal)?;
 
-    users::set_status(state.db().pool(), user.id, "disabled")
-        .await
-        .map_err(internal)?;
+    users::set_status_and_end_sessions(
+        state.db().pool(),
+        user.id,
+        "disabled",
+        "scim_deactivated",
+    )
+    .await
+    .map_err(internal)?;
 
     log(
         &state,
@@ -1210,8 +1243,12 @@ pub async fn delete_user(
             outcome: "deactivated",
             external_id: None,
             entity_id: Some(user.id),
+            // DELETE is what connectors send last for somebody who left, and it is the one path
+            // where "the account is disabled" is the whole meaning. Ending the sessions is not an
+            // extra nicety here: a DELETE that left the tokens working would hand a departed
+            // employee's browser a working session until the token expired on its own.
             detail: format!(
-                "{} was deactivated (the SCIM default — the account stays)",
+                "{} was deactivated (the SCIM default — the account stays, its sessions do not)",
                 user.email
             ),
         },

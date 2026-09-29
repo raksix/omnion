@@ -156,6 +156,12 @@ pub async fn create_user(pool: &PgPool, new: NewUser) -> Result<User> {
 ///
 /// `None` means no such account. The status decides `is_active`, which every sign-in path
 /// already reads, so a deactivation takes effect on the next request without touching sessions.
+///
+/// **This is the display-only half.** [`set_status_and_end_sessions`] is the one that revokes,
+/// and it is the one every code path that takes an account out of service must call: a status
+/// flag alone is not a revocation, because the flag is a *query filter* while a session token is
+/// a *bearer credential* already in somebody's browser. See that function for the failure this
+/// distinction produces.
 pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<User>> {
     if !matches!(status, "active" | "invited" | "disabled") {
         return Err(IdentityError::InvalidUser(format!(
@@ -170,6 +176,134 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .fetch_optional(pool)
         .await
         .map_err(IdentityError::from)
+}
+
+/// What a status change did to the account's live sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusChange {
+    /// Sessions ended by this change.
+    pub revoked_sessions: u64,
+}
+
+/// The row a status change returns: the account as it now reads, and the status it read as
+/// before this statement ran.
+///
+/// A named struct rather than a tuple, because `sqlx::FromRow` is derived and does not exist for
+/// tuples — and because the second field is the whole reason the query exists, and a positional
+/// accessor would hide what it is.
+#[derive(sqlx::FromRow)]
+struct StatusUpdateRow {
+    id: Uuid,
+    organization_id: Option<Uuid>,
+    email: String,
+    display_name: String,
+    status: String,
+    created_at: OffsetDateTime,
+    previous_status: String,
+}
+
+/// Set an account's status **and end every live session it has**, in one transaction.
+///
+/// The status flip and the revocation are the same fact: an account taken out of service must
+/// not keep handing out access through a token minted a second earlier. Doing them in one
+/// transaction means there is no window in which the account reads `disabled` while its
+/// sessions are still live, or the reverse.
+///
+/// **Why the revocation is not optional, stated as the bug it fixes.** `resolve_session` already
+/// filters on `u.status = 'active'`, so a deactivated account's sessions *stop resolving* — and
+/// that is exactly why the missing revocation is invisible to a test that only checks "the
+/// session no longer works". It works again. A directory that deactivates an account because it
+/// left the company, and reactivates it weeks later when the sync notices the stale row, hands
+/// the *old* browser tabs back a working session: `status` is back to `active`, the session row
+/// was never touched, and a token that was believed dead is alive again with its original
+/// expiry. The session must be *ended*, not merely masked, so that reactivating cannot resurrect
+/// it.
+///
+/// A status that does not take the account out of service (`active`, `invited`) revokes
+/// nothing: an admin re-activating an account is not an instruction to log the person out of the
+/// tabs they just used to sign in with.
+///
+/// **A no-op change revokes nothing.** Setting `disabled` on an account that is already disabled
+/// must not clear its sessions — an operator pressing the button twice, or a connector
+/// re-sending the same document on its timer, would silently sign a colleague out. That is why
+/// the read of the current status is part of the same statement as the write rather than a
+/// separate `find_by_id` before it.
+pub async fn set_status_and_end_sessions(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    reason: &str,
+) -> Result<Option<(User, StatusChange)>> {
+    // Validated before anything is written, and by this function alone: the variant a caller can
+    // pass is a `&str`, so the check the other setter makes is the one that has to be repeated.
+    if !matches!(status, "active" | "invited" | "disabled") {
+        return Err(IdentityError::InvalidUser(format!(
+            "unknown account status `{status}`"
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // `for update` in the CTE is what makes "read the old status, write the new one" one
+    // statement: two concurrent deactivations cannot both read `active` and both believe they
+    // were the one that ended the sessions.
+    let row: Option<StatusUpdateRow> = sqlx::query_as(
+        "with previous as (select id, status from users where id = $1 for update) \
+         update users u set status = $2 from previous p where u.id = p.id \
+         returning u.id, u.organization_id, u.email, u.display_name, u.status, u.created_at, \
+                 p.status as previous_status",
+    )
+    .bind(id)
+    .bind(status)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    // No such account. The row lock is released with the rollback rather than held to the end of
+    // the function for a result that needs no further writes.
+    let Some(row) = row else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    // A status change that does not take the account out of service, or one that leaves it where
+    // it already was, ends nothing. The comparison borrows: `into_user` below needs the row.
+    let revokes = status == "disabled" && row.previous_status != status;
+    if !revokes {
+        tx.commit().await?;
+        return Ok(Some((row.into_user(), StatusChange::default())));
+    }
+
+    let reason = crate::sessions::truncate_reason(reason);
+    let revoked: Vec<Uuid> = sqlx::query_scalar(
+        "update sessions set revoked_at = now(), revoke_reason = coalesce(revoke_reason, $2) \
+         where user_id = $1 and revoked_at is null returning id",
+    )
+    .bind(id)
+    .bind(&reason)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some((
+        row.into_user(),
+        StatusChange {
+            revoked_sessions: revoked.len() as u64,
+        },
+    )))
+}
+
+impl StatusUpdateRow {
+    /// The account half of the row, with the `previous_status` column dropped.
+    fn into_user(self) -> User {
+        User {
+            id: self.id,
+            organization_id: self.organization_id,
+            email: self.email,
+            display_name: self.display_name,
+            status: self.status,
+            created_at: self.created_at,
+        }
+    }
 }
 
 /// Look an account up by email address.
