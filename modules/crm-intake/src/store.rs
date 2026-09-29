@@ -383,6 +383,109 @@ pub async fn set_broken_mappings(pool: &PgPool, id: Uuid, broken: &[String]) -> 
     Ok(())
 }
 
+/// Run the binding health check for this source's submission and record the answer.
+///
+/// **Never fatal, and never a write when the answer is unchanged.** Three decisions, each one
+/// the obvious alternative of which is wrong:
+///
+/// * **Not fatal.** A health check that can fail a capture is a health check that can lose a
+///   lead. A rename on somebody's form is a broken integration; answering `500` to the
+///   visitor who is submitting right now makes the platform the reason the business stops.
+///   Every failure here is logged and the capture continues, because a lead written with one
+///   empty field is worth more than a lead nobody wrote.
+/// * **Not a write when unchanged.** A row whose health is rewritten on every submission
+///   produces an `updated_at` that moves continuously, and the source list orders by it — so
+///   the health check would turn the "recently touched" signal into a submission-rate signal.
+///   `broken_mappings` is compared first, and the write is skipped when it already matches.
+/// * **Not cleared by an unknown answer.** [`BindingHealth::keys_to_store`] is `None` for the
+///   unknown cases, so a forms-less installation does not silently un-break every form-bound
+///   source it has. An empty list and an unreadable one are different facts.
+async fn record_binding_health(pool: &PgPool, source: &IntakeSource, submission: &Submission) {
+    let health = match crate::binding_health::check(pool, source, &submission.payload).await {
+        Ok(health) => health,
+        Err(error) => {
+            tracing::warn!(
+                source_id = %source.id,
+                error = %error,
+                "the intake binding health check could not run; the submission continues"
+            );
+            return;
+        }
+    };
+
+    let Some(keys) = health.keys_to_store() else {
+        // An answer we could not read. Deliberately not a warning about the binding: the
+        // binding may be perfectly healthy, and the operator's action is "install the forms
+        // module", which a red "broken mapping" badge would send them in the wrong direction.
+        tracing::info!(
+            source_id = %source.id,
+            reason = ?health,
+            "the intake binding health could not be read; the source keeps its last answer"
+        );
+        return;
+    };
+    if !keys.is_empty() {
+        tracing::warn!(
+            source_id = %source.id,
+            form_key = ?source.form_key,
+            keys = %keys.join(", "),
+            "the bound form no longer has some mapped keys; those fields arrive empty"
+        );
+    }
+    if keys == source.broken_mappings {
+        return;
+    }
+    if let Err(error) = set_broken_mappings(pool, source.id, keys).await {
+        tracing::warn!(
+            source_id = %source.id,
+            error = %error,
+            "the broken-mapping list could not be recorded"
+        );
+        return;
+    }
+
+    if let Some(lead_id) = lead_of_claim(pool, submission).await {
+        // The trail line is what turns "a source is broken" into "this lead is missing these
+        // fields", and it is written only when the answer *changed* — a health line on every
+        // submission would bury the one where it broke.
+        let _ = append_event(
+            pool,
+            lead_id,
+            "mapping_health",
+            None,
+            serde_json::json!({ "broken": keys }),
+        )
+        .await;
+    }
+}
+
+/// The lead a *previous* delivery of this submission produced, if there is one.
+///
+/// The health check runs before the lead is written, so on the first submission after a rename
+/// there is nothing to attach a line to. That asymmetry is deliberate and not worth a second
+/// code path: the source row is the authoritative record, and the trail line is a pointer at
+/// it. When a claim links a submission to a lead — a redelivery, or a retried capture — that
+/// lead is the one the operator is looking at, and it gets the line.
+///
+/// The lookup goes through `crm_lead_submissions` because that is the only table that
+/// records "this submission id produced that lead" as a fact. A `payload->>'submission_id'`
+/// read looks equivalent and is not: the payload is the submitter's own data, and a form
+/// cannot be trusted to carry an id the platform minted.
+async fn lead_of_claim(pool: &PgPool, submission: &Submission) -> Option<Uuid> {
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "select lead_id from crm_lead_submissions \
+         where source_id = $1 and submission_id = $2 and lead_id is not null \
+         order by claimed_at desc limit 1",
+    )
+    .bind(submission.source_id)
+    .bind(submission.submission_id.clone()?)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    id
+}
+
 /// Record that a source accepted (or refused) a submission, and why.
 ///
 /// `last_error` is *not* cleared on success by this function; the editor shows the last thing
@@ -563,6 +666,23 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
 
     let lines = source.mapping_lines();
     let mapped = mapping::apply(&lines, &submission.payload)?;
+
+    // 2a. The binding's health, checked on this submission because this submission is the only
+    //     evidence that a key still exists. **Written before the verdict, and never fatal.**
+    //
+    //     `mapping::health` and `set_broken_mappings` shipped several slices before this line,
+    //     and neither had a production caller: the pure function's references were its own
+    //     definition and two unit tests, the writer's was its own definition. The column had a
+    //     model predicate and a screen branch that renders the missing keys, so the panel drew
+    //     a "broken mapping" warning that no state on any installation could reach. An exported,
+    //     unit-tested, REQ-named function is not a feature.
+    //
+    //     The check runs here rather than in the editor because the editor is not where the
+    //     drift is observable: a field rename reaches the CRM as a submission whose payload no
+    //     longer has the old key, and the moment that answer becomes true is the moment the
+    //     platform has evidence for it.
+    record_binding_health(pool, &source, &submission).await;
+
     let spam = SpamVerdict::evaluate(&submission.payload);
     let attribution = merge_attribution(
         pool,
