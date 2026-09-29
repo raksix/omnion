@@ -282,6 +282,15 @@ catalogue! {
     "media.retention_applied", "media", Live,
     "A retention rule changed or removed items.",
     [("rule", String, req), ("affected", Integer, opt)];
+
+    // The AI router (REQ-098). `unresolved` is the only one that is recorded today, and it is
+    // the one an operator actually needs: it is the signal that a request came in and *nothing*
+    // in the pool could answer it, which is the failure that otherwise surfaces as a feature
+    // that quietly stopped working rather than as an error anywhere.
+    "ai.route.unresolved", "ai", Live,
+    "A model request could not be resolved to a usable model by any rule.",
+    [("decision_id", Uuid, req), ("task", String, req), ("rule", String, opt),
+     ("feature", String, opt), ("requested", String, opt), ("requirements", Json, opt)];
     "media.duplicate_merged", "media", Live,
     "A duplicate item was merged into the one that was kept.",
     [("kept_media_id", Uuid, req), ("merged_media_id", Uuid, req), ("affected", Integer, opt)];
