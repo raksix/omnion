@@ -6968,11 +6968,173 @@ async function runIamAuthenticationDepth(page, report) {
   note({ step: "sign-in-log", logRows, hasEmptyState: /No sign-in/i.test(logText) });
   await shot(page, "page-iam-authentication-log");
 
-  // ---- The attribute map: a real editor, and a preview that runs the real projection --------
-  // The mapping is the wizard's third step and it is the part that is invisible until somebody
-  // cannot sign in, so the walkthrough edits it and rehearses a pasted claims payload. The
-  // rehearsal matters more than the editing: a preview that echoed its own input would agree
-  // with this screen and disagree with every sign-in.
+  // ---- The BLOCKED half of the deletion dialog (REQ-065, slice 4 part 12) ------------------
+  // Everything above this line walks the *unblocked* provider, and that is the half that was
+  // already running. The other half needs an account that really came from a directory, and the
+  // pass had no way to make one: the SCIM round trip in the provisioning pass minted a token and
+  // used it, but its account lived in an organization this dialog would never be pointed at, and
+  // the two passes have no channel between them.
+  //
+  // So this provisions one through the **real** SCIM endpoint with a token minted a few lines
+  // below, and then opens the dialog on a provider that has provisioned nobody — which is now a
+  // different account. Wait: the order matters. The token is minted, the account is pushed, and
+  // only then is the dialog opened on a *different*, freshly created provider, because the
+  // guard's query is organization-scoped: a SCIM row counts for **every** provider in the
+  // organization, since a connector names no provider. That is `0127`'s documented state, and
+  // asserting it is the point — the criterion is "deleting a provider that provisioned users is
+  // blocked", and this is the only shape a SCIM-provisioned account can take in this schema.
+  const blockedStamp = Date.now().toString().slice(-6);
+  const blockedEmail = `scim-blocked-${blockedStamp}@omnion.test`;
+
+  // A token, from the real screen. Minted here rather than in the provisioning pass because the
+  // dialog needs a *live* account in *this* organization and the provisioning pass is a different
+  // function with a different token whose secret is already revoked by the time it returns.
+  await page.goto(`${URL_ADMIN}/settings/iam/provisioning`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-provisioning-view]", { timeout: 20000 }).catch(() => {});
+  await page.waitForSelector("[data-provisioning-organization]", { timeout: 8000 }).catch(() => {});
+  await page.locator("[data-token-name]").first().fill(`QA deletion guard ${blockedStamp}`).catch(() => {});
+  await page.locator("[data-token-mint]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-token-secret]", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const blockedToken = (await page.locator("[data-token-secret] code").first().innerText().catch(() => "")).trim();
+
+  // The push, through the real endpoint. Asserting `identity_source` here rather than through
+  // the dialog alone is deliberate: the dialog proves the guard, and the column is what the guard
+  // reads, so a guard that counted the account for some other reason would still be caught.
+  const push = await page.evaluate(async ({ token, email, stamp: localStamp }) => {
+    const call = async (method, path, body) => {
+      const response = await fetch(`/api/v1/scim/v2${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          accept: "application/json",
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      return { status: response.status, payload };
+    };
+    const created = await call("POST", "/Users", {
+      schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
+      userName: email,
+      displayName: "SCIM deletion guard",
+      externalId: `qa-blocked-${localStamp}`,
+      active: true,
+    });
+    return { status: created.status, id: created.payload?.id ?? null, email };
+  }, { token: blockedToken, email: blockedEmail, stamp: blockedStamp });
+
+  note({
+    step: "deletion-guard-fixture",
+    email: blockedEmail,
+    // The push must have worked before the dialog can mean anything.
+    provisioned: push.status === 201 || push.status === 200,
+    pushStatus: push.status,
+  });
+
+  // A provider that has provisioned *nothing itself* — and is still blocked, because a SCIM row
+  // is organization-wide. This is the assertion that never ran: before the store write, the count
+  // read `0` here and the dialog happily offered the delete.
+  await page.goto(`${URL_ADMIN}/settings/iam/authentication`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-iam-authentication]", { timeout: 20000 }).catch(() => {});
+  await page.locator("[data-iam-auth-new]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[data-provider-drawer]", { timeout: 8000 }).catch(() => {});
+  const gstamp = Date.now().toString().slice(-6);
+  await page.locator("[data-provider-slug-input]").first().fill(`qa-guard-${gstamp}`).catch(() => {});
+  await page.locator("[data-provider-name]").first().fill(`QA guard ${gstamp}`).catch(() => {});
+  await page.locator("[data-provider-field=issuer]").first().fill("https://idp.qa.invalid/guard").catch(() => {});
+  await page.locator("[data-provider-field=client_id]").first().fill(`qa-guard-${gstamp}`).catch(() => {});
+  await page.locator("[data-provider-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector(`[data-provider-delete="qa-guard-${gstamp}"]`, { timeout: 15000 }).catch(() => {});
+  await page.locator(`[data-provider-delete="qa-guard-${gstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector(
+    `[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`,
+    { timeout: 15000 },
+  ).catch(() => {});
+  await page.waitForTimeout(500);
+
+  const blockedState = {
+    affected: await page
+      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`)
+      .first()
+      .getAttribute("data-affected")
+      .catch(() => null),
+    blocked: await page
+      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`)
+      .first()
+      .getAttribute("data-blocked")
+      .catch(() => null),
+    offersReassign: (await page.locator("[data-provider-reassign]").count()) > 0,
+    listsTheAccount: (await page.locator(`[data-deletion-account]`).count()) > 0,
+    breakdown: await page
+      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-deletion-source]`)
+      .evaluateAll((nodes) => nodes.map((n) => `${n.getAttribute("data-deletion-source")}:${n.textContent.trim()}`))
+      .catch(() => []),
+    // The breakdown has to ADD UP to the total. A dialog whose chips say 1 and a headline saying
+    // 2 is a dialog an operator cannot act on, and it is only visible by summing in the browser.
+    unreconciled: (await page.locator("[data-provider-deletion-unreconciled]").count()) > 0,
+  };
+  note({
+    step: "deletion-dialog-blocked",
+    ...blockedState,
+    // The whole criterion: a non-zero count, a refusal, and the repair it tells you to use.
+    blockedIsTrue: blockedState.blocked === "true",
+    countIsPositive: Number(blockedState.affected) > 0,
+    offersTheRepair: blockedState.offersReassign,
+    namesWhereTheyComeFrom: blockedState.breakdown.some((row) => row.startsWith("scim")),
+    reconciled: blockedState.unreconciled === false,
+  });
+  await shot(page, "page-iam-provider-deletion-blocked");
+
+  // ---- The repair actually works, and the delete then succeeds -----------------------------
+  // The criterion's second clause, through the button. A dialog that *says* "fall back to local"
+  // and a repair that does nothing are the same screen to an operator until they press it, and
+  // the count afterwards is what tells the two apart.
+  if (blockedState.blocked === "true") {
+    await page.locator("[data-provider-reassign]").first().click({ timeout: 8000 }).catch(() => {});
+    // The dialog re-reads the impact before it says anything, so wait on the count going to zero
+    // rather than on a pause — the announcement is the only thing that changed and it arrives
+    // after a round trip.
+    await page
+      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count][data-blocked="false"]`)
+      .first()
+      .waitFor({ timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(400);
+    const afterReassign = await page
+      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"] [data-provider-deletion-count]`)
+      .first()
+      .getAttribute("data-affected")
+      .catch(() => null);
+    const hidesTheRepair = (await page.locator("[data-provider-reassign]").count()) === 0;
+    note({
+      step: "deletion-repair",
+      afterReassign,
+      // Zero accounts means the update really moved the rows; a dialog that merely re-rendered
+      // its own stale state would still show the old number.
+      countIsZero: afterReassign === "0",
+      // And the repair must disappear, or the next press sends an empty batch.
+      repairHidden: hidesTheRepair,
+    });
+    await shot(page, "page-iam-provider-deletion-reassigned");
+
+    await page.locator(`[data-provider-delete-confirm="qa-guard-${gstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
+    await page
+      .locator(`[data-provider-deletion-dialog="qa-guard-${gstamp}"]`)
+      .waitFor({ state: "detached", timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(1200);
+    const goneNow = (await page.locator(`[data-provider-slug="qa-guard-${gstamp}"]`).count()) === 0;
+    note({ step: "delete-after-reassign", goneFromTheList: goneNow });
+  }
+
+  // Back to the OIDC provider's editor for the attribute map below.
   await page.locator(`[data-provider-edit="qa-${stamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForSelector("[data-attribute-map]", { timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(600);
@@ -6986,6 +7148,15 @@ async function runIamAuthenticationDepth(page, report) {
     ),
   });
 
+  // ---- The attribute map: a real editor, and a preview that runs the real projection --------
+  // The mapping is the wizard's third step and it is the part that is invisible until somebody
+  // cannot sign in, so the walkthrough edits it and rehearses a pasted claims payload. The
+  // rehearsal matters more than the editing: a preview that echoed its own input would agree
+  // with this screen and disagree with every sign-in.
+  //
+  // The editor and the empty-state check are above, immediately after the deletion walk: the
+  // dialog block navigates away to the provisioning screen, so the map has to be re-opened here
+  // and the empty state has to be read in the same place it is rendered.
   await page.locator("[data-attribute-map-add]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(300);
   await page.locator("[data-attribute-source=0]").first().fill("mail").catch(() => {});
