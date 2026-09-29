@@ -1011,3 +1011,184 @@ async fn enterprise_sign_in_provisions_maps_and_refuses() {
 
     fixture.cleanup().await;
 }
+
+/// The local-password half of the local-sign-in invariant, against an account that has none.
+///
+/// `sso_attribute_map.rs` proves the *provider-shaped* half: a provider with no attribute map
+/// still signs people in. This file proves the half that was still unproven, and it is the half
+/// that hurts: **an account created by a provider must not be able to come in through the
+/// password form**, because it has no password — and the answer to a wrong password there has to
+/// be the same `invalid_credentials` a typo against a local account gets.
+///
+/// The shape of the account is what makes this worth a walk rather than a unit test. A JIT row
+/// stores the literal `!jit:no-password` in `password_hash`, which is not an Argon2 hash, so the
+/// password verifier cannot parse it. A verifier that is handed an unparseable hash has two
+/// honest options — refuse, or burn the same work and refuse — and the difference between them is
+/// what a person sees: a `401` naming the wrong password, or a `500` that says the server is
+/// broken. Worse, the `500` is a **tell**: an address that answers `401` has a local account and
+/// an address that answers `500` is an SSO account, which turns the password form into a way to
+/// enumerate the directory.
+///
+/// So the walk asserts the refusal a person would see, twice — once for the JIT account and once
+/// for the local owner — and then asserts the two answers are *identical*, because "a password
+/// form tells you which addresses are local" is the whole failure this guards against.
+#[tokio::test]
+async fn a_provisioned_account_refuses_a_local_password_like_any_other() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let cookie = fixture.owner_session().await;
+
+    // A provider that provisions on first sight, and one signed-in identity it has never met.
+    let provider_id = fixture
+        .connect(
+            &cookie,
+            json!({
+                "slug": "local-invariant",
+                "kind": "oidc",
+                "name": "Local Invariant Provider",
+                "config": { "client_id": "local-invariant-client" },
+                "group_claim": "groups",
+                "jit_enabled": true,
+            }),
+        )
+        .await;
+    let provider = omnion_identity::sso::providers::find_provider(fixture.db.pool(), provider_id)
+        .await
+        .expect("the provider must be readable")
+        .expect("the provider exists");
+    // The address is unique per run, like this file's owner address, and it keeps the
+    // `sso-subject-` prefix the fixture's cleanup matches. A *fixed* address is a trap: the first
+    // run of this walk failed (it did, on the 500), and the account it provisioned was written in
+    // its own organization — which the *other* walk's scoped cleanup never touches. So the second
+    // run found the row, `provision()` returned `Existing` instead of `Created`, and the walk
+    // failed for a reason that had nothing to do with what it tests. A fixture that cannot be
+    // re-run after a failure is a fixture that hides failures.
+    let provisioned_email = format!(
+        "sso-subject-local-invariant-{}@omnion.test",
+        Uuid::new_v4().simple()
+    );
+    let identity = omnion_identity::sso::claims::Identity {
+        subject: "local-invariant-subject".into(),
+        email: provisioned_email.clone(),
+        display_name: Some("Local Invariant Person".into()),
+        groups: vec![],
+        attributes: json!({ "email": provisioned_email })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let provisioned =
+        omnion_identity::sso::provisioning::provision(fixture.db.pool(), &provider, &identity)
+            .await
+            .expect("JIT provisions the first sign-in");
+    assert_eq!(
+        provisioned.outcome,
+        omnion_identity::sso::ProvisionOutcome::Created,
+        "the fixture has to be a fresh account, or the walk is testing the wrong row"
+    );
+
+    // The precondition, asserted rather than assumed: this account really has no password. A
+    // test that passes because the fixture provisioned a *local* account would prove nothing,
+    // and the only way to know which row answered is to look at the row.
+    let stored: String = sqlx::query_scalar("select password_hash from users where id = $1")
+        .bind(provisioned.user.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the hash must be readable");
+    assert!(
+        omnion_identity::sso::providers::is_jit_account(&stored),
+        "the account under test carries the JIT marker, not a password: {stored:?}"
+    );
+
+    // A guessed password against it, and the same guess against a real local account.
+    let guessed = json!({
+        "email": provisioned.user.email,
+        "password": "whatever the directory password might be",
+    });
+    let against_jit = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(guessed.clone()),
+        ),
+    )
+    .await;
+    let against_local = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": fixture.owner_email, "password": guessed["password"].clone() })),
+        ),
+    )
+    .await;
+
+    // 1. It is refused — and as a *credential*, not as a server fault.
+    assert_eq!(
+        against_jit.status,
+        StatusCode::UNAUTHORIZED,
+        "an account with no password is a wrong password, not a broken server: {}",
+        against_jit.body
+    );
+    assert_eq!(
+        against_jit.body["error"]["code"],
+        json!("invalid_credentials"),
+        "the refusal is the ordinary one: {}",
+        against_jit.body
+    );
+
+    // 2. It is refused the *same way*. A different status or code on the two rows is the
+    //    enumeration oracle, and it is the only part of this walk that is not obvious.
+    assert_eq!(
+        against_jit.status, against_local.status,
+        "a provisioned account and a local account must answer a wrong password identically"
+    );
+    assert_eq!(
+        against_jit.body["error"]["code"], against_local.body["error"]["code"],
+        "and with the same code — a different code is a tell"
+    );
+    assert_eq!(
+        against_jit.body["error"]["message"], against_local.body["error"]["message"],
+        "and with the same message — the sign-in form may not name which kind of account it is"
+    );
+
+    // 3. The local account still works, so "refuse a password-less account" did not cost the
+    //    platform the sign-in the invariant is about.
+    let local = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/auth/login",
+            None,
+            Some(json!({ "email": fixture.owner_email, "password": PASSWORD })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        local.status,
+        StatusCode::OK,
+        "a local account signs in with its password while an SSO provider is connected: {}",
+        local.body
+    );
+
+    // 4. The JIT account is not merely refused — it is refused *without* being locked out. A
+    //    password-less account cannot be brute-forced, so counting its failures would let anyone
+    //    lock a colleague out of the account their provider still works for.
+    let locked_until: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select locked_until from users where id = $1")
+            .bind(provisioned.user.id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the lockout column must be readable");
+    assert!(
+        locked_until.is_none(),
+        "a guess against a password-less account must not lock the person out of the one they \
+         can still use"
+    );
+
+    fixture.cleanup().await;
+}

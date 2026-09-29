@@ -26,6 +26,7 @@ use crate::password::{dummy_verify, verify_password};
 use crate::secrets::SecretBox;
 use crate::security::{self, IpVerdict, SecurityPolicy, SessionPolicy};
 use crate::sessions;
+use crate::sso::providers;
 use crate::users::{User, normalize_email};
 
 /// How long a second-factor challenge stays valid.
@@ -241,6 +242,44 @@ pub async fn sign_in(
         .await?;
         return Ok(SignInOutcome::InvalidCredentials);
     };
+
+    // 2b. An account a provider created has no password to guess.
+    //
+    // A JIT row stores the literal `!jit:no-password` in `password_hash`, which is not an Argon2
+    // hash, so handing it to the verifier is not "a wrong password" — it is a parse failure that
+    // surfaces as an `internal_error` (500) rather than an `invalid_credentials` (401). That is
+    // both a lie to the person ("the server is broken") and a **tell**: an address answering 401
+    // has a local account and an address answering 500 is an SSO account, so the password form
+    // would become a way to enumerate the directory — the exact thing the constant-time branch
+    // above exists to prevent.
+    //
+    // So it is refused here, and refused *as a credential*: the same outcome an unknown address
+    // gets, after the same `dummy_verify` work, so the two are indistinguishable in the response
+    // and in the time it takes to produce one.
+    //
+    // It is checked **before** the lockout, and it never registers a failure, on purpose. A
+    // password-less account cannot be brute-forced, so counting guesses against it would only
+    // serve one purpose — letting anybody lock a colleague out of the one sign-in that still
+    // works for them, their directory.
+    if providers::is_jit_account(&account.password_hash) {
+        dummy_verify(password.to_owned()).await?;
+        record_attempt(
+            pool,
+            &AttemptRecord {
+                email: attempt_email,
+                user_id: Some(account.user.id),
+                organization_id: account.organization_id(),
+                ip: ip.map(str::to_owned),
+                user_agent: user_agent.map(str::to_owned),
+                outcome: "failed",
+                // The log is for the operator, not the browser: it is the one place that may say
+                // *why*, and the response above says nothing either way.
+                reason: Some("the account signs in through a provider and has no password".into()),
+            },
+        )
+        .await?;
+        return Ok(SignInOutcome::InvalidCredentials);
+    }
 
     // 3. An existing lockout is checked before the password: a locked account cannot be
     //    unlocked by guessing it correctly.
