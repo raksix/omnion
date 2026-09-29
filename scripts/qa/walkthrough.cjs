@@ -41,6 +41,21 @@ function arg(name, fallback) {
 
 const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
 const URL_WEB = arg("web", "http://127.0.0.1:3200");
+// The two names the CMS depth passes use, and the reason they are DEFINED here rather than
+// copied at each call site.
+//
+// `URL_API` is the API the panel talks to — the admin dev server proxies `/api` to it, but
+// `page.request` is not the browser, so a depth pass that POSTs through the page must name the
+// API directly. `ADMIN` is the panel's own origin, which is what `URL_ADMIN` already is.
+//
+// Both were referenced by twenty-two lines across five depth passes (featured-media, forms,
+// seo, comments and newsletter) and **never declared**, so every one of those passes threw
+// `ReferenceError: URL_API is not defined` on its first write and reported itself as broken.
+// A harness bug that only appears when a pass reaches its first POST is a bug the pass list
+// cannot catch, because the pass never ran. Declaring the names here is what makes the passes
+// runnable at all; the QA pass is owed to this tick for finding it.
+const URL_API = process.env.QA_API_URL || arg("api", URL_ADMIN);
+const ADMIN = URL_ADMIN;
 const OUT = path.resolve(arg("out", `qa-artifacts/${Date.now()}`));
 const SHOTS = path.join(OUT, "shots");
 const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome";
@@ -5766,6 +5781,129 @@ async function runSeoDepth(page, report) {
   return steps;
 }
 
+/**
+ * `/themes` — the theme gallery (REQ-062, slice 1).
+ *
+ * The pass drives the two things a gallery can get wrong that a screenshot cannot: the badge
+ * has to MOVE when a theme is activated, and *Restore previous* has to be ABSENT when there is
+ * nothing to restore. A card that shows a badge regardless of the database passes a
+ * screenshot review every time and is wrong every time.
+ *
+ * The activation is written through the panel's OWN route (not by SQL) so the pass exercises
+ * the write the button performs, and the column is then read from the table — a panel
+ * agreeing with itself is the pair that can agree while the site renders the old theme.
+ */
+async function runThemesDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the gallery has nothing to read";
+    return steps;
+  }
+
+  // The pass needs a second theme to switch TO, and a bundled theme is a mirror of a file the
+  // platform may not ship, so the fixture writes one directly and says it is a fixture. A card
+  // the pass activated into a theme it created itself is still a real activation.
+  const candidate = `qa-theme-${stamp}`;
+  const seeded = qaSql(
+    `insert into themes (organization_id, key, name, version, source, manifest, storage_key) ` +
+      `select null, '${candidate}', 'QA Theme', '1.0.0', 'uploaded', ` +
+      `'{"key":"${candidate}","name":"QA Theme","version":"1.0.0","modes":["light","dark"]}'::jsonb, ` +
+      `'qa/${candidate}.zip' on conflict do nothing; select count(*) from themes where key = '${candidate}'`,
+  );
+  steps.fixtureThemeExists = seeded === "1";
+
+  // ------------------------------------------------------------------ the screen
+  await page.goto(`${ADMIN}/themes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.screenReady = (await page.locator("[data-themes-gallery]").count()) > 0;
+  steps.cardsRendered = (await page.locator("[data-theme-card]").count()) > 0;
+  steps.fixtureCardIsOnScreen =
+    (await page.locator(`[data-theme-card="${candidate}"]`).count()) > 0;
+  // A card that says nothing about what it ships is a card an operator cannot choose between.
+  steps.cardDescribesItself =
+    (await page.locator(`[data-theme-shape="${candidate}"]`).first().innerText().catch(() => ""))
+      .length > 0;
+
+  // A bundled theme may not be deleted, and the action must be ABSENT rather than disabled.
+  steps.bundledCardOffersNoDelete =
+    (await page.locator('[data-theme-card="minimal"] [data-theme-delete]').count()) === 0;
+
+  // ------------------------------------------------------------------ the starting state
+  const beforeKey = await page
+    .locator("[data-themes-active-key]")
+    .first()
+    .getAttribute("data-themes-active-key")
+    .catch(() => "");
+  steps.activeKeyIsOnScreen = (beforeKey !== null && beforeKey !== undefined) && beforeKey !== "";
+  steps.rollbackAbsentWhenNeverSwitched =
+    (await page.locator("[data-themes-rollback]").first().isDisabled().catch(() => false)) === true;
+
+  // ------------------------------------------------------------------ activate
+  await page.locator(`[data-theme-activate="${candidate}"]`).first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.confirmationOpened = (await page.locator("[data-themes-confirm]").count()) > 0;
+  // The confirmation must NAME what is being replaced — a theme switch changes every page a
+  // visitor sees, and "are you sure" does not say what.
+  const confirmText = await page.locator("[data-themes-confirm]").first().innerText().catch(() => "");
+  steps.confirmationNamesTheTheme = confirmText.includes(candidate);
+  steps.confirmationNamesTheReplaced = beforeKey ? confirmText.includes(beforeKey) : false;
+  await page.locator("[data-themes-confirm-accept]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+
+  steps.badgeMoved =
+    (await page.locator(`[data-theme-card="${candidate}"][data-active="true"]`).count()) > 0;
+  steps.onlyOneCardIsActive =
+    (await page.locator('[data-theme-card][data-active="true"]').count()) === 1;
+  steps.noticeIsOnScreen =
+    (await page.locator("[data-themes-notice]").first().innerText().catch(() => "")).length > 0;
+
+  // The column, because that is what a visitor's request reads.
+  const column = qaSql(`select theme from sites where id = '${siteId}'`);
+  steps.columnFollowedThePanel = column === candidate;
+
+  // ------------------------------------------------------------------ roll back
+  const target = await page
+    .locator("[data-themes-rollback-target]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.rollbackTargetIsNamed = target === beforeKey;
+  steps.rollbackEnabledWithATarget =
+    (await page.locator("[data-themes-rollback]").first().isDisabled().catch(() => true)) === false;
+  await page.locator("[data-themes-rollback]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  steps.rollbackConfirmationOpened = (await page.locator("[data-themes-confirm]").count()) > 0;
+  await page.locator("[data-themes-confirm-accept]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+
+  steps.badgeMovedBack =
+    beforeKey
+      ? (await page.locator(`[data-theme-card="${beforeKey}"][data-active="true"]`).count()) > 0
+      : false;
+  const columnAfter = qaSql(`select theme from sites where id = '${siteId}'`);
+  steps.columnRestored = columnAfter === beforeKey;
+  // A restore is itself reversible, so the button must be armed again — a rollback that
+  // spends the target leaves an operator with no way back to what they just tried.
+  steps.rollbackArmedAgainAfterARestore =
+    (await page.locator("[data-themes-rollback]").first().isDisabled().catch(() => true)) === false;
+
+  // ------------------------------------------------------------------ the mobile layout
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const overflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.noHorizontalScrollAt390 = overflow <= 1;
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  return steps;
+}
+
 async function runFormsDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -8161,6 +8299,49 @@ async function main() {
   // on a box six writers share. It runs the SAME function the full pass calls; what it does not
   // do is reset the database (run.sh does that) or report a `summary.json` with the whole
   // pass's counts.
+  // `--only=themes` runs the gallery's depth pass alone.
+  //
+  // Same argument as the four CMS passes above it, and with the same urgency: this pass is the
+  // only thing that will ever click *Activate* and *Restore previous* in a browser, and a
+  // rollback path that throws a ReferenceError on its first write is indistinguishable from a
+  // screen that was never implemented.
+  if (process.argv.includes("--only=themes")) {
+    report.themes = await runThemesDepth(page, report);
+    log(`themes: ${JSON.stringify(report.themes)}`);
+    const required = [
+      "fixtureThemeExists", "screenReady", "cardsRendered", "fixtureCardIsOnScreen",
+      "cardDescribesItself", "bundledCardOffersNoDelete",
+      "activeKeyIsOnScreen", "rollbackAbsentWhenNeverSwitched",
+      "confirmationOpened", "confirmationNamesTheTheme", "confirmationNamesTheReplaced",
+      "badgeMoved", "onlyOneCardIsActive", "noticeIsOnScreen", "columnFollowedThePanel",
+      "rollbackTargetIsNamed", "rollbackEnabledWithATarget", "rollbackConfirmationOpened",
+      "badgeMovedBack", "columnRestored", "rollbackArmedAgainAfterARestore",
+      "noHorizontalScrollAt390",
+    ];
+    const themeSteps = report.themes || {};
+    const missing = required.filter((key) => themeSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=themes",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: themeSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`themes depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`themes depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=newsletter")) {
     report.newsletter = await runNewsletterDepth(page, report);
     log(`newsletter: ${JSON.stringify(report.newsletter)}`);
@@ -8535,6 +8716,10 @@ async function main() {
     // (a public signup, the confirmation link, the replayed link, the expiry, the unsubscribe,
     // a bounce with a reason, a CSV import that has to name what it skipped, and the archive).
     { path: "/newsletter", name: "newsletter" },
+    // The theme gallery (REQ-062, slice 1) — walked here so the screen is in the inventory,
+    // and driven by `runThemesDepth` below, which activates a theme, reads the badge, restores
+    // the previous one and requires the button to disappear when there is nothing to restore.
+    { path: "/themes", name: "themes" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.
@@ -8823,6 +9008,9 @@ async function main() {
   // read with the other in view. It leaves its rows: a list cleaned up afterwards is a list the
   // next pass opens empty.
   report.newsletter = await runNewsletterDepth(page, report);
+  // The theme gallery (REQ-062, slice 1). Driven right after the CMS depth passes because it
+  // is the one screen in this group that changes what every OTHER one renders.
+  report.themes = await runThemesDepth(page, report);
   log(`newsletter: ${JSON.stringify(report.newsletter)}`);
 
   // The visitor-accounts pass (REQ-064, slice 4c). It runs after the newsletter pass because

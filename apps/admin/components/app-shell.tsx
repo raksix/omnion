@@ -38,6 +38,7 @@ import {
   Timer,
   UserCog,
   UserRoundCheck,
+  Palette,
   UsersRound,
   Webhook,
   X,
@@ -79,6 +80,11 @@ const NAV = [
   // purpose: `UserCog` already means a PANEL user two rows down, and an operator who confuses
   // the two is about to grant a visitor a set of platform permissions.
   { href: "/members", label: "Members", icon: UserRoundCheck },
+  // The theme gallery (REQ-062). It sits directly BEFORE Media on purpose: the gallery decides
+  // what a visitor sees, and every row below it in this shelf — media, menus, pages — is content
+  // a theme then presents. `Palette` rather than `LayoutTemplate`, which the block editor
+  // already owns one screen over.
+  { href: "/themes", label: "Themes", icon: Palette },
   { href: "/media", label: "Media", icon: Images },
   // Backups sit beside Media rather than under Settings: an operator asking "where are my
   // files and can I get them back" is one question, and burying half of it under a

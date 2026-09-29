@@ -6256,3 +6256,66 @@ export function saveBackupSettings(input: {
     body: JSON.stringify(input),
   });
 }
+
+/**
+ * The theme gallery of one site (REQ-062 slice 1).
+ *
+ * The response is the whole screen's state, not a list: the active key, whether that key is
+ * one the gallery can show, and whether a rollback has something to restore. `rollbackTarget`
+ * is `null` for "nothing to go back to" AND for "going back would change nothing" — so the
+ * panel renders the button from the server's answer rather than computing it, which is the only
+ * way the button and the database can agree.
+ */
+export type ThemeCard = {
+  key: string;
+  name: string;
+  version: string;
+  description: string;
+  author: string;
+  modes: string[];
+  slotCount: number;
+  tokenCount: number;
+  previewImage: string | null;
+  source: "bundled" | "uploaded";
+  canDelete: boolean;
+};
+
+export type GalleryEntry = { theme: ThemeCard; isActive: boolean };
+
+export type ThemeGallery = {
+  siteKey: string;
+  activeKey: string;
+  activeKnown: boolean;
+  rollbackTarget: string | null;
+  themes: GalleryEntry[];
+};
+
+export type ActivationResult = {
+  gallery: ThemeGallery;
+  themeKey: string;
+  previousThemeKey: string | null;
+  restored: boolean;
+};
+
+export async function fetchThemeGallery(siteId: string): Promise<ThemeGallery> {
+  const query = new URLSearchParams({ site: siteId });
+  return request<ThemeGallery>(`/api/v1/themes?${query.toString()}`);
+}
+
+export async function fetchTheme(key: string): Promise<ThemeCard> {
+  return request<ThemeCard>(`/api/v1/themes/${encodeURIComponent(key)}`);
+}
+
+export async function activateTheme(siteId: string, themeKey: string): Promise<ActivationResult> {
+  return request<ActivationResult>(`/api/v1/sites/${encodeURIComponent(siteId)}/theme`, {
+    method: "POST",
+    body: JSON.stringify({ theme_key: themeKey }),
+  });
+}
+
+export async function rollbackTheme(siteId: string): Promise<ActivationResult> {
+  return request<ActivationResult>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme/rollback`,
+    { method: "POST" },
+  );
+}
