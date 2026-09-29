@@ -4361,3 +4361,62 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 `report.notificationOutbox` to be **present** — that last one is the first pass that can close
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
+
+---
+
+## Wave 4 · REQ-052 slice 3 · the discount gate (5a26ca6, d0745f8, 6f62881)
+
+**What.** The approval gate between a quote over the discount limit and being sent. Slice 2 built
+the quote and the builder already drew the amber banner, but **nothing could move a quote into
+`approved`**, so a quote over the limit had no way out of `pending_approval` — the status existed,
+the send path refused it, and no code could clear it. This is the missing middle: migration
+`0055_quote_approvals.sql`, `modules/sales/src/approvals.rs` (module rules), `routes/sales_approvals.rs`
+(permissions, audit, events, the two notifications), the `/sales/approvals` inbox, the button the
+banner used to only promise, and a QA pass for the screen.
+
+**The four defects the walks found** — none of which a typecheck or a unit test would have:
+
+1. **A draft over the threshold was still sendable.** The send check guarded only
+   `pending_approval`, so a quote nobody had asked about went straight out: the exact case the
+   discount policy exists to stop. Now checked against the stored `max_discount`.
+2. **Raising a request sat behind `sales.quotes.send`.** That leaves the drafter role — the role
+   the acceptance criteria are about — with an amber banner and no button. Asking moved to
+   `sales.quotes.update`; **deciding** stayed on `send`, which is the power.
+3. **The `requested_by_me` scope answered `500`.** A `Vec<String>` bind list sent `requested_by`
+   as text; PostgreSQL replied `operator does not exist: uuid = text`. The binds now carry their
+   SQL type in a `Bind` enum, because a type mismatch looks like a `500` from the outside.
+4. **A lapsed quote blamed the discount gate.** The validity check ran *after* it, so an expired
+   quote said "ask a manager" when the only thing it needed was a new date. Order fixed.
+
+**A test that lowered its own bar.** Two slice-2 walks broke: they sent a 20% fixture against a
+15% policy. The temptation was to edit the fixture. Instead they now write a **policy** that
+allows it (`allow_the_fixture_discount`), because the totals walks assert on that 20% and a test
+that edits its own fixture to pass has stopped measuring anything.
+
+**Proof.**
+`cargo test -p omnion-module-sales --lib` → **110 passed** (102 before, +8).
+`cargo test -p omnion-api --lib` → **243 passed**.
+`cargo test -p omnion-api --test sales_approvals -- --test-threads=1` → **5 passed**.
+`cargo test -p omnion-api --test sales_quotes -- --test-threads=1` → **16 passed** (unchanged
+after the gate, once the policy is written).
+`pnpm turbo run typecheck --force` → **2/2**. `node --check scripts/qa/walkthrough.cjs` → clean.
+clippy: **0** large-`Err`-variant warnings (both new error payloads are `Box`ed, because
+`SalesError` is returned by every fallible function in the crate).
+
+**Also fixed here.** `sales_quotes.rs` had a unit test calling `quote_totals_mut()`, a helper that
+does not exist — a pre-existing test-only break from slice 2 that only `--all-targets` found. It
+now assigns the field.
+
+**Not proven, and not claimed.** The browser pass is **queued** behind four other writers on the
+single QA slot (`/tmp/w4-qa-slice3.log`); until it lands, the inbox's rendering, its four scopes,
+the rejection dialog and the 390px overflow are unverified. The two boxes slice 3 can prove
+without it are ticked; the browser-side ones are not.
+
+**Next.** Read the pass when it lands and require `report.salesApprovals.ok`, with
+`reject-requires-a-reason` true. Then **slice 4**: orders, reservation, the invoice handoff and
+the reports screen — the last slice before REQ-052 closes. It needs `sales_orders`,
+`sales_order_lines` and `sales_status_history`, all three already in migration 0053 and still
+unwritten; `sales.orders.confirm` and `sales.orders.create` are already in the permission
+catalogue. Check the shared migration namespace again before writing 0056 — wave7 and wave10 both
+sit on 0053.
+
