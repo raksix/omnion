@@ -4227,3 +4227,63 @@ part of the invocation, and the ledger carries it.
 `labelComesFromTheTitle`) and the whole queue half (`queueReady` … `scheduleStatus`) are still
 unrun — the pass reaches the locations rail and stops there. Then a full
 `bash scripts/qa/run.sh` on the w2 stack to close slice 1, and REQ-064 slice 2 (forms).
+
+### Tick 16 — REQ-064 slice 1: the four menus checks the targeted pass reported missing were three product defects
+
+The `--only=menus` pass last tick ended with fourteen checks missing and one net failure. Four of
+those checks never ran because the pass inherited a fixture it did not own; the rest exposed real
+defects, and the one acceptance box still store-only is still there for a reason I can now name.
+
+**What I found, and which of them were the product's fault**
+
+1. **The pass read a page another pass created** (`aaa660a`). The picker and the whole publishing
+   queue hang off a published page; `runMenusDepth` looked one up and skipped everything if it was
+   absent. On a private stack `omnion_qa_w2` has no pages, so fourteen checks vanished with no reason
+   attached. It now seeds a published page (with the revision that carries its title) and a draft,
+   and refuses to continue without them. The draft is load-bearing: with no draft in the database
+   `pickerOnlyOffersPublished` passes for a picker that lists everything.
+2. **A nested row disappeared from the tree** (`b9995ad`). "Nest under the row above" moved the row
+   onto a parent whose branch was closed, so the row left the DOM and the editor looked like it had
+   deleted it. Both the keyboard nest and the pointer drop now expand the new parent, outside the
+   state updater where React may defer it.
+3. **A refused nest was silent** (`b9995ad`). Both depth guards returned the unchanged list, which
+   their own doc comment had promised would "say so". They now set a notice naming the limit.
+4. **The queue's write paths were dead for a platform owner** (`6a033bd`). The screen listed its
+   rows and then answered 400 `no_organization` to Reschedule, Cancel, Publish-now and Retry — for
+   the account onboarding creates first. The read path was fixed for that account two ticks ago and
+   the four write handlers were left behind. All fourteen tests were green because every fixture
+   carries an organization.
+5. **A contested location named the slot but not the holder** (`fecb4b0`) — `MenuLocationTaken`
+   carried a UUID and the message said "another menu", which is the thing an editor cannot act on.
+
+**One of my own changes was a security regression, and an existing test caught it.**
+`entry_in_scope` first scoped through `ensure_same_organization`, which answers 403 — "this exists
+and is not yours". The store's `where organization_id = $1` had answered 404 for free, so moving
+the check into a handler turned it into an existence oracle for tenant entry ids.
+`the_queue_is_scoped_to_the_callers_organization` failed `404 → 403` and the helper now conceals
+the row by hand before scoping it.
+
+**Proof**
+
+- `cargo test -p omnion-api --test cms_menus` → **14/14** on a fresh `omnion_w2_menus_test`,
+  `--test-threads=1`. Two of those runs were **not** real: the suite prints `SKIP` and still reports
+  `ok` when PostgreSQL is unreachable, and the fixture drops its database on the way out. The
+  `--nocapture` flag is what distinguishes them, and a green line without it is worth nothing.
+- The new owner assertions were proved **in both directions**: reverting only `routes/menus.rs`
+  fails with `an owner must be able to move the entry they just read: {"code":"no_organization"}`,
+  and restoring it passes.
+- `pnpm typecheck` → exit 0 (`@omnion/admin` cache miss, executed).
+- `--only=menus` on the w2 stack, this tick vs last: missing **14 → 1** (`retryRefusesASentRow`
+  only), net failures **3 → 1**, console errors 0. New green: `pickerOpened`,
+  `pickerOnlyOffersPublished`, `pageItems 1`, `labelComesFromTheTitle 1`, `queueReady`,
+  `entryOnScreen`, `rescheduleFormOpened`, `rescheduleStored 2026-10-04T09:00`, `rescheduleMoved`,
+  `rescheduleIsLater`, `cancelledInSql`, `cancelButtonGone`, `nestedUnderSecond`,
+  `nestedParentRowFound`, `rivalRefusalNamesTheHolder`.
+
+**Still not proved.** `fourthLevelRefused` reads `false` with `fourthLevelStatus 200` — correctly,
+because the pass builds its fourth level under `deepest.parent_id`, which for a two-level tree is
+the top level, so it writes a legal second-level row. It has to drive the screen to a real third
+level first. `retryRefusesASentRow` is not written at all.
+
+**Next.** Drive the nest to a genuine third level so `fourthLevelRefused` is a screen fact, write
+`retryRefusesASentRow`, then a full `bash scripts/qa/run.sh` on the w2 stack to close slice 1.
