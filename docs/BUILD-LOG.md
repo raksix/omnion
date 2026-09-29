@@ -4183,3 +4183,47 @@ close slice 1; if the pass finds anything, fix it in the same tick — the depth
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
+
+## 2026-09-29 · REQ-064 slice 1, the pass that could reach it — `a412407`, `3177a5a`, `5269ff3`
+
+**What.** Three defects, all on the slice-1 surfaces and all of which the browser found and no
+test could have. The queue now takes its organization from the site the caller names rather than
+from the account (the platform Owner's `organization_id` is deliberately NULL, so the queue
+answered 400 to the one person who runs the platform) and carries `?site_id=` so two sites of one
+organization no longer share a screen; a menu body carries the site's **global key** beside its
+uuid, because the editor's audience preview calls a *public* route and the uuid was read as a key
+and answered 404. And the editor's "Add item" no longer creates a `url: ""` row that the store
+refuses by name — which refused the *whole* submission, so three rows in the canvas became one
+error and no rows in the database.
+
+**The harness also had three faults of its own**, which is the more interesting half: the depth
+pass filled the inspector before React mounted it (Playwright calls that success), counted visible
+rows to decide whether a nest had happened (a nested child renders *inside* its parent's row), and
+swallowed every nest click, so a missing button and a failed selector looked identical. Each is
+now verified rather than assumed, and the pass reports what it actually did.
+
+**`--only=menus`** exists because the pass lives at the very end of a forty-five-minute run on a
+box five writers share — a screen whose only proof usually dies before reaching it is a screen
+that is untested. Same function, same `steps.*` keys, minutes instead of an hour.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test cms_menus` → **14/14** (13 before) against `omnion_qa_w2`,
+  including the new `the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site`
+- `cargo test -p omnion-content --lib` → **118** · `cargo test -p omnion-api --lib` → **192**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `--only=menus` on the w2 stack, before → after:
+  `savedItems` 0 → 3 · `claimedHeader` false → true · `firstHolderKeptIt` false → true ·
+  `visitorItems/memberItems` 0/0 → 1/2 · `treeHasChildren` false → true ·
+  `parentsAreStored` false → true · `depthLabel` "deepest branch 1 of 3" → "2 of 3" ·
+  console errors 0
+
+**A test that connects to the wrong database is a test that proves nothing.** `qaSql` defaults to
+`omnion_qa` — main's — and the first `--only=menus` run died on `relation "cms_menus" does not
+exist` while the API answered 200 on the very table. `--db omnion_qa_w2` (or `QA_DB=`) is now
+part of the invocation, and the ledger carries it.
+
+**Next.** The picker half (`pickerOpened`, `pickerOnlyOffersPublished`, `pageItems`,
+`labelComesFromTheTitle`) and the whole queue half (`queueReady` … `scheduleStatus`) are still
+unrun — the pass reaches the locations rail and stops there. Then a full
+`bash scripts/qa/run.sh` on the w2 stack to close slice 1, and REQ-064 slice 2 (forms).
