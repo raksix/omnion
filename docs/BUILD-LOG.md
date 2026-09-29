@@ -3277,3 +3277,61 @@ drive the connect gesture and read the notice's tone and text.
 **Next.** Read the pass: `palette-drag`, `port-connect`, `port-connect-escape`, `undo`,
 `shift-click-multi`, `⌘A`, edge delete + undo. Then the 409 two-tab criterion and Table
 mode.
+
+## 2026-09-29 · omnion-wave3 · REQ-004 slice 2 (the pass, and three defects it finally read)
+
+**The gate ran.** It had been queued for two ticks. Running it is what produced every finding
+below — none of them was visible to `cargo test`, `pnpm test` or `tsc`, which is the whole
+argument for the tiered gate.
+
+**1. `find_graph` read a column the table does not have** (`e14a5e1`). `graph_store.rs` selected
+`workflow_id` from `workflows`, whose primary key is `id`, so *every* graph read failed with
+`column "workflow_id" does not exist`. The builder's only symptom was its error screen — and a
+walkthrough that reports "the builder did not open" cannot tell an error screen from a missing
+page. The alias `id as workflow_id` keeps the row tuple's shape. The guard reads the column
+catalogue rather than running the query, because a query that hits no row proves nothing about a
+column; reverting the fix makes it fail naming the exact column, which is the point.
+
+**2. The QA harness was reading a marker the component never renders** (`0823f06`). The depth
+pass looked for `[data-builder]`, which does not exist; the root is `[data-builder-state]`. So
+every interaction check — palette drag, connect, marquee, undo — was reporting "the builder did
+not open" for a page that had opened fine. Two ticks of "not proven" were this one line. Reading
+the state also separates an error screen from an absent one, which is what finding 1 needed.
+
+**3. No node could ever be connected** (`3b4cbfd`, `671b43c`). `connect(source, …)` received a
+*node id* and looked it up in the node-*type* map, so the lookup never matched and every
+connection refused with "has no output ports, so nothing can leave it". The refusal was
+*confidently worded*, which is why two ticks read it as a design decision rather than a defect.
+The rules moved into `connect-edge.ts` (9 cases) so the id resolves to its type once, in a place
+a test can reach; the browser now reads `tone: ok, "Wait · Next → Transform"`.
+
+**4. Every rule created after 0051 was born unsaveable** (`c864ca1`, `0c9ee98`). The migration
+backfilled the graph of every rule that *existed* and left the column default as
+`{"nodes":[],"edges":[]}` — so every rule created afterwards opened on a blank canvas and had its
+first save refused with `graph_invalid` ("the graph has no nodes, a definition needs at least a
+trigger"). An unsaveable new rule is the one defect no editing recovers from. `insert_workflow`
+now seeds `Graph::starter`, the same shape the SQL backfill describes; the walkthrough reads
+`canvasNodes: 2` and `projection.valid: true` where it read `0` and `graph_invalid` before, and
+the conflict check now reports `graph_version_conflict` (a real conflict) instead of
+`graph_invalid` (a refusal of the request).
+
+**Proof.**
+- `cargo test -p omnion-workflows` — 84 unit. `cargo test -p omnion-api --test workflows` —
+  13/13 integration, `--test-threads=1` (the suite shares one database; the walk lock is real).
+- Each fix was reverted and the test re-run: the graph-store guard fails on the column, the
+  born-valid test fails on the node count. A green test that cannot go red is not a gate.
+- `pnpm --filter @omnion/admin test` — 21/21 (12 history + 9 connection). `pnpm typecheck` clean.
+- QA: `walkthrough.cjs --only=workflowbuilder` against the w3 stack (18082/3102/3202, database
+  `omnion_qa_w3`). Passing steps this tick: `palette-add`, `palette-keyboard-add`, `palette-drag`
+  (nearDropPoint), `undo`, `select-all`, `shift-click-multi` (running, not skipping),
+  `port-connect` (ok + a named refusal), `port-connect-escape`, `validate-broken` (names the
+  node), `layout-is-not-semantics`, `conflict`.
+
+**Two defects the pass read, not yet fixed.** `escape-clears` reports `stillSelected: 3` — the
+selection survives the key meant to clear it. `edge-delete` hits an edge and nothing then reports
+`data-edge-selected`, so `Del` on an edge is still unproven. Both are selection bugs, and both
+are the next slice: selection is one piece of state with four writers (click, shift-click, marquee,
+⌘A) and no single owner.
+
+**Next.** Selection ownership, then edge delete + its undo, then the two-tab `409` criterion and
+Table mode.
