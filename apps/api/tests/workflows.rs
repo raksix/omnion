@@ -65,6 +65,7 @@ const WORKFLOW_PERMISSIONS: [&str; 3] = ["workflows.read", "workflows.manage", "
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
     status: StatusCode,
+    /// Every `Set-Cookie` the response carried, joined — a response can set more than one.
     set_cookie: Option<String>,
     body: Value,
 }
@@ -77,11 +78,20 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    // `headers().get(SET_COOKIE)` returns the **first** value only, and a sign-in sets two: the
+    // session and the CSRF token. Taking one is how a harness ends up unable to send a header
+    // the browser is always holding — the failure then shows up as an unexplained `403` in a
+    // test that never mentions CSRF. `get_all` is the only call that sees both.
+    let set_cookie = {
+        let values: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        (!values.is_empty()).then(|| values.join(","))
+    };
 
     let bytes = response
         .into_body()
@@ -105,11 +115,44 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 
 /// Build a JSON request; `token` becomes the session cookie.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
-    let builder = Request::builder().method(method).uri(uri);
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
-        None => builder,
+    request_with_csrf(method, uri, token, None, body)
+}
+
+/// Build a JSON request that also carries a CSRF token, the way a browser does.
+///
+/// **This is the second door to the same room, and the reason it exists matters.** A
+/// cookie-authenticated mutation is refused unless it carries `x-omnion-csrf`, and the value is
+/// the `omnion_csrf` cookie the sign-in response set — the browser is *handed* a token, it
+/// never derives one. The four-argument `request` above cannot express that, so every write
+/// test in this file has been answering `403 csrf_failed` whenever a CSRF secret is
+/// configured. The suite was green only while the secret was unset — green against the one
+/// configuration that refuses every mutation — and it is invisible precisely because the read
+/// tests keep passing.
+///
+/// A suite that quietly stops exercising the write paths and still reports a pass is worse
+/// than a red one, so the door is here rather than a secret derivation: **deriving** the token
+/// in the harness would test a client that does not exist, and would keep passing if the
+/// server ever stopped setting the cookie. A read-safe method sends no header, matching the
+/// server, and never putting a credential in a request that has no need for it.
+fn request_with_csrf(
+    method: Method,
+    uri: &str,
+    token: Option<&str>,
+    csrf: Option<&str>,
+    body: Option<Value>,
+) -> Request<Body> {
+    let header_token = if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        None
+    } else {
+        csrf
     };
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(token) = token {
+        builder = builder.header(header::COOKIE, format!("omnion_session={token}"));
+    }
+    if let Some(header_value) = header_token {
+        builder = builder.header(omnion_security::CSRF_HEADER, header_value);
+    }
 
     match body {
         Some(value) => builder
@@ -463,6 +506,17 @@ async fn create_account(db: &Db, organization_id: Option<Uuid>) -> (Uuid, String
 
 /// Sign an account in and return the raw session token.
 async fn login(state: &AppState, email: &str) -> String {
+    login_with_csrf(state, email).await.0
+}
+
+/// Sign in and return the **session token and the CSRF token**.
+///
+/// The CSRF cookie is a second `Set-Cookie` on the same response, and the previous helper
+/// kept only the first — which is exactly how a harness ends up unable to send a header a
+/// real browser is always holding. It reads every `Set-Cookie` rather than the first one,
+/// because a helper that silently drops the credential it needs is a helper whose failure
+/// mode is an unexplained `403` in a test three files away.
+async fn login_with_csrf(state: &AppState, email: &str) -> (String, String) {
     let response = call(
         state,
         request(
@@ -480,17 +534,27 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
+
+    let cookies = response
         .set_cookie
         .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+        .expect("login must set the session cookie");
+    let value_of = |name: &str| {
+        cookies
+            .split(',')
+            .map(|pair| pair.split(';').next().unwrap_or(pair).trim())
+            .find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                (key.trim() == name).then(|| value.to_owned())
+            })
+    };
+
+    let session = value_of("omnion_session").expect("login sets a session cookie");
+    // A secret that is not configured produces no CSRF cookie, and then none is needed. So the
+    // token is optional here and absent is not a panic — a panic would make this helper
+    // unusable in the one configuration the rest of the suite has always run in.
+    let csrf = value_of("omnion_csrf").unwrap_or_default();
+    (session, csrf)
 }
 
 /// The `id` field of a response body, as text.
@@ -1627,6 +1691,148 @@ async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
         saved.body["projection"]["valid"],
         Value::Bool(true),
         "the graph a new rule is born with does not validate: {graph}"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// REQ-004 slice 4: **a rule opened from a LIST row can be saved.**
+///
+/// The bug this closes was invisible from the builder and obvious from the API. The graph
+/// write is guarded by `graph_version`, and that column existed — but only
+/// `GET /workflows/{id}/graph` sent it. The two *list* routes (`/workflows` and
+/// `/automations`, which is the surface the panel's rule list actually reads) never did, so
+/// every client that started from a list row had nothing to quote. The honest fallback —
+/// send `0` — is refused with `graph_version_required`, an error about a version the author
+/// was never shown. Meanwhile a raw `fetch` to the same route, which had read the graph
+/// detail first, returned a clean `409 graph_version_conflict`: the server fine, the client
+/// broken, and the two looking like different products.
+///
+/// So the assertion is deliberately the *whole* round trip rather than "the field is
+/// serialized": read the list, take the version off a row, PUT the graph that row names,
+/// and expect `200`. A body-shape assertion would have passed while leaving every
+/// list-originated save broken, which is the shape of the defect this test exists to prevent.
+#[tokio::test]
+async fn a_rule_opened_from_a_list_row_carries_the_version_a_save_must_quote() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = login_with_csrf(&fixture.state, &fixture.operator_email).await;
+
+    let created = call(
+        &fixture.state,
+        request_with_csrf(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "name": "Opened from the list",
+                "organization_id": fixture.organization_a,
+                "trigger": { "kind": "event", "event": "page.published" },
+                "steps": [ { "name": "prepare", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "create: {}", created.body);
+    let workflow_id = created.body["id"]
+        .as_str()
+        .expect("a created rule has an id")
+        .to_owned();
+
+    // ---- Both list surfaces have to carry it ------------------------------------------------
+    // Two, not one: the panel's rule list reads `/automations` and the workflow list reads
+    // `/workflows`, and they are separate projections of the same row. Fixing one leaves the
+    // other exactly as broken, which is how a defect survives the commit that claims to fix it.
+    for label in ["/api/v1/workflows", "/api/v1/automations"] {
+        let listed = call(
+            &fixture.state,
+            request(Method::GET, label, Some(&token), None),
+        )
+        .await;
+        assert_eq!(listed.status, StatusCode::OK, "{label}: {}", listed.body);
+
+        let row = listed.body["workflows"]
+            .as_array()
+            .or(listed.body["automations"].as_array())
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["id"].as_str() == Some(workflow_id.as_str()))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label} does not list the rule just created: {}",
+                    listed.body
+                )
+            });
+
+        let quoted = row["graph_version"].as_i64().unwrap_or_else(|| {
+            panic!(
+                "{label} sends no graph_version, so a client saving from this row has nothing \
+                 to quote: {row}"
+            )
+        });
+        assert!(
+            quoted >= 1,
+            "{label} sends graph_version {quoted}; a save must quote a version from 1 up, and 0 \
+             is the answer the server refuses as `graph_version_required`"
+        );
+    }
+
+    // ---- And the save itself, using ONLY what the list gave us ------------------------------
+    // The graph is read back for its content, but the *version* deliberately comes from the
+    // list row: quoting the detail route's version would pass even with the list broken, which
+    // is precisely the substitution that hid this in the first place.
+    let listed = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/workflows", Some(&token), None),
+    )
+    .await;
+    let from_list: i64 = listed.body["workflows"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(workflow_id.as_str()))
+        })
+        .and_then(|row| row["graph_version"].as_i64())
+        .expect("the list carries the version this test is about");
+
+    let graph = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await
+    .body["graph"]
+    .clone();
+
+    let saved = call(
+        &fixture.state,
+        request_with_csrf(
+            Method::PUT,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({ "graph": graph, "graph_version": from_list })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "a rule opened from a list row cannot be saved with the version that row carries: \
+         quoted {from_list}, got {}",
+        saved.body
+    );
+    assert_eq!(
+        saved.body["graph_version"].as_i64(),
+        Some(from_list + 1),
+        "the write must advance the version exactly once"
     );
 
     fixture.cleanup().await;
