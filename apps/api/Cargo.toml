@@ -34,6 +34,7 @@ omnion-content = { path = "../../crates/content" }
 omnion-core = { path = "../../crates/core" }
 omnion-events = { path = "../../crates/events" }
 omnion-identity = { path = "../../crates/identity" }
+omnion-backup = { path = "../../crates/backup" }
 omnion-media = { path = "../../crates/media" }
 omnion-notifications = { path = "../../crates/notifications" }
 omnion-security = { path = "../../crates/security" }

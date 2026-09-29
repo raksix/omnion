@@ -39,6 +39,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -112,7 +113,9 @@ step "API on :$API_PORT (database omnion_qa)"
 if [ ! -x target/debug/omnion-api ] \
    || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
-  cargo build -p omnion-api
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null

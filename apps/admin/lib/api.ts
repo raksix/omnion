@@ -72,6 +72,13 @@ import type {
   MediaRetentionPolicy,
   MediaRetentionPolicyInput,
   MediaRetentionRepair,
+  BackupCreateResult,
+  BackupDetail,
+  BackupList,
+  BackupSchedule,
+  BackupSettings,
+  BackupStatus,
+  BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
   MediaTrash,
@@ -4775,4 +4782,120 @@ export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
     `/api/v1/security/locked-accounts/${encodeURIComponent(userId)}/unlock`,
     { method: "POST" },
   );
+}
+
+
+/* ---------------------------------------------------------------------------------------------
+ * Backups (REQ-013)
+ *
+ * Six functions for the overview, the detail, the create drawer, the verify action and the
+ * settings screen. The schedules' writes arrive with slice 3, which is also where the worker
+ * that produces them arrives; a "Run now" button with no worker behind it is a dead button,
+ * and this file does not grow one.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The query the list screen sends. Every field is optional and every one is a filter. */
+export interface BackupListQuery {
+  /** Restrict to one terminal state. */
+  status?: string;
+  /** Restrict to one kind. */
+  kind?: string;
+  /** Restrict to runs that included this part. */
+  scope?: string;
+  /** Restrict to one destination. */
+  destination?: string;
+  /** Only runs created at or after this. */
+  created_after?: string;
+  /** Only runs created at or before this. */
+  created_before?: string;
+  /** Page size. */
+  limit?: number;
+  /** Page offset. */
+  offset?: number;
+}
+
+/** The list, filtered and paged. */
+export function fetchBackups(query: BackupListQuery = {}): Promise<BackupList> {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined || value === null || value === "") continue;
+    search.set(key, String(value));
+  }
+  const suffix = search.toString();
+  return request<BackupList>(`/api/v1/backups${suffix ? `?${suffix}` : ""}`);
+}
+
+/** The four cards at the top of the overview. */
+export function fetchBackupStatus(): Promise<BackupStatus> {
+  return request<BackupStatus>("/api/v1/backups/status");
+}
+
+/** One run with its parts and its manifest. */
+export function fetchBackup(id: string): Promise<BackupDetail> {
+  return request<BackupDetail>(`/api/v1/backups/${id}`);
+}
+
+/** The manifest on its own, for the copy button. */
+export function fetchBackupManifest(id: string): Promise<unknown> {
+  return request<unknown>(`/api/v1/backups/${id}/manifest`);
+}
+
+/** Take a backup now. The response is the FINISHED run, not a queued one. */
+export function createBackup(input: {
+  label?: string;
+  scopes?: string[];
+  destination?: string;
+  protected?: boolean;
+  retain_days?: number | null;
+}): Promise<BackupCreateResult> {
+  return request<BackupCreateResult>("/api/v1/backups", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Re-read a run's artifacts and compare them with its manifest.
+ *
+ * A `200` with `clean: false` is a successful verification that found a problem, so this
+ * returns normally in that case — the caller renders the verdict, it does not catch it.
+ */
+export function verifyBackup(id: string): Promise<BackupVerification> {
+  return request<BackupVerification>(`/api/v1/backups/${id}/verify`, { method: "POST" });
+}
+
+/** Remove a run. The artifacts on the destination are not removed by this call. */
+export function deleteBackup(id: string): Promise<void> {
+  return request<void>(`/api/v1/backups/${id}`, { method: "DELETE" });
+}
+
+/** The schedules table. Slice 3 adds the writes. */
+export function fetchBackupSchedules(): Promise<BackupSchedule[]> {
+  return request<BackupSchedule[]>("/api/v1/backup-schedules");
+}
+
+/** The settings record. */
+export function fetchBackupSettings(): Promise<BackupSettings> {
+  return request<BackupSettings>("/api/v1/backup-settings");
+}
+
+/**
+ * Save the settings.
+ *
+ * The API probes the destination before it stores anything and refuses an unwritable one, so
+ * a `200` here means the configuration was not only saved but proved writable.
+ */
+export function saveBackupSettings(input: {
+  destination: string;
+  local_root: string;
+  s3_prefix?: string | null;
+  credential_ref?: string | null;
+  encryption: string;
+  default_retention: number;
+  verify_after_backup: boolean;
+}): Promise<BackupSettings> {
+  return request<BackupSettings>("/api/v1/backup-settings", {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
 }
