@@ -79,6 +79,7 @@ import {
   type HistorySnapshot,
 } from "./builder-history";
 import { decideConnection } from "./connect-edge";
+import { readVersionFrom, resolveConflict } from "./conflict";
 import {
   clearSelection,
   deleteTarget,
@@ -125,7 +126,7 @@ type SaveState =
   | { kind: "dirty"; since: number }
   | { kind: "saving" }
   | { kind: "saved"; at: number }
-  | { kind: "conflict"; message: string }
+  | { kind: "conflict"; message: string; version: number | null }
   | { kind: "error"; message: string };
 
 /**
@@ -156,6 +157,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const selectionCount = selectionSize(selection);
   const [findings, setFindings] = useState<GraphFinding[]>([]);
   const [save, setSave] = useState<SaveState>({ kind: "clean" });
+  // A mirror of `save` for the handlers that run outside a render. `keepMine` has to read
+  // the conflict the *server* just reported, and a click handler closing over the state it
+  // was rendered with would be reading the state from the render before the conflict
+  // arrived — so it would take the reload exit while the banner showed an overwrite.
+  const saveRef = useRef<SaveState>(save);
+  saveRef.current = save;
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [paletteQuery, setPaletteQuery] = useState("");
@@ -283,7 +290,16 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       setFindings([]);
     } catch (error) {
       if (error instanceof ApiError && error.code === "graph_version_conflict") {
-        setSave({ kind: "conflict", message: error.message });
+        // The server names the version it is holding, and it is read out of the message
+        // rather than kept in a second field: `graph_store::replace_graph` is the only
+        // producer of this error and it always says "it is now at version N". A client that
+        // stored the version separately would have two answers to "what is the server on"
+        // and they would drift the first time one of them changed.
+        setSave({
+          kind: "conflict",
+          message: error.message,
+          version: readVersionFrom(error.message),
+        });
         return;
       }
       if (error instanceof ApiError && error.details) {
@@ -317,6 +333,32 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     saveTimer.current = setTimeout(() => {
       void persist();
     }, AUTOSAVE_MS);
+  }, [persist]);
+
+  /**
+   * Take the conflict's second exit: write this tab's graph on top of the other editor's.
+   *
+   * The version quoted is the one the *server* named, taken from `conflict.ts`, and never a
+   * locally derived `versionRef + 1`. That distinction is the whole safety argument: the
+   * guard exists so two editors cannot both believe they won, and re-deriving the base turns
+   * it into "last write wins" wearing the costume of a guard. The author has just been told,
+   * in the button's own label, what this click destroys.
+   *
+   * The save goes out immediately rather than through the debounce — the author has already
+   * waited for the conflict to be noticed, and one more 1.2s would read as a second refusal.
+   */
+  const keepMine = useCallback(() => {
+    const current = saveRef.current;
+    if (current.kind !== "conflict") return;
+    const resolution = resolveConflict({ message: current.message, version: current.version });
+    if (resolution.nextVersion === null) return;
+    versionRef.current = resolution.nextVersion;
+    setSave({ kind: "dirty", since: Date.now() });
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    void persist();
   }, [persist]);
 
   /** Save the layout, which bumps neither the version nor the step list. */
@@ -1255,7 +1297,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
           Rule
         </button>
 
-        <SaveIndicator state={save} onReload={() => void load()} />
+        <SaveIndicator state={save} onReload={() => void load()} onKeepMine={keepMine} />
 
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           <ToolbarButton
@@ -1801,8 +1843,24 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 // ---------------------------------------------------------------------------------------------
 
 /** The toolbar's save state, which is the toolbar's honesty. */
-function SaveIndicator({ state, onReload }: { state: SaveState; onReload: () => void }) {
+function SaveIndicator({
+  state,
+  onReload,
+  onKeepMine,
+}: {
+  state: SaveState;
+  onReload: () => void;
+  onKeepMine: () => void;
+}) {
   if (state.kind === "conflict") {
+    // Two exits, and both of them work. The server's message offers the author a choice —
+    // "reload to see their change, or keep editing to overwrite it" — and until this tick
+    // only the first half was real: the tab kept quoting the version it had loaded, so every
+    // later save was refused again and "keep editing" was a sentence describing a dead end.
+    // Overwriting is the destructive half, so it is behind a confirm that names what it
+    // destroys; a one-click "overwrite" would be the same silent loss the criterion exists
+    // to prevent, one click earlier.
+    const resolution = resolveConflict({ message: state.message, version: state.version });
     return (
       <span
         className="flex items-center gap-2 rounded-md bg-accent-soft px-2.5 py-1 text-[12px] text-ink"
@@ -1819,6 +1877,17 @@ function SaveIndicator({ state, onReload }: { state: SaveState; onReload: () => 
         >
           Reload
         </button>
+        {resolution.requiresConfirmation ? (
+          <button
+            type="button"
+            onClick={onKeepMine}
+            className="rounded border border-ink px-1.5 py-0.5 text-[11.5px]"
+            data-save-keep-mine
+            title={resolution.confirmLabel}
+          >
+            {resolution.confirmLabel}
+          </button>
+        ) : null}
       </span>
     );
   }
