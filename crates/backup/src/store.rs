@@ -631,6 +631,31 @@ pub async fn set_prefix(pool: &PgPool, id: Uuid, prefix: &str) -> Result<Backup>
     .map_err(BackupError::from)
 }
 
+/// The tenants that own at least one backup, oldest history first, plus the platform's own
+/// (`null`) row when it has one.
+///
+/// The retention sweep walks this list, and it is a **separate function rather than a query
+/// the runner writes**: the sweep has to walk tenants one at a time because
+/// [`prune_candidates`] is scoped by `organization_id` and `is not distinct from` is what
+/// keeps the platform's own backups in the same loop. A runner that wrote
+/// `select distinct organization_id from backups` inline would look identical and would be a
+/// second answer to "who gets swept" — the same mistake the walkthrough's own comment warns
+/// about, one layer up.
+///
+/// `null` is a real member of this list, not a missing value: `backups.organization_id` is
+/// nullable for the platform itself, and a sweep that filtered it away would never prune the
+/// platform's own restore points — the ones that matter most on a single-tenant installation.
+pub async fn organizations_with_backups(pool: &PgPool, batch: i64) -> Result<Vec<Option<Uuid>>> {
+    let rows: Vec<(Option<Uuid>,)> = sqlx::query_as(
+        "select organization_id from backups group by organization_id \
+         order by min(created_at) asc limit $1",
+    )
+    .bind(batch.clamp(1, 500))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(organization_id,)| organization_id).collect())
+}
+
 /// Delete a run. Its parts cascade; its artifacts do not, and slice 2 owns removing those.
 pub async fn delete_backup(pool: &PgPool, id: Uuid, organization_id: Option<Uuid>) -> Result<()> {
     let removed = sqlx::query(

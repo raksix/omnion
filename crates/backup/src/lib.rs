@@ -37,6 +37,7 @@ pub mod media;
 pub mod part;
 pub mod purge;
 pub mod store;
+pub mod sweep;
 
 pub use destination::{
     DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
@@ -63,7 +64,10 @@ pub use store::{
     Backup, BackupPage, BackupQuery, BackupSchedule, BackupSettings, NewBackup, NewPart,
     NewSchedule, NewSettings, PartTotals, StatusTotals, count_by_status, delete_backup,
     delete_schedule, find_backup, finish_run, insert_backup, insert_part, list_backups, list_parts,
-    list_schedules, load_settings, manifest_of, next_due_schedules, protected_backup_count,
-    prune_candidates, record_schedule_run, save_part, save_settings, schedule_appears_due,
-    set_prefix, set_protected, start_run, totals, upsert_schedule,
+    list_schedules, load_settings, manifest_of, next_due_schedules, organizations_with_backups,
+    protected_backup_count, prune_candidates, record_schedule_run, save_part, save_settings,
+    schedule_appears_due, set_prefix, set_protected, start_run, totals, upsert_schedule,
+};
+pub use sweep::{
+    MAX_REPORTED_STRANDED, StrandedArtifact, SweepReport, sweep_all, sweep_organization,
 };
