@@ -80,6 +80,7 @@ import {
 } from "./builder-history";
 import { decideConnection } from "./connect-edge";
 import { readVersionFrom, resolveConflict } from "./conflict";
+import { arbitrateSave } from "./save-arbitration";
 import {
   clearSelection,
   deleteTarget,
@@ -274,7 +275,33 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
    * a cycle: `queueSave` needs `persist`, and `persist` is the thing that clears the timer
    * the queue set.
    */
+  // ---- ⌘S: save now, and save once -------------------------------------------------------
+  //
+  // The criterion is the second half of "⌘S during a pending autosave does not write twice",
+  // and both halves are the same bug. The obvious implementation — press ⌘S, call `persist`
+  // — writes the graph a second time a moment after the debounce fires, so the version
+  // advances twice for one keystroke and a second tab watching that workflow sees a conflict
+  // that no author caused.
+  //
+  // So the two conditions `saveNow` has to refuse are the two races, and they are different:
+  //
+  //   1. A debounce is armed but has not fired. Cancelling the timer is the whole fix — the
+  //      graph is already in `graphRef`, so the write that was going to happen in 1.2s
+  //      happens now instead, exactly once.
+  //   2. A write is already in flight. Here the timer is irrelevant: the request has left,
+  //      and sending a second one with the same `versionRef` would race the first for the
+  //      version column. A second `⌘S` is a second *request to save*, and the honest answer
+  //      to a request the server is already satisfying is to let that request finish.
+  //
+  // In both cases the indicator moves to `saving` so the press is not silently ignored —
+  // a key that does nothing looks broken, which is how a builder teaches people to hammer
+  // it.
+  const inFlight = useRef(false);
   const persist = useCallback(async () => {
+    // A save already on the wire owns the version column until it answers. A second write
+    // started here would quote the version the first one is about to replace.
+    if (inFlight.current) return;
+    inFlight.current = true;
     setSave({ kind: "saving" });
     try {
       const current = graphRef.current;
@@ -313,8 +340,35 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         kind: "error",
         message: error instanceof ApiError ? error.message : "The graph could not be saved.",
       });
+    } finally {
+      inFlight.current = false;
     }
   }, [workflowId]);
+
+  /**
+   * The ⌘S press: flush the debounce, or join the write already running.
+   *
+   * The rule itself is `arbitrateSave` — a decision about whether a write may start cannot
+   * be verified from inside a React callback, and this one is the difference between one
+   * version bump and two.
+   */
+  const saveNow = useCallback(() => {
+    const action = arbitrateSave({
+      debounceArmed: saveTimer.current !== null,
+      writeInFlight: inFlight.current,
+    });
+    if (action === "join-in-flight") {
+      // The request is already on the wire and owns the version column. Say so rather than
+      // sitting still, and let it answer.
+      setSave({ kind: "saving" });
+      return;
+    }
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    void persist();
+  }, [persist]);
 
   /**
    * Queue a save after the last change.
@@ -1104,6 +1158,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         }
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        // ⌘S flushes the debounce instead of racing it. The browser's own "save the page"
+        // dialog is the other reason this key must be consumed: an author who presses it
+        // while the graph is dirty and gets a download prompt has learned that ⌘S is a lie.
+        event.preventDefault();
+        saveNow();
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
         // Select every node. The inspector shows the last one in the array, so a select-all
         // still lands somewhere the user can act on rather than clearing everything.
@@ -1188,7 +1250,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       );
       commit("nudge", before, nextNodes, edges);
     },
-    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusPaletteItem, nodes, pasteClipboard, removeEdge, removeNodes, selected, selection, selectionCount],
+    [commit, copySelection, currentSnapshot, doRedo, doUndo, duplicateSelected, edges, filteredTypes, focusPaletteItem, nodes, pasteClipboard, removeEdge, removeNodes, saveNow, selected, selection, selectionCount],
   );
 
   // ---- actions ----------------------------------------------------------------------------
