@@ -254,6 +254,48 @@ else
   fail "grouped=$grouped total=$unread_summary"
 fi
 
+# 5. **A read notification is still a notification.** The bare list — no `with_read`, no `read`
+#    — has to include rows that have been read, and `?with_read=0` has to exclude them.
+#
+#    This is a regression gate for a real defect rather than a new claim. `with_read` was a
+#    `bool` defaulting to `false`, and a `bool` cannot tell "the client said nothing" from
+#    "the client said no" — so *every* caller that named no filter silently got unread-only,
+#    while the admin panel's State menu labelled that same state "Unread and read". Nothing
+#    failed loudly: the list rendered, the badge was right, and the screen simply stopped
+#    showing mail the reader had already seen. The browser pass found it only because it
+#    marks its own rows read and then walks straight into the keyboard step.
+#
+#    Both halves are asserted over a real socket, in this order: mark one row read, then the
+#    bare list must still be longer than the inbox list. Asserting the counts separately
+#    would pass against a list that returns nothing at all.
+#
+#    The row to mark is read from SQL here rather than reusing `$target` from the 404 check
+#    below: that variable is assigned further down, and a shell script that reads a value
+#    before the line that sets it runs with an empty string and reports it as "the endpoint
+#    refused" — a failure that names this gate and belongs to the next one.
+read_target=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select id from notifications where user_id = '$OWNER_ID' and archived_at is null limit 1")
+marked=$(curl -s -X POST "$URL/api/v1/notifications/$read_target/read" -b "$COOKIE_A" \
+  -H 'content-type: application/json' -d '{"read":true}')
+
+# `grep -c` on a body with no matches exits 1, and the script runs under `set -e`, so the
+# *inbox* leg — which is allowed to be empty, and is empty here on purpose — would abort the
+# whole gate before it printed a verdict. Counting with `tr` alone avoids the non-zero exit
+# entirely: it converts whatever came back into a digit count and never fails.
+count_rows() {
+  curl -s "$1" -b "$COOKIE_A" | tr ',' '\n' | grep -c '"id"' || true
+}
+all_rows=$(count_rows "$URL/api/v1/notifications?limit=100")
+inbox_rows=$(count_rows "$URL/api/v1/notifications?limit=100&with_read=0")
+live_rows=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select count(*) from notifications
+    where user_id = '$OWNER_ID' and archived_at is null")
+if [ -n "$marked" ] && [ "$all_rows" -gt "$inbox_rows" ] && [ "$all_rows" -eq "$live_rows" ]; then
+  pass "the bare list keeps read rows (all=$all_rows inbox=$inbox_rows live=$live_rows)"
+else
+  fail "all=$all_rows inbox=$inbox_rows live=$live_rows"
+fi
+
 # 2. Another person's notification is a 404, and the body does not carry the title.
 #    Read the base `member` role's id first: the binding below needs it, and a role that does
 #    not exist is a 404 from the IAM route that would read as "the member could not be bound".
