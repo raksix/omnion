@@ -21,12 +21,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod csv;
 pub mod error;
 pub mod model;
 pub mod posture;
 pub mod store;
 pub mod vocabulary;
 
+pub use csv::{COLUMNS as EXPORT_COLUMNS, MAX_EXPORT_ROWS, render as render_findings_csv};
 pub use error::{Result, SecurityError};
 pub use model::{
     BuiltFinding, CheckResult, Finding, FindingPage, FindingQuery, NewCheckResult, NewFinding,
@@ -37,9 +39,9 @@ pub use posture::{
     unevaluated_state,
 };
 pub use store::{
-    BulkReport, bulk_set_status, count_findings, find_finding, last_run_at, latest_results,
-    list_findings, open_counts_by_severity, record_run, set_status, stale_dependency_count,
-    upsert_finding,
+    BulkReport, bulk_set_status, count_findings, export_findings, find_finding, last_run_at,
+    latest_results, list_findings, open_counts_by_severity, record_run, set_status,
+    stale_dependency_count, upsert_finding,
 };
 pub use vocabulary::{
     FINDING_STATUSES, MAX_BULK_IDS, MAX_PAGE, SEVERITIES, SOURCES, STATES,

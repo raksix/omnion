@@ -369,6 +369,32 @@ pub async fn count_findings(
     Ok(count.build_query_scalar().fetch_one(pool).await?)
 }
 
+/// Every finding the current filter matches, for the CSV export — unpaged by design.
+///
+/// The export is the one read here that is *not* a page, and the reason is that an export that
+/// silently respects the current page size is the most common way a security report goes
+/// wrong: an operator exports 200 rows, hands the file to an auditor, and the auditor reads a
+/// filtered, truncated list as the platform's whole posture. `FindingQuery::limit` is ignored
+/// here on purpose, and the count comes from the *same* filter, so the row count in the file
+/// and the total on the screen are the same number.
+pub async fn export_findings(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    query: &FindingQuery,
+) -> Result<Vec<Finding>> {
+    let filter = finding_filter(organization_id, query)?;
+    let mut builder = QueryBuilder::<Postgres>::new(format!(
+        "select {FINDING_COLUMNS} from security_findings where "
+    ));
+    push_filter(&mut builder, &filter);
+    // The same worst-first order as the table, so a row in the file lines up with a row on
+    // screen and a reader comparing the two is not looking for a different order.
+    builder.push(" order by case severity when 'critical' then 0 when 'high' then 1 \
+                  when 'medium' then 2 when 'low' then 3 when 'info' then 4 else 9 end, \
+                  last_seen_at desc, id desc");
+    Ok(builder.build_query_as::<Finding>().fetch_all(pool).await?)
+}
+
 /// One filter's condition, held as a value rather than as SQL text with hand-numbered
 /// placeholders.
 ///
