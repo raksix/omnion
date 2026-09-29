@@ -123,6 +123,11 @@ import type {
   EnvironmentDetailResponse,
   EnvironmentFilters,
   EnvironmentListResponse,
+  // Promotions (REQ-017, slice 3).
+  ChangeSetResponse,
+  Promotion,
+  PromotionDetail,
+  PromotionRequested,
 } from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
@@ -5798,6 +5803,56 @@ export async function cancelEnvironmentClone(
 export async function archiveEnvironment(id: string): Promise<Environment> {
   return request<Environment>(`/api/v1/environments/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+}
+
+/** What staging holds that production does not — the Changes tab, and what a promotion freezes. */
+export async function fetchEnvironmentChanges(id: string): Promise<ChangeSetResponse> {
+  return request<ChangeSetResponse>(
+    `/api/v1/environments/${encodeURIComponent(id)}/changes`,
+  );
+}
+
+/** An environment's promotion history, newest first. */
+export async function fetchEnvironmentPromotions(id: string): Promise<Promotion[]> {
+  return request<Promotion[]>(
+    `/api/v1/environments/${encodeURIComponent(id)}/promotions`,
+  );
+}
+
+/** One promotion with the change set it froze. */
+export async function fetchPromotion(id: string): Promise<PromotionDetail> {
+  return request<PromotionDetail>(`/api/v1/promotions/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Request a promotion.
+ *
+ * `items` names the change-set rows to freeze; an **empty list means every change**, which is what
+ * the dialog's primary button sends. The answer carries both the record and the frozen items,
+ * because the dialog opens on it and a second request would describe a second instant.
+ */
+export async function requestPromotion(
+  environmentId: string,
+  items: string[] = [],
+): Promise<PromotionRequested> {
+  return request<PromotionRequested>(
+    `/api/v1/environments/${encodeURIComponent(environmentId)}/promotions`,
+    { method: "POST", body: JSON.stringify({ items }) },
+  );
+}
+
+/** Approve and apply the frozen change set to production (`deployment.deploy`). */
+export async function approvePromotion(id: string): Promise<Promotion> {
+  return request<Promotion>(`/api/v1/promotions/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+  });
+}
+
+/** Withdraw a promotion that has not started. Only its requester may. */
+export async function cancelPromotion(id: string): Promise<Promotion> {
+  return request<Promotion>(`/api/v1/promotions/${encodeURIComponent(id)}/cancel`, {
+    method: "POST",
   });
 }
 

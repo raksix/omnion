@@ -1964,6 +1964,112 @@ export type EnvironmentFilters = {
   limit?: number;
 };
 
+/** `GET /api/v1/environments/{id}/changes` — what staging holds that production does not. */
+export type ChangeSetResponse = {
+  environment_id: string;
+  environment_key: string;
+  /** The environment this one was cloned from. */
+  production_id: string;
+  items: ChangeItem[];
+  added: number;
+  updated: number;
+  deleted: number;
+  /** `true` when nothing differs — the normal state of a fresh environment. */
+  empty: boolean;
+};
+
+/** One row of the change set, as the Changes tab reads it. */
+export type ChangeItem = {
+  site_id: string;
+  slug: string;
+  /**
+   * The page's id **in the environment that holds it** — staging's id for `added` and `updated`,
+   * production's id for `deleted`. This is the id a promotion freezes and addresses items by, and
+   * for a deletion it is the only id that exists.
+   */
+  page_id: string;
+  /** `added`, `updated` or `deleted`. */
+  kind: "added" | "updated" | "deleted";
+  changed_by: string | null;
+  changed_at: string;
+  title: string | null;
+};
+
+/** One entry of a promotion's step log — the dialog's timeline. */
+export type PromotionStep = {
+  /** `validate`, `apply`, `audit` or `done`. */
+  step: string;
+  at: string;
+  /** A phrase a person reads, written by the server. */
+  detail: string;
+};
+
+/**
+ * One promotion, as the Promotions tab and the dialog read it.
+ *
+ * The counts are the *frozen* set's counts, not the change set's live counts: a promotion is a
+ * record of what was read at request time, and a panel that recounted them from staging would
+ * describe a different deploy than the one that ran.
+ */
+export type Promotion = {
+  id: string;
+  environment_id: string;
+  target_environment_id: string;
+  /** `pending_approval`, `approved`, `running`, `done`, `failed` or `cancelled`. */
+  status: string;
+  item_count: number;
+  /** How many items write a production row — deletions do not. */
+  write_count: number;
+  added: number;
+  updated: number;
+  deleted: number;
+  /** The conflicting item ids, which the dialog leads with. */
+  conflicts: string[];
+  /**
+   * Whether the operator must type the environment's name before the deploy.
+   *
+   * Decided by the server, above 25 items, so the panel and the promotion can never disagree
+   * about the threshold — and a panel-side constant would drift the first time it moved.
+   */
+  requires_typed_confirmation: boolean;
+  requested_by: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  steps: PromotionStep[];
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+};
+
+/** One frozen item, as the dialog's conflict list and the detail panel read it. */
+export type FrozenItem = {
+  page_id: string;
+  site_id: string;
+  slug: string;
+  title: string | null;
+  kind: "added" | "updated" | "deleted";
+  /** Production's `updated_at` at request time. Absent for an `added` row. */
+  base_updated_at: string | null;
+  /** SHA-256 of production's published revision at request time. */
+  base_digest: string;
+};
+
+/** The frozen change set, which is what runs. */
+export type FrozenChangeSet = {
+  environment_id: string;
+  target_environment_id: string;
+  items: FrozenItem[];
+};
+
+/** The answer to a promotion request: the record plus the set it froze, in one response. */
+export type PromotionRequested = {
+  promotion: Promotion;
+  changes: FrozenChangeSet;
+};
+
+/** `GET /api/v1/promotions/{id}` — the record and its frozen set. */
+export type PromotionDetail = PromotionRequested;
+
 export type RateLimitScope = {
   scope: string;
   window_seconds: number;
