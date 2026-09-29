@@ -825,11 +825,17 @@ pub fn router(state: AppState) -> Router {
     // attached agent sends, which is a different act from reading a list of them.
     let ai_skills = get(ai_skills::list_skills_route)
         .layer(guards::require(&state, "ai.skills.read"))
-        .merge(post(ai_skills::create_skill_route).layer(guards::require(&state, "ai.skills.manage")))
-        .merge(
-            post(ai_skills::validate_skill_route)
-                .layer(guards::require(&state, "ai.skills.manage")),
-        );
+        .merge(post(ai_skills::create_skill_route).layer(guards::require(&state, "ai.skills.manage")));
+    // `POST /ai/skills/{key}/validate`, **not** a second POST on `/ai/skills`. The handler has
+    // always been written for the keyed path — the spec's own table says so — and the router was
+    // the only place that disagreed. axum does not accept two `POST` routes on one path: it
+    // panics at *router construction*, so the whole API refused to start and the symptom was
+    // "the API did not answer", with `Overlapping method route` naming a line in a file whose
+    // other 1600 lines are fine. This is slice 3's own defect, found by the first pass that
+    // ever got far enough to boot the binary: the skill walks had run against a *test* binary
+    // built with the routes module, and the unit suite never builds a router at all.
+    let ai_skill_validate = post(ai_skills::validate_skill_route)
+        .layer(guards::require(&state, "ai.skills.manage"));
     let ai_skill = get(ai_skills::get_skill_route)
         .layer(guards::require(&state, "ai.skills.read"))
         .merge(
@@ -1609,6 +1615,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/agents/{id}/files/{*path}", ai_agent_file)
         .route("/ai/skills", ai_skills)
         .route("/ai/skills/{key}", ai_skill)
+        // Registered before `/ai/agents/{id}/skills/{key}` for the same reason the other AI
+        // routes are: a literal segment outranks a capture, so this keeps its own path.
+        .route("/ai/skills/{key}/validate", ai_skill_validate)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)
         .route("/ai/runs", ai_runs)
