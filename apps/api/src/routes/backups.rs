@@ -904,7 +904,27 @@ async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part>
     let pool = state.db().pool();
     let prefix = run.storage_prefix.clone();
     let mut produced = Vec::new();
-    for name in omnion_backup::PARTS {
+    // Only the scopes the run asked for. This loop used to walk all five `PARTS`
+    // unconditionally, so a backup requested for `["database"]` produced five artifacts and
+    // the scope selector in the drawer was a dead control: the scopes were validated,
+    // stored, normalised and rendered, and then ignored at the only point that mattered.
+    //
+    // Four existing walks asked for `["database"]` and none of them noticed, because each
+    // asserted on the part it *wanted* rather than on the number of parts, and the extra
+    // artifacts are perfectly valid files. It is the same silence class as the uncalled
+    // `prune_candidates` and the media part that only counted: the feature's rule is tested
+    // and nothing obeys it.
+    //
+    // A scope the run does not name produces no row at all rather than a `queued` one. A row
+    // that will never advance is the dead screen this crate's header is about, and the
+    // manifest is the run's own account of itself — a part nobody asked for does not belong
+    // in it.
+    let requested: Vec<&str> = omnion_backup::PARTS
+        .iter()
+        .copied()
+        .filter(|name| run.scopes.iter().any(|scope| scope == name))
+        .collect();
+    for name in requested {
         // `media` is not a document. It is the library's bytes, copied one object at a time
         // into the run's own directory, and it is produced outside the JSON pipeline below
         // because no amount of describing a file puts the file anywhere.
@@ -1236,12 +1256,19 @@ async fn produce_media(state: &AppState, run: &omnion_backup::Backup) -> Part {
 /// recorded — the same order every other part uses, and for the same reason: a `done` part
 /// whose artifact is not on the destination is the failure this whole crate is about.
 ///
-/// The recorded size is `bytes_copied + index bytes`, not one or the other. A part's `size_bytes`
-/// is what `verify_manifest` compares against the artifact on disk, so recording only the
-/// payload would make every media part report a mismatch against a perfectly good archive —
-/// and recording only the index would claim a size the archive does not have. The media part is
-/// also the one part whose artifact is a *directory*, so the number is stated as the sum and the
-/// index carries the per-object breakdown the restore actually walks.
+/// **The recorded size is the index's own length, and the payload is in the index.** An
+/// earlier version recorded `bytes_copied + index bytes` with a comment explaining that
+/// `size_bytes` is "what `verify_manifest` compares against the artifact on disk". That
+/// reasoning is exactly backwards, and the restore preview found it: `storage_path` names the
+/// **index file alone**, so any run with a non-empty library recorded a size that its own
+/// artifact could never have. The sum only agreed with the file when `bytes_copied` was zero,
+/// which is why the `verify` walk stayed green — that suite's library is empty.
+///
+/// So a `partial` media backup is what actually happened: `verify` called it mismatched, the
+/// restore preview refused to offer it, and both were right. The size a part records is the
+/// size of the artifact its `storage_path` points at, and the payload's bytes are accounted
+/// for by `item_count` and by the index's per-object breakdown — which is the number the
+/// restore path walks anyway.
 async fn finish_media_part(
     pool: &sqlx::PgPool,
     backup_id: Uuid,
@@ -1287,10 +1314,15 @@ async fn finish_media_part(
         .await;
     }
 
+    // The recorded size and checksum describe **this file** — the index — and nothing else.
+    // `storage_path` names the index, so a size that included the copied objects' bytes could
+    // never match it, and the mismatch it produced was indistinguishable from real
+    // corruption. The payload is not unaccounted for: `item_count` is the object count and the
+    // index holds every object's own size and checksum.
     let part = Part::done(
         "media",
         report.objects_copied,
-        report.bytes_copied + document.len() as i64,
+        document.len() as i64,
         omnion_backup::bytes_checksum(&document),
         key,
     );
@@ -1455,6 +1487,153 @@ pub async fn sweep(
     .await;
 
     Ok(Json(serde_json::to_value(&report).unwrap_or_default()))
+}
+
+/// `GET /api/v1/backups/{id}/restore-preview` — what a restore of this run would do.
+///
+/// The preview is the whole safety argument of the restore path, and it is deliberately a
+/// **`GET` that writes nothing**: it re-reads every artifact off the destination, counts what
+/// a restore would overwrite and what it would drop, and returns the sentence the operator
+/// has to agree to. Nothing in this function mutates a row, an object or a clock, which is
+/// why it is safe to let anyone with `backup.read` call it — the expensive, destructive
+/// permission (`backup.restore`) is only needed for the button *after* it.
+///
+/// Behind `backup.read` and not `backup.restore`, for a reason that is easy to get backwards:
+/// gating the preview behind the restore permission means the first time an operator meets
+/// "are you sure" is a 403 with no explanation, and the second time they grant themselves
+/// the permission without ever having seen what they were agreeing to. Reading a warning
+/// costs nothing and changes nothing.
+///
+/// Three things it refuses to do, which is where the value is:
+///
+/// 1. **It does not trust the manifest about what is on disk.** Each part's artifact is
+///    re-read and its size compared, so a truncated file is reported as unavailable instead
+///    of being offered as a restore point.
+/// 2. **It prices the restore against LIVE data.** The archive's own counts are in the
+///    manifest; the number that decides anything — how much the operator loses by choosing
+///    this restore point — is not in it anywhere.
+/// 3. **It names the tenant boundary.** A stranger's run is a 404 from the same statement
+///    that reads the row, so a preview cannot be used to discover another organization's
+///    restore points.
+pub async fn restore_preview(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let row = omnion_backup::find_backup(pool, id, org).await?;
+    let manifest = omnion_backup::manifest_of(&row);
+    let settings = omnion_backup::load_settings(pool).await?;
+
+    // Re-read the artifacts. `observe` already walks the manifest for `verify`, and the
+    // preview needs the same walk — but it needs the *failures* too, and `verify` drops
+    // them (`unreadable` is a name, not a sentence). So the reads happen here rather than by
+    // reusing a function whose return type cannot carry the reason.
+    let mut evidence: Vec<omnion_backup::PartEvidence> = Vec::new();
+    let mut archive_keys: Vec<String> = Vec::new();
+    for part in &manifest.parts {
+        let observed = match part.storage_path.as_deref() {
+            Some(relative) => {
+                let path = omnion_backup::local_path_for(&settings.local_root, relative);
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => Ok((
+                        omnion_backup::bytes_checksum(&bytes),
+                        bytes.len() as i64,
+                    )),
+                    Err(error) => Err(format!("{relative}: {error}")),
+                }
+            }
+            // A part with no path produced no artifact. That is not a failed read, and
+            // saying so is the difference between "this part is missing" and "this part was
+            // never written".
+            None => Err("the run recorded no artifact for this part".to_owned()),
+        };
+        evidence.push(omnion_backup::PartEvidence {
+            part: part.clone(),
+            artifact: observed,
+            live: omnion_backup::LiveCounts::default(),
+        });
+    }
+
+    // The media index is a separate file from the media artifact, and it is the only place
+    // the archive's own list of storage keys exists. Without it the preview can count what
+    // the live library holds but has nothing to compare it against, and would report every
+    // live object as "dropped" — which is the most alarming possible false positive on a
+    // screen whose whole job is being believed.
+    let media_readable = evidence
+        .iter()
+        .any(|item| item.part.part == "media" && item.artifact.is_ok());
+    if media_readable {
+        let index_key = omnion_backup::index_key(&row.storage_prefix);
+        let index_path = omnion_backup::local_path_for(&settings.local_root, &index_key);
+        if let Ok(text) = tokio::fs::read(&index_path).await {
+            if let Ok(index) = serde_json::from_slice::<omnion_backup::MediaIndex>(&text) {
+                archive_keys = index
+                    .objects
+                    .iter()
+                    .map(|object| object.storage_key.clone())
+                    .collect();
+            }
+        }
+    }
+
+    for item in &mut evidence {
+        item.live = if item.part.part == "media" && !archive_keys.is_empty() {
+            match omnion_backup::compare_media(pool, org, &archive_keys).await {
+                Ok(comparison) => comparison.counts(),
+                Err(error) => {
+                    // A preview that cannot count the live side must not quietly render
+                    // zeros: the caller is told the comparison is unpriced, and the wizard
+                    // says so rather than drawing a reassuring all-clear.
+                    tracing::warn!(%error, "the restore preview could not compare live media");
+                    omnion_backup::LiveCounts::default()
+                }
+            }
+        } else if item.part.part == "database" {
+            match omnion_backup::compare_database(pool, item.part.item_count, org).await {
+                Ok(comparison) => comparison.counts(),
+                Err(error) => {
+                    tracing::warn!(%error, "the restore preview could not count live rows");
+                    omnion_backup::LiveCounts::default()
+                }
+            }
+        } else {
+            omnion_backup::LiveCounts::default()
+        };
+    }
+
+    let preview = omnion_backup::build_preview(
+        &row.id.to_string(),
+        &row.label,
+        &manifest,
+        &evidence,
+        row.finished_at.map(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default()
+        }),
+        OffsetDateTime::now_utc().unix_timestamp(),
+    );
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.restore.previewed",
+        row.id.to_string(),
+        json!({
+            "restorable": preview.restorable,
+            "available": preview.available_parts(),
+            "live_dropped": preview.total_live_dropped,
+            "live_matches": preview.total_live_matches,
+            "age_days": preview.age_days,
+        }),
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&preview).unwrap_or_default()))
 }
 
 /// Write the audit entry, tolerating a failure rather than failing the action.
