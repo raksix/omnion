@@ -379,6 +379,15 @@ pub struct Workflow {
     pub next_run_at: Option<OffsetDateTime>,
     /// Ordered step definitions, as stored JSON.
     pub steps: serde_json::Value,
+    /// Why this rule's stored graph does not project into `steps`, when it does not.
+    ///
+    /// A graph is edited one card at a time, so a rule is *born* incomplete and its first
+    /// save is a definition that cannot run. That save is not refused — refusing it refuses
+    /// the first keystroke of the builder — so the reason is recorded here and the previous
+    /// `steps` is left alone. Both halves are load-bearing, and this column is the join
+    /// between them: a run reads it to refuse, and the rule list reads it to say so without
+    /// starting anything. `None` is the ordinary state and the whole point of the design.
+    pub validation_error: Option<String>,
     /// When the trigger last started a run of this workflow (schedules and events).
     pub last_triggered_at: Option<OffsetDateTime>,
     /// How many runs the trigger has started.
@@ -425,7 +434,8 @@ impl Workflow {
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
      trigger_kind, schedule, trigger_event, conditions, hook_token_hash, on_error, hook_secret, \
      run_as_user_id, rate_limit_per_hour, concurrency, last_error, next_run_at, steps, \
-     last_triggered_at, trigger_count, graph_version, created_by, created_at, updated_at";
+     validation_error, last_triggered_at, trigger_count, graph_version, created_by, created_at, \
+     updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]

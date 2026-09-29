@@ -1694,6 +1694,231 @@ async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
     fixture.cleanup().await;
 }
 
+/// REQ-004: **an unfinished graph saves, and the rule refuses to RUN — with the reason the
+/// author was shown.**
+///
+/// The design in one test. A rule is built by being incomplete, so the save must not refuse
+/// the author's first wiring; and the runner executes the `steps` column, which a graph that
+/// does not project cannot produce. Both halves are only safe together, and the join is the
+/// recorded reason: the save writes it, the run reads it.
+///
+/// A body-only test could not catch the failure this exists for. The dangerous states are
+/// "save returned 200" and "run returned 400" — and a server that saved an **empty** step
+/// list answers both, because a run of zero steps is a run that reports success. So every
+/// assertion here reads the **stored rows**: the previous step list must survive, the reason
+/// must be recorded, and no `workflow_steps` row may exist for a run that never started.
+#[tokio::test]
+async fn an_unfinished_graph_saves_and_the_rule_refuses_to_run() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = login(&fixture.state, &fixture.operator_email).await;
+
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&token),
+            Some(json!({
+                "name": "Built in two saves",
+                "organization_id": fixture.organization_a,
+                "trigger": { "kind": "event", "event": "page.published" },
+                "steps": [ { "name": "prepare", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "create: {}", created.body);
+    let workflow_id = created.body["id"].as_str().expect("an id").to_owned();
+    let uuid = Uuid::parse_str(&workflow_id).expect("an id parses");
+
+    // The step list the rule is born with — the thing that must survive the unfinished save.
+    let before: Value = sqlx::query_scalar(
+        "select steps from workflows where id = $1::uuid",
+    )
+    .bind(uuid)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the row is readable");
+    let before_steps = before.as_array().map_or(0, Vec::len);
+    assert!(before_steps > 0, "a new rule is born with its steps: {before}");
+
+    let read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "read: {}", read.body);
+    let version = read.body["graph_version"].clone();
+
+    // **The author's first wiring**: the second card is placed and NOT yet connected. This is
+    // the state the old code refused, and it is the state every rule passes through.
+    let wired = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            Some(json!({
+                "graph": {
+                    "nodes": [
+                        { "id": "t1", "type": "trigger.manual", "params": {} },
+                        { "id": "a1", "type": "action.task", "params": {} },
+                        { "id": "e9", "type": "end", "params": {} }
+                    ],
+                    "edges": []
+                },
+                "graph_version": version
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        wired.status,
+        StatusCode::OK,
+        "an unfinished graph must SAVE — refusing it refuses the first keystroke of the \
+         builder: {}",
+        wired.body
+    );
+    // The author is told every problem at once, not one per press.
+    assert!(
+        wired.body["findings"].as_array().is_some_and(|f| !f.is_empty()),
+        "a save of a rule that is still being wired must report its findings: {}",
+        wired.body
+    );
+    assert!(
+        wired.body["error_count"].as_u64().unwrap_or(0) > 0,
+        "an unwired graph has errors and the panel counts them: {}",
+        wired.body
+    );
+
+    // **The stored rows**, which is where the design either holds or does not.
+    let after: (Value, Option<String>, Value) = sqlx::query_as(
+        "select steps, validation_error, graph from workflows where id = $1::uuid",
+    )
+    .bind(uuid)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the row is readable");
+    assert_eq!(
+        after.0, before,
+        "a graph that does not project must leave the previous step list alone; blanking it \
+         makes \"not yet runnable\" indistinguishable from \"has never run\" and hands a \
+         zero-step run to the engine"
+    );
+    let reason = after
+        .1
+        .as_deref()
+        .expect("an unwired graph records why it cannot run, or the run-time guard is blind");
+    assert!(
+        !reason.trim().is_empty(),
+        "a recorded reason that is blank reads as no reason"
+    );
+    assert_eq!(
+        after.2["nodes"].as_array().map_or(0, Vec::len),
+        3,
+        "the author's three cards were stored: {}",
+        after.2
+    );
+
+    // **And the run is refused, by name, with that reason.** A refusal that returns 500 looks
+    // like an outage; a client cannot branch on it.
+    let run = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/run"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        run.status,
+        StatusCode::BAD_REQUEST,
+        "a rule that is not runnable must refuse the run rather than execute the last thing \
+         that was: {}",
+        run.body
+    );
+    assert_eq!(
+        run.body["error"]["code"], Value::String("workflow_not_runnable".into()),
+        "the client branches on this code: {}",
+        run.body
+    );
+
+    // No run was started. A run of zero steps settles `completed`, so the row count is the
+    // only thing that distinguishes "refused" from "refused after doing the work anyway".
+    let runs: i64 = sqlx::query_scalar("select count(*) from workflow_executions where workflow_id = $1::uuid")
+        .bind(uuid)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the count is readable");
+    assert_eq!(runs, 0, "the refusal happens before a run row exists");
+
+    // **The other direction, and the one the fix must not break.** Wire the graph for real and
+    // the same rule runs — otherwise the guard is a rule that stopped working forever.
+    let fixed = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            Some(json!({
+                "graph": {
+                    "nodes": [
+                        { "id": "t1", "type": "trigger.manual", "params": {} },
+                        { "id": "a1", "type": "action.task", "params": {} },
+                        { "id": "e9", "type": "end", "params": {} }
+                    ],
+                    "edges": [
+                        { "id": "w1", "source": "t1", "source_port": "out", "target": "a1" },
+                        { "id": "w2", "source": "a1", "source_port": "success", "target": "e9" }
+                    ]
+                },
+                "graph_version": wired.body["graph_version"].clone()
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(fixed.status, StatusCode::OK, "wiring it up: {}", fixed.body);
+    let cleared: Option<String> = sqlx::query_scalar(
+        "select validation_error from workflows where id = $1::uuid",
+    )
+    .bind(uuid)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the row is readable");
+    assert!(
+        cleared.is_none(),
+        "a graph that projects must clear the recorded reason, or the rule stays unrunnable \
+         after it was fixed: {cleared:?}"
+    );
+
+    let run_again = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/run"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        run_again.status.is_success(),
+        "a wired rule runs: {}",
+        run_again.body
+    );
+
+    fixture.cleanup().await;
+}
+
 /// REQ-004 slice 4: **a rule opened from a LIST row can be saved.**
 ///
 /// The bug this closes was invisible from the builder and obvious from the API. The graph

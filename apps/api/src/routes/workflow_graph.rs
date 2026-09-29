@@ -67,6 +67,14 @@ pub struct GraphBody {
     pub edge_count: usize,
     /// What the author would see if they pressed Run now.
     pub projection: ProjectionBody,
+    /// Every finding the last validate produced, so the panel can list all of them instead of
+    /// the first. `projection.reason` is the first message on its own.
+    #[serde(default)]
+    pub findings: Vec<graph::Finding>,
+    /// How many of `findings` are errors. Zero with a non-empty list is a warning-only graph,
+    /// which is a real state: a rule that runs with an unconnected note.
+    #[serde(default)]
+    pub error_count: usize,
 }
 
 /// Whether the graph is currently runnable, and what would have to change.
@@ -81,11 +89,20 @@ pub struct ProjectionBody {
 }
 
 impl GraphBody {
+    /// Build the body a reader opens the builder with.
+    ///
+    /// `all` is the **whole** finding list — errors and warnings — because the problems
+    /// panel is where a warning belongs: "Event is not connected to anything" is a note an
+    /// author can act on, and filtering it out here is how a rule ends up with a panel that
+    /// says "No problems" over a graph the server will refuse to run. The prior code collected
+    /// errors only, so the panel could never have rendered the warning branch at all.
     fn build(definition: &graph_store::GraphDefinition) -> Self {
-        let findings: Vec<_> = graph::validate(&definition.graph)
-            .into_iter()
-            .filter(graph::Finding::is_error)
-            .collect();
+        let all = graph::validate(&definition.graph);
+        // A closure, not the method path: `Iterator::filter` hands its predicate `&&Finding`,
+        // and naming a `fn(&Finding) -> bool` there is a type error the compiler reports as
+        // "trait bounds not satisfied" — three lines of type theory in a filter. `error_count`
+        // below is the one definition of the same question.
+        let findings: Vec<_> = all.iter().filter(|f| f.is_error()).cloned().collect();
         let step_count = definition.steps.as_array().map_or(0, Vec::len);
         Self {
             id: definition.workflow_id,
@@ -102,8 +119,24 @@ impl GraphBody {
                 step_count,
                 reason: findings.first().map(|finding| finding.message.clone()),
             },
+            // The same list, carried whole. A client that renders only the first finding makes
+            // the author fix one problem per press, which is how a five-defect graph gets
+            // abandoned on the fourth.
+            //
+            // `error_count` counts ERRORS and the panel's own filter counts them again, so
+            // the two must not be the same expression: setting it to `findings.len()` after
+            // filtering to errors is right by accident, and would be wrong the day anyone
+            // passed the unfiltered list in. One definition, used twice.
+            error_count: error_count(&all),
+            findings: all,
         }
     }
+}
+
+/// How many of a finding list are errors. One definition, because the panel, the body and
+/// the tests all need to agree and a second copy is where they stop agreeing.
+fn error_count(findings: &[graph::Finding]) -> usize {
+    findings.iter().filter(|finding| finding.is_error()).count()
 }
 
 /// A graph as the panel writes it.
@@ -386,21 +419,17 @@ pub async fn replace_graph(
         ));
     }
 
-    // The same registry the palette was drawn from. Validating a save against a *different*
-    // set than the one the author was looking at is how a rule gets refused for a node the
-    // palette still offers.
+    // **VALIDATE TO TELL THE AUTHOR, NOT TO REFUSE THE WORK.** The graph is validated here for
+    // two reasons that both point the same way: the same registry the palette was drawn from
+    // (a save checked against a *different* set is how a rule gets refused for a node the
+    // palette still offers), and so the author is handed every finding at once rather than
+    // pressing Save once per problem. It is deliberately NOT a gate. Refusing a save whose cards
+    // are not wired together yet refuses the first keystroke of the feature: a rule is built by
+    // being incomplete, and the runner refuses a graph it cannot project — so the guard that
+    // belongs to this feature lives at run time, where it is the true statement.
     let plugins = plugins_enabled_for(&state, &current).await?;
     let findings = graph::validate_with_plugins(&input.graph, &plugins);
-    if let Some(blocking) = findings.iter().find(|finding| finding.is_error()) {
-        // The whole list travels with the refusal: a client that renders only the first
-        // finding makes the author press Save once per problem.
-        return Err(
-            ApiError::bad_request("graph_invalid", blocking.message.clone()).with_details(json!({
-                "findings": findings,
-                "error_count": findings.iter().filter(|f| f.is_error()).count(),
-            })),
-        );
-    }
+    let errors = error_count(&findings);
 
     let saved = graph_store::replace_graph(
         state.db().pool(),
@@ -421,6 +450,19 @@ pub async fn replace_graph(
         return Err(workflow_missing());
     };
 
+    // A save that could not project is a successful save of a rule that cannot run yet, and the
+    // author has to be able to tell those apart. `GraphBody::build` recomputes the findings the
+    // panel's problems panel draws from and reports them in `projection`; the count is carried
+    // here because a client that renders only the first finding makes the author press Save
+    // once per problem.
+    // `build` re-validates with the CORE registry; this save was validated against the
+    // registry the palette was drawn from, and a plugin node is known there and unknown
+    // here. The save's own list is the one the author must see, or enabling a plugin makes
+    // the panel invent a finding the server never produced.
+    let mut body = GraphBody::build(&saved);
+    body.error_count = errors;
+    body.findings = findings;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "workflow.graph.updated")
@@ -436,7 +478,7 @@ pub async fn replace_graph(
     )
     .await?;
 
-    Ok(Json(GraphBody::build(&saved)))
+    Ok(Json(body))
 }
 
 /// `PUT /api/v1/workflows/{id}/graph/ui-state` — the layout, and nothing else.
@@ -619,6 +661,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **THE PANEL MUST BE ABLE TO RENDER A WARNING, OR ITS WARNING BRANCH IS DEAD CODE.**
+    ///
+    /// `GraphBody::build` collected `filter(is_error)` and shipped that as `findings`, so the
+    /// list on the wire could only ever contain errors — while the panel's own rendering has
+    /// a `severity !== "error"` branch and a "N warnings" heading. The branch was unreachable:
+    /// a graph with a real warning and no error reached the author as "No problems". The
+    /// `error_count` that came with it was `findings.len()` after the filter, which was right
+    /// only by accident and would have counted warnings as errors the moment the filter was
+    /// removed — the two were the same expression, so they could not disagree until they did.
+    #[test]
+    fn the_body_carries_warnings_and_counts_only_errors() {
+        // **START FROM A GRAPH PROVEN CLEAN, THEN ADD THE ONE WARNING.** The first draft built
+        // its fixture from `starter_graph(None)` and expected a clean result — and an event
+        // trigger with no event name is a `missing_parameter` **error**, so the fixture carried
+        // a second finding and the assertion that mattered (`errors == 0`) failed. A fixture
+        // whose cleanliness is assumed is a fixture whose defects are the test's.
+        let mut warned = starter_graph(Some("page.published"));
+        assert!(
+            error_count(&graph::validate(&warned)) == 0,
+            "the starting point must be clean, or every finding below is ambiguous"
+        );
+
+        // **THE FIXTURE IS A LABEL, NOT A NOTE CARD — and the difference is the whole test.**
+        // The second draft of this test reached for a `note` node, which reads like the obvious
+        // "harmless card that is not wired to anything" — and produces *no finding at all*,
+        // because a note is inert by design (it contributes no step and no error). The test
+        // would then have passed its own fixture guard with `all.is_empty()` and proved
+        // nothing: an empty list counts errors correctly.
+        //
+        // A label longer than the card draws is the one warning the validator raises on an
+        // otherwise clean graph, so it is the only fixture that reaches the state under test:
+        // warnings present, errors absent.
+        let long = "W".repeat(graph::MAX_NODE_LABEL + 1);
+        let Some(trigger) = warned.nodes.first_mut() else {
+            panic!("a starter graph has a trigger");
+        };
+        trigger.label = long;
+
+        let all = graph::validate(&warned);
+        let warnings = all.iter().filter(|f| !f.is_error()).count();
+        let errors = error_count(&all);
+
+        // **The guard, and it is an equality this time.** The original form allowed `all` to be
+        // empty, which is exactly the outcome that would make the test pass for the wrong
+        // reason. This fixture MUST produce one warning and no error, or it is not the shape.
+        assert_eq!(
+            warnings, 1,
+            "this fixture must produce exactly one warning, or it is not testing the shape: \
+             {all:?}"
+        );
+        assert_eq!(
+            errors, 0,
+            "a warning must not be counted as an error, or the panel refuses a runnable \
+             rule: {all:?}"
+        );
+
+        // And the assertion the old code could not have passed: the error count and the list
+        // length disagree, which is the only way to notice that both were the same
+        // expression. Before the fix `findings` was the error-only list and `error_count` was
+        // `findings.len()` — one expression, so the two could never disagree until they did.
+        assert_ne!(
+            errors,
+            all.len(),
+            "a list with a warning in it must not report every entry as an error"
+        );
     }
 
     #[test]

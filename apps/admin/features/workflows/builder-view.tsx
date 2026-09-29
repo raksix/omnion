@@ -483,8 +483,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       versionRef.current = saved.graph_version;
       setSave({ kind: "saved", at: Date.now() });
       // The server's own verdict replaces the local one: it validated the graph it stored,
-      // which is not always the graph the editor believes it stored.
-      setFindings([]);
+      // which is not always the graph the editor believes it stored. A save of a graph that
+      // is still being wired SUCCEEDS and reports its findings here — refusing the work is
+      // refusing the first keystroke of a feature whose whole job is being edited, and the
+      // guard that matters lives at run time, where it is the true statement. An absent
+      // `findings` is a server that does not send them (older build), so the local list is
+      // kept rather than replaced with a claim of "no problems" nobody proved.
+      setFindings(saved.findings ?? []);
+      setProblemsOpen((open) => open || (saved.error_count ?? 0) > 0);
     } catch (error) {
       if (error instanceof ApiError && error.code === "graph_version_conflict") {
         // The server names the version it is holding, and it is read out of the message

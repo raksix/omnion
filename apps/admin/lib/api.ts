@@ -5154,6 +5154,14 @@ export interface WorkflowGraph {
   edge_count: number;
   /** What the author would see if they pressed Run now. */
   projection: { valid: boolean; step_count: number; reason: string | null };
+  /**
+   * Every finding, so the problems panel lists all of them. A save of a graph that is still
+   * being wired succeeds and reports them here — a rule is built by being incomplete, and a
+   * save that refused the work would refuse the first card the author adds.
+   */
+  findings?: GraphFinding[];
+  /** How many of `findings` are errors. */
+  error_count?: number;
 }
 
 /** The node-type registry the palette draws. */

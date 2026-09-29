@@ -361,14 +361,52 @@ async fn audit_settlement(pool: &PgPool, execution_id: Uuid) -> Result<()> {
 }
 
 /// Start a run of one workflow and audit it.
+///
+/// **THE RUN IS WHERE THE GUARD LIVES, AND IT IS THE ONLY PLACE IT CAN BE.** A graph is
+/// edited one card at a time, so a rule's first save is a definition that is not wired
+/// together yet — refusing that write refuses the first keystroke of the builder. The save
+/// therefore records the reason it cannot project (`validation_error`) and leaves the
+/// previous step list alone, which makes the guard here load-bearing rather than
+/// decorative: `steps` is what a run executes, so without this check a rule whose author has
+/// unhooked a card would run the **last runnable definition** — work the author can no
+/// longer see on their canvas, on a trigger they never chose. "Save says it is not runnable"
+/// and "run quietly did the last thing that was" are the same database row.
+///
+/// The refusal is an `Invalid`, so the API answers `400` with the reason the save recorded,
+/// which is a sentence the author was already shown in the problems panel.
 pub async fn start_run(
     pool: &PgPool,
     workflow: &Workflow,
     trigger: TriggerKind,
     triggered_by: Option<Uuid>,
 ) -> Result<WorkflowExecution> {
+    admit_to_run(workflow.validation_error.as_deref())?;
     let definitions = workflow.definitions()?;
     start_run_with(pool, workflow, trigger, triggered_by, &definitions).await
+}
+
+/// The rule, on its own, of whether a run may start: **a recorded reason refuses it, and
+/// nothing else does.**
+///
+/// A pure function because a policy about admitting work is exactly the thing that must be
+/// testable without a database, and because the two halves of this design only hold together
+/// while it is a single decision: the save that *records* the reason and the run that
+/// *obeys* it are 300 lines and a release apart, and the join is this column. A test that
+/// read the column would pass against a guard that checked the wrong thing.
+///
+/// `None` is admitted — it is the ordinary state, and it is the state of every rule whose
+/// graph projects.
+pub fn admit_to_run(validation_error: Option<&str>) -> Result<()> {
+    match validation_error {
+        Some(reason) if !reason.trim().is_empty() => Err(crate::error::WorkflowError::invalid(
+            "workflow_not_runnable",
+            format!("this rule is not runnable yet: {reason}"),
+        )),
+        // A blank reason is an empty string, not a verdict. Reading it as a refusal would
+        // make a rule permanently unrunnable over a column nothing wrote, which is the
+        // silent-failure direction: the rule simply never runs and nothing says why.
+        _ => Ok(()),
+    }
 }
 
 /// Start a run of one workflow from steps the caller already holds, and audit it.
@@ -1119,6 +1157,52 @@ mod tests {
             ..TickReport::default()
         };
         assert!(!busy.is_idle());
+    }
+
+    // ---- the run-time guard, which is what makes "a save may not refuse the work" true ----
+
+    /// **A RULE WHOSE AUTHOR UNHOOKED A CARD MUST NOT RUN ITS LAST RUNNABLE DEFINITION.**
+    ///
+    /// The save deliberately leaves `steps` alone when a graph does not project and records
+    /// the reason in `validation_error` — refusing the write would refuse the first keystroke
+    /// of the builder. The price of that trade is that `steps` and the author's canvas
+    /// disagree, and `steps` is what a run executes. This is the test that says the trade is
+    /// safe, and it is the only thing standing between "a rule being edited" and "a rule
+    /// quietly doing yesterday's work on today's trigger".
+    ///
+    /// The assertion that matters is the **code**, not the message: an API that maps this to
+    /// a `500` instead of a `400` has the same behaviour and a different screen, and only the
+    /// code is what a client branches on.
+    #[test]
+    fn a_recorded_reason_refuses_the_run_and_nothing_else_does() {
+        let error = admit_to_run(Some("the action card has no connection"))
+            .expect_err("a graph that does not project cannot run");
+        assert_eq!(
+            error.code(),
+            "workflow_not_runnable",
+            "the client branches on this code; a run that 500s looks like an outage, not a rule \
+             that needs one more connection",
+        );
+        assert!(
+            error.to_string().contains("no connection"),
+            "the refusal quotes the reason the save recorded, because that sentence is the one \
+             the author was shown in the problems panel: {error}"
+        );
+    }
+
+    /// The other two directions, and the one the fix must not break. `None` is the state of
+    /// every rule whose graph projects — including every rule that predates the column — and a
+    /// guard that refused it would take the whole platform's automations offline for the sake
+    /// of a feature.
+    #[test]
+    fn a_rule_with_no_recorded_reason_runs() {
+        assert!(admit_to_run(None).is_ok());
+        // Blank is not a verdict. A rule that was never validated writes nothing here; a
+        // rule whose reason was written empty by a bad migration must not become permanently
+        // unrunnable with nothing to show for it. This is the silent direction: the rule
+        // simply never fires and no screen says why.
+        assert!(admit_to_run(Some("")).is_ok());
+        assert!(admit_to_run(Some("   \n")).is_ok());
     }
 
     #[test]

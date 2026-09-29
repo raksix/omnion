@@ -113,22 +113,52 @@ pub async fn find_graph(pool: &PgPool, workflow_id: Uuid) -> Result<Option<Graph
 /// and the disagreement is a save that is accepted and then refused, with a sentence
 /// pointing at the wrong problem. `None` therefore means *no plugins* explicitly, not
 /// "caller forgot".
+/// Which SQL the projection outcome asks for.
+///
+/// A private helper because the choice of column is the whole fix and it is the part a reader
+/// cannot check by looking at the call site: `steps = $3` and `steps = coalesce($3, steps)` differ
+/// by one word and mean opposite things. On a graph that projects, both write the same list; on
+/// one that does not, `$3` binds `NULL` and **erases the rule's last good definition**, which is
+/// the difference between "not yet runnable" and "has never run" on the list screen.
+fn step_column(steps: &Option<Value>) -> &'static str {
+    if steps.is_some() {
+        "steps = $3"
+    } else {
+        "steps = coalesce($3, steps)"
+    }
+}
+
 pub async fn replace_graph(
     pool: &PgPool,
     workflow_id: Uuid,
     update: GraphUpdate,
     plugins: Option<&crate::plugin_nodes::PluginRegistry>,
 ) -> Result<Option<GraphDefinition>> {
-    let steps = project_steps(&update.graph, plugins)?;
+    // **A SAVE IS NOT A RUN, AND A RULE IS BUILT BY BEING INCOMPLETE.** A graph is edited one
+    // node at a time, so the author's first save is a rule whose cards are not wired together
+    // yet — and refusing that write is refusing the first keystroke of the feature. What makes
+    // this safe is that the projection is the only thing that can fail, and the runner refuses
+    // a graph it cannot project anyway: the guard moved from "you may not save" to "you may not
+    // run", where it was always the true statement.
+    //
+    // The step list is therefore left alone on a graph that does not project, rather than
+    // blanked. The previous definition is what a rule ran last, and the row is what the list
+    // screen shows; replacing it with an empty list would make "not yet runnable" indistinguishable
+    // from "has never run" — the same conflation the trace panel was fixed for.
+    let (steps, validation_error) = match project_steps(&update.graph, plugins) {
+        Ok(steps) => (Some(steps), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
 
+    let step_column = step_column(&steps);
     let sql = format!(
         "update workflows \
             set graph = $2, \
-                steps = $3, \
+                {step_column}, \
                 ui_state = coalesce($4, ui_state), \
                 graph_version = graph_version + 1, \
                 validated_at = now(), \
-                validation_error = null, \
+                validation_error = $6, \
                 updated_at = now() \
           where id = $1 and graph_version = $5 \
           returning {GRAPH_COLUMNS}"
@@ -148,6 +178,7 @@ pub async fn replace_graph(
         .bind(steps)
         .bind(update.ui_state)
         .bind(update.graph_version)
+        .bind(validation_error)
         .fetch_optional(pool)
         .await?;
 
@@ -389,6 +420,95 @@ mod tests {
                 },
             ],
         }
+    }
+
+    /// **A RULE IS BUILT BY BEING INCOMPLETE, SO A SAVE MAY NOT REFUSE THE WORK.**
+    ///
+    /// The shape under test is a graph whose second card has no wire yet — the state every
+    /// rule passes through on the way to being a rule. `project_steps` cannot walk it (it
+    /// projects from the trigger and this graph's action is not reachable), and the old code
+    /// carried that `?` straight out of the save, so the author's first edit was a `400` on a
+    /// feature whose entire job is being edited.
+    ///
+    /// The negative control is the point: `some_steps`/`some_error` are what the save derives,
+    /// so this test cannot pass against a server that writes an empty step list on a graph it
+    /// cannot project — that would make "not yet runnable" look like "has never run", which is
+    /// the one thing the trace panel was fixed for.
+    #[test]
+    fn a_save_of_a_graph_that_cannot_project_still_writes_the_definition() {
+        let unwired = Graph {
+            nodes: vec![node("trigger", "trigger.manual"), action("a1")],
+            // No edge at all: the action exists and is not reachable, so the walk stops at the
+            // trigger and the graph projects to nothing.
+            edges: vec![],
+        };
+
+        let outcome = project_steps(&unwired, None);
+        assert!(
+            outcome.is_err(),
+            "the fixture must be a graph that cannot project, or this test proves nothing",
+        );
+
+        // What `replace_graph` binds: the graph is written either way, the step list is left
+        // alone when there is nothing to project, and the reason is recorded for the panel.
+        let (steps, validation_error) = match project_steps(&unwired, None) {
+            Ok(steps) => (Some(steps), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        assert!(
+            steps.is_none(),
+            "a graph that does not project has no step list to write"
+        );
+        let reason = validation_error.expect("the author is told why it cannot run yet");
+        assert!(
+            !reason.is_empty(),
+            "a recorded reason that is empty reads on the list screen as a rule that is fine",
+        );
+
+        // **The half that actually reaches the database.** The previous version of this test
+        // stopped one line earlier and passed against a server that blanked the step list on
+        // a graph it could not project — the regression it was written for, silently green,
+        // because nothing in it ever looked at the SQL. `steps = $3` binds NULL and erases the
+        // rule's last good definition, which is how "not yet runnable" becomes "has never run"
+        // on the list screen. This is the assertion that notices.
+        assert_eq!(
+            step_column(&steps),
+            "steps = coalesce($3, steps)",
+            "a graph that does not project must leave the previous step list alone, or the \
+             rule's last runnable definition is erased by an edit that was not finished",
+        );
+    }
+
+    /// The other direction, and the one the fix must not break: a graph that **does** project
+    /// writes its steps and clears the recorded error. Without this the `coalesce` could keep a
+    /// stale error forever and the list would call a working rule invalid.
+    #[test]
+    fn a_save_of_a_graph_that_projects_writes_its_steps_and_clears_the_error() {
+        let (steps, validation_error) = match project_steps(&linear(), None) {
+            Ok(steps) => (Some(steps), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let array = steps
+            .as_ref()
+            .expect("a linear graph projects")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            array.len(),
+            2,
+            "the projected list is what the runner executes"
+        );
+        assert!(
+            validation_error.is_none(),
+            "a projectable graph must not carry a validation error, or the list calls it invalid",
+        );
+        assert_eq!(
+            step_column(&steps),
+            "steps = $3",
+            "a projectable graph writes its own step list; coalescing it would silently keep \
+             the previous one when a node is removed from the middle of a rule",
+        );
     }
 
     #[test]

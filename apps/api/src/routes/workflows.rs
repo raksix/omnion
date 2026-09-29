@@ -1141,6 +1141,9 @@ mod tests {
             steps: serde_json::json!([
                 { "name": "prepare", "kind": "task", "action": "noop", "params": {}, "max_attempts": 1 }
             ]),
+            // A runnable rule records no reason. The field is the save/run join, and a
+            // fixture that set it would make every run in this module refused.
+            validation_error: None,
             last_triggered_at: None,
             trigger_count: 0,
             graph_version: 1,
