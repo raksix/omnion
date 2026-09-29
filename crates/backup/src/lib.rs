@@ -35,7 +35,9 @@ pub mod destination;
 pub mod error;
 pub mod media;
 pub mod part;
+pub mod preview;
 pub mod purge;
+pub mod restore;
 pub mod store;
 pub mod sweep;
 
@@ -47,7 +49,7 @@ pub use error::{BackupError, Result};
 pub use media::{
     CopiedObject, INDEX_FILENAME, INDEX_VERSION, MAX_OBJECT_BYTES, MAX_REPORTED_FAILURES,
     MediaCopyReport, MediaIndex, MediaObject, OBJECTS_DIR, ObjectFailure, SiteCount, build_index,
-    copy_objects, object_key, pending_objects, pending_objects_for_organization, roll_up_sites,
+ copy_objects, index_key, object_key, pending_objects, pending_objects_for_organization, roll_up_sites,
     safe_filename,
 };
 pub use part::{
@@ -59,6 +61,12 @@ pub use part::{
 pub use purge::{
     MAX_REPORTED_PURGE_FAILURES, PROBE_MARKER, PurgeFailure, PurgeReport, remove_run_artifacts,
     run_directory,
+};
+pub use preview::{LiveComparison, MAX_MATCHED_KEYS, compare_database, compare_media};
+pub use restore::{
+    LiveCounts, MAX_REPORTED_SITES, PartEvidence, RestoreMode, RestorePreview, RestoreWarning,
+    RestoreWarningCode, STALE_AFTER_DAYS, WarningSeverity, build_preview, confirm_phrase,
+    reported_sites,
 };
 pub use store::{
     Backup, BackupPage, BackupQuery, BackupSchedule, BackupSettings, NewBackup, NewPart,

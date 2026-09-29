@@ -48,9 +48,11 @@ import {
   Trash2,
   TriangleAlert,
   Unplug,
+  X,
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { RestorePreviewPanel } from "@/features/backups/restore-preview-panel";
 import { LoadingTable } from "@/components/loading-table";
 import {
   ApiError,
@@ -704,6 +706,10 @@ function BackupDetailPanel({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  // The preview is collapsed until it is asked for. A restore panel that renders itself
+  // unprompted puts five tables of numbers in front of an operator who opened a run to see
+  // its status, and the warning they needed is now one of thirty rows.
+  const [previewing, setPreviewing] = useState(false);
   return (
     <div className="rounded-xl border border-line bg-panel px-4 py-3" data-testid="backup-detail">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -745,6 +751,21 @@ function BackupDetailPanel({
             {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldAlert className="h-3 w-3" />}
             Verify
           </button>
+          {/*
+            The restore preview is offered on every run, including a `failed` one. That is
+            the point: "can I restore from this?" is the question an operator has when a run
+            went red, and hiding the button until the run is healthy answers it the wrong way
+            round. The panel reports an unrestorable run honestly instead of disappearing.
+          */}
+          <button
+            type="button"
+            onClick={() => setPreviewing((value) => !value)}
+            data-testid="backup-restore-preview"
+            className="inline-flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-muted"
+          >
+            {previewing ? <X className="h-3 w-3" /> : <ShieldAlert className="h-3 w-3" />}
+            {previewing ? "Hide restore preview" : "Restore preview"}
+          </button>
           <button
             type="button"
             onClick={onClose}
@@ -784,6 +805,15 @@ function BackupDetailPanel({
           ))}
         </tbody>
       </table>
+
+      {previewing ? (
+        <div className="mt-3">
+          <RestorePreviewPanel
+            backupId={detail.backup.id}
+            onClose={() => setPreviewing(false)}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
