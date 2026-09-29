@@ -36,6 +36,7 @@ pub mod assignment;
 pub mod assignment_store;
 pub mod autoresponder;
 pub mod autoresponder_store;
+pub mod binding_health;
 pub mod claims;
 pub mod convert;
 pub mod convert_store;
