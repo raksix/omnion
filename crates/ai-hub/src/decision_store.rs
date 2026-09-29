@@ -42,6 +42,14 @@ const DECISION_COLUMNS: &str = "id, organization_id, site_id, user_id, run_id, t
      reason, walk, created_at";
 
 /// A decision row as stored.
+///
+/// **The timestamp serialises as RFC 3339, not as a component array.** This struct is returned
+/// *directly* by `GET /ai/routing/last-resolved` — it is a store type that doubles as an API
+/// body, which is only safe because every other body in the codebase annotates its timestamps
+/// with `time::serde::rfc3339`. Without the attribute `OffsetDateTime` falls back to its
+/// component representation and the endpoint answers `[2026,271,20,43,19,…]`, a number where a
+/// date belongs: `new Date(...)` silently reads it as 1970, and a panel sorting or formatting it
+/// shows garbage rather than failing.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RouteDecision {
     /// The row's own identifier; the cost row joins back to it.
@@ -74,7 +82,9 @@ pub struct RouteDecision {
     pub reason: String,
     /// The full candidate walk.
     pub walk: serde_json::Value,
-    /// When the decision was taken.
+    /// When the decision was taken, RFC 3339 — this row is returned straight to the panel by
+    /// `last-resolved`, so it has to serialise as a date rather than as a component array.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -365,10 +375,12 @@ struct Clause {
 /// One bind value in a clause, positionally.
 #[derive(Clone)]
 enum Bind {
-    Uuid(Uuid),
-    Text(String),
+    Uuid(Option<Uuid>),
+    Text(Option<String>),
     Bool(bool),
-    Time(OffsetDateTime),
+    /// `None` means "no bound", and the clause tests it with `is null` — which is the only
+    /// spelling of "unset" that the parameter itself can carry. See [`clause`].
+    Time(Option<OffsetDateTime>),
 }
 
 impl Bind {
@@ -386,16 +398,33 @@ impl Bind {
     }
 }
 
+/// The WHERE clause of the decision log, as SQL plus its binds.
+///
+/// **Every "no filter" case binds a real NULL, not a sentinel.** The obvious shortcut is to
+/// bind `Uuid::nil()`, an empty string or the Unix epoch for an absent value — and every one of
+/// them is *non-null*, so `$n is null` is false and the comparison runs against the sentinel
+/// instead of being skipped. The two that happen to work are the uuid and the text: the nil uuid
+/// and the empty string match no stored value, so the clause reads as "no restriction" by
+/// accident. The time bounds are the ones that bite: binding the epoch for an absent `to` makes
+/// the clause `created_at < 1970-01-01`, which matches **no row at all** — so asking for the log
+/// with no date range returns an empty page while the rows are sitting there.
+///
+/// That bug shipped, and the existing walks missed it because every one of them passes a date
+/// range. "The export matches the filtered rows" was proved against a filter that was never
+/// absent, which is the case an operator meets first: open the screen, press nothing.
+///
+/// The shape that is correct is a nullable bind. `Option<T>::None` becomes SQL `NULL`, `is null`
+/// is true, and the comparison is skipped — so the neutral case is a property of the *value*
+/// rather than of which sentinel happened to be chosen.
 fn clause(filter: &DecisionFilter) -> Clause {
     // Each condition always contributes exactly one placeholder, even when the filter is
-    // "off" (`$n is not null` is false for null, and `($n::boolean is null or …)` reads as the
-    // neutral case). This is what keeps the bind numbering and the placeholder count identical
-    // between the rows query and the count query — the bug that a hand-written pair hits the
-    // first time someone adds a filter.
+    // "off" (`($n is null or …)` reads as the neutral case). This is what keeps the bind
+    // numbering and the placeholder count identical between the rows query and the count query —
+    // the bug that a hand-written pair hits the first time someone adds a filter.
     let mut parts: Vec<String> = Vec::new();
     let mut binds: Vec<Bind> = Vec::new();
 
-    let mut push = |parts: &mut Vec<String>, binds: &mut Vec<Bind>, text: String, bind: Bind| {
+    let push = |parts: &mut Vec<String>, binds: &mut Vec<Bind>, text: String, bind: Bind| {
         binds.push(bind);
         parts.push(text);
     };
@@ -404,31 +433,31 @@ fn clause(filter: &DecisionFilter) -> Clause {
         &mut parts,
         &mut binds,
         "($1::uuid is null or organization_id = $1)".to_owned(),
-        Bind::Uuid(filter.organization_id.unwrap_or(Uuid::nil())),
+        Bind::Uuid(filter.organization_id),
     );
     push(
         &mut parts,
         &mut binds,
         "($2::uuid is null or site_id = $2)".to_owned(),
-        Bind::Uuid(filter.site_id.unwrap_or(Uuid::nil())),
+        Bind::Uuid(filter.site_id),
     );
     push(
         &mut parts,
         &mut binds,
         "($3::text is null or task = $3)".to_owned(),
-        Bind::Text(filter.task.clone().unwrap_or_default()),
+        Bind::Text(filter.task.clone()),
     );
     push(
         &mut parts,
         &mut binds,
         "($4::text is null or feature = $4)".to_owned(),
-        Bind::Text(filter.feature.clone().unwrap_or_default()),
+        Bind::Text(filter.feature.clone()),
     );
     push(
         &mut parts,
         &mut binds,
         "($5::uuid is null or resolved_model_id = $5)".to_owned(),
-        Bind::Uuid(filter.model_id.unwrap_or(Uuid::nil())),
+        Bind::Uuid(filter.model_id),
     );
     // `fallback_only` and `unresolved_only` are two questions about one column rather than two
     // columns: a row is either unresolved or it has a position, and encoding them separately
@@ -437,26 +466,26 @@ fn clause(filter: &DecisionFilter) -> Clause {
     push(
         &mut parts,
         &mut binds,
-        "(not $6::boolean or (fallback_index > 0 and rule <> 'unresolved'))".to_owned(),
+        "(not coalesce($6::boolean, false) or (fallback_index > 0 and rule <> 'unresolved'))".to_owned(),
         Bind::Bool(filter.fallback_only),
     );
     push(
         &mut parts,
         &mut binds,
-        "(not $7::boolean or rule = 'unresolved')".to_owned(),
+        "(not coalesce($7::boolean, false) or rule = 'unresolved')".to_owned(),
         Bind::Bool(filter.unresolved_only),
     );
     push(
         &mut parts,
         &mut binds,
         "($8::timestamptz is null or created_at >= $8)".to_owned(),
-        Bind::Time(filter.from.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+        Bind::Time(filter.from),
     );
     push(
         &mut parts,
         &mut binds,
         "($9::timestamptz is null or created_at < $9)".to_owned(),
-        Bind::Time(filter.to.unwrap_or(OffsetDateTime::UNIX_EPOCH)),
+        Bind::Time(filter.to),
     );
 
     Clause {
@@ -606,10 +635,18 @@ pub async fn last_per_task(pool: &PgPool, filter: &DecisionFilter) -> Result<BTr
 /// took the counters with it would make every historical cost number on `/ai/costs` wrong, and
 /// the only symptom would be a chart that quietly went flat.
 pub async fn prune(pool: &PgPool, days: i64) -> Result<u64> {
-    let deleted = sqlx::query("delete from ai_route_decisions where created_at < now() - make_interval(days => $1)")
-        .bind(days.max(1))
-        .execute(pool)
-        .await?;
+    // The cast is load-bearing: `make_interval` is declared `days => int`, and a `bigint`
+    // parameter does not implicitly narrow. Without `::int` PostgreSQL raises 42883
+    // ("function make_interval(days => bigint) does not exist") and the pruner never deletes
+    // anything — which is the failure mode that looks like success, because an empty sweep
+    // reports zero rows and the decision log just grows.
+    let deleted = sqlx::query(
+        "delete from ai_route_decisions \
+         where created_at < now() - make_interval(days => $1::int)",
+    )
+    .bind(days.max(1))
+    .execute(pool)
+    .await?;
     Ok(deleted.rows_affected())
 }
 
