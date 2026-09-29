@@ -1616,6 +1616,17 @@ export type AiUsageSummary = {
   missing_usage: number;
   p95_latency_ms: number | null;
   error_rate_percent: number;
+  /**
+   * REQ-098 slice 5: what the window cost, summed from the snapshots stored on each usage row.
+   *
+   * `null` is not zero. It means no call in the window had a knowable cost — either the model was
+   * never priced, or the endpoint reported no token counts. A window of only free models really
+   * does cost `0`, and the panel shows those two differently, because only one of them is a fact
+   * about the money and the other is a fact about the data.
+   */
+  cost_micros: number | null;
+  /** How many calls in the window had no knowable cost. */
+  uncosted_calls: number;
   by_day: AiUsageDay[];
 };
 

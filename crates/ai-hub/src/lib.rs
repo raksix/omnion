@@ -17,6 +17,7 @@
 pub mod catalog;
 pub mod client;
 pub mod connection_test;
+pub mod cost;
 pub mod decision_store;
 pub mod error;
 pub mod failover;

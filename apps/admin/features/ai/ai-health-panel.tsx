@@ -63,6 +63,19 @@ function numberOrDash(value: number | null): string {
   return value === null ? "—" : value.toLocaleString();
 }
 
+/**
+ * A window's cost, in micros (REQ-098 slice 5).
+ *
+ * `null` renders as an em dash and never as `0`, and the difference is the point: a null means
+ * nothing in the window could be priced, which is a different statement from a window of free
+ * models. The unit is spelled out in the figure's own hint rather than baked into the string, so
+ * a locale that formats numbers differently cannot turn the amount into a different number.
+ */
+function formatCostMicros(micros: number | null): string {
+  if (micros === null) return "—";
+  return `${micros.toLocaleString("en-US")} µ`;
+}
+
 /** One figure in the header strip. */
 function Figure({
   label,
@@ -498,7 +511,22 @@ function UsagePanel({ provider }: { provider: AiProvider }) {
           value={summary.p95_latency_ms === null ? "—" : `${summary.p95_latency_ms} ms`}
           testId="usage-p95"
         />
+        <Figure
+          label="Cost"
+          value={formatCostMicros(summary.cost_micros)}
+          hint="at the price each call was billed"
+          testId="usage-cost"
+        />
       </div>
+
+      {summary.uncosted_calls > 0 ? (
+        <p data-usage-uncosted className="text-[12px] text-caution">
+          {summary.uncosted_calls} call{summary.uncosted_calls === 1 ? "" : "s"} in this window
+          could not be priced — the model has no price, or the endpoint reported no token counts.
+          They are left out of the cost figure rather than counted as free, and they stay unpriced
+          in the history too: editing a price today changes new calls only.
+        </p>
+      ) : null}
 
       {summary.missing_usage > 0 ? (
         <p data-usage-missing className="text-[12px] text-caution">

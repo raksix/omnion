@@ -105,6 +105,14 @@ pub struct NewUsage {
     pub substituted_from: Option<Uuid>,
     /// When the first byte reached a subscriber.
     pub first_byte_at: Option<OffsetDateTime>,
+    /// REQ-098 slice 5: the cost this call was billed at, snapshotted from the model's price at
+    /// this instant.
+    ///
+    /// A field rather than a value computed inside the function, and that is the entire design:
+    /// the store has no way to reach the catalog, so the price it stores cannot change after the
+    /// call. `None` means the cost is **not knowable** — an unpriced model, or an endpoint that
+    /// reported no token counts — and it is stored as `null`, never as `0`.
+    pub cost: Option<crate::cost::CallCost>,
 }
 
 /// The one probe result a runner hands in.
@@ -373,8 +381,10 @@ pub async fn record_usage(pool: &PgPool, new: NewUsage) -> Result<()> {
 
     let sql = format!(
         "insert into ai_provider_usage (provider_id, model_key, task, outcome, http_status, \
-         prompt_tokens, completion_tokens, latency_ms, substituted_from, first_byte_at) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning id"
+         prompt_tokens, completion_tokens, latency_ms, substituted_from, first_byte_at, \
+         cost_input_micros_per_mtok, cost_output_micros_per_mtok, cost_total_micros, \
+         cost_calculated_at) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) returning id"
     );
     sqlx::query(&sql)
         .bind(new.provider_id)
@@ -387,6 +397,14 @@ pub async fn record_usage(pool: &PgPool, new: NewUsage) -> Result<()> {
         .bind(new.latency_ms)
         .bind(new.substituted_from)
         .bind(new.first_byte_at)
+        // The snapshot, bound as values rather than computed here. `cost_calculated_at` is
+        // stamped even when the cost is null: the fact that the platform *tried* to price this
+        // call at a known instant is what separates "not priced" from "never considered", and
+        // those are different things to see in a costs screen.
+        .bind(new.cost.and_then(|cost| cost.input_micros_per_mtok))
+        .bind(new.cost.and_then(|cost| cost.output_micros_per_mtok))
+        .bind(new.cost.map(|cost| cost.total_micros))
+        .bind(OffsetDateTime::now_utc())
         .fetch_one(pool)
         .await?;
 
@@ -411,6 +429,18 @@ pub struct UsageSummary {
     pub p95_latency_ms: Option<i32>,
     /// Error rate as a percentage of `requests`.
     pub error_rate_percent: f64,
+    /// REQ-098 slice 5: what the window actually cost, summed from the **stored snapshots**.
+    ///
+    /// A sum, never a re-derivation: joining the catalog's current price here is precisely the
+    /// bug this column's existence prevents. `None` means no call in the window had a knowable
+    /// cost, which the panel renders as "not priced" rather than `Some(0)`.
+    pub cost_micros: Option<i64>,
+    /// How many calls in the window had no knowable cost — an unpriced model, or an endpoint
+    /// that reported no token counts.
+    ///
+    /// A separate number from `cost_micros` because "we spent nothing" and "we do not know what
+    /// this cost" are different sentences, and only the second one is actionable.
+    pub uncosted_calls: i64,
     /// The per-day breakdown, oldest first.
     pub by_day: Vec<UsageDay>,
 }
@@ -436,11 +466,13 @@ pub struct UsageDay {
 /// is a sum over `ai_provider_usage` and nothing else — no in-memory counter that a restart would
 /// reset and no estimate that would be a different number than the test.
 pub async fn usage_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Result<UsageSummary> {
-    let row: (i64, i64, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+    let row: (i64, i64, Option<i64>, Option<i64>, i64, Option<i64>, i64) = sqlx::query_as(
         "select count(*), \
          count(*) filter (where outcome <> 'ok'), \
          sum(prompt_tokens), sum(completion_tokens), \
-         count(*) filter (where prompt_tokens is null and completion_tokens is null) \
+         count(*) filter (where prompt_tokens is null and completion_tokens is null), \
+         sum(cost_total_micros), \
+         count(*) filter (where cost_total_micros is null) \
          from ai_provider_usage \
          where provider_id = $1 and created_at >= now() - make_interval(hours => $2::int)",
     )
@@ -481,7 +513,7 @@ pub async fn usage_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Resu
             .collect::<Vec<_>>(),
     );
 
-    let (requests, errors, prompt, completion, missing) = row;
+    let (requests, errors, prompt, completion, missing, cost, uncosted) = row;
 
     Ok(UsageSummary {
         requests,
@@ -490,6 +522,11 @@ pub async fn usage_summary(pool: &PgPool, provider_id: Uuid, hours: i64) -> Resu
         completion_tokens: completion.unwrap_or(0),
         missing_usage: missing,
         p95_latency_ms: p95,
+        // `sum` over a column where every value is null is itself null, not zero — which is the
+        // answer we want: no call in the window had a knowable cost. A window of only free
+        // models *does* sum to zero, and that is a real measurement, so the two never collide.
+        cost_micros: cost,
+        uncosted_calls: uncosted,
         error_rate_percent: if requests == 0 {
             0.0
         } else {
