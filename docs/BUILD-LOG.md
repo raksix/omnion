@@ -4014,3 +4014,85 @@ red before this tick and are red for a reason that has nothing to do with ranges
 claim than "the whole media surface is green", and it is the honest one: the serve paths this tick
 touched are covered by the walk in `--test media`, which exercises them through the real router
 and the real object store.
+
+## 2026-09-29 · wave7 tick 23 · REQ-099 slice 4, the guardrails and the telemetry
+
+The slice that was left open by three ticks: the output-verification helper, the guardrail bus
+events, the per-run telemetry roll-up, and the SDK (already in since slice 2).
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` — **346 pass** (38 new this slice).
+- `cargo test -p omnion-api --test ai_telemetry -- --test-threads=1` against PostgreSQL at 5433 —
+  **18 pass**, on the first executed run of the suite.
+- `pnpm typecheck` (apps/admin) — clean.
+- `node --check scripts/qa/walkthrough.cjs` — parses.
+- The QA pass itself is the one thing still outstanding; see "Next".
+
+**Four commits**, in the order the work had to happen.
+
+`bf3d1bc` the rules, `20326c8` the loop, `518b17d` the telemetry, `c2e7e2a` the screens and
+migration `0158_ai_run_output_repairs.sql`.
+
+**The migration came last and had to come first.** A new `StopReason` with no entry in
+`ai_runs_stop_reason_known` is a run the loop produces and the store refuses to write: the
+transaction fails with a constraint name instead of the sentence the panel needs. The same
+migration adds `output_repairs` to the run row, bounded `between 0 and 1`, because the one-turn
+repair budget has to survive a process restart.
+
+**A guardrail that cannot see itself is not a guardrail.** The loop already delimited tool
+output and already refused denied tools; neither could *report* that it had. Two of slice 4's
+four decisions follow from that: a guardrail hit is a first-class `AgentEvent::Guardrail`
+rather than a `note`, because `ai.guardrail.blocked` has to be subscribable; and it carries the
+rule, the source and the step but **never the payload**, because the rule exists because the
+content is untrusted and a trace row every operator can read is the last place a hostile string
+should be re-served.
+
+**"Detected" is not "blocked".** The hostile payload is still delivered to the model, labelled
+as data. Dropping it silently would make the trace disagree with what the tool returned, and
+the promise being made is the checkable one — labelled, and named on the bus. The fixture test
+asserts the *next step* is the one the system prompt asked for (`model.calls() == 2`), not a
+string the model happened to produce, and the companion test asserts ordinary tool output
+raises nothing: `ignore case when comparing` and `You are now logged in as the service account`
+are both real sentences real tools return, and a flag that fires on them is a flag nobody reads
+by the time it matters.
+
+**The telemetry has no counter table, on purpose.** Every number is a `sum`/`count` over
+`ai_runs` and `ai_run_steps` with the window in the `where` clause. A maintained roll-up and the
+rows it summarises are two facts about the same thing, and they drift at exactly the moments
+anybody is looking. The run detail therefore shows the **stored** cost and the **recomputed** one
+side by side with a `mismatch` marker: that turns "telemetry equals the underlying rows" from a
+test into something a person can read off the screen. The agents table's rate is over *finished*
+runs with the cancelled count published beside it, and it renders an em dash — never `0%` — when
+nothing has finished.
+
+**Two defects, both mine, both found by the thing that was written to find them.**
+
+1. The repair counter was declared `let mut output_repairs = 0_u32;` and then written back over
+   the caller's `repairs_spent`, so a resumed run arriving with a spent budget had it zeroed on
+   its first answer and repaired forever. Two variables holding one fact, and the local winning
+   — the fourth time this module has been bitten by that exact shape. The counter is now seeded
+   from the caller and is the single source of truth; `Outcome` reports what was spent so a
+   store can persist it.
+2. Two walk expectations were my own arithmetic, not the function's: 800 prompt tokens, not
+   1000, and `2.0/3.0*100.0` not being the same double as a hand-typed `66.66666666666667`. The
+   anti-tautology walk recomputes the same sum by hand in SQL, which is the version that can
+   catch a bug in the function rather than agreeing with it.
+
+**And one harness defect, which is worth more than either.** The QA pass failed with "the API
+did not answer" and a router panic on a route that **no longer exists in the tree**. The build
+was fine. `scripts/qa/run.sh` read a hardcoded `target/debug/omnion-api` in three places — the
+staleness check, the build decision and the `pm2 start` — while every parallel writer on this box
+sets `CARGO_TARGET_DIR` to a `/dev/shm` tmpfs because `/mnt/apopic` is full. So cargo compiled
+the current tree into the tmpfs, the staleness check compared migration timestamps against a
+three-hours-older binary in `target/debug`, judged it fresh, skipped the build, and pm2 started
+the stale one. One variable, used three times, is the whole fix (`28445ac`).
+
+The lesson generalises past the harness: **a pass that reports a symptom of code which is not
+there is telling you about the pass.** "The API did not answer" sent the reading to the API;
+the answer was that the harness had been testing a binary nobody had built since 14:33.
+
+**Next.** The QA pass on the private stack (`QA_STACK=w7 …`). The walkthrough now reads the
+agents table's 30-day cell on both the desktop row and the mobile card — asserting the em dash
+rather than a zero — and the run detail's telemetry panel, asserting the two costs *agree*
+rather than that the panel exists. Then the approval decision and resume (REQ-101) are the only
+boxes REQ-099 still cannot close on its own.
