@@ -40,20 +40,33 @@ pub async fn insert_event(executor: impl sqlx::PgExecutor<'_>, new: NewEvent) ->
 /// belong to organizations, and matching a tenant's endpoint against a fact that belongs to no
 /// tenant would leak. The unique index on `(endpoint_id, event_id)` makes the statement
 /// idempotent.
+///
+/// **The subscription test carries the group wildcard.** `catalogue::reconcile` stores a
+/// `page.*` subscription both as the wildcard and as today's expansion, so a plain
+/// `= any (w.events)` would already find today's members. It tests the wildcard anyway, for
+/// one honest reason: a row whose list carries only `page.*` — written before reconciliation
+/// existed, or by an operator's own SQL — would otherwise silently stop receiving, and the
+/// cost of a missing group test is a receiver that never hears about a page again with no
+/// error anywhere. The clause is indexed on the same column either way.
 pub async fn enqueue_fanout(executor: impl sqlx::PgExecutor<'_>, event: &Event) -> Result<u64> {
     let Some(organization_id) = event.organization_id else {
         return Ok(0);
     };
 
+    let group = event.name.split('.').next().unwrap_or_default();
+    let wildcard = format!("{group}.*");
+
     let result = sqlx::query(
         "insert into webhook_deliveries (endpoint_id, event_id, max_attempts) \
-         select w.id, $1, $4 from webhook_endpoints w \
-         where w.enabled and w.organization_id = $2 and $3 = any (w.events) \
+         select w.id, $1, $5 from webhook_endpoints w \
+         where w.enabled and w.organization_id = $2 \
+           and ($3 = any (w.events) or $4 = any (w.events)) \
          on conflict (endpoint_id, event_id) do nothing",
     )
     .bind(event.id)
     .bind(organization_id)
     .bind(event.name.as_str())
+    .bind(wildcard.as_str())
     .bind(DEFAULT_MAX_ATTEMPTS)
     .execute(executor)
     .await?;

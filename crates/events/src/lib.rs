@@ -3,6 +3,8 @@
 //! The CMS is not a closed box: publishing a page is a fact other software needs to hear about
 //! (docs/01-VISION.md §13). This crate records those facts and delivers them:
 //!
+//! * [`catalogue`] — the one registry of every name the platform records: its area, its
+//!   meaning, its payload fields, and the group wildcards an endpoint may subscribe to.
 //! * [`bus`] — recording an event. One call writes the event row and queues one delivery per
 //!   subscribed, enabled endpoint of the same organization, atomically.
 //! * [`store`] — the SQL behind it: events, endpoints, the delivery queue and its leases.
@@ -18,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bus;
+pub mod catalogue;
 pub mod engine;
 pub mod error;
 pub mod model;
