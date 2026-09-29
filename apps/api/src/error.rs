@@ -976,6 +976,12 @@ impl From<AiHubError> for ApiError {
             ),
             AiHubError::InvalidProvider(message) => Self::bad_request("invalid_provider", message),
             AiHubError::InvalidModel(message) => Self::bad_request("invalid_model", message),
+            // An agent and a run are both things the caller *shaped*, so both are 400s with the
+            // message carried through: the limit text ("the goal is 2001 characters; the limit is
+            // 2000") is what the form puts under the field, and replacing it with a generic
+            // sentence would throw away the only part the user can act on.
+            AiHubError::InvalidAgent(message) => Self::bad_request("invalid_agent", message),
+            AiHubError::InvalidRun(message) => Self::bad_request("invalid_run", message),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code

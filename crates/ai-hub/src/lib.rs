@@ -30,6 +30,7 @@ pub mod resolve_path;
 pub mod router;
 pub mod routing;
 pub mod routing_store;
+pub mod run_store;
 pub mod store;
 
 pub use catalog::{

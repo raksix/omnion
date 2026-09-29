@@ -50,6 +50,20 @@ pub enum AiHubError {
     /// The model definition (or the model selection) is unusable.
     #[error("invalid model: {0}")]
     InvalidModel(String),
+    /// The agent definition is unusable.
+    ///
+    /// A separate code from `invalid_model` because the fix is in a different place: an
+    /// `invalid_model` sends an operator to the registry, an `invalid_agent` sends them to the
+    /// agent form, and a client that collapses the two shows the wrong field's message under
+    /// this one.
+    #[error("invalid agent: {0}")]
+    InvalidAgent(String),
+    /// The run cannot be started, continued or finished as asked.
+    ///
+    /// Carries the reason a resume was refused and the limit a goal broke, so the API can put
+    /// the text under the field that caused it rather than answering with a generic 400.
+    #[error("invalid run: {0}")]
+    InvalidRun(String),
     /// The request needs a capability the model does not claim.
     ///
     /// The refusal happens before any call leaves the process, so a caller that asked for a
@@ -112,6 +126,8 @@ impl AiHubError {
             Self::ProviderIsDefault(_) => "provider_is_default",
             Self::InvalidProvider(_) => "invalid_provider",
             Self::InvalidModel(_) => "invalid_model",
+            Self::InvalidAgent(_) => "invalid_agent",
+            Self::InvalidRun(_) => "invalid_run",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",

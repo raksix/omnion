@@ -191,6 +191,12 @@ create table if not exists ai_run_steps (
     status            text        not null default 'running',
     prompt_tokens     int         not null default 0,
     completion_tokens int         not null default 0,
+    -- The cost this step's own provider call was billed at, snapshotted at write time by the same
+    -- path that writes `ai_provider_usage` (REQ-098 slice 5). It has to live on the step, not only
+    -- on the run: a run's cost is the *sum of its steps' costs*, and a run column that cannot be
+    -- recomputed from its own rows is a number nobody can audit. `finish_step` takes it as an
+    -- argument for the same reason — the price is read once per call, never re-read later.
+    cost_micros       bigint      not null default 0,
     duration_ms       int,
     error             text,
     started_at        timestamptz not null default now(),
@@ -207,7 +213,7 @@ create table if not exists ai_run_steps (
     ),
     constraint ai_run_steps_step_no_positive check (step_no > 0),
     constraint ai_run_steps_token_counters_non_negative check (
-        prompt_tokens >= 0 and completion_tokens >= 0
+        prompt_tokens >= 0 and completion_tokens >= 0 and cost_micros >= 0
     ),
     constraint ai_run_steps_duration_non_negative check (duration_ms is null or duration_ms >= 0)
 );
