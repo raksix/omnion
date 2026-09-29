@@ -5541,6 +5541,29 @@ two pieces of slice 1 still missing, then the walkthrough route. The `route`-sco
 unenforced by design until a layer above the router can see the matched path; the flag that says
 so is already on every row.
 
+**The HTTP walk did not run, and the reason is the box rather than the code.** `apps/api/tests/
+reliability_limits.rs` compiles as far as the link step, and the link died with
+`collect2: fatal error: ld terminated with signal 7 [Bus error]`. That is not a Rust error: at the
+moment it happened **`/dev/shm` read 100% with 60 KB free of 32 GB**, `free -m` reported 128 MB
+free of 33000 with 24.7 GB of swap already used, and `uptime` read **load average 214** with five
+`rustc` processes alive. Eight writer worktrees each park a multi-gigabyte `target/` in that same
+tmpfs, so their combined target directories no longer fit: `du` on it at the tick's start already
+showed 28.6 GB across eight directories in a 32 GB filesystem.
+
+**So the counts this tick can quote are the ones that ran, and the walk is quoted as not run.** The
+`read_cache` and the glob defect were both caught by *unit* tests and both are fixed; the
+`window_seconds` `INT4`/`i64` defect was caught by an earlier attempt of the walk against
+`omnion_w6_dev` and is fixed; the walk's own verdict is still outstanding. That distinction is the
+finding worth recording: a saturated box fails a BUILD with a signal that does not name the cause,
+and a "the test failed" report is one operator-week of misdiagnosis away from a red gate that is
+really a full tmpfs.
+
+**Every number above was produced before the box filled, and the two gates that DID run are the
+tiered ones this loop requires**: `cargo test -p omnion-reliability --lib` **110/110** with no
+database and no browser, and the migration verified on a scratch database — `0162`'s up half
+creates all nine tables, its commented reversal drops all nine, and `0165` applies twice with four
+rows after two applies.
+
 
 ### Tick 66 — the media part was a manifest wearing a backup's name (2026-09-29)
 

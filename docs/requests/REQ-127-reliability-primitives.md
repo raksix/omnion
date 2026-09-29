@@ -218,6 +218,16 @@ the output's cursor**, so one removed control character silently disabled every 
 the **down script was live statements**, so `Db::migrate` applied the file and then dropped every
 table it had just created.
 
-**Next.** The Redis token bucket and the middleware that turns a refusal into a `429` with
-`Retry-After` and the three `X-RateLimit-*` headers — the first thing on this request that can be
-ticked in the acceptance list, because it is the first thing a request can observe.
+**Next.** The `/settings/reliability/limits` screen and the refusal rollup's chart, then the
+walkthrough route — and, first, the HTTP walk's verdict, which this tick could not obtain.
+
+**The walk did not run, and the reason is worth more than the slice.** `apps/api/tests/
+reliability_limits.rs` reaches the link step and the link dies with
+`collect2: fatal error: ld terminated with signal 7 [Bus error]`. At that moment `/dev/shm` read
+**100% full with 60 KB free of 32 GB** and `uptime` read **load average 214** with five `rustc`
+processes alive: eight writer worktrees park a multi-gigabyte `target/` in that one tmpfs and
+their combined target directories no longer fit. The three boxes this tick CAN quote are the ones
+that ran — 110/110 unit tests, `0162` applied and reversed on a scratch database, `0165` applied
+twice with four rows after two applies — and the walk is recorded as **not run** rather than
+passed. A saturated box fails a build with a signal that does not name the cause, and a red gate
+reported as a test failure sends the next operator to the wrong file.
