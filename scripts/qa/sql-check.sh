@@ -10,10 +10,20 @@
 #
 # It creates and drops its own database and touches nothing else. Run it after writing any
 # migration, and before a `cargo test` that will apply them.
+#
+# It reads the URL from `run.sh` so the two scripts cannot disagree about the server, and that
+# is a CONTRACT: a merge renamed the variable and this script matched nothing, then reported
+# **every** migration as FAIL with a connection error that had nothing to do with any of them.
+# A checker that cannot find its input must refuse to run, never to answer. The `grep -q`
+# guard below is the whole lesson — see the ledger's "measure the value, not the exit status".
 #!/usr/bin/env bash
 set -uo pipefail
-cd /mnt/apopic/omnion-w2
-LINE=$(grep -m1 'OMNION_DATABASE_URL="postgres' scripts/qa/run.sh)
+cd "$(dirname "$0")/../.."
+LINE=$(grep -m1 -E '^(export )?QA_DATABASE_URL="postgres' scripts/qa/run.sh)
+if [ -z "$LINE" ]; then
+  echo "sql-check: no QA_DATABASE_URL found in scripts/qa/run.sh — refusing to report a verdict"
+  exit 2
+fi
 RAW=$(printf '%s' "$LINE" | sed -E 's/.*"(postgres[^"]+)".*/\1/')
 DB="omnion_sqlcheck"
 QA_DB_NAME="$DB"

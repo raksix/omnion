@@ -99,6 +99,7 @@ pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
 pub mod menus;
+pub mod newsletter;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod onboarding;
@@ -1068,6 +1069,51 @@ pub fn router(state: AppState) -> Router {
     let public_robots = get(seo::public_robots);
     let public_redirect = get(seo::public_redirect);
 
+    // Newsletter (REQ-064, slice 4b). Two powers, and the public surface underneath them: the
+    // signup, the confirmation click and the unsubscribe click are the only unauthenticated
+    // routes in this module, and each of them writes to somebody else's inbox — so the confirm
+    // and unsubscribe tokens are the whole security surface, hashed and single-use.
+    let newsletter_lists_read =
+        get(newsletter::list_lists).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_lists_write = post(newsletter::create_list)
+        .layer(guards::require(&state, "newsletter.manage"));
+    let newsletter_list_read =
+        get(newsletter::get_list).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_list_write = put(newsletter::patch_list)
+        .layer(guards::require(&state, "newsletter.manage"))
+        .merge(delete(newsletter::delete_list).layer(guards::require(&state, "newsletter.manage")));
+    let newsletter_subscribers_read =
+        get(newsletter::list_subscribers).layer(guards::require(&state, "newsletter.read"));
+    // TWO separate POST method routers on purpose: they serve DIFFERENT paths
+    // (`/newsletter/lists/{id}/subscribers` and `/newsletter/lists/{id}/import`), and merging
+    // two POST routers panics at router construction with "Overlapping method route" — which
+    // takes down the whole application, not just this screen. A method router is a per-PATH
+    // thing; the paths are what decide.
+    let newsletter_list_subscribers_write =
+        post(newsletter::add_subscriber).layer(guards::require(&state, "newsletter.manage"));
+    let newsletter_list_import = post(newsletter::import_subscribers)
+        .layer(guards::require(&state, "newsletter.manage"));
+    let newsletter_subscriber_read =
+        get(newsletter::get_subscriber).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_subscriber_write = patch(newsletter::set_subscriber_status)
+        .layer(guards::require(&state, "newsletter.manage"))
+        .merge(
+            delete(newsletter::delete_subscriber)
+                .layer(guards::require(&state, "newsletter.manage")),
+        );
+    let newsletter_export =
+        get(newsletter::export_subscribers).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_issues_read =
+        get(newsletter::list_issues).layer(guards::require(&state, "newsletter.read"));
+    let newsletter_issues_write =
+        post(newsletter::send_issue).layer(guards::require(&state, "newsletter.manage"));
+
+    let public_newsletter_subscribe = post(newsletter::public_subscribe);
+    let public_newsletter_confirm = get(newsletter::public_confirm);
+    let public_newsletter_unsubscribe = get(newsletter::public_unsubscribe);
+    let public_newsletter_issue = get(newsletter::public_issue);
+    let public_newsletter_lists = get(newsletter::public_lists);
+
     // Comments (REQ-064, slice 4a). Two powers and one public surface. `comments.read` opens
     // the inbox, `comments.manage` changes a row and edits the policy — and the two are
     // deliberately separate, because the value of the split is exactly the case where a site
@@ -1506,6 +1552,36 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/seo/broken-links", seo_broken_read.merge(seo_broken_scan))
         .route("/seo/broken-links/{id}", seo_broken_write)
+        // Newsletter (REQ-064, slice 4b). The panel is three tables and one archive; the
+        // `/public` half is the signup, the two link clicks and the archive page, and none of
+        // them carry a session. The literal segments are declared before the parameter ones so
+        // axum ranks `/newsletter/subscribers/export` ahead of `/newsletter/subscribers/{id}` —
+        // a route registered after a parameterised sibling is unreachable, and the export is
+        // the one button an owner reaches for under pressure.
+        .route("/newsletter/lists", newsletter_lists_read)
+        .route("/newsletter/lists", newsletter_lists_write)
+        .route("/newsletter/lists/{id}", newsletter_list_read.merge(newsletter_list_write))
+        .route(
+            "/newsletter/lists/{id}/subscribers",
+            newsletter_list_subscribers_write,
+        )
+        .route("/newsletter/lists/{id}/import", newsletter_list_import)
+        .route("/newsletter/subscribers", newsletter_subscribers_read)
+        .route("/newsletter/subscribers/export", newsletter_export)
+        .route(
+            "/newsletter/subscribers/{id}",
+            newsletter_subscriber_read.merge(newsletter_subscriber_write),
+        )
+        .route("/newsletter/issues", newsletter_issues_read)
+        .route("/newsletter/issues", newsletter_issues_write)
+        .route("/public/newsletter/lists", public_newsletter_lists)
+        .route("/public/newsletter/confirm", public_newsletter_confirm)
+        .route("/public/newsletter/unsubscribe", public_newsletter_unsubscribe)
+        .route("/public/newsletter/issues/{slug}", public_newsletter_issue)
+        .route(
+            "/public/newsletter/{key}/subscribe",
+            public_newsletter_subscribe,
+        )
         // Comments (REQ-064, slice 4a). The inbox is `/comments`, the policy hangs off the site
         // it belongs to (`/sites/{id}/comment-settings`, beside the other per-site surfaces) and
         // the visitor's two routes live under `/public` where every unauthenticated surface on

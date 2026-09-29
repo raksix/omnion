@@ -179,6 +179,33 @@ pub enum ContentError {
     /// because "you are banned" with no reason is the one answer a person will argue with.
     #[error("comment refused: {0}")]
     CommentBanned(String),
+    /// Newsletter and membership validation (REQ-064 slice 4b/4c). One variant rather than one
+    /// per field, because every caller renders the same thing from it — a message a person can
+    /// act on — and a variant per field is a variant nobody ever adds an arm for.
+    #[error("{0}")]
+    InvalidNewsletter(String),
+    /// No list carries this identifier, or it belongs to another site.
+    #[error("no such newsletter list")]
+    NewsletterListNotFound,
+    /// No subscriber carries this identifier, or it belongs to another site.
+    #[error("no such subscriber")]
+    SubscriberNotFound,
+    /// The address is already confirmed on this list. Deliberately NOT a 404: the caller is
+    /// told the truth because this is a panel write, and a panel that cannot say "already
+    /// subscribed" makes an owner guess whether their button worked.
+    #[error("{0} is already subscribed to this list")]
+    SubscriberAlreadyConfirmed(String),
+    /// A confirmation or unsubscribe token that matches no row, or is not a token at all.
+    ///
+    /// The three refusals a token can earn — unknown, expired, already used — are ONE error to
+    /// the caller and THREE reasons in [`crate::newsletter::TokenOutcome`]. A visitor who
+    /// clicked a link from a forwarded mail must not be able to learn whether an address is
+    /// on a list, so the error says nothing and the outcome says everything.
+    #[error("that link is not valid")]
+    InvalidToken,
+    /// No issue carries this archive slug, or it belongs to another site.
+    #[error("no such newsletter issue")]
+    IssueNotFound,
 }
 
 /// Result alias used across the content crate.
@@ -236,6 +263,12 @@ impl ContentError {
             Self::CommentAlreadyInState(_) => "comment_already_in_state",
             Self::CommentBanned(_) => "comment_banned",
             Self::CommentThreadTooDeep => "comment_thread_too_deep",
+            Self::InvalidNewsletter(_) => "invalid_newsletter",
+            Self::NewsletterListNotFound => "newsletter_list_not_found",
+            Self::SubscriberNotFound => "subscriber_not_found",
+            Self::SubscriberAlreadyConfirmed(_) => "subscriber_already_confirmed",
+            Self::InvalidToken => "invalid_token",
+            Self::IssueNotFound => "newsletter_issue_not_found",
             Self::SiteNotFound => "site_not_found",
         }
     }

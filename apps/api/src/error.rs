@@ -541,6 +541,38 @@ impl From<ContentError> for ApiError {
                 "comment_thread_too_deep",
                 "a reply cannot answer another reply",
             ),
+            // Newsletter / membership (REQ-064 slice 4b). The catch-all below turns every
+            // unmapped variant into `invalid_request`, which is exactly the trap slice 4a
+            // recorded: a new store error silently becomes "your request was malformed", so a
+            // token that matched nothing answers as a form mistake. These are the STATUS
+            // assignments, not the variants.
+            ContentError::InvalidNewsletter(message) => {
+                Self::bad_request("invalid_newsletter", message)
+            }
+            ContentError::NewsletterListNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "newsletter_list_not_found",
+                "no such newsletter list",
+            ),
+            ContentError::SubscriberNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "subscriber_not_found",
+                "no such subscriber",
+            ),
+            ContentError::IssueNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "newsletter_issue_not_found",
+                "no such newsletter issue",
+            ),
+            ContentError::SubscriberAlreadyConfirmed(email) => Self::new(
+                StatusCode::CONFLICT,
+                "subscriber_already_confirmed",
+                format!("{email} is already confirmed on this list"),
+            ),
+            ContentError::InvalidToken => Self::bad_request(
+                "invalid_token",
+                "that link is not valid — it may have expired or already been used",
+            ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

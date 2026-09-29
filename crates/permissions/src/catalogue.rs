@@ -141,6 +141,21 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Approve, spam, trash, reply, ban and change the comment policy",
     },
+    // Newsletter (REQ-064, slice 4b). The same split as the comment inbox, for the same
+    // reason, and the argument is sharper here: reading a subscriber table already shows every
+    // address on it, so "somebody may look at the list" must not imply "somebody may re-add the
+    // people who left". An operator who can import a CSV can undo an unsubscribe in one action,
+    // and that is a moderation power, not a reporting one.
+    PermissionDef {
+        key: "newsletter.read",
+        category: "content",
+        description: "Read newsletter lists, subscribers and the issue archive",
+    },
+    PermissionDef {
+        key: "newsletter.manage",
+        category: "content",
+        description: "Create lists, import and export subscribers, change states, send issues",
+    },
     // Media.
     PermissionDef {
         key: "media.read",
