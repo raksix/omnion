@@ -261,10 +261,24 @@ pub async fn sweep(pool: &PgPool, retention: Retention) -> PruneReport {
     report
 }
 
-/// Read the settings row and prune once.
+/// Read the settings row, prune once, and record what went.
+///
+/// **This is the only sweep entry point that tells anybody what it did, and that is deliberate.**
+/// `sweep` prunes and counts and is the right primitive for a caller that only wants the numbers
+/// (a test asserting a window, an operator's own cron running the same deletions from a replica).
+/// But the *documented* behaviour of retention on this platform includes writing
+/// `observability.retention.pruned` and moving the prune counter, and a sweep that only happened
+/// to be called by `run` was an event reachable from exactly one private loop — the sixth instance
+/// of the shape this request has kept producing, where a fact is documented, unit-provable, and
+/// unreachable in a running instance. `run` calls this, so the loop's behaviour is unchanged; a
+/// caller reaching for "prune the way the instance does" now gets the event too.
 pub async fn prune_from_settings(pool: &PgPool) -> Result<PruneReport, crate::TelemetryError> {
     let retention = read_retention(pool).await?;
-    Ok(sweep(pool, retention).await)
+    let report = sweep(pool, retention).await;
+    if !report.is_empty() {
+        record(pool, &report).await;
+    }
+    Ok(report)
 }
 
 /// Start the sweep loop. The handle ends with the process.
@@ -293,9 +307,12 @@ pub fn run(pool: PgPool) -> tokio::task::JoinHandle<()> {
         loop {
             ticks.tick().await;
             match prune_from_settings(&pool).await {
+                // The event and the counter are already written by `prune_from_settings` — this
+                // arm is now only the log line. Recording here as well is what would have made
+                // every sweep emit two `retention.pruned` events, and a subscriber that gets the
+                // same name twice for one sweep learns to ignore the name.
                 Ok(report) => {
                     if !report.is_empty() {
-                        record(&pool, &report);
                         tracing::info!(
                             log_rows = report.log_rows,
                             trace_rows = report.trace_rows,
@@ -320,7 +337,15 @@ pub fn run(pool: PgPool) -> tokio::task::JoinHandle<()> {
 /// watching, which is the same "provable but unreachable" shape as the prune functions had. The
 /// event is emitted only when something was removed, because a webhook subscriber that receives
 /// a `retention.pruned` every 24 hours for zero rows learns to ignore the name.
-fn record(pool: &PgPool, report: &PruneReport) {
+///
+/// **Awaited, not spawned.** This used to `tokio::spawn` the write and hand the report back, which
+/// is the one arrangement where the caller's next statement — read the `events` table back — races
+/// the write it is checking for. The walk that does that read failed with "the event reached the
+/// events table" while the event arrived milliseconds later, and it did so intermittently, which
+/// is the hardest kind of failure to reproduce. Retention is housekeeping: a subscriber's slow
+/// inbox must not hold up a prune, and a *bounded* wait is the honest way to have both. A failure
+/// is logged and the sweep stands either way, which is what the doc below has always claimed.
+async fn record(pool: &PgPool, report: &PruneReport) {
     crate::metrics::global().counter_add(PRUNED_FAMILY, &["rows"], report.total() as f64);
     if report.failed() {
         // A `retention.pruned` payload is a claim that retention ran. Emitting it from a pass
@@ -329,13 +354,9 @@ fn record(pool: &PgPool, report: &PruneReport) {
         crate::metrics::global().counter_add(PRUNED_FAMILY, &["failed"], f64::from(report.errors));
         return;
     }
-    let pool = pool.clone();
-    let payload = report.payload();
-    tokio::spawn(async move {
-        if let Err(error) = emit_pruned(&pool, payload).await {
-            tracing::warn!(error = %error, "the retention event could not be recorded");
-        }
-    });
+    if let Err(error) = emit_pruned(pool, report.payload()).await {
+        tracing::warn!(error = %error, "the retention event could not be recorded");
+    }
 }
 
 /// Write `observability.retention.pruned` to the bus.
