@@ -572,11 +572,37 @@ async fn assert_untested_providers_stay_off(fixture: &Fixture, cookie: &str, pro
     );
 }
 
+/// The person the stub provider will assert on the next authorization request.
+///
+/// A named struct rather than four positional strings, because the second walk in this file
+/// asserts a *different* identity and a `&["editors"]` in the wrong position compiles perfectly
+/// while meaning something else entirely.
+struct Subject {
+    subject: &'static str,
+    email: &'static str,
+    display_name: &'static str,
+    groups: &'static [&'static str],
+}
+
+/// The identity the main walk signs in: in the `editors` group, which is what the legacy claim
+/// mapping keys on.
+const EDITOR: Subject = Subject {
+    subject: "stub-user-1",
+    email: "sso-live-subject@omnion.test",
+    display_name: "Live Directory Person",
+    groups: &["editors"],
+};
+
 /// Walk a full OIDC sign-in: `start` → the provider's own authorization endpoint → `callback`.
 ///
 /// `challenge`, `code` and `state` are all read out of what each party actually sent, so the two
 /// servers are driven against each other rather than the walk inventing a code.
-async fn oidc_sign_in(fixture: &Fixture, idp: &StubIdp, slug: &str) -> TestResponse {
+async fn oidc_sign_in(
+    fixture: &Fixture,
+    idp: &StubIdp,
+    slug: &str,
+    who: &Subject,
+) -> TestResponse {
     let start = call(
         &fixture.state,
         public_request(
@@ -604,10 +630,10 @@ async fn oidc_sign_in(fixture: &Fixture, idp: &StubIdp, slug: &str) -> TestRespo
     let challenge =
         query_value(&authorization_url, "code_challenge").expect("PKCE must ride the URL");
     idp.expect_identity(
-        "stub-user-1",
-        "sso-live-subject@omnion.test",
-        "Live Directory Person",
-        &["editors"],
+        who.subject,
+        who.email,
+        who.display_name,
+        who.groups,
         &challenge,
     );
 
@@ -714,7 +740,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     // would follow is added to that same response as a `Location` (the session rides the response
     // that carries it), so both facts are asserted: who is signed in, and where the panel sends
     // them next.
-    let response = oidc_sign_in(&fixture, &idp, "stub-oidc").await;
+    let response = oidc_sign_in(&fixture, &idp, "stub-oidc", &EDITOR).await;
     assert!(
         response.status.is_success(),
         "a verified sign-in opens a session: {}",
@@ -849,7 +875,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
     // The signature is perfectly valid — the provider really issued it. What does not match is
     // the code it was issued for, and a stateless signature check alone would never notice.
     idp.corrupt_code_hash();
-    let wrong_code = oidc_sign_in(&fixture, &idp, "stub-oidc").await;
+    let wrong_code = oidc_sign_in(&fixture, &idp, "stub-oidc", &EDITOR).await;
     assert_eq!(
         wrong_code.status,
         StatusCode::BAD_REQUEST,
@@ -860,7 +886,7 @@ async fn a_live_oidc_provider_signs_a_person_in_end_to_end() {
 
     // ---- 9. A token signed by a key the provider does not publish is refused ----------------
     idp.sign_with_unpublished_key();
-    let unpublished = oidc_sign_in(&fixture, &idp, "stub-oidc").await;
+    let unpublished = oidc_sign_in(&fixture, &idp, "stub-oidc", &EDITOR).await;
     assert_eq!(
         unpublished.status,
         StatusCode::BAD_REQUEST,
@@ -1163,4 +1189,292 @@ async fn a_live_saml_provider_signs_a_person_in_end_to_end() {
     );
 
     fixture.cleanup().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// REQ-065 slice 3: the rule set decides on the sign-in path, and says so in the audit
+// ------------------------------------------------------------------------------------------
+
+/// The identity a rule set is written *against*: a group the rules do not name, so a rule that
+/// matches is a rule that read something real rather than a catch-all.
+const ANALYST: Subject = Subject {
+    subject: "stub-user-rules",
+    email: "sso-live-rules@omnion.test",
+    display_name: "Rule Mapped Person",
+    groups: &["analytics"],
+};
+
+/// A real OIDC sign-in resolves the provider's ordered rules, and the sign-in audit says which
+/// one decided.
+///
+/// This is the walk the dry run exists to be checked against. Everything upstream of it was
+/// proven by a real provider and real cryptography, and everything downstream is bookkeeping; the
+/// claim being made here is the narrow one that `RoleRules::resolve` is what a *callback* calls,
+/// not only what a preview calls, and that the sentence `role via rule #N` reaches the audit.
+///
+/// The test is arranged so it can only pass one way. The provider carries **both** a legacy
+/// `role_mappings` entry that would grant the platform `editor` and a rule set that says
+/// something different. If the rules were consulted in *addition* to the mapping, the person
+/// would hold two roles and the dry run — which shows the rules alone — would have been a lie
+/// about what the sign-in does. Asserting that `editor` is absent is therefore not a detail: it
+/// is the proof that "first match wins" means first, not last.
+#[tokio::test]
+async fn a_real_sign_in_resolves_the_rules_and_says_which_one_decided() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let cookie = fixture.owner_session().await;
+    unsafe { std::env::set_var(SECRET_REF, CLIENT_SECRET) };
+    let idp = StubIdp::start().await;
+
+    let (provider_id, _) = connect(
+        &fixture,
+        &cookie,
+        json!({
+            "slug": "stub-rules",
+            "kind": "oidc",
+            "name": "Live Rule Directory",
+            "config": {
+                "issuer": idp.issuer(),
+                "client_id": CLIENT_ID,
+                // The legacy claim mapping is left in place on purpose — see the doc comment.
+                "role_mappings": [{ "claim_value": "analytics", "role_slug": "editor" }],
+            },
+            "secret_ref": SECRET_REF,
+            "group_claim": "groups",
+            "jit_enabled": true,
+        }),
+    )
+    .await;
+
+    let tested = call(
+        &fixture.state,
+        session_request(
+            Method::POST,
+            &format!("/api/v1/iam/providers/{provider_id}/test"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(tested.body["status"], json!("ok"), "test: {}", tested.body);
+    publish(&fixture, &cookie, provider_id).await;
+
+    // Two roles to rule between, and the rules are ordered so that the *first* one is the narrow
+    // one. A set evaluated last-to-first would grant the moderator and the test would say so.
+    let editor: Uuid = sqlx::query_scalar("select id from roles where key = 'editor'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the platform seeds a base editor role");
+    let moderator: Uuid = sqlx::query_scalar("select id from roles where key = 'moderator'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the platform seeds a base moderator role");
+
+    let saved = call(
+        &fixture.state,
+        session_request(
+            Method::PUT,
+            &format!("/api/v1/iam/providers/{provider_id}/role-rules"),
+            Some(&cookie),
+            Some(json!({
+                "rules": [
+                    {
+                        "when_kind": "group",
+                        "when_key": "groups",
+                        "when_operator": "equals",
+                        "when_value": "analytics",
+                        "role_id": moderator,
+                        "scope_type": "organization",
+                    },
+                    {
+                        "when_kind": "group",
+                        "when_key": "groups",
+                        "when_operator": "equals",
+                        "when_value": "analytics",
+                        "role_id": editor,
+                        "scope_type": "organization",
+                    },
+                ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "two rules, both matching, in a saved order: {}",
+        saved.body
+    );
+
+    // ---- 1. The dry run and the callback are asked the same question, before the sign-in -----
+    let preview = call(
+        &fixture.state,
+        session_request(
+            Method::POST,
+            &format!("/api/v1/iam/providers/{provider_id}/role-rules/preview"),
+            Some(&cookie),
+            Some(json!({ "sample": { "groups": ["analytics"], "sub": "stub-user-rules" } })),
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "preview: {}", preview.body);
+    assert_eq!(
+        preview.body["matched_rule_index"],
+        json!(0),
+        "the first rule wins, and the preview says which: {}",
+        preview.body
+    );
+    assert_eq!(
+        preview.body["role_id"],
+        json!(moderator),
+        "and the role it predicts is the first rule's"
+    );
+
+    // ---- 2. A real sign-in, through the provider, resolves the same rule ---------------------
+    let response = oidc_sign_in(&fixture, &idp, "stub-rules", &ANALYST).await;
+    assert!(
+        response.status.is_success(),
+        "a verified sign-in opens a session: {}",
+        response.body
+    );
+    let user_id: Uuid = Uuid::parse_str(response.body["user"]["id"].as_str().unwrap()).unwrap();
+
+    let roles: Vec<String> = sqlx::query_scalar(
+        "select r.key from role_bindings b join roles r on r.id = b.role_id \
+         where b.subject_id = $1 and b.revoked_at is null order by r.key",
+    )
+    .bind(user_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the bindings must be readable");
+    assert!(
+        roles.iter().any(|key| key == "moderator"),
+        "the first rule's role is the one attached: {roles:?}"
+    );
+    assert!(
+        !roles.iter().any(|key| key == "editor"),
+        "the second matching rule is NOT also applied — first match wins, and the rule set \
+         replaces the claim mapping rather than adding to it: {roles:?}"
+    );
+    assert_eq!(
+        role_of(&fixture, user_id).await,
+        Some("moderator".to_owned()),
+        "and the role the sign-in produced is the role the dry run predicted"
+    );
+    assert_eq!(
+        preview.body["role_id"],
+        json!(moderator),
+        "the preview and the callback named the same role id, which is the only thing that makes \
+         the preview evidence rather than a picture of it"
+    );
+
+    // ---- 3. The audit carries the sentence, and not the rule's condition ---------------------
+    let (metadata,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'iam.sso_sign_in' \
+         and actor_user_id = $1 order by created_at desc limit 1",
+    )
+    .bind(user_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the sign-in audit entry must exist");
+    assert!(
+        metadata.contains("role via rule #1"),
+        "the audit answers 'why does this person have that role': {metadata}"
+    );
+    assert!(
+        metadata.contains("moderator"),
+        "and names what it granted: {metadata}"
+    );
+    // The rule's `when_value` is `analytics` — the group the person belongs to. It must NOT be
+    // written down: a rule diff in a log nobody audits is a second copy of the directory.
+    assert!(
+        !metadata.contains("analytics"),
+        "the audit records the decision, not the directory behind it: {metadata}"
+    );
+
+    // ---- 4. The event fires, carrying ids and counts only ------------------------------------
+    let (payload,): (serde_json::Value,) = sqlx::query_as(
+        "select payload from events where name = 'iam.role_rule_matched' \
+         and organization_id = $1 order by created_at desc limit 1",
+    )
+    .bind(fixture.organization_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("a role granted by a rule is a fact somebody subscribed to");
+    assert_eq!(payload["subject_id"], json!(user_id));
+    assert_eq!(payload["rule_position"], json!(0));
+    assert_eq!(payload["role_id"], json!(moderator));
+    assert_eq!(payload["scope_type"], json!("organization"));
+    assert!(
+        !payload.to_string().contains("analytics"),
+        "a webhook payload carries ids and codes, never a group name: {payload}"
+    );
+
+    // ---- 5. An identity that matches nothing says so, rather than silently granting -----------
+    let visitor = Subject {
+        subject: "stub-user-nomatch",
+        email: "sso-live-nomatch@omnion.test",
+        display_name: "Nobody In Particular",
+        groups: &[],
+    };
+    let unmatched = oidc_sign_in(&fixture, &idp, "stub-rules", &visitor).await;
+    assert!(
+        unmatched.status.is_success(),
+        "a sign-in nobody wrote a rule for still succeeds: {}",
+        unmatched.body
+    );
+    let visitor_id: Uuid =
+        Uuid::parse_str(unmatched.body["user"]["id"].as_str().unwrap()).unwrap();
+    let (no_rule_metadata,): (String,) = sqlx::query_as(
+        "select metadata::text from audit_log where action = 'iam.sso_sign_in' \
+         and actor_user_id = $1 order by created_at desc limit 1",
+    )
+    .bind(visitor_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("that sign-in is audited too");
+    assert!(
+        no_rule_metadata.contains("no rule matched"),
+        "a rule set that granted nothing says so in those words — a silent no-op and a misconfigured \
+         provider look identical from the panel otherwise: {no_rule_metadata}"
+    );
+    // And the event did *not* fire for a sign-in no rule decided.
+    let fired: i64 = sqlx::query_scalar(
+        "select count(*) from events where name = 'iam.role_rule_matched' \
+         and payload ->> 'subject_id' = $1",
+    )
+    .bind(visitor_id.to_string())
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the count must run");
+    assert_eq!(
+        fired, 0,
+        "`iam.role_rule_matched` means a rule matched; firing it for a default role would make \
+         the event name false"
+    );
+
+    unsafe { std::env::remove_var(SECRET_REF) };
+    fixture.cleanup().await;
+}
+
+/// The single role key a subject holds, for the assertions above.
+///
+/// A `Vec` reduced to one is the shape that makes the claim legible: "the role this person ended
+/// up with" is one string, and a test that asserts on a list forces the reader to work out which
+/// element was meant.
+async fn role_of(fixture: &Fixture, user_id: Uuid) -> Option<String> {
+    let mut roles: Vec<String> = sqlx::query_scalar(
+        "select r.key from role_bindings b join roles r on r.id = b.role_id \
+         where b.subject_id = $1 and b.revoked_at is null order by r.key",
+    )
+    .bind(user_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the bindings must be readable");
+    assert!(
+        roles.len() <= 1,
+        "this walk asserts a single role, and the person holds {roles:?}"
+    );
+    roles.pop()
 }
