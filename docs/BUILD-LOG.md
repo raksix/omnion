@@ -5086,3 +5086,74 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
+
+## Wave 4b / w8 tick 17b — the fixture fix exposed the product bug it had been hiding
+
+With the pass able to build its own tenant (tick 17), the CRM screens rendered — 36–40 real
+elements where they had been 3–4 (Chrome's offline page) — and the intake depth pass moved from
+`403` to `400`. A `400` on a `create` is a *different* failure, so it was worth reading rather
+than retrying, and the body was reproduced directly:
+
+    POST /api/v1/crm/intake/sources   →  400
+    {"error":{"code":"no_organization",
+              "message":"this account does not belong to an organization …"}}
+
+**The product defect.** The first run creates the owner **platform-level on purpose** — an Owner
+runs the platform, not one tenant — and `state::set_organization` only ever wrote the
+onboarding-state singleton. Nothing attached the owner afterwards. So after a **complete,
+successful** wizard: `users.organization_id` is `null`, no organization-scoped binding exists,
+and every organization-scoped surface answers `no_organization`. The wizard reported success, the
+overview loaded, and the failure appeared only on the first *business* screen a new installation
+ever opens — the lead inbox, the media library, the analytics. Three symptoms, one cause, and
+nothing in the product's own test suite was looking for it.
+
+`users::attach_to_organization` + `permissions::seed::bind_owner_in` make the two statements one.
+Both are idempotent by construction (the attach fires only on a `null` organization; the grant
+skips an existing binding) because the first run is retryable. The global Owner binding survives:
+this attaches the account to a tenant, it does not demote it from the platform, and moving a
+running account between tenants stays a different operation with its own permission.
+
+**The first version of the fix was wrong and the gate caught it immediately.**
+`bind_owner_in` looked the role up with `find_role_by_key(pool, Some(org), "owner")` and answered
+`404 role_not_found` on every first run. Base roles are written at *platform* scope by
+`seed_base_roles`; the **binding** carries the scope, not the role lookup. A tenant-specific copy
+of a base role is a different, opt-in thing.
+
+**The suite around it was already red on `main`, and that is a separate finding.** Four tests in
+`apps/api/tests/onboarding.rs` failed with `403 csrf_failed` *before* this change — proven by
+stashing the test file and re-running, same four. The request builder kept the **first**
+`Set-Cookie` and silently dropped the `omnion_csrf` one, so the failure text blamed the guard
+rather than the builder. `TestResponse` now keeps every cookie and `session_cookie` sends both.
+
+And a trap worth naming: two of those tests intended to prove *a stranger cannot finish the first
+run*, but their store-level session carried no CSRF token, so they were measuring the **guard**.
+They would have kept passing if the ownership check were deleted. They now sign in over HTTP, so
+the refusal they assert is the layer they name.
+
+**Proof.**
+
+    cargo test -p omnion-api --test onboarding        5/5  (4 were red before, proven red)
+      — and PROVEN TO FAIL: stashing the fix gives
+        "the owner must belong to the organization it created"  left: None  right: Some(uuid)
+    cargo build -p omnion-api                          clean
+    identity + permissions + onboarding --lib          green
+    apps/admin tsc --noEmit                            clean
+    crm gates: assign 14/14 · assignment 14/14 · claims 7/7 · dedupe 10/10
+               convert 6/6 · autoresponder 10/10 · intake PASS · lib 143/143
+
+**Merge.** 16 commits behind `origin/main`; `apps/api/src/main.rs` conflicted (two independent
+worker spawns — both kept) and `BUILD-LOG.md` conflicted (append-only — both sides spliced and
+verified by **multiset**, not by a line count, which would hide a duplicated block).
+
+**Known, not mine:** `apps/api/tests/iam.rs` fails `Migration(VersionMissing(19))`. `origin/main`
+has the same `0019`/`0020` gap plus five more (36/38, 42/44, 47/49, 52/54, 56/58), and sqlx's
+migrator requires a contiguous sequence, so this is main-wide and every branch inherits it.
+
+**Not proved.** A full CRM browser pass has still not completed on this branch — the slot has
+been continuously held by live passes of other writers, and the last pass that did start proved
+the harness end to end (wizard ran, tenant created, CRM screens 36–40 elements, analytics fixture
+`applied` instead of a `site_id = ''` type error) but ran out of the tick before the depth passes
+reported. The next pass should close it.
+
+**Next.** Re-run the CRM pass and read its *summary*. Then REQ-117 slice 3: the REQ-064
+form-editor card, inbox metrics, and the `request id` half of the audit line.
