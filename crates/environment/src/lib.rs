@@ -19,6 +19,9 @@
 //!   fold into a progress figure an operator can trust while it runs.
 //! * [`changes`] — what a staging environment holds that production does not: the change set the
 //!   Changes tab lists and the promotion in slice 3 freezes.
+//! * [`promotion`] — the frozen change set itself: what was approved, what a conflict is, and the
+//!   step log the promotion dialog's timeline renders.
+//! * [`promotion_store`] — the promotion's persistence and its one-transaction apply.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,5 +31,7 @@ pub mod clone;
 pub mod error;
 pub mod key;
 pub mod model;
+pub mod promotion;
+pub mod promotion_store;
 pub mod runner;
 pub mod store;
