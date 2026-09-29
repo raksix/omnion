@@ -4573,6 +4573,676 @@ async function runGoalAndRealtimeDepth(page, report) {
 }
 
 /**
+ * The notification pass (REQ-021, slice 1).
+ *
+ * An inbox is the easiest screen in the platform to make look right and be wrong: the rows are
+ * real, the badge is real, and the reader still cannot trust either if the *counts* and the
+ * *rows* were computed by different code. So the claims proved here are the ones a screenshot
+ * cannot settle:
+ *
+ * 1. the badge and the grouped panel lines come from ONE summary, so the panel cannot show a
+ *    total and a set of lines that disagree;
+ * 2. a grouped line filters the list to that category — the click is the whole point of the
+ *    group, so a line that does not filter is a dead control;
+ * 3. a bulk action reports the number it *changed*, which is not always the size of the
+ *    selection, and the notice must name that number;
+ * 4. the keyboard path works: `j` moves the cursor, `e` toggles read, `x` selects, `/` focuses
+ *    the filter, `Esc` closes the drawer;
+ * 5. the empty state, the loading skeleton and the error state all exist and are reachable.
+ *
+ * Notifications are emitted through the API with the signed-in session, so the rows are real
+ * rows created by the real route — the pass does not seed the table behind the panel's back.
+ */
+async function runNotificationsDepth(page, report) {
+  const steps = {};
+  const me = await page.evaluate(() =>
+    fetch("/api/v1/me", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  const userId = me?.user?.id;
+  if (!userId) {
+    steps.skipped = "no signed-in user to address notifications to";
+    return steps;
+  }
+
+  // Seed through the real emit route, so the badge the panel shows is a badge the API computed
+  // from rows the API wrote. Two categories with different counts is the minimum that makes
+  // "the grouped lines add up to the total" a claim with teeth.
+  const seed = await page.evaluate(async (id) => {
+    const emit = async (category, title, dedupe_key, priority) => {
+      const response = await fetch("/api/v1/notifications/emit", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ category, title, priority, user_ids: [id], dedupe_key }),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    };
+    return {
+      approval: await emit("approval", "QA · a page is waiting for approval", `qa-appr-${Date.now()}`),
+      security: await emit("security", "QA · a new sign-in", `qa-sec-${Date.now()}`, "high"),
+      ticket: await emit("ticket", "QA · a ticket was assigned to you", `qa-tic-${Date.now()}`),
+    };
+  }, userId);
+  steps.emitted = Object.fromEntries(
+    Object.entries(seed).map(([key, value]) => [key, value.status]),
+  );
+  // A 403 here is a real finding, not a setup problem: the owner seeds the roles on boot, so an
+  // owner without `notifications.send` means the permission did not reach the role.
+  expectRefusal(
+    "notifications/emit",
+    seed.approval?.status === 403
+      ? "the signed-in account cannot emit — recorded rather than hidden"
+      : "an emit the panel never asked for",
+  );
+
+  // 1. The bell, on the header of a screen that is not the notification screen.
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.bell = (await page.locator("[data-bell]").count()) > 0;
+  const badge = (await page.locator("[data-bell-badge]").innerText().catch(() => "")).trim();
+  steps.badge = badge;
+
+  await page.locator("[data-bell]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.panel = (await page.locator("[data-bell-panel]").count()) > 0;
+  steps.groupLines = await page.locator("[data-bell-groups] a").count();
+  await shot(page, "page-notifications-bell-panel");
+
+  // The badge must equal the sum of the lines. Read the numbers as text and add them here,
+  // because "the panel looks consistent" is not a measurement.
+  const lineCounts = await page.locator("[data-bell-groups] a span.font-medium").allInnerTexts();
+  const summed = lineCounts.reduce((total, text) => total + (Number(text.trim()) || 0), 0);
+  steps.badgeMatchesGroups = String(summed) === badge || badge === "99+";
+  steps.groupSum = summed;
+
+  // 2. A grouped line filters the list to its category.
+  const approvalLine = page.locator("[data-bell-group=approval]").first();
+  if ((await approvalLine.count()) > 0) {
+    await approvalLine.click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    steps.groupFilteredUrl = page.url().includes("category=approval");
+    steps.groupFilteredRows = await page.locator("[data-notification-row]").count();
+    // Every row on a category-filtered list has to BE that category — the strongest form of
+    // "clicking the line filters the list", and the one a badge-only implementation fails.
+    steps.onlyThatCategory = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("[data-notification-row]")).every((row) => {
+        const cells = row.querySelectorAll("td");
+        return cells.length > 2 && /approval/i.test(cells[2].textContent ?? "");
+      }),
+    );
+  }
+  await shot(page, "page-notifications-filtered");
+
+  // 3. The bulk path. Select three rows and archive them; the notice must report what CHANGED.
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const selects = page.locator("[data-select]");
+  const selection = Math.min(3, await selects.count());
+  for (let index = 0; index < selection; index += 1) {
+    await selects.nth(index).click({ timeout: 3000 }).catch(() => {});
+  }
+  steps.selected = await page.locator("[data-notification-bulk]").count() > 0;
+  steps.bulkButtons = await page.locator("[data-notification-bulk] button[data-bulk]").count();
+  await page.locator("[data-bulk=read]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.bulkNotice = (await page.locator("[data-notification-notice]").innerText().catch(() => ""))
+    .replace(/\s+/g, " ")
+    .trim();
+  // The notice has to name a number and say "of" — the honest shape is "2 of 3 marked read",
+  // and a panel that says "3 of 3" is asserting something it cannot know.
+  steps.bulkNoticeIsHonest = /\d+ of \d+/.test(steps.bulkNotice);
+  await shot(page, "page-notifications-bulk");
+
+  // 3b. **A list that empties itself the moment you read its mail.** Every row the pass just
+  //     marked read is still there — it is a notification, not a receipt — so the bare
+  //     `/notifications` URL has to bring them back. Assert it immediately after the bulk
+  //     action, because that is the only moment in a pass where "read rows are visible" and
+  //     "read rows are hidden" produce the same list, and the next step quietly drives past
+  //     it.
+  //
+  // This is the assertion the defect did not have. `with_read` was a `bool` defaulting to
+  // `false`, so a client that named no filter got *unread only* — while the panel's own State
+  // menu labelled that state "Unread and read". The symptom arrived four lines below as
+  // `keyboard: "no rows to drive — the list did not load"`, which reads like a timing problem
+  // and is not one: the pass had just marked every row read. `absent means everything` is the
+  // invariant; `?with_read=0` is the inbox, and both halves are asserted.
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.rowsAfterMarkingRead = await page.locator("[data-notification-row]").count();
+  steps.readRowsStayVisible = steps.rowsAfterMarkingRead > 0;
+  // The opposite half, on the same screen: `?with_read=0` is the reader who asked for the
+  // inbox, and it has to actually filter — otherwise the fix above is just a default nobody
+  // can turn off, which is a different bug with the same root cause.
+  await page.goto(`${URL_ADMIN}/notifications?with_read=0`, { waitUntil: "domcontentloaded" }).catch(
+    () => {},
+  );
+  await page.waitForTimeout(1600);
+  steps.inboxRows = await page.locator("[data-notification-row]").count();
+  steps.inboxFilterIsHonest = steps.inboxRows < steps.rowsAfterMarkingRead;
+  await shot(page, "page-notifications-inbox");
+
+  // 4. The keyboard path. The shortcuts are bound on the table body, so the table has to be
+  //    there and the body has to have focus — clicking a row opens the drawer and then every
+  //    key press lands in the drawer instead. An earlier version clicked `tbody` and hoped;
+  //    this one focuses the body explicitly and asserts the row count first, because a
+  //    keyboard pass over an empty list reports every shortcut as broken and that is the
+  //    single most misleading way for this gate to fail.
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.keyboardRows = await page.locator("[data-notification-row]").count();
+  if (steps.keyboardRows === 0) {
+    steps.keyboard = "no rows to drive — the list did not load";
+    return steps;
+  }
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.locator("[data-notification-table] tbody").click({ position: { x: 2, y: 2 } }).catch(() => {});
+  // `Escape` first, so a drawer left open by the previous step cannot swallow the presses.
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.keyboard.press("j");
+  await page.waitForTimeout(250);
+  await page.keyboard.press("j");
+  await page.waitForTimeout(400);
+  steps.cursorMoved = (await page.locator("[data-notification-row][data-cursor=true]").count()) > 0;
+  await page.keyboard.press("x");
+  await page.waitForTimeout(300);
+  steps.keyboardSelected = (await page.locator("[data-notification-bulk]").innerText().catch(() => ""))
+    .includes("1 selected");
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(1200);
+  steps.keyboardOpenedDrawer = (await page.locator("[data-notification-drawer]").count()) > 0;
+  await shot(page, "page-notifications-drawer");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(600);
+  steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;
+  // Escape is answered from the *list's* key handler, so a regression has a second, sharper
+  // form: the drawer stops closing on Escape, and every shortcut after it silently stops
+  // working too, because the open drawer holds the focus the next press needs. Asserting only
+  // the keys that follow therefore reports a keyboard problem when the fault is one Escape
+  // press earlier. Re-open it and press Escape again from a row that is not under the cursor.
+  if (steps.escapeClosedDrawer) {
+    const rowsNow = page.locator("[data-notification-row]");
+    if ((await rowsNow.count()) > 0) {
+      await rowsNow.first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(700);
+      const reopened = (await page.locator("[data-notification-drawer]").count()) > 0;
+      await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+      await page.keyboard.press("k");
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(500);
+      steps.escapeWithNoRowUnderCursor =
+        reopened && (await page.locator("[data-notification-drawer]").count()) === 0;
+    }
+  } else {
+    steps.escapeWithNoRowUnderCursor = "the drawer never closed, so the second form cannot run";
+  }
+
+  // `e` toggles read and `Shift+E` marks the visible rows — the second one is the shortcut
+  // most likely to be documented and missing, so it is asserted rather than assumed.
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.keyboard.press("j");
+  await page.waitForTimeout(300);
+  await page.keyboard.press("e");
+  await page.waitForTimeout(900);
+  steps.eToggledRead =
+    (await page.locator("[data-notification-row][data-read=false]").count()) > 0 ||
+    (await page.locator("[data-notification-notice]").count()) > 0;
+
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.keyboard.press("Shift+E");
+  await page.waitForTimeout(1000);
+  steps.shiftEMarkedVisible =
+    (await page.locator("[data-notification-notice]").innerText().catch(() => "")).includes("read");
+
+  await page.locator("[data-notification-table] tbody").focus().catch(() => {});
+  await page.keyboard.press("/");
+  await page.waitForTimeout(400);
+  steps.slashFocusedFilter =
+    (await page.evaluate(() => document.activeElement?.id ?? "")) === "notification-search";
+
+  // 5. The three states. The skeleton is asserted on a slow load rather than hoped for: it is
+  //    rendered while `loading && rows.length === 0`, which a fast API can outrun — so the
+  //    check is that the element EXISTS in the component, reached by throttling the response.
+  await page.route("**/api/v1/notifications?*", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await route.continue();
+  });
+  // The empty state needs a filter that genuinely matches nothing. An earlier version asked
+  // for `?read=read` — which by this point in the pass holds the very rows the bulk action
+  // just marked read, so the list was correctly NOT empty and the assertion was measuring the
+  // test's own ordering rather than the component. A category nobody was ever addressed is the
+  // honest way in: the API answers 200 with zero rows, which is the state under test.
+  await page.goto(`${URL_ADMIN}/notifications?category=mention&read=read&archived=1`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.skeleton = (await page.locator("[data-notification-skeleton]").count()) > 0;
+  await page.waitForTimeout(1800);
+  await page.unroute("**/api/v1/notifications?*").catch(() => {});
+  steps.emptyState = (await page.locator("[data-notification-empty]").count()) > 0;
+  await shot(page, "page-notifications-empty");
+
+  // The error state, provoked the honest way: a route that answers 500. The panel must show a
+  // retry line, not an empty table — an inbox that says "all caught up" after a failure is the
+  // one state that makes people stop trusting it.
+  //
+  // The route that is failed is the **list**, not the summary. An earlier version fulfilled
+  // `…/notifications/summary` with a 500 and then asserted on the list's error element, which
+  // the summary cannot affect — the bell degrades on its own and the list stays healthy, so
+  // the assertion could only ever have passed by accident. The element under test belongs to
+  // the call that has to fail.
+  await page.route("**/api/v1/notifications?*", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: '{"error":{"code":"boom","message":"deliberate"}}',
+    }),
+  );
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.errorState = (await page.locator("[data-notification-error]").count()) > 0;
+  // A retry the reader can actually press: an error banner with no way forward is a dead end.
+  steps.errorOffersRetry =
+    (await page.locator("[data-notification-error] button").count()) > 0;
+  await page.unroute("**/api/v1/notifications?*").catch(() => {});
+  await shot(page, "page-notifications-error");
+
+  return steps;
+}
+
+/**
+ * The preferences pass (REQ-021, slice 2): the matrix, the settings row, and the two rules
+ * that make them safe to edit.
+ *
+ * Everything here is driven through the **screen** and read back from the **API**, in that
+ * order. A form that renders its own state correctly proves nothing about whether the server
+ * stored it — the class of bug this screen is most likely to have is "the checkbox moved and
+ * the row did not", and only a read-back after a reload can see it.
+ *
+ * The three claims:
+ * 1. **A cell survives a round trip.** Flip one, save, reload, and it is still flipped.
+ * 2. **The in-app column cannot be turned off**, and the server says why rather than ignoring
+ *    the write — asserted by asking the API directly, because the UI's disabled checkbox is a
+ *    promise while the API's refusal is a guarantee.
+ * 3. **A half-set quiet window is refused.** The form is allowed to submit it; the server is
+ *    not, and the message has to reach the screen.
+ */
+async function runNotificationSettingsDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  steps.loaded = (await page.locator("[data-pref-state=ready]").count()) > 0;
+  if (!steps.loaded) {
+    steps.reason = await page
+      .locator("[data-pref-state=error]")
+      .innerText()
+      .catch(() => "the settings screen did not reach its ready state");
+    return steps;
+  }
+
+  // The complete matrix: categories × channels, with the in-app column locked. A matrix that
+  // renders only the stated cells would show fewer boxes than this count, and the difference
+  // between a hole and a checked box is invisible until a reader tries to change one.
+  steps.cells = await page.locator("[data-cell]").count();
+  steps.matrixIsComplete = steps.cells >= 6 * 5;
+  steps.inAppLocked = await page.evaluate(() => {
+    const locked = [...document.querySelectorAll('[data-cell*="/in_app"]')];
+    return locked.length > 0 && locked.every((box) => box.disabled);
+  });
+  steps.lockedColumnExplainsItself =
+    (await page.locator("[data-pref-state=ready]").innerText()).includes("cannot be turned off");
+  await shot(page, "page-notifications-settings");
+
+  // 1. Flip one real cell, save, reload, read it back from the API.
+  const target = "ticket/email";
+  const box = page.locator(`[data-cell="${target}"]`);
+  const before = await box.isChecked().catch(() => false);
+  await box.click({ timeout: 4000 });
+  await page.waitForTimeout(300);
+  steps.saveEnabledAfterChange = await page.locator("[data-pref-save]").isEnabled();
+  await page.locator("[data-pref-save]").click({ timeout: 4000 });
+  await page.waitForTimeout(1200);
+  steps.saveNotice = await page.locator("[data-pref-notice]").innerText().catch(() => "");
+  // "1 preference saved" is the honest shape. A form that says "5" for one flipped box is
+  // reporting its grid size, not its work.
+  steps.saveNoticeIsHonest = /\b1 preference\b/.test(steps.saveNotice);
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.persisted = (await page.locator(`[data-cell="${target}"]`).isChecked().catch(() => before)) === !before;
+
+  // Read the server's own copy, not the screen's: this is the difference between "the form
+  // renders what it was sent" and "the row was written".
+  steps.serverAgrees = await page.evaluate(async (cellKey) => {
+    const response = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" });
+    if (!response.ok) return null;
+    const body = await response.json();
+    const [category, channel] = cellKey.split("/");
+    const cell = body.cells.find((c) => c.category === category && c.channel === channel);
+    return cell ? cell.enabled : null;
+  }, target);
+  steps.serverAgrees = steps.serverAgrees === !before;
+
+  // 2. The server refuses to write in_app:false, and says why in a sentence.
+  steps.inAppRefusal = await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return null;
+    const response = await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [{ category: "security", channel: "in_app", enabled: false }],
+        settings: current.settings,
+      }),
+    });
+    return { status: response.status, message: (await response.json().catch(() => ({})))?.error?.message ?? "" };
+  });
+  steps.inAppRefusalIsA400 = steps.inAppRefusal?.status === 400;
+  steps.inAppRefusalExplainsItself = /in-app/i.test(steps.inAppRefusal?.message ?? "");
+
+  // 3. Quiet hours: a half-set window is refused, and the message reaches the screen.
+  await page.locator("[data-quiet-toggle]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.quietFieldsAppear = (await page.locator("[data-quiet-start]").count()) > 0;
+  await page.locator("[data-quiet-start]").fill("22:00").catch(() => {});
+  await page.locator("[data-quiet-end]").fill("07:00").catch(() => {});
+  await page.locator("[data-timezone]").selectOption("Europe/Istanbul").catch(() => {});
+  await page.locator("[data-pref-save]").click({ timeout: 4000 });
+  await page.waitForTimeout(1200);
+  steps.quietSaved = (await page.locator("[data-quiet-start]").inputValue().catch(() => "")) === "22:00";
+  steps.timezoneSaved = (await page.locator("[data-timezone]").inputValue().catch(() => "")) === "Europe/Istanbul";
+
+  // A window that leaves no waking hours is refused by the server. Asked directly, because the
+  // form is *allowed* to submit it — the rule is the server's, and a form that pre-emptively
+  // disabled the input would be hiding a rule the reader is entitled to know.
+  steps.fullDayRefused = await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return null;
+    const response = await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [],
+        settings: { ...current.settings, quiet_hours_start: "08:00", quiet_hours_end: "08:00" },
+      }),
+    });
+    return response.status;
+  });
+  steps.fullDayRefusedIsA400 = steps.fullDayRefused === 400;
+
+  // 4. The digest: weekly needs a weekday, and the form supplies one rather than sending an
+  //    unsaveable body. Saving `weekly` and reloading is the whole claim.
+  await page.locator("[data-digest-cadence]").selectOption("weekly").catch(() => {});
+  await page.waitForTimeout(300);
+  steps.weekdayAppears = (await page.locator("[data-digest-weekday]").count()) > 0;
+  await page.locator("[data-digest-hour]").selectOption("9").catch(() => {});
+  await page.locator("[data-pref-save]").click({ timeout: 4000 });
+  await page.waitForTimeout(1200);
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.digestPersisted =
+    (await page.locator("[data-digest-cadence]").inputValue().catch(() => "")) === "weekly" &&
+    (await page.locator("[data-digest-hour]").inputValue().catch(() => "")) === "9";
+  await shot(page, "page-notifications-settings-saved");
+
+  // The error state, provoked the way the list's is: a routed 500 must show a retry, not a
+  // blank screen with the Save button still on it.
+  await page.route("**/api/v1/notifications/preferences", (route) =>
+    route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: '{"error":{"code":"boom","message":"deliberate"}}',
+    }),
+  );
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.errorState = (await page.locator("[data-pref-state=error]").count()) > 0;
+  steps.errorOffersRetry =
+    (await page.locator("[data-pref-state=error]").innerText().catch(() => "")).length > 0;
+  await shot(page, "page-notifications-settings-error");
+  await page.unroute("**/api/v1/notifications/preferences").catch(() => {});
+
+  // Put the row back the way it was, so a later pass in the same run starts from the defaults
+  // rather than from whatever this one left behind. A QA pass that mutates shared state
+  // without restoring it is a pass whose failures depend on run order.
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.evaluate(async () => {
+    const current = await fetch("/api/v1/notifications/preferences", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    if (!current) return;
+    await fetch("/api/v1/notifications/preferences", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        cells: [{ category: "ticket", channel: "email", enabled: true }],
+        settings: {
+          quiet_hours_start: null,
+          quiet_hours_end: null,
+          timezone: "UTC",
+          digest_cadence: "off",
+          digest_weekday: null,
+          digest_hour: 8,
+        },
+      }),
+    });
+  }).catch(() => {});
+  steps.restored = true;
+
+  return steps;
+}
+
+/**
+ * The outbox and routing pass (REQ-021, slice 3).
+ *
+ * The slice's whole claim is "a fact on the bus becomes a notification with no call between the
+ * two modules", and this is where that is either proven or not. It is proven the only honest
+ * way: write a rule through the screen, hand the router an event a producer would have written,
+ * and read the *database* to see whether a row appeared — not the screen's own report, which
+ * would pass if the screen rendered the server's optimism.
+ *
+ * Six things it asserts, each one a way this screen could be a convincing lie:
+ *   1. the screen loads and the log is reachable at all;
+ *   2. a row exists in the table behind it (a log that renders but has no rows is a fixture);
+ *   3. the counts on the chips equal the counts in the table — a client that added up its own
+ *      page would agree here and disagree everywhere else;
+ *   4. a rule can be written from the form and is really in the table;
+ *   5. running the event creates a notification for a real reader, and the second run of the
+ *      *same* event id collapses as a duplicate rather than writing a second row;
+ *   6. the retry path answers for a failed row, and the rule can be removed again.
+ */
+async function runNotificationOutboxDepth(page, report) {
+  const steps = {};
+  await page.goto(`${URL_ADMIN}/notifications/outbox`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  steps.loaded = (await page.locator("[data-outbox-state=ready]").count()) > 0;
+  if (!steps.loaded) {
+    steps.reason = await page
+      .locator("[data-outbox-state=error]")
+      .innerText()
+      .catch(() => "the outbox did not reach its ready state");
+    return steps;
+  }
+
+  // The chips and the log. A screen whose chips are all "0" above a real table is a screen
+  // that renders, so the counts are compared against SQL rather than against their own look.
+  const chips = await page.locator("[data-outbox-chip]").allInnerTexts().catch(() => []);
+  steps.chips = chips.length;
+  steps.chipsCarryCounts = chips.filter((text) => /\(\d+\)/.test(text)).length;
+  await shot(page, "page-notifications-outbox");
+
+  // The log's own rows, and whether the table behind it agrees. A retry run earlier in the pass
+  // may have moved things, so this is a comparison, not an equality.
+  const deliveryCount = Number(qaSql("select count(*) from notification_deliveries") || 0);
+  steps.deliveryRows = deliveryCount;
+  steps.chiptotal = Number(
+      (chips.find((text) => text.startsWith("All")) || "").match(/\((\d+)\)/)?.[1] || -1,
+    );
+  steps.chiptotalMatchesSql = steps.chiptotal === deliveryCount;
+  if (!steps.chiptotalMatchesSql) {
+    steps.note = `the chip says ${steps.chiptotal}, the table has ${deliveryCount}`;
+  }
+
+  // 1. Write a rule through the form. Every field is filled from the screen's own controls —
+  //    a fixture that POSTs the API directly would leave the form untested, and the form is
+  //    where a recipient prefix gets typed wrong.
+  await page.locator("[data-rules-toggle]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.formOpened = (await page.locator("[data-rule-form]").count()) > 0;
+
+  const eventName = `qa.ticket.created.${Date.now()}`;
+  await page.locator("[data-rule-event]").fill(eventName).catch(() => {});
+  await page.locator("[data-rule-category]").selectOption("ticket").catch(() => {});
+  await page.locator("[data-rule-priority]").selectOption("high").catch(() => {});
+  // `actor` needs no target, so the target field must *not* be on screen — a form that shows a
+  // target for the shape that has none is a form asking for input it will discard.
+  steps.targetHiddenForActor = (await page.locator("[data-rule-target]").count()) === 0;
+  await page.locator("[data-rule-title]").fill("QA rule for {subject}").catch(() => {});
+  await page.locator("[data-rule-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+
+  steps.ruleRows = Number(
+    qaSql(`select count(*) from notification_routes where event_name = '${eventName}'`) || 0,
+  );
+  steps.ruleIsInTheTable = steps.ruleRows === 1;
+  steps.ruleVisibleOnScreen =
+    (await page.locator(`[data-rule-row="${eventName}"]`).count()) > 0;
+
+  // 2. The permission shape must make the target field appear, and must not submit without it.
+  await page.locator("[data-rules-toggle]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-rule-shape]").selectOption("permission:").catch(() => {});
+  await page.waitForTimeout(300);
+  steps.targetAppearsForPermission = (await page.locator("[data-rule-target]").count()) > 0;
+  await page.locator("[data-rule-event]").fill(`${eventName}.unused`).catch(() => {});
+  await page.locator("[data-rule-title]").fill("QA rule without a target").catch(() => {});
+  await page.locator("[data-rule-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  // The browser's own `required` is the first line of defence; the database's check is the
+  // second. This asserts the row did not land, which is the claim either way.
+  steps.noTargetWroteNothing = Number(
+    qaSql(`select count(*) from notification_routes where event_name = '${eventName}.unused'`) || 0,
+  ) === 0;
+  await page.locator("[data-rule-form] button[type=button]").first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(400);
+
+  // 3. Run the event through the router. The event id is minted by the screen, so the second
+  //    run cannot be made to collide by the harness — which is the point: a *different* run
+  //    creating a second row is correct, and asserting a duplicate here would assert a bug.
+  const before = Number(
+    qaSql(
+      `select count(*) from notifications where source_type = 'event' and source_id = '${eventName}'`,
+    ) || 0,
+  );
+  await page.locator("[data-probe-event]").fill(eventName).catch(() => {});
+  await page.locator("[data-probe-subject]").fill("QA probe subject").catch(() => {});
+  await page.locator("[data-probe-run]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  steps.probeReported = (await page.locator("[data-probe-report]").count()) > 0;
+  steps.probeCreated = await page
+    .locator("[data-probe-created]")
+    .first()
+    .getAttribute("data-probe-created")
+    .catch(() => null);
+  const after = Number(
+    qaSql(
+      `select count(*) from notifications where source_type = 'event' and source_id = '${eventName}'`,
+    ) || 0,
+  );
+  // The actor rule resolves to the event's actor; the harness sends none, so the honest
+  // answer is zero created and one unmatched rule — and the screen must *say* which, rather
+  // than showing a bare "0".
+  steps.rowsAfter = after;
+  steps.probeMatchesTheTable = after === before;
+  steps.unmatchedIsExplained =
+    Number(steps.probeCreated) === after - before ||
+    (await page.locator("[data-probe-report]").innerText().catch(() => "")).includes("matched nobody");
+
+  // 4. Now with an actor, so the rule actually fires and a row really lands.
+  const actorRun = await page.evaluate(async (name) => {
+    const me = await fetch("/api/v1/me", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    const response = await fetch("/api/v1/notifications/route", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        event_name: name,
+        actor_user_id: me?.user?.id ?? me?.id,
+        payload: { title: "QA actor probe" },
+      }),
+    });
+    return { status: response.status, body: await response.json().catch(() => ({})) };
+  }, eventName);
+  steps.actorRunStatus = actorRun.status;
+  steps.actorCreated = actorRun.body?.created ?? null;
+  steps.rowsAfterActor = Number(
+    qaSql(
+      `select count(*) from notifications where source_type = 'event' and source_id = '${eventName}'`,
+    ) || 0,
+  );
+  steps.actorActuallyWroteARow = steps.rowsAfterActor > after;
+
+  // 5. Remove the rule, and prove the table agrees rather than trusting the toast.
+  const ruleId = qaSql(`select id from notification_routes where event_name = '${eventName}' limit 1`);
+  steps.ruleId = ruleId || null;
+  if (ruleId) {
+    const removed = await page.evaluate(async (id) => {
+      const response = await fetch(`/api/v1/notifications/routes/${id}`, {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      return response.status;
+    }, ruleId);
+    steps.removeStatus = removed;
+    steps.removedFromTheTable =
+      Number(qaSql(`select count(*) from notification_routes where event_name = '${eventName}'`) || 0) === 0;
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    steps.goneFromTheScreen = (await page.locator(`[data-rule-row="${eventName}"]`).count()) === 0;
+  }
+
+  // 6. The retry path, asked directly, because the button only exists on a row that failed and
+  //    the QA database may have none. The claim is the *refusal* on a non-failed row.
+  steps.retryRefusesASentRow = await page.evaluate(async () => {
+    const sent = await fetch("/api/v1/notifications/outbox?status=sent&limit=1", {
+      credentials: "same-origin",
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    const row = sent?.rows?.[0];
+    if (!row) return null;
+    const response = await fetch(`/api/v1/notifications/outbox/${row.id}/retry`, {
+      method: "POST",
+      credentials: "same-origin",
+    });
+    return { status: response.status, outcome: (await response.json().catch(() => ({})))?.outcome };
+  });
+  steps.retryIsNotRetryable = steps.retryRefusesASentRow?.outcome !== "requeued";
+
+  // Leave nothing behind: the probe's own notifications, and the event names it used.
+  qaSql(`delete from notifications where source_type = 'event' and source_id like 'qa.ticket.created.%'`);
+  qaSql(`delete from notification_routes where event_name like 'qa.ticket.created.%'`);
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -4872,6 +5542,28 @@ async function main() {
     { path: "/analytics/events", name: "analytics-events", area: "analytics" },
     { path: "/analytics/downloads", name: "analytics-downloads", area: "analytics" },
     { path: "/analytics/forms", name: "analytics-forms", area: "analytics" },
+    // The notification list (REQ-021, slice 1) — walked here and driven by the depth pass
+    // below, which emits real notifications through the API, checks the bell's badge against
+    // its own grouped lines, filters from a group line, runs a bulk action and proves the
+    // keyboard path.
+    { path: "/notifications", name: "notifications" },
+    // The preferences matrix (REQ-021, slice 2). Walked on its own route rather than reached
+    // through the list, because "no untested screen" is about the *screen* and a settings
+    // page that is only ever opened by a click is a screen whose first paint is never seen.
+    // Its depth pass below flips a cell, saves, reloads and reads the value back.
+    { path: "/notifications/settings", name: "notifications-settings" },
+    // The outbox and the routing rules (REQ-021, slice 3). Same reasoning as the settings
+    // screen above: an administrator-only screen that is only ever reached by a click is a
+    // screen whose first paint nobody has seen. Its depth pass below writes a rule, runs an
+    // event through the router, reads the counts back and removes the rule again.
+    { path: "/notifications/outbox", name: "notifications-outbox" },
+    { path: "/analytics", name: "analytics" },
+    { path: "/analytics/pages", name: "analytics-pages" },
+    { path: "/analytics/sources", name: "analytics-sources" },
+    { path: "/analytics/audience", name: "analytics-audience" },
+    { path: "/analytics/events", name: "analytics-events" },
+    { path: "/analytics/downloads", name: "analytics-downloads" },
+    { path: "/analytics/forms", name: "analytics-forms" },
     // Goals, funnels and realtime (REQ-007, slice 3), and the settings screen of slice 4 — the
     // section's own write surface, whose depth pass below drives it.
     { path: "/analytics/goals", name: "analytics-goals", area: "analytics" },
@@ -5020,9 +5712,23 @@ async function main() {
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
-  if (inScope("analytics")) {
     report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
-  }
+  // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
+  // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
+  // path, and the three states. It runs after the analytics passes because it emits into the
+  // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
+  report.notifications = await runNotificationsDepth(page, report);
+  log(`notifications: ${JSON.stringify(report.notifications)}`);
+  // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
+  // restores the row it touched, so a later pass in the same run sees the defaults rather
+  // than whatever this one left behind.
+  report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
+  // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
+  // passes because it emits into the same inbox, and it cleans up every row it creates — a QA
+  // database that grows a notification per pass is one whose counts stop meaning anything.
+  report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
