@@ -1,8 +1,7 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
-> **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record,
-> the loop, the real provider model, the background runner, the HTTP surface and the panel —
-> `0fc9fe4`, `0e6b0fb`, `424284b`, `9f3747f`, `2e0a30d`, `011654d`, `30eefc9`, `cf2368d`, `91bf56e`) ·
+> **Status:** in-progress (slices 1–2 done; slice 3, the skills, `13fb32c` / `7e6db61` /
+> `cfce116`) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 >
@@ -153,6 +152,37 @@
 > landed this round. The **Skills tab and the Runs tab** are slice 3, and the tab bar renders only
 > the two that exist — a tab that opens onto nothing is a tab that lies.
 >
+> **Slice 3, three commits** (`13fb32c` the registry, `7e6db61` the screens, `cfce116`
+> the defects the walks found). `crates/ai-hub/src/skills.rs`, migration
+> `0155_ai_skills.sql`, `apps/api/src/routes/ai_skills.rs`, the Skills tab and `/ai/skills`.
+> Four decisions, each of which exists because the obvious alternative fails a real case:
+>
+> 1. **A skill is data and never grants a tool.** It may *name* tool keys it is relevant to;
+>    the agent's own `tools` array is the only grant. Attaching a skill that says "use
+>    `web.search`" to an agent that cannot call it is allowed and *reported*, because a skill
+>    that could widen an allow-list would be a privilege-escalation payload wearing a prompt
+>    fragment's costume. A walk asserts the agent's `tools` column is byte-identical before
+>    and after an attach.
+> 2. **The checksum covers the definition and ignores the bookkeeping.** A re-enable is a
+>    decision, not tampering — a digest that moved on every disable would warn about the most
+>    ordinary action in the panel. A mismatched checksum is *refused at assembly*, so a row
+>    edited in the database, by a restore, or by a migration cannot reach a model.
+> 3. **Attached is not the same as injected**, and the tab says which of the three it is
+>    (disabled, missing from the registry, checksum-mismatched). "3 skills" above a prompt
+>    carrying one is a lie nobody could debug from a run transcript.
+> 4. **Uniqueness is a folded index.** `unique (organization_id, key)` does not fire for a
+>    NULL in PostgreSQL, so every tenant could install a "built-in" row; `coalesce(..., nil)`
+>    is what makes the constraint real. A walk proves the second NULL row is refused *and*
+>    that a different key at NULL is allowed — a check that only proved the first would also
+>    pass if the column were simply immutable.
+>
+> The three seed checksums are printed by `examples/seed_checksums.rs`, never typed, and a
+> walk recomputes all three — a hand-written digest fails as "checksum does not match" on
+> three rows that look perfectly well-formed.
+>
+> Still open in slice 4: the output-verification helper, the guardrail bus events and the
+> per-run telemetry roll-up. The SDK entry point and its example are already in (slice 2).
+>
 > Still open in slice 1: the output-verification helper and the guardrail bus events. The SDK
 > example is no longer open (the module above). REQ-099 is not closeable: the approval decision
 > and resume are REQ-101's, and the skills are slice 3.
@@ -274,8 +304,8 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 - [x] Resume on a run whose steps are all completed is refused with a clear message. *(the store returns the refusal signal; the route that words it is slice 1's remaining half)*
 - [ ] Untrusted tool output containing an instruction-shaped string does not change behaviour (fixture test asserts the next step is the one the system prompt asked for) and `ai.guardrail.blocked` fires when the tripwire triggers. *(the delimiting itself is proved in the loop's tests; the bus event is slice 4's)*
 - [ ] The output-verification helper forces exactly one repair turn on a malformed answer and fails the run with `output_schema` on the second failure.
-- [ ] A skill attaching an unknown tool key fails validation with the key named, and a disabled skill is absent from the assembled prompt (test asserts the prompt).
-- [ ] A skill with a mismatched checksum is refused at run start with the reason shown on the Skills tab.
+- [x] A skill attaching an unknown tool key fails validation with the key named, and a disabled skill is absent from the assembled prompt (test asserts the prompt). *(proved on both halves and at both layers: a unit test names the offending key and not the innocent one beside it; a walk drives the same refusal through the store with a catalogue that does NOT carry the key, then shows the same definition is accepted once the catalogue does — the first version of that walk passed its own catalogue and would have passed for the wrong reason. The prompt half is a walk: a disabled skill is still listed, `assembly.injected` is empty, and `prompt_block()` is `None` rather than an empty header.)*
+- [x] A skill with a mismatched checksum is refused at run start with the reason shown on the Skills tab. *(three walks, because there are three ways to be wrong: a raw `update` behind the API, a hand-written all-zero digest, and the seeded rows themselves after a migration body is edited. Each asserts `injected` is empty AND the reason is `ChecksumMismatch` rather than `Disabled` — a row that is both off and tampered with has to report the tampering, because turning it back on fixes nothing.)*
 - [x] Workspace paths with `..`, an absolute path or a control character are refused; per-file and per-agent caps are enforced with stable codes. *(proved on both sides of the boundary, because a rule the code enforces and the schema does not is a rule a restore or a migration sails past. Twelve unit tests call `validate_path` with values the test wrote — `../secrets.txt`, `/etc/passwd`, `C:\notes.md`, `notes\n.md`, `notes.md/`, `..hidden.md` — and four walks prove the *database* refuses the same shapes by constraint name. The caps are arithmetic: `sum(size_bytes) where agent_id = $1`, so a deleted file releases its bytes and a replacement refunds the old size. The walk that fills a workspace to exactly 100 MB asserts the asymmetry that matters: a replacement at the same size goes through, a *new* file at the same size is refused with "100 MB … already stored in 10 file(s)", and deleting one file makes room. Both limits are `MAX_FILE_BYTES` / `MAX_AGENT_BYTES` in the crate, quoted by the panel rather than retyped.)*
 - [ ] Agent A cannot read agent B's workspace files in another organization, and organization A cannot read organization B's runs (404 both). *(both halves are now proved at the store: `get_file` by path, `get_file_by_id` by row id, `list_files` and `delete_file` all answer `None`/`false` for another organization, and the file is still there afterwards — a single un-scoped query is a cross-tenant read and there are four of them. Two agents in *one* organization also do not share a namespace, which is the half the unique index on `(agent_id, path)` gives for free. The route's 404 is REQ-101's remaining wiring. **This tick executed the walks for the first
   time** — they had been committed unrun because the box had no free RAM — and 6 of 16 failed on a

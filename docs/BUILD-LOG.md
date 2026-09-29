@@ -4168,3 +4168,48 @@ was recorded as though it were "it passes". Running it:
 panel are wired in `runAiAgentsDepth` but have never run. Then slice 3 (skills) and slice 4's
 remaining two boxes (the output-verification helper, the guardrail bus events). REQ-099 still
 cannot close: the approval decision and resume belong to REQ-101.
+
+## 2026-09-29 · wave7 tick 22 · REQ-099 slice 3, the skills registry
+
+**What.** `ai_skills` + `ai_agent_skills` (migration `0155_ai_skills.sql`), a three-skill
+built-in seed, `crates/ai-hub/src/skills.rs` with validation and checksums, the whole HTTP
+surface in `routes/ai_skills.rs`, the Skills tab on an agent, the `/ai/skills` registry, and
+the walkthrough depth pass that drives both. Also fixed a defect slice 2 shipped: the
+wildcard route `/ai/agents/{id}/files/*path` panicked **at router construction** under axum
+0.8, so the API restart-looped and the QA stack never came up — it is `{*path}` now.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` — 298 pass (23 new).
+- `cargo test -p omnion-api --test ai_skills -- --test-threads=1` against PostgreSQL at 5433 —
+  **28 pass**, on the first executed run of the suite.
+- `pnpm typecheck` (apps/admin) — clean.
+- `bun build scripts/qa/walkthrough.cjs` — parses; the only error is the pre-existing
+  `playwright-core` resolution failure, which is why a .cjs gate here is a parse, not a
+  `node --check`.
+
+**Four defects the walks found on their first execution.** All of them compiled, type-checked
+and looked right; all of them failed by doing nothing.
+
+1. A built-in could never be toggled. `where organization_id = $2` is never true for a
+   built-in, because a built-in's `organization_id` IS NULL — and `is not distinct from $2`
+   fails identically, because it compares NULL to the caller's id, which is also never NULL.
+   Both matched zero rows, the store answered `Ok(None)`, and the route reported "no skill
+   with that key": **a toggle that makes a skill disappear.** The predicate is now the one
+   `get_skill` reads with, spelled the same way.
+2. A custom skill may legally reuse a built-in key (the folded index treats `(NULL, 'summary')`
+   and `(org, 'summary')` as different keys), and the attachment query joined on the key
+   alone. One attachment came back **twice** and the prompt listed the skill twice. A LATERAL
+   with `order by (organization_id is not null) desc limit 1` fixed it.
+3. That LATERAL is a left join, so every registry column is NULL for a stale attachment —
+   including the key, which is why reading it as `Uuid` was a decode error in exactly the
+   state the tab exists to report. The key now comes from the attachment.
+4. `SKILL_COLUMNS` holds a scalar subquery aliased `as tools`, illegal in an UPDATE's
+   RETURNING list. The statement matched the row, **wrote it**, and returned nothing
+   decodable — a successful write reported as a 404.
+
+**Next.** Slice 4 — the output-verification helper (one repair turn, then `output_schema`),
+the `ai.guardrail.blocked` bus events, and the per-run telemetry roll-up with its 30-day
+agent aggregate. The QA pass is deferred: at tick time the box was at load 117 with 70 Chrome
+processes and three sibling passes holding the single slot, so a fourth pass was not the way
+to spend it. `runAiSkillsDepth` is written and registered and has **not yet run**; the API
+answers 404 for its selectors until it does.
