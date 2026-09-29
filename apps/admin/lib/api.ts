@@ -80,6 +80,7 @@ import type {
   BackupStatus,
   BackupPurge,
   BackupPurgeFailure,
+  BackupSweepReport,
   BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
@@ -4892,6 +4893,18 @@ export function verifyBackup(id: string): Promise<BackupVerification> {
  */
 export function deleteBackup(id: string): Promise<BackupPurge> {
   return request<BackupPurge>(`/api/v1/backups/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Run the retention sweep now, for this tenant.
+ *
+ * The background sweep runs every six hours, and a six hour wait is not an answer an
+ * operator can act on when the disk is filling. The full report comes back rather than a
+ * count, because "pruned 4" and "1 of those 4 left a stuck file" are two different facts and
+ * the screen renders both.
+ */
+export function sweepBackups(): Promise<BackupSweepReport> {
+  return request<BackupSweepReport>("/api/v1/backups/sweep", { method: "POST" });
 }
 
 /** The schedules table. Slice 3 adds the writes. */

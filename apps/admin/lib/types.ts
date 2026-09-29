@@ -1899,6 +1899,47 @@ export interface BackupPurge {
   failures: BackupPurgeFailure[];
 }
 
+/**
+ * One artifact the retention sweep could not remove.
+ *
+ * Its own type rather than a formatted string because the screen shows the path and the
+ * operating system's reason in two different places, and a string that gets split back into
+ * two is a string that will be split wrong.
+ */
+export interface BackupStrandedArtifact {
+  /** The run whose bytes are still on the destination. */
+  backup_id: string;
+  /** Where the run's directory is. */
+  path: string;
+  /** The operating system's own words. */
+  reason: string;
+}
+
+/**
+ * What one retention sweep did.
+ *
+ * `removed`, `partial` and `stranded` are three different facts and the screen says all
+ * three: "pruned 4" and "3 of those 4 had a stuck file" are not the same sentence, and a
+ * screen that renders only the first one is the sentence the delete route stopped saying a
+ * tick ago — over a destination nobody is watching.
+ */
+export interface BackupSweepReport {
+  /** Tenants the sweep walked. */
+  walked: number;
+  /** Runs the exemptions offered to the sweep. */
+  candidates: number;
+  /** Runs whose artifacts were completely removed. */
+  removed: number;
+  /** Runs whose row is gone but whose artifacts could not all be removed. */
+  partial: number;
+  /** Tenants whose sweep failed outright. */
+  failed: number;
+  /** Every artifact the sweep could not take, in the store's own words. */
+  stranded: BackupStrandedArtifact[];
+  /** When the sweep ran, in UTC. */
+  at: string;
+}
+
 /** The result of taking a backup. */
 export interface BackupCreateResult {
   /** The finished run. */

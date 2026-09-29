@@ -2520,12 +2520,32 @@ async function runBackups(page, report) {
     note({ step: "delete-confirm", confirmed: false, reason: "no delete button to press" });
   }
 
+  // The retention strip and its button. Clicked on a DISPOSABLE stack only — the sweep is
+  // the one action on this screen that deletes data nobody asked it to delete, and a
+  // walkthrough that presses it is fine exactly as long as the destination is a temporary
+  // directory. The assertion is about the screen answering, not about the sweep finding
+  // work: on a fresh stack there is nothing past its window, and "nothing to prune" is the
+  // correct sentence, not a failure.
+  const retentionStrip = (await page.locator('[data-testid="backup-retention"]').count()) > 0;
+  await page.click('[data-testid="backup-sweep"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const sweepReport = await page
+    .locator('[data-testid="backup-sweep-report"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const sweepText = sweepReport.join(" | ");
+  const sweepAnswered = /looked at \d+ expired backup|failed for \d+ tenant/i.test(sweepText);
+  const sweepStrandedShown = (await page.locator('[data-testid="backup-sweep-stranded"]').count()) > 0;
+  note({ step: "retention", retentionStrip, sweepAnswered, sweepStrandedShown, sweep: sweepText });
+
   const ok =
     rendered &&
     cardsPresent &&
     allFivePresent &&
     everyPartTerminal &&
-    verificationRan;
+    verificationRan &&
+    retentionStrip &&
+    sweepAnswered;
   return { ok, steps: steps.length, cards: cardText };
 }
 

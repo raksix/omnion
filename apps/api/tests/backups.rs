@@ -1004,6 +1004,173 @@ async fn a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful
     );
 }
 
+/// The retention sweep, end to end: it removes the **bytes**, not only the rows.
+///
+/// `prune_candidates` shipped in slice 1 and nothing called it. The screen could list what
+/// the sweep would do and this suite could assert its four exemptions, and the destination
+/// would still fill up for ever — so the walk drives the route and then goes and looks at
+/// the filesystem, which is the only place the claim can be true or false.
+///
+/// Four things are proved, and each of them is a way the shortcut is wrong:
+///
+/// 1. **The directory is gone.** A sweep that deleted the row and left the archive would
+///    report the same counts the panel shows.
+/// 2. **The exemptions survive the route.** They are decided inside `prune_candidates`, and
+///    the route is a caller — so this asserts on the *result* rather than on the SQL, and a
+///    future edit to the sweep's rule has to break the outcome to break the test.
+/// 3. **A stranger tenant's expired run is untouched.** Scoped to the caller's own
+///    organization, because a sweep that ran `sweep_all` from a tenant's button would delete
+///    restore points the operator has never seen and cannot restore from.
+/// 4. **A fresh run is not swept.** Retention is a window, not a bulk delete.
+#[tokio::test]
+async fn the_retention_sweep_takes_the_bytes_and_spares_what_it_promised() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+    let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
+
+    // Three of this tenant's runs and one of the stranger's, each with real artifacts on
+    // the destination. The paths are read out of the run's own `storage_prefix` rather than
+    // recomputed here, so the walk and the code cannot agree about a path by both being
+    // wrong in the same way.
+    let mut mine = Vec::new();
+    for index in 0..3 {
+        let created = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                &backups_uri(),
+                Some(&token),
+                Some(&csrf),
+                Some(json!({ "label": format!("sweep-{index}"), "scopes": ["database"] })),
+            ),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+        let id =
+            Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+        let prefix = created.body["backup"]["storage_prefix"]
+            .as_str()
+            .expect("a storage prefix")
+            .to_owned();
+        let directory = fixture.root.join(prefix.trim_start_matches('/'));
+        assert!(
+            directory.exists(),
+            "the run must have written its directory before the sweep is asked to remove it: {}",
+            directory.display()
+        );
+        mine.push((id, directory));
+    }
+
+    // The stranger's own expired run, created with the stranger's session and pointed at
+    // the same destination. It is the fixture's "other tenant", and without it "everything"
+    // and "this organization" are the same set — the exact blind spot the media part's
+    // tenancy fix was found through.
+    let stranger_run = {
+        let created = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                &backups_uri(),
+                Some(&stranger_token),
+                Some(&stranger_csrf),
+                Some(json!({ "label": "stranger", "scopes": ["database"] })),
+            ),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+        let id =
+            Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+        let prefix = created.body["backup"]["storage_prefix"]
+            .as_str()
+            .expect("a storage prefix")
+            .to_owned();
+        (id, fixture.root.join(prefix.trim_start_matches('/')))
+    };
+
+    // Two of this tenant's runs expire; the newest one is left in the future, and the middle
+    // one is protected. So the sweep has one candidate, two exemptions and a stranger.
+    sqlx::query("update backups set retain_until = now() - interval '1 day' where id = any($1)")
+        .bind(vec![mine[0].0, mine[1].0, stranger_run.0])
+        .execute(fixture.db.pool())
+        .await
+        .expect("the rows must be aged");
+    sqlx::query("update backups set retain_until = now() + interval '30 days' where id = $1")
+        .bind(mine[2].0)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the fresh row must be left alone");
+    sqlx::query("update backups set protected = true where id = $1")
+        .bind(mine[1].0)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the protection must be set");
+
+    let response = call(
+        &fixture.state,
+        request(Method::POST, "/api/v1/backups/sweep", Some(&token), Some(&csrf), None),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
+    assert_eq!(
+        response.body["candidates"].as_i64(),
+        Some(1),
+        "exactly one of this tenant's runs is a candidate: {}",
+        response.body
+    );
+    assert_eq!(response.body["removed"].as_i64(), Some(1), "body: {}", response.body);
+    assert_eq!(response.body["partial"].as_i64(), Some(0), "body: {}", response.body);
+
+    // 1. The bytes. Not the row — the directory.
+    assert!(
+        !mine[0].1.exists(),
+        "the expired run's directory must be gone: {}",
+        mine[0].1.display()
+    );
+
+    // 2. The exemptions, as outcomes.
+    for (label, (id, directory)) in [("protected", &mine[1]), ("fresh", &mine[2])] {
+        let still_there: Option<Uuid> = sqlx::query_scalar("select id from backups where id = $1")
+            .bind(id)
+            .fetch_optional(fixture.db.pool())
+            .await
+            .expect("the row must still read");
+        assert!(still_there.is_some(), "the {label} run's row was swept");
+        assert!(
+            directory.exists(),
+            "the {label} run's artifacts were removed: {}",
+            directory.display()
+        );
+    }
+
+    // 3. The stranger. Both halves: the row and the directory.
+    let stranger_row: Option<Uuid> = sqlx::query_scalar("select id from backups where id = $1")
+        .bind(stranger_run.0)
+        .fetch_optional(fixture.db.pool())
+        .await
+        .expect("the stranger's row must still read");
+    assert!(
+        stranger_row.is_some(),
+        "another tenant's expired run was swept by this tenant's button"
+    );
+    assert!(
+        stranger_run.1.exists(),
+        "another tenant's artifacts were removed: {}",
+        stranger_run.1.display()
+    );
+
+    // 4. An audit entry, because a button that deletes restore points with no record of who
+    // asked is a button nobody can reconcile at 02:00.
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'backup.sweep'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit must read");
+    assert!(audited >= 1, "a destructive sweep must leave an audit entry");
+}
+
 #[tokio::test]
 async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the_run() {
     // The walk that matters most in this suite, and the one that was impossible to write
