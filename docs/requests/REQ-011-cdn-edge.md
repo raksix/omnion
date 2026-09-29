@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slice 2 built, `69ba2c7`; main merged `698f249`; browser gate still pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slices 1–3 built — `807e307`, `69ba2c7`, `3603060`; browser gate still pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -128,7 +128,24 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   that the history is still empty afterwards. That second assertion is the one worth having —
   a rejected zone purge that still left a queued row would be discovered an hour later by
   somebody who had been told it did not happen._
-- [ ] Publishing a page produces a purge row automatically within one worker tick, honouring trigger toggles.
+- [x] Publishing a page produces a purge row automatically within one worker tick, honouring trigger toggles.
+  _`crates/cdn/src/invalidation.rs` is the automatic half: a trigger table, a **pure** `plan`
+  from `(event, payload, toggles, provider capabilities)` to the purge that would be queued, and
+  a durable-cursor walk over `events` that writes the plans. The pure half is deliberate — the
+  mapping is where every real choice lives, and a mapping testable only by emitting an event and
+  reading a table is a mapping nobody writes a second test for. Sixteen such tests cost 0.02s;
+  nine integration walks against the real bus cost 155s and are the ones that would catch a
+  statement PostgreSQL refuses. The drain runs **before** the drain that claims due items, so a
+  publication is queued and claimed in the same worker tick rather than the next one.
+  Trigger toggles are honoured per name and default to **off**: a settings row created before a
+  trigger existed must not start purging a site because someone added an event name, and the
+  operator has a switch for every name precisely so the answer is theirs to give.
+  Proved by `apps/api/tests/cdn_invalidation.rs` — the publish walk (a purge row, one item, the
+  page's own address, `requested_by = null`, and a `cdn_purge_sources` row naming the event),
+  the exactly-once walk (drain three times → one purge), the disabled-toggle walk, the
+  no-address walk, the foreign-event walk, the media-address walk, the tag-less fallback walk,
+  and one that carries the queued row to `succeeded` through the worker's own
+  `claim_due` / `apply_outcome` / `settle`._
 - [x] A provider error marks the purge `failed`, records the provider message and leaves items retryable.
   _`a_provider_refusal_lands_in_the_drawer_with_its_message_and_is_retryable` points the site
   at an adapter with an unreachable endpoint and drains it three times against a budget of
@@ -219,6 +236,26 @@ The walkthrough must visit `/cdn`, `/cdn/purges`, `/cdn/purge`, `/cdn/rules`, `/
    passes clippy, and is a string — so the drain shipped unable to do its one job with every
    unit test green. The only thing that found it was a walk that runs the statement.
 3. **Automatic invalidation** — event subscription for publish/unpublish/media/theme/domain, trigger toggles in settings. Done: publishing a page from the panel queues a purge automatically and the new version is served after it completes.
+   *Status:* **the mechanism shipped; the walkthrough pass on it is still queued.** The trigger
+   table, the planner, the cursor walk (`0120`), the provenance table and the drawer's
+   "automatic · `page.published` · event 412" line are in (`3603060`), and the settings screen's
+   trigger list now names **seven real events instead of six, two of which were never emitted at
+   all**. That correction is the substantive part of this slice and it was not in the plan: REQ-011
+   names `media.replaced` and `site.domain.changed`, and nothing in the platform records either —
+   a file's bytes are replaced by `media.version_created`, and a domain changing is `domain.added`
+   or `domain.removed`. Two of the six switches on `/cdn/settings` could be turned on, saved,
+   and observed doing nothing for ever, with no error anywhere. The trigger table consumes the
+   names the bus carries, and a test in the crate asks `omnion_events::catalogue` whether every
+   one of them exists, so the next rename is a failing build rather than a quiet regression.
+
+   The other two decisions this slice made are in `invalidation`'s module docs because the
+   obvious implementation is wrong in a way that only shows up in production: an automatic purge
+   is written with `requested_by = null` (borrowing the publisher's id would make the history
+   accuse a person of a decision the platform took, and the drawer now names the event instead);
+   and a whole-site trigger against a provider that cannot hold surrogate keys resolves to the
+   site's published addresses **at plan time**, because a `site-<uuid>` tag handed to
+   `generic_http` is a body no endpoint reads — the adapter answers `Succeeded` and the operator
+   has a successful purge that invalidated nothing.
 4. **Provider + settings depth** — adapter catalogue, masked credentials, `generic_http` signed payload, `cdn.purge.failed` webhook, counters on the overview. Done: a test endpoint receives a correctly signed purge payload and the overview counters reflect it.
 
 ### Risks / notes

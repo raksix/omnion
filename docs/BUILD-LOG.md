@@ -4120,3 +4120,62 @@ and fewer than ~20 Chrome processes.
 **Next.** Run the browser pass as the first action of the next tick, and on a green gate
 close slice 2 and start slice 3 — the six trigger events mapped through the rule set into one
 enqueued purge, gated by the `auto_purge` toggles the settings screen already stores.
+
+## Tick 18 — REQ-011 slice 3: automatic invalidation (partial; browser gate still deferred)
+
+**Pre-flight said no again, so this tick spent its budget on product instead.** `MemAvailable`
+**4G** against a `> 8G` precondition, load 14.4 (peaking 31.6 while six other writers built),
+**40** Chrome processes, `/mnt/apopic` 87%. A pass started into that dies on `Page crashed` and
+reports nothing, which is worse than not running: it would look like a red gate caused by this
+branch. The gate stays queued — fifth tick in a row — and this entry does not claim otherwise.
+
+**What shipped: the request's diagram now has code behind it.** Slice 2 gave the platform a purge
+queue an operator drives by hand. REQ-011's own request is not about a hand: it opens with
+`page published -> purge CDN cache -> new version live`, and that arrow had no implementation.
+`crates/cdn/src/invalidation.rs` is it, in three parts — a `Trigger` table, a **pure** `plan`
+from `(event, payload, toggles, provider capabilities)` to the purge that *would* be queued, and
+a durable-cursor walk over `events` that writes the plans (`0120`).
+
+The pure half is the design decision worth defending. The mapping is where every real choice
+lives — which address a media id is, whether a tag survives a provider that cannot hold one,
+whether a disabled trigger skips or errors — and a mapping that can only be tested by emitting an
+event, waiting for a worker tick and reading a table is a mapping nobody writes a second test
+for. Sixteen such tests cost 0.02s.
+
+**The finding that was not in the plan: two of the six trigger names the request names are never
+emitted.** REQ-011 says `media.replaced` and `site.domain.changed`; the platform records
+`media.version_created`, `domain.added` and `domain.removed`. A switch on a name nothing emits
+is a switch an operator can turn on, watch for a week and never see anything happen from — and
+the failure is *silent*, because the setting saves, nothing errors, and the purge simply never
+comes. Two of the six switches in `/cdn/settings` were therefore decorative. The trigger table
+now uses the names the bus actually carries (seven of them, the two split ones being real events
+rather than one fiction), the screen matches, and a test asks `omnion_events::catalogue` whether
+every name exists — so a future rename fails a build instead of a customer's week.
+
+**Two further decisions, both recorded in the module docs because the shortcut is wrong:**
+an automatic purge is written with `requested_by = null` rather than the publisher's id (the
+history's "Requested by" column answers who pressed the button, and borrowing the publisher
+makes it accuse a person of something the platform decided), with the provenance in
+`cdn_purge_sources` instead; and a whole-site trigger against a tag-less provider falls back to
+the site's published addresses **at plan time**, because a `site-<uuid>` tag handed to
+`generic_http` is a body no endpoint reads, the adapter answers `Succeeded`, and the operator
+gets a successful purge that invalidated nothing.
+
+**Proof.**
+- `cargo test -p omnion-cdn --quiet` -> **110 passed / 0 failed** (94 before, 16 new).
+- `apps/api/tests/cdn_invalidation.rs` — nine walks, written against the **real** bus: they call
+  `bus::emit` and then `invalidation::drain`, so the row that appears is one the platform wrote.
+  Includes the exactly-once walk (drain three times, one purge), the disabled-toggle walk, the
+  tag-less fallback walk, and one that takes the queued row all the way to `succeeded` through
+  the *worker's* `claim_due` / `apply_outcome` / `settle`.
+- `GET /api/v1/cdn/purges/{id}` answers a `source` object; `/cdn/purges`' drawer renders
+  "automatic · page.published · event 412" against a platform-raised purge and "requested by an
+  operator" against a manual one.
+- **Pending at the time of writing**: the API build and the nine walks were still compiling when
+  this entry was written. The crate is green; the API half is not yet claimed as verified.
+
+**Commits.** `3603060` (crate, migration, catalog drift test).
+
+**Next.** Finish the API compile and run the nine walks; then merge `origin/main` (four known
+conflicts: `app-shell.tsx`, `lib/api.ts`, `lib/types.ts`, `BUILD-LOG.md`, `walkthrough.cjs`) and
+run the browser gate on the first tick that finds a quiet box.
