@@ -1,3 +1,57 @@
+## 2026-09-29 — REQ-086 slice 3 · the two halves of the expression editor, and a probe that blamed the wrong thing
+feat(workflows): the expression autocomplete the canvas asks the server for
+**What.** Slice 3 owed CodeMirror 6 for code nodes and the expression autocomplete. Both are
+built. `omnion_workflows::completion` builds the candidate list — and it is the **server's**
+grammar, deliberately: a client-side list is a second copy of the rules, it agrees with the
+server on the day it is written, and it offers `{{node.count + 1}}` for as long as nobody
+re-reads the evaluator. `POST /workflows/{id}/graph/expressions/complete` (workflows.read)
+answers it, and the inspector embeds `CodeEditor` (CodeMirror 6: javascript/python/json, line
+numbers, bracket matching, close-brackets, in-editor search) plus `ExpressionField` with a
+menu driven by ↑↓/Enter/Tab/Esc.
+
+**Two decisions worth the argument they cost.** The graph travels in the request body, because
+"upstream outputs" is a fact about the graph as it is *on screen* — wires drawn but unsaved
+included — and reading the stored graph completes against a topology the person has already
+changed, at exactly the moment they are most likely to trust the list. And upstream is
+**direct** only: a grandparent is not in the step's namespace today, so offering it suggests an
+expression that resolves until somebody deletes the middle wire.
+
+**`Issue.param`, because the gutter needs a line.** The code editor marks diagnostics, and
+scraping the parameter name out of `"url" must be a URL` would be a convention rather than a
+contract — it breaks the first time somebody rewords an error. Additive, skipped when absent, so
+every existing serialisation stays byte-identical. Every diagnostic is at line 0 and that is
+honest rather than lazy: the server validates a parameter's *value*, not its contents, and
+inventing a line number marks a line nobody got wrong.
+
+**What the probe found, in the wrong order.** `node scripts/qa/expression-completion.cjs`
+came back **17 failed / 2 passed**, every response a 404 with an *empty body*. That reads
+exactly like "the route is not registered" and sent me into `mod.rs` looking for a router line
+I had already written. Two faults, the second hiding the first:
+
+1. `stack-only.sh` builds only when the binary is **missing**, so a rebuilt API is not what the
+   private stack serves. A 404 with an empty body is the router not knowing the path; a 404
+   with the route's own JSON error is the handler refusing. Different failures, same status.
+2. **The API had never compiled.** `complete()` took `&Value`; the route has a `Map`. A
+   `cargo test -p omnion-workflows --lib` does not compile the route that calls it, so
+   "13 passed" was true and irrelevant. `complete()` now takes `expression::Namespaces`, which
+   is what the body's deserializer produces.
+
+**Proof.** 13 unit (`completion`) · 183 lib · **6 integration** against `omnion_qa_w10`
+(`--test workflow_completion`) · `pnpm typecheck` clean · `pnpm --filter @omnion/admin build`
+clean · `node scripts/qa/expression-completion.cjs` = **19 passed 0 failed** live on :18089.
+The probe's last check is the one that matters: **every candidate the server offers is fed into
+the preview endpoint and none may be refused.** An offered candidate is a promise, and that is
+the assertion that stops the two halves of slice 3 drifting into a feature worse than none — a
+menu full of paths that preview as errors teaches a person to ignore the menu.
+
+**The browser pass has still not run.** `runGraphCanvasDepth` remains unwalked. This tick the
+QA slot was *free* and the box was not: load average peaked at 178 with nine writers' cargo
+target directories filling /dev/shm to 100% and 0 GiB available, which is the real reason
+rather than the queue. No gesture acceptance box is ticked.
+
+**Next.** Run the walkthrough when the box has room. Then slice 3's last owed item: the
+type-aware half of connects (`connection_type_mismatch`), which belongs to REQ-088's ports.
+
 
 ## 2026-09-29 — REQ-087 · the credential surface was closed to the account that needs it
 fix(workflows): let a platform account read, write and connect a tenant's credentials
