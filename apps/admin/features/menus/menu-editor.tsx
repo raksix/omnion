@@ -380,10 +380,14 @@ export function MenuEditor({ menuId }: { menuId: string }) {
     if (!detail) return;
     setPreviewNote(null);
     try {
+      // `site_key`, never `site_id`: the public menu route resolves a site by global key or
+      // host, and a uuid there is looked up as a key, matches nothing and answers 404 — which the
+      // screen renders as "no menu claims this location", so the bug would read as an empty menu
+      // rather than as a wrong argument.
       const answer = await fetchRenderedMenu(
         previewLocation,
         audience,
-        detail.site_id,
+        detail.site_key,
       );
       setPreview(answer);
       if (!answer) {

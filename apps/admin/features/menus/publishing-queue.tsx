@@ -33,6 +33,7 @@ import {
   retryEntry,
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
+import { useSites } from "@/lib/sites";
 import { PUBLISHING_STATUSES, type PublishingEntry } from "@/lib/types";
 
 const STATUS_CLASS: Record<string, string> = {
@@ -50,14 +51,25 @@ export function PublishingQueueView() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rescheduling, setRescheduling] = useState<PublishingEntry | null>(null);
 
+  const { selectedSite } = useSites();
+
+  // The queue is the site switcher's screen, exactly like `/pages`: an entry schedules a PAGE, and
+  // a page belongs to a site. Without the site in the query the server has to guess the
+  // organization from the account, which refuses the platform owner outright (an owner has no
+  // primary organization by design) and would list a second site's rows under this one's name.
   const load = useCallback(async () => {
     setError(null);
+    if (!selectedSite) {
+      setRows([]);
+      return;
+    }
     try {
-      setRows(await fetchPublishingQueue(status ? { status, limit: 200 } : { limit: 200 }));
+      const base = { site_id: selectedSite.id, limit: 200 };
+      setRows(await fetchPublishingQueue(status ? { ...base, status } : base));
     } catch (caught) {
       setError((caught as ApiError).message);
     }
-  }, [status]);
+  }, [status, selectedSite]);
 
   useEffect(() => {
     void load();

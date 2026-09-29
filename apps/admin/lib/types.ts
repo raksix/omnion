@@ -1269,6 +1269,11 @@ export type NotificationRouteReport = {
 export type Menu = {
   id: string;
   site_id: string;
+  /**
+   * The site's GLOBAL key. The public routes address a site by key or host, the authenticated
+   * ones by uuid; the audience preview calls a public route, so it needs this and not `site_id`.
+   */
+  site_key: string;
   key: string;
   name: string;
   locations: string[];

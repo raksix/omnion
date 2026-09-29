@@ -96,6 +96,9 @@ pub struct QueueQuery {
     pub page_type: Option<String>,
     /// Most rows to return.
     pub limit: Option<i64>,
+    /// Keep only the sites of this organization. `None` means every site in it, which is what a
+    /// caller that named no site asked for.
+    pub site_ids: Option<Vec<Uuid>>,
 }
 
 /// A schedule to write.
@@ -146,6 +149,15 @@ pub async fn list_queue(
         None => None,
     };
     let limit = query.limit.unwrap_or(200).clamp(1, 1_000);
+    // The site filter is a LIST, not a single id: the panel is scoped to the site the editor is
+    // looking at, and a queue screen that quietly showed a second site's rows would be a leak
+    // that looks like a feature. An empty list is "no sites", not "every site" — the caller that
+    // means every site sends `None`, so the two can never be confused.
+    let site_ids = query.site_ids.as_deref();
+    let no_sites = site_ids.is_some_and(<[Uuid]>::is_empty);
+    if no_sites {
+        return Ok(Vec::new());
+    }
 
     let sql = format!(
         "select {QUEUE_COLUMNS}{PAGE_TITLE} from cms_publishing_queue q \
@@ -153,6 +165,7 @@ pub async fn list_queue(
          where q.organization_id = $1 \
            and ($2::text is null or q.status = $2) \
            and ($3::text is null or p.page_type = $3) \
+           and ($4::uuid[] is null or p.site_id = any($4)) \
          order by (q.status = 'pending') desc, q.scheduled_at asc, q.id asc \
          limit {limit}"
     );
@@ -160,6 +173,7 @@ pub async fn list_queue(
         .bind(organization_id)
         .bind(status)
         .bind(page_type)
+        .bind(site_ids)
         .fetch_all(pool)
         .await
         .map_err(Into::into)

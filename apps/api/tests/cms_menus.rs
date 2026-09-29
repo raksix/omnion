@@ -1538,3 +1538,294 @@ async fn an_item_without_a_target_is_refused_by_name() {
 
     fixture.cleanup().await;
 }
+
+/// **The queue is addressed by site, and the platform owner may read it.** Two defects, both of
+/// which only a *real* panel session could reach, and both of which this suite's fixtures were
+/// shaped to hide:
+///
+/// 1. The queue took its organization from `current.user.organization_id` and refused when that
+///    was NULL. The account a fresh installation creates first is the platform Owner, whose
+///    `organization_id` is deliberately NULL (`crates/onboarding/src/steps.rs` — "an Owner runs
+///    the platform, not one tenant"), so the one person who must read the queue got a 400. Every
+///    test in this file passes because its fixtures all carry an organization.
+/// 2. The organization is not enough. Two sites of one organization have separate queues, and a
+///    screen that lists both under one site's name is a leak that reads as a feature — which is
+///    why `?site_id=` exists and the panel always sends it.
+///
+/// And the third thing this proves is the shape the fix had to take: the menu body carries the
+/// site's **key** beside its id, because the panel's audience preview calls a *public* route that
+/// addresses a site by key or host. Sending the uuid there is a 404 that renders as "this
+/// installation has no navigation", and no test on the authenticated half could have seen it.
+#[tokio::test]
+async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.curator().await;
+
+    // A second site of the SAME organization, with its own page and its own queue entry.
+    let sibling_site = Uuid::new_v4();
+    sqlx::query("insert into sites (id, organization_id, key, name) values ($1, $2, $3, $4)")
+        .bind(sibling_site)
+        .bind(fixture.org)
+        .bind(format!("mns{}", &Uuid::new_v4().simple().to_string()[..8]))
+        .bind("Menu Sibling Site")
+        .execute(fixture.db.pool())
+        .await
+        .expect("the sibling site must be created");
+    let sibling_page = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/pages",
+            Some(&token),
+            Some(json!({ "site_id": sibling_site, "slug": "sibling", "title": "Sibling" })),
+        ),
+    )
+    .await;
+    assert_eq!(sibling_page.status, StatusCode::CREATED, "{}", sibling_page.body);
+    let sibling_page_id = sibling_page.body["id"].as_str().expect("an id").to_owned();
+    let scheduled_sibling = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{sibling_page_id}/schedule"),
+            Some(&token),
+            Some(json!({
+                "action": "publish",
+                "scheduled_at": (time::OffsetDateTime::now_utc() + time::Duration::hours(5))
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        scheduled_sibling.status,
+        StatusCode::CREATED,
+        "{}",
+        scheduled_sibling.body
+    );
+    let mine = fixture.draft_page(&token, "own", "Own").await;
+    let scheduled_mine = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{mine}/schedule"),
+            Some(&token),
+            Some(json!({
+                "action": "publish",
+                "scheduled_at": (time::OffsetDateTime::now_utc() + time::Duration::hours(6))
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(scheduled_mine.status, StatusCode::CREATED, "{}", scheduled_mine.body);
+
+    // A platform account: no primary organization, the Owner role bound globally — the shape
+    // onboarding creates, and the one that answers 400 when a route reads the organization off
+    // the account.
+    let (owner_id, owner_email) = create_account(&fixture.db, None).await;
+    seed::bind_owner(fixture.db.pool(), owner_id)
+        .await
+        .expect("the owner binding must be written");
+    let owner_token = login(&fixture.state, &owner_email).await;
+
+    // **Scoped** — what the panel sends on every load. This call used to answer 400
+    // `no_organization` for exactly this account, because the route read the organization off
+    // the account instead of off the site the caller named.
+    let scoped = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/publishing/queue?site_id={}&limit=500", fixture.site),
+            Some(&owner_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        scoped.status,
+        StatusCode::OK,
+        "an owner must read the queue of the site they are looking at: {}",
+        scoped.body
+    );
+    let scoped_rows = scoped.body.as_array().expect("an array").clone();
+    assert_eq!(
+        scoped_rows.len(),
+        1,
+        "one site, one entry: {}",
+        scoped.body
+    );
+    assert_eq!(
+        scoped_rows[0]["page_id"], json!(mine),
+        "the row that survives is this site's own: {}",
+        scoped.body
+    );
+
+    // The sibling's entry is reachable the same way, so the filter is what separates them rather
+    // than a broken join: same account, same token, one query parameter apart.
+    let sibling_view = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/publishing/queue?site_id={sibling_site}"),
+            Some(&owner_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sibling_view.status, StatusCode::OK, "{}", sibling_view.body);
+    let sibling_rows = sibling_view.body.as_array().expect("an array").clone();
+    assert_eq!(sibling_rows.len(), 1, "one site, one entry: {}", sibling_view.body);
+    assert_eq!(sibling_rows[0]["page_id"], json!(sibling_page_id));
+
+    // Unscoped, an organization account still sees both rows: the queue is a per-site screen and
+    // the organization-wide read is the API's own convenience, not a panel path.
+    let org_token = fixture.curator().await;
+    let all = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/publishing/queue?limit=500",
+            Some(&org_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    assert!(
+        all.body.as_array().expect("an array").len() >= 2,
+        "one organization, two sites, two entries: {}",
+        all.body
+    );
+
+    // A platform owner legitimately reads *across* tenants — that is what `ensure_same_organization`
+    // means by `(None, Some(_)) => Ok(())`, and it is the point of an Owner. What must NOT happen
+    // is the sibling row leaking into the wrong answer: the foreign site's own queue is empty
+    // because nothing is scheduled there, and that is what the scope check turns a leaked row
+    // into. An ORGANIZATION account, by contrast, is refused — and that is the assertion below,
+    // because "another tenant's queue is visible" is the failure this filter exists to stop.
+    let other_org = Uuid::new_v4();
+    sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
+        .bind(other_org)
+        .bind("Queue Site Other Org")
+        .bind(format!("qsite-{}", &Uuid::new_v4().simple().to_string()[..8]))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the second organization must be created");
+    let foreign_site = Uuid::new_v4();
+    sqlx::query("insert into sites (id, organization_id, key, name) values ($1, $2, $3, $4)")
+        .bind(foreign_site)
+        .bind(other_org)
+        .bind(format!("mnf{}", &Uuid::new_v4().simple().to_string()[..8]))
+        .bind("Menu Foreign Site")
+        .execute(fixture.db.pool())
+        .await
+        .expect("the foreign site must be created");
+    let foreign_view = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/publishing/queue?site_id={foreign_site}"),
+            Some(&owner_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(foreign_view.status, StatusCode::OK, "{}", foreign_view.body);
+    assert_eq!(
+        foreign_view.body.as_array().expect("an array").len(),
+        0,
+        "the foreign site has nothing scheduled and must answer empty: {}",
+        foreign_view.body
+    );
+
+    let (tenant_id, tenant_email) = create_account(&fixture.db, Some(fixture.org)).await;
+    let mut tenant_keys: Vec<&str> = MANAGER_PERMISSIONS.to_vec();
+    tenant_keys.extend_from_slice(&CURATOR_EXTRA);
+    grant(&fixture.db, fixture.org, tenant_id, &tenant_keys, "Queue Tenant").await;
+    let tenant_token = login(&fixture.state, &tenant_email).await;
+    let refused_foreign = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/publishing/queue?site_id={foreign_site}"),
+            Some(&tenant_token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused_foreign.status,
+        StatusCode::FORBIDDEN,
+        "an organization account must be refused another organization's site, not answered empty: {}",
+        refused_foreign.body
+    );
+    assert_eq!(refused_foreign.body["error"]["code"], "cross_organization");
+    sqlx::query("delete from users where id = $1")
+        .bind(tenant_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the tenant account must be removed");
+
+    // The menu body carries the site's key beside its id — the panel's audience preview
+    // addresses a site by key or host, so an id alone is not enough to render a preview. Both
+    // routes are asserted because the editor reads the detail and the list screen reads the row,
+    // and a field added to only one of them is a screen that works in exactly one of them.
+    let menu = fixture.create_menu(&token, "keyed", "Keyed", vec!["header"]).await;
+    let detail = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/menus/{menu}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK, "{}", detail.body);
+    // `MenuDetailBody` FLATTENS the menu beside `items` and `vocabulary` — there is no `menu`
+    // key, which is the same reason an indexing test written from memory of the struct fails.
+    assert_eq!(
+        detail.body["site_key"],
+        json!(fixture.site_key),
+        "the menu body must carry the site's global key: {}",
+        detail.body
+    );
+    assert_eq!(detail.body["site_id"], json!(fixture.site));
+
+    let listed = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/menus?site_id={}", fixture.site),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    let row = listed
+        .body
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|row| row["id"] == json!(menu))
+        .expect("the menu just created is in its own list");
+    assert_eq!(row["site_key"], json!(fixture.site_key), "the list row too");
+
+    sqlx::query("delete from users where id = $1")
+        .bind(owner_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the owner account must be removed");
+    sqlx::query("delete from organizations where id = $1")
+        .bind(other_org)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the foreign organization must be removed");
+    fixture.cleanup().await;
+}

@@ -4503,6 +4503,12 @@ export function addPagesToMenu(
  *
  * The editor's preview calls the *public* endpoint rather than re-implementing the filter, so a
  * preview and the live site cannot disagree about who sees a members-only link.
+ *
+ * `site` is a site's **global key or a host**, never a uuid. The public addressing rule
+ * (`routes::public::classify_hint`) reads a dot as "this is a host" and anything else as a key, so
+ * a uuid is looked up as a key, matches nothing and answers 404 — while the authenticated half of
+ * the same screen works, because `/menus` takes `site_id`. Two endpoints naming "the site"
+ * differently is the defect; this comment is what stops it coming back.
  */
 export function fetchRenderedMenu(
   location: string,
@@ -4521,8 +4527,15 @@ export function fetchPublishingQueue(filters: {
   status?: string;
   page_type?: string;
   limit?: number;
+  /**
+   * The site the panel is showing. Required in practice: the queue is scoped to a site like every
+   * other content screen, and the server reads the organization from this site — which is also
+   * what lets the platform owner (an account with no primary organization) read the queue at all.
+   */
+  site_id?: string;
 } = {}): Promise<PublishingEntry[]> {
   const query = new URLSearchParams();
+  if (filters.site_id) query.set("site_id", filters.site_id);
   if (filters.status) query.set("status", filters.status);
   if (filters.page_type) query.set("page_type", filters.page_type);
   if (filters.limit) query.set("limit", String(filters.limit));
