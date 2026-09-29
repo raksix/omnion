@@ -56,10 +56,23 @@ reap() {
     fi
   done
 }
+# Reap, *then* wait — and reaping again on every turn of the wait loop, not only before it.
+#
+# Running `reap` once before the loop is right when every pass is healthy, and exactly wrong when
+# one dies: the place it left behind is already older than the grace period by the time the next
+# waiter looks, but nobody re-checks, so the queue waits out its whole timeout for a pass that is
+# not coming. The symptom is a line that says "waiting for a QA slot" forever and then a pass
+# that either proceeds unslotted or dies at its own timeout with no report — which is precisely
+# what happened here, on a box where one writer's crashed pass held four other writers hostage.
+#
+# Reaping per turn costs one `stat` and one `kill -0` per waiting pass every 15 seconds, which is
+# nothing next to a Chromium session, and the grace period already protects the only race there
+# is (a place created moments before its holder file is written).
 reap
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
