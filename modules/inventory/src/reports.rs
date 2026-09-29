@@ -295,7 +295,7 @@ pub struct InventoryReport {
 /// A report whose three blocks answered three slightly different questions is three
 /// reports wearing one heading, so the scope is built once here and pushed to each
 /// statement — including the count, which is where the stock list's bug lived.
-struct Scope {
+pub(crate) struct Scope {
     warehouse_id: Option<Uuid>,
     category: Option<String>,
 }
