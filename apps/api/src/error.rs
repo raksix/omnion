@@ -173,6 +173,30 @@ impl ApiError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// The structured explanation of a refusal, when it has one.
+    ///
+    /// Added for the reliability limiter, whose acceptance criterion is about **wire behaviour**
+    /// rather than about a function's return value: "`429` carries `Retry-After`,
+    /// `X-RateLimit-Limit/Remaining/Reset` and the standard error code", and a `429` body that
+    /// names only the scope cannot say which of the two limiters refused it. The accessors existed
+    /// for status, code and message and not for details, which meant the one field a refusal adds
+    /// most — the thing that makes it explainable — was the one field no test could read.
+    #[must_use]
+    pub fn details(&self) -> Option<&Value> {
+        self.details.as_ref()
+    }
+
+    /// The wait this error attaches, in seconds.
+    ///
+    /// `None` for every error that is not a refusal with a window behind it, and `None` for a
+    /// refusal whose window **cannot** be computed — a counter that could not be read. Both are
+    /// the same answer for the same reason: a `Retry-After` is a promise, and there is nothing to
+    /// promise when the platform does not know when its window rolls.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<u64> {
+        self.retry_after
+    }
 }
 
 /// The code and the message, and never the details.

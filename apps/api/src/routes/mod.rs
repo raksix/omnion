@@ -8,7 +8,13 @@
 //! account, and `GET /api/v1/iam/effective-permissions` resolves the caller's own set without a
 //! permission because it answers "what may I do here".
 //!
-//! The tenancy surface (`/organizations`, `/sites`) is guarded by the `organizations.*`,
+//! The reliability surface (`/reliability/rate-limits`, docs/requests/REQ-127) is the
+//! PLATFORM-WIDE budget — user, organization, ip and route scopes an operator edits, with a
+//! dry-run that resolves the same policy the middleware resolves. It is deliberately separate
+//! from the security centre's per-route limiter, which is the gateway's own budget: two layers,
+//! two documents, and every refusal names which one answered.
+//!
+//! The tenancy surface (`/organizations`, `/sites`) is guarded
 //! `sites.*` and `domains.manage` permissions and additionally scoped in the handlers
 //! (`crate::scope`): organization accounts only ever see and change their own organization.
 //!
@@ -105,6 +111,7 @@ pub mod notifications_admin;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod reliability_limits;
 pub mod scim;
 pub mod search;
 pub mod security;
@@ -1034,6 +1041,44 @@ pub fn router(state: AppState) -> Router {
             "/security/rate-limits/test",
             post(security_limiter::test_rate_limit).layer(guards::require(&state, "security.read")),
         )
+        // The reliability centre's limits (REQ-127 slice 1). Deliberately BESIDE the security
+        // centre's limiter above rather than merged into it: the gateway owns a per-route budget
+        // and this owns the platform-wide user/organization/ip budgets, and an operator who
+        // cannot tell which document a `429` came from cannot fix it. Every refusal below names
+        // its limiter in `details.limiter`, which is what makes the two joinable.
+        //
+        // The dry-run sits behind `reliability.manage` rather than `reliability.read`, which
+        // reads backwards: it changes nothing. It reads live counters, and the panel shows the
+        // winning policy's identity, the remaining budget and the Redis key — that is a map of
+        // the limiter's internals, and `security.read` was explicitly not granted it by REQ-012's
+        // own comment. So the same reasoning, one power stricter.
+        .route(
+            "/reliability/rate-limits",
+            get(reliability_limits::list_policies)
+                .layer(guards::require(&state, "reliability.read"))
+                .merge(
+                    post(reliability_limits::create_policy)
+                        .layer(guards::require(&state, "reliability.manage")),
+                ),
+        )
+        .route(
+            "/reliability/rate-limits/evaluate",
+            post(reliability_limits::evaluate)
+                .layer(guards::require(&state, "reliability.manage")),
+        )
+        .route(
+            "/reliability/rate-limits/refusals",
+            get(reliability_limits::list_refusals).layer(guards::require(&state, "reliability.read")),
+        )
+        .route(
+            "/reliability/rate-limits/{id}",
+            patch(reliability_limits::update_policy)
+                .layer(guards::require(&state, "reliability.manage"))
+                .merge(
+                    delete(reliability_limits::delete_policy)
+                        .layer(guards::require(&state, "reliability.manage")),
+                ),
+        )
         .route(
             "/security/sign-in-protection",
             get(security_limiter::get_sign_in_protection)
@@ -1731,6 +1776,13 @@ pub fn router(state: AppState) -> Router {
     // built without one (the in-process test harnesses) falls back to the shipped defaults rather
     // than to no limiter at all, which is the failure mode this whole layer exists to remove.
     let limiter_layer = crate::rate_limit_middleware::ensure_installed(&state);
+    // The platform-wide budget (REQ-127 slice 1), installed beside the gateway limiter rather
+    // than merged into it. The in-process harnesses that build a router without a `main.rs` get
+    // an EMPTY policy set rather than invented defaults: this layer is a second document, and a
+    // second set of defaults is a second thing an operator has to discover and tune. "No policy
+    // matches" is the documented state of a fresh instance, and the gateway limiter above is
+    // still enforcing its own document throughout.
+    let platform_layer = crate::reliability_middleware::ensure_installed(&state);
 
     Router::new()
         .route("/healthz", get(health::healthz))
@@ -1768,6 +1820,16 @@ pub fn router(state: AppState) -> Router {
         // BURNED the budget is still a line an operator can find — a rate-limited request with no
         // log line is the one rejection the log cannot answer questions about.
         .layer(crate::rate_limit_middleware::rate_limit(limiter_layer.clone()))
+        // The platform budgets sit INSIDE the gateway limiter, so a caller over both budgets is
+        // refused by the outer one and the operator's first stop is the document they configured
+        // first. The reverse order would mean the newer, less-tuned layer always wins, and a
+        // platform whose 429s are decided by whichever row was written last is not debuggable.
+        //
+        // The request log stays OUTSIDE both, for the same reason it is outside the gateway
+        // limiter: a request that BURNED a budget must still be a line an operator can find.
+        .layer(crate::reliability_middleware::platform_limit(
+            platform_layer.clone(),
+        ))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually

@@ -5475,6 +5475,73 @@ alone (`qa-artifacts/20260929-174300`, the Turbopack `apps/admin/.next/dev` cach
 directory whose walkthrough is still running**: the live pass was writing into
 `qa-artifacts/20260929-183047` and only the previous run was removable.
 
+## w6 · tick 22 — REQ-127 slice 1 reaches the request path, and the migration that was never read
+
+`crates/reliability` grew two modules (`limiter_redis.rs`, `store.rs`), the API grew a middleware
+(`reliability_middleware.rs`) and a route module (`routes/reliability_limits.rs`), the permission
+catalogue grew three keys, and migration `0165_reliability_default_budgets.sql` seeds the shipped
+budgets. `crates/reliability` is at **110 unit tests** and `apps/api/tests/reliability_limits.rs`
+is the HTTP walk.
+
+**The middleware is a SECOND limiter, beside REQ-012's, and that is the design rather than an
+accident.** The request says so in one sentence — "the per-key rate limits of the API gateway stay
+where they are: this request adds the **platform-wide** budgets" — and the consequence is that two
+layers in the chain can refuse the same caller. So every refusal carries
+`details.limiter: "platform_budget"`, the keyspaces are different (`omnion:rlx:` against
+`omnion:rl:`), and the platform layer sits INSIDE the gateway one so a caller over both budgets is
+refused by the document the operator configured first. A `429` an operator cannot attribute is a
+`429` they will widen the wrong document over.
+
+**`X-RateLimit-Reset` is an absolute unix time and `Retry-After` is relative seconds.** The two
+headers in common use disagree about this and a client that reads seconds as a timestamp waits
+until 1970. The walk asserts the reset against `now`, not against a range, because "inside the
+window" is the property and a range check passes for both readings.
+
+**The headers are written ONLY on an authoritative answer.** `Verdict` grew three variants beyond
+allowed/refused — `Unlimited` (no policy), `Uncounted` (a policy and an unreadable counter, fail
+open) and `RefusedUncounted` (the same, fail closed) — because a `bool` cannot carry "allowed,
+uncounted, and there is no number to publish". An `X-RateLimit-Remaining: 0` written by a layer
+that never read a counter is a measurement nobody took, and a client that believes its budget is
+spent stops trying. The fail mode is a per-deployment `FailMode` read by the panel from the
+installed layer, because the request's own risk note says the mode must not "hide in a config
+file".
+
+### Four defects, and three of them were the shape this request's sibling produced four times
+
+1. **A poisoned policy lock returned an EMPTY list.** `read_cache` was `unwrap_or_default()`, which
+   hands back an empty `Arc` — so one panic anywhere in a writer turned the platform-wide limiter
+   off for the life of the process, with the only symptom being a budget nobody enforced. The
+   function two lines below it already did the right thing, and the doc comment said it. The unit
+   test now poisons the lock deliberately and asserts the policy survives.
+2. **`/api/v1/public/*` matched NOTHING.** The shipped migration's own seed row uses a trailing
+   glob, and `route_matches` compared segments literally, so the row sat in the table looking like
+   a budget on every public path and not one request was ever counted against it. Found by reading
+   the migration I had just written against the matcher I had just written — neither test covered
+   the seam. `*` is now supported as a terminal segment, and `validate` REFUSES a `*` anywhere
+   else, because `/api/v1/*/admin` reads as a glob and matches as a literal segment.
+3. **`window_seconds` is `INT4` in SQL and `i64` in Rust.** sqlx's runtime bind answered
+   `mismatched types; Rust type i64 (as SQL type INT8) is not compatible with SQL type INT4` on the
+   first request. The same runtime-bind trap this codebase has been bitten by twice already, on a
+   column the migration's own `check (window_seconds between 1 and 86400)` made unambiguous. Caught
+   by the integration walk, not by a unit test, because a unit test that never touches a database
+   cannot see a column type.
+4. **A source-scanning test read itself.** The store's `make_interval` guard matched its own filter
+   text and its own explanatory prose, and failed on all three. The scan now extracts the `r#"…"#`
+   SQL literals, which is the difference between a test that reads the SQL and a test that reads
+   itself.
+
+**Verified.** `cargo test -p omnion-reliability --lib` 110/110. The migration applies twice with
+four rows after two applies, and `0162`'s commented reversal drops all nine of its tables on a
+scratch database. The HTTP walk drives the real router, a real Redis counter and a real
+PostgreSQL, and the box read **load average 134** while it ran — seven sibling writers on six
+cores, which is why its result is quoted below as counts and not as a wall-clock time.
+
+**Next.** The `/settings/reliability/limits` screen and the refusal rollup's chart, which are the
+two pieces of slice 1 still missing, then the walkthrough route. The `route`-scoped budget stays
+unenforced by design until a layer above the router can see the matched path; the flag that says
+so is already on every row.
+
+
 ### Tick 66 — the media part was a manifest wearing a backup's name (2026-09-29)
 
 **What.** Last tick's next step was written before it was understood: *"the `media` part of a

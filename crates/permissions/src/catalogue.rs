@@ -348,6 +348,25 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "observability",
         description: "Add, edit and test telemetry exporters",
     },
+    // REQ-127, the reliability centre. The read/manage split is the request's own: reading a
+    // budget is safe, changing one is a production behaviour, and the intake power is separate
+    // because an intake endpoint's HMAC secret is a different kind of danger from a rate limit —
+    // a wrong budget throttles a customer, a wrong HMAC scheme accepts forged webhooks.
+    PermissionDef {
+        key: "reliability.read",
+        category: "reliability",
+        description: "Read rate-limit policies, refusal rollups and reliability state",
+    },
+    PermissionDef {
+        key: "reliability.manage",
+        category: "reliability",
+        description: "Change rate-limit policies, retry policies and breaker state",
+    },
+    PermissionDef {
+        key: "reliability.intake.manage",
+        category: "reliability",
+        description: "Declare inbound endpoints and change their HMAC, size caps and sanitisation",
+    },
     PermissionDef {
         key: "iam.sessions.read",
         category: "iam",
@@ -704,6 +723,38 @@ mod tests {
                 "{key} belongs to the observability category"
             );
         }
+    }
+
+    /// REQ-127: the reliability centre's three keys exist, and the intake power is SEPARATE.
+    ///
+    /// The separation is the assertion, not the existence. `reliability.manage` changes a budget
+    /// — a wrong number throttles a customer. `reliability.intake.manage` declares an inbound
+    /// endpoint and its HMAC scheme — a wrong scheme accepts forged webhooks. Folding them into
+    /// one key would hand every operator who tunes a rate limit the power to change how inbound
+    /// traffic is authenticated, and folding the other way would make the intake screen
+    /// unreachable to the people who are supposed to own it.
+    #[test]
+    fn the_reliability_family_is_catalogued_and_intake_is_separate() {
+        for key in [
+            "reliability.read",
+            "reliability.manage",
+            "reliability.intake.manage",
+        ] {
+            assert!(is_known(key), "{key} must be in the catalogue");
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("reliability"),
+                "{key} belongs to the reliability category"
+            );
+        }
+        // The read key must not imply the manage key, and the manage key must not imply the
+        // intake one. This is a catalogue-level statement about powers, and the integration walk
+        // in `apps/api/tests/reliability_limits.rs` proves it over the router.
+        assert_ne!(
+            get("reliability.manage").map(|entry| entry.description),
+            get("reliability.intake.manage").map(|entry| entry.description),
+            "two powers with one description are one power written twice"
+        );
     }
 
     #[test]

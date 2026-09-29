@@ -219,6 +219,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let limiter = omnion_api::rate_limit_middleware::RateLimiter::from_store(&state).await;
     let _ = omnion_api::rate_limit_middleware::install(limiter);
 
+    // The platform-wide budgets (REQ-127 slice 1), read here for the same reason and with the
+    // opposite fallback: `RateLimiter::from_store` falls back to its SHIPPED DEFAULTS because a
+    // gateway with no document should still limit, while this one falls back to an EMPTY set
+    // because the platform budgets are an operator-written document and inventing numbers for it
+    // would be a second policy nobody chose. The gateway limiter above is enforcing throughout.
+    //
+    // The fail mode is the documented per-deployment choice the request demands: `RELIABILITY_FAIL_MODE`
+    // is `open` unless the operator says otherwise, and the panel reads it from the installed
+    // layer rather than from this environment variable — a behaviour that only exists in a config
+    // file is a behaviour nobody can see.
+    let fail_mode = match std::env::var("RELIABILITY_FAIL_MODE").as_deref() {
+        Ok("closed") | Ok("CLOSE") | Ok("close") => {
+            omnion_reliability::limiter_redis::FailMode::Closed
+        }
+        _ => omnion_reliability::limiter_redis::FailMode::Open,
+    };
+    let platform = omnion_api::reliability_middleware::PlatformLimiter::from_store(&state, fail_mode).await;
+    let _ = omnion_api::reliability_middleware::install(platform);
+
     let app = routes::router(state.clone());
     // The graceful shutdown sequence (REQ-126, slice 4). The order is the contract and it lives
     // in `omnion_telemetry::lifecycle`:

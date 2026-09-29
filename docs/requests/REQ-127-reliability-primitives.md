@@ -1,6 +1,6 @@
 # REQ-127 — Reliability Primitives
 
-> **Status:** in-progress (slice 1's decision layer and slice 3's and 4's core are shipped and green: `crates/reliability` at 92 unit tests, migration `0162` applied and reversed on a scratch database — no HTTP surface yet, so no acceptance box is ticked) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 is now on the request path: the Redis counter, the store, the middleware, the `429` with `Retry-After` and the three `X-RateLimit-*` headers, the panel's policy CRUD and its dry-run, plus the shipped default budgets — `crates/reliability` at 110 unit tests, migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database) · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -106,7 +106,8 @@ Migration: `database/migrations/0028_reliability.sql` (next free slot at tick ti
 
 ### Acceptance criteria
 
-- [ ] `database/migrations/0028_reliability.sql` applies on a fresh and a populated database, and its down script reverses it.
+- [x] `database/migrations/0028_reliability.sql` applies on a fresh and a populated database, and its down script reverses it. *(Shipped as `0162_reliability.sql`, the slot above the shared high-water mark at write time. Verified on a scratch database: the up half creates all nine tables, the commented reversal drops all nine, and — the reason the reversal is COMMENTED — `Db::migrate` executes a file's live statements on apply, so a down script written as live SQL would drop what it had just created and record a success doing it. That was a defect in the first draft, caught by the migration test rather than by reading the file.)*
+- [x] Login, password-reset and public form routes ship with conservative default budgets. *(Migration `0165_reliability_default_budgets.sql` seeds four rows, marked `is_default` so `store::delete_policy` DISABLES rather than removes them: sign-in 10/min +2 burst, password-reset 3/hour with no burst, the public subtree 120/min +20, and a per-user 600/min on the authenticated API. The last one is the row that makes the `user` scope reachable at all — without it a deployment has no user budget and the screen's scope dropdown offers a scope nothing can ever spend. Applied twice against a scratch database: four rows after two applies.)*
 - [ ] Replaying a keyed write with the same key and body returns the stored response with `Idempotent-Replay: true` and does not execute the handler twice (asserted by counting side effects).
 - [ ] The same key with a different body is `409 idempotency_conflict`.
 - [ ] A replay while the original attempt is running is `409` with `Retry-After`, and resolves once the original completes.
@@ -166,11 +167,24 @@ The same pass asserts the counters move in Redis and the rollup rows appear, tha
    database:** the file applies, a second `null/null` policy row is refused, a second refusal row
    for the same window is refused, and the reversal drops all nine tables.
 
-   **Not in this slice yet:** the Redis token bucket, the middleware, the `429` headers and the
-   screen. Nothing here is reachable from HTTP, so **no acceptance box is ticked** — the
-   criteria are all about observable wire behaviour, and a box ticked on a passing unit test for
-   a function no request calls is the "documented but unreachable" shape this request's sibling
-   has produced four times.
+   — **The request path shipped this tick** (`limiter_redis.rs`, `store.rs`,
+   `reliability_middleware.rs`, `routes/reliability_limits.rs`, migration `0165`): the Redis
+   counter, the policy store, the middleware, the `429` with `Retry-After` and the three
+   `X-RateLimit-*` headers, the panel's policy CRUD, and the dry-run that resolves the same
+   policy the middleware resolves **without spending the budget it measures**.
+
+   **Two things this slice is deliberately NOT, both stated rather than implied.** The counter is
+   a **fixed window**, not a token bucket with a sliding window: the request says "token-bucket …
+   with a sliding window", and a sliding log keeps every timestamp of every request for the
+   window, which is unbounded memory under exactly the load the limiter exists to survive. What is
+   shipped keeps the burst allowance — `limit + burst` is headroom inside one window, which is
+   what a bucket's burst bucket provides — and what it costs is a peak of 2× the limit across a
+   window boundary. Every fixed-window limiter makes that trade; writing it down is what keeps the
+   request's wording from becoming a promise the code cannot keep. And a **`route`-scoped policy
+   cannot be enforced by this layer**, because it runs before the router publishes
+   `MatchedPath`: the `PolicyBody` therefore carries an `enforced_here` flag and the dry-run says
+   so in its own answer, because a row that is stored but never spent is the "documented but
+   unreachable" shape this request's sibling produced four times.
 2. **Idempotency.** *Core shipped* (`efbae1b`): `decide` (the five-sentence contract in one
    function), a fingerprint that canonicalises key order recursively so a client that serialises
    the same object twice replays rather than conflicting, `StoredResponse::seal` with the

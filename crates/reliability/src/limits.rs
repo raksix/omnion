@@ -127,6 +127,18 @@ impl LimitPolicy {
                     "route_pattern must start with '/', got '{pattern}'"
                 )));
             }
+            // A `*` in the middle reads as a glob and matches as a literal segment, so a policy
+            // written as `/api/v1/*/admin` would store, appear in the table, and never fire. The
+            // trailing form is the only one the matcher honours, so the other one is refused with
+            // a message that says where the `*` has to be.
+            let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+            if let Some(wildcard) = segments.iter().position(|segment| *segment == "*")
+                && wildcard + 1 != segments.len()
+            {
+                return Err(ReliabilityError::invalid(format!(
+                    "'*' is only supported as the last segment of a route_pattern, got '{pattern}'"
+                )));
+            }
         }
         Ok(())
     }
@@ -195,13 +207,52 @@ pub enum Verdict {
         /// How many requests the window allows in total, for the `X-RateLimit-Limit` header.
         ceiling: i64,
     },
+    /// No policy applies, so the budget is not finite. Allowed, and *not* zero.
+    ///
+    /// A separate variant rather than `Allowed { remaining: 0 }` because the two read
+    /// completely differently to a client: an `X-RateLimit-Limit: 0` header is a client that
+    /// believes it has no budget and backs off, while the truth is that nobody has written a
+    /// policy yet. There is no number to publish here, so there is no number to publish.
+    Unlimited,
+    /// A policy applies, but the counter could not be read, and the deployment fails open.
+    ///
+    /// The request proceeds and **nothing was counted**, so there is no meaningful `remaining`:
+    /// a header claiming a number here would be a measurement nobody took. This is the third
+    /// answer between "allowed with a budget" and "refused", and a `bool` cannot represent it —
+    /// which is the whole reason [`Verdict`] is an enum.
+    Uncounted {
+        /// Which scope would have governed the request.
+        scope: String,
+    },
+    /// A policy applies, the counter could not be read, and the deployment fails closed.
+    ///
+    /// Refused for a reason the client cannot act on. It carries no `Retry-After`, because a wait
+    /// the platform cannot compute is not a promise: a client told to retry in a second would
+    /// hammer a dependency that is already the thing being refused.
+    RefusedUncounted {
+        /// Which scope would have governed the request.
+        scope: String,
+    },
 }
 
 impl Verdict {
     /// Whether the request may proceed.
     #[must_use]
     pub fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allowed { .. })
+        matches!(
+            self,
+            Self::Allowed { .. } | Self::Unlimited | Self::Uncounted { .. }
+        )
+    }
+
+    /// Whether the answer came from a real reading of a real counter.
+    ///
+    /// The middleware branches on this before it writes any header: only an authoritative answer
+    /// may carry `X-RateLimit-*` or a `Retry-After`, because a header is a promise and a promise
+    /// needs a measurement behind it.
+    #[must_use]
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::Allowed { .. } | Self::Limited { .. })
     }
 
     /// The scope that produced this answer, or `None` when no policy matched at all.
@@ -212,7 +263,42 @@ impl Verdict {
     #[must_use]
     pub fn scope(&self) -> Option<&str> {
         match self {
-            Self::Allowed { scope, .. } | Self::Limited { scope, .. } => Some(scope),
+            Self::Allowed { scope, .. }
+            | Self::Limited { scope, .. }
+            | Self::Uncounted { scope }
+            | Self::RefusedUncounted { scope } => Some(scope),
+            Self::Unlimited => None,
+        }
+    }
+
+    /// The budget the window allows in total, for the `X-RateLimit-Limit` header.
+    ///
+    /// `None` for the two answers that carry no measurement. A `Limit: 0` on an outage is a lie
+    /// an operator will read as a policy, and `Unlimited` has no number to publish at all.
+    #[must_use]
+    pub fn ceiling(&self) -> Option<i64> {
+        match self {
+            Self::Allowed { limit, .. } => Some(i64::from(*limit)),
+            Self::Limited { ceiling, .. } => Some(*ceiling),
+            Self::Unlimited | Self::Uncounted { .. } | Self::RefusedUncounted { .. } => None,
+        }
+    }
+
+    /// Requests left after the one being decided, for the `X-RateLimit-Remaining` header.
+    #[must_use]
+    pub fn remaining(&self) -> Option<i64> {
+        match self {
+            Self::Allowed { remaining, .. } => Some(*remaining),
+            _ => None,
+        }
+    }
+
+    /// Seconds a refused caller should wait, for `Retry-After`.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<i64> {
+        match self {
+            Self::Limited { retry_after, .. } => Some(*retry_after),
+            _ => None,
         }
     }
 }
@@ -290,7 +376,19 @@ pub fn matches_policy(policy: &LimitPolicy, subject: &Subject) -> bool {
     true
 }
 
-/// Match a route template against a route, `{name}` standing for exactly one segment.
+/// Match a route template against a route.
+///
+/// Two placeholder forms, and both were added because a template that silently never matches is
+/// the worst shape a policy can take: it is stored, it appears in the table, an operator believes
+/// it is protecting a route, and it never fires.
+///
+/// * `{name}` — exactly one segment. An empty segment is not a value.
+/// * `*` — one or more remaining segments, and it must be the LAST segment. A trailing `*` is
+///   what a prefix policy means ("every public path"), and without it the only way to write one
+///   is a row per path — which is a policy per path, the cardinalty mistake the whole design is
+///   built to avoid. It is refused in the middle, because `/api/v1/*/admin` reads as a glob and
+///   matches as one, and a policy that looks like it covers a subtree and covers nothing is
+///   worse than one that is obviously narrow.
 #[must_use]
 pub fn route_matches(pattern: &str, route: &str) -> bool {
     let mut p = pattern.split('/');
@@ -298,6 +396,12 @@ pub fn route_matches(pattern: &str, route: &str) -> bool {
     loop {
         match (p.next(), r.next()) {
             (None, None) => return true,
+            // A trailing `*` swallows everything that is left, INCLUDING nothing: so
+            // `/api/v1/public/*` matches `/api/v1/public` too, which is the shape an operator
+            // means when they write it. The wildcard is greedy and terminal by construction —
+            // there is no segment after it to be greedy about, because the split that produced it
+            // had already consumed the pattern's last element.
+            (Some("*"), _remaining) => return true,
             (Some(seg), Some(actual)) => {
                 if seg.starts_with('{') && seg.ends_with('}') {
                     // An empty segment is not a value: `/posts//comments` must not satisfy
@@ -547,6 +651,48 @@ mod tests {
             "/api/v1/posts/{id}/comments",
             "/api/v1/posts//comments"
         ));
+    }
+
+    /// A trailing `*` is a prefix policy, and a mid-pattern `*` is refused rather than stored.
+    ///
+    /// Both halves matter, and the first one was a defect the shipped migration's own
+    /// `/api/v1/public/*` row found: the matcher compared segments literally, so the glob matched
+    /// nothing, the row sat in the table looking like a budget on every public path, and not one
+    /// request was ever counted against it. A policy that silently never fires is the worst shape
+    /// a policy can take — it is the "documented but unreachable" shape this request's sibling has
+    /// produced four times, arrived at through SQL.
+    #[test]
+    fn a_trailing_star_is_a_prefix_and_a_middle_one_is_refused() {
+        assert!(
+            route_matches("/api/v1/public/*", "/api/v1/public/pages/home"),
+            "the glob must cover the subtree it claims"
+        );
+        assert!(
+            route_matches("/api/v1/public/*", "/api/v1/public/forms/submit"),
+            "and be greedy across as many segments as there are"
+        );
+        assert!(route_matches("/api/v1/public/*", "/api/v1/public"));
+        assert!(
+            !route_matches("/api/v1/public/*", "/api/v1/auth/login"),
+            "and must NOT cover a sibling subtree"
+        );
+
+        // `{id}` and `*` do not overlap: one segment versus the rest.
+        assert!(!route_matches("/api/v1/posts/{id}/*", "/api/v1/posts"));
+
+        // And the store refuses a `*` that is not last, so the unreadable pattern never reaches
+        // the table in the first place.
+        let mut middle = policy("ip", 10, 0, 60);
+        middle.route_pattern = Some("/api/v1/*/admin".into());
+        let error = middle.validate().expect_err("a middle glob must be refused");
+        assert!(
+            error.to_string().contains("last segment"),
+            "the message must say WHERE the wildcard belongs: {error}"
+        );
+
+        let mut trailing = policy("ip", 10, 0, 60);
+        trailing.route_pattern = Some("/api/v1/public/*".into());
+        assert!(trailing.validate().is_ok(), "the trailing form is the supported one");
     }
 
     #[test]

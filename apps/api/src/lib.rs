@@ -18,6 +18,7 @@ pub mod guards;
 pub mod headers_middleware;
 pub mod intent_resolver;
 pub mod rate_limit_middleware;
+pub mod reliability_middleware;
 pub mod request_log;
 pub mod retention_runner;
 pub mod routes;

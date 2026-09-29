@@ -36,11 +36,14 @@ pub mod breaker;
 pub mod error;
 pub mod idempotency;
 pub mod intake;
+pub mod limiter_redis;
 pub mod limits;
 pub mod retry;
+pub mod store;
 pub mod vocabulary;
 
 pub use error::{ReliabilityError, Result};
+pub use limits::{LimitPolicy, Subject, Verdict};
 pub use vocabulary::{
     BREAKER_STATES, IDEMPOTENCY_STATES, INTAKE_REASONS, INTAKE_SCHEMES, JITTER_MODES,
     MAX_PAGE, RATE_SCOPES, RETRY_SUBSYSTEMS, RETRY_OUTCOMES, SANITIZE_PROFILES,

@@ -41,6 +41,10 @@ omnion-security = { path = "../../crates/security" }
 omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-onboarding = { path = "../../crates/onboarding" }
 omnion-permissions = { path = "../../crates/permissions" }
+omnion-reliability = { path = "../../crates/reliability" }
+# The integration walk clears its own Redis counter with the same key builder the middleware
+# uses, rather than a hand-built string that could drift from the bucket layout.
+redis = { workspace = true }
 omnion-secrets = { path = "../../crates/secrets" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
