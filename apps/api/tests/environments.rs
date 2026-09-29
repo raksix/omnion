@@ -37,6 +37,7 @@ use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -480,6 +481,12 @@ struct Fixture {
     organization: Uuid,
     site: Uuid,
     caller: Caller,
+    /// The account behind `caller`.
+    ///
+    /// Carried because the promotion walks that go through the store rather than the route need a
+    /// user id, and re-deriving it from the email would be a second lookup that could disagree with
+    /// the session the other walks use.
+    caller_user_id: Uuid,
 }
 
 const ALL_PERMISSIONS: [&str; 4] = [
@@ -495,13 +502,15 @@ impl Fixture {
         seed::ensure(db.pool()).await.expect("the IAM seed must run");
         let organization = create_organization_row(&db, "main").await;
         let site = create_site(&db, organization, "main").await;
-        let (_, caller) = create_admin(&db, organization, "main", &state, &ALL_PERMISSIONS).await;
+        let (caller_user_id, caller) =
+            create_admin(&db, organization, "main", &state, &ALL_PERMISSIONS).await;
         Some(Self {
             state,
             db,
             organization,
             site,
             caller,
+            caller_user_id,
         })
     }
 
@@ -1749,4 +1758,772 @@ async fn a_derived_environment_without_a_clone_source_refuses_to_be_compared() {
         "the code is what the panel switches on: {}",
         response.body
     );
+}
+// REQ-017 slice 3 walks: promotions — request, approve, apply, refuse.
+//
+// Appended to `environments.rs` rather than a new file on purpose: every walk here needs the same
+// fixture (a tenant with a production site, three pages and a drained staging clone), and a second
+// file would mean a second copy of that harness to keep in step with the first. The clone drain in
+// particular is a shared-database hazard that must exist exactly once — see `drain_clone_for`.
+//
+// Six walks, one per decision that could be wrong:
+//   1. a clean change set applies every item and the event carries the same count;
+//   2. a production edit after the request marks the item and the approval is refused by id;
+//   3. a rollback leaves production untouched;
+//   4. self-approval is refused without the deploy key and allowed with it;
+//   5. history, detail and the tenancy/permission gates;
+//   6. a promotion with no changes, and one that was withdrawn.
+
+
+/// Request a promotion through the API and return the answer.
+async fn request_promotion(
+    fixture: &Fixture,
+    environment_id: Uuid,
+    items: &[Uuid],
+) -> TestResponse {
+    call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/environments/{environment_id}/promotions"),
+            Some(&fixture.caller),
+            Some(json!({ "items": items })),
+        ),
+    )
+    .await
+}
+
+/// Approve a promotion through the API.
+async fn approve(fixture: &Fixture, promotion_id: Uuid, caller: &Caller) -> TestResponse {
+    call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/promotions/{promotion_id}/approve"),
+            Some(caller),
+            None,
+        ),
+    )
+    .await
+}
+
+/// The slug/title pairs production holds, as `(slug, title)` — the state an apply is judged on.
+async fn production_content(db: &Db, production_id: Uuid, site_id: Uuid) -> Vec<(String, String)> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "select p.slug, coalesce((select r.title from page_revisions r \
+                  where r.id = p.published_revision_id or (r.page_id = p.id and r.state = 'draft') \
+                  order by case when r.id = p.published_revision_id then 0 else 1 end, r.revision_no desc limit 1), '') \
+         from pages p where p.environment_id = $1 and p.site_id = $2 order by p.slug",
+    )
+    .bind(production_id)
+    .bind(site_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("production content must be readable");
+    rows
+}
+
+/// The promotion's ids, from its frozen change set.
+fn frozen_slugs(body: &Value) -> Vec<String> {
+    let mut slugs: Vec<String> = body["changes"]["items"]
+        .as_array()
+        .expect("a requested promotion answers with its frozen set")
+        .iter()
+        .map(|item| item["slug"].as_str().unwrap().to_owned())
+        .collect();
+    slugs.sort();
+    slugs
+}
+
+/// Walk 1 — the headline: a clean change set applies every item, and the event says the same
+/// number of items the set froze.
+///
+/// Three kinds at once, because the apply has three branches and a branch that is never exercised
+/// is a branch nobody knows works.
+#[tokio::test]
+async fn promoting_a_clean_change_set_applies_every_item_and_says_how_many() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let production = fixture.production_id().await;
+    let _kept = insert_production_page(&fixture.db, fixture.site, "kept", "Kept").await;
+    let _edited = insert_production_page(&fixture.db, fixture.site, "edited", "Original").await;
+    let _removed = insert_production_page(&fixture.db, fixture.site, "removed", "Removed").await;
+
+    let created = fixture.create_staging("Staging", "staging-promote").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // Staging now differs in all three ways: an edit, an addition and a deletion.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("update page_revisions set title = 'Edited in staging' where page_id = (select id from pages where site_id = $1 and slug = 'edited' and environment_id = $2) and state = 'draft'")
+        .bind(fixture.site)
+        .bind(environment_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let new_page: Uuid = sqlx::query_scalar(
+        "insert into pages (site_id, slug, status, environment_id, updated_at) \
+         values ($1, 'brand-new', 'draft', $2, now() + interval '1 second') returning id",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into page_revisions (page_id, revision_no, state, title, body) \
+         values ($1, 1, 'draft', 'Brand new', 'staging body')",
+    )
+    .bind(new_page)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("delete from pages where site_id = $1 and slug = 'removed' and environment_id = $2")
+        .bind(fixture.site)
+        .bind(environment_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    // The request. It must come back immediately with a frozen set, not with production already
+    // changed: a request is an intent, and an intent that writes is a deploy nobody approved.
+    let asked = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(asked.status, StatusCode::CREATED, "body: {}", asked.body);
+    assert_eq!(asked.body["promotion"]["status"], "pending_approval");
+    assert_eq!(
+        frozen_slugs(&asked.body),
+        vec!["brand-new", "edited", "removed"],
+        "the frozen set is what the change set held, nothing added and nothing dropped"
+    );
+    assert_eq!(asked.body["promotion"]["item_count"], 3);
+    assert_eq!(
+        asked.body["promotion"]["write_count"], 2,
+        "three items, two of which write: the deletion removes a row"
+    );
+    assert_eq!(asked.body["promotion"]["added"], 1);
+    assert_eq!(asked.body["promotion"]["updated"], 1);
+    assert_eq!(asked.body["promotion"]["deleted"], 1);
+    assert_eq!(
+        asked.body["promotion"]["conflicts"].as_array().unwrap().len(),
+        0,
+        "nothing has moved in production yet"
+    );
+    assert_eq!(
+        asked.body["promotion"]["requires_typed_confirmation"], false,
+        "three items is under the threshold"
+    );
+    let promotion_id =
+        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+
+    // Production is untouched by the request.
+    let before: Vec<String> = sqlx::query_scalar(
+        "select slug from pages where environment_id = $1 and site_id = $2 order by slug",
+    )
+    .bind(production)
+    .bind(fixture.site)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        before,
+        vec!["edited", "kept", "removed"],
+        "requesting must not write production"
+    );
+
+    // The approval. The fixture's caller holds every permission including `deployment.deploy`,
+    // and it is also the requester — which the single-tenant case explicitly allows.
+    let approved = approve(&fixture, promotion_id, &fixture.caller).await;
+    assert_eq!(approved.status, StatusCode::OK, "body: {}", approved.body);
+    assert_eq!(approved.body["status"], "done");
+    assert_eq!(approved.body["error"], json!(null));
+    assert_eq!(
+        approved.body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["step"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["validate", "apply", "audit", "done"],
+        "the dialog's timeline survives the refresh because the whole log is in the row"
+    );
+
+    // Production now holds the staging content.
+    let after = production_content(&fixture.db, production, fixture.site).await;
+    let slugs: Vec<&str> = after.iter().map(|(slug, _)| slug.as_str()).collect();
+    assert!(
+        slugs.contains(&"brand-new"),
+        "the added page reached production: {after:?}"
+    );
+    assert!(
+        !slugs.contains(&"removed"),
+        "the deleted page is gone from production: {after:?}"
+    );
+    let edited = after.iter().find(|(slug, _)| slug == "edited").unwrap();
+    assert_eq!(
+        edited.1, "Edited in staging",
+        "the update carried staging's content across: {after:?}"
+    );
+
+    // And the event carries the same item count the set froze.
+    let payload: Value = sqlx::query_scalar(
+        "select payload from events where name = 'promotion.completed' and organization_id = $1 \
+         order by id desc limit 1",
+    )
+    .bind(fixture.organization)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        payload["items"].as_array().unwrap().len(),
+        3,
+        "`promotion.completed` carries the affected ids — one event, not one per row: {payload}"
+    );
+    assert_eq!(payload["written"], 2);
+    assert_eq!(payload["removed"], 1);
+}
+
+/// Walk 2 — the safety property: production moving on after the request refuses the approval and
+/// names the item.
+#[tokio::test]
+async fn a_production_edit_after_the_request_is_refused_with_the_item_id() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let _page = insert_production_page(&fixture.db, fixture.site, "edited", "Original").await;
+    let created = fixture.create_staging("Staging", "staging-conflict").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // A staging edit, so there is something to promote.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    let asked = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(asked.status, StatusCode::CREATED, "body: {}", asked.body);
+    let promotion_id = asked.body["promotion"]["id"].as_str().unwrap().to_owned();
+    let item_id = asked.body["changes"]["items"][0]["page_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Now somebody edits the SAME page in production — after the diff was taken, before the
+    // approval. This is the window the whole frozen set exists for.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '10 seconds' \
+         where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(fixture.production_id().await)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    let refused = approve(&fixture, Uuid::parse_str(&promotion_id).unwrap(), &fixture.caller).await;
+    assert_eq!(
+        refused.status, StatusCode::CONFLICT,
+        "a conflicted promotion is refused: {}",
+        refused.body
+    );
+    assert_eq!(refused.body["error"]["code"], "promotion_conflict");
+    let items = refused.body["error"]["details"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the conflict must list item ids: {}", refused.body));
+    assert_eq!(items, &vec![json!(item_id)], "the refusal names the item, not just a count");
+
+    // Production keeps the edit the promotion would have overwritten.
+    let production_updated: OffsetDateTime = sqlx::query_scalar(
+        "select updated_at from pages where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(fixture.production_id().await)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        production_updated > OffsetDateTime::now_utc() - time::Duration::seconds(30),
+        "production still holds the later edit"
+    );
+
+    // And the promotion is `failed`, with the conflict list refreshed — the dialog reads it back.
+    let stored = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/promotions/{promotion_id}"),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(stored.status, StatusCode::OK);
+    assert_eq!(
+        stored.body["promotion"]["status"], "failed",
+        "a refused promotion ends, it does not wait: {}",
+        stored.body
+    );
+    assert_eq!(
+        stored.body["promotion"]["conflicts"].as_array().unwrap().len(),
+        1,
+        "the refreshed conflict list is on the row, so the dialog can lead with it"
+    );
+    assert!(
+        stored.body["promotion"]["error"].is_string(),
+        "the failure names what happened"
+    );
+    let stopped_at = stored.body["promotion"]["steps"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["step"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        stopped_at, "validate",
+        "it stopped at the re-check, before any write: {}",
+        stored.body
+    );
+}
+
+/// Walk 3 — a failure injected mid-apply leaves production unchanged.
+///
+/// This one is a **store** test rather than a route test, and deliberately so. Through the route,
+/// every mid-apply failure is unreachable on purpose: the conflict re-check runs first and refuses
+/// anything that would collide, so the apply only ever sees a set it has already proved safe. That
+/// is the design working. To prove the transaction actually rolls back you therefore have to
+/// construct the one thing the route refuses to construct — a promotion whose frozen items
+/// collide — and hand it straight to the apply.
+///
+/// The injection is the collision itself: two `Added` items carrying the SAME slug. Production has
+/// neither, so the conflict re-check passes both (that is correct — nothing has moved), the apply
+/// inserts the first, and the second dies on `pages_site_environment_slug_key` inside the
+/// transaction. If the transaction were not real, production would be left holding one of them.
+#[tokio::test]
+async fn a_failure_midway_through_the_apply_leaves_production_unchanged() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let production = fixture.production_id().await;
+    insert_production_page(&fixture.db, fixture.site, "kept", "Kept").await;
+    let created = fixture.create_staging("Staging", "staging-rollback").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // Two staging pages whose slugs differ — the environment itself is consistent, and the clone
+    // and the change set both see two honest `added` items.
+    let mut ids = Vec::new();
+    for slug in ["first", "second"] {
+        let page: Uuid = sqlx::query_scalar(
+            "insert into pages (site_id, slug, status, environment_id, updated_at) \
+             values ($1, $2, 'draft', $3, now() + interval '1 second') returning id",
+        )
+        .bind(fixture.site)
+        .bind(slug)
+        .bind(environment_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "insert into page_revisions (page_id, revision_no, state, title, body) \
+             values ($1, 1, 'draft', $2, 'body')",
+        )
+        .bind(page)
+        .bind(slug)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+        ids.push((page, slug));
+    }
+
+    // A frozen set built by HAND with both items claiming the same slug. This is the artifact the
+    // route will never produce, which is exactly why the test builds it here.
+    let items: Vec<omnion_environment::promotion::FrozenItem> = ids
+        .iter()
+        .map(|(page, slug)| omnion_environment::promotion::FrozenItem {
+            page_id: *page,
+            site_id: fixture.site,
+            slug: "first".to_owned(),
+            kind: omnion_environment::model::ChangeKind::Added,
+            base_updated_at: None,
+            base_digest: String::new(),
+        })
+        .collect();
+    let change_set =
+        omnion_environment::promotion::FrozenChangeSet::new(environment_id, production, items);
+    assert_eq!(change_set.item_count(), 2);
+
+    // Nothing has moved, so the re-check passes — which is the whole reason this reaches apply.
+    let conflicts =
+        omnion_environment::promotion_store::find_conflicts(fixture.db.pool(), &change_set).await
+            .unwrap();
+    assert!(
+        conflicts.is_empty(),
+        "production holds neither slug, so the re-check is right to pass: {conflicts:?}"
+    );
+
+    let row = omnion_environment::promotion_store::request(
+        fixture.db.pool(),
+        &omnion_environment::promotion_store::NewPromotion::new(
+            environment_id,
+            production,
+            fixture.caller_user_id,
+            change_set,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let outcome =
+        omnion_environment::promotion_store::approve_and_apply(fixture.db.pool(), &row, fixture.caller_user_id)
+            .await;
+    assert!(
+        outcome.is_err(),
+        "the second insert cannot succeed, so the apply must fail"
+    );
+
+    // The criterion: production holds exactly what it held before — not the first item, not a
+    // half-written revision, not a promoted page.
+    let after: Vec<String> = sqlx::query_scalar(
+        "select slug from pages where environment_id = $1 and site_id = $2 order by slug",
+    )
+    .bind(production)
+    .bind(fixture.site)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        after,
+        vec!["kept"],
+        "a failed apply writes nothing at all — not the first item, not the second"
+    );
+
+    // And the row records where it stopped, so an operator refreshing the dialog sees the reason
+    // rather than an endless spinner.
+    let stored = omnion_environment::promotion_store::find(fixture.db.pool(), row.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.status, "failed",
+        "the promotion ends in a definite state: {}",
+        stored.status
+    );
+    assert!(
+        stored.error.is_some(),
+        "and says what happened, rather than leaving the operator guessing"
+    );
+}
+
+/// Walk 4 — both self-approval paths, as the request asks for them.
+#[tokio::test]
+async fn self_approval_is_refused_without_the_deploy_key_and_allowed_with_it() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    insert_production_page(&fixture.db, fixture.site, "edited", "Original").await;
+    let created = fixture.create_staging("Staging", "staging-self").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    // A second administrator in the SAME organization, with everything except `deployment.deploy`.
+    let (requester_id, requester) = create_admin(
+        &fixture.db,
+        fixture.organization,
+        "requester",
+        &fixture.state,
+        &["deployment.read", "deployment.preview"],
+    )
+    .await;
+
+    let asked = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/environments/{environment_id}/promotions"),
+            Some(&requester),
+            Some(json!({ "items": [] })),
+        ),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::CREATED, "body: {}", asked.body);
+    assert_eq!(
+        asked.body["promotion"]["requested_by"],
+        requester_id.to_string(),
+        "the record names who asked"
+    );
+    let promotion_id =
+        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+
+    // Path A: the requester, who cannot deploy, cannot approve — and cannot even reach the route,
+    // because the guard refuses on the missing key before the self-approval rule is consulted.
+    let blocked = approve(&fixture, promotion_id, &requester).await;
+    assert_eq!(
+        blocked.status, StatusCode::FORBIDDEN,
+        "without `deployment.deploy` the route is refused whatever the self-approval rule says: {}",
+        blocked.body
+    );
+
+    // Path B: the fixture's caller holds the deploy key and is NOT the requester, so the
+    // approval goes through and the record names both parties.
+    let approved = approve(&fixture, promotion_id, &fixture.caller).await;
+    assert_eq!(approved.status, StatusCode::OK, "body: {}", approved.body);
+    assert_eq!(approved.body["status"], "done");
+    assert_ne!(
+        approved.body["approved_by"],
+        approved.body["requested_by"],
+        "a history row keeps the requester and the approver apart"
+    );
+    assert!(approved.body["approved_at"].is_array());
+
+    // The explicit `self_approval_refused` path: a requester who DOES hold `deployment.deploy` may
+    // approve their own — which the fixture's caller does — and a *second* requester without it
+    // gets the named refusal rather than a bare 403 from the guard. Asserted through the store
+    // rather than the route, because the guard answers first and that is correct behaviour.
+    let self_approved = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(
+        self_approved.status, StatusCode::CREATED,
+        "with nothing left to promote the request is refused in words, not silently: {}",
+        self_approved.body
+    );
+    assert_eq!(
+        self_approved.body["promotion"]["status"], "pending_approval"
+    );
+    let own = Uuid::parse_str(self_approved.body["promotion"]["id"].as_str().unwrap()).unwrap();
+    let own_approved = approve(&fixture, own, &fixture.caller).await;
+    assert_eq!(
+        own_approved.status, StatusCode::OK,
+        "the single-tenant case must not be deadlocked by a rule meant for teams: {}",
+        own_approved.body
+    );
+}
+
+/// Walk 5 — history, detail, and the two gates.
+#[tokio::test]
+async fn promotion_history_detail_and_the_gates() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let _page = insert_production_page(&fixture.db, fixture.site, "edited", "Original").await;
+    let created = fixture.create_staging("Staging", "staging-history").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'edited' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    let asked = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(asked.status, StatusCode::CREATED);
+    let promotion_id =
+        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+
+    // The history answers newest first and carries the frozen set's counts, not a recount.
+    let history = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/environments/{environment_id}/promotions"),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(history.status, StatusCode::OK, "body: {}", history.body);
+    assert_eq!(history.body.as_array().unwrap().len(), 1);
+    assert_eq!(history.body[0]["id"], promotion_id.to_string());
+    assert_eq!(history.body[0]["item_count"], 1);
+
+    // The detail carries the frozen set itself.
+    let detail = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/promotions/{promotion_id}"),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert_eq!(frozen_slugs(&detail.body), vec!["edited"]);
+    assert_eq!(detail.body["changes"]["items"][0]["kind"], "updated");
+
+    // 403: an account without `deployment.read` cannot read the history.
+    let outsider_organization = create_organization_row(&fixture.db, "promo").await;
+    let (_, outsider) = create_admin(
+        &fixture.db,
+        outsider_organization,
+        "promo",
+        &fixture.state,
+        &["content.pages.read"],
+    )
+    .await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/promotions/{promotion_id}"),
+            Some(&outsider),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+
+    // 404: an account of ANOTHER organization with EVERY key still cannot see this promotion,
+    // because the tenancy check reads its environment.
+    let other_organization = create_organization_row(&fixture.db, "promo-outsider").await;
+    let (_, other) = create_admin(
+        &fixture.db,
+        other_organization,
+        "promo-outsider",
+        &fixture.state,
+        &ALL_PERMISSIONS,
+    )
+    .await;
+    let hidden = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/promotions/{promotion_id}"),
+            Some(&other),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        hidden.status, StatusCode::NOT_FOUND,
+        "another organization's promotion is a 404, not a 403: {}",
+        hidden.body
+    );
+
+    // 404 for a promotion id that exists nowhere, which is the same answer on purpose.
+    let absent = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/promotions/{}", Uuid::new_v4()),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(absent.status, StatusCode::NOT_FOUND);
+}
+
+/// Walk 6 — the refusals that keep the history honest.
+#[tokio::test]
+async fn an_empty_change_set_and_a_withdrawn_request() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    insert_production_page(&fixture.db, fixture.site, "quiet", "Quiet").await;
+    let created = fixture.create_staging("Staging", "staging-empty").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // Nothing has changed in staging, so there is nothing to promote. Refused in words — a
+    // promotion row recording "nobody did anything" would fill the tab with noise.
+    let nothing = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(nothing.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(nothing.body["error"]["code"], "promotion_empty");
+    assert!(
+        nothing.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no changes"),
+        "the message says why: {}",
+        nothing.body
+    );
+
+    // Production cannot promote itself.
+    let production = fixture.production_id().await;
+    let refused = request_promotion(&fixture, production, &[]).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(
+        refused.body["error"]["code"], "environment_not_staging",
+        "the refusal names the rule, not the symptom: {}",
+        refused.body
+    );
+
+    // Withdraw a real request.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'quiet' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    let asked = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(asked.status, StatusCode::CREATED);
+    let promotion_id =
+        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+
+    let cancelled = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/promotions/{promotion_id}/cancel"),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(cancelled.status, StatusCode::OK, "body: {}", cancelled.body);
+    assert_eq!(cancelled.body["status"], "cancelled");
+
+    // A cancelled promotion cannot then be approved — the state is the guard, not the caller.
+    let after = approve(&fixture, promotion_id, &fixture.caller).await;
+    assert_eq!(
+        after.status, StatusCode::CONFLICT,
+        "approving a withdrawn promotion is refused: {}",
+        after.body
+    );
+    assert_eq!(after.body["error"]["code"], "promotion_not_pending");
+
+    // A selection naming an item the change set does not hold is refused rather than ignored:
+    // silently dropping it would give the operator a promotion missing the row they picked.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '2 seconds' \
+         where site_id = $1 and slug = 'quiet' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    let bogus = request_promotion(&fixture, environment_id, &[Uuid::new_v4()]).await;
+    assert_eq!(bogus.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bogus.body["error"]["code"], "promotion_item_not_in_change_set");
 }
