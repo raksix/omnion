@@ -4244,3 +4244,67 @@ where `store::retry_step_from`'s own comment is the spec and it says the opposit
 criterion wants: it is deliberately a **tail** re-run, so a single-node retry is a different
 write and must not be built by narrowing it).
 
+
+## 2026-09-29 — REQ-004 slice 3 · criterion 2 (node status pills) — built, blocked at the DB gate
+
+**What.** The pill half of *"after a run each node shows its status pill"*. The mapping is a
+pure function (`node-status.ts`) with 10 tests; the pill is on the node card; the QA probe
+now reads the canvas instead of the API.
+
+**The finding worth keeping: the criterion was unprovable, not unmet.** The engine had been
+writing `workflow_steps.node_id` and `skip_reason` since `0122`, and the run has recorded
+`started_from_node` since it was created — for two ticks. `StepBody` carried a step's
+`status` and none of the other two, and `ExecutionSummary` had no `started_from_node` at
+all. So the probe had been reading `null` for every field it asked about, on a run that was
+behaving perfectly. Writing a row and reading it back are two different things, and only one
+of them was ever built.
+
+**Three rules in the mapping, each of which fails *visibly*:**
+
+1. **A node with no step paints nothing.** Not "pending", not a grey dot. A pill on a node
+   the run never reached is a claim about work the engine never did, and there is nothing on
+   screen that distinguishes it from a real one.
+2. **A node whose branches disagreed is `diverged`.** A `success` and an `error` output are
+   two steps of the *same* node; after a run one is `succeeded` and the other `skipped`. A
+   `Map` keyed by node keeps whichever row the API returned last, which makes the answer
+   depend on row order — and row order is not a fact about the run.
+3. **Steps with no `node_id` are dropped, not bucketed under an empty key.** A rule whose
+   definition predates the builder has no node behind its steps; attributing them by index
+   paints the first card on the canvas with a status that belongs to no node at all.
+
+**The probe reads the canvas, and that is the point.** Re-reading the run's rows from the
+API would pass even if every card rendered nothing — the same trap as a handler that
+returns a plan-shaped body while writing no run. It now compares the *painted node set*
+against the run's, which is the assertion that catches rule 1 being broken.
+
+**Proof.**
+- `node-status` → **10/10**; builder suites → **71/71** (61 before)
+- `cargo test -p omnion-workflows --lib` → **95/95**
+- `cargo check -p omnion-api --all-targets` → exit 0
+- `tsc --noEmit` in `apps/admin` → exit 0
+
+**Not proved: the DB integration test, and it is not my change.**
+`cargo test -p omnion-api --test workflows run_from_here` fails at migration
+`VersionMissing(19)`. The branch is missing **`0019` and `0022` entirely** — the sequence
+runs `0018 → 0020 → 0021 → 0023`. The gap is present at this tick's baseline commit
+(`efe58ec`), so it predates this work, and the last tick's 14/14 passed against a QA
+database built from a *different* branch's migration set, which is why it looked healthy.
+The cause is the shared numbering namespace again: `0019_cms_blocks.sql` is on
+`origin/wave2-cms` and `0019_organization_memberships.sql` on `origin/wave5`, neither merged
+into `main`, while `0022_*` lives on `origin/wave4` and `origin/wave7`. **Renumbering is
+not mine to do** — every branch picks the next free number from its own tail, and the
+numbers are in use on branches this worktree does not own. Resetting the database does not
+help: the gap is in the *repository*, so a fresh DB hits it too. This needs the owner to
+land the two migrations, or a reconciliation pass across branches.
+
+**Queue note.** `/mnt/apopic` hit **100%** mid-tick — `git commit` returned *"unable to
+write loose object file: No space left on device"* with all three files staged and intact.
+Reclaimed 5.4G of **my own** `/dev/shm/w3-target` cache (never another writer's); another
+writer's cleanup then brought it to 90%. Both commits landed after that. At 100% a
+`write_file` can report success having written zero bytes, so a tick that touches this
+threshold should check `df` before writing, not after.
+
+**Next.** The click half of criterion 2 — clicking a node opens that step's inputs and
+output — which is the inspector's question rather than the canvas's, and needs the run's
+step `params`/`output` to be reachable from a node id (the mapping already carries
+`stepNos` for exactly that). Then criterion 3, *Retry this node*.
