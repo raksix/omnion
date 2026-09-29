@@ -89,14 +89,21 @@ mod tests {
 
     #[test]
     fn the_runner_config_follows_the_process_config() {
+        // `..Default::default()` rather than every field spelled out, and the reason is the
+        // cost of getting it wrong: the retention knobs arrived on this struct in a later
+        // slice, and the literal that enumerated all seven of the delivery fields stopped
+        // compiling — which is a *good* failure, but only because the struct was exhaustive
+        // then. A struct literal that lists every field is a test that has to be edited by
+        // hand every time a knob is added, and the edit is easy to forget. Spreading the
+        // default keeps the test about the fields it actually asserts on.
         let process = EventsConfig {
-            runner_enabled: true,
             poll_ms: 250,
             batch: 7,
             lease_seconds: 30,
             request_timeout_ms: 1_500,
             retry_base_ms: 100,
             retry_max_ms: 900,
+            ..EventsConfig::default()
         };
 
         let config = runner_config(&process);

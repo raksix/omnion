@@ -414,6 +414,19 @@ catalogue! {
     "A delivery ran out of attempts and the receiver never took it.",
     [("delivery_id", Uuid, req), ("endpoint_id", Uuid, req), ("endpoint_name", String, req),
      ("event_name", String, req), ("attempts", Integer, opt), ("response_status", Integer, opt)];
+    // The two retention events (REQ-016 slice 3). `changed` carries the window *before* and
+    // *after*, because "the window is 30 days" on its own is not a record of anything — what an
+    // audit needs is the transition, and a consumer that keeps history longer than the platform
+    // did must be able to see the moment that changed. Neither carries a count of what was
+    // deleted: that number is the run log's, and a payload that duplicates it is a second
+    // place for the two to disagree.
+    "webhook.retention.changed", "webhooks", Live,
+    "An organization changed how long it keeps its event history.",
+    [("previous_window_days", Integer, opt), ("window_days", Integer, req)];
+    "webhook.retention.swept", "webhooks", Live,
+    "A retention sweep removed history from the bus.",
+    [("window_days", Integer, opt), ("events_deleted", Integer, opt),
+     ("deliveries_deleted", Integer, opt)];
 
     // ---- Analytics, search, notifications -------------------------------------------------------
     "analytics.traffic_spike", "analytics", Live,

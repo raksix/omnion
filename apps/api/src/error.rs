@@ -174,6 +174,21 @@ impl From<EventsError> for ApiError {
             EventsError::RedeliveryRefused { code, message } => {
                 Self::new(StatusCode::CONFLICT, code, message)
             }
+            // A retention window outside the range is a `400` that names the field: the request
+            // is what has to change. Clamping instead would answer `200` with a number the
+            // operator did not choose, and a screen that shows the clamped value has no way to
+            // know it was not what was asked for.
+            EventsError::InvalidRetention(message) => {
+                Self::bad_request("invalid_retention_window", message)
+            }
+            // An organization that does not exist is a `404`, not a `500`: the update matched
+            // no row, which is a fact about the request rather than about the database, and a
+            // caller that cannot tell the two apart retries a write that can never succeed.
+            EventsError::OrganizationNotFound(_) => Self::new(
+                StatusCode::NOT_FOUND,
+                "organization_not_found",
+                "no organization carries that id",
+            ),
         }
     }
 }

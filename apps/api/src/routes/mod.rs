@@ -779,6 +779,26 @@ pub fn router(state: AppState) -> Router {
     let webhook_test =
         post(webhooks::test_webhook).layer(guards::require(&state, "webhooks.manage"));
 
+    // The delivery operations (REQ-016 slice 2). Reading an endpoint's history and its summary
+    // is the same power as reading the endpoint — the history belongs to it — while sending one
+    // again is not: a replay is an outbound request to somebody else's server, so it is
+    // `webhooks.manage` and never `webhooks.read`. A read-only auditor must not be able to make
+    // the platform POST to a third party by pressing a button.
+    let webhook_stats = get(webhooks::endpoint_stats).layer(guards::require(&state, "webhooks.read"));
+
+    let webhook_secret_rotate =
+        post(webhooks::rotate_secret).layer(guards::require(&state, "webhooks.manage"));
+
+    // Declared before the single-delivery path on purpose: `/deliveries/redeliver` is a literal
+    // segment and `/deliveries/{delivery_id}/redeliver` would read `redeliver` as an id if the
+    // two were registered the other way round, answering `404 no such delivery` for a request
+    // that is perfectly valid.
+    let webhook_redeliver_batch =
+        post(webhooks::redeliver_many).layer(guards::require(&state, "webhooks.manage"));
+
+    let webhook_redeliver_one = post(webhooks::redeliver_one)
+        .layer(guards::require(&state, "webhooks.manage"));
+
     let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
     // The catalogue is the platform's own registry of event names (REQ-016 slice 1), read with
@@ -787,6 +807,29 @@ pub fn router(state: AppState) -> Router {
     // `catalogue` segment can never be read as an event id.
     let event_catalogue =
         get(webhooks::list_catalogue).layer(guards::require(&state, "events.read"));
+
+    // The event bus's own retention (REQ-016 slice 3). Reading the window, the counts and the
+    // last sweep is reading the bus, so it rides `events.read`; **changing** the window and
+    // running a sweep are `webhooks.manage`, because shortening a window destroys an audit
+    // trail and a read-only auditor must not be able to trigger that from a link.
+    //
+    // Declared before `/events/{id}` for the same reason `/events/catalogue` is: `retention`
+    // is a literal segment, and a parameterised sibling registered first would read it as an
+    // event id and answer `404 no such event` for a request that is perfectly valid.
+    let event_retention = get(webhooks::retention_status)
+        .layer(guards::require(&state, "events.read"))
+        // The PATCH rides the same router as the GET because the two are one read/write pair on
+        // one path; a separate `patch(...)` bound to `/events/retention` would need a second
+        // `.route()` line and axum panics at boot when a path carries two `MethodRouter`s from
+        // different calls. The guards differ, and that is fine: the GET's layer answers the
+        // GET and the PATCH's layer answers the PATCH, and a caller holding only `events.read`
+        // reaches the GET and is refused on the PATCH — which is exactly the split the two
+        // powers are for.
+        .merge(
+            patch(webhooks::set_retention).layer(guards::require(&state, "webhooks.manage")),
+        );
+    let event_retention_sweep =
+        post(webhooks::sweep_retention).layer(guards::require(&state, "webhooks.manage"));
 
     // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
     // read and write powers are the workflow keys the engine already defines — being allowed to
@@ -1302,9 +1345,18 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
+        .route("/webhooks/{id}/deliveries/redeliver", webhook_redeliver_batch)
+        .route(
+            "/webhooks/{id}/deliveries/{delivery_id}/redeliver",
+            webhook_redeliver_one,
+        )
+        .route("/webhooks/{id}/stats", webhook_stats)
+        .route("/webhooks/{id}/secret/rotate", webhook_secret_rotate)
         .route("/webhooks/{id}/test", webhook_test)
         .route("/events", events)
         .route("/events/catalogue", event_catalogue)
+        .route("/events/retention", event_retention)
+        .route("/events/retention/sweep", event_retention_sweep)
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
         .route("/automations/{id}", automation_entry)

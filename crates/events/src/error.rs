@@ -5,6 +5,8 @@
 //! (`EndpointNameTaken`), a definition the platform refuses to store (`Invalid*`), and the
 //! store itself (`Store`).
 
+use uuid::Uuid;
+
 /// Result alias of the events crate.
 pub type Result<T> = std::result::Result<T, EventsError>;
 
@@ -41,6 +43,21 @@ pub enum EventsError {
         /// The sentence the operator reads.
         message: &'static str,
     },
+    /// A retention window the platform will not store.
+    ///
+    /// A **range** refusal rather than a clamp, and the reason is the same one the redelivery
+    /// cap has: a caller that asked for a one-day window and was given seven would see a `200`
+    /// and a number it did not ask for. The column's check constraint is the backstop for a
+    /// write that bypasses the API; this variant is the answer for one that does not.
+    #[error("invalid retention window: {0}")]
+    InvalidRetention(String),
+    /// No organization carries that id, so its window cannot be set.
+    ///
+    /// Its own variant rather than [`EventsError::Store`]: the update matched no row, which is
+    /// a "that organization does not exist" and not a database failure, and a caller that
+    /// cannot tell the two apart will retry a write that can never succeed.
+    #[error("no organization carries that id")]
+    OrganizationNotFound(Uuid),
 }
 
 impl EventsError {
@@ -58,6 +75,8 @@ impl EventsError {
             Self::InvalidEvent(_) => "invalid_event",
             Self::Client(_) => "internal_error",
             Self::RedeliveryRefused { code, .. } => code,
+            Self::InvalidRetention(_) => "invalid_retention_window",
+            Self::OrganizationNotFound(_) => "organization_not_found",
         }
     }
 }
@@ -74,6 +93,12 @@ impl EventsError {
     #[must_use]
     pub fn invalid_event(message: impl Into<String>) -> Self {
         Self::InvalidEvent(message.into())
+    }
+
+    /// A retention window the platform will not store.
+    #[must_use]
+    pub fn invalid_retention(message: impl Into<String>) -> Self {
+        Self::InvalidRetention(message.into())
     }
 }
 

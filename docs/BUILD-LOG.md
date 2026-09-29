@@ -1,3 +1,65 @@
+
+## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
+
+build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
+
+Slice 1 gave the bus a read side. This is the half an operator actually reaches for: connect a
+receiver, watch what it was sent, send it again, and find out whether it is still working.
+
+**0052_webhook_delivery_ops.sql**, four routes on `/webhooks/{id}` (`deliveries`, `redeliver`,
+`redeliver` batch, `stats`, `secret/rotate`), and four screens: `/webhooks`, `/webhooks/new`,
+`/webhooks/[id]` (Overview / Deliveries / Stats) and the edit form.
+
+**Six decisions, each a shortcut that produces a plausible wrong answer.** The **redelivery
+resets the row** rather than inserting a second one — the `(endpoint_id, event_id)` unique index
+would refuse the insert anyway, and it should: two rows for one fact means the receiver cannot
+tell a replay from a duplicate, and it is also what makes `attempts` mean "attempts in this
+round" instead of "attempts ever", which is the number compared against `max_attempts`. A
+**pending row is refused**, and its checkbox is disabled rather than offered: the runner holds
+that row's lease, so a reset would hand it to the next claim while the attempt is in flight —
+the one place this operation could double-send. **The three refusals carry three codes**, because
+"wait a moment" and "fix your receiver instead" are different advice, and the refusal travels
+*inside* `EventsError` (as a `409`, not a `400` — the row's state is the problem, not the
+request) so a store error stays an error instead of being reported as "no such delivery". The
+**success rate counts settled traffic only**: pending in the denominator would read 0% for a
+queue whose every delivery is about to succeed, and a test row in it would let an operator make
+a broken receiver look healthy by pressing the button — so a history that is only probes answers
+`null` and the screen prints "No traffic" with the excluded count underneath. The **cursor is
+`(created_at, id)`**, because the read sorts by both and a cursor on one column of a two-column
+order repeats rows whenever two deliveries share a timestamp, which is normal when the bus fans
+out; half a cursor is refused by name because a null id there is a `500` on a request the panel
+builds itself. **Rotation is a separate route from `PATCH`**, because it is the one write whose
+answer carries the secret — a receiver cannot be reconfigured with a value it never saw.
+
+**Two defects the walks found, both of the "the column exists" kind.** Migration 0052 added
+`trigger` and nothing wrote it, so every test delivery was stamped `event` and the stats read was
+counting a button press as the platform delivering something; the column is now stamped at the
+one place a test is queued. And `redeliver` originally reported its count through a follow-up
+read, which can observe a different value after somebody else pressed the same button — it now
+returns the count from the update itself.
+
+**The rotation is proved against a receiver, not a status code.** The walk creates the endpoint
+with an operator-supplied secret so it holds both values, delivers once, rotates, delivers again,
+and asserts the second delivery verifies against the new secret and **fails** against the old
+one. The receiver is `infra/mocks/webhook-receiver.mjs`, started by the depth pass and killed in
+its `finally`, so a throw mid-pass does not leave a port bound.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **45** (42 before, +3)
+- `cargo test -p omnion-api --test events` → **9/9** (6 before, +3) against real Postgres
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `cdba36e` (the store and the migration), `b826899` (the routes and the walks),
+  `17d87cd` (the screens and the depth pass)
+
+**Not done, and not claimed: no browser pass.** A sibling writer held the QA slot for the whole
+window at load 18–20, so `runWebhooksDepth` is written and **unrun** and every acceptance box
+that names a screen stays unticked with the reason written into the box. The fast gates ran
+instead and the pass is queued.
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with no `QA_STACK` override. If it is
+green, tick the screen boxes and close slice 2. Then slice 3, which is the retention sweeper
+plus the delivery-failed notification REQ-021 turns into an operator alert.
 ## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
 
 build media: retention policies, the run log, the hold, and the reference repair
@@ -282,7 +344,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   Slice 4 then brings folder and file grants with inheritance, the scanning pipeline with
   quarantine and release, retention policies with the daily worker, and the reference-based purge
   refusal — and with them the Usage and Activity tabs, which finally have rows to read.
-
 
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
@@ -3041,7 +3102,6 @@ data source does.
 on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
 turns "did I remember?" into a red line with a file and a line number.
 
-
 ---
 
 ## 2026-09-29 — REQ-016 slice 1 (emission half) · the gate that walked one direction
@@ -3292,8 +3352,6 @@ on `origin/main`** by checking out main and re-running with none of this branch'
 **Next.** The rest of REQ-099 slice 1: the provider call and tool execution, the runner's
 claim/heartbeat/requeue, `POST /ai/agents/{id}/runs` with SSE, the run list and the trace screen.
 
-
-
 ## w7 · REQ-099 slice 1, the loop · 2026-09-29
 
 **What** — `crates/ai-hub/src/tools.rs` (the tool boundary) and `crates/ai-hub/src/loop_engine.rs`
@@ -3320,3 +3378,143 @@ claim/heartbeat/requeue, `POST /ai/agents/{id}/runs` with SSE, the run list and 
 store-backed runner (claim with `skip locked`, heartbeat, requeue), `POST /ai/agents/{id}/runs`
 with SSE, the run list and the trace screen, then extend `scripts/qa/walkthrough.cjs`. Do **not**
 close the REQ: the QA browser pass has not run and eight acceptance boxes are still open.
+---
+
+## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
+
+**What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
+shows the last page, the API keeps a keyset cursor over every row, the automation matcher
+replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
+`/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
+question (what will be forgotten and when) rather than a fourth card inside the Feed.
+
+Migration `0123_event_retention.sql` puts the window on the **organization**
+(`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
+decisions carry it, and each is a place the obvious shortcut is wrong:
+
+* **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
+  and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
+  The receiver's only symptom is a delivery that never arrives with nothing in the platform
+  saying why. The store's predicate selects events with **no delivery at all** or with **only
+  settled** ones; a `pending` row pins its event for ever. An event nobody was ever queued
+  for is the bulk of the bus, which is exactly the part worth deleting.
+* **The window is a column on the organization, not on the event.** "30 days" is a policy an
+  operator sets once and then changes; storing it per event would mean a sweeper that has to
+  *compare* the two to decide what is old. The cutoff is computed per organization inside the
+  same statement, and an organization that has never set one falls back to the platform
+  default rather than to `null` — because `null` would mean "keep for ever", which is a
+  decision nobody made deliberately.
+* **A run that deletes nothing is still written to the log.** "The last sweep was at 03:00 and
+  it found nothing" is the sentence an operator needs on the day they ask why a March event is
+  still in the feed, and a table that only records activity cannot answer it on the day
+  nothing happened.
+
+**A window on the organization is also a permission split.** Reading the window, the counts and
+the last sweep rides `events.read` — describing what will be removed is reading the bus.
+**Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
+destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
+
+**`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
+literal segment registered after a parameterised sibling is read as an event id, and a request
+that is perfectly valid answers `404 no such event`.
+
+**A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
+comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
+in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
+would be quoting a number nobody can reconcile with the run log.
+
+**The panel refuses the range before the server does, because the bounds are the server's.**
+`min_days`/`max_days` arrive in the read rather than being written into the component, because
+a range written in two places is a range that will disagree, and the input that disagrees with
+the server is the one that gets a `400` nobody can act on. Out of range *disables* Save rather
+than offering a failure. And when the server does refuse, its own sentence is shown — it names
+the field and the range, and replacing that with "invalid value" throws away the only sentence
+that says which bound was crossed.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **47** (45 + 2)
+- `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
+  one-day window set through the same `PATCH` an operator uses
+- `cargo test -p omnion-api --test events` → **9/9** (the sweep must not disturb the existing
+  delivery history)
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
+  `runRetentionDepth`)
+
+**Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
+PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
+$2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
+a named argument has to land on `int`, and the error names a function that plainly exists, so
+it reads like a migration fault rather than an argument type. The second is an **assertion
+written in the same breath as the code that broke it**: the walk set the window through a
+`PATCH`, that `PATCH` recorded `webhook.retention.changed` on the same bus, and the count
+assertion still said "two aged events" while the bus honestly held three. It had passed for
+the wrong reason only because nobody had run it since the audit event was added. Counting is
+not "count the rows I set up" — a number an operator reads is a number the platform has to be
+able to explain, including the parts nobody staged.
+
+**Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
+whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
+mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
+**unrun**, so every acceptance box naming a screen stays unticked with the reason written into
+the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
+a probe that selects a hook the screen does not carry is a probe that cannot fail.
+
+**Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
+slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
+(REQ-012/013/014 — the security, backup and system-health centres).
+
+## 2026-09-29 — omnion-build tick 56 · the blocker was never the QA slot
+
+**What.** Three REQs (010, 021, 016) had each recorded, in their own words, that their
+browser pass never ran because "the QA slot is held by a sibling writer". Three ticks running,
+the excuse had become the plan: wait for the slot, write nothing, tick nothing. This tick
+checked the excuse instead of repeating it — and it was false.
+
+The slot was never the constraint. **`/dev/shm` was at 99%** (418M free) and the box was at
+load 33 with 1G of RAM available. Several stacks point `CARGO_TARGET_DIR` at tmpfs so a
+compile does not fill the disk, so the worktrees had collectively moved their unbounded build
+growth onto a filesystem *every sibling shares* — and a build that cannot write its output dies
+with "No space left on device", which reads like a source error. Freeing three orphaned
+targets took tmpfs to 29% free and the load to 15. The slot was the symptom; the excuse named
+the wrong culprit, and the wrong culprit cannot be fixed by waiting.
+
+**The fix, and the two rules it had to learn first.** `disk-guard.sh` grew a tmpfs sweep with
+an `in_use` test — and that test deleted a 7 GB target out from under a **running w8 QA pass**.
+The reason is the lesson worth the whole tick: a stack's build runs in a wrapper that *exits*
+once the binary is staged, so `run.sh`, the pm2 API and the walkthrough all carry no
+`CARGO_TARGET_DIR` and answered "not held". A pass is not a build, and asking only "is a
+compiler running" cannot tell them apart. The guard now requires both tests — nothing building
+into it AND nobody living in the worktree that owns it — and step 4, the disk's own last
+resort, gets the same check it had been missing.
+
+**Also shipped.** The one unticked REQ-016 box that named *missing* UI: the payload inspector
+could copy a whole payload but not a JSON path. It now lists the payload's keys as a tree and
+copies the path a receiver would actually write — `["order.total"]` for a key with a dot in
+it, because `payload.order.total` is two lookups that read as a key that does not exist, and a
+path that silently matches nothing in the receiver being debugged is worse than no path.
+
+**Proof.**
+
+- `bash scripts/qa/disk-guard.sh` → freed **13.9 GB**, `/dev/shm` 91% → 29% free, load 33 → 15
+- a second run against the live w8 pass → reclaimed **nothing** (the rule holds under the case
+  that broke it)
+- `tsc --noEmit` in `apps/admin` → exit 0
+- `node --check scripts/qa/walkthrough.cjs` → exit 0
+- Commits: `f658491` (the guard), `aa14c42` (the path tree), `a8399a0` (the walkthrough step),
+  `a0c0320` (the REQ's record of it)
+
+**Not done, and not claimed. Still no browser pass.** This tick's own pass is queued behind
+the same single slot (now w8's, which I disturbed and which is still running), so the
+acceptance boxes naming a screen stay unticked with the reason in the box. What changed is
+that the excuse is no longer believed: the cliff is gone, and the next tick either gets the
+slot or says which sibling is holding it and for how long.
+
+**Next.** On arrival: if the slot is free, run `bash scripts/qa/run.sh` with **no `QA_STACK`
+override** and tick the screen boxes for slices 1–3 of REQ-016 together, then close REQ-016,
+then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
+the same reason). If the slot is still held, name the holder and its ports in the log rather
+than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
