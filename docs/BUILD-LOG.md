@@ -5194,3 +5194,115 @@ that into a ledger.
 **Migrations.** `0125_search_provider_enablement.sql` — taken above the shared high-water, which
 now reads main 0052/0123, wave3 0056, w5 0054, w6 0052, w7 0064, w8 0058, wave9 0124. Mine are
 0053, 0054, 0055, 0057 and now 0125.
+
+---
+
+## Wave 4 · REQ-053 inventory · slice 1 — items, warehouses, locations and the stock rollup
+
+**Commits** `27c3e7b` (the module) and `37bf572` (the API surface and the five permission keys).
+
+REQ-053 is the first of the nine untouched wave-4 requests and the one with the most downstream
+weight: sales records the *intent to hold* stock as a row per line (`0057_sales_order_reservations.sql`
+says so on the order detail), and inventory is what turns that into a ledger. It is also the
+request whose central property is an **absence** — the rollup agreeing with the ledger — which is
+why the suite treats a missing database as a failure rather than a skip.
+
+### What
+
+`modules/inventory` (a module, not a crate: docs/04), `0126_inventory.sql`, twenty-two routes and
+five permission keys. The rule the whole thing serves:
+
+> **`inventory_stock` is a rollup of `inventory_movements`, and the two may never disagree.**
+
+Four mechanisms, none of which is "be careful in the service":
+
+* **The ledger is append-only.** No `PATCH`, no `DELETE`, no trigger. The only way to fix a
+  mistake is another movement with reason `correction`. axum answers `405` for a method it does not
+  implement, which is the only answer a later handler cannot undo by deciding to be helpful.
+* **Every row carries the numbers it produced** (`on_hand_after`, `reserved_after`), written from
+  the same locked read that computed them, so the ledger is *replayable*. `replay` recomputes every
+  item × location from the movements alone; `reconciliation_report` compares that with the rollup
+  and names every disagreement **with both numbers** — a list, because a count tells somebody the
+  module is wrong and not where.
+* **The sign lives in the kind, not in the number.** `quantity` is stored positive and `kind` says
+  which way it went; an adjustment carries its own sign. Storing both is two sources of truth for
+  one fact, and the second is always the one a manual fix gets wrong.
+* **Concurrency is the lock, not a retry.** The stock row is taken `for update` inside the
+  transaction, the ledger row is written first, and the rollup write is the one that can be lost —
+  a lost rollup is caught by `replay`; a lost ledger row is the state the module exists to prevent.
+
+### Proof
+
+```
+cargo test -p omnion-module-inventory --lib                       47 passed, 0 failed
+cargo test -p omnion-api --test inventory -- --test-threads=1     11 passed, 0 failed
+  -- OMNION_DATABASE_URL=…/omnion_qa_w4 OMNION_REQUIRE_DB=1
+@omnion/admin:typecheck + @omnion/web:typecheck                   2/2 successful
+```
+
+`OMNION_REQUIRE_DB=1` makes a missing PostgreSQL a **panic**: a walk that reports SKIP when the
+database is down is a green tick that proved nothing, and this suite's subject is an absence.
+
+**Seven boxes ticked, seven left unticked and named.** The reconciliation test is a replay rather
+than a comparison of the last row's `on_hand_after` — the cheap version only proves the final
+number, and a ledger whose middle was corrupted still ends at the right number if the last row was
+honest. It writes the awkward decimals on purpose (10 + 3.5 + 0.25 + 12 − 2.75 = **23.000**, which a
+binary float would not land on) and then **breaks the rollup deliberately** — a row set to 999 with
+no ledger row behind it, the exact state a two-transaction service would leave — and requires the
+report to name it. A test that has never seen the failure it is looking for is a test of the happy
+path.
+
+### Four bugs the tests found, all of them real
+
+* **The decimal parser mis-scaled every quantity with a trailing zero.** `whole_to_milli` scaled
+  the fraction by *its own length* instead of padding on the right, so `3.250` came back as
+  **`3.002`** — a thousand times too small, and still a value that looks like a number. Found by
+  the unit test, not by a walk, because a walk would have shown `6.000 − 1.5` and stopped there.
+* **The schema's `reserved <= on_hand` had the same gap as the service, in the opposite order.**
+  A permitted `correction` may leave `on_hand` at −3, and re-testing `reserved <= on_hand` after
+  the service had already allowed it refused the very write the permission exists to permit — with
+  the message "this would hold 0.000 against −3.000 on hand", which is nonsense to read. A service
+  that allows a negative and a constraint that then refuses the row would leave **a written ledger
+  row with no rollup behind it**, which is the one state this module exists to make impossible.
+  Fixed in both places, in the same order, and the constraint now reads
+  `reserved <= on_hand or on_hand < 0`.
+* **`Quantity::checked_sub` refuses an overflow, not a negative result.** The release path trusted
+  it to stop a release below zero; `0 − 1000` is a perfectly good value of an `i128`, so a release
+  of more than was held produced `reserved = −1.000` and the schema refused the row *after* the
+  ledger row had been written. The check is now written out.
+* **The available quantity was only in `details`, not in the sentence.** The form renders `details`
+  beside the input; a person reads the sentence, in a log and on a terminal. The walk's assertion
+  checks the sentence, because a human reads the sentence.
+
+### And three test bugs that were worth having found
+
+* `fixture.org` where the test meant `fixture.other_org` produced a **`200` for "another
+  organization's item"** — which was the module correctly answering about the caller's *own*
+  organization. The instinct was to look for a tenant leak; measuring first (which organization
+  was the outsider actually resolved to?) is what kept a green build from shipping a real fix for a
+  bug that did not exist.
+* A tenant naming another organization is stopped by the tenancy rule with a `403
+  cross_organization` **before the module is reached**, so the criterion's `404` needs a different
+  caller. Two refusals, two callers, and the test now names both.
+* `Uuid::new_v4().simple()` is **hex**, so a "barcode" built from it contained `a`–`f` and the
+  normalizer correctly upper-cased it, making the test compare `"869B2B0D22AF"` with
+  `"869b2b0d22af"`. A barcode that is really an EAN is digits and the test now says so.
+
+### Not proved this tick, and said so rather than ticked
+
+**No admin UI and no QA browser pass.** The module, the migration, the API and the tests are done
+and committed; `apps/admin` has no `/inventory/*` screen yet, so a walkthrough would find nothing
+and the pass's absence is not evidence of anything. The seven unticked boxes are the ones that name
+a screen, a drawer or a document that does not exist. This slice is deliberately the data layer:
+the ledger and the rollup are the part that has to be right before anything is drawn on top of it,
+and drawing screens against a ledger that later moves is how a module gets rewritten.
+
+### Next
+
+**Slice 2 — the ledger screen and the adjust drawer**, including the over-threshold approval
+(`inventory_settings.adjustment_approval_threshold` and the `ApprovalNotGranted` variant already
+exist with no route behind them), the CSV export and the first `/inventory/*` admin screens. The
+box left unticked for the mobile criterion stays unticked until a pass measures it.
+
+**Migrations.** `0126_inventory.sql` — taken above the shared high-water, which now reads main
+0123, wave3 0125, wave9 0125. Mine are 0053, 0054, 0055, 0057, 0125 and now 0126.
