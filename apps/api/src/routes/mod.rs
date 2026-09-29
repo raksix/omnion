@@ -71,6 +71,7 @@
 
 pub mod ai;
 pub mod ai_agents;
+pub mod ai_agent_workspace;
 pub mod ai_decisions;
 pub mod ai_routing;
 pub mod analytics;
@@ -793,6 +794,24 @@ pub fn router(state: AppState) -> Router {
     let ai_run_resume =
         post(ai_agents::resume_run).layer(guards::require(&state, "ai.agents.run"));
 
+    // The per-agent workspace (REQ-099 slice 2). Reading a workspace is reading the agent;
+    // adding or removing a file is managing it, and it is `ai.agents.manage` rather than
+    // `ai.agents.run` on purpose — a run is what *spends*, and a workspace file is an input to
+    // a run somebody still has to press Run for. The download carries the same read power as
+    // the listing for the obvious reason: a file the tab shows is a file the tab can fetch.
+    let ai_agent_files = get(ai_agent_workspace::list_agent_files)
+        .layer(guards::require(&state, "ai.agents.read"))
+        .merge(
+            post(ai_agent_workspace::upload_agent_file)
+                .layer(guards::require(&state, "ai.agents.manage")),
+        );
+    let ai_agent_file = get(ai_agent_workspace::download_agent_file)
+        .layer(guards::require(&state, "ai.agents.read"))
+        .merge(
+            delete(ai_agent_workspace::delete_agent_file)
+                .layer(guards::require(&state, "ai.agents.manage")),
+        );
+
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
     // `webhooks.manage`, and the platform's event feed is read with `events.read`. Every
@@ -1438,6 +1457,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/agents", ai_agents)
         .route("/ai/agents/{id}", ai_agent)
         .route("/ai/agents/{id}/runs", ai_agent_runs)
+        // The workspace file path is a wildcard, so `*path` rather than `{path}`: a workspace
+        // holds `data/2026/q3.csv` as readily as `notes.md`, and a single-segment capture would
+        // answer 404 for every file in a subdirectory.
+        .route("/ai/agents/{id}/files", ai_agent_files)
+        .route("/ai/agents/{id}/files/*path", ai_agent_file)
         .route("/ai/runs", ai_runs)
         .route("/ai/runs/{id}", ai_run)
         .route("/ai/runs/{id}/steps", ai_run_steps)

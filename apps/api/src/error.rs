@@ -1009,6 +1009,11 @@ impl From<AiHubError> for ApiError {
             // sentence would throw away the only part the user can act on.
             AiHubError::InvalidAgent(message) => Self::bad_request("invalid_agent", message),
             AiHubError::InvalidRun(message) => Self::bad_request("invalid_run", message),
+            // A workspace refusal is a 400 with the limit text kept: the Workspace tab shows the
+            // message under the path field, and "file too large" without the number is a message
+            // the reader cannot act on. It is deliberately not an `invalid_agent` — the shape
+            // differs and a client that folds them together puts a path error above the name.
+            AiHubError::InvalidFile(message) => Self::bad_request("invalid_file", message),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code
