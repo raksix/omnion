@@ -24,8 +24,7 @@ use uuid::Uuid;
 use crate::error::{Result, WorkflowError};
 
 /// Columns of `automation_projects` for one `select`, in [`Project`] order.
-const PROJECT_COLUMNS: &str =
-    "id, organization_id, key, name, description, color, icon, is_default, status, owner_user_id, \
+const PROJECT_COLUMNS: &str = "id, organization_id, key, name, description, color, icon, is_default, status, owner_user_id, \
      created_by, created_at, updated_at";
 
 /// What a member may do inside a project.
@@ -273,7 +272,10 @@ pub fn validate_key(key: &str) -> Result<()> {
     let count = key.chars().count();
     let because = if key.contains(' ') {
         "and contains a space"
-    } else if !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    } else if !key
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
         "and uses lower case or a symbol"
     } else {
         // Reachable only by length, so the message must not claim a character problem it
@@ -351,6 +353,83 @@ pub async fn find_visible(
         .fetch_optional(pool)
         .await?;
     Ok(row)
+}
+
+/// The projects a caller may see, as ids.
+///
+/// This is the query slice 2 is built on, and it answers a question the per-project read cannot:
+/// **"which projects is this person in?"** asked once, for a whole list, before the caller's
+/// first row is fetched. Two shapes of scoping exist and only one of them is a boundary —
+///
+/// * `is_instance_admin` sees the whole organization;
+/// * a member sees exactly the projects they are a member of;
+/// * **and the organization's DEFAULT project is always visible**, because it is where every
+///   resource created without an explicit project lands.
+///
+/// That last clause is the decision worth arguing for, and the argument is that the alternative
+/// is a fresh installation where the owner cannot see the project their first workflow is in.
+/// 0164 backfills every pre-existing workflow into the default and `resolve_target` sends every
+/// un-targeted new one there; a scoping rule that hides it makes both of those facts invisible
+/// to the person who needs them. The default is also the one project the migration refuses to
+/// archive, so it is never a container that can be read-only — there is no state in which showing
+/// it would leak a dormant queue.
+///
+/// The result is an id list rather than a boolean predicate, because callers bind it into
+/// `project_id = any($2)` on tables this module does not own, and a predicate cannot be
+/// transported into another query's `where` without a second round trip.
+pub async fn visible_project_ids(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Vec<Uuid>> {
+    let rows: Vec<Uuid> = sqlx::query_scalar(
+        "select p.id from automation_projects p \
+         where p.organization_id = $1 \
+           and ($2 or p.is_default \
+                or exists (select 1 from automation_project_members m \
+                           where m.project_id = p.id and m.user_id = $3))",
+    )
+    .bind(organization_id)
+    .bind(caller.is_instance_admin)
+    .bind(caller.user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// The same answer, as a claim about one workflow: may this caller see it?
+///
+/// The function every read path uses instead of comparing organizations, and the reason is a
+/// specific accident: an organization-only check is what slice 1 shipped, and it is correct for
+/// tenancy and silent about projects. Two people in ONE organization, in different projects,
+/// both pass it. This one is the check that makes project membership mean anything.
+pub async fn can_see_workflow(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<bool> {
+    Ok(visible_project_ids(pool, organization_id, caller)
+        .await?
+        .contains(&project_id))
+}
+
+/// A list filter: the caller's visible projects, or `None` when they may see all of them.
+///
+/// `None` here means "do not filter" and is returned for an instance administrator, because a
+/// `Some` carrying every id in the organization would be the same answer spelled more expensively
+/// — and a filter that silently stops applying is how a scoping rule gets un-applied by accident.
+pub async fn visible_project_filter(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<Vec<Uuid>>> {
+    if caller.is_instance_admin {
+        return Ok(None);
+    }
+    Ok(Some(
+        visible_project_ids(pool, organization_id, caller).await?,
+    ))
 }
 
 /// The organization's default project, created on first use.
@@ -464,13 +543,18 @@ pub async fn create_project(pool: &PgPool, new: NewProject) -> Result<Project> {
 /// [`ProjectRole::Owner`]. The distinction matters: membership is a fact about the row, and slice
 /// 4's "remove the last owner" check must not be satisfied by an administrator who has no
 /// membership to remove.
-pub async fn role_of(pool: &PgPool, project_id: Uuid, user_id: Uuid) -> Result<Option<ProjectRole>> {
-    let raw: Option<String> =
-        sqlx::query_scalar("select role from automation_project_members where project_id = $1 and user_id = $2")
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await?;
+pub async fn role_of(
+    pool: &PgPool,
+    project_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<ProjectRole>> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "select role from automation_project_members where project_id = $1 and user_id = $2",
+    )
+    .bind(project_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(raw.as_deref().and_then(ProjectRole::parse))
 }
 
@@ -669,8 +753,16 @@ mod tests {
         // the wrong branch. A key that is long AND clean is the only way to reach it.
         let error = validate_key("TOOLONGKEY").unwrap_err();
         assert!(error.to_string().contains("10 characters"), "{error}");
-        assert!(error.to_string().contains("not 2 to 8 characters long"), "{error}");
-        assert!(validate_key("A").unwrap_err().to_string().contains("1 character "));
+        assert!(
+            error.to_string().contains("not 2 to 8 characters long"),
+            "{error}"
+        );
+        assert!(
+            validate_key("A")
+                .unwrap_err()
+                .to_string()
+                .contains("1 character ")
+        );
     }
 
     #[test]

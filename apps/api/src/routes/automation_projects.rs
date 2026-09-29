@@ -176,7 +176,12 @@ pub struct MemberResponse {
 /// different facts: an organization account can be given an instance-wide permission, and a
 /// platform-level account can lack it. Either way the answer is a decision, and every read here
 /// consults the same one.
-async fn is_instance_admin(
+///
+/// `pub(crate)` because slice 2 needed it in two more files: the workflows and automations
+/// surfaces both build a [`ProjectCaller`] for their scoped queries, and a private function that
+/// four call sites each re-implement is how `projects.admin` comes to mean two different things
+/// on one branch. One function, one answer, and the permission key appears exactly once.
+pub(crate) async fn is_instance_admin(
     state: &AppState,
     current: &CurrentSession,
     organization_id: Uuid,
