@@ -5606,3 +5606,21 @@ just closed: the schema can be right and the feature absent.
 
 **Migrations.** `0127_inventory_adjustment_approvals.sql` — taken above the shared high-water, which now reads
 main 0123, wave3 0125, wave9 0125, wave2 0124. Mine are 0053, 0054, 0055, 0057, 0125, 0126 and now 0127.
+
+**The QA pass, at commit time, had not finished** — this section is written before its verdict is
+known and says so rather than predicting one. It was at ~23 minutes and still in the walk's login phase
+against the private stack, with four other writers' walkthroughs running at the same time; the run's
+artifact directory was still empty. What the pass is *supposed* to evaluate, listed so the next tick can
+check its own output against a list that was written before the answer existed:
+
+* `inventory-stock` renders, and the **status filter as a conjunction** (asking for negatives yields
+  either nothing or only negatives);
+* `inventory-movements` renders, and **no row carries an edit/delete/remove/void control** — the
+  assertion that backs the spec's "no pencil icon" line;
+* the **scanner's miss** says `Nothing is labelled …` and keeps the code in the box;
+* `inventory-approvals` renders its four scopes;
+* screenshots `page-inventory-stock`, `page-inventory-movements`, `page-inventory-approvals`.
+
+Until those land, the screens are **built and typechecked but not visually reviewed**, and the REQ stays
+`in-progress` rather than `done`. Slice 3 does not depend on the pass finishing, so the next tick proceeds
+to transfers and the alert sweep rather than waiting on it.
