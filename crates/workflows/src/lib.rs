@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod completion;
 pub mod credential_store;
 pub mod credentials;
 pub mod cron;
