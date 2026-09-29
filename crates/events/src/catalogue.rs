@@ -388,6 +388,108 @@ catalogue! {
     "A domain was detached from its site.",
     [("domain_id", Uuid, req), ("site_id", Uuid, opt), ("hostname", String, opt)];
 
+    // The CDN purge lifecycle (REQ-011). `cdn.purge.requested` is what an operator caused and
+    // `cdn.purge.failed` is what the runner could not finish; both are Low volume on the happy
+    // path and the failure one is the row an operations endpoint alerts on. The names that only
+    // exist as audit actions — `cdn.rule.changed`, `cdn.settings.updated` — are deliberately
+    // NOT listed: they are written to `audit_log`, not to the bus, and a catalogue row would
+    // put a name in the endpoint picker that no delivery can ever carry.
+    //
+    // `failed_items` is `Any` rather than an integer: it is a per-item error list, and pinning
+    // its shape here would make a future richer failure a breaking change to a subscribed name.
+    "cdn.purge.requested", "cdn", Live,
+    "An operator asked the edge to drop cached copies of something on a site.",
+    [("purge_id", Uuid, req), ("site_id", Uuid, req), ("kind", String, req),
+     ("target_count", Integer, req), ("provider", String, opt)];
+    "cdn.purge.failed", "cdn", Live,
+    "An edge purge finished with items the provider would not drop.",
+    [("purge_id", Uuid, req), ("provider", String, opt), ("kind", String, opt),
+     ("failed_items", Any, opt)];
+
+    // The tenant lifecycle (REQ-005). Every one of these carries `organization_id` in the
+    // payload as well as on the event, because the envelope's own field is what the fan-out
+    // scopes by and a consumer reading only the payload would otherwise not know the tenant
+    // without already holding the event.
+    //
+    // `organization.member.role_changed` is ONE name with two shapes, and the catalogue records
+    // that honestly rather than pretending it is uniform: a *membership* binding emits
+    // `user_id`/`role_id`/`scope`/`change`, while a *department* binding emits
+    // `department_id`/`department_key`/`role_id`/`action`. Both are marked optional, because
+    // neither is always present — a department grant has no `user_id`, and a member grant has no
+    // `department_key`. Declaring either as required would make the catalogue promise something
+    // an emitter does not deliver; declaring both optional is the honest statement, and the
+    // receiver that cares about one shape tests for the keys it needs.
+    "organization.member.joined", "tenancy", Live,
+    "A person became a member of an organization, directly or by accepting an invitation.",
+    [("organization_id", Uuid, req), ("user_id", Uuid, req), ("status", String, opt),
+     ("via", String, opt), ("invitation_id", Uuid, opt)];
+    "organization.member.status_changed", "tenancy", Live,
+    "A member's status within the organization changed.",
+    [("organization_id", Uuid, req), ("user_id", Uuid, req), ("status", String, req),
+     ("is_primary", Boolean, opt)];
+    "organization.member.removed", "tenancy", Live,
+    "A person was removed from an organization.",
+    [("organization_id", Uuid, req), ("user_id", Uuid, req)];
+    "organization.member.invitation_released", "tenancy", Live,
+    "A pending invitation was withdrawn or expired, freeing its seat.",
+    [("organization_id", Uuid, req), ("invitation_id", Uuid, req),
+     ("email_masked", String, opt), ("role_id", Uuid, opt)];
+    "organization.member.role_changed", "tenancy", Live,
+    "A role binding was granted or revoked, on a member or on a department.",
+    [("organization_id", Uuid, opt), ("user_id", Uuid, opt), ("role_id", Uuid, req),
+     ("scope", String, opt), ("change", String, opt),
+     ("department_id", Uuid, opt), ("department_key", String, opt), ("action", String, opt)];
+    "organization.department.created", "tenancy", Live,
+    "A department was added to an organization's structure.",
+    [("organization_id", Uuid, req), ("department_id", Uuid, req),
+     ("department_key", String, req), ("parent_id", Uuid, opt)];
+    "organization.department.updated", "tenancy", Live,
+    "A department was renamed, moved, or changed status.",
+    [("organization_id", Uuid, req), ("department_id", Uuid, req),
+     ("department_key", String, req), ("status", String, opt), ("parent_id", Uuid, opt)];
+    "organization.department.archived", "tenancy", Live,
+    "A department was archived and is no longer a part of the structure.",
+    [("organization_id", Uuid, req), ("department_id", Uuid, req),
+     ("department_key", String, req)];
+    "organization.limit.reached", "tenancy", Live,
+    "An organization hit a configured ceiling and the action that was refused.",
+    [("resource", String, req), ("used", Integer, opt), ("limit", Integer, opt),
+     ("action", String, req)];
+    // The sweep runs on a timer with no request behind it, so it has no actor — the field is
+    // left off entirely rather than filled with a synthetic id, because "who" is the wrong
+    // question for a row the scheduler produced.
+    "organization.retention.swept", "tenancy", Live,
+    "An organization's retention sweep removed audit rows older than its window.",
+    [("retention_days", Integer, req), ("rows_removed", Integer, opt),
+     ("cutoff", Timestamp, opt)];
+
+    // The staging lifecycle (REQ-017). `promotion.requested` and `promotion.completed` are the
+    // CI/CD signal this request names: an endpoint subscribed to `promotion.*` triggers a build,
+    // a cache purge or a smoke test on the other side of a deploy. That is why
+    // `promotion.completed` carries the affected item ids' *count* rather than re-emitting
+    // `page.published` for every copied row — the one event with the answer, not a flood.
+    //
+    // The remaining three (`promotion.approved`, `promotion.failed`, `promotion.conflict`) are
+    // not here: no emitter records them yet, and a row in this table is a promise that the name
+    // fires. They join the catalogue in the commit that gives the apply path its emitter.
+    "environment.created", "environments", Live,
+    "A staging environment was created and its first clone started.",
+    [("environment_id", Uuid, req), ("key", String, req), ("type", String, req)];
+    "environment.clone.started", "environments", Live,
+    "A clone job began copying production content into an environment.",
+    [("environment_id", Uuid, req), ("job_id", Uuid, req), ("areas", Json, opt)];
+    "environment.archived", "environments", Live,
+    "A staging environment was archived: its content is kept and its host released.",
+    [("environment_id", Uuid, req), ("key", String, req)];
+    "promotion.requested", "environments", Live,
+    "A frozen change set was submitted for promotion to production.",
+    [("promotion_id", Uuid, req), ("environment_id", Uuid, req),
+     ("items", Integer, req), ("conflicts", Integer, opt)];
+    "promotion.completed", "environments", Live,
+    "An approved change set was applied to production.",
+    [("promotion_id", Uuid, req), ("environment_id", Uuid, req),
+     ("written", Integer, opt), ("removed", Integer, opt), ("items", Integer, opt)];
+
     // ---- Plugins, themes, workflows --------------------------------------------------------------
     "plugin.installed", "plugins", Reserved,
     "A plugin was installed.",
