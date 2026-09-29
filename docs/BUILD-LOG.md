@@ -4765,3 +4765,24 @@ Stop the servers first, or use a `target` symlink (below).
 other unticked boxes still waiting on the same pass: the selection gestures, edge delete, the
 five validation classes, `⌘S`-writes-once, two-tab conflict, run-from-here, the status pills and
 the step trace.
+
+**The pass did not finish, and the reason is the box, not the code.** Three attempts: the first
+died on `CARGO_TARGET_DIR` (fixed, symlink), the second produced a **real** media upload and
+636 screenshots before `/mnt/apopic` hit ENOSPC mid-run, the third got as far as
+`search-depth` with 921 clicks — and then the API on :18082 stopped answering. The admin log
+says it plainly: `connect ECONNREFUSED 127.0.0.1:18082` from 08:47. `free -g` reads **29 of
+32 used, 2 available, load 48.6** — five browser passes at once, which is the exact failure this
+box produces rather than avoids. The pass was killed rather than left holding memory.
+
+**Two more environment lessons, both mine.** (1) **Do not `rm -rf` an artifact directory a live
+process is writing into.** I deleted `qa-artifacts/20260929-073042` while the *previous* pass's
+walkthrough was still alive and writing to it; the run then reported
+`artifact directory is gone (ENOSPC), recording in memory only` and produced an evidence-free
+pass. Check the pids before reclaiming, not the directory names. (2) **A stale orphan pass holds
+a whole browser.** The pass I thought had died was alive and I had started a second one on the
+*same stack and ports* — two passes, one API, and the second one's failures were really the
+first one's leftovers. One stack, one pass, and `ps` before `run.sh`, not after.
+
+**Honest position: criterion 8 is BUILT, TESTED and PUSHED; the box that would prove it never
+came up.** Nothing is claimed that was not measured. Next tick runs the pass on its own — with
+`free -g` and `ps` checked first — and reads the five notes before anything is ticked.
