@@ -3824,5 +3824,12 @@ loop-level deadline / token-budget / cancellation tests, the output-verification
 guardrail bus events and the SDK example are all still open. **Do not close REQ-099** — nine
 acceptance boxes are unticked and no browser pass has run over the new screens yet.
 
+**The QA pass did not run this tick, and the reason is worth recording.** The box was at load
+average **25.5** with 4 GB available and 25 GB of swap already spent, one browser pass holding the
+single QA slot and ten Chromium processes alive. That is precisely the condition the resource
+guard was installed for after the 2026-09-28 death spiral, and a second pass would have turned a
+slow tick into a crashed one. The pass is the *next* tick's first step, and the code it will
+exercise is committed, typed and `node --check`-ed — so nothing is left half-written for it.
+
 **Next.** The QA pass over the new screens (the private `w7` stack), then the loop-level stop
 tests with the `ScriptedModel::slow` seam, then slice 2's migration and the workspace.
