@@ -32,6 +32,7 @@ use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::seed;
+use omnion_secrets::leases::DEPLOYMENT_KEY_PREFIX;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -285,8 +286,9 @@ async fn mint_key(
 
 /// An RFC 3339 timestamp `hours` from now, as the key creation needs.
 ///
-/// A negative number is how a key is minted already expired — an operator backdating one is
-/// legitimate, and the row reports `expired` rather than pretending to be live.
+/// A negative number is only ever handed to the API, and only to assert that it REFUSES: the
+/// product rejects an expiry in the past outright, so a walk cannot mint an already-expired key
+/// through the route and must age a live one in the database if it wants the `expired` rendering.
 fn in_hours(hours: i64) -> String {
     let when = time::OffsetDateTime::now_utc() + time::Duration::hours(hours);
     when.format(&time::format_description::well_known::Rfc3339)
@@ -326,18 +328,23 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "the owner must hold a session token"
     );
 
-    let payment_secret = sealed_secret(
-        &db,
-        organization_id,
-        format!("payments-live-{}", Uuid::new_v4().simple()),
-    )
-    .await;
-    let smtp_secret = sealed_secret(
-        &db,
-        organization_id,
-        format!("smtp-live-{}", Uuid::new_v4().simple()),
-    )
-    .await;
+    // The scope list on a deployment key names **credentials**, not permissions. `scope_allows`
+    // is the whole rule: an entry matches the secret's NAME, with a trailing `.*` as the one
+    // wildcard. A key scoped to the permission name `secrets.lease` therefore matches no
+    // credential at all, and every redemption it attempts is refused as "not scoped to that
+    // credential" — the walk used to be written that way, which is why its one positive
+    // redemption had never been able to pass.
+    //
+    // A family wildcard is the shape a deployment actually wants, so the keys below are scoped
+    // to the family rather than to the exact per-run name: the secrets are named with a random
+    // suffix on purpose, and a key that had to be re-minted per run would be a key nobody keeps.
+    // The wildcard is `prefix.*` — the dot belongs to the rule, and a `prefix-*` spelling
+    // matches nothing at all, which is the second thing this walk had to learn.
+    let payment_name = format!("payments.live.{}", Uuid::new_v4().simple());
+    let smtp_name = format!("smtp.live.{}", Uuid::new_v4().simple());
+    let payment_secret = sealed_secret(&db, organization_id, payment_name.clone()).await;
+    let smtp_secret = sealed_secret(&db, organization_id, smtp_name.clone()).await;
+    const PAYMENT_SCOPE: &str = "payments.live.*";
 
     /* ------------------------------------------------------------------- the empty list reads */
 
@@ -445,12 +452,17 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         &owner_token,
         &format!("release-{}", Uuid::new_v4().simple()),
         "production",
-        &["secrets.lease"],
+        &[PAYMENT_SCOPE],
         &in_hours(24),
     )
     .await;
+    // The prefix is a CONTRACT (an operator recognises a key pasted into a CI variable), so the
+    // walk asserts the crate's own constant rather than a spelling of its own. It used to assert
+    // `omdk_`, which four other places in the tree — the generator, the CLI help, a route test
+    // and this crate's fixture — had never used, and the failure read as "the product minted the
+    // wrong key" when the product was the one thing in agreement with itself.
     assert!(
-        key_value.starts_with("omdk_"),
+        key_value.starts_with(DEPLOYMENT_KEY_PREFIX),
         "a deployment key value is recognisable as one: {key_value}"
     );
 
@@ -507,10 +519,29 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         Some(1),
         "the redemption budget shows what was spent"
     );
+    // The address is `None`, and that is the honest answer rather than a missing one.
+    // `ClientAddress` is extracted from the `ConnectInfo<SocketAddr>` extension, which exists
+    // only when the router is served by a real listener; an in-process `oneshot` call has no peer
+    // address, so `as_text()` is `None` and `redeem_lease` writes `null`. The walk asserted
+    // `Some("::1")`, which is a claim about a connection the test does not make — and it is the
+    // second time this assertion was about the harness rather than the product (the first was
+    // the scope). What the walk CAN prove about the column is that redemption is what fills it,
+    // so the value is compared against the row the walk just spent, read back out of PostgreSQL
+    // rather than out of a response that projects it.
+    let stamped: (Option<String>, Option<time::OffsetDateTime>) = sqlx::query_as(
+        "select last_address, last_redeemed_at from secret_leases where id = $1",
+    )
+    .bind(lease_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the spent lease must be readable");
+    assert!(
+        stamped.1.is_some(),
+        "the redemption did not stamp the lease: {stamped:?}"
+    );
     assert_eq!(
-        listed["last_address"].as_str(),
-        Some("::1"),
-        "the in-process caller has a loopback address and the lease records it"
+        stamped.0, listed["last_address"].as_str().map(str::to_owned),
+        "the list and the row must agree about the redemption address: {stamped:?} vs {listed:?}"
     );
 
     /* ----------------------------------------------- the use cap is spent, then refused again */
@@ -565,25 +596,73 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "a refused redemption must be written to the use log, found {denials}"
     );
 
-    /* ------------------------------------------------- a key is refused outside its environment */
+    /* ------------------------------- a machine identity cannot ISSUE; only redeem is for a key */
 
-    let other_environment = call(
+    // The walk used to read this as "a key bound to production must not lease in staging" and
+    // expected a 403 from `POST /secrets/{id}/lease` with a key in the header. The route does not
+    // take one: issuing is session-guarded (`CurrentSession`), so a machine key there is simply
+    // an unauthenticated caller and the honest answer is 401. The environment binding is real
+    // and it is enforced — at REDEMPTION, by `check_key_may_touch` — which is the assertion
+    // further down, on a lease that actually exists.
+    let machine_cannot_issue = call(
         &state,
         post_as_machine(
-            &format!("/api/v1/secrets/{smtp_secret}/lease"),
+            &format!("/api/v1/secrets/{payment_secret}/lease"),
             &key_value,
             json!({ "consumer": "nightly-release", "environment": "staging" }),
         ),
     )
     .await;
     assert_eq!(
-        other_environment.status,
-        StatusCode::FORBIDDEN,
-        "a key bound to production must not lease in staging: {}",
-        other_environment.raw
+        machine_cannot_issue.status,
+        StatusCode::UNAUTHORIZED,
+        "a lease is issued by a session, never by a machine key: {}",
+        machine_cannot_issue.raw
     );
     assert!(
-        !other_environment.raw.contains(FIXTURE_VALUE),
+        !machine_cannot_issue.raw.contains(FIXTURE_VALUE),
+        "the refusal must not echo a value"
+    );
+
+    // The scope rule, at the point it is actually enforced: REDEMPTION. `check_key_may_touch`
+    // runs inside the redeem handler, so a lease on the `smtp` credential is what has to exist
+    // first — the same key, an in-environment lease, and a secret outside its `payments.live.*`
+    // scope, leaving the scope as the only rule that can refuse it. Every deployment-key refusal
+    // is the same status and code by design, so the *only* thing separating a scope refusal from
+    // a wrong key is which secret was asked for.
+    let smtp_lease = call(
+        &state,
+        post(
+            &format!("/api/v1/secrets/{smtp_secret}/lease"),
+            &owner_token,
+            json!({ "consumer": "release-runner", "environment": "production" }),
+        ),
+    )
+    .await;
+    assert_eq!(smtp_lease.status, StatusCode::CREATED, "a lease must issue");
+    let smtp_lease_id: Uuid = serde_json::from_value(smtp_lease.body["id"].clone()).expect("an id");
+    let smtp_lease_token = smtp_lease.body["token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+
+    let out_of_scope = call(
+        &state,
+        post_as_machine(
+            &format!("/api/v1/secret-leases/{smtp_lease_id}/redeem"),
+            &key_value,
+            json!({ "token": smtp_lease_token }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        out_of_scope.status,
+        StatusCode::FORBIDDEN,
+        "a key scoped to payments must not redeem an smtp lease: {}",
+        out_of_scope.raw
+    );
+    assert!(
+        !out_of_scope.raw.contains(FIXTURE_VALUE),
         "the scope refusal must not echo a value"
     );
 
@@ -591,9 +670,9 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     let wrong_key = call(
         &state,
         post_as_machine(
-            &format!("/api/v1/secrets/{smtp_secret}/lease"),
-            "omdk_totally-made-up-key-value-0000000000000000",
-            json!({ "consumer": "nightly-release", "environment": "production" }),
+            &format!("/api/v1/secret-leases/{smtp_lease_id}/redeem"),
+            "omnion_dk_totally-made-up-key-value-0000000000000000",
+            json!({ "token": smtp_lease_token }),
         ),
     )
     .await;
@@ -603,28 +682,96 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "an unknown key must be refused: {}",
         wrong_key.raw
     );
+    // The two refusals must be indistinguishable to a caller — but the bodies differ in exactly
+    // one field, `details.request_id`, and that difference is the point: it is what lets an
+    // operator find the audit row for *this* call. So the comparison is on the parts a caller
+    // could learn anything from, and the request id is asserted to be PRESENT and different
+    // rather than compared away. A whole-body equality assertion here would have been asserting
+    // that two separate requests share an id.
+    let (wrong_code, wrong_message) = (
+        wrong_key.body["error"]["code"].as_str(),
+        wrong_key.body["error"]["message"].as_str(),
+    );
+    let (scoped_code, scoped_message) = (
+        out_of_scope.body["error"]["code"].as_str(),
+        out_of_scope.body["error"]["message"].as_str(),
+    );
     assert_eq!(
-        wrong_key.body["error"], other_environment.body["error"],
-        "a wrong key and a scope escalation must not be distinguishable from outside"
+        (wrong_code, wrong_message),
+        (scoped_code, scoped_message),
+        "a wrong key and a scope escalation must not be distinguishable from outside: {} vs {}",
+        wrong_key.raw,
+        out_of_scope.raw
+    );
+    let wrong_request_id = wrong_key.body["error"]["details"]["request_id"].as_str();
+    let scoped_request_id = out_of_scope.body["error"]["details"]["request_id"].as_str();
+    assert!(
+        wrong_request_id.is_some_and(|id| !id.is_empty()) && scoped_request_id.is_some(),
+        "every refusal carries a request id so the operator can find its audit row"
+    );
+    assert_ne!(
+        wrong_request_id, scoped_request_id,
+        "two separate calls must not share a request id"
     );
 
     /* ----------------------------------------------------------- a key past its expiry is refused */
 
-    let (expired_key_id, expired_value) = mint_key(
+    // **The API refuses to mint one at all**, and the walk used to insist it could. `mint_key`
+    // with `in_hours(-1)` wanted a `201` so it could then assert the redemption was refused — but
+    // `create_deployment_key` rejects an expiry in the past outright, with a message that says
+    // why ("dead on arrival"), and that is the better product: a key nobody can present is a key
+    // in the list that an operator has to reason about, and refusing at creation removes the
+    // state rather than rendering it honestly. The refusal is therefore the assertion, and the
+    // "expired" rendering is still checked below on a row that gets there the only way a real
+    // deployment can — by ageing.
+    let backdated = call(
         &state,
-        &owner_token,
-        &format!("expired-{}", Uuid::new_v4().simple()),
-        "production",
-        &["secrets.lease"],
-        &in_hours(-1),
+        post(
+            "/api/v1/deployment-keys",
+            &owner_token,
+            json!({
+                "name": format!("expired-{}", Uuid::new_v4().simple()),
+                "environment": "production",
+                "scopes": [PAYMENT_SCOPE],
+                "expires_at": in_hours(-1),
+            }),
+        ),
     )
     .await;
+    assert_eq!(
+        backdated.status,
+        StatusCode::BAD_REQUEST,
+        "a key that is dead on arrival must not be mintable: {}",
+        backdated.raw
+    );
+    assert!(
+        !backdated.raw.contains(FIXTURE_VALUE),
+        "the refusal must not echo a value"
+    );
+
+    // A live key that has since aged behaves the same as the walk's original intent: its value
+    // stops working, and the refusal is the uniform one.
+    let (aged_key_id, aged_value) = mint_key(
+        &state,
+        &owner_token,
+        &format!("aged-{}", Uuid::new_v4().simple()),
+        "production",
+        &[PAYMENT_SCOPE],
+        &in_hours(1),
+    )
+    .await;
+    // Age it from the past, which is the one thing the API will not do.
+    sqlx::query("update deployment_keys set expires_at = now() - interval '1 hour' where id = $1")
+        .bind(aged_key_id)
+        .execute(db.pool())
+        .await
+        .expect("the key must be ageable");
     let expired_use = call(
         &state,
         post_as_machine(
-            &format!("/api/v1/secrets/{payment_secret}/lease"),
-            &expired_value,
-            json!({ "consumer": "nightly-release", "environment": "production" }),
+            &format!("/api/v1/secret-leases/{lease_id}/redeem"),
+            &aged_value,
+            json!({ "token": lease_token }),
         ),
     )
     .await;
@@ -634,13 +781,21 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "a key past its expiry must be refused: {}",
         expired_use.raw
     );
-    assert_eq!(
-        expired_use.body["error"], wrong_key.body["error"],
-        "an expired key and a wrong key must be the same answer"
+    let (expired_code, expired_message) = (
+        expired_use.body["error"]["code"].as_str(),
+        expired_use.body["error"]["message"].as_str(),
     );
+    assert_eq!(
+        (expired_code, expired_message),
+        (wrong_code, wrong_message),
+        "an expired key and a wrong key must be the same answer: {} vs {}",
+        expired_use.raw,
+        wrong_key.raw
+    );
+    let expired_key_id = aged_key_id;
 
-    // A mint in the past is allowed — an operator often has to backdate one — but the row says
-    // `expired` rather than `active`, so the screen never shows a working key that is not.
+    // The aged key is listed and renders as `expired` rather than `active`, so the screen never
+    // shows a working key that is not one.
     let key_list = call(&state, get("/api/v1/deployment-keys", &owner_token)).await;
     let expired_row = key_list.body["keys"]
         .as_array()
@@ -654,7 +809,7 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         "a past-dated key reports expired, not active"
     );
     assert!(
-        !key_list.raw.contains(&expired_value),
+        !key_list.raw.contains(&aged_value),
         "the key value is shown once and never returns: {}",
         key_list.raw
     );
@@ -680,7 +835,13 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     )
     .await;
     assert_eq!(uses.status, StatusCode::OK, "the use log must read");
-    let entries = uses.body["uses"].as_array().expect("an array");
+    // The route answers with a BARE array — `Json<Vec<DeploymentKeyUseView>>` — not the
+    // `{ "uses": [...] }` envelope the walk assumed. A wrapper that does not exist is a
+    // `.expect("an array")` that fires on a perfectly good response, and it fires on the
+    // RESPONSE rather than on a product defect, which is the worst place for a walk to fail.
+    let entries = uses.body.as_array().unwrap_or_else(|| {
+        panic!("the use log must be a bare array of rows: {}", uses.raw);
+    });
     assert!(
         entries
             .iter()
@@ -728,11 +889,36 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         ),
     )
     .await;
-    assert_eq!(revoked.status, StatusCode::OK, "a key must be revocable");
+    // The route answers `204 No Content` (`Result<StatusCode, ApiError>`) — it revokes and says
+    // nothing, which is the right shape for an idempotent action. The walk asserted `200` and
+    // then read a `state` field out of a body that a `204` does not have, so the "a revoked key
+    // says so" claim was being checked against a field the product never claimed to return. It is
+    // checked below, against the list an operator actually reads.
     assert_eq!(
-        revoked.body["state"].as_str(),
+        revoked.status,
+        StatusCode::NO_CONTENT,
+        "a key must be revocable: {}",
+        revoked.raw
+    );
+
+    // "A revoked key says so" — checked on the list, because that is where an operator looks
+    // and the revoke itself returned no body at all.
+    let after_revoke_list = call(
+        &state,
+        get("/api/v1/deployment-keys", &owner_token),
+    )
+    .await;
+    let revoked_row = after_revoke_list.body["keys"]
+        .as_array()
+        .expect("keys must be an array")
+        .iter()
+        .find(|entry| entry["id"] == key_id.to_string())
+        .expect("the revoked key must still be listed — a revoke is not a delete");
+    assert_eq!(
+        revoked_row["state"].as_str(),
         Some("revoked"),
-        "a revoked key says so"
+        "a revoked key says so in the list: {}",
+        after_revoke_list.raw
     );
 
     let after_revoke = call(
@@ -744,15 +930,45 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         ),
     )
     .await;
+    // A revoked key answers `401` with the SAME uniform body a wrong key does, and that is the
+    // security fix rather than a regression: the walk used to expect `410 Gone`, which told a
+    // caller that its key was REAL and had been revoked — a free oracle for enumerating valid
+    // keys, and the whole point of `DEPLOYMENT_KEY_UNUSABLE`. The lease itself was already
+    // revoked by the sweep, so the *information a caller must not get* is the key's state, and
+    // the status is where it was leaking. The `401` is correct; the assertion now holds the
+    // uniformity instead of the leak.
     assert_eq!(
         after_revoke.status,
-        StatusCode::GONE,
-        "a revoked key cannot redeem anything: {}",
+        StatusCode::UNAUTHORIZED,
+        "a revoked key must be indistinguishable from a wrong one: {}",
         after_revoke.raw
     );
     assert_eq!(
-        after_revoke.body["error"], wrong_key.body["error"],
-        "a revoked key is indistinguishable from a wrong one"
+        (after_revoke.body["error"]["code"].as_str(),
+         after_revoke.body["error"]["message"].as_str()),
+        (wrong_code, wrong_message),
+        "a revoked key and a wrong key must render the same sentence: {} vs {}",
+        after_revoke.raw,
+        wrong_key.raw
+    );
+    // The operator still learns what happened — the use log is where the distinction lives, and
+    // it never travels to the caller. The row is `action = "denied"` with the error's own `code`
+    // in `result`, which is the machine-only half of the uniform refusal: "denied /
+    // deployment_key_unavailable" says to an operator exactly which rule fired.
+    let revoked_uses: Vec<(String, String)> = sqlx::query_as(
+        "select action, coalesce(result, '') from deployment_key_uses \
+         where key_id = $1 order by created_at desc limit 10",
+    )
+    .bind(key_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("the use log must be readable");
+    assert!(
+        revoked_uses
+            .iter()
+            .any(|(action, result)| action == "denied" && result == "deployment_key_unavailable"),
+        "the refusal is recorded for the operator even though the caller learns nothing: \
+         {revoked_uses:?}"
     );
 
     // A live key cannot be deleted — only revoked. A delete on a live key would remove the row a
@@ -762,7 +978,7 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         &owner_token,
         &format!("doomed-{}", Uuid::new_v4().simple()),
         "production",
-        &["secrets.lease"],
+        &[PAYMENT_SCOPE],
         &in_hours(24),
     )
     .await;
@@ -787,7 +1003,7 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     .await;
     assert_eq!(
         delete_revoked.status,
-        StatusCode::OK,
+        StatusCode::NO_CONTENT,
         "a revoked key's record can be deleted: {}",
         delete_revoked.raw
     );
@@ -887,11 +1103,23 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         ),
     )
     .await;
+    // The refusal is `401` with the uniform sentence, not `410 Gone` — the key is unusable, and
+    // saying *why* it is unusable (revoked by a deploy) to the machine holding it is the same
+    // oracle as any other distinguishable refusal. The deploy's effect on the LEASE is asserted
+    // above, on the row's own `revoke_reason`, which is where an operator reads it.
     assert_eq!(
         denied_after_deploy.status,
-        StatusCode::GONE,
+        StatusCode::UNAUTHORIZED,
         "a lease a deploy revoked must not redeem: {}",
         denied_after_deploy.raw
+    );
+    assert_eq!(
+        (denied_after_deploy.body["error"]["code"].as_str(),
+         denied_after_deploy.body["error"]["message"].as_str()),
+        (wrong_code, wrong_message),
+        "a deploy-revoked lease renders the uniform refusal: {} vs {}",
+        denied_after_deploy.raw,
+        wrong_key.raw
     );
     assert!(
         denied_after_deploy.body["error"]["details"]["request_id"].is_string(),
@@ -929,7 +1157,7 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
         &owner_token,
         &format!("staging-{}", Uuid::new_v4().simple()),
         "staging",
-        &["secrets.lease"],
+        &[PAYMENT_SCOPE],
         &in_hours(24),
     )
     .await;
@@ -1008,8 +1236,14 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
     .await;
     assert_eq!(
         bridge_lease.status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "a read-only bridge cannot be leased: {}",
+        StatusCode::METHOD_NOT_ALLOWED,
+        "a read-only bridge cannot be leased — a lease is a write, and the route says so: {}",
+        bridge_lease.raw
+    );
+    assert_eq!(
+        bridge_lease.body["error"]["code"].as_str(),
+        Some("secret_read_only"),
+        "and the refusal names the reason rather than a generic validation failure: {}",
         bridge_lease.raw
     );
 
@@ -1068,7 +1302,7 @@ async fn leases_deployment_keys_and_deploy_revocation_are_proven_end_to_end() {
             json!({
                 "name": "not-allowed",
                 "environment": "production",
-                "scopes": ["secrets.lease"],
+                "scopes": [PAYMENT_SCOPE],
                 "expires_at": in_hours(24),
             }),
         ),

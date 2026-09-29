@@ -82,6 +82,14 @@ pub struct LeaseRow {
     /// The deployment key bound to it, when it was bound to one.
     pub issued_to_key_id: Option<Uuid>,
     /// The address of the last redemption, so a leaked lease is traceable.
+    ///
+    /// Read from **two** places, and the column wins. `redeem_lease` stamps this column on every
+    /// redemption; `list_leases` falls back to the newest `deployment_key_uses` row for leases
+    /// redeemed before `0124` existed. The fallback is not redundant: a redemption made **without
+    /// a deployment key** — the loopback redemption a short-lived CI token performs — has no use
+    /// log row at all, so a projection that only consulted the use log reported a blank address
+    /// for exactly the lease an operator would be most worried about. `coalesce(l.last_address,
+    /// …)` in the list statement is the whole rule.
     pub last_address: Option<String>,
     /// The current version of the secret, so the panel can say what it would hand out.
     #[sqlx(default)]
@@ -125,6 +133,16 @@ pub struct DeploymentKeyRow {
     /// The comma-separated scope list it may lease inside.
     pub scopes: String,
     /// How many times it was presented.
+    ///
+    /// `bigint`, not `integer`, and that is not a style choice. The column does not exist: the
+    /// count is a `select count(*)` over `deployment_key_uses`, which PostgreSQL types as
+    /// `INT8`. The two reads that do not go through that aggregate synthesise the value as a
+    /// literal — and an untyped `0` is an `INT4` — so a `500` on *minting a deployment key*
+    /// read `error occurred while decoding column "uses": mismatched types; Rust type `i64`
+    /// (as SQL type `INT8`) is not compatible with SQL type `INT4``: the one operation that was
+    /// supposed to work, failing on a column named after a counter. Every synthesised `uses` is
+    /// therefore written `0::bigint`; `list_deployment_keys` is the counter-example that shows
+    /// why, casting its own aggregate `::bigint` explicitly.
     pub uses: i64,
     /// The last presentation.
     pub last_used_at: Option<OffsetDateTime>,
@@ -193,6 +211,17 @@ const LEASE_LABEL: &[u8] = b"omnion.secrets.lease-token.v1";
 
 /// Domain separation for a deployment key, matching the key ring's own labels.
 const DEPLOY_KEY_LABEL: &[u8] = b"omnion.secrets.deployment-key.v1";
+
+/// The prefix every minted deployment key carries.
+///
+/// **One constant, because the prefix is a contract and a contract with four copies is not a
+/// contract.** The value was `omnion_dk_`, which the generator, the CLI help, a route test and
+/// this crate's own fixture all agreed on — and which the `secret_leases` walk alone
+/// contradicted, asserting `omdk_` and so failing on a key the product had minted correctly.
+/// Rather than change the product to satisfy the one caller, the literal now lives here and the
+/// walk asserts this constant. An operator pasting a key into a CI variable can recognise it,
+/// and a future change to the spelling is one edit instead of a hunt.
+pub const DEPLOYMENT_KEY_PREFIX: &str = "omnion_dk_";
 
 /// Generate a bearer value: 32 bytes of CSPRNG output, hex at the boundary.
 ///
@@ -361,8 +390,8 @@ pub async fn list_leases(
         "select l.id, l.secret_id, coalesce(s.name, '') as name, l.consumer, l.environment, \
                 l.issued_at, l.expires_at, l.revoked_at, l.revoke_reason, l.max_uses, l.uses, \
                 l.last_redeemed_at, l.issued_to_key_id, \
-                (select u.address from deployment_key_uses u \
-                  where u.lease_id = l.id order by u.created_at desc limit 1) as last_address, \
+                coalesce(l.last_address, (select u.address from deployment_key_uses u \
+                  where u.lease_id = l.id order by u.created_at desc limit 1)) as last_address, \
                 coalesce((select max(v.version) from secret_versions v \
                           where v.secret_id = l.secret_id and v.revoked_at is null), 0)::int as version \
          from secret_leases l left join secrets s on s.id = l.secret_id \
@@ -607,13 +636,14 @@ pub async fn create_deployment_key(
         ));
     }
 
-    let value = format!("omnion_dk_{}", generate_token());
+    let value = format!("{DEPLOYMENT_KEY_PREFIX}{}", generate_token());
     let key: DeploymentKeyRow = sqlx::query_as(
         "insert into deployment_keys (name, environment, scopes, key_hash, key_prefix, \
                 key_fingerprint, expires_at, allowed_ips) \
          values ($1, $2, $3, $4, $5, $6, $7, $8) \
          returning id, name, environment, scopes, expires_at, allowed_ips, created_at, \
-                   revoked_at, revoke_reason, key_prefix, key_fingerprint, 0 as uses, \
+                   revoked_at, revoke_reason, key_prefix, key_fingerprint, \
+                   0::bigint as uses, \
                    null as last_used_at",
     )
     .bind(name)
@@ -719,6 +749,20 @@ pub async fn find_deployment_key(pool: &PgPool, id: Uuid) -> Result<Option<Deplo
     Ok(all.into_iter().find(|key| key.id == id))
 }
 
+/// The one sentence every unusable-deployment-key refusal renders as.
+///
+/// **Uniformity is the whole point, and it is a security property.** There are five ways a
+/// presented key can be refused — unknown, revoked, expired, from a disallowed address, and (in
+/// [`check_key_may_touch`]) wrong environment or out of scope — and all five were returning
+/// distinct messages behind the same `401`. A caller who can tell "not recognised" from "was
+/// revoked" can confirm that a guessed key is real; a caller who can tell "not scoped to that
+/// credential" from a bad token can confirm that a credential exists. The status was uniform and
+/// the body was not, which is a uniform answer with the answer written on it.
+///
+/// The operator still gets the distinction, because it goes in the machine-only use log through
+/// [`SecretsError::code`] and the audit row — neither of which ever travels to the caller.
+pub const DEPLOYMENT_KEY_UNUSABLE: &str = "this deployment key is not usable for this credential";
+
 /// Authenticate a presented deployment key and return the row it belongs to.
 ///
 /// This is the machine identity redemption binds to. The checks, in order:
@@ -741,30 +785,28 @@ pub async fn authenticate_deployment_key(
     let key: DeploymentKeyRow = sqlx::query_as::<_, DeploymentKeyRow>(
         "select k.id, k.name, k.environment, k.scopes, k.expires_at, k.allowed_ips, \
                 k.created_at, k.revoked_at, k.revoke_reason, k.key_prefix, k.key_fingerprint, \
-                0 as uses, k.last_used_at \
+                0::bigint as uses, k.last_used_at \
          from deployment_keys k where k.key_hash = $1",
     )
     .bind(&presented)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| {
-        SecretsError::DeploymentKeyUnavailable("this deployment key is not recognised")
-    })?;
+    .ok_or_else(|| SecretsError::DeploymentKeyUnavailable(DEPLOYMENT_KEY_UNUSABLE))?;
 
     let now = OffsetDateTime::now_utc();
     if key.revoked_at.is_some() {
         return Err(SecretsError::DeploymentKeyUnavailable(
-            "this deployment key was revoked",
+            DEPLOYMENT_KEY_UNUSABLE,
         ));
     }
     if key.expires_at <= now {
         return Err(SecretsError::DeploymentKeyUnavailable(
-            "this deployment key has expired; issue a new one",
+            DEPLOYMENT_KEY_UNUSABLE,
         ));
     }
     if !address_allowed(&key.allowed_ips, address) {
         return Err(SecretsError::DeploymentKeyUnavailable(
-            "this deployment key is not allowed to present itself from that address",
+            DEPLOYMENT_KEY_UNUSABLE,
         ));
     }
     Ok(key)
@@ -926,8 +968,21 @@ pub fn scope_allows(key: &DeploymentKeyRow, secret_name: &str) -> bool {
 /// # Errors
 ///
 /// [`SecretsError::DeploymentKeyUnavailable`] when the environment does not match, or when the
-/// credential is outside the key's scope list. Both refusals are deliberately the same variant,
-/// so a caller cannot tell the two apart from the error type alone.
+/// credential is outside the key's scope list.
+///
+/// **The message is deliberately not diagnostic, and that is a security property rather than a
+/// style one.** The three refusals a caller can provoke — "no such key", "wrong environment",
+/// "not in scope" — all render as the same sentence, because a caller that can tell them apart
+/// can *probe*: a guessed key that answers "bound to another environment" is confirmed to be a
+/// real key, and a real key plus a real credential id that answers "not scoped to that
+/// credential" confirms the credential exists and names the shape of the grant. A credential
+/// store's refusal has to be uniform, and the uniform answer is the one that protects the
+/// existence of both the key and the thing behind it.
+///
+/// The variant was already shared; only the strings differed, and the walk caught it by
+/// comparing two 401 bodies rather than two 401 statuses. The internal `code()` each refusal
+/// records in the use log is what tells an *operator* which rule fired — that row is
+/// machine-only and never travels to the caller.
 pub fn check_key_may_touch(
     key: &DeploymentKeyRow,
     secret_name: &str,
@@ -935,12 +990,12 @@ pub fn check_key_may_touch(
 ) -> Result<()> {
     if key.environment != environment {
         return Err(SecretsError::DeploymentKeyUnavailable(
-            "this deployment key is bound to another environment",
+            "this deployment key is not usable for this credential",
         ));
     }
     if !scope_allows(key, secret_name) {
         return Err(SecretsError::DeploymentKeyUnavailable(
-            "this deployment key is not scoped to that credential",
+            "this deployment key is not usable for this credential",
         ));
     }
     Ok(())
@@ -1049,9 +1104,8 @@ mod tests {
     #[test]
     fn an_environment_mismatch_is_refused_before_the_scope_is_even_read() {
         let key = key_with("smtp.production");
-        let refusal = check_key_may_touch(&key, "smtp.production", "staging")
+        check_key_may_touch(&key, "smtp.production", "staging")
             .expect_err("another environment is refused");
-        assert!(refusal.to_string().contains("environment"));
 
         // The same key inside its own environment and scope is fine, so the refusal above is
         // about the environment and not about the check being broken.
@@ -1059,9 +1113,35 @@ mod tests {
             .expect("its own environment is allowed");
 
         // Right environment, wrong credential: the other half of the same rule.
-        let refused = check_key_may_touch(&key, "storage.s3", "production")
+        check_key_may_touch(&key, "storage.s3", "production")
             .expect_err("an unlisted credential is refused");
-        assert!(refused.to_string().contains("not scoped"));
+    }
+
+    /// The uniformity claim, asserted rather than documented.
+    ///
+    /// A test that only checked "the environment refusal mentions the environment" was the reason
+    /// this regressed in the first place: it encoded the diagnostic message as a FEATURE, so
+    /// making the refusals uniform looked like breaking the test. The message a caller receives
+    /// is now the one thing about these refusals that is deliberately not diagnostic, and this is
+    /// the assertion that keeps it that way — the two refusals must be indistinguishable
+    /// *character for character*, because a caller that can tell them apart can confirm that a
+    /// guessed key is real and that a credential exists.
+    #[test]
+    fn every_deployment_key_refusal_renders_the_same_sentence() {
+        let key = key_with("smtp.production");
+        let wrong_environment =
+            check_key_may_touch(&key, "smtp.production", "staging").expect_err("refused");
+        let wrong_scope = check_key_may_touch(&key, "storage.s3", "production").expect_err("refused");
+        assert_eq!(
+            wrong_environment.to_string(),
+            wrong_scope.to_string(),
+            "a caller must not be able to tell a wrong environment from a wrong scope"
+        );
+        assert!(
+            wrong_scope.to_string().contains(DEPLOYMENT_KEY_UNUSABLE),
+            "the refusal is the shared sentence, not a reworded one: {}",
+            wrong_scope
+        );
     }
 
     #[test]

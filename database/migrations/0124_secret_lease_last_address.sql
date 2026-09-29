@@ -1,0 +1,53 @@
+-- 0124_secret_lease_last_address.sql — the address a lease was last redeemed from
+--   (REQ-125, slice 3 depth).
+--
+-- ## Why this migration exists
+--
+-- `crates/secrets/src/leases.rs` has always *read* a `last_address` on `LeaseRow`, and three of
+-- the four reads synthesise it rather than touching a column: the issuing statement returns
+-- `null::text as last_address` (a fresh lease has never been redeemed), the list statement
+-- projects the most recent `deployment_key_uses.address`, and the redemption statement returns
+-- `null as last_address` for the same reason the issuer does. Only one of the four touches
+-- storage — `redeem_lease`'s `update … set last_address = $2` — and the column it names has never
+-- existed in any migration.
+--
+-- The result was a redemption that worked up to its last statement and then answered
+--
+--     error returned from database: column "last_address" of relation "secret_leases"
+--     does not exist
+--
+-- as a `secrets_database_error` 500. The first half of the walk passed — issue, never return the
+-- value, refuse a browser — and the single positive redemption, the one that proves a machine
+-- identity in scope can actually get the secret, could not pass on any run against any database.
+-- A capability whose only success path is broken is not a capability, and it survived four REQs
+-- because four REQs' gates never executed this suite's positive half.
+--
+-- ## The decision, and the obvious wrong one
+--
+-- The wrong fix is to delete `last_address = $2` from the `update`, because three of the four
+-- reads synthesise the value and the table is therefore not obviously short of it. That is worse
+-- than the bug: the list screen and the use log both get their address from
+-- `deployment_key_uses`, so a lease redeemed by a **browser-adjacent** path — a loopback
+-- redemption that has no deployment key, which is exactly what a short-lived CI token does — is
+-- invisible there, and the panel's "last redeemed from" column would be blank for the one
+-- consumer of a short lease that has no key to be traced through. A leaked short lease is
+-- precisely the leak an operator reads this column to find.
+--
+-- So the column is added, and it is the ONLY change in this file.
+--
+-- ## Additive, per docs/05-VERSIONING.md
+--
+-- `alter table … add column if not exists …` is additive: no table is rewritten and no existing
+-- row is touched. Existing leases read `null` until they are next redeemed, which is what
+-- `last_redeemed_at` also says for them — the two are always written by the same statement, so
+-- "this lease has an address" and "this lease has been redeemed" cannot disagree.
+--
+-- `text` and not `inet`: the redemption address is whatever the proxy chain presented, which
+-- behind a load balancer is a string that has already been normalised by `address_text`;
+-- refusing the write because a header held something that is not a literal address would turn a
+-- forensic column into a reason a legitimate redemption failed.
+--
+-- `if not exists` so the file is safe to re-run against a database another writer's branch has
+-- already patched, which on a seven-writer box is the normal case rather than an exception.
+alter table secret_leases
+    add column if not exists last_address text;
