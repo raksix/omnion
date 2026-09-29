@@ -257,6 +257,7 @@ pub fn router(state: AppState) -> Router {
         .merge(post(iam_provisioning::create_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_token = delete(iam_provisioning::revoke_token)
+        .merge(post(iam_provisioning::rotate_token))
         .layer(guards::require(&state, "iam.provisioning.manage"));
     let iam_provisioning_log =
         get(iam_provisioning::list_log).layer(guards::require(&state, "iam.provisioning.manage"));
