@@ -1,5 +1,62 @@
 
 
+## tick 14 — REQ-065 slice 4 part 8 · wave9
+
+**The count, as a number.** `f0246f4` made the revocation real and wrote the figure into `detail`
+as English. That reads well and is worth nothing to the platform: a number inside a sentence
+cannot be summed, filtered, sorted or rendered as a number, so the panel could only display it and
+an export had to re-parse it — and the day somebody re-words the sentence, that regex returns 0
+with no type error and no failing test. A security panel that quietly under-counts an offboarding
+is the failure this removes. `0126` adds `provisioning_log.revoked_sessions integer not null
+default 0`; five of the six write paths have nothing to report and "none" is their true value,
+whereas a null would add a third state nothing can produce.
+
+**The path that reported nothing, which is the one that mattered.** `DELETE /scim/v2/Users/{id}`
+is what a connector sends last for somebody who left. It called `set_status_and_end_sessions` and
+**discarded the `StatusChange`** — the count existed, was computed, and was thrown away, so the
+line an offboarding review most often reads was the one line it could not get a figure from. The
+PATCH path already had it; the DELETE path had the work done and dropped the answer.
+
+**`50439a0` — a fix I owed this branch.** `cargo test -p omnion-api --lib` had not compiled since
+`b2d82aa`: two assertions called `to_string()` on an `ApiError`, which implements neither
+`Display` nor `Error`. The whole lib test profile was unreachable, so both tests were *unproven*
+rather than green. One was also **wrong**: the fixture `«redacted:sk-…»` was asserted to be caught
+by `looks_like_a_credential`, and it is not a secret — it is what a scanner emits after it found
+one and removed it. A detector that refuses masked markers refuses every tool that masks its
+output, so the screen would go dark on exactly the findings worth reading. The detector was right
+(the mask is tool-decorated so it does not `starts_with("sk-")`, and it is far under the
+24-character floor); the fixture was wrong, and the masked case is now asserted to pass *through*,
+which is what the original was reaching for.
+
+**Proof.** `cargo test -p omnion-identity --lib` → **218 passed** (216 before, +2).
+`-p omnion-api --lib` → **208 passed, 0 failed** (it could not compile before `50439a0`).
+`bash scripts/qa/run-media-walk.sh iam_revocation_count` → **1 passed** (8.1s) against a
+disposable database, through the real router and the real SCIM route.
+`iam_deprovision_revocation` → **1 passed** and `scim` → **2 passed** still green.
+`bash scripts/qa/run-iam-0126.sh` → **PASS**: `0126` applied over a **populated** `provisioning_log`,
+2 pre-existing rows survived with their details intact and read 0, `-1` was refused by the
+non-negative constraint read back with `pg_get_constraintdef`, a real count survived, the index
+kept its `WHERE revoked_sessions > 0` predicate, and a second apply was refused.
+`tsc --noEmit` in `apps/admin` → exit 0.
+
+**What the walk asserts, and why the number 2.** A count of 1 is indistinguishable from a
+hard-coded 1, from a boolean rendered as a digit, and from "only the first session" — so a
+single-session walk passes any check the figure can satisfy. It creates **two** live sessions and
+asserts the reported number is 2, and separately that the page's own sum equals
+`count(*) from sessions where revoked_at is not null`: two independent sources of truth, and the
+drift between them is invisible until somebody counts by hand. The walk is red against the
+previous code with only the fix stashed, failing at "the log line must carry `revoked_sessions` at
+all" — a fact about the product, reached through the real route.
+
+**Not claimed.** The browser pass still has not run on this branch, so `0d48756`'s column and
+total are typechecked but unobserved. The live OIDC round trip against the stub IdP with a
+SCIM-provisioned subject — the one assertion `115cce4` still rests on unit tests and the dry run
+for — is still open.
+
+**Next.** The live OIDC round trip with a SCIM-provisioned subject, and the browser pass on the
+private stack (`QA_STACK=w9`, 18088/3108/3208) when the shared QA slot frees.
+
+
 ## tick 13 — REQ-065 slice 4 part 7 (`f0246f4`) — criterion 8, the clause that did not exist
 
 **The criterion was half absent, and the half that was missing had a helper sitting next to it.**
