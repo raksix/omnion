@@ -106,6 +106,7 @@ pub mod scim;
 pub mod search;
 pub mod security;
 pub mod security_headers;
+pub mod security_limiter;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -1084,6 +1085,56 @@ pub fn router(state: AppState) -> Router {
             "/security/headers",
             put(security_headers::put).layer(guards::require(&state, "security.manage")),
         )
+        // Rate limiting and sign-in protection (REQ-012, slice 3).
+        //
+        // Reading either document is `security.read` — the same read the overview already makes,
+        // and a deployment where a viewer could not see its own limits would make the screen
+        // useless to the person diagnosing a refusal. Writing is `security.manage`, the same
+        // power that dismisses a finding, because raising a limit until nothing is refused is
+        // the same act as making the refusals stop mattering.
+        //
+        // The tester is `security.read`, not `security.scan`: it changes nothing, and it is the
+        // screen an operator has open at 3am with a client being refused. Requiring a write power
+        // to *look* at why something was refused would make the screen unusable exactly when it
+        // is needed.
+        .route(
+            "/security/rate-limits",
+            get(security_limiter::get_rate_limits)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    put(security_limiter::put_rate_limits)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
+        .route(
+            "/security/rate-limits/test",
+            post(security_limiter::test_rate_limit)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/sign-in-protection",
+            get(security_limiter::get_sign_in_protection)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    put(security_limiter::put_sign_in_protection)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
+        .route(
+            "/security/sign-in-protection/probe",
+            post(security_limiter::probe_lockout)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/locked-accounts",
+            get(security_limiter::get_locked_accounts)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/locked-accounts/{user_id}/unlock",
+            post(security_limiter::unlock)
+                .layer(guards::require(&state, "security.manage")),
+        )
         .route(
             "/security/findings/{id}",
             get(security::get)
@@ -1504,10 +1555,33 @@ pub fn router(state: AppState) -> Router {
     // unreachable at boot still serves headers rather than serving none.
     let header_layer = crate::headers_middleware::install(omnion_security::HeaderPolicy::default());
 
+    // The rate limiter (REQ-012, slice 3) holds its document in the same process-wide cell the
+    // headers do, and for the same reason: read once, not per request, so a request's cost never
+    // depends on the database; `security_limiter::put_rate_limits` then replaces the numbers in
+    // place, so a save applies to the next request rather than after the next restart.
+    //
+    // `main.rs` reads the stored document before building the router and installs it; a router
+    // built without one (the in-process test harnesses) falls back to the shipped defaults rather
+    // than to no limiter at all, which is the failure mode this whole layer exists to remove.
+    let limiter_layer = crate::rate_limit_middleware::ensure_installed(&state);
+
     Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(readyz::readyz))
         .nest("/api/v1", v1)
+        // The limiter is the OUTERMOST layer, ahead of CSRF and ahead of every permission guard,
+        // and the order is the design rather than an accident of where the line falls in the chain:
+        //
+        // * A limiter behind the guards would cap only callers who already hold a permission, which
+        //   leaves an anonymous spray against `POST /auth/login` uncapped — the one path worth
+        //   capping, and the only one an attacker can reach without an account.
+        // * Ahead of CSRF, because a cookie-less mutation is still a request somebody is sending and
+        //   it must spend budget whether or not it would have been refused anyway.
+        //
+        // `/healthz` and `/readyz` are inside it too, which is deliberate and cheap: they are two
+        // `GET`s a probe makes every few seconds, counted against a budget of 600 a minute, and a
+        // probe that trips the limiter is a probe that reports the platform down.
+        .layer(crate::rate_limit_middleware::rate_limit(limiter_layer.clone()))
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually

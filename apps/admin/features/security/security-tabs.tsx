@@ -10,10 +10,14 @@
  *
  * Two rules shape it:
  *
- * 1. **The strip lists the screens that exist, never the ones planned.** `rate-limits`,
- *    `sign-in-protection`, `ip-access` and `events` are slices 3 and 4; a tab that leads to
- *    "coming soon" is the dead control the definition of done forbids, so they are not here
- *    until they are. The tab count is therefore a claim the section can back.
+ * 1. **The strip lists the screens that exist, never the ones planned.** `ip-access` and
+ *    `events` are slice 4; a tab that leads to "coming soon" is the dead control the
+ *    definition of done forbids, so they are not here until they are. The tab count is
+ *    therefore a claim the section can back. Slice 3 added `rate-limits` and
+ *    `sign-in-protection` to the list, and it is worth naming *why* the rule held in the other
+ *    direction too: the limiter's screen is reachable from the overview only once its route
+ *    exists, so adding the tab and the screen in the same slice is what keeps the strip
+ *    truthful. A tab added a commit before its screen would have been a lie for that commit.
  * 2. **The current tab is marked, not merely styled.** `aria-current="page"` is what a screen
  *    reader announces and what the walkthrough asserts against, so "which am I on" is never a
  *    question about a colour.
@@ -25,6 +29,8 @@ const TABS = [
   { href: "/security", label: "Posture", key: "overview" },
   { href: "/security/findings", label: "Findings", key: "findings" },
   { href: "/security/headers", label: "Headers", key: "headers" },
+  { href: "/security/rate-limits", label: "Rate limits", key: "rate-limits" },
+  { href: "/security/sign-in-protection", label: "Sign-in protection", key: "sign-in-protection" },
 ] as const;
 
 export type SecurityTabKey = (typeof TABS)[number]["key"];
