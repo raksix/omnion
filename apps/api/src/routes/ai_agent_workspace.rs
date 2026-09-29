@@ -37,7 +37,7 @@ use omnion_ai_hub::workspace::{self, AgentFile, MAX_FILE_BYTES, NewAgentFile, Us
 use omnion_audit::NewAuditEntry;
 use serde::Serialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
@@ -63,9 +63,11 @@ pub struct FileView {
     /// The run that wrote it, if it was written by one.
     pub run_id: Option<Uuid>,
     /// When it was added.
-    pub created_at: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
     /// When a run last named it.
-    pub last_used_at: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_used_at: Option<OffsetDateTime>,
 }
 
 impl FileView {
@@ -78,10 +80,8 @@ impl FileView {
             content_type: file.content_type.clone(),
             checksum: file.checksum.clone(),
             run_id: file.run_id,
-            created_at: file.created_at.to_offset_date_time().to_string(),
-            last_used_at: file
-                .last_used_at
-                .map(|at| at.to_offset_date_time().to_string()),
+            created_at: file.created_at,
+            last_used_at: file.last_used_at,
         }
     }
 }
@@ -180,7 +180,10 @@ pub async fn upload_agent_file(
     let usage = workspace::usage(state.db().pool(), agent.id).await?;
     workspace::check_caps(&usage, upload.bytes.len() as u64, replacing)?;
 
-    let checksum = hex_sha256(&upload.bytes);
+    // The digest is computed by the crate, next to the key derivation that consumes it. A
+    // route that computed its own would be a second implementation of the pair, and the one
+    // that matters is the one nobody would think to update.
+    let checksum = workspace::checksum_of(&upload.bytes);
     let storage_key = workspace::storage_key(agent.id, &checksum);
 
     // Bytes first, row second — with the object dropped again if the row cannot be written. The
@@ -391,24 +394,6 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
 }
 
-/// Hex SHA-256 of the bytes.
-///
-/// The workspace's own checksum, computed over the *stored* bytes rather than trusting a
-/// header: the checksum is what makes a re-upload reuse the same object key, and a client that
-/// could name the key would be able to address another file's bytes.
-fn hex_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .fold(String::with_capacity(64), |mut acc, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{byte:02x}");
-            acc
-        })
-}
-
 /// Read the `file` and `path` parts of the upload.
 ///
 /// A body larger than the per-file cap is refused by the *cap check* rather than by a read
@@ -539,24 +524,5 @@ mod tests {
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("a%zzb"), "a%zzb");
         assert_eq!(percent_decode("trailing%2"), "trailing%2");
-    }
-
-    #[test]
-    fn the_checksum_is_the_sha256_of_the_bytes() {
-        // The empty string's digest, so the key derivation is pinned against a wrong algorithm
-        // rather than against a hand-computed value that is easy to get wrong.
-        assert_eq!(
-            hex_sha256(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(hex_sha256(b"abc").len(), 64);
-    }
-
-    #[test]
-    fn two_different_files_do_not_share_a_key() {
-        let agent = Uuid::new_v4();
-        let one = workspace::storage_key(agent, &hex_sha256(b"one"));
-        let two = workspace::storage_key(agent, &hex_sha256(b"two"));
-        assert_ne!(one, two);
     }
 }

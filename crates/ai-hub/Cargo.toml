@@ -11,6 +11,11 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 time.workspace = true
+# The workspace derives an object's storage key from the SHA-256 of the bytes it stored, so
+# the digest has to be computed *here* rather than in the route: a client that could name the
+# key would be able to address another file's bytes. `omnion-storage` has the same dependency
+# for its own checksum column, so this is not a new edge in the tree.
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }

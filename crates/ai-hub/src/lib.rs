@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod agent_sdk;
 pub mod catalog;
 pub mod client;
 pub mod connection_test;
@@ -57,6 +58,7 @@ pub use loop_engine::{
     Persist, RequestedCall, RunOptions, Runtime, SINK_CAPACITY, ScriptedModel, Sink,
     run as run_agent, run_with as run_agent_with,
 };
+pub use agent_sdk::{AgentSdk, AgentSdkBuilder};
 pub use tools::{
     AllowList, DenyReason, Execution, FnTool, Tool, ToolOutcome, ToolRegistry, ToolSummary,
     decide as decide_tool_call, event_for as tool_event,
