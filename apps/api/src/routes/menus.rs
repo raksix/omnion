@@ -420,7 +420,7 @@ pub async fn create_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": menu.id, "action": "created", "site_id": site.id }),
-    );
+    ).await;
 
     Ok((StatusCode::CREATED, Json(menu_body(&menu, 0))))
 }
@@ -453,7 +453,7 @@ pub async fn update_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "updated", "site_id": menu.site_id }),
-    );
+    ).await;
 
     let items = omnion_content::list_items(state.db().pool(), id).await?;
     Ok(Json(menu_body(&updated, items.len())))
@@ -486,7 +486,7 @@ pub async fn save_menu_items(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "items_saved", "items": items.len() }),
-    );
+    ).await;
 
     Ok(Json(MenuDetailBody {
         menu: menu_body(&saved, items.len()),
@@ -613,7 +613,7 @@ pub async fn add_pages_to_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "pages_added", "count": published.len() }),
-    );
+    ).await;
 
     Ok(Json(MenuDetailBody {
         menu: menu_body(&saved, items.len()),
@@ -648,7 +648,7 @@ pub async fn delete_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "deleted", "site_id": menu.site_id }),
-    );
+    ).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -788,7 +788,7 @@ pub async fn schedule_page(
             "action": entry.action,
             "scheduled_at": entry.scheduled_at,
         }),
-    );
+    ).await;
 
     Ok((StatusCode::CREATED, Json(QueueEntryBody::from(&entry))))
 }
@@ -812,7 +812,7 @@ pub async fn reschedule_entry(
         &state,
         "content.page.scheduled",
         json!({ "page_id": entry.page_id, "entry_id": entry.id, "action": "rescheduled" }),
-    );
+    ).await;
     Ok(Json(QueueEntryBody::from(&entry)))
 }
 
@@ -828,7 +828,7 @@ pub async fn cancel_entry(
         &state,
         "content.page.schedule_cancelled",
         json!({ "page_id": entry.page_id, "entry_id": entry.id, "action": entry.action }),
-    );
+    ).await;
     Ok(Json(QueueEntryBody::from(&entry)))
 }
 
