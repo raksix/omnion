@@ -948,6 +948,25 @@ pub async fn public_submit(
         .with_details(json!({ "errors": outcome.errors })));
     }
 
+    // The OTHER refusal a visitor is told about, and the reason it is not folded into the one
+    // above. The spam verdicts — a filled honeypot, a form finished in under a second — answer
+    // 202 with `stored: false`, because naming the protection that fired hands a bot a map of
+    // what to vary. A rate limit is not a verdict about the sender, it is a fact about the
+    // window: the same person retrying in five minutes is stored normally, and the only honest
+    // way to say that is a 429 carrying the seconds that have to pass. So a visitor over the
+    // limit learns that they are over the limit and when to come back, while a bot probing the
+    // threshold still gets nothing from the honeypot, the floor or this number beyond the one
+    // bit it could already measure by counting.
+    if outcome.refused == Some("form_rate_limited") {
+        let wait = outcome.retry_after().unwrap_or(1);
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "form_rate_limited",
+            "this form has received too many messages from you; try again shortly",
+        )
+        .with_retry_after(wait));
+    }
+
     if let Some(stored) = &outcome.submission {
         // The event the REQ names as contract: `content.form.submitted`. An automation, a CRM or
         // a webhook can subscribe without the module knowing any of them exist.
