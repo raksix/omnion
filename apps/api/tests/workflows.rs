@@ -1518,3 +1518,92 @@ async fn the_graph_store_reads_a_column_the_workflows_table_actually_has() {
         Err(err) => panic!("find_graph named a column the workflows table does not have: {err}"),
     }
 }
+
+/// A rule created through the UI must open in the builder on a graph the server will accept.
+///
+/// The column default for `workflows.graph` is `{"nodes":[],"edges":[]}`, so a rule created
+/// after 0051 — every rule, since the backfill only covered the ones that existed — inherited
+/// an empty graph. The builder opened on a blank canvas and refused the first save with
+/// `graph_invalid` ("the graph has no nodes, a definition needs at least a trigger"), on a rule
+/// the author had just created through that same screen. The insert is what makes the row born
+/// valid, so the insert is where the proof belongs: a real insert, then the real validator.
+#[tokio::test]
+async fn a_new_rule_is_born_with_a_graph_the_server_will_save() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = login(&fixture.state, &fixture.operator_email).await;
+
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&token),
+            Some(json!({
+                "name": "Born with a valid graph",
+                "organization_id": fixture.organization_a,
+                "trigger": { "kind": "event", "event": "page.published" },
+                "steps": [ { "name": "prepare", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "create refused: {}", created.body);
+    let workflow_id = created.body["id"].as_str().expect("a created rule has an id").to_owned();
+
+    // The row the insert actually wrote.
+    let stored: Value = sqlx::query_as::<_, (Value, i32)>(
+        "select graph, graph_version from workflows where id = $1::uuid",
+    )
+    .bind(Uuid::parse_str(&workflow_id).expect("an id parses"))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the row is readable")
+    .0;
+    let graph = stored;
+    let node_count = graph["nodes"].as_array().map_or(0, Vec::len);
+    assert!(node_count > 0, "a new rule was born with no graph nodes: {graph}");
+
+    // The version the panel would be holding: it opens the graph, then saves what it read.
+    let read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK, "reading a new rule's graph: {}", read.body);
+    let current_version = read.body["graph_version"].clone();
+
+    // And the server agrees: the graph it just wrote must validate, or the first save is a
+    // refusal the author cannot do anything about.
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            // The write envelope, not the bare graph: `graph_version` is what the server
+            // compares, and a PUT without it is a refusal about the request, not the graph.
+            Some(json!({ "graph": graph, "graph_version": current_version })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "the graph a new rule is born with cannot be saved: {graph} -> {}",
+        saved.body
+    );
+    assert_eq!(
+        saved.body["projection"]["valid"],
+        Value::Bool(true),
+        "the graph a new rule is born with does not validate: {graph}"
+    );
+
+    fixture.cleanup().await;
+}
