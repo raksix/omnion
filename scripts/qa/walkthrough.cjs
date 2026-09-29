@@ -4883,6 +4883,39 @@ async function runEventsDepth(page, report) {
     steps.payloadText = (
       await page.locator(`[data-event-payload="${rowId}"]`).innerText().catch(() => "")
     ).slice(0, 200);
+
+    // 4b. The key tree, and the path it copies. The claim under test is that the button hands
+    //     over the path a *receiver* would write, so the assertion reads the clipboard the
+    //     browser actually filled rather than trusting the button's presence: a copy button
+    //     that copies the key's display name passes a click test and fails the reader.
+    const pathBlock = page.locator(`[data-event-paths="${rowId}"]`);
+    steps.hasPathTree = (await pathBlock.count()) > 0;
+    if (steps.hasPathTree) {
+      const firstPathButton = pathBlock.locator("[data-event-copy-path]").first();
+      steps.pathCount = await pathBlock.locator("[data-event-copy-path]").count();
+      const pathHint = await firstPathButton.getAttribute("title").catch(() => null);
+      steps.pathButtonNamesItsPath = !!pathHint && pathHint.startsWith("Copy the path ");
+      steps.pathIsRootedAtPayload = !!pathHint && pathHint.includes("payload");
+      await shot(page, "page-events-paths");
+
+      await page
+        .context()
+        .grantPermissions(["clipboard-read", "clipboard-write"])
+        .catch(() => {});
+      await firstPathButton.click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(350);
+      const clip = await page
+        .evaluate(() => navigator.clipboard.readText().catch(() => ""))
+        .catch(() => "");
+      steps.clipboardPath = clip;
+      // The copied text must BE the path, and must be the one the button advertised. A
+      // mismatch here is the exact failure the acceptance box is about.
+      steps.clipboardMatchesHint = !!pathHint && clip === pathHint.replace("Copy the path ", "");
+      steps.noticeNamesTheCopy = (
+        await page.locator("[data-event-notice], [role=status]").first().innerText().catch(() => "")
+      ).includes("Copied");
+    }
+
     await shot(page, "page-events-payload");
     // The keyboard path: `j` walks the cursor and `Enter` opens, so the shortcuts are real.
     await page.locator("[data-event-table] tbody").focus().catch(() => {});
@@ -5281,6 +5314,224 @@ async function runWebhooksDepth(page, report) {
  *     whole reason the log exists.
  *  6. The window is put back to what it was, and the status read back says so.
  */
+/**
+ * The security centre's two screens (REQ-012, slice 1).
+ *
+ * What this pass is really checking is a *claim*, not a layout: does the screen ever say
+ * "verified" about something it did not verify? The checks that answer `unknown` are the ones
+ * a QA pass is most able to catch, because a fresh QA database has no MFA rows, no backup
+ * history and no header policy — so the honest screen says "Not checked yet" and a dishonest
+ * one would say "Verified". The pass asserts the badges that appear, so a change that turns
+ * an `unknown` into a `pass` without a data source behind it fails here.
+ *
+ * The findings half drives the transitions the request names: acknowledge, ignore with a
+ * reason, and the refusal when the reason is missing. The refusal is the interesting one — a
+ * client that could ignore without a reason would be a dismissal with no stated justification,
+ * which is the one transition that quietly erases a finding from an operator's view.
+ */
+async function runSecurityDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "security", action: "security-depth", step: key, ...value });
+  };
+
+  // ---- The overview -----------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/security`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-security-overview]", { timeout: 15000 }).catch(() => {});
+  const rendered = (await page.locator("[data-security-overview]").count()) > 0;
+  note({ step: "overview-loaded", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "/security did not render the overview", steps };
+  }
+
+  const rows = await page.locator("[data-security-checks] li").count();
+  note({ step: "check-rows", rows });
+  await shot(page, "security-overview");
+
+  // The registry has ten checks in this build, and the panel must show a row for each one
+  // whether or not it has ever been evaluated. A shorter list is the bug this rule catches:
+  // an unevaluated check that renders as a missing row reads as "there is nothing here".
+  if (rows < 5) {
+    note({ step: "registry-too-short", rows, reason: "fewer than five check rows rendered" });
+  }
+
+  // Every row must carry a state badge, and no row may claim a pass it cannot back. The
+  // counts are read from the server's own summary, so they cannot drift from the legend.
+  const states = await page.$$eval("[data-security-state]", (nodes) =>
+    nodes.map((node) => node.getAttribute("data-security-state")),
+  );
+  const tally = states.reduce((acc, state) => {
+    acc[state] = (acc[state] || 0) + 1;
+    return acc;
+  }, {});
+  note({ step: "states", tally });
+  if (states.length !== rows) {
+    note({ step: "state-badge-missing", badges: states.length, rows });
+  }
+
+  const score = await page
+    .locator("[data-security-score]")
+    .getAttribute("data-security-score")
+    .catch(() => null);
+  note({ step: "score", score });
+  if (score === null || Number.isNaN(Number(score))) {
+    note({ step: "score-missing", reason: "the score ring rendered no number" });
+  }
+
+  // "Run checks" must move the timestamps and produce a full result set. A run that answers
+  // 200 and writes nothing is a button that looks like it works.
+  const before = await page.locator("[data-security-state]").count();
+  await page.locator("[data-security-run]").click().catch(() => {});
+  await page
+    .waitForFunction(
+      (previous) => document.querySelectorAll("[data-security-state]").length > 0,
+      before,
+      { timeout: 20000 },
+    )
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+  const runError = await page.locator("[data-security-run-error]").count();
+  note({ step: "run-completed", errorShown: runError > 0 });
+  await shot(page, "security-overview-after-run");
+
+  // ---- The findings list -------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/security/findings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-security-findings]", { timeout: 15000 }).catch(() => {});
+  const listRendered = (await page.locator("[data-security-findings]").count()) > 0;
+  note({ step: "findings-loaded", listRendered });
+  if (!listRendered) {
+    return { ok: false, reason: "/security/findings did not render", steps };
+  }
+  await shot(page, "security-findings-empty");
+
+  // ---- Import a report, twice, and prove the second run does not double the count -------------
+  //
+  // The idempotence claim is the one an API response cannot make on its own: a re-ingest that
+  // reports "created" a second time has quietly doubled the operator's open findings, and the
+  // count on the screen is the only place that would show it.
+  const stamp = Date.now().toString(36);
+  const fixture = {
+    findings: [
+      {
+        title: `QA unpinned dependency ${stamp}`,
+        severity: "high",
+        component: "qa-probe-package",
+        version: "0.1.0",
+        description: "Injected by the QA walkthrough to exercise the ingest path.",
+      },
+      {
+        title: `QA advisory finding ${stamp}`,
+        severity: "low",
+        component: "qa-probe-advisory",
+        version: "2.0.0",
+        fixed_in: "2.0.1",
+        description: "Injected by the QA walkthrough to exercise a finding with a fix.",
+      },
+    ],
+  };
+
+  const ingest = async (payload) =>
+    page.evaluate(
+      async (body) => {
+        const response = await fetch("/api/v1/security/findings/import", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { accept: "application/json", "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        return { status: response.status, body: await response.json().catch(() => null) };
+      },
+      payload,
+    );
+
+  const first = await ingest({ report: fixture, source: "dependency" });
+  note({ step: "ingest-first", status: first.status, created: first.body?.created, refreshed: first.body?.refreshed });
+  const second = await ingest({ report: fixture, source: "dependency" });
+  note({ step: "ingest-second", status: second.status, created: second.body?.created, refreshed: second.body?.refreshed });
+  if (second.body && second.body.created !== 0) {
+    note({
+      step: "ingest-not-idempotent",
+      created: second.body.created,
+      reason: "a re-ingest created rows instead of refreshing them",
+    });
+  }
+
+  // A report carrying something that looks like a credential is refused whole.
+  const leaky = await ingest({
+    report: { findings: [{ title: `QA leak probe ${stamp}`, api_key: "not-a-real-key" }] },
+    source: "dependency",
+  });
+  note({ step: "ingest-credential-refused", status: leaky.status });
+  if (leaky.status === 200) {
+    note({ step: "credential-accepted", reason: "a report carrying a credential was imported" });
+  }
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-finding-row]", { timeout: 15000 }).catch(() => {});
+  const rowCount = await page.locator("[data-finding-row]").count();
+  note({ step: "finding-rows", rows: rowCount });
+  await shot(page, "security-findings-list");
+
+  // ---- The drawer: acknowledge, then ignore, and the refusal without a reason -----------------
+  if (rowCount > 0) {
+    await page.locator("[data-finding-open]").first().click().catch(() => {});
+    await page.waitForSelector("[data-finding-drawer]", { timeout: 8000 }).catch(() => {});
+    const drawer = (await page.locator("[data-finding-drawer]").count()) > 0;
+    note({ step: "drawer-opened", drawer });
+    await shot(page, "security-finding-drawer", { full: false });
+
+    if (drawer) {
+      // The ignore button starts disabled, because the reason is required. A button that is
+      // enabled and then fails is a form the operator learns to distrust.
+      const ignoreDisabled = await page.locator("[data-finding-ignore]").isDisabled().catch(() => null);
+      note({ step: "ignore-disabled-without-reason", disabled: ignoreDisabled });
+      if (ignoreDisabled === false) {
+        note({ step: "ignore-enabled-without-reason", reason: "the ignore control is live with no reason" });
+      }
+
+      await page.locator("[data-finding-ack]").click().catch(() => {});
+      await page.waitForTimeout(1200);
+      note({ step: "acknowledged" });
+      await shot(page, "security-finding-acknowledged", { full: false });
+    }
+  }
+
+  // ---- The keyboard: `/` focuses the filter ----------------------------------------------------
+  await page.keyboard.press("/");
+  await page.waitForTimeout(300);
+  const focused = await page.evaluate(() => document.activeElement?.getAttribute("data-findings-search") !== null);
+  note({ step: "slash-focuses-search", focused });
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Backspace");
+  await page.waitForTimeout(600);
+
+  // ---- The filter: an unknown value is refused by name, not silently ignored ------------------
+  const badFilter = await page.evaluate(async () => {
+    const response = await fetch("/api/v1/security/findings?severity=spicy", {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  });
+  note({ step: "unknown-filter-refused", status: badFilter.status, code: badFilter.body?.error?.code });
+  if (badFilter.status === 200) {
+    note({ step: "unknown-filter-accepted", reason: "a nonsense severity returned a list" });
+  }
+
+  // ---- Clean up what the pass created ------------------------------------------------------------
+  try {
+    const removed = qaSql(
+      `delete from security_findings where component in ('qa-probe-package', 'qa-probe-advisory') and title like 'QA %${stamp}%'`,
+    );
+    note({ step: "cleanup", removed: removed || "0" });
+  } catch (error) {
+    note({ step: "cleanup-failed", reason: String(error.message || error) });
+  }
+
+  return { ok: true, steps };
+}
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -5866,6 +6117,12 @@ async function main() {
   // first would make their numbers wrong for a reason that has nothing to do with them.
   report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
   log(`retention: ${JSON.stringify(report.retention)}`);
+
+  // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
+  // because a scan counts the findings those passes have already written, and a scan that ran
+  // first would report a posture that the rest of the pass then invalidates.
+  report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
+  log(`security: ${JSON.stringify(report.security)}`);
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather

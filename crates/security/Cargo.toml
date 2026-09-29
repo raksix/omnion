@@ -1,0 +1,21 @@
+[package]
+name = "omnion-security"
+description = "Omnion security centre: posture checks, findings and their lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+hex.workspace = true
+# The CSRF token is an HMAC over the session id (REQ-012, slice 2): derived rather than stored,
+# so there is no table to rotate and nothing to leak from a dump.
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
