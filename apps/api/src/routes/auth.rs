@@ -174,11 +174,15 @@ pub async fn logout(
 
     let secure = !state.config().env.is_development();
     let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().insert(
-        SET_COOKIE,
-        HeaderValue::from_str(&cookies::cleared_session_cookie(secure))
-            .expect("cleared cookie is valid header text"),
-    );
+    // Both cookies go, not just the session one: the CSRF token is derived from the session id,
+    // so leaving it behind would leave a value the next sign-in overwrites and nothing in
+    // between can use.
+    for cookie in cookies::signout_cookies(secure) {
+        response.headers_mut().append(
+            SET_COOKIE,
+            HeaderValue::from_str(&cookie).expect("cleared cookie is valid header text"),
+        );
+    }
     Ok(response)
 }
 
@@ -266,11 +270,21 @@ pub(crate) async fn start_session_with_body<T: Serialize>(
 
     let secure = !state.config().env.is_development();
     let cookie = cookies::session_cookie(&token, sessions::SESSION_TTL_SECONDS, secure);
+    // The token the CSRF layer will ask for. Issued here, in the same response as the session,
+    // because a browser that has a session but no token cannot change anything — and a 403 on
+    // every save is a far worse first sign-in than a header nobody reads.
+    let csrf = cookies::csrf_cookie_for(&session.id, state.config().csrf.as_bytes(), secure);
 
     let mut response = Json(body).into_response();
     response.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("session cookie is valid header text"),
     );
+    if let Some(csrf) = csrf {
+        response.headers_mut().append(
+            SET_COOKIE,
+            HeaderValue::from_str(&csrf).expect("CSRF cookie is valid header text"),
+        );
+    }
     Ok(response)
 }

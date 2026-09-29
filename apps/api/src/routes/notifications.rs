@@ -950,4 +950,216 @@ mod tests {
         assert!(query.before.is_none());
         assert!(query.unread.is_none());
     }
+
+    // -----------------------------------------------------------------------------------------
+    // The query-string parser
+    //
+    // These exist because of a real 400: `Query<Vec<String>>` under axum 0.8 refuses both
+    // `?category=approval` and `?category=approval&category=ticket`, so the whole category
+    // filter was broken and every assertion below would have passed against a parser that
+    // silently returned an empty list.
+    // -----------------------------------------------------------------------------------------
+
+    fn parse(raw: &str) -> Result<ListParams, ApiError> {
+        parse_list_params(Some(raw))
+    }
+
+    #[test]
+    fn one_category_is_one_category() {
+        // The exact case the QA pass caught as a 400 against a perfectly legal value.
+        let params = parse("category=approval").expect("valid");
+        assert_eq!(params.category, ["approval"]);
+    }
+
+    #[test]
+    fn a_repeated_category_accumulates_rather_than_replacing() {
+        let params = parse("category=approval&category=ticket").expect("valid");
+        assert_eq!(params.category, ["approval", "ticket"]);
+    }
+
+    #[test]
+    fn a_category_and_a_priority_travel_together() {
+        let params =
+            parse("category=approval&priority=high&category=ticket&limit=25").expect("valid");
+        assert_eq!(params.category, ["approval", "ticket"]);
+        assert_eq!(params.priority, ["high"]);
+        assert_eq!(params.limit, Some(25));
+        // And they survive into the store query — the parser is not a second, looser filter.
+        let query = build_query(params).expect("valid");
+        assert_eq!(query.categories, ["approval", "ticket"]);
+        assert_eq!(query.priorities, ["high"]);
+    }
+
+    #[test]
+    fn a_percent_encoded_value_is_decoded() {
+        // The panel's own links put the category in the query string, so a category that ever
+        // needs escaping must not arrive at the store as its encoded form.
+        let params = parse("before=2026-09-28T10%3A00%3A00Z").expect("valid");
+        assert_eq!(params.before.as_deref(), Some("2026-09-28T10:00:00Z"));
+    }
+
+    #[test]
+    fn a_plus_is_a_space() {
+        assert_eq!(decode("a+b"), "a b");
+    }
+
+    #[test]
+    fn a_bare_flag_is_on_and_an_explicit_zero_is_off() {
+        // The two shapes a checkbox produces: a ticked one sends `archived=1`, a cleared one
+        // sends nothing. `?archived=0` has to mean off, or "show me everything including the
+        // archived rows" cannot be asked for.
+        assert!(parse("archived=1").expect("valid").archived);
+        assert!(parse("archived").expect("valid").archived);
+        assert!(!parse("archived=0").expect("valid").archived);
+        assert!(!parse("archived=false").expect("valid").archived);
+        // `Some(false)` and not `false`, because the parameter being *absent* has to survive
+        // as a third state. `with_read=off` is the reader who asked for the inbox; a client
+        // that never mentioned `with_read` asked for everything, and the two are not the same
+        // question.
+        assert_eq!(
+            parse("with_read=off").expect("valid").with_read,
+            Some(false)
+        );
+        assert_eq!(parse("with_read=1").expect("valid").with_read, Some(true));
+    }
+
+    #[test]
+    fn an_absent_with_read_and_an_explicit_off_are_different_questions() {
+        // This is the assertion the defect did not have. The bare list used to be unread-only
+        // because a `bool` defaulting to `false` cannot tell "the client said nothing" from
+        // "the client said no" — and the walkthrough found it by marking its own three rows
+        // read and then reporting an empty list to drive the keyboard on. Assert the parse
+        // AND the built query, because a parse that keeps the two apart and a builder that
+        // throws the distinction away are two different bugs and only the pair is the fix.
+        assert_eq!(parse("").expect("valid").with_read, None);
+        assert_eq!(parse("category=approval").expect("valid").with_read, None);
+        let bare = build_query(parse("").expect("valid")).expect("valid");
+        assert!(bare.include_read, "no filter must mean read and unread");
+        let inbox = build_query(parse("with_read=0").expect("valid")).expect("valid");
+        assert!(!inbox.include_read, "with_read=0 must mean unread only");
+    }
+
+    #[test]
+    fn an_unknown_parameter_is_ignored_rather_than_refused() {
+        // A client that adds a filter this build does not know should still get its list. The
+        // refusal is reserved for a *malformed* pair, not an unrecognised name.
+        let params = parse("category=approval&sort=newest").expect("valid");
+        assert_eq!(params.category, ["approval"]);
+    }
+
+    #[test]
+    fn a_valueless_non_flag_key_is_ignored_rather_than_refused() {
+        // `?category` with no value is a client that meant to filter and gave up halfway.
+        // Refusing it would be defensible; ignoring it is friendlier and cannot make the list
+        // wrong, because an empty category matches nothing and an absent one matches
+        // everything — so the honest answer is the unfiltered list plus no error banner.
+        let params = parse("category").expect("not an error");
+        assert!(params.category.is_empty());
+    }
+
+    #[test]
+    fn a_non_numeric_limit_is_a_bad_request_naming_the_field() {
+        let error = parse("limit=lots").expect_err("not a number");
+        assert!(error.message().contains("limit="));
+    }
+
+    #[test]
+    fn an_absent_query_string_is_an_empty_parameter_set() {
+        let params = parse_list_params(None).expect("valid");
+        assert!(params.category.is_empty());
+        assert!(params.limit.is_none());
+    }
+
+    #[test]
+    fn an_empty_query_string_is_the_same_as_none() {
+        let params = parse("").expect("valid");
+        assert!(params.category.is_empty());
+        assert!(!params.archived);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Slice 2: the preferences body
+    // -----------------------------------------------------------------------------------------
+
+    fn settings_json(extra: &str) -> String {
+        format!("{{\"quiet_hours_start\":null,\"quiet_hours_end\":null,{extra}}}")
+    }
+
+    #[test]
+    fn a_settings_body_without_the_optional_fields_still_parses() {
+        // Only quiet hours are mandatory in the sense of "may be null"; everything else has a
+        // default, so a client that sends `{}` gets the platform defaults rather than a 400.
+        let body: SettingsBody = serde_json::from_str("{}").expect("defaults");
+        assert_eq!(body.timezone, "UTC");
+        assert_eq!(body.digest_cadence, "off");
+        assert_eq!(body.digest_hour, 8);
+        assert!(body.quiet_hours_start.is_none());
+    }
+
+    #[test]
+    fn a_weekly_digest_survives_the_round_trip_through_the_body() {
+        // The two conversions (body → store row, store row → body) are written separately and
+        // a field added to one and not the other is invisible until a reader sets it. This
+        // asserts the whole row survives, not just the two fields that matter today.
+        let original = Settings {
+            user_id: Uuid::nil(),
+            quiet_hours_start: Some("22:00".to_owned()),
+            quiet_hours_end: Some("07:00".to_owned()),
+            timezone: "Europe/Istanbul".to_owned(),
+            digest_cadence: "weekly".to_owned(),
+            digest_weekday: Some(3),
+            digest_hour: 17,
+        };
+        let round_tripped = SettingsBody::from(original.clone()).to_settings(Uuid::nil());
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn a_mistyped_field_is_refused_rather_than_silently_dropped() {
+        // serde ignores unknown fields by default, so without `deny_unknown_fields` this is a
+        // `200` that saved nothing — and the reader's report is "the setting does not work".
+        // One `s` of difference is the whole bug.
+        assert!(
+            serde_json::from_str::<SettingsBody>(&settings_json("\"quiet_hour_start\":\"22:00\""))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_owners_id_comes_from_the_session_and_never_from_the_body() {
+        // The body has no `user_id` field at all, so there is nothing to spoof. The assertion
+        // is the refusal: a client that adds one is rejected by serde rather than silently
+        // ignored, because a silently-ignored owner field is a field somebody will rely on.
+        assert!(
+            serde_json::from_str::<SettingsBody>(&settings_json("\"user_id\":\"x\"")).is_err(),
+            "the settings body must not accept an owner"
+        );
+    }
+
+    #[test]
+    fn a_put_without_a_settings_block_is_refused_rather_than_wiping_the_row() {
+        // This is the reason `settings` is a required field: a body carrying only cells must
+        // not be read as "clear my quiet hours", because the reader cannot tell the difference
+        // between that and a save that forgot them.
+        let result: Result<PutPreferencesBody, _> = serde_json::from_str("{\"cells\":[]}");
+        assert!(
+            result.is_err(),
+            "settings is required so a partial save cannot wipe the row"
+        );
+    }
+
+    #[test]
+    fn a_put_with_no_cells_still_saves_the_settings_row() {
+        // Turning one channel back on and leaving every cell alone is a legitimate save, and it
+        // must not be refused for carrying no cells.
+        let body: PutPreferencesBody = serde_json::from_str(&format!(
+            "{{\"cells\":[],\"settings\":{}}}",
+            settings_json("\"timezone\":\"Europe/Istanbul\",\"digest_cadence\":\"daily\"")
+        ))
+        .expect("valid");
+        assert!(body.cells.is_empty());
+        let settings = body.settings.to_settings(Uuid::nil());
+        assert_eq!(settings.digest_cadence, "daily");
+        assert!(omnion_notifications::validate_settings(&settings).is_ok());
+    }
 }
