@@ -4686,3 +4686,82 @@ override** and tick the screen boxes for slices 1–3 of REQ-016 together, then 
 then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
 the same reason). If the slot is still held, name the holder and its ports in the log rather
 than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
+
+## 2026-09-29 · wave 3, slice 3 · REQ-004 criterion 8 — Table mode
+
+**What.** `/workflows/{id}/table` — the same definition as a list, editable, committed through
+the builder's own save. `table-mode.ts` (the rules), `table-view.tsx` (the screen),
+`table/page.tsx` (the route), 19 unit tests and a new `workflowtable` depth pass.
+
+**The criterion was not partly done. It was not satisfiable.** "Table mode" linked to
+`/automations/{id}` — REQ-003's linear step editor, a **different projection** of the rule — so
+"the same definition" named two objects that were never the same, and "consistent after a save
+in either mode" had nothing to be consistent with. A table over the linear editor is a
+perfectly good table of a definition the canvas never drew, which is exactly the kind of thing
+that passes every count a reviewer writes. The new route reads the same `graph` jsonb and
+commits through the same `saveWorkflowGraph` call quoting the same version, so a save there
+advances exactly the version the canvas would.
+
+**The four decisions.** An **unedited draft is not committable** — the write would advance
+`graph_version` and manufacture a conflict for the next tab. A parameter edit is **by key**, and
+re-typing a field's own value is an **undo rather than a change**. **Clearing a field removes
+the key** instead of storing `""`, which the registry's non-empty validation refuses on save
+while the table shows the field filled. A **dangling edge is named** `(missing node)` rather
+than dropped, because the canvas draws an edge heading nowhere and a table that omits it is
+rendering a *repairable* definition, not the same one.
+
+**The one that was my own bug, and a test found it rather than a read.** Clearing a label fell
+back to the node **id** — a plausible guard against three unnamed cards, and irreversible: the
+author clears one field and a node called "Send mail" is permanently called `n2`. Restoring the
+row's **own original** label makes the clear an undo, which is what clearing a field means
+everywhere else. The test I wrote first asserted the id fallback was right.
+
+**The probe goes through the link, not the route**, because loading the route directly passes
+every row check while the link still points at the linear editor — `pointsAtTableRoute` is the
+assertion that catches it. Ids are compared one for one (a count passes against the wrong nodes
+in the right number), "edits parameters" is proved by reading the **server's** copy back after
+Save (the field is uncontrolled, so a table that never reads it back looks right until the
+author reloads), and "in either mode" is asserted in **both** directions — a canvas rename must
+appear in the table, and a table commit must survive the builder being reopened. A table holding
+its own copy of the graph passes the first two and fails exactly the third.
+
+**Proof.**
+
+- `apps/admin` suite → **138/138** (119 before; 19 new)
+- `cargo test -p omnion-workflows --lib` → **115/115** against merged main
+- `tsc --noEmit` clean · `bun build scripts/qa/walkthrough.cjs --target node` bundles
+- Commits: `0558ec2` (the feature), `98010ed` (the probe)
+
+**The two hours before it, because the environment is the finding.** The pass that last tick
+was still "running" was **wedged, not slow**: 29 of its last 30 screenshots were byte-identical
+(md5 `de3f558…`) — the login page, over and over — with `clicks.jsonl` at zero growth and the
+process parked in `epoll_wait`. It had lost its session and was screenshotting `/login` as if it
+were every screen, while holding `/tmp/omnion-qa-slot`.
+
+**The cause was mine, from the previous tick.** To free disk I deleted `apps/admin/.next` while
+the dev servers were *running*. Next.js logged `The directory at …/.next/dev was deleted` and
+entered its crash-restart path; the admin server then answered from a half-dead state and the
+web app 500'd. A pass against that stack cannot find a single screen, and a pass that reports
+"no problems found" from it is worse than no pass at all. **Deleting a build directory out from
+under a running dev server does not fail loudly — it makes the next hour's evidence worthless.**
+Stop the servers first, or use a `target` symlink (below).
+
+**Three environment repairs, in the order they mattered.**
+
+1. `scripts/qa/run.sh` hardcodes `target/debug/omnion-api`, so exporting
+   `CARGO_TARGET_DIR=.w3-target` makes the pass build for seven minutes and then die with
+   `[PM2][ERROR] Script not found`. The fix is a **symlink**: `mv .w3-target /dev/shm/w3-target
+   && ln -s /dev/shm/w3-target target`. `/dev/shm` was back to 54% (the ENOSPC that killed last
+   tick's build has cleared), and this both satisfies `run.sh` and took 2.4G off `/mnt/apopic`.
+2. `/dev/shm` at 99% presents as a **compiler fault** — `cargo build` dies writing `full.rmeta`.
+   Two ticks running, it is the tmpfs and eight waves' `CARGO_TARGET_DIR`s, never the code.
+3. **MinIO shares `/mnt/apopic`**, so at 97% it refuses writes with `XMinioStorageFull` and every
+   media probe fails on "no file input". That killed the run before it reached the workflow
+   passes. Reclaiming my own worktree (`qa-artifacts` from dead runs, then `.next` **with the
+   servers already down**) took it to 2.7G free.
+
+**Next.** Read `workflow-table` from the pass — `pointsAtTableRoute`, `idsMatch`,
+`wroteToServer`, `seesCanvasRename`, `table-save-survives` — and only then tick criterion 8. The
+other unticked boxes still waiting on the same pass: the selection gestures, edge delete, the
+five validation classes, `⌘S`-writes-once, two-tab conflict, run-from-here, the status pills and
+the step trace.
