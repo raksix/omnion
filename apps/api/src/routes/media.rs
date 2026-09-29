@@ -398,9 +398,20 @@ pub async fn raw_media(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(media_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let media = media_in_scope(&state, &current, media_id).await?;
-    serve(&state, &media, "private, max-age=300").await
+    let range = range_header(&headers);
+    serve(&state, &media, "private, max-age=300", range).await
+}
+
+/// The caller's `Range` header, if it carries one.
+///
+/// A header that is present but not valid UTF-8 reads as `None` rather than as an error: the
+/// parser would ignore it either way, and refusing the request over an undecodable byte would
+/// make a broken proxy into a broken video.
+pub(crate) fn range_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers.get(header::RANGE)?.to_str().ok()
 }
 
 /// The bytes of one file for the panel, through the full file-manager row.
@@ -413,10 +424,12 @@ pub async fn raw_file(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(media_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
     let file = crate::routes::media_files::file_in_scope(&state, &current, media_id).await?;
     ensure_servable(&state, &current, &file).await?;
-    serve_file(&state, &file, "private, max-age=300").await
+    let range = range_header(&headers);
+    serve_file(&state, &file, "private, max-age=300", range).await
 }
 
 /// Remove one file: the object and its row.
@@ -489,19 +502,21 @@ pub async fn public_media(
     // unauthenticated reader must not reach. The two halves are separate functions for this
     // reason, and conflating them is the mistake this comment is here to stop.
     ensure_scan_allows(&state, &file).await?;
-
-    // The cache headers are not hardcoded here but decided by the site's cache-rule set
-    // (REQ-011): a rule an operator created has to change what a visitor's browser does, and a
-    // fixed `max-age` would make the whole rules screen a promise with no effect.
-    //
-    // The rule set is matched against the API path here, not a public address: a media file is
-    // addressed by its id and has no address of its own, so `/api/v1/public/media/*` is the only
-    // path a rule author can write that matches this response.
-    let request_path = format!("/api/v1/public/media/{media_id}");
+let request_path = format!("/api/v1/public/media/{media_id}");
     let shape = cdn_cache::request_shape(&request_path, None, &headers);
     let policy = cdn_cache::policy_for(state.db().pool(), file.site_id, &shape).await;
 
-    let response = serve_file(&state, &file, "no-store").await?;
+    // A range-aware body underneath a CDN policy: seeking (main's range slice) decides which
+    // bytes travel, the cache layer decides what the visitor's browser does with them
+    // (REQ-011). Reverse the two and the cache headers report the wrong length for the
+    // window that was actually sent.
+    let response = serve_file(
+        &state,
+        &file,
+        "no-store",
+        range_header(&headers),
+    )
+    .await?;
     Ok(cdn_cache::apply(
         response,
         &policy,
@@ -585,15 +600,25 @@ fn multipart_error(error: axum::extract::multipart::MultipartError) -> ApiError 
 }
 
 /// Answer with the bytes of one file, under the serve plan of its content type.
+///
+/// `range` is the caller's `Range` header, already extracted. A `None` header and a header the
+/// parser could not read are the same request as far as this function is concerned, and they get
+/// the same answer — see [`omnion_media::RangePlan`] for why an unreadable range is ignored
+/// rather than refused.
 async fn serve(
     state: &AppState,
     media: &Media,
     cache_control: &'static str,
+    range: Option<&str>,
 ) -> Result<Response, ApiError> {
-    let bytes = state.storage().get(&media.storage_key).await?;
     let plan = serve_plan(&media.content_type);
+    let (status, body) = read_window(state, &media.storage_key, range, media.size()).await?;
+    // The range headers are decided *before* the body moves into the response, because they
+    // report the number of bytes that arrived and the body is the only thing that knows it.
+    let ranges = range_header_values(range, media.size(), &body)?;
 
-    let mut response = Response::new(Body::from(bytes));
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
     headers.insert(
@@ -605,6 +630,7 @@ async fn serve(
     );
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    apply_range_headers(headers, ranges)?;
     Ok(response)
 }
 
@@ -617,11 +643,16 @@ async fn serve_file(
     state: &AppState,
     media: &omnion_media::MediaFile,
     cache_control: &'static str,
+    range: Option<&str>,
 ) -> Result<Response, ApiError> {
-    let bytes = state.storage().get(&media.storage_key).await?;
     let plan = serve_plan(&media.content_type);
+    let (status, body) = read_window(state, &media.storage_key, range, media.size()).await?;
+    // The range headers are decided *before* the body moves into the response, because they
+    // report the number of bytes that arrived and the body is the only thing that knows it.
+    let ranges = range_header_values(range, media.size(), &body)?;
 
-    let mut response = Response::new(Body::from(bytes));
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, header_value(plan.content_type)?);
     headers.insert(
@@ -633,7 +664,103 @@ async fn serve_file(
     );
     headers.insert(header::CACHE_CONTROL, header_value(cache_control)?);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, header_value("nosniff")?);
+    apply_range_headers(headers, ranges)?;
     Ok(response)
+}
+
+/// Read the bytes a request asks for: the whole object, or the window its `Range` header names.
+///
+/// Three decisions live here and each is a shortcut that produces a plausible wrong answer:
+///
+/// 1. **The window is chosen from the row's length, and a store that disagrees is answered with
+///    what actually came back.** The `media` row records the size at upload; the object may be
+///    shorter (a truncated write, a key rewritten by hand). Slicing to the row's length and
+///    reporting it in `Content-Range` would tell a player it received bytes that never existed.
+/// 2. **A store that cannot satisfy the window yields the whole object, not an error.** A
+///    `416` from the *store* means the object is shorter than the row says — the client did
+///    nothing wrong, so answering `416` to it blames the client for the server's disagreement.
+///    The body is then the whole object, which is what a player can still play.
+/// 3. **A window is only requested when it is worth requesting.** For a small object the whole
+///    read is cheaper than a second round trip, and the branch keeps a one-kilobyte text file on
+///    exactly the code path it used before ranges existed.
+pub(crate) async fn read_window(
+    state: &AppState,
+    storage_key: &str,
+    range: Option<&str>,
+    claimed_total: u64,
+) -> Result<(StatusCode, Vec<u8>), ApiError> {
+    match omnion_media::RangePlan::decide(range, claimed_total) {
+        omnion_media::RangePlan::Whole => {
+            let bytes = state.storage().get(storage_key).await?;
+            Ok((StatusCode::OK, bytes))
+        }
+        omnion_media::RangePlan::Unsatisfiable { .. } => {
+            // Nothing the client named exists, and no body is sent: the `Content-Range` header
+            // on this response is the whole answer, and a player reads the length from it.
+            Ok((StatusCode::RANGE_NOT_SATISFIABLE, Vec::new()))
+        }
+        omnion_media::RangePlan::Partial { window, .. } => {
+            match state
+                .storage()
+                .get_range(storage_key, window.start, window.end)
+                .await
+            {
+                Ok(bytes) if !bytes.is_empty() => Ok((StatusCode::PARTIAL_CONTENT, bytes)),
+                // Decision 2 above: the store refused the window the *row* implied, so the whole
+                // object is the honest answer and the status follows the bytes that arrived.
+                Ok(_) => {
+                    let bytes = state.storage().get(storage_key).await?;
+                    Ok((StatusCode::OK, bytes))
+                }
+                Err(omnion_storage::StorageError::RangeNotSatisfiable { .. }) => {
+                    let bytes = state.storage().get(storage_key).await?;
+                    Ok((StatusCode::OK, bytes))
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
+}
+
+/// Write the three headers a range answer carries.
+///
+/// `Accept-Ranges` goes on **every** response, including the whole-object one: a client that has
+/// to fail a request to discover that ranges work never tries again, and the media player is
+/// exactly the client that most needs the second attempt. `Content-Range` is only written when
+/// bytes were actually windowed, and its total is the number of bytes that really arrived.
+pub(crate) fn range_header_values(
+    range: Option<&str>,
+    claimed_total: u64,
+    served: &[u8],
+) -> Result<Option<String>, ApiError> {
+    let plan = omnion_media::RangePlan::decide(range, claimed_total);
+    // A `200` carries no `Content-Range` even when the client asked for a window and the answer
+    // turned out to be the whole object — a `Content-Range` on a `200` is a lie about a
+    // response that is not a range.
+    match plan.content_range(served.len() as u64) {
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
+}
+
+/// Write the headers a range answer carries.
+///
+/// `Accept-Ranges` goes on **every** response, including the whole-object one: a client that has
+/// to fail a request to discover that ranges work never tries again, and the media player is
+/// exactly the client that most needs the second attempt. `Content-Range` is only written when
+/// bytes were actually windowed, and its total is the number of bytes that really arrived.
+pub(crate) fn apply_range_headers(
+    headers: &mut axum::http::HeaderMap,
+    content_range: Option<String>,
+) -> Result<(), ApiError> {
+    headers.insert(
+        header::ACCEPT_RANGES,
+        header_value(omnion_media::RangePlan::ACCEPT_RANGES)?,
+    );
+    if let Some(value) = content_range {
+        headers.insert(header::CONTENT_RANGE, header_value(&value)?);
+    }
+    Ok(())
 }
 
 /// Build one response header value, refusing anything unusable.
