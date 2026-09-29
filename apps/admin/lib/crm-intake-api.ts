@@ -407,3 +407,33 @@ export function testIntakeMapping(id: string, payload: Record<string, unknown>):
 export function intakeEndpointUrl(sourceKey: string): string {
   return `${window.location.origin}/api/v1/crm/intake/${sourceKey}`;
 }
+
+/** What one sweep of the retention window did, and the window it used. */
+export type RetentionSweep = {
+  archived: number;
+  retention_days: number;
+  dry_run: boolean;
+};
+
+/**
+ * Archive the stored bodies of leads older than the window.
+ *
+ * The rows, their routing, their SLA facts and their timelines all stay — this erases the
+ * submission body, not the history. Omitting the window uses the server's own default,
+ * which is the one an organization that has never configured anything already lives with.
+ *
+ * `dryRun` asks what *would* be cleared and writes nothing. The action has no undo and no
+ * second copy of what it erases, so the screen reads the number first and only then offers
+ * the press — a control that erases on the first click is not a control, it is a trapdoor.
+ */
+export function sweepRetention(
+  options: { retentionDays?: number; dryRun?: boolean } = {},
+): Promise<RetentionSweep> {
+  const body: Record<string, unknown> = {};
+  if (options.retentionDays !== undefined) body.retention_days = options.retentionDays;
+  if (options.dryRun) body.dry_run = true;
+  return request<RetentionSweep>("/api/v1/crm/leads/retention/sweep", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}

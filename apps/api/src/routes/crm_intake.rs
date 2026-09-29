@@ -1305,6 +1305,11 @@ async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
 /// Reads as a maintenance action rather than something an operator presses per lead, because
 /// the promise it keeps is "the row is deletable and the body stops being stored after N
 /// days" — a policy, not a decision. The lead rows, their routing and their timelines stay.
+///
+/// `dry_run` answers the same count and writes nothing, and it is not an optional nicety:
+/// the sweep clears the only copy of a person's submission with no undo, so the number has
+/// to be readable before the press. It audits nothing either — a preview that appends to the
+/// audit log on every render is a log full of events that never happened.
 pub async fn retention_sweep(
     State(state): State<AppState>,
     session: CurrentSession,
@@ -1317,6 +1322,21 @@ pub async fn retention_sweep(
             format!("retention_days must be between 1 and 3650, got {days}"),
         ));
     }
+    if body.dry_run == Some(true) {
+        let matching = omnion_module_crm_intake::convert_store::count_expired_payloads(
+            state.db().pool(),
+            organization_of(&session)?,
+            days,
+        )
+        .await
+        .map_err(map_store)?;
+        return Ok(Json(SweepResult {
+            archived: matching,
+            retention_days: days,
+            dry_run: true,
+        }));
+    }
+
     let archived = omnion_module_crm_intake::convert_store::archive_expired_payloads(
         state.db().pool(),
         organization_of(&session)?,
@@ -1335,7 +1355,11 @@ pub async fn retention_sweep(
     )
     .await;
 
-    Ok(Json(SweepResult { archived, retention_days: days }))
+    Ok(Json(SweepResult {
+        archived,
+        retention_days: days,
+        dry_run: false,
+    }))
 }
 
 /// The retention window an organization gets when it says nothing.
@@ -1346,15 +1370,19 @@ const DEFAULT_RETENTION_DAYS: i32 = 730;
 pub struct SweepBody {
     /// How old a payload must be before it is archived.
     pub retention_days: Option<i32>,
+    /// Count what a sweep would archive and write nothing.
+    pub dry_run: Option<bool>,
 }
 
-/// What the sweep did.
+/// What the sweep did — or, in a dry run, what it would have done.
 #[derive(Debug, Serialize)]
 pub struct SweepResult {
-    /// How many lead payloads were cleared.
+    /// How many lead payloads were cleared (or would be).
     pub archived: u64,
     /// The window it ran with.
     pub retention_days: i32,
+    /// Whether this answer came from a dry run, so the screen can say "would clear".
+    pub dry_run: bool,
 }
 
 // ---------------------------------------------------------------------------------------------

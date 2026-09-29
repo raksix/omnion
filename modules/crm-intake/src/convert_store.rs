@@ -463,6 +463,28 @@ pub async fn mark_quote_accepted(
     Ok(updated)
 }
 
+/// Count the payloads a sweep at this window would archive, without touching one.
+///
+/// A preview of an irreversible action is not politeness: `archive_expired_payloads` clears
+/// the submission body and there is no second copy anywhere, so the count has to be readable
+/// *before* the press. It is the same statement as the sweep's, minus the `update`.
+pub async fn count_expired_payloads(
+    pool: &PgPool,
+    organization_id: Uuid,
+    older_than_days: i32,
+) -> Result<u64> {
+    let days = older_than_days.clamp(1, 3650);
+    let count: i64 = sqlx::query_scalar(
+        "select count(*) from crm_leads where organization_id = $1 and payload_bytes > 0 \
+           and received_at < now() - make_interval(days => $2::int)",
+    )
+    .bind(organization_id)
+    .bind(days)
+    .fetch_one(pool)
+    .await?;
+    Ok(count.max(0) as u64)
+}
+
 /// Archive the payloads of leads older than the retention window, keeping the rows.
 ///
 /// The promise is "the lead is deletable, and after N days the submission body stops being

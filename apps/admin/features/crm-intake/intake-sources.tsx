@@ -31,6 +31,7 @@ import {
   Plus,
   RefreshCw,
   RotateCw,
+  Search,
   Trash2,
   TriangleAlert,
   Wand2,
@@ -58,6 +59,7 @@ import {
   intakeEndpointUrl,
   previewAutoresponder,
   rotateIntakeKey,
+  sweepRetention,
   testIntakeMapping,
   updateIntakeSource,
   type AutoresponderPreview,
@@ -65,6 +67,7 @@ import {
   type IntakeSource,
   type MappingLine,
   type MappingPreview,
+  type RetentionSweep,
 } from "@/lib/crm-intake-api";
 
 /** The sample a `Test mapping` starts from, so the button has something to run. */
@@ -526,6 +529,10 @@ export function IntakeSources() {
         />
       ) : null}
 
+      {/* The retention promise lives here, next to the sources whose submissions it governs:
+          a window set on a different screen is a window nobody thinks to look for. */}
+      <RetentionSection />
+
       <p className="text-[11.5px] text-muted">
         Assignment rules and SLA policies have their own screens
         (<button
@@ -832,6 +839,176 @@ function AutoresponderSection({
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The retention window, and the one control that erases.
+ *
+ * The endpoint existed for two ticks with nothing calling it, which is the definition of a
+ * dead API: the REQ promises "payloads are size-capped, retention is configurable with an
+ * archive sweep", and an operator who read that promise had no way to keep it. The sweep
+ * also has a property no other button here does — **there is no undo and no second copy.**
+ * Deleting a source keeps its leads; rotating a key can be rotated again; this one clears
+ * the only stored body of what somebody wrote to the business. So the screen reads the
+ * count with a dry run first, and the erase button does not exist until a dry run has
+ * answered a number for *this* window. Change the window and it disappears again, because
+ * the number that justified the press was for a different window.
+ */
+function RetentionSection() {
+  const [days, setDays] = useState(730);
+  const [count, setCount] = useState<RetentionSweep | null>(null);
+  const [done, setDone] = useState<RetentionSweep | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [sweeping, setSweeping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // A count is a statement about ONE window. Editing the number invalidates it, so the
+  // answer that could authorise the press is not allowed to survive the edit.
+  const counted = count?.retention_days === days;
+
+  const runCount = async () => {
+    setChecking(true);
+    setError(null);
+    setDone(null);
+    try {
+      setCount(await sweepRetention({ retentionDays: days, dryRun: true }));
+    } catch (caught) {
+      setCount(null);
+      setError(
+        caught instanceof ApiError ? caught.message : "The stored bodies could not be counted.",
+      );
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const runSweep = async () => {
+    setSweeping(true);
+    setError(null);
+    try {
+      const answer = await sweepRetention({ retentionDays: days });
+      setDone(answer);
+      // The count is spent: it described the state before the press, and leaving it on
+      // screen would invite a second press against a stale number.
+      setCount(null);
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "The sweep could not be run.");
+    } finally {
+      setSweeping(false);
+    }
+  };
+
+  return (
+    <section
+      data-retention-section
+      className="rounded-lg border border-line bg-canvas p-3 text-[12.5px]"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h3 className="flex items-center gap-1.5 text-[12.5px] font-semibold">
+            <Trash2 className="size-3.5" aria-hidden />
+            How long a submission body is kept
+          </h3>
+          <p className="mt-0.5 max-w-prose text-[11.5px] text-muted">
+            After this many days the stored submission body is cleared. The lead itself, its
+            routing, its response times and its whole timeline stay — an inbox that forgot
+            what it answered is worse than one that forgot the wording. A single lead is
+            deleted outright from its detail screen, at any age.
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-end gap-3">
+        <label className="flex flex-col gap-1 text-[11.5px] text-muted">
+          <span className="font-medium">Clear bodies older than (days)</span>
+          <input
+            type="number"
+            min={1}
+            max={3650}
+            data-retention-days
+            value={days}
+            onChange={(event) => {
+              const next = Math.min(3650, Math.max(1, Number(event.target.value) || 1));
+              setDays(next);
+              setCount(null);
+              setDone(null);
+            }}
+            className="w-32 rounded-lg border border-line bg-surface px-2 py-1.5 text-[12.5px] text-ink"
+          />
+        </label>
+
+        <button
+          type="button"
+          data-retention-count
+          disabled={checking || sweeping}
+          onClick={() => void runCount()}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12px] transition hover:text-ink disabled:opacity-50"
+        >
+          {checking ? (
+            <Loader2 className="size-3.5 animate-spin" aria-hidden />
+          ) : (
+            <Search className="size-3.5" aria-hidden />
+          )}
+          Count what a sweep would clear
+        </button>
+      </div>
+
+      {error ? (
+        <p role="alert" data-retention-error className="mt-2 text-[12px] text-red-700">
+          {error}
+        </p>
+      ) : null}
+
+      {counted ? (
+        <div data-retention-count className="mt-2 rounded-lg border border-line bg-surface p-3">
+          {count && count.archived > 0 ? (
+            <>
+              <p className="flex items-center gap-1.5 font-medium">
+                <TriangleAlert className="size-3.5 text-caution" aria-hidden />
+                {count.archived} stored bod{count.archived === 1 ? "y is" : "ies are"} older than{" "}
+                {count.retention_days} days
+              </p>
+              <p className="mt-1 text-[11.5px] text-muted">
+                Clearing them cannot be undone and there is no second copy. The lead rows, their
+                response times and their timelines are not touched.
+              </p>
+              <button
+                type="button"
+                data-retention-sweep
+                disabled={sweeping}
+                onClick={() => void runSweep()}
+                className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-red-500/50 bg-red-500/5 px-2.5 py-1.5 text-[12px] text-red-700 transition hover:border-red-500 disabled:opacity-50"
+              >
+                {sweeping ? (
+                  <Loader2 className="size-3.5 animate-spin" aria-hidden />
+                ) : (
+                  <Trash2 className="size-3.5" aria-hidden />
+                )}
+                Clear {count.archived} stored bod{count.archived === 1 ? "y" : "ies"}
+              </button>
+            </>
+          ) : (
+            <p data-retention-count-empty className="text-muted">
+              Nothing is old enough. Every stored body in this workspace is younger than{" "}
+              {days} days, so a sweep right now would change nothing.
+            </p>
+          )}
+        </div>
+      ) : null}
+
+      {done ? (
+        <p
+          role="status"
+          data-retention-done
+          className="mt-2 rounded-lg border border-positive/40 bg-positive-soft px-3 py-2 text-[12px] text-positive"
+        >
+          {done.archived === 0
+            ? "The sweep ran and found nothing to clear."
+            : `${done.archived} stored bod${done.archived === 1 ? "y was" : "ies were"} cleared. The lead rows and their timelines are unchanged.`}
+        </p>
+      ) : null}
+    </section>
   );
 }
 

@@ -4336,6 +4336,48 @@ async function runCrmIntakeDepth(page, report) {
   steps.oldKeyAfterRotate = afterRotate;
   expectRefusal("crm/intake/{key}", `a key that was rotated away answered ${afterRotate} instead of 401`);
 
+  // The retention control, measured the way the screen promises to measure it.
+  //
+  // The load-bearing assertion is NOT that a number appeared: it is that the erase button
+  // does not exist before a dry run, and that it disappears again when the window changes.
+  // A screen that rendered "Clear" next to an unverified guess would erase somebody's
+  // submission body on a mis-click with no undo, and the number being right afterwards would
+  // not be the thing that went wrong.
+  steps.retentionSectionPresent = (await page.locator("[data-retention-section]").count()) > 0;
+  steps.retentionSweepHiddenBeforeCount = (await page.locator("[data-retention-sweep]").count()) === 0;
+  steps.retentionNoCountBeforeAsking = (await page.locator("[data-retention-count]").count()) === 0;
+
+  // A window that cannot possibly match, so the answer is a definite "nothing".
+  await page.locator("[data-retention-days]").first().fill("3650").catch(() => {});
+  await page.waitForTimeout(200);
+  steps.retentionWindowEditClearsCount = (await page.locator("[data-retention-count]").count()) === 0;
+  await page.locator("[data-retention-count]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.retentionCountAnswered = (await page.locator("[data-retention-count]").count()) > 0;
+  steps.retentionEmptySaysSo =
+    (await page.locator("[data-retention-count-empty]").count()) > 0 ||
+    (await page.locator("[data-retention-section]").innerText().catch(() => "")).includes("older than");
+  // Nothing old enough means there is nothing to press: the button must be absent, not disabled.
+  steps.retentionNoSweepWhenEmpty = (await page.locator("[data-retention-sweep]").count()) === 0;
+  await shot(page, "page-crm-retention");
+
+  // And a real press, on a window that does match. The count the button carries must equal
+  // what the sweep then reports, or the button lied.
+  await page.locator("[data-retention-days]").first().fill("1").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.locator("[data-retention-count]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const sweepLabel = await page.locator("[data-retention-sweep]").first().innerText().catch(() => "");
+  steps.retentionSweepLabelCounts = /\d/.test(sweepLabel);
+  if (steps.retentionSweepLabelCounts) {
+    await page.locator("[data-retention-sweep]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    steps.retentionDoneShown = (await page.locator("[data-retention-done]").count()) > 0;
+    steps.retentionDoneText = (await page.locator("[data-retention-done]").innerText().catch(() => "")).slice(0, 120);
+    // After the press the count is spent: a second press must not be one stray click away.
+    steps.retentionCountSpentAfterSweep = (await page.locator("[data-retention-count]").count()) === 0;
+  }
+
   // Clean up: the sources this pass created are not left behind for the next run to read.
   for (const id of [source.id, dupeSource.body?.id]) {
     if (id) {

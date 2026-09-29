@@ -510,6 +510,87 @@ async fn the_retention_sweep_clears_the_payload_and_keeps_the_row() {
     drop_org(&pool, org).await;
 }
 
+/// The count a dry run answers is the sweep's own number, and asking changes nothing.
+///
+/// Two claims, and both are easy to state and easy to get wrong. The screen shows the count
+/// in the erase button's own label, so a count that disagreed with the sweep would promise a
+/// number and then archive a different one. And a "preview" that wrote would be a preview
+/// that *archived on render* — the count must be readable twice with the same answer, and
+/// the rows must be byte-identical afterwards.
+#[tokio::test]
+async fn the_dry_run_counts_the_sweep_without_erasing_anything() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "convert-retention-dry").await;
+
+    let mut aged = Vec::new();
+    for address in ["a@example.com", "b@example.com"] {
+        let lead = one_lead(&pool, org, address, quote_payload(address)).await;
+        sqlx::query("update crm_leads set received_at = now() - interval '900 days' where id = $1")
+            .bind(lead)
+            .execute(&pool)
+            .await
+            .expect("age the lead");
+        aged.push(lead);
+    }
+    // A third lead stays recent, so the count is not just "the number of rows".
+    let recent = one_lead(&pool, org, "fresh@example.com", quote_payload("fresh@example.com")).await;
+
+    let counted = convert_store::count_expired_payloads(&pool, org, 730)
+        .await
+        .expect("the dry run");
+    assert_eq!(counted, 2, "both aged rows match the window");
+
+    // Asking again answers the same, which is only true if the first ask wrote nothing.
+    assert_eq!(
+        convert_store::count_expired_payloads(&pool, org, 730)
+            .await
+            .expect("the second dry run"),
+        2,
+        "a dry run that counted differently the second time had written something"
+    );
+
+    // The rows are untouched by the counting itself.
+    for id in aged.into_iter().chain(std::iter::once(recent)) {
+        let row = store::find_lead(&pool, org, id)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(
+            row.payload_bytes > 0,
+            "counting must not have cleared a body"
+        );
+    }
+
+    // A window that matches nothing says zero rather than falling back to a default.
+    assert_eq!(
+        convert_store::count_expired_payloads(&pool, org, 3650)
+            .await
+            .expect("a wide window"),
+        0,
+        "900 days is not older than 3650 days… and the count must say so"
+    );
+
+    // And the sweep then clears exactly what the count promised.
+    assert_eq!(
+        convert_store::archive_expired_payloads(&pool, org, 730)
+            .await
+            .expect("the sweep"),
+        counted,
+        "the sweep must archive what the dry run counted, no more and no fewer"
+    );
+
+    // A second dry run after the sweep is zero: the count tracks reality, not a stale read.
+    assert_eq!(
+        convert_store::count_expired_payloads(&pool, org, 730)
+            .await
+            .expect("after the sweep"),
+        0,
+        "the bodies are gone, so the count follows"
+    );
+
+    drop_org(&pool, org).await;
+}
+
 /// `true` when a relation is in this database's catalog.
 async fn table_present(pool: &PgPool, name: &str) -> bool {
     sqlx::query_scalar::<_, bool>("select to_regclass($1) is not null")
