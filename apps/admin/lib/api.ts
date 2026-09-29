@@ -3919,6 +3919,14 @@ export type Automation = {
   action_permissions: [string, string][];
   /** How many runs the trigger has started. */
   trigger_count: number;
+  /**
+   * The version a graph write must quote.
+   *
+   * Present on the list for the same reason it is on the row: a rule opened from a list row
+   * and then saved has no other way to learn it, and a client that guessed `0` would be
+   * refused with a conflict about a version the author was never shown.
+   */
+  graph_version: number;
   /** When the rule last fired. */
   last_triggered_at: string | null;
   /** Creation time. */

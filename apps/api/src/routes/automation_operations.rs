@@ -616,6 +616,16 @@ fn rebuild(definition: &Value, live: &AutomationRule) -> Result<AutomationRule, 
         )),
         last_error: None,
         trigger_count: live.trigger_count,
+        // A restore replaces the *definition* at the version the rule is on, never at a
+        // version of its own. Carrying the live one is the whole correctness of the write:
+        // `replace_graph`'s guard compares this against the column, so a snapshot that
+        // invented `1` would be refused as a conflict on any rule that had ever been
+        // edited, and a restore that reset it to `1` would hand the next editor a version
+        // that no longer matches the row. `field("graph_version")` is deliberately NOT
+        // consulted: a version is an identity for optimistic concurrency, not a field a
+        // stored snapshot gets to choose, and the one that came from a restore would then
+        // be able to impersonate a version the author never held.
+        graph_version: live.graph_version,
         last_triggered_at: live.last_triggered_at,
         created_at: live.created_at,
         updated_at: live.updated_at,
@@ -706,6 +716,7 @@ mod tests {
             concurrency: omnion_automation::limits::Concurrency::Queue,
             last_error: None,
             trigger_count: 0,
+            graph_version: 1,
             last_triggered_at: None,
             created_at: OffsetDateTime::now_utc(),
             updated_at: OffsetDateTime::now_utc(),

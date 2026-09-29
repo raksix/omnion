@@ -545,6 +545,10 @@ mod tests {
             concurrency: crate::limits::Concurrency::Queue,
             last_error: None,
             trigger_count: 0,
+            // The first version a row can hold. Not `0`: a version of zero is the state the
+            // graph write refuses as `graph_version_required`, and a fixture claiming to be a
+            // real rule should be quotable rather than interesting.
+            graph_version: 1,
             last_triggered_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,

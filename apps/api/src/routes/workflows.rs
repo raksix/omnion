@@ -84,6 +84,15 @@ pub struct WorkflowBody {
     pub steps: serde_json::Value,
     /// How many steps the definition carries.
     pub step_count: usize,
+    /// The version a graph write from this row must quote.
+    ///
+    /// The list carries it for the reason `Workflow::graph_version` documents: a save that
+    /// starts from a list row — the builder's own "open" path, a bulk edit, a tool that
+    /// rewrites one parameter on many rules — has no other way to learn it. Without this the
+    /// only honest client behaviour is to refuse to save from here, and a rule that the
+    /// operator can see and rename but not edit is worse than one the API simply forgets to
+    /// serialize.
+    pub graph_version: i32,
     /// Creation time.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -113,6 +122,7 @@ impl WorkflowBody {
             next_run_at: workflow.next_run_at,
             steps: workflow.steps.clone(),
             step_count,
+            graph_version: workflow.graph_version,
             created_at: workflow.created_at,
             updated_at: workflow.updated_at,
         }
@@ -1133,6 +1143,7 @@ mod tests {
             ]),
             last_triggered_at: None,
             trigger_count: 0,
+            graph_version: 1,
             created_by: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,

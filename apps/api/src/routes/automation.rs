@@ -96,6 +96,13 @@ pub struct AutomationBody {
     pub action_permissions: &'static [(&'static str, &'static str)],
     /// How many runs the trigger has started.
     pub trigger_count: i32,
+    /// The version a graph write against this rule must quote.
+    ///
+    /// The rule list is a place a save starts from, exactly as the workflow list is: a card
+    /// that opens the builder, a bulk edit, a tool that rewrites one parameter on many rules.
+    /// A version available only behind `GET …/graph` leaves those paths quoting `0`, and the
+    /// server's answer to that is a refusal about a version the author was never shown.
+    pub graph_version: i32,
     /// When the rule last fired.
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_triggered_at: Option<OffsetDateTime>,
@@ -175,6 +182,7 @@ impl AutomationBody {
             last_error: rule.last_error.clone(),
             action_permissions: omnion_automation::authority::ACTION_PERMISSIONS,
             trigger_count: rule.trigger_count,
+            graph_version: rule.graph_version,
             last_triggered_at: rule.last_triggered_at,
             created_at: rule.created_at,
             updated_at: rule.updated_at,
@@ -845,6 +853,12 @@ pub async fn update_automation(
         concurrency,
         last_error: existing.last_error.clone(),
         trigger_count: existing.trigger_count,
+        // The version is the *stored* one, never one this request could have chosen. An
+        // update rebuilds the whole row from the request, and a field the request may set
+        // that the row also stores is a field a client can use to skip the concurrency
+        // check the graph write exists to perform. The graph write has its own endpoint and
+        // its own guard; nothing here may move this column.
+        graph_version: existing.graph_version,
         last_triggered_at: existing.last_triggered_at,
         created_at: existing.created_at,
         updated_at: existing.updated_at,

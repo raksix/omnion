@@ -77,6 +77,14 @@ pub struct AutomationRule {
     pub last_error: Option<String>,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
+    /// The version a graph write against this rule must quote.
+    ///
+    /// Carried through from the workflow row rather than looked up, and for the same reason
+    /// the builder needs it: the rule list is where an author opens a rule, and a client
+    /// that opened one from here and then saved the graph would have no version to quote. A
+    /// read that can be obtained from here and not from there is a read the API chose to
+    /// expose on one surface only, and the second surface is then silently uneditable.
+    pub graph_version: i32,
     /// When it last fired.
     pub last_triggered_at: Option<OffsetDateTime>,
     /// Creation time.
@@ -146,6 +154,7 @@ impl AutomationRule {
             concurrency: crate::limits::Concurrency::parse_or_default(&workflow.concurrency),
             last_error: workflow.last_error.clone(),
             trigger_count: workflow.trigger_count,
+            graph_version: workflow.graph_version,
             last_triggered_at: workflow.last_triggered_at,
             created_at: workflow.created_at,
             updated_at: workflow.updated_at,

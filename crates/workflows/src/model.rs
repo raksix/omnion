@@ -383,6 +383,18 @@ pub struct Workflow {
     pub last_triggered_at: Option<OffsetDateTime>,
     /// How many runs the trigger has started.
     pub trigger_count: i32,
+    /// The optimistic-concurrency token a graph write must quote.
+    ///
+    /// It is on the row rather than only behind `GET …/graph` because **the rule list is a
+    /// place a save starts from**: a card that opens the builder, a bulk action that renames
+    /// and re-saves, a "fix this on every rule" tool. Every one of them has to quote a
+    /// version, and a version that only exists on the detail route is a version those paths
+    /// cannot obtain — so they send `0`, the server answers `409 graph_version_required`, and
+    /// the author is told their rule is in conflict with a version they were never shown.
+    ///
+    /// It is one integer on a row that is already read whole, so the cost is nil and the
+    /// alternative is a write path that cannot write.
+    pub graph_version: i32,
     /// Account that created the workflow.
     pub created_by: Option<Uuid>,
     /// Creation time.
@@ -413,7 +425,7 @@ impl Workflow {
 pub const WORKFLOW_COLUMNS: &str = "id, organization_id, site_id, name, description, enabled, \
      trigger_kind, schedule, trigger_event, conditions, hook_token_hash, on_error, hook_secret, \
      run_as_user_id, rate_limit_per_hour, concurrency, last_error, next_run_at, steps, \
-     last_triggered_at, trigger_count, created_by, created_at, updated_at";
+     last_triggered_at, trigger_count, graph_version, created_by, created_at, updated_at";
 
 /// A definition row to be written.
 #[derive(Debug, Clone)]

@@ -489,6 +489,7 @@ mod tests {
             concurrency: crate::limits::Concurrency::Queue,
             last_error: None,
             trigger_count: 0,
+            graph_version: 1,
             last_triggered_at: None,
             created_at: Offset::UNIX_EPOCH,
             updated_at: Offset::UNIX_EPOCH,
