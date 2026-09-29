@@ -1130,6 +1130,23 @@ pub async fn delete_user(
         Uuid::parse_str(&id).map_err(|_| ScimError::not_found(format!("no account {id}")))?;
     let user = require_user(&state, &principal, user_id).await?;
 
+    // SCIM's delete is a deactivation: the row stays, so the catalogue calls it what it is.
+    // `user.deleted` is the name a receiver of the platform's own bus reads \u2014 the account is
+    // no longer usable \u2014 and it is emitted here because this is the one write that takes an
+    // account out of service on an identity provider's instruction.
+    omnion_events::bus::emit(
+        state.db().pool(),
+        omnion_events::NewEvent::new("user.deleted")
+            .organization(principal.organization_id())
+            .payload(json!({
+                "user_id": user.id,
+                "email": user.email,
+                "source": "scim",
+            })),
+    )
+    .await
+    .map_err(internal)?;
+
     users::set_status(state.db().pool(), user.id, "disabled")
         .await
         .map_err(internal)?;
