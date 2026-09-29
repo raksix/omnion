@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** in-progress (slices 1–4, `c3ec2d0`…`50fff1a`; slice 4 code shipped, browser pass queued) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slices 1–4, `c3ec2d0`…`0e88f27`; slice 4 browser-proven, credentials org scoping open) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -316,8 +316,33 @@ match the tested state, usage data is real.
    (REQ-086 slice 2 — the event carries `credential_key`, and the canvas has nowhere to
    disable nodes yet).
 4. **Node packages and SDK** — ledger, install/remove via REQ-044, scaffold/validate/pack CLI, fixtures. Done: a fixture package installs, appears in the palette, and removal degrades instead of breaking.
-   *Code shipped (`e4c41ce`, `4488a05`, `77fad33`, `dc7b897`, `76e0bd1`, `50fff1a`); the
-   browser pass is queued, so the "appears in the palette" clause is not yet closed.*
+   *Browser-proven (`dc75ffa`, `112e81f`, `b3124fd`, `2324711`, `0e88f27`): the pass signed in as
+   the platform QA owner, read the organization the selector resolved, and drove the whole
+   lifecycle — `list` shows the empty state, `refused` renders **4** findings, `install` puts
+   the row on the ledger with the **namespaced** key (`qa-fixture.echo`), `toggle` keeps the
+   row while the chip changes, and `remove` opens a dialog naming the node it takes away. The
+   same lifecycle is proven against a live API outside the browser: 201 with a server-computed
+   checksum, 409 on a downgrade, a toggle in both directions, and the broken variant refused
+   with all four findings.*
+
+   **Two product bugs the browser pass found, both fixed.**
+   1. *Every node-package route called `resolve_organization(&current, None)`*, so an account
+      with no primary organization was refused `organization_required` before the manifest was
+      read — which is exactly the account that installs a package for a tenant. The
+      organization is now carried in the install and toggle bodies, a query on the removal that
+      has no body, and the list read; the panel sends its active organization and a platform
+      account picks one. It stays optional, so a tenant's own call is unchanged.
+   2. *The pass's own fixture was not installable.* A node that accepts a credential needs a
+      `credential_key` select for the palette to fill (`node_credential_not_selectable`), and
+      the fixture had a textarea. So the pass had been proving a *refusal* while claiming to
+      prove an install, and every step after it ran against a row that was never there. The
+      parameter now matches the shape the SDK's own scaffold writes.
+
+   **Still open on this slice:** the palette reading the ledger is REQ-086 slice 2's job, and
+   the credentials screens carry the *same* org-scoping defect the ledger had — 8 routes in
+   `credentials.rs` and 3 in `credential_oauth.rs` still resolve with no requested value, which
+   is why the pass's credential depth reads an empty list and the API answers `400` 66 times.
+   Same fix, same reason; it is the next slice and it is not started.*
    `crates/workflows/src/node_package.rs` — the manifest, the validator, the canonical
    checksum, `pack`, `scaffold` and `removal_plan`. The validator lints each definition with
    the **bundled registry's own** `lint_node`/`lint_credential` on the same object it installs,
