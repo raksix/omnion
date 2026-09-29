@@ -3966,10 +3966,22 @@ export function releaseMediaQuarantine(
  * meant to apply, and forwarding it would ask the server for the empty category — which the
  * server refuses with a 400, so a cleared `<select>` would turn the list into an error screen
  * instead of an unfiltered one.
+ *
+ * **`with_read` is the exception, and it is not a special case so much as the rule's own
+ * limit.** A skipped `false` is right for every other flag, because there `false` is the same
+ * as absent. For `with_read` absent means *show read and unread* and `false` means *unread
+ * only*, so a generic falsy skip would drop the reader's inbox filter on the floor and hand
+ * back a list they did not ask for. It is sent as `with_read=0` — the same value the server's
+ * `parse_flag` reads as off — rather than as `false`, which would serialize to "false" and is
+ * the kind of asymmetry that later reads as a bug in the wrong place.
  */
 function notificationQuery(filters: NotificationFilters = {}): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
+    if (key === "with_read") {
+      if (value === false) params.set(key, "0");
+      continue;
+    }
     if (value === undefined || value === "" || value === false) continue;
     params.set(key, String(value));
   }
