@@ -261,7 +261,18 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       parameters are refused **by name** — a typo'd `?status=flaky` answers
       `invalid_delivery_query` naming the field, because a filter that silently matches
       nothing is indistinguishable from an endpoint that has had no failures.
-- [ ] Disabling an endpoint stops new deliveries but keeps its history readable.
+- [x] Disabling an endpoint stops new deliveries but keeps its history readable.
+      — `a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did`: a receiver hears a
+      published page, the endpoint is `PATCH`ed to `enabled: false`, a second page publishes and
+      is **never queued** (asserted by reading `webhook_deliveries` out of PostgreSQL, not out of
+      a response body — queue-then-skip would show the operator a growing list of `pending` rows
+      for an endpoint they switched off), and the deliveries made before the switch are still on
+      the screen and still `delivered`. The last step switches it back on and publishes a third
+      page, so the assertion is that re-enabling *resumes* rather than that disabling is
+      destructive: the subscription was muted, never destroyed. A disabled endpoint whose history
+      is unreadable is a switch that deletes the answer to "what was this receiver doing last
+      Tuesday", and the log is the reason an operator pauses an integration instead of deleting
+      it.
 - [x] `403` is returned (not `404`) when a caller without `webhooks.manage` posts to a management route, and `404` when an endpoint belongs to another
       organization.
       — The cross-organization half was already proven in `webhooks_are_scoped_per_organization_and_permission_guarded`.
