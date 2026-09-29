@@ -18,6 +18,7 @@ pub mod error;
 pub mod mfa;
 pub mod organizations;
 pub mod password;
+pub mod provenance;
 pub mod provisioning;
 pub mod secrets;
 pub mod security;
