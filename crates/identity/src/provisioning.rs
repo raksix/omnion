@@ -34,7 +34,14 @@ pub const DEFAULT_LOG_LIMIT: i64 = 50;
 pub const MAX_LOG_LIMIT: i64 = 500;
 
 /// Column list of every token query.
-const TOKEN_COLUMNS: &str = "id, organization_id, name, prefix, created_by, last_used_at, \
+///
+/// **Public, deliberately.** A route that reads a token must name the same columns the store
+/// does, and a second hand-written list is a second thing to forget: when `0124` added
+/// `expires_at` and `rotated_at`, the identity queries were updated and the revoke route's copy
+/// was not — so `ProvisioningToken` had two fields with no column and **every revoke answered
+/// 500**. Nothing in the type system connects a `FromRow` struct to a query's column list, so the
+/// only defence is for there to be exactly one list to read.
+pub const TOKEN_COLUMNS: &str = "id, organization_id, name, prefix, created_by, last_used_at, \
      revoked_at, created_at, expires_at, rotated_at";
 
 /// How long a token lives when the caller does not say. Ninety days: long enough that a connector

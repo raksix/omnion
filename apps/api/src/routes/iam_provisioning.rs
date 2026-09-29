@@ -157,10 +157,18 @@ pub async fn revoke_token(
 ) -> Result<Json<Value>, ApiError> {
     // The row is read first, so the tenancy check runs before anything is written and a token of
     // another organization is invisible rather than revocable.
-    let token = sqlx::query_as::<_, provisioning::ProvisioningToken>(
-        "select id, organization_id, name, prefix, created_by, last_used_at, revoked_at, \
-         created_at from provisioning_tokens where id = $1",
-    )
+    //
+    // The column list is the one the store uses, and that is not tidiness: this query used to
+    // spell out the columns by hand, and when `0124` added `expires_at` and `rotated_at` to
+    // `ProvisioningToken` the list was left behind. sqlx then had no value for two fields of
+    // the struct and the route answered **500 internal_error** for every revoke — on the one
+    // operation an operator reaches for when a credential must die. The identity branch had it
+    // fixed and this one did not, which is what a duplicated column list buys: two places to
+    // forget, and no compiler to notice. A row shape the store owns is a constant, so read it.
+    let token = sqlx::query_as::<_, provisioning::ProvisioningToken>(&format!(
+        "select {} from provisioning_tokens where id = $1",
+        provisioning::TOKEN_COLUMNS
+    ))
     .bind(token_id)
     .fetch_optional(state.db().pool())
     .await
@@ -216,10 +224,12 @@ pub async fn rotate_token(
     // holding a guessed uuid learns whether it names a real token, and a token is exactly the
     // kind of row whose existence is worth not confirming. `ensure_same_organization` is right for
     // a body field the caller supplied; it is wrong for a path id that was never theirs.
-    let before = match sqlx::query_as::<_, provisioning::ProvisioningToken>(
-        "select id, organization_id, name, prefix, created_by, last_used_at, revoked_at, \
-         created_at, expires_at, rotated_at from provisioning_tokens where id = $1",
-    )
+    // The store's column list, like the revoke route above: a second hand-written copy is a
+    // second thing to forget when the row shape changes.
+    let before = match sqlx::query_as::<_, provisioning::ProvisioningToken>(&format!(
+        "select {} from provisioning_tokens where id = $1",
+        provisioning::TOKEN_COLUMNS
+    ))
     .bind(token_id)
     .fetch_optional(state.db().pool())
     .await
@@ -299,10 +309,10 @@ pub async fn rotate_token(
     // rotated, and the panel renders exactly this response immediately after the button — so the
     // one surface that says "this was replaced" would contradict the list it refreshes into. A
     // response about a write should describe the write, not the state that preceded it.
-    let replaced = sqlx::query_as::<_, provisioning::ProvisioningToken>(
-        "select id, organization_id, name, prefix, created_by, last_used_at, revoked_at, \
-         created_at, expires_at, rotated_at from provisioning_tokens where id = $1",
-    )
+    let replaced = sqlx::query_as::<_, provisioning::ProvisioningToken>(&format!(
+        "select {} from provisioning_tokens where id = $1",
+        provisioning::TOKEN_COLUMNS
+    ))
     .bind(before.id)
     .fetch_optional(state.db().pool())
     .await
