@@ -856,6 +856,14 @@ impl From<WorkflowError> for ApiError {
                 err.to_string(),
             ),
             WorkflowError::Audit(err) => err.into(),
+            // A stale `graph_version` is a `409`, not a `400`: the request was well formed and the
+            // row's *state* is what the author has to change first (reload, or choose to overwrite).
+            // A `400` tells them to fix their request, which is not the problem, and it is the
+            // status `workflow_graph.rs` documents for exactly this case. Every other invalid
+            // definition really is a `400` — the graph they sent is what has to change.
+            WorkflowError::Invalid { code, message } if code == "graph_version_conflict" => {
+                Self::new(StatusCode::CONFLICT, code, message)
+            }
             WorkflowError::Invalid { code, message } => Self::bad_request(code, message),
         }
     }
@@ -1078,6 +1086,26 @@ mod tests {
             ApiError::forbidden("account_disabled", "no").status(),
             StatusCode::FORBIDDEN
         );
+    }
+
+    // A stale `graph_version` answers `409` and every other invalid definition answers `400`.
+    // The two must not collapse: a `400` sends the author to fix a request that was already
+    // correct, and the module documentation for `workflow_graph.rs` promises the `409`.
+    #[test]
+    fn a_stale_graph_version_is_a_conflict_and_not_a_bad_request() {
+        let error = ApiError::from(WorkflowError::invalid(
+            "graph_version_conflict",
+            "it is now at version 3",
+        ));
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "graph_version_conflict");
+    }
+
+    #[test]
+    fn an_invalid_definition_is_still_a_bad_request() {
+        let error = ApiError::from(WorkflowError::invalid("invalid_step_action", "no such action"));
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.code(), "invalid_step_action");
     }
 
     #[test]
