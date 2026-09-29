@@ -1761,7 +1761,6 @@ pub fn router(state: AppState) -> Router {
         // `GET`s a probe makes every few seconds, counted against a budget of 600 a minute, and a
         // probe that trips the limiter is a probe that reports the platform down.
         .layer(crate::rate_limit_middleware::rate_limit(limiter_layer.clone()))
- origin/main
         // CSRF sits OUTSIDE the permission guards on purpose: a guard answers 401 for a request
         // with no session and 403 for one whose account lacks the key. The CSRF layer's answer is
         // about the *request*, and it has to be reached only by a request that actually
