@@ -80,6 +80,48 @@ reap() {
       echo "[qa-slot] reclaimed a place whose pass is gone: ${name} (${age}s old, owner ${owner}, holder ${holder:-none})" >&2
       continue
     fi
+    # A holder with no owner line is an **orphan**, and parentage is what tells it apart from the
+    # race case above. A holder spawned by a live `run.sh` has a bash parent; one whose pass was
+    # SIGKILLed or OOM-killed is reparented to init (pid 1, or a subreaper on a box with a
+    # systemd user manager), and that is the only observable difference between "written down a
+    # moment ago" and "left behind by a pass that is not coming".
+    #
+    # This is not a refinement of the owner line — it is what makes an **old-format** place
+    # reclaimable at all. A writer that has not taken the owner-line commit writes a ONE-line
+    # holder file, so `owner` is always empty for it, and the two rules above both decline: the
+    # holder is alive so nothing is stale, and there is no owner to test. On a box where several
+    # writers are on different revisions of this script that is not an edge case, it is a
+    # permanent deadlock: one orphaned place, every other writer printing "waiting for a QA slot"
+    # until its own timeout, with no pass anywhere.
+    #
+    # `QA_SLOT_REAP_ORPHAN` defaults on and exists so a writer can still opt out while its
+    # siblings merge. The test asserts BOTH directions — an orphan is reclaimed, a reparented-
+    # to-nothing case is not invented — because the failure mode of getting this wrong is
+    # deleting the lock of a pass that is running.
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && [ -z "$owner" ]; then
+      # Parentage is the WRONG signal, and the box proved it. This one reparents orphans to the
+      # systemd *user* manager (pid 338), not to init, so `ppid <= 1` is false for a perfectly
+      # orphaned holder — the test built a real orphan, got ppid 338, and skipped itself.
+      #
+      # The signal that holds is the **process-group leader**. run.sh starts the holder through a
+      # job-control pipeline, so the holder's pgid is the shell that created it; a SIGKILLed or
+      # OOM-killed pass takes that leader with it and the holder is left as the last member of a
+      # dead group. A live pass's group leader is alive, because it is the pass. That is the
+      # difference, and unlike `ppid` it does not depend on whether anything on the box is
+      # configured as a subreaper.
+      pgid="$(ps -o pgid= -p "$holder" 2>/dev/null | tr -d ' ' || echo '')"
+      if [ -n "$pgid" ] && ! kill -0 "$pgid" 2>/dev/null; then
+        if [ "${QA_SLOT_REAP_ORPHAN:-1}" = "1" ]; then
+          rm -f "$f" "${HOLDERDIR}/${name}" 2>/dev/null || true
+          kill "$holder" 2>/dev/null
+          echo "[qa-slot] reclaimed an orphaned place from ${name} (${age}s old, holder ${holder} in dead process group ${pgid})" >&2
+          continue
+        fi
+      else
+        continue
+      fi
+    fi
+
     # No holder file at all, this long after the place appeared, means the pass died between
     # taking the place and writing the holder down.
     if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then

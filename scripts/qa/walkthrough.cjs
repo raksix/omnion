@@ -6030,6 +6030,47 @@ async function runIamAuthenticationDepth(page, report) {
 
   await page.locator("[data-provider-drawer-close]").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(400);
+
+  // ---- The sync ledger (REQ-065, slice 4 part 2) --------------------------------------------
+  // Walked while the directory provider still exists, because the ledger is only offered on a
+  // directory kind — a protocol provider has nothing to sync, and offering the tab there would
+  // be a screen with nothing in it.
+  const dirProviderId = await page
+    .locator(`[data-sync-toggle]`)
+    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-sync-toggle")))
+    .catch(() => []);
+  await page.locator(`[data-sync-toggle="${dirProviderId[0] ?? ""}"]`).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const syncEmpty = await page.locator("[data-sync-empty]").count();
+  const syncRuns = await page.locator("[data-sync-run]").count();
+  // A provider that has never synced says so. A ledger that rendered an empty *table* instead
+  // would be indistinguishable from "loaded and there is nothing", which is the state that
+  // makes an operator wonder whether the sync ever runs at all.
+  note({
+    step: "sync-ledger-empty",
+    found: dirProviderId.length > 0,
+    emptyState: syncEmpty > 0,
+    // Either is legitimate — a provider that has synced has rows — so this asserts that the
+    // screen answered *something* rather than which answer it gave.
+    answered: syncEmpty > 0 || syncRuns > 0,
+  });
+
+  if (syncRuns > 0) {
+    await page.locator("[data-sync-open]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const drawer = await page.locator("[data-sync-drawer]").count();
+    const subjects = await page.locator("[data-sync-subject]").count();
+    // The retry control is disabled at zero rather than sending an empty list, because an empty
+    // list means "every subject that ever failed" and the button says "retry these N".
+    const retryDisabledAtZero = (await page.locator("[data-sync-retry]").first().isDisabled().catch(() => true));
+    note({ step: "sync-drawer", drawer: drawer > 0, subjects, retryDisabledAtZero });
+    await shot(page, "page-iam-provider-sync");
+    await page.locator("[data-sync-filter]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const filteredLabel = await page.locator("[data-sync-filter]").first().getAttribute("data-sync-filter").catch(() => null);
+    note({ step: "sync-problems-filter", toggles: filteredLabel === "problems" });
+  }
+
   await page.locator(`[data-provider-delete="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(400);
   await page.locator(`[data-provider-delete-confirm="qa-dir-${dstamp}"]`).first().click({ timeout: 8000 }).catch(() => {});
