@@ -71,12 +71,15 @@ pub enum SalesError {
     /// bug this variant exists to prevent.
     #[error("quote {quote_number} is already waiting on an approval decision")]
     AlreadyAwaitingApproval {
-        /// The open request's id.
-        request_id: Uuid,
         /// The quote's number, so the message names the document.
         quote_number: String,
         /// The request that is already open, rendered by the form as the row to show.
-        existing: crate::approvals::ApprovalView,
+        ///
+        /// **Boxed**: `ApprovalView` is a wide struct and this error is returned from every
+        /// fallible function in the crate, so an unboxed payload would make the `Err` variant —
+        /// and therefore every `Result` in the module — hundreds of bytes larger. `SalesError`
+        /// is returned by pointer on the error path, and the cost is paid on the hot path.
+        existing: Box<crate::approvals::ApprovalView>,
     },
     /// Somebody tried to approve their own quote.
     ///
@@ -101,7 +104,7 @@ pub enum SalesError {
     /// can print the discount, the limit and the open request — a bare "cannot send" would make
     /// the seller hunt for the button that clears it.
     #[error("{}", .0.message())]
-    ApprovalNotGranted(crate::approvals::ApprovalRequired),
+    ApprovalNotGranted(Box<crate::approvals::ApprovalRequired>),
     /// An amount or quantity the platform will not accept, carrying the module's own reason.
     #[error("invalid {entity}.{field}: {source}")]
     InvalidNumber {

@@ -1213,10 +1213,6 @@ pub fn router(state: AppState) -> Router {
         .route_layer(guards::require(&state, "sales.quotes.read"));
     let sales_approvals_send = Router::new()
         .route(
-            "/sales/quotes/{id}/approval-requests",
-            post(sales_approvals::request_approval),
-        )
-        .route(
             "/sales/approvals/{id}/decision",
             post(sales_approvals::decide_approval),
         )
@@ -1225,6 +1221,16 @@ pub fn router(state: AppState) -> Router {
             post(sales_approvals::cancel_approval),
         )
         .route_layer(guards::require(&state, "sales.quotes.send"));
+    // **Raising** a request is on the *update* key, not the send key, and this is not a detail:
+    // the request is what the seller asks for when they may not send, so a route behind
+    // `sales.quotes.send` would leave the drafter role — the one the acceptance criteria are
+    // about — with an amber banner and no button. Deciding stays on `send`; that is the power.
+    let sales_approvals_ask = Router::new()
+        .route(
+            "/sales/quotes/{id}/approval-requests",
+            post(sales_approvals::request_approval),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.update"));
 
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
@@ -1236,6 +1242,7 @@ pub fn router(state: AppState) -> Router {
 
     let sales = sales_products_read
         .merge(sales_approvals_read)
+        .merge(sales_approvals_ask)
         .merge(sales_approvals_send)
         .merge(sales_products_manage)
         .merge(sales_pricelists_read)

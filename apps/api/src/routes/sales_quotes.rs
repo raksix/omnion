@@ -939,7 +939,7 @@ mod tests {
         // A totals-only change (the lines moved, not the header) is not a header change: it would
         // otherwise be reported twice, once here and once by the line replacement.
         let mut totals_only = base.clone();
-        totals_only.quote_totals_mut().grand_total = "99.00".to_string();
+        totals_only.totals.grand_total = "99.00".to_string();
         assert!(header_changes(&base, &totals_only).is_empty());
     }
 

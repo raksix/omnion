@@ -1655,21 +1655,6 @@ pub async fn send_quote(
     let row = fetch_quote_row_tx(&mut transaction, organization_id, quote_id).await?;
     let status = QuoteStatus::parse(&row.status)
         .ok_or_else(|| SalesError::invalid("quote", "status", "this quote has an unknown status"))?;
-    if status != QuoteStatus::Draft && status != QuoteStatus::Approved {
-        // A quote waiting for a decision is the case the discount gate exists for, so the
-        // refusal names the request and the manager who has it rather than saying "wrong
-        // status". The builder shows the same sentence before the button is pressed.
-        if status == QuoteStatus::PendingApproval {
-            if let Some(requirement) =
-                crate::approvals::requirement(pool, organization_id, quote_id).await?
-            {
-                return Err(SalesError::ApprovalNotGranted(requirement));
-            }
-        }
-        return Err(SalesError::InvalidStatusChange(format!(
-            "a {status} quote cannot be sent — only a draft or an approved one can"
-        )));
-    }
     let today = today_utc();
     // The column is read as text (the store's money/date rule) and parsed here rather than
     // compared as a string: `"2026-9-8" < "2026-10-1"` is true in ASCII and false as a date.
@@ -1679,6 +1664,41 @@ pub async fn send_quote(
             "quote {} expired on {valid_until} and cannot be sent",
             row.number
         )));
+    }
+
+    if status == QuoteStatus::PendingApproval {
+        // The refusal names the request and the manager who has it. A `pending_approval` quote
+        // that fell through to the generic "wrong status" sentence was a dead end for the seller:
+        // the one thing they can do about it is wait, and nothing on the page said so.
+        //
+        // It is checked **after** the validity, not before: a quote that lapsed a week ago does
+        // not need a manager, it needs a new validity date, and telling a seller to go and get a
+        // discount approved on a document that cannot be sent is advice that wastes their
+        // afternoon.
+        if let Some(requirement) =
+            crate::approvals::requirement(pool, organization_id, quote_id).await?
+        {
+            return Err(SalesError::ApprovalNotGranted(Box::new(requirement)));
+        }
+    }
+    if status != QuoteStatus::Draft && status != QuoteStatus::Approved {
+        return Err(SalesError::InvalidStatusChange(format!(
+            "a {status} quote cannot be sent — only a draft or an approved one can"
+        )));
+    }
+
+    // The gate itself, and it is checked against the **stored** `max_discount` rather than the
+    // status: a draft whose line was pushed over the limit in the last edit is still a draft, and
+    // the first version of this check only guarded `pending_approval` — so a quote nobody had
+    // asked about yet went straight out, which is the one case the discount policy exists to
+    // stop. An `approved` quote is exempt: it carries a decision, and re-measuring it against a
+    // threshold the organization may have lowered since would silently un-approve real work.
+    if status == QuoteStatus::Draft {
+        if let Some(requirement) =
+            crate::approvals::requirement(pool, organization_id, quote_id).await?
+        {
+            return Err(SalesError::ApprovalNotGranted(Box::new(requirement)));
+        }
     }
 
     let line_count: (i64,) = sqlx::query_as(

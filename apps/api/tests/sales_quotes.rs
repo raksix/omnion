@@ -200,6 +200,9 @@ struct Fixture {
     _walk: tokio::sync::MutexGuard<'static, ()>,
     state: AppState,
     db: Db,
+    /// The organization the walk owns, so a walk can write a **policy** (the discount threshold)
+    /// rather than editing the fixture grid out from under the totals assertions.
+    organization: Uuid,
     company: Uuid,
     product: Uuid,
     drafter: String,
@@ -245,6 +248,7 @@ impl Fixture {
             _walk: walk,
             state,
             db,
+            organization: org,
             company,
             product,
             drafter,
@@ -457,6 +461,33 @@ const FIXTURE_DISCOUNT: &str = "9.95";
 const FIXTURE_TAX: &str = "67.96";
 const FIXTURE_GRAND: &str = "407.76";
 
+/// Raise this organization's discount threshold above the fixture's 20% line.
+///
+/// Slice 3 made the threshold a gate, so a walk that wants to **send** the 20% fixture has to
+/// say so: the policy is a per-organization setting and the honest way to exercise the send path
+/// is to write a policy that allows it, not to quietly edit the fixture the totals walks assert
+/// on. The change is made through the same settings row the panel writes.
+async fn allow_the_fixture_discount(fixture: &Fixture) {
+    sqlx::query(
+        "update sales_settings set discount_approval_threshold = 50 where organization_id = $1",
+    )
+    .bind(fixture.organization)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the threshold must be raised");
+    let (threshold,): (f64,) = sqlx::query_as(
+        "select discount_approval_threshold::float8 from sales_settings where organization_id = $1",
+    )
+    .bind(fixture.organization)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the settings row must exist");
+    assert!(
+        (threshold - 50.0).abs() < f64::EPSILON,
+        "the policy now allows a 20% discount, not {threshold}"
+    );
+}
+
 /// A quote body with the fixture grid, in the module's own request shape.
 fn quote_body(company: Uuid, product: Uuid) -> Value {
     json!({
@@ -609,6 +640,8 @@ async fn changing_one_line_moves_all_four_totals_together() {
 #[tokio::test]
 async fn numbers_are_per_organization_gap_free_under_concurrent_creates_and_immutable_after_send() {
     let Some(fixture) = Fixture::new().await else { return };
+    // Slice 3's gate: this walk sends the 20% fixture, so the policy has to allow it.
+    allow_the_fixture_discount(&fixture).await;
     let token = fixture.token(&fixture.drafter).await;
 
     // Ten creates at once: the counter row is taken `for update`, so the numbers are distinct and
@@ -692,6 +725,7 @@ async fn numbers_are_per_organization_gap_free_under_concurrent_creates_and_immu
 #[tokio::test]
 async fn sending_snapshots_a_version_freezes_the_lines_and_a_patch_afterwards_is_a_conflict() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, _) = create_quote(&fixture, &drafter, quote_body(fixture.company, fixture.product)).await;
@@ -787,6 +821,7 @@ async fn sending_snapshots_a_version_freezes_the_lines_and_a_patch_afterwards_is
 #[tokio::test]
 async fn duplicating_a_sent_quote_gives_a_new_number_and_a_draft_that_can_be_sent_again() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, body) =
@@ -852,6 +887,7 @@ async fn duplicating_a_sent_quote_gives_a_new_number_and_a_draft_that_can_be_sen
 #[tokio::test]
 async fn the_public_page_reads_without_a_session_and_accepts_once() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, _) = create_quote(&fixture, &drafter, quote_body(fixture.company, fixture.product)).await;
@@ -930,6 +966,7 @@ async fn the_public_page_reads_without_a_session_and_accepts_once() {
 #[tokio::test]
 async fn a_decline_without_a_reason_is_refused_and_one_with_a_reason_is_recorded() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, _) = create_quote(&fixture, &drafter, quote_body(fixture.company, fixture.product)).await;
@@ -989,6 +1026,7 @@ async fn a_decline_without_a_reason_is_refused_and_one_with_a_reason_is_recorded
 #[tokio::test]
 async fn re_issuing_a_link_invalidates_the_previous_one() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, _) = create_quote(&fixture, &drafter, quote_body(fixture.company, fixture.product)).await;
@@ -1033,6 +1071,7 @@ async fn re_issuing_a_link_invalidates_the_previous_one() {
 #[tokio::test]
 async fn a_draft_has_no_public_link_and_a_honeypot_is_answered_as_if_the_link_did_not_exist() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, _) = create_quote(&fixture, &drafter, quote_body(fixture.company, fixture.product)).await;
@@ -1136,6 +1175,7 @@ async fn issue_link(fixture: &Fixture, token: &str, id: Uuid) -> String {
 #[tokio::test]
 async fn a_quote_past_its_validity_flips_to_expired_on_the_next_read_and_cannot_be_sent() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
 
@@ -1228,6 +1268,8 @@ async fn a_quote_past_its_validity_flips_to_expired_on_the_next_read_and_cannot_
 #[tokio::test]
 async fn the_quote_routes_answer_the_full_ladder_and_a_foreign_quote_is_a_four_oh_four() {
     let Some(fixture) = Fixture::new().await else { return };
+    // This ladder walk sends the 20% fixture on the happy path, so the policy allows it.
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let reader = fixture.token(&fixture.reader).await;
@@ -1491,6 +1533,8 @@ async fn a_cancelled_quote_is_final_and_says_why() {
 #[tokio::test]
 async fn the_list_filters_composes_and_refuses_an_unknown_sort() {
     let Some(fixture) = Fixture::new().await else { return };
+    // It filters on `status = sent`, so one quote in this walk has to actually reach `sent`.
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
 
@@ -1639,6 +1683,7 @@ async fn the_vocabulary_names_every_status_and_the_organizations_own_defaults() 
 #[tokio::test]
 async fn the_quote_lifecycle_writes_audit_rows_and_emits_the_documented_events() {
     let Some(fixture) = Fixture::new().await else { return };
+    allow_the_fixture_discount(&fixture).await;
     let drafter = fixture.token(&fixture.drafter).await;
     let seller = fixture.token(&fixture.seller).await;
     let (id, _) = create_quote(&fixture, &drafter, quote_body(fixture.company, fixture.product)).await;

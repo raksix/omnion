@@ -274,6 +274,19 @@ pub struct ApprovalQuery {
     pub viewer: Uuid,
 }
 
+/// One bind, tagged with the SQL type it must be sent as.
+///
+/// Two kinds is all this query needs. The tag exists because a bind list of plain strings is
+/// indistinguishable from a list of uuids at the call site, and PostgreSQL's answer to a uuid
+/// compared with text is a `500` rather than a validation error — so the type has to travel with
+/// the value rather than be guessed at the bind site.
+enum Bind {
+    /// `uuid` columns: `requested_by`.
+    Uuid(Uuid),
+    /// `text` columns: `status` and the search term.
+    Text(String),
+}
+
 #[derive(Debug, FromRow)]
 struct ApprovalRow {
     id: Uuid,
@@ -437,22 +450,25 @@ pub async fn list_approvals(
     // becomes a string in the SQL and the first casualty is a quoteable one.
     // `$1` is the organization, bound first; every later slot shifts with the bind list so a
     // scope that adds a clause cannot leave a numbered placeholder pointing at the wrong value.
-    let mut binds: Vec<String> = Vec::new();
+    // The binds carry their **SQL type**, not just their value. A `Vec<String>` was the first
+    // version of this and it sent `requested_by` as text, which PostgreSQL answers with
+    // "operator does not exist: uuid = text" — a `500` on the one scope a seller actually uses.
+    let mut binds: Vec<Bind> = Vec::new();
     match scope {
         ApprovalScope::Pending => sql.push_str(" and a.status = 'pending'"),
         ApprovalScope::RequestedByMe => {
-            binds.push(query.viewer.to_string());
+            binds.push(Bind::Uuid(query.viewer));
             sql.push_str(&format!(" and a.requested_by = ${}", binds.len() + 1));
         }
         ApprovalScope::Decided => sql.push_str(" and a.status <> 'pending'"),
         ApprovalScope::All => {}
     }
     if let Some(wanted) = status {
-        binds.push(wanted.as_str().to_string());
+        binds.push(Bind::Text(wanted.as_str().to_string()));
         sql.push_str(&format!(" and a.status = ${}", binds.len() + 1));
     }
     if let Some(term) = search {
-        binds.push(term);
+        binds.push(Bind::Text(term));
         let slot = binds.len() + 1;
         sql.push_str(&format!(
             " and (lower(q.number) like ${slot} escape '\\' or lower(q.title) like ${slot} escape '\\')"
@@ -463,7 +479,10 @@ pub async fn list_approvals(
 
     let mut statement = sqlx::query_as::<_, ApprovalRow>(&sql).bind(organization_id);
     for bind in &binds {
-        statement = statement.bind(bind);
+        statement = match bind {
+            Bind::Uuid(value) => statement.bind(value),
+            Bind::Text(value) => statement.bind(value),
+        };
     }
     let mut rows: Vec<ApprovalRow> = statement.fetch_all(pool).await?;
 
@@ -654,10 +673,10 @@ pub async fn request_approval(
         let request = open_request(pool, organization_id, quote_id)
             .await?
             .ok_or(SalesError::NotFound("approval request"))?;
+        let _ = existing;
         return Err(SalesError::AlreadyAwaitingApproval {
-            request_id: existing,
             quote_number: number,
-            existing: request,
+            existing: Box::new(request),
         });
     }
 
