@@ -64,7 +64,14 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   # Invoked through `bash` for the same reason as cargo-slot.sh below: the executable bit is
   # not carried by every clone, and a pass that dies holding the slot blocks the other seven
   # writers behind it.
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  #
+  # `$$` is THIS shell, not the qa-slot.sh child, and that distinction is the fix. The place
+  # lives in a holder the reaper must find alive, so a pass killed with SIGKILL — the OOM
+  # killer, a terminal timeout — leaves the holder reparented to init and holding the one
+  # place for the life of the box. Passing our own pid lets the holder watch us and exit on
+  # its own when the pass dies the way no trap can catch.
+  QA_SLOT_PID="$(QA_SLOT_OWNER_PID="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" \
+    bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # Free the place whenever this pass ends, however it ends.
