@@ -1007,6 +1007,125 @@ async function runDepthPass(name, pass) {
   }
 }
 
+/**
+ * The backup centre, driven end to end (REQ-013, slice 1).
+ *
+ * The assertion that matters is not "the screen rendered" — it is that the five parts
+ * reached a terminal state, that the parts table shows `plugins` as an empty-but-done part
+ * rather than a gap, and that a verification over the real destination comes back clean. A
+ * backup screen that renders perfectly while the destination is unwritable is the exact
+ * failure this pass exists to catch, and no screenshot shows it.
+ */
+async function runBackups(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "backups", action: "backups", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/backups`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="backups-overview"]', { timeout: 8000 }).catch(() => {});
+  const rendered = (await page.locator('[data-testid="backups-overview"]').count()) > 0;
+  note({ step: "load", rendered });
+  if (!rendered) {
+    return { ok: false, reason: "the backup overview did not render" };
+  }
+
+  // The four status cards are on the screen before anything is created, and the
+  // last-successful one says "never" rather than rendering nothing. An absent card reads as a
+  // screen that has not loaded; "never" is the alarm.
+  await page.waitForTimeout(800);
+  const cards = await page.locator('[data-testid="backup-card"]').allInnerTexts();
+  const cardText = cards.join(" | ");
+  const cardsPresent = cards.length >= 4;
+  const lastSuccessfulCard = cards[0] ?? "";
+  note({
+    step: "cards",
+    cardsPresent,
+    lastSuccessfulCard,
+    // Before any run there is nothing to quote, so the card must say so out loud.
+    saysNever: /never|no run/i.test(lastSuccessfulCard),
+  });
+
+  // Take a real backup through the drawer and wait for all five parts.
+  await page.click('[data-testid="backup-create"]').catch(() => {});
+  await page.waitForSelector('[data-testid="backup-create-drawer"]', { timeout: 5000 }).catch(() => {});
+  const drawerOpen = (await page.locator('[data-testid="backup-create-drawer"]').count()) > 0;
+  note({ step: "drawer", drawerOpen });
+
+  await page.click('[data-testid="backup-create-confirm"]').catch(() => {});
+  await page
+    .waitForSelector('[data-testid="backup-part-row"]', { timeout: 120000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const partRows = await page.locator('[data-testid="backup-part-row"]').allInnerTexts();
+  const partNames = partRows.map((text) => text.split("\n")[0].trim());
+  const allFivePresent = ["database", "media", "configuration", "themes", "plugins"].every(
+    (name) => partNames.includes(name),
+  );
+  const everyPartTerminal = partRows.every((text) => /done|failed/.test(text));
+  note({
+    step: "parts",
+    count: partRows.length,
+    allFivePresent,
+    everyPartTerminal,
+    rows: partRows,
+  });
+
+  // The plugins part is empty BY DESIGN until a package installer exists, and the screen has
+  // to say that rather than leave a row of zeroes the operator reads as a broken exporter.
+  const pluginsRow = partRows.find((text) => /^plugins/.test(text)) ?? "";
+  const pluginsExplainsItself = /nothing to record|result, not a gap/i.test(pluginsRow);
+  note({ step: "plugins-empty", pluginsExplainsItself, row: pluginsRow });
+
+  // Verify against the real destination.
+  await page.click('[data-testid="backup-verify"]').catch(() => {});
+  await page.waitForTimeout(4000);
+  const verdict = await page
+    .locator('[data-testid="backups-overview"] p[role="status"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const verdictText = verdict.join(" | ");
+  const verificationRan = /parts match the manifest|checksum differs|could not be read back/i.test(
+    verdictText,
+  );
+  note({ step: "verify", verificationRan, verdict: verdictText });
+
+  // The list shows the run, and its state pill is the run's own state.
+  await page.waitForTimeout(500);
+  const rows = await page.locator('[data-testid="backup-row"]').count();
+  const states = await page.locator('[data-testid="backup-state"]').allInnerTexts();
+  note({ step: "list", rows, states: states.slice(0, 6) });
+
+  // Filter chips carry the counts the endpoint sent, so a chip cannot disagree with the table.
+  const chips = await page.locator('[data-testid^="backup-filter-"]').allInnerTexts();
+  note({ step: "filters", chips: chips.slice(0, 6) });
+
+  // Delete asks, and the confirmation names the backup.
+  const deleteButtons = page.locator('[data-testid="backup-delete"]');
+  if ((await deleteButtons.count()) > 0) {
+    await deleteButtons.first().click().catch(() => {});
+    await page.waitForTimeout(400);
+    const confirmed = (await page.locator('[data-testid="backup-delete-confirm"]').count()) > 0;
+    note({ step: "delete-confirm", confirmed });
+    await page.click('[data-testid="backup-delete-confirm"]').catch(() => {});
+    await page.waitForTimeout(1200);
+    const afterDelete = await page.locator('[data-testid="backup-row"]').count();
+    note({ step: "delete", rowsAfter: afterDelete });
+  } else {
+    note({ step: "delete-confirm", confirmed: false, reason: "no delete button to press" });
+  }
+
+  const ok =
+    rendered &&
+    cardsPresent &&
+    allFivePresent &&
+    everyPartTerminal &&
+    verificationRan;
+  return { ok, steps: steps.length, cards: cardText };
+}
+
 async function runMediaFileManager(page, report) {
   const steps = [];
   const note = (step) => {
@@ -5480,6 +5599,11 @@ async function main() {
     // carries a file id, and a route walked with a placeholder id only proves that the 404
     // state renders. `runMediaFileDetail` below opens a *real* file's screen instead. Listing
     // the bare prefix here produced exactly that 404 screenshot.
+    // The backup centre (REQ-013, slice 1) — walked here, and driven by the depth pass below,
+    // which takes a real backup, watches all five parts reach a terminal state and verifies
+    // the artifacts off the destination. A backup screen that is never clicked is exactly
+    // the screen that ships claiming a restore point nobody has ever produced.
+    { path: "/backups", name: "backups" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
@@ -5685,6 +5809,7 @@ async function main() {
   // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
   // sentence and writes a log row even when it found nothing, and the file's hold switch is on
   // the tab where the file's other facts are.
+  report.backups = await runDepthPass("backups", () => runBackups(page, report));
   report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
   log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
 

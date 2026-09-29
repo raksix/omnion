@@ -73,6 +73,7 @@ pub mod ai;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
+pub mod backups;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -608,6 +609,31 @@ pub fn router(state: AppState) -> Router {
     // question. Writing a policy, running a sweep, setting a hold and repairing references are
     // `media.settings.manage`, the key slice 3 already gave the storage screen: retention is
     // the destructive half of the same screen, so it is the same key.
+    // Backup centre (REQ-013). Four keys, and the split is the point: reading the list is
+    // `backup.read`, taking one and verifying one is `backup.create`, and schedules,
+    // retention and settings are `backup.manage` — which deliberately does NOT include
+    // `backup.restore`, so the schedule editor cannot overwrite live content.
+    let backups_read: MethodRouter<AppState, Infallible> =
+        get(backups::list).layer(guards::require(&state, "backup.read"));
+    let backups_create: MethodRouter<AppState, Infallible> =
+        post(backups::create).layer(guards::require(&state, "backup.create"));
+    let backups_status: MethodRouter<AppState, Infallible> =
+        get(backups::status).layer(guards::require(&state, "backup.read"));
+    let backups_detail: MethodRouter<AppState, Infallible> =
+        get(backups::detail).layer(guards::require(&state, "backup.read"));
+    let backups_manifest: MethodRouter<AppState, Infallible> =
+        get(backups::manifest).layer(guards::require(&state, "backup.read"));
+    let backups_verify: MethodRouter<AppState, Infallible> =
+        post(backups::verify).layer(guards::require(&state, "backup.create"));
+    let backups_delete: MethodRouter<AppState, Infallible> =
+        delete(backups::delete).layer(guards::require(&state, "backup.manage"));
+    let backup_schedules_read: MethodRouter<AppState, Infallible> =
+        get(backups::list_schedules).layer(guards::require(&state, "backup.read"));
+    let backup_settings_read: MethodRouter<AppState, Infallible> =
+        get(backups::read_settings).layer(guards::require(&state, "backup.read"));
+    let backup_settings_write: MethodRouter<AppState, Infallible> =
+        put(backups::write_settings).layer(guards::require(&state, "backup.manage"));
+
     let media_retention: MethodRouter<AppState, Infallible> =
         get(media_retention::read).layer(guards::require(&state, "media.read"));
     let media_retention_create: MethodRouter<AppState, Infallible> =
@@ -1005,8 +1031,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/security/rate-limits/test",
-            post(security_limiter::test_rate_limit)
-                .layer(guards::require(&state, "security.read")),
+            post(security_limiter::test_rate_limit).layer(guards::require(&state, "security.read")),
         )
         .route(
             "/security/sign-in-protection",
@@ -1019,8 +1044,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/security/sign-in-protection/probe",
-            post(security_limiter::probe_lockout)
-                .layer(guards::require(&state, "security.read")),
+            post(security_limiter::probe_lockout).layer(guards::require(&state, "security.read")),
         )
         .route(
             "/security/locked-accounts",
@@ -1029,8 +1053,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/security/locked-accounts/{user_id}/unlock",
-            post(security_limiter::unlock)
-                .layer(guards::require(&state, "security.manage")),
+            post(security_limiter::unlock).layer(guards::require(&state, "security.manage")),
         )
         .route(
             "/security/findings/{id}",
@@ -1608,6 +1631,16 @@ pub fn router(state: AppState) -> Router {
         .route("/media/retention/repair", media_retention_repair)
         .route("/media/retention/{id}", media_retention_update)
         .route("/media/retention/{id}", media_retention_delete)
+        .route("/backups", backups_read)
+        .route("/backups", backups_create)
+        .route("/backups/status", backups_status)
+        .route("/backups/{id}", backups_detail)
+        .route("/backups/{id}", backups_delete)
+        .route("/backups/{id}/manifest", backups_manifest)
+        .route("/backups/{id}/verify", backups_verify)
+        .route("/backup-schedules", backup_schedules_read)
+        .route("/backup-settings", backup_settings_read)
+        .route("/backup-settings", backup_settings_write)
         // The hold is on a *file*, so it lives under the file rather than under the policy.
         .route("/media/files/{id}/hold", media_file_hold)
         .route("/media/transformation-presets", media_preset_create)
