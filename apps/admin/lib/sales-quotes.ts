@@ -420,6 +420,214 @@ export function issueSalesQuoteLink(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Approvals (slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** Where a request sits. A union, so a switch cannot miss a case silently. */
+export type SalesApprovalStatus = "pending" | "approved" | "rejected" | "cancelled";
+
+/** Which list the inbox is showing. */
+export type SalesApprovalScope = "pending" | "requested_by_me" | "decided" | "all";
+
+/** The decision half of a request, or `null` while it is still open. */
+export type SalesApprovalDecision = {
+  /** `null` for a cancellation: withdrawn is not a verdict. */
+  outcome: SalesApprovalStatus | null;
+  decided_by: string | null;
+  decider_name: string;
+  comment: string;
+  decided_at: string;
+};
+
+/** One request as the inbox and the quote detail read it. */
+export type SalesApproval = {
+  id: string;
+  organization_id: string;
+  quote_id: string;
+  quote_number: string;
+  quote_title: string;
+  quote_status: SalesQuoteStatus;
+  requested_by: string;
+  requester_name: string;
+  discount_percent: number;
+  threshold_percent: number;
+  currency: string;
+  /** Decimal text. */
+  grand_total: string;
+  note: string;
+  status: SalesApprovalStatus;
+  decision: SalesApprovalDecision | null;
+  /** The panel route for the quote under decision. */
+  subject_url: string;
+  created_at: string;
+  updated_at: string;
+};
+
+/** One page of the inbox. */
+export type SalesApprovalPage = {
+  items: SalesApproval[];
+  next_cursor: string | null;
+  total_estimate: number;
+};
+
+/**
+ * What the send button has to say about a quote.
+ *
+ * `null` means the quote is inside the limit and needs nothing — which is the **common** case and
+ * the reason this is a nullable field rather than an object with a boolean: a screen that renders
+ * `requirement.discount_percent` unconditionally would print "0%" above every ordinary quote.
+ */
+export type SalesApprovalRequirement = {
+  quote_id: string;
+  quote_number: string;
+  discount_percent: number;
+  threshold_percent: number;
+  request: SalesApproval | null;
+};
+
+/** The query of the inbox. */
+export type SalesApprovalQuery = {
+  scope?: SalesApprovalScope;
+  status?: SalesApprovalStatus;
+  search?: string;
+  limit?: number;
+  organization_id?: string | null;
+};
+
+/** One page of the inbox, four ways. */
+export function fetchSalesApprovals(
+  query: SalesApprovalQuery = {},
+): Promise<SalesApprovalPage> {
+  return quotesRequest<SalesApprovalPage>(
+    withQuery("/api/v1/sales/approvals", {
+      scope: query.scope,
+      status: query.status,
+      search: query.search,
+      limit: query.limit,
+      organization_id: query.organization_id ?? undefined,
+    }),
+  );
+}
+
+/** One request with its decision. */
+export function fetchSalesApproval(
+  id: string,
+  organizationId?: string | null,
+): Promise<SalesApproval> {
+  return quotesRequest<SalesApproval>(
+    withQuery(`/api/v1/sales/approvals/${id}`, {
+      organization_id: organizationId ?? undefined,
+    }),
+  );
+}
+
+/** A quote's whole approval history, newest first. */
+export function fetchQuoteApprovals(
+  quoteId: string,
+  organizationId?: string | null,
+): Promise<SalesApproval[]> {
+  return quotesRequest<SalesApproval[]>(
+    withQuery(`/api/v1/sales/quotes/${quoteId}/approvals`, {
+      organization_id: organizationId ?? undefined,
+    }),
+  );
+}
+
+/**
+ * What the builder needs to know about the gate.
+ *
+ * The builder calls this on load rather than reading `max_discount_percent` off the quote: the
+ * threshold lives in the **settings**, so lowering it can make an already-open quote need a
+ * manager, and only this endpoint compares the two.
+ */
+export function fetchApprovalRequirement(
+  quoteId: string,
+  organizationId?: string | null,
+): Promise<SalesApprovalRequirement | null> {
+  return quotesRequest<SalesApprovalRequirement | null>(
+    withQuery(`/api/v1/sales/quotes/${quoteId}/approval-requirement`, {
+      organization_id: organizationId ?? undefined,
+    }),
+  );
+}
+
+/** Ask a manager to look at a discount. */
+export function requestSalesApproval(
+  quoteId: string,
+  note = "",
+  organizationId?: string | null,
+): Promise<SalesApproval> {
+  return quotesRequest<SalesApproval>(
+    withQuery(`/api/v1/sales/quotes/${quoteId}/approval-requests`, {
+      organization_id: organizationId ?? undefined,
+    }),
+    { method: "POST", body: JSON.stringify({ note }) },
+  );
+}
+
+/**
+ * Approve or reject a request.
+ *
+ * The two verbs are named rather than a boolean, because a boolean cannot be misread: a
+ * `decision: "true"` that reached the server as a string would be one careless change away from
+ * approving a rejection.
+ */
+export function decideSalesApproval(
+  id: string,
+  decision: "approve" | "reject",
+  comment = "",
+  organizationId?: string | null,
+): Promise<SalesApproval> {
+  return quotesRequest<SalesApproval>(
+    withQuery(`/api/v1/sales/approvals/${id}/decision`, {
+      organization_id: organizationId ?? undefined,
+    }),
+    { method: "POST", body: JSON.stringify({ decision, comment }) },
+  );
+}
+
+/** Withdraw a request — the requester only; the server refuses anybody else. */
+export function cancelSalesApproval(
+  id: string,
+  organizationId?: string | null,
+): Promise<SalesApproval> {
+  return quotesRequest<SalesApproval>(
+    withQuery(`/api/v1/sales/approvals/${id}/cancel`, {
+      organization_id: organizationId ?? undefined,
+    }),
+    { method: "POST" },
+  );
+}
+
+/** The badge a request's status gets. */
+export function approvalStatusTone(status: SalesApprovalStatus): string {
+  switch (status) {
+    case "approved":
+      return "bg-[color-mix(in_oklab,var(--green)_14%,transparent)] text-green border-green/30";
+    case "rejected":
+      return "bg-[color-mix(in_oklab,var(--red)_12%,transparent)] text-red border-red/30";
+    case "pending":
+      return "bg-[color-mix(in_oklab,var(--warn)_14%,transparent)] text-warn border-warn/30";
+    default:
+      return "bg-canvas text-muted border-line";
+  }
+}
+
+/** The empty-state sentence per tab: a box that says "no results" for all four is a dead end. */
+export function approvalEmptyCopy(scope: SalesApprovalScope): string {
+  switch (scope) {
+    case "requested_by_me":
+      return "You have not asked for a discount approval. A quote over the limit will need one.";
+    case "decided":
+      return "Nothing has been decided yet — the first decision shows up here with its comment.";
+    case "all":
+      return "No approval requests in this organization yet.";
+    default:
+      return "Nothing is waiting on you. Nice.";
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Presentation helpers
 // ---------------------------------------------------------------------------------------------
 

@@ -118,6 +118,7 @@ pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod sales;
+pub mod sales_approvals;
 pub mod sales_quotes;
 pub mod scim;
 pub mod search;
@@ -1192,6 +1193,39 @@ pub fn router(state: AppState) -> Router {
         .route("/sales/quotes/{id}/send", post(sales_quotes::send_quote))
         .route("/sales/quotes/{id}/link", post(sales_quotes::issue_link))
         .route_layer(guards::require(&state, "sales.quotes.send"));
+    // The discount gate (docs/requests/REQ-052, slice 3). Reading the inbox is `sales.quotes.read`
+    // and **deciding is `sales.quotes.send`**, which is the deliberate choice: approving a
+    // discount is the last step before the organization's name goes on a document, so a role that
+    // may not send may not clear the gate that lets it be sent. Raising a request is on the send
+    // key too, because asking for a discount and granting one are the same conversation and a
+    // seller with `.update` but not `.send` is exactly the person who needs this.
+    let sales_approvals_read = Router::new()
+        .route("/sales/approvals", get(sales_approvals::list_approvals))
+        .route("/sales/approvals/{id}", get(sales_approvals::get_approval))
+        .route(
+            "/sales/quotes/{id}/approvals",
+            get(sales_approvals::list_quote_approvals),
+        )
+        .route(
+            "/sales/quotes/{id}/approval-requirement",
+            get(sales_approvals::approval_requirement),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.read"));
+    let sales_approvals_send = Router::new()
+        .route(
+            "/sales/quotes/{id}/approval-requests",
+            post(sales_approvals::request_approval),
+        )
+        .route(
+            "/sales/approvals/{id}/decision",
+            post(sales_approvals::decide_approval),
+        )
+        .route(
+            "/sales/approvals/{id}/cancel",
+            post(sales_approvals::cancel_approval),
+        )
+        .route_layer(guards::require(&state, "sales.quotes.send"));
+
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
     // a document would be prefetched by a crawler and accepted on the customer's behalf.
@@ -1201,6 +1235,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sales/public/quotes/{token}/decline", post(sales_quotes::decline_quote));
 
     let sales = sales_products_read
+        .merge(sales_approvals_read)
+        .merge(sales_approvals_send)
         .merge(sales_products_manage)
         .merge(sales_pricelists_read)
         .merge(sales_pricelists_manage)

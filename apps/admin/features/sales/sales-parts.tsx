@@ -43,6 +43,7 @@ import { fetchSalesVocabulary, type SalesVocabulary } from "@/lib/sales";
  */
 export const SALES_NAV = [
   { href: "/sales/quotes", label: "Quotes", shortcut: "q" },
+  { href: "/sales/approvals", label: "Approvals", shortcut: "a" },
   { href: "/sales/catalog", label: "Catalog", shortcut: "c" },
   { href: "/sales/pricelists", label: "Price lists", shortcut: "p" },
   { href: "/sales/settings", label: "Settings", shortcut: "s" },
@@ -59,6 +60,7 @@ const SHORTCUTS: Shortcut[] = [
   { keys: "e", what: "Edit the selected row" },
   { keys: "n", what: "New record" },
   { keys: "g then q", what: "Go to the quotes" },
+  { keys: "g then a", what: "Go to the approvals" },
   { keys: "g then c", what: "Go to the catalog" },
   { keys: "g then p", what: "Go to the price lists" },
   { keys: "?", what: "Show or hide this sheet" },

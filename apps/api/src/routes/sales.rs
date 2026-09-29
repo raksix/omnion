@@ -833,6 +833,39 @@ impl From<SalesError> for ApiError {
             SalesError::InvalidStatusChange(message) => {
                 Self::bad_request("invalid_sales_status_change", message)
             }
+            // The gate's three refusals. Each is a `409` with the **requirement attached**, not
+            // a `400` with a sentence: nothing the caller typed is wrong, the document is
+            // waiting on somebody else, and a form that only learns "cannot send" has nowhere
+            // to send the person next.
+            SalesError::ApprovalNotGranted(requirement) => Self::new(
+                StatusCode::CONFLICT,
+                "sales_quote_approval_required",
+                requirement.message(),
+            )
+            .with_details(json!({
+                "quote_id": requirement.quote_id,
+                "quote_number": requirement.quote_number,
+                "discount_percent": requirement.discount_percent,
+                "threshold_percent": requirement.threshold_percent,
+                "request": requirement.request,
+            })),
+            SalesError::AlreadyAwaitingApproval { quote_number, existing, .. } => Self::new(
+                StatusCode::CONFLICT,
+                "sales_approval_already_open",
+                format!("quote {quote_number} is already waiting on an approval decision"),
+            )
+            .with_details(json!({ "request": existing })),
+            SalesError::SelfApproval { quote_status } => Self::new(
+                StatusCode::CONFLICT,
+                "sales_approval_self_review",
+                "you cannot decide your own approval request — ask someone else to review it",
+            )
+            .with_details(json!({ "quote_status": quote_status.as_str() })),
+            SalesError::NotRequester { .. } => Self::new(
+                StatusCode::CONFLICT,
+                "sales_approval_not_requester",
+                "only the person who raised this request can withdraw it",
+            ),
             // One message for all three reasons a token does not resolve, so a caller cannot use
             // the error to learn which tokens exist.
             SalesError::InvalidPublicToken => Self::new(

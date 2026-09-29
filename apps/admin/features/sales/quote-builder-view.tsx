@@ -31,12 +31,15 @@ import { ErrorState, toScreenError, type ScreenErrorValue } from "@/components/e
 import { formatMoney, fetchSalesProducts, fieldOf, type SalesProduct } from "@/lib/sales";
 import {
   createSalesQuote,
+  fetchApprovalRequirement,
   fetchSalesQuote,
   fetchSalesQuoteVocabulary,
+  requestSalesApproval,
   saveSalesQuoteLines,
   sendSalesQuote,
   updateSalesQuoteHeader,
   blankQuoteLine,
+  type SalesApprovalRequirement,
   type SalesQuoteDetail,
   type SalesQuoteLineDraft,
   type SalesQuoteVocabulary,
@@ -166,6 +169,56 @@ export function QuoteBuilderView({ quoteId }: { quoteId?: string }) {
 
   const threshold = vocabulary?.discount_approval_threshold ?? 15;
   const needsApproval = maxDiscount > threshold;
+
+  /**
+   * What the server says the gate needs, for the quote **as it is saved**.
+   *
+   * The typed grid above decides `needsApproval` while a seller is still typing; this is the
+   * server's own answer for the stored quote, and it is the one that also carries the open
+   * request. They agree on the threshold and disagree about the request, which is why both are
+   * drawn: the banner would otherwise say "ask a manager" to a quote that was already asked about
+   * three days ago.
+   */
+  const [requirement, setRequirement] = useState<SalesApprovalRequirement | null>(null);
+  const [asking, setAsking] = useState(false);
+
+  const loadRequirement = useCallback(async () => {
+    if (!detail?.quote.id) {
+      setRequirement(null);
+      return;
+    }
+    try {
+      setRequirement(await fetchApprovalRequirement(detail.quote.id, organizationId));
+    } catch {
+      // A banner that cannot read the requirement is still honest: the typed grid's own
+      // comparison is shown, and the send button is refused by the server either way.
+      setRequirement(null);
+    }
+  }, [detail?.quote.id, organizationId]);
+
+  useEffect(() => {
+    void loadRequirement();
+  }, [loadRequirement]);
+
+  const ask = useCallback(async () => {
+    if (!detail) return;
+    setAsking(true);
+    setFormError(null);
+    setFormField(null);
+    try {
+      await requestSalesApproval(detail.quote.id, "", organizationId);
+      // `setReloadToken` is this screen's reload: the quote's own status changes to
+      // `pending_approval`, and the draft the grid is typed into is rebuilt from that row, so
+      // reloading the requirement alone would leave the status badge on the old value.
+      setReloadToken((token) => token + 1);
+      await loadRequirement();
+      setNotice("The request is with a manager now. This quote can be sent once it is approved.");
+    } catch (cause) {
+      setFormError(cause instanceof Error ? cause.message : "The request could not be raised.");
+    } finally {
+      setAsking(false);
+    }
+  }, [detail, loadRequirement, organizationId]);
 
   const setLine = useCallback((index: number, patch: Partial<SalesQuoteLineDraft>) => {
     setDraft((current) => {
@@ -386,17 +439,40 @@ export function QuoteBuilderView({ quoteId }: { quoteId?: string }) {
       ) : null}
 
       {needsApproval && !readOnly ? (
-        <p
+        <div
           data-qa-sales-approval-banner
-          className="flex items-start gap-2 rounded-md border border-warn/40 bg-[color-mix(in_oklab,var(--warn)_10%,transparent)] px-3 py-2 text-[12.5px]"
+          className="flex flex-wrap items-start gap-2 rounded-md border border-warn/40 bg-[color-mix(in_oklab,var(--warn)_10%,transparent)] px-3 py-2 text-[12.5px]"
         >
           <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" aria-hidden />
-          <span>
+          <span className="min-w-[16rem] flex-1">
             A {maxDiscount}% discount is over this organization&apos;s {threshold}% threshold, so
-            this quote needs a manager before it can be sent. Save it as a draft and the approval
-            request is raised from the quote&apos;s page.
+            this quote needs a manager before it can be sent.
+            {requirement?.request ? (
+              <>
+                {" "}
+                {requirement.request.requester_name} asked on{" "}
+                {new Date(requirement.request.created_at).toISOString().slice(0, 10)}.
+              </>
+            ) : (
+              " Save the draft, then ask a manager here."
+            )}
           </span>
-        </p>
+          {/* The button the banner used to only promise. It is drawn on the *saved* quote,
+              because the request row is about a quote — raising one against unsaved lines
+              would ask a manager to approve a document nobody can read. */}
+          {requirement?.request ? null : (
+            <button
+              type="button"
+              disabled={saving || !detail || asking}
+              data-qa-sales-approval-ask
+              onClick={() => void ask()}
+              className="inline-flex items-center gap-1.5 rounded-md border border-line bg-panel px-2.5 py-1.5 text-[12.5px] font-medium disabled:opacity-60"
+            >
+              {asking ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : null}
+              Ask a manager for approval
+            </button>
+          )}
+        </div>
       ) : null}
 
       {notice ? (

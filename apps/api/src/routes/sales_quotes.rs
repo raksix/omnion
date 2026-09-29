@@ -541,7 +541,8 @@ pub async fn cancel_quote(
     let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
     let reason = body.and_then(|Json(body)| body.reason);
-    let cancelled = quotes::cancel_quote(pool, organization_id, quote_id, reason).await?;
+    let cancelled =
+        quotes::cancel_quote(pool, organization_id, quote_id, reason, current.user.id).await?;
 
     record(
         &state,
