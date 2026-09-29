@@ -10,6 +10,9 @@ publish = false
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+# The invalidation drain (REQ-011 slice 3) logs why an event queued nothing. That reason is
+# the only trace of a mis-set trigger, so it cannot live in a `Result` a caller may drop.
+tracing.workspace = true
 thiserror.workspace = true
 time.workspace = true
 uuid.workspace = true
@@ -17,3 +20,11 @@ uuid.workspace = true
 # synchronous `Provider` trait stays synchronous, with the queue worker awaiting on
 # `spawn_blocking`.
 reqwest = { workspace = true, features = ["blocking", "json"] }
+
+[dev-dependencies]
+# The trigger table must only name events the platform records, and the event catalogue is
+# the one place that knows. A dev-dependency rather than a real one: `omnion-events` does
+# not depend on this crate, so there is no cycle, but the CDN layer has no business knowing
+# the catalogue at runtime — it consumes event *names*, and a test that asks the registry
+# whether those names exist is the whole of the guarantee.
+omnion-events = { path = "../events" }

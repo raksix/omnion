@@ -17,6 +17,10 @@
 //! * [`etag`] — the `ETag` and `Vary` that tell a cache *which* stored copy to hand back.
 //! * [`provider`] — the adapter seam the purge worker dispatches through, and the
 //!   catalogue of adapters that actually ship.
+//! * [`purge`] — the queue’s own decisions: target validation, batching, backoff, and the
+//!   fold from item outcomes to a parent status.
+//! * [`invalidation`] — the automatic half (slice 3): a platform event, the trigger
+//!   toggles and the site’s published addresses in, one planned purge out.
 //!
 //! The purge *adapters* are here; the queue, worker and history that drive them (slice 2)
 //! are the persistence layer in `apps/api` on top of [`provider`].
@@ -27,6 +31,7 @@
 pub mod error;
 pub mod etag;
 pub mod headers;
+pub mod invalidation;
 pub mod matcher;
 pub mod provider;
 pub mod purge;

@@ -1429,12 +1429,14 @@ dependencies = [
 name = "omnion-cdn"
 version = "0.1.0"
 dependencies = [
+ "omnion-events",
  "reqwest",
  "serde",
  "serde_json",
  "sqlx",
  "thiserror",
  "time",
+ "tracing",
  "uuid",
 ]
 
