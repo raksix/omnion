@@ -5,6 +5,16 @@
  * `/api/*` to the API origin, so the HttpOnly session cookie is first-party everywhere.
  */
 import type {
+  SecurityBulkResult,
+  SecurityFinding,
+  SecurityFindingFilter,
+  SecurityFindingPage,
+  SecurityFindingStatus,
+  SecurityImportReport,
+  SecurityOverview,
+  HeaderPolicyDocument,
+  HeaderPolicySave,
+  HeaderPolicySaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -118,6 +128,44 @@ type ErrorBody = {
   };
 };
 
+/** The header the API reads the CSRF token back in, matching `CSRF_HEADER` on the server. */
+const CSRF_COOKIE = "omnion_csrf";
+const CSRF_HEADER = "x-omnion-csrf";
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Read one cookie, tolerating the several-cookie headers and whitespace a browser may send. */
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  for (const part of document.cookie.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+    return decodeURIComponent(part.slice(separator + 1).trim());
+  }
+  return null;
+}
+
+/**
+ * The `x-omnion-csrf` header a state-changing request needs, or nothing.
+ *
+ * The API refuses a cookie-authenticated mutation that carries no token (REQ-012, slice 2), and
+ * the token arrives as a readable cookie at sign-in. So every mutating call has to echo it here —
+ * **one** place, or a second screen that forgot would answer `403 csrf_failed` on a save that
+ * works everywhere else, which is the hardest kind of bug to find from a user's report.
+ *
+ * Read-safe methods send nothing: the server never asks for one, and sending it anyway would put
+ * a token in a request that has no need for it. When the cookie is absent (a server-rendered
+ * first paint, a test double) the header is simply omitted and the server's own refusal — which
+ * names the missing secret, or the missing token — is what the operator sees, rather than a
+ * client-side guess about which of the two it is.
+ */
+function csrfHeader(init: RequestInit): Record<string, string> {
+  const method = (init.method ?? "GET").toUpperCase();
+  if (SAFE_METHODS.has(method)) return {};
+  const token = readCookie(CSRF_COOKIE);
+  return token ? { [CSRF_HEADER]: token } : {};
+}
+
 async function readJson(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text) {
@@ -141,6 +189,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         // Only a JSON body gets the JSON content type: an upload sends `FormData`, and the
         // browser has to set that content type itself — including its multipart boundary.
         ...(typeof init.body === "string" ? { "content-type": "application/json" } : {}),
+        ...csrfHeader(init),
         ...init.headers,
       },
     });
@@ -5576,4 +5625,162 @@ export function setRetentionWindow(windowDays: number): Promise<RetentionStatus>
 /** Run one sweep now, and answer with what it actually removed. */
 export function sweepRetention(): Promise<SweepResult> {
   return request<SweepResult>("/api/v1/events/retention/sweep", { method: "POST" });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The posture overview.
+ *
+ * Always fetched with `cache: "no-store"`: the whole point of this screen is that it says what
+ * is true *now*, and a cached overview is a security claim with an expiry nobody chose.
+ */
+export function fetchSecurityOverview(): Promise<SecurityOverview> {
+  return request<SecurityOverview>("/api/v1/security/overview", { cache: "no-store" });
+}
+
+/**
+ * Re-evaluate every check now.
+ *
+ * The answer is a full overview rather than a run id, so the panel replaces what it has with
+ * what the server now believes — a client that merged the new states into the old rows would
+ * keep a stale `pass` for a check the run could not evaluate.
+ */
+export function runSecurityChecks(): Promise<SecurityOverview> {
+  return request<SecurityOverview>("/api/v1/security/checks/run", {
+    method: "POST",
+    cache: "no-store",
+  });
+}
+
+/** The findings list. An unknown filter value is refused by the server by name. */
+export function fetchSecurityFindings(
+  filter: SecurityFindingFilter & { offset?: number; limit?: number } = {},
+): Promise<SecurityFindingPage> {
+  const params = new URLSearchParams();
+  if (filter.severity) params.set("severity", filter.severity);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.component) params.set("component", filter.component);
+  if (filter.search) params.set("search", filter.search);
+  if (filter.offset) params.set("offset", String(filter.offset));
+  if (filter.limit) params.set("limit", String(filter.limit));
+  const query = params.toString();
+  return request<SecurityFindingPage>(
+    `/api/v1/security/findings${query ? `?${query}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** One finding, with the evidence the detail drawer shows. */
+export function fetchSecurityFinding(id: string): Promise<SecurityFinding> {
+  return request<SecurityFinding>(`/api/v1/security/findings/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * The URL the export button points at, carrying the *current* filter.
+ *
+ * A plain href rather than a fetch: the answer is a file, and a client that fetched it and
+ * built a blob URL would have to get the filename, the content type and the error case right
+ * on its own. The filter travels in the query string, which is what makes "export what I am
+ * looking at" true by construction rather than by two parsers agreeing — and the server
+ * deliberately ignores `limit` here, because an export that respects the page size is how a
+ * 50-row file gets read as a 300-row platform's whole posture.
+ */
+export function securityFindingsExportUrl(
+  filter: SecurityFindingFilter = {},
+): string {
+  const params = new URLSearchParams();
+  if (filter.severity) params.set("severity", filter.severity);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.source) params.set("source", filter.source);
+  if (filter.component) params.set("component", filter.component);
+  if (filter.search) params.set("search", filter.search);
+  const query = params.toString();
+  return `/api/v1/security/findings.csv${query ? `?${query}` : ""}`;
+}
+
+/**
+ * Change one finding's status.
+ *
+ * `ignore_reason` is **required by the server** for an ignore and the refusal names the field,
+ * so the form can show it on the input rather than as a generic toast. The client does not
+ * pre-validate it beyond the drawer's disabled button: a second rule that disagreed with the
+ * server's would be a second place to be wrong.
+ */
+export function setSecurityFindingStatus(
+  id: string,
+  change: {
+    status: SecurityFindingStatus;
+    ignore_reason?: string;
+    ignored_until?: string;
+    note?: string;
+  },
+): Promise<SecurityFinding> {
+  return request<SecurityFinding>(`/api/v1/security/findings/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(change),
+  });
+}
+
+/** One change, many findings, and the per-row report of what actually happened. */
+export function bulkSecurityFindingStatus(
+  ids: string[],
+  change: { status: SecurityFindingStatus; ignore_reason?: string; note?: string },
+): Promise<SecurityBulkResult> {
+  return request<SecurityBulkResult>("/api/v1/security/findings/bulk", {
+    method: "POST",
+    body: JSON.stringify({ ids, ...change }),
+  });
+}
+
+/**
+ * Ingest a CI report.
+ *
+ * The document is parsed by the platform, not by this client, and a report carrying anything
+ * that looks like a credential is refused **whole** — which is why the file is read here and
+ * sent as a value rather than being trusted field by field.
+ */
+export function importSecurityReport(
+  report: unknown,
+  source: "dependency" | "report" = "dependency",
+): Promise<SecurityImportReport> {
+  return request<SecurityImportReport>("/api/v1/security/findings/import", {
+    method: "POST",
+    body: JSON.stringify({ report, source }),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 2) — the header policy
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Read the stored header policy and what it currently renders to.
+ *
+ * `no-store` for the same reason the overview is: the screen's whole claim is that these are
+ * the lines the next response will carry, and a cached policy is a policy that may no longer be
+ * the one in force.
+ */
+export function fetchHeaderPolicy(): Promise<HeaderPolicyDocument> {
+  return request<HeaderPolicyDocument>("/api/v1/security/headers", { cache: "no-store" });
+}
+
+/**
+ * Save the header policy.
+ *
+ * `expected_document` is the document the form was opened with and is the compare-and-swap key:
+ * a form somebody else has since saved is **refused** rather than silently overwriting them.
+ * The client never pre-validates a directive — the server owns every rule here, and a second
+ * validator that disagreed with it would be a second place to be wrong.
+ */
+export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySaved> {
+  return request<HeaderPolicySaved>("/api/v1/security/headers", {
+    method: "PUT",
+    body: JSON.stringify(save),
+  });
 }

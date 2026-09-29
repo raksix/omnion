@@ -132,6 +132,18 @@ impl ApiError {
     }
 }
 
+/// The code and the message, and never the details.
+///
+/// `details` is excluded on purpose: it can carry a decision source, a considered list and a
+/// count, which is right in a response body and wrong in a log line or an assertion message.
+/// An error type that cannot be printed is one that never gets printed, so this exists even
+/// though every call site in the codebase uses the accessors.
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
 impl From<CoreError> for ApiError {
     fn from(error: CoreError) -> Self {
         Self::from_core(error)

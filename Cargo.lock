@@ -1375,6 +1375,7 @@ dependencies = [
  "omnion-permissions",
  "omnion-policy-engine",
  "omnion-search",
+ "omnion-security",
  "omnion-storage",
  "omnion-workflows",
  "p256",
@@ -1599,6 +1600,22 @@ name = "omnion-search"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-security"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "time",

@@ -1016,12 +1016,14 @@ pub async fn list_deliveries(
 
     // The cursor is the last row's own `(created_at, id)`, exclusive, so the next page cannot
     // re-serve the row the cursor names.
-    let next_cursor = page.has_more.then(|| page.deliveries.last()).flatten().map(|row| {
-        DeliveryCursorBody {
+    let next_cursor = page
+        .has_more
+        .then(|| page.deliveries.last())
+        .flatten()
+        .map(|row| DeliveryCursorBody {
             at: row.created_at,
             id: row.id,
-        }
-    });
+        });
 
     Ok(Json(DeliveryPageBody {
         deliveries: page.deliveries.iter().map(DeliveryBody::build).collect(),
@@ -1057,14 +1059,18 @@ fn parse_delivery_query(raw: Option<&str>) -> Result<DeliveryQuery, ApiError> {
             "q" => query.q = Some(value),
             "cursor_at" => query.cursor_at = Some(value),
             "cursor_id" => {
-                query.cursor_id = Some(value.parse().map_err(|_| {
-                    invalid_delivery_query("cursor_id", "it is not a uuid")
-                })?)
+                query.cursor_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_delivery_query("cursor_id", "it is not a uuid"))?,
+                )
             }
             "limit" => {
-                query.limit = Some(value.parse().map_err(|_| {
-                    invalid_delivery_query("limit", "it is not a whole number")
-                })?)
+                query.limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_delivery_query("limit", "it is not a whole number"))?,
+                )
             }
             _ => {}
         }
@@ -1202,7 +1208,8 @@ pub async fn redeliver_many(
         ));
     }
 
-    let outcomes = store::redeliver_many(state.db().pool(), endpoint.id, &body.delivery_ids).await?;
+    let outcomes =
+        store::redeliver_many(state.db().pool(), endpoint.id, &body.delivery_ids).await?;
 
     let mut queued = 0;
     let mut skipped = Vec::new();
@@ -1248,7 +1255,10 @@ pub async fn endpoint_stats(
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<EndpointStatsBody>, ApiError> {
     let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
-    let window_hours = query.window_hours.unwrap_or(DEFAULT_STATS_WINDOW_HOURS).clamp(1, 24 * 365);
+    let window_hours = query
+        .window_hours
+        .unwrap_or(DEFAULT_STATS_WINDOW_HOURS)
+        .clamp(1, 24 * 365);
 
     let stats = store::endpoint_stats(
         state.db().pool(),
@@ -1448,8 +1458,9 @@ pub async fn retention_status(
 ) -> Result<Json<RetentionStatusBody>, ApiError> {
     let organization_id = current.user.organization_id;
     let status = store::retention_status(state.db().pool(), organization_id).await?;
-    let recent_runs = store::list_retention_runs(state.db().pool(), organization_id, RETENTION_RUN_HISTORY)
-        .await?;
+    let recent_runs =
+        store::list_retention_runs(state.db().pool(), organization_id, RETENTION_RUN_HISTORY)
+            .await?;
 
     Ok(Json(RetentionStatusBody {
         organization_id,
@@ -1515,9 +1526,12 @@ pub async fn set_retention(
     .await;
 
     let status = store::retention_status(state.db().pool(), Some(organization_id)).await?;
-    let recent_runs =
-        store::list_retention_runs(state.db().pool(), Some(organization_id), RETENTION_RUN_HISTORY)
-            .await?;
+    let recent_runs = store::list_retention_runs(
+        state.db().pool(),
+        Some(organization_id),
+        RETENTION_RUN_HISTORY,
+    )
+    .await?;
 
     Ok(Json(RetentionStatusBody {
         organization_id: Some(organization_id),
