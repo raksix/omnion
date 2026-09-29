@@ -74,6 +74,15 @@ export function ProvisioningView() {
   const { user } = useSession();
   const [tokens, setTokens] = useState<IamProvisioningToken[]>([]);
   const [log, setLog] = useState<IamSyncLogEntry[]>([]);
+  // Two numbers, not one: the total sessions ended, and how many lines contributed. Reporting
+  // "11 sessions ended" without the second is the same sentence that makes an operator believe
+  // eleven are still live — a single line can carry eleven. The counts are summed from the
+  // column and never from `detail`, which is prose and can be re-worded without a type error.
+  // `?? 0` is not defensive noise: a `NaN` here would render as "NaN live sessions ended" on a
+  // security panel, which reads as a *count of sessions* and is worse than showing nothing. One
+  // `??` here is cheaper than a screen that can render a number it does not have.
+  const totalRevoked = log.reduce((sum, entry) => sum + (entry.revoked_sessions ?? 0), 0);
+  const revokingLines = log.filter((entry) => (entry.revoked_sessions ?? 0) > 0).length;
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [loadError, setLoadError] = useState<{ code: string; message: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -506,6 +515,7 @@ export function ProvisioningView() {
                   <th className="px-3 py-2">Resource</th>
                   <th className="px-3 py-2">Action</th>
                   <th className="px-3 py-2">Outcome</th>
+                  <th className="px-3 py-2 text-right">Sessions ended</th>
                   <th className="px-3 py-2">Detail</th>
                 </tr>
               </thead>
@@ -526,12 +536,41 @@ export function ProvisioningView() {
                         {entry.outcome}
                       </span>
                     </td>
+                    {/* The count is the column `detail` cannot be: the sentence below already says
+                        it in English, and this is the one that can be summed, sorted, or read by
+                        a screen reader as a number. A deactivation badge is the whole reason an
+                        operator opens this tab after an offboarding — "deactivated" says the
+                        account is out and nothing about whether the tokens in that person's
+                        browser still work. */}
+                    <td
+                      data-sync-revoked={entry.revoked_sessions ?? 0}
+                      className={`px-3 py-1.5 text-right tabular-nums ${
+                        (entry.revoked_sessions ?? 0) > 0 ? "font-medium text-danger" : "text-muted/70"
+                      }`}
+                    >
+                      {(entry.revoked_sessions ?? 0) > 0 ? entry.revoked_sessions : "—"}
+                    </td>
                     <td className="px-3 py-1.5 text-muted">{entry.detail}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+        ) : null}
+
+        {log.length > 0 ? (
+          <p data-sync-revoked-total className="text-[11.5px] text-muted">
+            {/* A total across the page, and it is derived from the numbers rather than from the
+                sentences: a sum that re-parses `detail` would silently read 0 the day the wording
+                changes, and the failure mode is a security panel quietly under-reporting an
+                offboarding. It says which lines it covers, because "11 sessions ended" next to
+                a page of 20 rows invites the reading that eleven are still live. */}
+            {totalRevoked === 0
+              ? "No live session was ended by any line on this page."
+              : `${totalRevoked} live session${totalRevoked === 1 ? "" : "s"} ended by ${
+                  revokingLines === 1 ? "one line" : `${revokingLines} lines`
+                } on this page. Tokens not counted here were either already dead or ended by a line outside the current page.`}
+          </p>
         ) : null}
       </section>
     </div>

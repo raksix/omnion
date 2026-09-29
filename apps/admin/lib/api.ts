@@ -3535,6 +3535,13 @@ export type IamSyncLogEntry = {
   action: string;
   outcome: string;
   detail: string;
+  /**
+   * Live sessions this line ended (`0126`). Always a number: 0 means the line revoked nothing,
+   * which is the true answer for a create or a group write. The panel must not re-parse `detail`
+   * to get this — the sentence in `detail` is for a reader, and two consumers parsing it
+   * differently is how a security panel ends up quoting a wrong figure to somebody leaving.
+   */
+  revoked_sessions: number;
   created_at: string;
 };
 
