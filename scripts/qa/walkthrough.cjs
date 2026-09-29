@@ -7142,7 +7142,18 @@ async function main() {
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
 
   for (const p of report.pages) {
+    // **A page without diagnostics is not a page without findings.** The roll-up is the ONLY
+    // place a `high` becomes visible — the walk itself just records — so an entry that skipped
+    // the measurement (a navigation that never rendered, a page closed under memory pressure)
+    // used to throw `Cannot read properties of undefined (reading 'horizontalOverflow')` and
+    // discard every finding the pass had earned. This exact crash ended the 12:09 pass on this
+    // branch, and it is the reason two runs in a row wrote `summary.json` containing only a
+    // `fatal` string: the pass was not failing, its report was failing to be assembled.
     const d = p.diagnostics;
+    if (!d) {
+      pushFindings("medium", "unmeasured-page", `${p.name}: no diagnostics were recorded, so this screen was not judged`);
+      continue;
+    }
     if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
     if (d.offscreen.length) pushFindings("high", "offscreen", `${p.name}: ${d.offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(d.offscreen[0])}`);
     if (d.brokenImages.length) pushFindings("high", "broken-image", `${p.name}: ${d.brokenImages.join(", ")}`);
