@@ -1,6 +1,6 @@
 -- Sales: the per-organization document numbering (docs/requests/REQ-052, slice 2).
 --
--- `0051_sales.sql` already declares the quote tables, so this adds only what the quote *writer*
+-- `0053_sales.sql` already declares the quote tables, so this adds only what the quote *writer*
 -- needs and that table did not: somewhere to keep the next document number.
 --
 -- Why a table and not a PostgreSQL sequence or `max(number) + 1`:

@@ -254,7 +254,7 @@ pub struct NewQuote {
     #[serde(default)]
     pub owner_user_id: Option<Uuid>,
     /// The last day the customer may accept.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_until: Option<time::Date>,
     /// How the customer pays, printed next to the totals.
     #[serde(default)]
@@ -311,7 +311,7 @@ pub struct QuotePatch {
     #[serde(default)]
     pub title: Option<String>,
     /// The last day the customer may accept.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_until: Option<time::Date>,
     /// How the customer pays.
     #[serde(default)]
@@ -346,7 +346,7 @@ pub struct QuoteQuery {
     #[serde(default)]
     pub expiring_in_days: Option<i32>,
     /// Only quotes valid on or after this day.
-    #[serde(default)]
+    #[serde(default, with = "crate::dates::option")]
     pub valid_from: Option<time::Date>,
     /// Only quotes whose grand total is at or above this amount.
     #[serde(default)]
@@ -1288,10 +1288,14 @@ async fn list_lines(pool: &PgPool, quote_id: Uuid) -> Result<Vec<QuoteLineView>>
 
 async fn list_versions(pool: &PgPool, quote_id: Uuid) -> Result<Vec<QuoteVersionView>> {
     let rows = sqlx::query_as::<_, (i32, String, serde_json::Value, serde_json::Value, OffsetDateTime)>(
+        // Each amount is projected **as text**, deliberately: the live quote's totals arrive as
+        // strings (money crosses the boundary as text — see `store.rs`), so a frozen version that
+        // carried JSON numbers would make the version history need a second formatter, and a
+        // `numeric` in JSON is a float by the time a browser parses it.
         "select version, currency, lines, jsonb_build_object(
-                    'subtotal', subtotal, 'discount_total', discount_total,
-                    'tax_total', tax_total, 'grand_total', grand_total,
-                    'max_discount', max_discount),
+                    'subtotal', subtotal::text, 'discount_total', discount_total::text,
+                    'tax_total', tax_total::text, 'grand_total', grand_total::text,
+                    'max_discount', max_discount::text),
                 sent_at
            from sales_quote_versions
           where quote_id = $1
@@ -1698,11 +1702,18 @@ pub async fn send_quote(
 
     // The frozen totals are the same four numbers the header carries, so a version and the live
     // quote it came from cannot disagree: they are read from one row in one pass.
+    //
+    // `organization_id` is bound rather than defaulted: the snapshot table is `not null` on it
+    // because every table in this migration carries the tenant, and a snapshot without one could
+    // not be listed by a future "which versions of this organization's quotes exist" query
+    // without a join back to a row that may itself be archived.
     sqlx::query(
-        "insert into sales_quote_versions (quote_id, version, currency, lines, subtotal,
-                discount_total, tax_total, grand_total, max_discount)
-         values ($1, $2, $3, $4, $5::numeric, $6::numeric, $7::numeric, $8::numeric, $9::numeric)",
+        "insert into sales_quote_versions (organization_id, quote_id, version, currency, lines,
+                subtotal, discount_total, tax_total, grand_total, max_discount)
+         values ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9::numeric,
+                 $10::numeric)",
     )
+    .bind(organization_id)
     .bind(quote_id)
     .bind(version)
     .bind(&row.currency)

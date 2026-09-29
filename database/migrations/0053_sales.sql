@@ -194,7 +194,13 @@ create table sales_quotes (
     grand_total      numeric(14,2)   not null default 0,
     max_discount     numeric(5,2)   not null default 0,
 
-    version           integer        not null default 1,
+    -- 0 until the quote is sent, then the number of the version the customer last read. 0 is a
+    -- real state, not a placeholder: it is what says "this document has never left the building",
+    -- and it is what makes the first snapshot version 1 rather than 2. The first version of this
+    -- column was `default 1` with `check (version >= 1)`, which pushed every first send to
+    -- version 2 — a customer reading "v2" on the first document anybody ever sent them, and a
+    -- gap in a sequence whose whole point is that it has none.
+    version           integer        not null default 0,
     public_token_hash text,
     public_token_expires_at timestamptz,
     sent_at          timestamptz,
@@ -216,15 +222,20 @@ create table sales_quotes (
         subtotal >= 0 and discount_total >= 0 and tax_total >= 0 and grand_total >= 0
     ),
     constraint sales_quotes_max_discount_range check (max_discount >= 0 and max_discount <= 100),
-    constraint sales_quotes_version_positive check (version >= 1),
+    constraint sales_quotes_version_non_negative check (version >= 0),
     -- A decline that does not say why is a refusal a person cannot act on, and an acceptance with
     -- a decline reason is a contradiction. Both are refused at the row, not in a form.
     constraint sales_quotes_decline_consistent check (
         (status = 'declined') = (decline_reason is not null and btrim(decline_reason) <> '')
     ),
-    -- A sent quote is the moment the customer was given a document, so it must say when — and a
-    -- draft that claims to have been sent is a link that resolves to a promise nobody made.
-    constraint sales_quotes_sent_consistent check ((status = 'draft') = (sent_at is null))
+    -- A draft that claims to have been sent is a link that resolves to a promise nobody made.
+    --
+    -- One direction only, deliberately. The first draft of this constraint read
+    -- `(status = 'draft') = (sent_at is null)`, which also forbids a **draft that was cancelled**:
+    -- the cancel sets `status` and leaves `sent_at` null, and the row is then refused by its own
+    -- table. Cancelling a draft nobody ever sent is the most ordinary withdrawal there is, so the
+    -- converse is not a rule this schema can hold.
+    constraint sales_quotes_sent_consistent check (sent_at is null or status <> 'draft')
 );
 
 create unique index sales_quotes_number_per_organization
