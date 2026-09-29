@@ -161,6 +161,19 @@ pub enum ContentError {
     /// purpose: a redirect for a site that was deleted is a caller bug, not a missing resource.
     #[error("no such site")]
     SiteNotFound,
+    /// No comment carries this identifier, or it belongs to another site (REQ-064 slice 4a).
+    #[error("no such comment")]
+    CommentNotFound,
+    /// The comment is already in the state the request asked for. A separate variant from
+    /// `CommentNotFound` because the two mean opposite things: one is "there is no such
+    /// comment", the other is "that comment is already approved" — and a bulk action that hit
+    /// this is a no-op, not a failure.
+    #[error("{0}")]
+    CommentAlreadyInState(String),
+    /// A banned address tried to comment. The message names the reason a moderator recorded,
+    /// because "you are banned" with no reason is the one answer a person will argue with.
+    #[error("comment refused: {0}")]
+    CommentBanned(String),
 }
 
 /// Result alias used across the content crate.
@@ -214,6 +227,9 @@ impl ContentError {
             Self::RedirectNotFound => "redirect_not_found",
             Self::InvalidSeo(_) => "invalid_seo",
             Self::BrokenLinkNotFound => "broken_link_not_found",
+            Self::CommentNotFound => "comment_not_found",
+            Self::CommentAlreadyInState(_) => "comment_already_in_state",
+            Self::CommentBanned(_) => "comment_banned",
             Self::SiteNotFound => "site_not_found",
         }
     }

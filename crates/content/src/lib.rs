@@ -15,6 +15,7 @@ pub mod error;
 pub mod forms;
 pub mod menus;
 pub mod model;
+pub mod page_comments;
 pub mod pages;
 pub mod patterns;
 pub mod publishing;
