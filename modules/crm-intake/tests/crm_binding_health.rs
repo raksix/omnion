@@ -32,6 +32,21 @@
 //!
 //! The last one is the assertion most likely to be deleted by a future reader as obvious, and
 //! it is the one that keeps a red badge from meaning "install the forms module".
+//!
+//! ## The `Unknown` state is not driven from this file, and the reason is a fixed defect
+//!
+//! Reaching `Unknown` through `capture` needs a payload of `{}`, which maps to no contactable
+//! value, so `capture` takes the *rejected* branch — and until migration `0159` that branch
+//! raised `23514` from `crm_leads_contactable_check`, so this half could not be driven at all.
+//! That was written down here as a *unit test on purpose*, which is the sentence shape a real
+//! bug wears while it is still being defended.
+//!
+//! The check is now narrowed to the three verdict statuses and the rejected row is written, so
+//! the case is provable through `capture` — and it is proven in `tests/crm_verdict_rows.rs`
+//! rather than here, because this file's fixtures exist to prove the health check's three
+//! answers and a second copy of the same line in a second database proves nothing extra. The
+//! property that genuinely needs no form module is asserted in the module, at
+//! `binding_health::tests::an_unknown_answer_never_clears_a_recorded_one`.
 
 use omnion_module_crm_intake::store::{self, Submission};
 use omnion_module_crm_intake::{MappingEntry, NewIntakeSource};
@@ -206,23 +221,6 @@ async fn a_recorded_break_makes_the_sources_own_predicate_agree() {
 
     drop_org(&pool, org).await;
 }
-
-/// The unknown half, at the only level it is reachable from here — see the note below.
-///
-/// **This is a unit test on purpose, and the reason is a pre-existing defect.** The unknown
-/// state needs a form-bound source whose key list cannot be read at all: no `cms_forms` row, no
-/// stored lead, and a submission carrying no keys. The only payload that reaches it is `{}`,
-/// and `{}` maps to no contactable value, so `capture` takes the *rejected* branch — which
-/// writes a lead with neither e-mail nor phone and is refused by `crm_leads_contactable_check`
-/// with a `23514`. The same failure is visible in the `crm_autoresponder` gate, which documents
-/// the rejected case as unreachable for this reason and works around it.
-///
-/// So on this branch the unknown state is not reachable through `capture`, and pretending
-/// otherwise would have meant a test that passes for a reason nobody could name. The property
-/// that matters is asserted where it is provable instead — see
-/// `binding_health::tests::an_unknown_answer_never_clears_a_recorded_one` in the module. The
-/// defect is recorded in the BUILD-LOG for its own slice: REQ-117 acceptance 5 says a rejected
-/// row is written, and on any real installation it raises `23514` instead.
 
 /// The other half of "not fatal": a source the check cannot judge still captures a lead. A
 /// health check that can lose an enquiry is worse than the broken mapping it reports.

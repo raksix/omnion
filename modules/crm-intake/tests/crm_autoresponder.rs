@@ -278,10 +278,17 @@ async fn a_rejected_submission_is_answered_by_nothing_and_says_why() {
     let now = time::OffsetDateTime::now_utc();
 
     // A spam submission, which is the case the REQ names ("a rejected spam submission sends
-    // nothing") and the one that can carry an address. The `rejected` case is unreachable
-    // through this fixture on purpose: `crm_leads_contactable_check` refuses a row with
-    // neither e-mail nor phone at the database, so a rejected lead is rejected *because* it
-    // could never be answered — and the pure half covers that verdict in a unit test.
+    // nothing") and the one that can carry an address. The `rejected` (non-spam) case is
+    // **not** driven here on purpose, and not because of a limitation: this file's subject is
+    // the autoresponder's *verdicts*, and a rejected row with no address is proven end to end —
+    // written, stored, claimed, and repairable — by `tests/crm_verdict_rows.rs`. Repeating it
+    // here would run the same fixture in a second database and prove the same line twice.
+    //
+    // (Until migration `0159` this note was a workaround: `crm_leads_contactable_check` refused
+    // a row with neither e-mail nor phone at the database, so the rejected case genuinely could
+    // not be written here. The sentence is kept because it is the reason the test is shaped
+    // this way, and because "unreachable on purpose" was exactly how a real defect hid for
+    // twenty ticks.)
     //
     // The honeypot key is written through a binding, not inline: `json!({ <expr>: value })` is
     // a *value*, not a key, so a non-literal key would be dropped and the honeypot would never

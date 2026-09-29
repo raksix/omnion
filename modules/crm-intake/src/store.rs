@@ -1791,9 +1791,13 @@ pub struct LeadPatch {
 
 /// Edit a lead.
 ///
-/// The `crm_leads_contactable_check` constraint is the backstop: an edit that removes both
-/// the e-mail and the phone is refused by the database with the constraint's own message, and
-/// the platform prefers that to a lead nobody can answer.
+/// The `crm_leads_contactable_check` constraint is the backstop for a write that routes around
+/// this function, and it is **narrower than it reads**: migration `0159` lets a `rejected`,
+/// `spam` or `duplicate` row exist with neither address, because REQ-117 requires the refusal
+/// itself to be recorded. This guard is therefore the only thing refusing the *edit* — a
+/// rejected row arrived without an address on purpose, and an operator who then clears both
+/// fields of an accepted lead has not made it a verdict, they have made it unanswerable. The
+/// message names the rule rather than surfacing a constraint violation.
 pub async fn patch_lead(
     pool: &PgPool,
     organization_id: Uuid,
