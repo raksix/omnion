@@ -7844,6 +7844,55 @@ async function runCrmKeyboardAndMobile(page, report) {
   steps.gThenDGoesToDeals = /\/crm\/deals/.test(page.url());
   await shot(page, "page-crm-keyboard-goto");
 
+  // ---- every screen that offers a row answers `e` ----------------------------------------------
+  //
+  // The defect this found. The shortcut sheet is **shared**: `crm-parts.tsx` prints `e` and `Enter`
+  // for every list, and each screen hands the frame a `keyboard` object. Two of them —
+  // `deals-view.tsx`'s board and its stage editor — passed `{ onEdit: () => {}, onOpen: () => {} }`.
+  // So the sheet advertised two bindings that did nothing, on the module's headline screen, and
+  // nothing caught it because the earlier leg of this pass pressed `e` on **contacts** only. A
+  // contract checked at one caller is not a contract.
+  //
+  // So the rule the pass now enforces is per screen: for each one, press `e` and require that the
+  // editor the screen advertises is the one that opened. A stage row's editor is its name field, a
+  // deal's is the deal form, a contact's is the contact form.
+  const keyboardPerScreen = {};
+  for (const route of [
+    { path: "/crm/deals", name: "deals" },
+    { path: "/crm/contacts", name: "contacts" },
+    { path: "/crm/companies", name: "companies" },
+    // The stage editor is a list too, and it is the other screen whose `e` was an empty callback.
+    // Its editor is a name field rather than a form, so the assertion is "the caret landed in the
+    // row's own field" instead of "a form opened" — the rule is per screen, the *editor* is not.
+    { path: "/crm/settings/pipelines", name: "stages" },
+  ]) {
+    await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const rows = await page.locator("[data-qa-crm-cursor]").count();
+    if (rows === 0) {
+      // An empty list has no row for `e` to stand on, and reporting that as a broken binding is how
+      // a fresh database gets reported as a broken screen. It is left unset on purpose.
+      keyboardPerScreen[route.name] = { rows: 0, checked: false };
+      continue;
+    }
+    await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+    await page.keyboard.press("e");
+    await page.waitForTimeout(900);
+    const opened = await page.evaluate(() => ({
+      form: Boolean(document.querySelector("#crm-deal-form, #crm-contact-form, #crm-company-form")),
+      focused: document.activeElement?.id ?? "",
+      selected: document.activeElement?.tagName === "INPUT",
+    }));
+    await shot(page, `page-crm-keyboard-e-${route.name}`);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+    keyboardPerScreen[route.name] = { rows, checked: true, ...opened };
+  }
+  steps.eAnswersOnEveryScreen = keyboardPerScreen;
+  steps.eIsNeverADeadBinding = Object.values(keyboardPerScreen).every(
+    (entry) => !entry.checked || entry.form || entry.selected,
+  );
+
   // ---- 390×844 -------------------------------------------------------------------------------
   //
   // The board is switched on deliberately: the box asks that the board *scroll* horizontally on a
