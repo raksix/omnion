@@ -6534,3 +6534,65 @@ the same pass.
 `moveReportRendered` out of the run, and fix whatever they show. (b) Slice 4's `transfer-ownership`
 and the limits tables, which 0164 never created. (c) REQ-118 slice 1a's acceptance 16 — the one line
 this branch's longest-standing open claim depends on.
+
+## Wave 4b / w8 tick 32 — REQ-133 slice 4: three defects, two of them the compiler's
+
+**What.** Migration `0170_automation_project_limits.sql` and `crates/workflows/src/limits.rs`: per-project
+limits, daily usage counters, and `transfer_ownership`. **`3f7f335`**.
+
+**Two of the three defects this slice produced were found by the compiler before a single test ran,
+and both would have passed every unit test on the branch.**
+
+1. **`new_role` was computed and then discarded.** The insert hardcoded `'owner'`, so promoting a
+   `viewer` produced an *owner who cannot edit anything*. Worse: because `remove_member`'s refusal
+   counts owners, such an account also blocks that refusal from ever firing for a real owner. The
+   warning was `unused variable: new_role` — the variable that exists precisely to be used, dead.
+   **A unit test asserting the role would have passed: it would have asserted what was written.**
+2. **A nullable column fetched through `fetch_optional` asks for `Option<Option<Uuid>>`**, and sqlx
+   answers `ColumnDecode: UnexpectedNullError`. `owner_user_id` is `on delete set null`, so
+   "a project with no owner" is a **real state a real installation reaches by deleting an account** —
+   and the code could not transfer a project in that state at all. Now read as
+   `(bool, Option<Uuid>)` in one statement, and `transfer_ownership` returns `Option<Uuid>` rather
+   than inventing an owner.
+3. **Mine, and the most instructive one:** the warning unit test read
+   `assert!(Limits::warns(79), "79 of 100 does not")`. The assertion said *warns* and the message said
+   *does not* — so it passed only while the function was wrong, and failed the moment it was fixed.
+   **A negated claim needs `assert!(!…)`; the message is not the negation.** It was green in the run
+   before, and the failure read as "the code broke" when the code was right.
+
+**Where the limits guard lives, and why that is the whole argument.** `ensure_run_within_limits` is
+called from `store::create_execution_in`, beside the archive guard, in the same transaction — because
+three of the four ways a run starts never pass through an HTTP handler. It reads the counters through
+a **connection**, not a pool: a pool read there would be a second connection reading counters the open
+transaction is about to change, which on a project one below its cap refuses the run that would have
+been the last one. That is the same check-then-write shape the archive guard was moved away from three
+ticks ago.
+
+**Two decisions that are decisions.**
+- **A `0` limit means unlimited, not none.** 0170 backfills every project with a zero row, so the other
+  reading makes a fresh installation unable to start a single run — a dead platform with a working UI.
+  Asserted in the module and again in `a_fresh_project_is_unlimited_rather_than_broken`.
+- **The archive refusal wins over the limit refusal.** A project that is both archived and over quota is
+  refused with `project_archived`, because "restore it" is the remedy that works and "raise the limit"
+  is not. Pinned by `an_archived_project_still_refuses_runs_before_the_limit_is_consulted`.
+
+**Proof.**
+- `scripts/qa/run-project-limits.sh` → **14/14**, and **proven to fail at 11/14** with the guard call
+  deleted: the three enforcement tests fail, the other eleven stay green.
+- `cargo test -p omnion-workflows --lib` → **56/56**. `run-workflow-move.sh` 13/13.
+  `run-project-isolation.sh` 14/14. Clippy: clean on every file this slice touched.
+
+**A test defect worth more than the product defects.** `the_transfer_is_audited_under_its_own_action_name`
+fetched *the newest row of that action across all projects* and compared its ids against this test's —
+so with the suite running concurrently it read whichever sibling committed first and failed on a stranger's
+data. **A test that can pass against another test's data is worse than one that fails.** Scoped by
+`project_id` now. Same family as the sibling fixture's "namespace per test, not per entity".
+
+**Not claimed.** The limits screen, the 80 percent warning's delivery, the CSV export and the transfer's
+two confirmations do not exist. Acceptance 9, 10 and 12 each say which half is proved and which is waiting
+on a screen. The project screens are still un-walked — the pass in flight started before this slice and
+before the walkthrough gained the move step.
+
+**Next.** (a) The limits screen: usage bars with the instance default as a placeholder, the warning at 80,
+the CSV export, and the two-confirmation transfer dialog. (b) The project-scoped audit screen. (c) REQ-118
+slice 1a's acceptance 16, still the longest-standing open claim on this branch.
