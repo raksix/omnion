@@ -681,7 +681,7 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
     //     drift is observable: a field rename reaches the CRM as a submission whose payload no
     //     longer has the old key, and the moment that answer becomes true is the moment the
     //     platform has evidence for it.
-    record_binding_health(pool, &source, &submission).await;
+    record_binding_health(pool, &source, submission).await;
 
     let spam = SpamVerdict::evaluate(&submission.payload);
     let attribution = merge_attribution(
