@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; `origin/main` merged in `928249f`; browser gate **red** as of tick 21 — the harness's own `--only` scope matched every route (`1aa8930`), and the re-run showed `cdn-purges` rendering 0 elements against three healthy sibling routes) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; `origin/main` merged in `0caa8c6`; browser gate still **red** after tick 22 — the tick-21 "0 elements" reading is **not reproduced** (every route in the re-run reported 30–42), and the pass is now blocked on the box rather than the code: `71d55cb` closed the second half of the scope defect, where nine depth passes ran outside `QA_ONLY` and the pass spent its time in `search-depth` instead of reaching `/cdn/purges`) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
