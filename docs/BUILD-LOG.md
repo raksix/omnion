@@ -5881,3 +5881,94 @@ what might be there. (b) `objects/` grows one file per object, and the delete ro
 remove the directory as well as the run's own JSON — check that before the restore wizard
 exists, because an operator who deletes a backup and finds the files still there will assume
 the product lied.
+
+## Wave 4b / w8 tick 26 — REQ-133 slice 1, and two artifacts my own merge had broken
+
+**The first hour of this tick was repair, and both repairs were mine.** The merge that opened the
+tick (`bec70b8`, merging `origin/main` into `wave8`) resolved three conflicts by hand and got two
+of them wrong in ways nothing in the build could see:
+
+1. **`docs/BUILD-LOG.md` was committed with its conflict markers still in it** — `<<<<<<< HEAD`
+   at line 5090 and `>>>>>>> origin/main` at 5885, with 503 of my lines and 290 of main's in
+   between. Fixed by splicing both sides (`f7e7a9e`), verified by **multiset rather than line
+   count**: `Counter(merged) == base + ours + theirs`, because a line count cannot tell a
+   correctly merged document from one with a block duplicated, and this file is append-only with
+   heavy repeated prose — exactly the shape where a count passes and the content is wrong.
+2. **`scripts/qa/walkthrough.cjs` was committed UNPARSEABLE.** The conflict kept the other
+   side's comment body and dropped the `/**` that opens it, so the file stops at line 1125 —
+   and it is the entire QA pass, meaning every writer on this box was invoking a harness that
+   cannot start. `node --check` names it in one line (`96f1494`).
+
+**The lesson is not "be careful with conflicts"; it is that no gate in this build reads the QA
+harness.** `cargo` never parses `scripts/qa/*.cjs` and `tsc` never sees them, so a merge can
+break the pass completely while every tick's own verification stays green. The one-line check
+that finds it belongs in the tick, and it costs nothing: **`node --check` on every script the
+pass runs.** It was only found because the syntax error surfaced while writing a *different*
+gate in the same file — a second instance of the recurring lesson that the useful assertion is
+usually the one written for a neighbouring feature.
+
+**What shipped.** REQ-133 slice 1, the automation project container, in five commits.
+
+`52c18c9` **migration `0164`**, and the decision it exists to make safe is the **ORDER**, because
+every part of it is a constraint applied to rows that already exist: create the table, create one
+DEFAULT project per organization, add a NULLABLE `project_id` to `workflows`, backfill, and
+*only then* apply `not null`. Apply the constraint first and the migration is refused outright on
+any populated database; apply it last and a row inserted between the two steps can never be
+backfilled. Foreign keys are `on delete restrict`, not cascade — a cascade would make "delete a
+project" a way to delete twenty workflows without an audit row for any of them.
+
+`28fc225` **the store**, whose two rules are why the module has this shape: a resource without an
+explicit project lands in the organization's default, decided by **one** function rather than by
+each insert path (slice 2 makes every automation query project-scoped, and the cheapest way to
+make that safe is for there to be exactly one answer to "which project"); and a read of a resource
+the caller may not see is `404`, not `403`, because a `403` on a read is an enumeration oracle.
+`default_project` uses `insert … on conflict do nothing` and then reads the row back — the same
+shape this engine's round-robin cursor and claim tables use: **insert, and let the row count be
+the decision.**
+
+`ca1192d` **the four permission keys**, `9bea093` **the API**, `b76eaba` **the two screens**,
+`afa9ac2` **the depth pass**.
+
+**Proof.** `scripts/qa/run-automation-projects.sh` **12/12 and PROVEN TO FAIL**. The gate builds
+a **populated** database — two organizations, a user, three workflows — and only then applies
+0164, because on an empty database the backfill has nothing to do and `not null` is trivially
+satisfiable. **The empty case is the one that cannot fail**, and a migration that has only ever
+been applied to an empty database has been tested for nothing. Inverting the order so `not null`
+precedes the backfill is refused verbatim — `ERROR: column "project_id" of relation "workflows"
+contains null values`, exit 3 — and the restore was `md5sum`-checked against a saved copy rather
+than eyeballed. `omnion-workflows` lib **48/0**, `omnion-permissions` **63/0**, `omnion-api` lib
+**249/0**, admin `tsc --noEmit` clean.
+
+**Three defects the slice found, none of them by reading the code.**
+
+* **None of the four permission keys existed in the catalogue.** The route table asks the guard
+  for `projects.read`, and the guard's answer to a key the catalogue does not know is a refusal
+  with no reason a reader can act on — so every route would have answered `403` on a feature
+  that compiles, typechecks and is fully written. A catalogued key and a guard key are the same
+  string in two files, and nothing in the build compares them. The new catalogue test asserts the
+  four exist *and* that slice 3/4's three do not, which is the half that keeps a later writer
+  from adding a key with no route behind it.
+* **A gate I wrote asserted something false, and the product was right.** "No base role holds
+  `projects.admin`" fails for `owner` and `administrator`, which are `BasePermissions::All` and
+  hold every catalogued key by construction. Asserting otherwise would be asserting the role
+  system does not work. The claim worth locking is the narrower true one: no **hand-written**
+  role list carries the key that overrides membership.
+* **The key validator told a nine-digit key it "uses lower case or a symbol."** Reachable only
+  by the length branch, and it sent the reader looking for a problem the key does not have. The
+  message now names length when length is the fault. Its test was also wrong in the same
+  direction: the fixture `"too-long"` is eight characters, so it failed on its lower case before
+  the length rule was ever consulted — **a fixture that is invalid for a different reason tests
+  the wrong branch and reads as coverage.**
+
+**Not done, and said rather than buried.** The two new screens are **un-walked**: the QA slot is
+held by a sibling's live pass (holder pid alive, load 17, ~0 MB free of 32 G), and starting a
+fifth Chromium on that box produces a result nobody should trust. The `projects` depth pass is
+wired and parses, but has never run against a browser. Slice 1 stays `in-progress` for that
+reason alone — the code and the migration gate are done, the screens are not observed.
+
+**Next.** (1) `QA_STACK=w8 … bash scripts/qa/run.sh` when the slot clears — the list screen, the
+detail screen, the protected default row and the not-found state are all asserted by a pass that
+has not run. (2) `node --check` on the QA harness belongs in every tick of every writer, not just
+this one; it is the only gate that reads the file. (3) Slice 2, isolation enforcement — the
+per-query project scoping, the `404` semantics and the save-time cross-reference validation, which
+is the slice that turns the container into a boundary.
