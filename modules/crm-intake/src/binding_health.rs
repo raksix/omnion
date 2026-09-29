@@ -114,7 +114,11 @@ impl BindingHealth {
 /// keyed endpoint's payload is the form's live schema: a submission that carries `email` is
 /// evidence that the surface still has `email`, and a check that ignored it would break a
 /// working integration on the strength of a missing optional table.
-pub async fn available_form_keys(pool: &sqlx::PgPool, source: &IntakeSource) -> Result<Option<Vec<String>>> {
+pub async fn available_form_keys(
+    pool: &sqlx::PgPool,
+    source: &IntakeSource,
+    submission_payload: &Value,
+) -> Result<Option<Vec<String>>> {
     let Some(form_key) = source.form_key.as_deref().map(str::trim).filter(|key| !key.is_empty())
     else {
         return Ok(None);
@@ -126,9 +130,22 @@ pub async fn available_form_keys(pool: &sqlx::PgPool, source: &IntakeSource) -> 
         }
     }
 
-    // No table, or the form is not in it: fall back to the payload's own keys when the
-    // submission carries any, so a live capture surface is evidence of its own health.
-    let keys = payload_keys(pool, source.id).await?;
+    // No table, or the form is not in it: fall back to the payload's own keys, so a live
+    // capture surface is evidence of its own health.
+    //
+    // **The submission in hand is counted first, and that ordering is the whole point.** The
+    // first draft read only *stored* leads, which cannot work: the check runs before the lead
+    // is written, so on the very first submission after a rename there is no stored payload,
+    // the list is empty, and the answer is `Unknown`. The rename would be detected on the
+    // second submission — one enquiry later, and only if a second one ever arrived. A form
+    // that takes one quote request a week would go a week without saying so. The payload the
+    // platform is holding *right now* is better evidence than one it stored earlier.
+    let mut keys = payload_keys(submission_payload);
+    for stored in payload_keys_of_recent_leads(pool, source.id).await? {
+        if !keys.iter().any(|existing| existing == &stored) {
+            keys.push(stored);
+        }
+    }
     if keys.is_empty() {
         Err(crate::error::CrmIntakeError::invalid(
             HealthUnknown::FormsModuleAbsent.message(),
@@ -136,6 +153,14 @@ pub async fn available_form_keys(pool: &sqlx::PgPool, source: &IntakeSource) -> 
     } else {
         Ok(Some(keys))
     }
+}
+
+/// The top-level keys of one submission payload.
+fn payload_keys(payload: &Value) -> Vec<String> {
+    payload
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// The stored field list of one form, when the forms module is installed and the form exists.
@@ -179,7 +204,14 @@ async fn form_keys_from_table(
 }
 
 /// The distinct payload keys the last submissions of one source carried.
-async fn payload_keys(pool: &sqlx::PgPool, source_id: Uuid) -> Result<Vec<String>> {
+///
+/// A union with the submission in hand, not a replacement for it: a field the form removed
+/// shows up here as a key that has *stopped* appearing, which is only visible against a
+/// history. One submission alone cannot tell "renamed away" from "this form never had it".
+async fn payload_keys_of_recent_leads(
+    pool: &sqlx::PgPool,
+    source_id: Uuid,
+) -> Result<Vec<String>> {
     let mut rows = sqlx::query_scalar::<_, serde_json::Value>(
         "select payload from crm_leads where source_id = $1 and payload <> '{}'::jsonb \
          order by received_at desc limit 20",
@@ -232,8 +264,12 @@ fn object_keys(value: &Value) -> Vec<String> {
 /// The pure part ([`crate::mapping::health`]) is what decides `Broken`; this function only
 /// supplies the available-key list and never computes a verdict of its own, so the interesting
 /// behaviour is testable without a database.
-pub async fn check(pool: &sqlx::PgPool, source: &IntakeSource) -> Result<BindingHealth> {
-    let Some(keys) = available_form_keys(pool, source).await? else {
+pub async fn check(
+    pool: &sqlx::PgPool,
+    source: &IntakeSource,
+    submission_payload: &Value,
+) -> Result<BindingHealth> {
+    let Some(keys) = available_form_keys(pool, source, submission_payload).await? else {
         return Ok(BindingHealth::Unknown(HealthUnknown::NotFormBound));
     };
     if keys.is_empty() {
