@@ -994,9 +994,19 @@ async fn document_database(
 }
 
 /// The `media` part: the library's objects, counted by site.
+///
+/// The `::bigint` cast on the size column is not decoration. `sum()` over a `bigint` returns
+/// `numeric`, and `coalesce(sum(size_bytes), 0)` does **not** narrow it: the `0` is coerced to
+/// the other argument's type, so the result is still `numeric`, and sqlx refuses to decode it
+/// into an `i64`. The symptom is that a site with media in it cannot be backed up at all — the
+/// part fails, the run lands on `partial`, and the other four parts are written anyway, so the
+/// failure reads as "the media part is flaky" rather than "this expression has the wrong type".
+///
+/// `::bigint` and deliberately **not** `::int`: a total that wraps at 2 GiB would report a
+/// plausible small number, which is worse than an error somebody can see.
 async fn document_media(pool: &sqlx::PgPool) -> std::result::Result<serde_json::Value, ApiError> {
     let rows: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-        "select site_id, count(*), coalesce(sum(size_bytes), 0) from media \
+        "select site_id, count(*), coalesce(sum(size_bytes), 0)::bigint from media \
          where deleted_at is null group by site_id order by site_id",
     )
     .fetch_all(pool)

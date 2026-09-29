@@ -212,12 +212,13 @@ pub fn with_csrf_secret(config: &mut omnion_core::config::Config) {
     config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
 }
 
-/// Raise this process's sign-in budget, once.
+/// Give this process a sign-in budget large enough for the walks in it.
 ///
 /// The limiter is a **process-wide** cell that `router()` fills from the *stored* document, and
 /// the stored `sign_in` scope is ten requests per five minutes. A suite that signs in three
 /// accounts per walk and runs fifteen walks is refused at the eleventh sign-in, and every walk
-/// after it dies on a line that has nothing to do with what it was testing.
+/// after it dies on a line that has nothing to do with what it was testing — a failure that
+/// names a rate limit on a suite that was never testing rate limits.
 ///
 /// Raising the ceiling here does not weaken the limiter suite: that suite installs and asserts
 /// its own numbers, and whichever fixture installs first wins the cell — so a suite that needs
@@ -225,7 +226,15 @@ pub fn with_csrf_secret(config: &mut omnion_core::config::Config) {
 /// Only `sign_in` is raised; the other ceilings stay as a deployment ships them, so no suite
 /// here can be the reason a genuinely over-budget request stops being refused.
 ///
-/// `OnceLock` because the limiter is global: installing per walk would be a race, not a reset.
+/// `OnceLock` because the limiter is global: installing per walk would be a race, not a reset,
+/// and the cell has no reset of its own.
+///
+/// # Not a claim about a defect
+///
+/// Both suites this tick needed (`media_shares`, `media_retention`) ran green with the *shipped*
+/// `sign_in` budget, so nothing in this tick proves the cell is a problem in them. It is here
+/// for the suites that do sign in many times, and it is the shape `--test media` already uses —
+/// lifted, not invented.
 static RATE_BUDGET: OnceLock<()> = OnceLock::new();
 
 /// Give this process a sign-in budget large enough for the walks in it.
