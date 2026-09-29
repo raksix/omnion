@@ -312,14 +312,24 @@ pub async fn run_checks(
     // The bus is told after the write commits, and never after: a consumer that sees an id it
     // cannot yet fetch is the one ordering bug a subscriber cannot detect — it just gets a
     // 404 and concludes the platform lied.
-    bus::emit(
+    //
+    // A failure here is logged rather than surfaced, for the same reason as the audit write
+    // above: the run and its results are already stored, so a 500 would report a scan as lost
+    // when the operator will see its rows on the very next read. Discarding the `Result`
+    // silently — which is what the bare statement compiled to — is the one version of this that
+    // is genuinely wrong, because it makes an event bus outage indistinguishable from a scan
+    // that was never subscribed to.
+    if let Err(error) = bus::emit(
         state.db().pool(),
         NewEvent::new("security.scan.completed")
             .organization(session.user.organization_id)
             .actor(session.user.id)
             .payload(json!({ "run_id": run_id, "checks": results.len() })),
     )
-    .await;
+    .await
+    {
+        tracing::warn!(error = %error, "the scan was recorded but the event was not emitted");
+    }
 
     let stored = latest_results(state.db().pool(), organization)
         .await
@@ -479,7 +489,12 @@ pub async fn patch_status(
     .await
     .map_err(map_store)?;
 
-    record_audit(
+    // The status change is already stored above, and the audit entry is the only record that
+    // somebody resolved a finding rather than leaving it open — so a failure here is logged,
+    // not swallowed. `.ok()` reads as deliberate and is not: it makes a missing audit trail
+    // indistinguishable from one that was never asked for, and the request that would have
+    // written it answered 200.
+    if let Err(error) = record_audit(
         state.db().pool(),
         NewAuditEntry::by_user(session.user.id, "security.finding.resolved")
             .organization(session.user.organization_id)
@@ -487,7 +502,13 @@ pub async fn patch_status(
             .metadata(json!({ "status": body.status })),
     )
     .await
-    .ok();
+    {
+        tracing::warn!(
+            error = %error,
+            finding = %id,
+            "the finding status was stored but the transition was not audited"
+        );
+    }
 
     Ok(Json(FindingBody::from(finding)))
 }

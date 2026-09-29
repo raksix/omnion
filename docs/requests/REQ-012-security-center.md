@@ -1,6 +1,17 @@
 # REQ-012 — Security Center
 
 > **Status:** in-progress — **slices 1 and 2 are code-complete; neither has a browser pass.** `crates/security` (posture registry, findings store, lifecycle), migration `0054_security_posture.sql`, the `/security` + `/security/findings` screens and the API behind three separate powers (`security.read` / `security.scan` / `security.manage`). Unit tests: 39 crate + 62 permissions. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+>
+> **The migration gap is not what is blocking the pass.** Earlier revisions of this file and of
+> `docs/BUILD-LOG.md` recorded that `main`'s `0018 → 0021` gap makes `migrate()` fail on any
+> fresh database and therefore stops `scripts/qa/run.sh` at step 1. That is wrong, and
+> `apps/api/tests/migration_gap.rs` proves it on 2026-09-29: sqlx's
+> `validate_applied_migrations` only rejects an *applied* version the binary cannot see, and a
+> fresh database has no applied rows, so a clean install migrates fine. The gap's real victim is
+> a **restore from a branch that had a 0019** — that row is applied and invisible here, so the
+> runner refuses, which is the correct behaviour and is now the second test. A fresh QA database
+> is not a restore, so the pass is unblocked. What is actually holding passes right now is the
+> one-pass-per-box slot, which two sibling waves have legitimately occupied.
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
