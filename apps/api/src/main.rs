@@ -11,8 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_retention_runner, event_runner,
-    publishing_runner, search_runner, workflow_runner,
+    analytics_runner, automation_runner, event_retention_runner, event_runner, publishing_runner,
+    search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};

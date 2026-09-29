@@ -179,7 +179,11 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
         db.pool(),
         NewRole {
             organization_id,
-            key: format!("{}-{}", slug_key(label), &Uuid::new_v4().simple().to_string()[..8]),
+            key: format!(
+                "{}-{}",
+                slug_key(label),
+                &Uuid::new_v4().simple().to_string()[..8]
+            ),
             name: label.to_owned(),
             description: format!("{label} role"),
             priority: 400,
@@ -316,13 +320,19 @@ fn block(kind: &str, props: Value) -> Value {
 fn hero_group() -> Value {
     json!([
         block("heading", json!({ "text": "Ship faster", "level": "h1" })),
-        block("text", json!({ "text": "One core for content, workflow and API." })),
-        block("cta", json!({
-            "title": "Start today",
-            "body": "No card, no trial clock.",
-            "label": "Get started",
-            "href": "/signup"
-        })),
+        block(
+            "text",
+            json!({ "text": "One core for content, workflow and API." })
+        ),
+        block(
+            "cta",
+            json!({
+                "title": "Start today",
+                "body": "No card, no trial clock.",
+                "label": "Get started",
+                "href": "/signup"
+            })
+        ),
     ])
 }
 
@@ -586,14 +596,20 @@ async fn a_page_created_from_a_template_keeps_the_sample_content() {
         .map(|entry| entry["key"].as_str().unwrap_or_default())
         .collect();
     for wanted in ["landing", "about", "pricing", "blog-post", "contact"] {
-        assert!(keys.contains(&wanted), "{wanted} must be in the gallery: {keys:?}");
+        assert!(
+            keys.contains(&wanted),
+            "{wanted} must be in the gallery: {keys:?}"
+        );
     }
     let landing = templates
         .iter()
         .find(|entry| entry["key"] == "landing")
         .expect("the landing template");
     let template_blocks = landing["blocks"].as_array().expect("an array").len();
-    assert!(template_blocks > 0, "a template with no blocks is a blank page");
+    assert!(
+        template_blocks > 0,
+        "a template with no blocks is a blank page"
+    );
     let landing_id = landing["id"].as_str().expect("an id").to_owned();
 
     // Build the page from it.
@@ -857,9 +873,12 @@ async fn a_pattern_is_saved_sanitised_and_reported_on() {
 
     let dirty = json!([
         block("heading", json!({ "text": "Clean", "level": "h1" })),
-        block("raw_html", json!({
-            "html": "<p>Kept</p><script>alert(1)</script>"
-        })),
+        block(
+            "raw_html",
+            json!({
+                "html": "<p>Kept</p><script>alert(1)</script>"
+            })
+        ),
     ]);
     let saved = call(
         &fixture.state,

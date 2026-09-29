@@ -397,9 +397,11 @@ impl From<ContentError> for ApiError {
             // Patterns and page templates (REQ-063 slice 3) follow the same shape as pages: a
             // missing row is a 404, a key an organization already uses is a 409 — not a 400,
             // because nothing about the request is malformed, the name is simply taken.
-            ContentError::PatternNotFound => {
-                Self::new(StatusCode::NOT_FOUND, "pattern_not_found", "no such pattern")
-            }
+            ContentError::PatternNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "pattern_not_found",
+                "no such pattern",
+            ),
             ContentError::PatternKeyTaken(key) => Self::new(
                 StatusCode::CONFLICT,
                 "pattern_key_taken",
@@ -433,7 +435,11 @@ impl From<ContentError> for ApiError {
                 "menu_key_taken",
                 format!("this site already has a menu with the key {key:?}"),
             ),
-            ContentError::MenuLocationTaken { location, holder_key, .. } => Self::new(
+            ContentError::MenuLocationTaken {
+                location,
+                holder_key,
+                ..
+            } => Self::new(
                 StatusCode::CONFLICT,
                 "menu_location_taken",
                 format!(
@@ -480,6 +486,30 @@ impl From<ContentError> for ApiError {
             }
             ContentError::InvalidSchedule(message) => {
                 Self::bad_request("invalid_schedule", message)
+            }
+            // SEO toolkit (REQ-064 slice 3). A loop is 409, not 400: the request is well formed
+            // and the site is simply not in a state that allows it — the same "that is taken"
+            // shape a duplicate key gets, and the distinction matters because the panel offers a
+            // different next step for each.
+            ContentError::InvalidRedirect(message) => {
+                Self::bad_request("invalid_redirect", message)
+            }
+            ContentError::RedirectLoop(message) => {
+                Self::new(StatusCode::CONFLICT, "redirect_loop", message)
+            }
+            ContentError::RedirectNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "redirect_not_found",
+                "no such redirect rule",
+            ),
+            ContentError::InvalidSeo(message) => Self::bad_request("invalid_seo", message),
+            ContentError::BrokenLinkNotFound => Self::new(
+                StatusCode::NOT_FOUND,
+                "broken_link_not_found",
+                "no such broken link",
+            ),
+            ContentError::SiteNotFound => {
+                Self::new(StatusCode::NOT_FOUND, "site_not_found", "no such site")
             }
             other => Self::bad_request("invalid_request", other.to_string()),
         }

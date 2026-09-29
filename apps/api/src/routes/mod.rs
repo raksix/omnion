@@ -76,6 +76,7 @@ pub mod automation;
 pub mod blocks;
 pub mod commands;
 pub mod content;
+pub mod forms;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -96,7 +97,6 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
-pub mod forms;
 pub mod menus;
 pub mod notifications;
 pub mod notifications_admin;
@@ -108,6 +108,7 @@ pub mod scim;
 pub mod search;
 pub mod security;
 pub mod security_headers;
+pub mod seo;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -429,8 +430,7 @@ pub fn router(state: AppState) -> Router {
     let pattern = get(patterns::get_pattern)
         .layer(guards::require(&state, "content.blocks.read"))
         .merge(
-            put(patterns::update_pattern)
-                .layer(guards::require(&state, "content.patterns.manage")),
+            put(patterns::update_pattern).layer(guards::require(&state, "content.patterns.manage")),
         )
         .merge(
             delete(patterns::delete_pattern)
@@ -476,8 +476,8 @@ pub fn router(state: AppState) -> Router {
     // REQ-063: the block-level compare two revisions, on the same read key as reading either
     // of them — looking at a history is `content.pages.read`, and needing a second permission to
     // ask what changed inside it would only teach authors to restore instead of compare.
-    let page_revision_diff = get(content::diff_revision)
-        .layer(guards::require(&state, "content.pages.read"));
+    let page_revision_diff =
+        get(content::diff_revision).layer(guards::require(&state, "content.pages.read"));
 
     let page_revision_comments =
         get(content::list_revision_comments).layer(guards::require(&state, "content.pages.read"));
@@ -976,10 +976,8 @@ pub fn router(state: AppState) -> Router {
     // is a genuinely separate power: an account that may publish a page should not thereby
     // rewrite the site's header. The public payload carries no guard at all, because a theme
     // that needs a session to draw its navigation cannot be rendered by anything.
-    let menus_list =
-        get(menus::list_menus).layer(guards::require(&state, "menus.read"));
-    let menus_create =
-        post(menus::create_menu).layer(guards::require(&state, "menus.manage"));
+    let menus_list = get(menus::list_menus).layer(guards::require(&state, "menus.read"));
+    let menus_create = post(menus::create_menu).layer(guards::require(&state, "menus.manage"));
     let menu_read = get(menus::get_menu).layer(guards::require(&state, "menus.read"));
     let menu_write = put(menus::update_menu)
         .layer(guards::require(&state, "menus.manage"))
@@ -998,8 +996,8 @@ pub fn router(state: AppState) -> Router {
     // queue" separately from "who may change it" without making either safer.
     let publishing_queue =
         get(menus::list_queue).layer(guards::require(&state, "content.pages.schedule"));
-    let publishing_entry = put(menus::reschedule_entry)
-        .layer(guards::require(&state, "content.pages.schedule"));
+    let publishing_entry =
+        put(menus::reschedule_entry).layer(guards::require(&state, "content.pages.schedule"));
     let publishing_entry_cancel =
         post(menus::cancel_entry).layer(guards::require(&state, "content.pages.schedule"));
     let publishing_entry_now =
@@ -1016,34 +1014,57 @@ pub fn router(state: AppState) -> Router {
     // person at some point. The public submit route carries no guard at all: it is the endpoint
     // a stranger's browser posts to.
     let forms_list = get(forms::list_forms).layer(guards::require(&state, "forms.read"));
-    let forms_create =
-        post(forms::create_form).layer(guards::require(&state, "forms.manage"));
+    let forms_create = post(forms::create_form).layer(guards::require(&state, "forms.manage"));
     let form_read = get(forms::get_form).layer(guards::require(&state, "forms.read"));
     let form_write = put(forms::update_form)
         .layer(guards::require(&state, "forms.manage"))
         .merge(delete(forms::delete_form).layer(guards::require(&state, "forms.manage")));
-    let form_fields =
-        put(forms::save_form_fields).layer(guards::require(&state, "forms.manage"));
-    let form_publish =
-        post(forms::set_form_status).layer(guards::require(&state, "forms.manage"));
+    let form_fields = put(forms::save_form_fields).layer(guards::require(&state, "forms.manage"));
+    let form_publish = post(forms::set_form_status).layer(guards::require(&state, "forms.manage"));
     // The inbox: reading it AND changing a row's state take the same key, because an inbox you
     // may read but not act on is a screen with buttons that answer 403.
-    let submissions_list = get(forms::list_submissions)
-        .layer(guards::require(&state, "forms.submissions.read"));
+    let submissions_list =
+        get(forms::list_submissions).layer(guards::require(&state, "forms.submissions.read"));
     let submissions_bulk = patch(forms::bulk_submission_status)
         .layer(guards::require(&state, "forms.submissions.read"));
-    let submissions_export = get(forms::export_submissions)
-        .layer(guards::require(&state, "forms.submissions.read"));
-    let submission_read = get(forms::get_submission)
-        .layer(guards::require(&state, "forms.submissions.read"));
+    let submissions_export =
+        get(forms::export_submissions).layer(guards::require(&state, "forms.submissions.read"));
+    let submission_read =
+        get(forms::get_submission).layer(guards::require(&state, "forms.submissions.read"));
     let submission_write = patch(forms::set_submission_status)
         .layer(guards::require(&state, "forms.submissions.read"))
         .merge(
-            delete(forms::delete_submission).layer(guards::require(&state, "forms.submissions.read")),
+            delete(forms::delete_submission)
+                .layer(guards::require(&state, "forms.submissions.read")),
         );
     // Unauthenticated, like the rendered menu: a form on a live page is posted to by browsers
     // that have no account on this installation.
     let public_form_submit = post(forms::public_submit);
+
+    // SEO toolkit (REQ-064, slice 3). TWO powers, and the split is the same one the CMS has
+    // drawn everywhere: `seo.read` looks at a site's search setup, `seo.manage` changes it.
+    // The public routes below carry no guard at all — a sitemap, a robots.txt and a redirect are
+    // what a crawler asks for before it has any account anywhere.
+    let seo_overview = get(seo::get_seo_overview).layer(guards::require(&state, "seo.read"));
+    let page_seo_read = get(seo::get_page_seo).layer(guards::require(&state, "seo.read"));
+    let page_seo_write = put(seo::put_page_seo).layer(guards::require(&state, "seo.manage"));
+    let seo_redirect_create =
+        post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
+    let seo_redirect_write = put(seo::update_redirect)
+        .layer(guards::require(&state, "seo.manage"))
+        .merge(delete(seo::delete_redirect).layer(guards::require(&state, "seo.manage")));
+    let seo_redirect_test = post(seo::test_redirect).layer(guards::require(&state, "seo.read"));
+    let seo_settings_write = put(seo::put_settings).layer(guards::require(&state, "seo.manage"));
+    let seo_sitemap_regenerate =
+        post(seo::regenerate_sitemap).layer(guards::require(&state, "seo.manage"));
+    let seo_broken_read = get(seo::list_broken_links).layer(guards::require(&state, "seo.read"));
+    let seo_broken_scan = post(seo::scan_broken_links).layer(guards::require(&state, "seo.manage"));
+    let seo_broken_write =
+        patch(seo::set_broken_link_ignored).layer(guards::require(&state, "seo.manage"));
+    // Unauthenticated by nature — see the note above.
+    let public_sitemap = get(seo::public_sitemap);
+    let public_robots = get(seo::public_robots);
+    let public_redirect = get(seo::public_redirect);
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -1350,6 +1371,13 @@ pub fn router(state: AppState) -> Router {
         .route("/publishing/queue/{id}/retry", publishing_entry_retry)
         .route("/pages/{id}/schedule", page_schedule)
         .route("/public/menus/{location}", public_menu)
+        // The three public SEO surfaces. The host is a path parameter rather than a header so
+        // they can be cached and proxied like any other file, and so a crawler following a
+        // canonical URL lands on the right site without a `Host` header being trusted through a
+        // CDN that rewrites it.
+        .route("/public/{host}/sitemap.xml", public_sitemap)
+        .route("/public/{host}/robots.txt", public_robots)
+        .route("/public/{host}/redirect", public_redirect)
         // Forms and their inbox (REQ-064, slice 2). The static segments are declared before the
         // parameter ones so axum ranks them ahead of `{id}` — `/forms/{id}/submissions/export`
         // is a literal, and a route registered after `/forms/{id}/submissions/{sid}` would never
@@ -1362,9 +1390,11 @@ pub fn router(state: AppState) -> Router {
         .route("/forms/{id}/submissions", submissions_list)
         .route("/forms/{id}/submissions", submissions_bulk)
         .route("/forms/{id}/submissions/export", submissions_export)
-        .route("/forms/{id}/submissions/{sid}", submission_read.merge(submission_write))
+        .route(
+            "/forms/{id}/submissions/{sid}",
+            submission_read.merge(submission_write),
+        )
         .route("/public/forms/{key}/submit", public_form_submit)
-
         .route("/pages/{id}/preview", page_preview)
         .route("/pages/{id}/restore", page_restore)
         .route("/pages/{id}/revisions", page_revisions)
@@ -1381,6 +1411,23 @@ pub fn router(state: AppState) -> Router {
             "/pages/{id}/revisions/{revision_id}/translations/{language}",
             page_translation,
         )
+        // SEO toolkit (REQ-064, slice 3). The page tab hangs off `/pages/{id}/seo` beside the
+        // other per-page sub-resources, and the site-wide surface lives under `/seo` with the
+        // settings under `/sites/{id}/seo` — three prefixes for one feature, because each names
+        // a different scope and a single one would have made a page's SEO a site-level route
+        // with a page id in the query.
+        .route("/pages/{id}/seo", page_seo_read.merge(page_seo_write))
+        .route("/seo/settings", seo_overview)
+        .route("/seo/redirects", seo_redirect_create)
+        .route("/seo/redirects/{id}", seo_redirect_write)
+        .route("/seo/redirects/{id}/test", seo_redirect_test)
+        .route("/sites/{site_id}/seo/settings", seo_settings_write)
+        .route(
+            "/sites/{site_id}/seo/sitemap/regenerate",
+            seo_sitemap_regenerate,
+        )
+        .route("/seo/broken-links", seo_broken_read.merge(seo_broken_scan))
+        .route("/seo/broken-links/{id}", seo_broken_write)
         .route("/media", media)
         .merge(media_upload)
         .route("/media/{id}", media_entry)

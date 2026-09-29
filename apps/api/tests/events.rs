@@ -918,7 +918,6 @@ async fn the_bus_records_events_and_delivers_signed_webhooks() {
     harness.dispose().await;
 }
 
-
 /// REQ-063 acceptance 16: the two events a block system adds reach a subscribed endpoint, and
 /// the retry ladder redelivers when the receiver refuses.
 ///
@@ -1005,7 +1004,9 @@ async fn the_block_events_reach_a_subscribed_endpoint_and_redeliver() {
         ))
         .await;
     assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
-    let revision_no = saved.body["draft"]["revision_no"].as_i64().expect("a revision");
+    let revision_no = saved.body["draft"]["revision_no"]
+        .as_i64()
+        .expect("a revision");
 
     // The event exists on the feed before anything is delivered, and its payload is the hint and
     // not the body.
@@ -1081,7 +1082,10 @@ async fn the_block_events_reach_a_subscribed_endpoint_and_redeliver() {
         .await;
     assert_eq!(published.status, StatusCode::OK, "{:?}", published.body);
     let feed = harness
-        .call(get("/api/v1/events?name=page.published", Some(&owner_token)))
+        .call(get(
+            "/api/v1/events?name=page.published",
+            Some(&owner_token),
+        ))
         .await;
     let events = feed.body["events"].as_array().expect("events").clone();
     assert_eq!(events.len(), 1, "{:?}", feed.body);
@@ -1104,7 +1108,12 @@ async fn the_block_events_reach_a_subscribed_endpoint_and_redeliver() {
         .expect("the publication reached the endpoint as well");
     assert_eq!(publication.json()["payload"]["slug"], json!("blocks"));
     assert!(
-        signature::verify(&secret, publication.timestamp, &publication.body, &publication.signature),
+        signature::verify(
+            &secret,
+            publication.timestamp,
+            &publication.body,
+            &publication.signature
+        ),
         "the publication is signed with the same secret"
     );
 
@@ -1139,8 +1148,14 @@ async fn the_block_events_reach_a_subscribed_endpoint_and_redeliver() {
     assert_eq!(saved_again.status, StatusCode::OK, "{:?}", saved_again.body);
 
     let first = tick(&harness).await;
-    assert_eq!(first.retried, 1, "the refusal is recorded, not swallowed: {first:?}");
-    assert_eq!(first.failed, 0, "one attempt does not exhaust the ladder: {first:?}");
+    assert_eq!(
+        first.retried, 1,
+        "the refusal is recorded, not swallowed: {first:?}"
+    );
+    assert_eq!(
+        first.failed, 0,
+        "one attempt does not exhaust the ladder: {first:?}"
+    );
 
     after_backoff().await;
     let second = tick(&harness).await;

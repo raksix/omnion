@@ -46,7 +46,11 @@ const MANAGER_PERMISSIONS: [&str; 4] = [
 ];
 
 /// What the curator adds on top: writing menus and scheduling pages.
-const CURATOR_EXTRA: [&str; 3] = ["menus.manage", "content.pages.schedule", "content.pages.publish"];
+const CURATOR_EXTRA: [&str; 3] = [
+    "menus.manage",
+    "content.pages.schedule",
+    "content.pages.publish",
+];
 
 /// Result of one in-process HTTP call, in the pieces the assertions need.
 struct TestResponse {
@@ -181,7 +185,11 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
         db.pool(),
         NewRole {
             organization_id,
-            key: format!("{}-{}", label.to_lowercase().replace(' ', "-"), &Uuid::new_v4().simple().to_string()[..8]),
+            key: format!(
+                "{}-{}",
+                label.to_lowercase().replace(' ', "-"),
+                &Uuid::new_v4().simple().to_string()[..8]
+            ),
             name: label.to_owned(),
             description: format!("{label} role"),
             priority: 400,
@@ -336,7 +344,13 @@ impl Fixture {
         created.body["id"].as_str().expect("an id").to_owned()
     }
 
-    async fn create_menu(&self, token: &str, key: &str, name: &str, locations: Vec<&str>) -> String {
+    async fn create_menu(
+        &self,
+        token: &str,
+        key: &str,
+        name: &str,
+        locations: Vec<&str>,
+    ) -> String {
         let response = call(
             &self.state,
             request(
@@ -429,8 +443,12 @@ async fn two_menus_hold_header_and_footer_and_a_third_is_refused() {
     };
     let token = fixture.curator().await;
 
-    let header = fixture.create_menu(&token, "primary", "Primary", vec!["header"]).await;
-    let footer = fixture.create_menu(&token, "legal", "Legal", vec!["footer"]).await;
+    let header = fixture
+        .create_menu(&token, "primary", "Primary", vec!["header"])
+        .await;
+    let footer = fixture
+        .create_menu(&token, "legal", "Legal", vec!["footer"])
+        .await;
 
     // Both claims stand, and the site has two menus.
     let listed = call(
@@ -467,8 +485,7 @@ async fn two_menus_hold_header_and_footer_and_a_third_is_refused() {
         contested.body
     );
     assert_eq!(
-        contested.body["error"]["code"],
-        "menu_location_taken",
+        contested.body["error"]["code"], "menu_location_taken",
         "the refusal must name the reason: {}",
         contested.body
     );
@@ -483,7 +500,9 @@ async fn two_menus_hold_header_and_footer_and_a_third_is_refused() {
     // The message must also name WHO holds it. `header` alone leaves the editor to guess which of
     // the site's menus to open, and the browser pass asserts on this string — a UUID or the word
     // "another" is not something anyone can act on, so the holder's key is required here.
-    let message = contested.body["error"]["message"].as_str().expect("a message");
+    let message = contested.body["error"]["message"]
+        .as_str()
+        .expect("a message");
     assert!(
         message.contains("primary"),
         "the refusal must name the holder's key so the editor knows which menu to move: {message}"
@@ -514,7 +533,12 @@ async fn two_menus_hold_header_and_footer_and_a_third_is_refused() {
         ),
     )
     .await;
-    assert_eq!(moved.status, StatusCode::CONFLICT, "still held: {}", moved.body);
+    assert_eq!(
+        moved.status,
+        StatusCode::CONFLICT,
+        "still held: {}",
+        moved.body
+    );
 
     let released = call(
         &fixture.state,
@@ -555,7 +579,9 @@ async fn items_nest_three_deep_survive_a_reload_and_a_fourth_is_refused() {
         return;
     };
     let token = fixture.curator().await;
-    let menu = fixture.create_menu(&token, "main", "Main", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "main", "Main", vec!["header"])
+        .await;
 
     let root = item("root");
     let root_id = root["id"].as_str().expect("an id").to_owned();
@@ -627,8 +653,7 @@ async fn items_nest_three_deep_survive_a_reload_and_a_fourth_is_refused() {
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
     assert_eq!(
-        refused.body["error"]["code"],
-        "menu_too_deep",
+        refused.body["error"]["code"], "menu_too_deep",
         "the refusal must be about depth, not a generic 400: {}",
         refused.body
     );
@@ -661,10 +686,16 @@ async fn add_pages_inserts_only_published_pages_with_their_titles() {
         return;
     };
     let token = fixture.curator().await;
-    let menu = fixture.create_menu(&token, "main", "Main", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "main", "Main", vec!["header"])
+        .await;
 
-    let live = fixture.published_page(&token, "pricing", "Pricing and plans").await;
-    let also_live = fixture.published_page(&token, "docs", "Documentation").await;
+    let live = fixture
+        .published_page(&token, "pricing", "Pricing and plans")
+        .await;
+    let also_live = fixture
+        .published_page(&token, "docs", "Documentation")
+        .await;
     let draft = fixture.draft_page(&token, "secret", "Not ready").await;
 
     // The draft is refused *for the whole batch*, and nothing is written: a menu that ends up
@@ -759,7 +790,9 @@ async fn a_members_item_is_absent_for_a_visitor_and_present_for_a_member() {
         return;
     };
     let token = fixture.curator().await;
-    let menu = fixture.create_menu(&token, "main", "Main", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "main", "Main", vec!["header"])
+        .await;
 
     let public = item("pricing");
     let mut members = item("members");
@@ -870,7 +903,9 @@ async fn a_submenu_with_no_visible_child_is_not_rendered() {
         return;
     };
     let token = fixture.curator().await;
-    let menu = fixture.create_menu(&token, "main", "Main", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "main", "Main", vec!["header"])
+        .await;
 
     let open = item("pricing");
     let open_id = open["id"].as_str().expect("an id").to_owned();
@@ -978,7 +1013,9 @@ async fn another_organizations_menu_is_not_reachable() {
         return;
     };
     let token = fixture.curator().await;
-    let menu = fixture.create_menu(&token, "mine", "Mine", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "mine", "Mine", vec!["header"])
+        .await;
 
     // A second organization with its own account.
     let other_org = Uuid::new_v4();
@@ -1086,8 +1123,7 @@ async fn scheduling_twice_replaces_the_pending_entry() {
     .await;
     assert_eq!(second.status, StatusCode::CREATED, "{}", second.body);
     assert_eq!(
-        first.body["id"],
-        second.body["id"],
+        first.body["id"], second.body["id"],
         "a second schedule must replace the first, not add a row"
     );
 
@@ -1176,7 +1212,12 @@ async fn scheduling_validates_the_instant_and_the_action() {
         ),
     )
     .await;
-    assert_eq!(bad_action.status, StatusCode::BAD_REQUEST, "{}", bad_action.body);
+    assert_eq!(
+        bad_action.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_action.body
+    );
     assert_eq!(bad_action.body["error"]["code"], "invalid_publish_action");
     assert!(
         bad_action.body["error"]["message"]
@@ -1198,7 +1239,12 @@ async fn scheduling_validates_the_instant_and_the_action() {
         ),
     )
     .await;
-    assert_eq!(not_a_time.status, StatusCode::BAD_REQUEST, "{}", not_a_time.body);
+    assert_eq!(
+        not_a_time.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        not_a_time.body
+    );
 
     fixture.cleanup().await;
 }
@@ -1213,7 +1259,9 @@ async fn a_due_entry_publishes_once_and_records_the_result() {
         return;
     };
     let token = fixture.curator().await;
-    let page = fixture.draft_page(&token, "scheduled", "Scheduled post").await;
+    let page = fixture
+        .draft_page(&token, "scheduled", "Scheduled post")
+        .await;
 
     // A schedule one second out, so it is due by the time the claim runs.
     let soon = (time::OffsetDateTime::now_utc() + time::Duration::seconds(1))
@@ -1251,7 +1299,10 @@ async fn a_due_entry_publishes_once_and_records_the_result() {
     let result = omnion_content::run_entry(pool, &claimed[0])
         .await
         .expect("the entry must run");
-    assert!(result.contains("published"), "the result must say what happened: {result}");
+    assert!(
+        result.contains("published"),
+        "the result must say what happened: {result}"
+    );
 
     // The page really is published.
     let page_now = call(
@@ -1264,7 +1315,12 @@ async fn a_due_entry_publishes_once_and_records_the_result() {
         ),
     )
     .await;
-    assert_eq!(page_now.body["status"], json!("published"), "{}", page_now.body);
+    assert_eq!(
+        page_now.body["status"],
+        json!("published"),
+        "{}",
+        page_now.body
+    );
 
     // The queue records it as done, with the result line.
     let queue = call(
@@ -1284,7 +1340,10 @@ async fn a_due_entry_publishes_once_and_records_the_result() {
         .unwrap_or_else(|| panic!("the entry must be done: {}", queue.body));
     assert_eq!(row["status"], json!("done"));
     assert!(
-        row["result"].as_str().expect("a result").contains("published"),
+        row["result"]
+            .as_str()
+            .expect("a result")
+            .contains("published"),
         "the result must be recorded: {row}"
     );
 
@@ -1315,10 +1374,13 @@ async fn a_publish_that_cannot_run_is_recorded_as_failed_with_its_reason() {
     let token = fixture.curator().await;
 
     // A page, published, then unpublised by hand so it has no draft left.
-    let page = fixture.published_page(&token, "unpublishable", "Unpublishable").await;
-    let unpublished = omnion_content::unpublish_page(fixture.db.pool(), Uuid::parse_str(&page).expect("a uuid"))
-        .await
-        .expect("the unpublish must answer");
+    let page = fixture
+        .published_page(&token, "unpublishable", "Unpublishable")
+        .await;
+    let unpublished =
+        omnion_content::unpublish_page(fixture.db.pool(), Uuid::parse_str(&page).expect("a uuid"))
+            .await
+            .expect("the unpublish must answer");
     assert!(
         unpublished,
         "the page was published, so the unpublish must report that it did work"
@@ -1438,7 +1500,12 @@ async fn the_queue_is_scoped_to_the_callers_organization() {
 
     let listed = call(
         &fixture.state,
-        request(Method::GET, "/api/v1/publishing/queue", Some(&other_token), None),
+        request(
+            Method::GET,
+            "/api/v1/publishing/queue",
+            Some(&other_token),
+            None,
+        ),
     )
     .await;
     assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
@@ -1458,7 +1525,12 @@ async fn the_queue_is_scoped_to_the_callers_organization() {
         ),
     )
     .await;
-    assert_eq!(cancelled.status, StatusCode::NOT_FOUND, "{}", cancelled.body);
+    assert_eq!(
+        cancelled.status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        cancelled.body
+    );
 
     sqlx::query("delete from users where id = $1")
         .bind(other_id)
@@ -1482,7 +1554,9 @@ async fn an_item_without_a_target_is_refused_by_name() {
         return;
     };
     let token = fixture.curator().await;
-    let menu = fixture.create_menu(&token, "main", "Main", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "main", "Main", vec!["header"])
+        .await;
 
     let mut page_item = item("orphan");
     page_item["item_type"] = json!("page");
@@ -1519,7 +1593,12 @@ async fn an_item_without_a_target_is_refused_by_name() {
         ),
     )
     .await;
-    assert_eq!(no_label.status, StatusCode::BAD_REQUEST, "{}", no_label.body);
+    assert_eq!(
+        no_label.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        no_label.body
+    );
 
     // An unknown location is refused naming the legal slots, so the editor's picker and the
     // server cannot drift apart.
@@ -1533,7 +1612,12 @@ async fn an_item_without_a_target_is_refused_by_name() {
         ),
     )
     .await;
-    assert_eq!(bad_location.status, StatusCode::BAD_REQUEST, "{}", bad_location.body);
+    assert_eq!(
+        bad_location.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        bad_location.body
+    );
     assert_eq!(bad_location.body["error"]["code"], "invalid_location");
     assert!(
         bad_location.body["error"]["message"]
@@ -1591,7 +1675,12 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
         ),
     )
     .await;
-    assert_eq!(sibling_page.status, StatusCode::CREATED, "{}", sibling_page.body);
+    assert_eq!(
+        sibling_page.status,
+        StatusCode::CREATED,
+        "{}",
+        sibling_page.body
+    );
     let sibling_page_id = sibling_page.body["id"].as_str().expect("an id").to_owned();
     let scheduled_sibling = call(
         &fixture.state,
@@ -1630,7 +1719,12 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
         ),
     )
     .await;
-    assert_eq!(scheduled_mine.status, StatusCode::CREATED, "{}", scheduled_mine.body);
+    assert_eq!(
+        scheduled_mine.status,
+        StatusCode::CREATED,
+        "{}",
+        scheduled_mine.body
+    );
 
     // A platform account: no primary organization, the Owner role bound globally — the shape
     // onboarding creates, and the one that answers 400 when a route reads the organization off
@@ -1648,7 +1742,10 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
         &fixture.state,
         request(
             Method::GET,
-            &format!("/api/v1/publishing/queue?site_id={}&limit=500", fixture.site),
+            &format!(
+                "/api/v1/publishing/queue?site_id={}&limit=500",
+                fixture.site
+            ),
             Some(&owner_token),
             None,
         ),
@@ -1661,14 +1758,10 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
         scoped.body
     );
     let scoped_rows = scoped.body.as_array().expect("an array").clone();
+    assert_eq!(scoped_rows.len(), 1, "one site, one entry: {}", scoped.body);
     assert_eq!(
-        scoped_rows.len(),
-        1,
-        "one site, one entry: {}",
-        scoped.body
-    );
-    assert_eq!(
-        scoped_rows[0]["page_id"], json!(mine),
+        scoped_rows[0]["page_id"],
+        json!(mine),
         "the row that survives is this site's own: {}",
         scoped.body
     );
@@ -1687,7 +1780,12 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
     .await;
     assert_eq!(sibling_view.status, StatusCode::OK, "{}", sibling_view.body);
     let sibling_rows = sibling_view.body.as_array().expect("an array").clone();
-    assert_eq!(sibling_rows.len(), 1, "one site, one entry: {}", sibling_view.body);
+    assert_eq!(
+        sibling_rows.len(),
+        1,
+        "one site, one entry: {}",
+        sibling_view.body
+    );
     assert_eq!(sibling_rows[0]["page_id"], json!(sibling_page_id));
 
     // **And writes.** The read path was corrected for this account and the four write handlers
@@ -1695,7 +1793,10 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
     // `no_organization` to Reschedule and Cancel on that very row — every button on the page dead
     // for the platform owner, while every test stayed green because their fixtures all carry an
     // organization. This is the shape that catches it: `create_account(db, None)`, no exception.
-    let owned_entry = scheduled_mine.body["id"].as_str().expect("an entry id").to_owned();
+    let owned_entry = scheduled_mine.body["id"]
+        .as_str()
+        .expect("an entry id")
+        .to_owned();
     let moved_to = (time::OffsetDateTime::now_utc() + time::Duration::hours(9))
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
@@ -1763,7 +1864,10 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
     sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
         .bind(other_org)
         .bind("Queue Site Other Org")
-        .bind(format!("qsite-{}", &Uuid::new_v4().simple().to_string()[..8]))
+        .bind(format!(
+            "qsite-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ))
         .execute(fixture.db.pool())
         .await
         .expect("the second organization must be created");
@@ -1797,7 +1901,14 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
     let (tenant_id, tenant_email) = create_account(&fixture.db, Some(fixture.org)).await;
     let mut tenant_keys: Vec<&str> = MANAGER_PERMISSIONS.to_vec();
     tenant_keys.extend_from_slice(&CURATOR_EXTRA);
-    grant(&fixture.db, fixture.org, tenant_id, &tenant_keys, "Queue Tenant").await;
+    grant(
+        &fixture.db,
+        fixture.org,
+        tenant_id,
+        &tenant_keys,
+        "Queue Tenant",
+    )
+    .await;
     let tenant_token = login(&fixture.state, &tenant_email).await;
     let refused_foreign = call(
         &fixture.state,
@@ -1826,7 +1937,9 @@ async fn the_queue_is_read_by_a_platform_owner_and_scoped_to_one_site() {
     // addresses a site by key or host, so an id alone is not enough to render a preview. Both
     // routes are asserted because the editor reads the detail and the list screen reads the row,
     // and a field added to only one of them is a screen that works in exactly one of them.
-    let menu = fixture.create_menu(&token, "keyed", "Keyed", vec!["header"]).await;
+    let menu = fixture
+        .create_menu(&token, "keyed", "Keyed", vec!["header"])
+        .await;
     let detail = call(
         &fixture.state,
         request(

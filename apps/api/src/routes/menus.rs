@@ -26,8 +26,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use omnion_audit::NewAuditEntry;
 use omnion_content::{
-    Audience, ContentError, Menu, MenuChanges, MenuItem, MenuSave, NewMenuItem, NewSchedule,
-    Page, PublishingEntry, QueueQuery, RenderedMenu,
+    Audience, ContentError, Menu, MenuChanges, MenuItem, MenuSave, NewMenuItem, NewSchedule, Page,
+    PublishingEntry, QueueQuery, RenderedMenu,
 };
 use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
@@ -425,9 +425,13 @@ pub async fn create_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": menu.id, "action": "created", "site_id": site.id }),
-    ).await;
+    )
+    .await;
 
-    Ok((StatusCode::CREATED, Json(menu_body(&state, &menu, 0).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(menu_body(&state, &menu, 0).await?),
+    ))
 }
 
 /// `PUT /api/v1/menus/{id}` — rename, rekey, or move to other locations.
@@ -458,7 +462,8 @@ pub async fn update_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "updated", "site_id": menu.site_id }),
-    ).await;
+    )
+    .await;
 
     let items = omnion_content::list_items(state.db().pool(), id).await?;
     Ok(Json(menu_body(&state, &updated, items.len()).await?))
@@ -491,7 +496,8 @@ pub async fn save_menu_items(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "items_saved", "items": items.len() }),
-    ).await;
+    )
+    .await;
 
     Ok(Json(MenuDetailBody {
         menu: menu_body(&state, &saved, items.len()).await?,
@@ -618,7 +624,8 @@ pub async fn add_pages_to_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "pages_added", "count": published.len() }),
-    ).await;
+    )
+    .await;
 
     Ok(Json(MenuDetailBody {
         menu: menu_body(&state, &saved, items.len()).await?,
@@ -653,7 +660,8 @@ pub async fn delete_menu(
         &state,
         "content.menu.updated",
         json!({ "menu_id": id, "action": "deleted", "site_id": menu.site_id }),
-    ).await;
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -682,12 +690,9 @@ pub async fn public_menu(
     Query(params): Query<PublicMenuParams>,
     headers: HeaderMap,
 ) -> Result<Json<Option<RenderedMenu>>, ApiError> {
-    let site = crate::routes::public::resolve_site(
-        state.db().pool(),
-        params.site.as_deref(),
-        &headers,
-    )
-    .await?;
+    let site =
+        crate::routes::public::resolve_site(state.db().pool(), params.site.as_deref(), &headers)
+            .await?;
     let audience = match params.audience.as_deref() {
         Some("member") => Audience::member(Vec::new()),
         // `visitor` and an absent value are the *same* audience, and both are accepted: the
@@ -814,7 +819,8 @@ pub async fn schedule_page(
             "action": entry.action,
             "scheduled_at": entry.scheduled_at,
         }),
-    ).await;
+    )
+    .await;
 
     Ok((StatusCode::CREATED, Json(QueueEntryBody::from(&entry))))
 }
@@ -838,7 +844,8 @@ pub async fn reschedule_entry(
         &state,
         "content.page.scheduled",
         json!({ "page_id": entry.page_id, "entry_id": entry.id, "action": "rescheduled" }),
-    ).await;
+    )
+    .await;
     Ok(Json(QueueEntryBody::from(&entry)))
 }
 
@@ -854,7 +861,8 @@ pub async fn cancel_entry(
         &state,
         "content.page.schedule_cancelled",
         json!({ "page_id": entry.page_id, "entry_id": entry.id, "action": entry.action }),
-    ).await;
+    )
+    .await;
     Ok(Json(QueueEntryBody::from(&entry)))
 }
 
@@ -961,12 +969,14 @@ async fn site_in_scope(
     Ok(site)
 }
 
-async fn page_in_scope(state: &AppState, current: &CurrentSession, page_id: Uuid) -> Result<Page, ApiError> {
+async fn page_in_scope(
+    state: &AppState,
+    current: &CurrentSession,
+    page_id: Uuid,
+) -> Result<Page, ApiError> {
     let page = omnion_content::pages::find_page(state.db().pool(), page_id)
         .await?
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::NOT_FOUND, "page_not_found", "no such page")
-        })?;
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "page_not_found", "no such page"))?;
     site_in_scope(state, current, page.site_id).await?;
     Ok(page)
 }
@@ -1014,17 +1024,18 @@ async fn entry_in_scope(
     current: &CurrentSession,
     id: Uuid,
 ) -> Result<Uuid, ApiError> {
-    let row: Option<(Uuid,)> = sqlx::query_as("select organization_id from cms_publishing_queue where id = $1")
-        .bind(id)
-        .fetch_optional(state.db().pool())
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("reading the publishing entry: {error}"),
-            )
-        })?;
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("select organization_id from cms_publishing_queue where id = $1")
+            .bind(id)
+            .fetch_optional(state.db().pool())
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("reading the publishing entry: {error}"),
+                )
+            })?;
     let Some((organization_id,)) = row else {
         return Err(ContentError::PublishingEntryNotFound.into());
     };
@@ -1060,7 +1071,11 @@ async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> 
 /// by the time this runs, so a bus that is momentarily full must not turn a successful save into
 /// a 500. Making it non-async is also what keeps the call sites honest — an `async fn` whose
 /// future nobody awaits is a silent no-op that compiles clean and emits nothing at all.
-fn emit(state: &AppState, event: &'static str, payload: serde_json::Value) -> impl std::future::Future<Output = ()> {
+fn emit(
+    state: &AppState,
+    event: &'static str,
+    payload: serde_json::Value,
+) -> impl std::future::Future<Output = ()> {
     let pool = state.db().pool();
     async move {
         if let Err(error) = bus::emit(pool, NewEvent::new(event).payload(payload)).await {

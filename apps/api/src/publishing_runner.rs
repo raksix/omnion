@@ -42,7 +42,10 @@ const BATCH: i64 = 50;
 /// Start the publishing worker; the returned handle ends with the process.
 #[must_use]
 pub fn spawn(state: AppState) -> JoinHandle<()> {
-    tracing::info!(poll_secs = POLL.as_secs(), "publishing queue worker started");
+    tracing::info!(
+        poll_secs = POLL.as_secs(),
+        "publishing queue worker started"
+    );
 
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(POLL);
@@ -98,7 +101,10 @@ pub async fn tick(state: &AppState) -> Result<usize, omnion_content::ContentErro
 ///
 /// It is the same claim → run → record path the loop takes, so a row's `result` is written by
 /// the same code whether it fired on time or because somebody pressed a button.
-pub async fn run_now(state: &AppState, entry_id: uuid::Uuid) -> Result<String, omnion_content::ContentError> {
+pub async fn run_now(
+    state: &AppState,
+    entry_id: uuid::Uuid,
+) -> Result<String, omnion_content::ContentError> {
     let pool = state.db().pool();
     let claimed = omnion_content::claim_entry(pool, entry_id).await?;
     match claimed {

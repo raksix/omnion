@@ -1381,7 +1381,8 @@ async fn a_hide_on_value_outside_the_list_cannot_be_saved() {
     )
     .await;
     assert_eq!(
-        saved.status, StatusCode::BAD_REQUEST,
+        saved.status,
+        StatusCode::BAD_REQUEST,
         "an unreadable viewport must not be stored: {}",
         saved.body
     );
@@ -1406,7 +1407,10 @@ async fn a_hide_on_value_outside_the_list_cannot_be_saved() {
         .expect("the setting is named");
     assert_eq!(issue["severity"], json!("error"));
     assert!(
-        issue["path"].as_str().expect("a path").contains("meta.hide_on"),
+        issue["path"]
+            .as_str()
+            .expect("a path")
+            .contains("meta.hide_on"),
         "the path has to name the setting: {issue}"
     );
 
@@ -1483,7 +1487,6 @@ async fn a_heading_that_skips_back_to_an_h1_is_reported_by_the_dry_run() {
 
     fixture.cleanup().await;
 }
-
 
 /// REQ-063, slice 2: the revision compare. "The revision diff shows added/removed/changed
 /// blocks with prop-level detail, not a raw JSON diff."
@@ -1564,7 +1567,12 @@ async fn two_revisions_compare_block_by_block() {
     let blocks = &diff.body["blocks"];
     assert_eq!(blocks["changed"], json!(1), "the image: {}", diff.body);
     assert_eq!(blocks["removed"], json!(1), "the paragraph: {}", diff.body);
-    assert_eq!(blocks["added"], json!(1), "the call to action: {}", diff.body);
+    assert_eq!(
+        blocks["added"],
+        json!(1),
+        "the call to action: {}",
+        diff.body
+    );
     assert!(blocks["has_removals"].as_bool().expect("a bool"));
 
     // The changed row names the prop and shows both values. This is the whole criterion: a row
@@ -1630,8 +1638,16 @@ async fn two_revisions_compare_block_by_block() {
         ),
     )
     .await;
-    assert_eq!(with_itself.status, StatusCode::BAD_REQUEST, "{}", with_itself.body);
-    assert_eq!(with_itself.body["error"]["code"], json!("diff_same_revision"));
+    assert_eq!(
+        with_itself.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        with_itself.body
+    );
+    assert_eq!(
+        with_itself.body["error"]["code"],
+        json!("diff_same_revision")
+    );
 
     // The FIRST revision on a page has nothing before it. It has to be looked up rather than
     // assumed: creating the page already wrote revision 1, so the revision this test saved first
@@ -1667,7 +1683,12 @@ async fn two_revisions_compare_block_by_block() {
         ),
     )
     .await;
-    assert_eq!(first_diff.status, StatusCode::BAD_REQUEST, "{}", first_diff.body);
+    assert_eq!(
+        first_diff.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        first_diff.body
+    );
     assert_eq!(
         first_diff.body["error"]["code"],
         json!("no_earlier_revision")
@@ -1874,7 +1895,9 @@ async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
     )
     .await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.body);
-    let live_no = published.body["published"]["revision_no"].as_i64().expect("a number");
+    let live_no = published.body["published"]["revision_no"]
+        .as_i64()
+        .expect("a number");
 
     // An edit that is only a draft: the frame must show it, the site must not.
     let draft_edit = call(
@@ -1948,9 +1971,7 @@ async fn the_preview_frame_reads_the_draft_and_filters_it_server_side() {
         "the stored tree and the phone render are different sizes, and the frame says so"
     );
     assert!(
-        phone.body["blocks"]
-            .to_string()
-            .contains("Wide-only line"),
+        phone.body["blocks"].to_string().contains("Wide-only line"),
         "the unfiltered tree travels beside the filtered one"
     );
 
@@ -2062,7 +2083,9 @@ async fn an_inline_save_writes_one_draft_revision_and_leaves_the_page_alone() {
     )
     .await;
     assert_eq!(first.status, StatusCode::OK, "{}", first.body);
-    let before = first.body["draft"]["revision_no"].as_i64().expect("a number");
+    let before = first.body["draft"]["revision_no"]
+        .as_i64()
+        .expect("a number");
 
     let published = call(
         &fixture.state,
@@ -2075,7 +2098,9 @@ async fn an_inline_save_writes_one_draft_revision_and_leaves_the_page_alone() {
     )
     .await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.body);
-    let live = published.body["published"]["revision_no"].as_i64().expect("a number");
+    let live = published.body["published"]["revision_no"]
+        .as_i64()
+        .expect("a number");
 
     // The frame's save is the page's own PATCH — there is no other verb on the route, and the
     // method list says so: a preview that could publish would need one.
@@ -2212,7 +2237,12 @@ async fn the_galleries_answer_the_owner_and_still_refuse_a_foreign_tenant() {
                 .await
                 .expect("router must answer");
             let status = response.status();
-            let bytes = response.into_body().collect().await.expect("body reads").to_bytes();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body reads")
+                .to_bytes();
             (
                 status,
                 if bytes.is_empty() {
@@ -2244,7 +2274,12 @@ async fn the_galleries_answer_the_owner_and_still_refuse_a_foreign_tenant() {
             None,
         ))
         .await;
-        assert_eq!(ok.0, StatusCode::OK, "{uri} must answer the owner: {}", ok.1);
+        assert_eq!(
+            ok.0,
+            StatusCode::OK,
+            "{uri} must answer the owner: {}",
+            ok.1
+        );
     }
 
     // The templates read seeds the system set, so it has something to answer with.

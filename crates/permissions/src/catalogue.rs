@@ -113,6 +113,19 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Read and moderate form submissions",
     },
+    // SEO toolkit (REQ-064, slice 3). Same split as everything else in the CMS: reading a
+    // site's search setup is not the power to change it, and the public sitemap/robots/redirect
+    // routes need no key at all — a crawler has no account.
+    PermissionDef {
+        key: "seo.read",
+        category: "content",
+        description: "Read page SEO, redirect rules, sitemap and broken links",
+    },
+    PermissionDef {
+        key: "seo.manage",
+        category: "content",
+        description: "Edit page SEO, redirects, sitemap settings and robots.txt",
+    },
     // Media.
     PermissionDef {
         key: "media.read",

@@ -21,7 +21,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_content::patterns::{
-    NewPattern, NewTemplate, PageFromTemplate, Pattern, PatternChanges, PageTemplate,
+    NewPattern, NewTemplate, PageFromTemplate, PageTemplate, Pattern, PatternChanges,
 };
 use omnion_content::{SYSTEM_TEMPLATES, instance_blocks, patterns, templates};
 use omnion_events::{NewEvent, bus};
@@ -250,9 +250,12 @@ pub async fn list_patterns(
     Query(query): Query<PatternsQuery>,
 ) -> Result<Json<PatternsResponse>, ApiError> {
     let organization_id = organization_in_scope(&current, query.organization_id)?;
-    let listed =
-        patterns::list_patterns(state.db().pool(), organization_id, query.category.as_deref())
-            .await?;
+    let listed = patterns::list_patterns(
+        state.db().pool(),
+        organization_id,
+        query.category.as_deref(),
+    )
+    .await?;
     Ok(Json(PatternsResponse {
         organization_id,
         patterns: listed.iter().map(PatternBody::from).collect(),
@@ -336,12 +339,20 @@ pub async fn save_pattern(
         &state,
         organization_id,
         current.user.id,
-        if was_update { "content.pattern.updated" } else { "content.pattern.created" },
+        if was_update {
+            "content.pattern.updated"
+        } else {
+            "content.pattern.created"
+        },
         json!({ "pattern_id": pattern.id, "key": pattern.key, "category": pattern.category }),
     )
     .await?;
 
-    let action = if was_update { "pattern.updated" } else { "pattern.created" };
+    let action = if was_update {
+        "pattern.updated"
+    } else {
+        "pattern.created"
+    };
     record(
         &state,
         current.user.id,
@@ -355,7 +366,11 @@ pub async fn save_pattern(
     .await?;
 
     Ok((
-        if was_update { StatusCode::OK } else { StatusCode::CREATED },
+        if was_update {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
         Json(PatternBody::from(&pattern)),
     ))
 }
@@ -375,8 +390,8 @@ pub async fn update_pattern(
         description: body.description,
         blocks: body.blocks,
     };
-    let pattern = patterns::update_pattern(state.db().pool(), organization_id, pattern_id, &changes)
-        .await?;
+    let pattern =
+        patterns::update_pattern(state.db().pool(), organization_id, pattern_id, &changes).await?;
 
     emit(
         &state,
@@ -508,7 +523,11 @@ pub async fn save_template(
     .await?;
 
     Ok((
-        if was_update { StatusCode::OK } else { StatusCode::CREATED },
+        if was_update {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
         Json(TemplateBody::from(&template)),
     ))
 }
@@ -651,9 +670,11 @@ impl From<Content404> for ApiError {
             Content404::Page => {
                 ApiError::new(StatusCode::NOT_FOUND, "page_not_found", "no such page")
             }
-            Content404::Pattern => {
-                ApiError::new(StatusCode::NOT_FOUND, "pattern_not_found", "no such pattern")
-            }
+            Content404::Pattern => ApiError::new(
+                StatusCode::NOT_FOUND,
+                "pattern_not_found",
+                "no such pattern",
+            ),
             Content404::Template => ApiError::new(
                 StatusCode::NOT_FOUND,
                 "template_not_found",
@@ -668,7 +689,10 @@ impl From<Content404> for ApiError {
 /// `requested` is the body's `organization_id` when the caller named one. A caller with a
 /// primary organization may only act on its own; a platform account (no primary organization)
 /// may act on any, which is the same rule the sites and pages routes already apply.
-fn organization_in_scope(current: &CurrentSession, requested: Option<Uuid>) -> Result<Uuid, ApiError> {
+fn organization_in_scope(
+    current: &CurrentSession,
+    requested: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
     let organization_id = requested.or(current.user.organization_id).ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -690,8 +714,7 @@ fn organization_in_scope(current: &CurrentSession, requested: Option<Uuid>) -> R
 async fn seed_system_templates(state: &AppState, organization_id: Uuid) -> Result<(), ApiError> {
     let pool = state.db().pool();
     for template in SYSTEM_TEMPLATES {
-        let existing =
-            patterns::find_template_by_key(pool, organization_id, template.key).await?;
+        let existing = patterns::find_template_by_key(pool, organization_id, template.key).await?;
         if let Some(existing) = existing {
             if existing.is_system {
                 continue;
@@ -763,7 +786,10 @@ async fn record(
 /// The system templates as plain JSON, for the panel's own error hints.
 #[must_use]
 pub fn system_template_keys() -> Vec<&'static str> {
-    templates::SYSTEM_TEMPLATES.iter().map(|entry| entry.key).collect()
+    templates::SYSTEM_TEMPLATES
+        .iter()
+        .map(|entry| entry.key)
+        .collect()
 }
 
 #[cfg(test)]
@@ -777,18 +803,22 @@ mod tests {
                 "description":"A hero with a button","blocks":[]}"#,
         )
         .expect("a valid body");
-        assert_eq!(body.key, " Hero-CTA ", "the store normalises, not the request");
+        assert_eq!(
+            body.key, " Hero-CTA ",
+            "the store normalises, not the request"
+        );
         assert_eq!(body.category.as_deref(), Some("marketing"));
-        assert!(body.organization_id.is_none(), "the caller's own organization is implied");
+        assert!(
+            body.organization_id.is_none(),
+            "the caller's own organization is implied"
+        );
     }
 
     #[test]
     fn a_save_without_blocks_is_refused_by_the_request_shape() {
         // `blocks` is not `Option`: a pattern with no block payload is not a pattern, and
         // defaulting it to `[]` would silently save an empty group the author cannot see.
-        let missing = serde_json::from_str::<SavePatternRequest>(
-            r#"{"key":"hero","name":"Hero"}"#,
-        );
+        let missing = serde_json::from_str::<SavePatternRequest>(r#"{"key":"hero","name":"Hero"}"#);
         assert!(missing.is_err(), "blocks is required");
     }
 

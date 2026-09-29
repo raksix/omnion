@@ -522,7 +522,8 @@ pub async fn update_form(
         retention_days: body.retention_days,
         target_segment_id: None,
     };
-    let updated = omnion_content::update_form(state.db().pool(), form.site_id, id, &changes).await?;
+    let updated =
+        omnion_content::update_form(state.db().pool(), form.site_id, id, &changes).await?;
 
     record(
         &state,
@@ -721,8 +722,7 @@ pub async fn export_submissions(
         limit: 500,
         ..query
     };
-    let submissions =
-        omnion_content::list_submissions(state.db().pool(), id, &query).await?;
+    let submissions = omnion_content::list_submissions(state.db().pool(), id, &query).await?;
     let csv = omnion_content::submissions_to_csv(&submissions);
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -756,13 +756,8 @@ pub async fn set_submission_status(
     Json(body): Json<SubmissionStatusRequest>,
 ) -> Result<Json<SubmissionBody>, ApiError> {
     let (form, _) = form_in_scope(&state, &current, id).await?;
-    let updated = omnion_content::set_submission_status(
-        state.db().pool(),
-        id,
-        sid,
-        &body.status,
-    )
-    .await?;
+    let updated =
+        omnion_content::set_submission_status(state.db().pool(), id, sid, &body.status).await?;
     if body.status == "spam" {
         record(
             &state,
@@ -848,8 +843,9 @@ pub async fn public_submit(
     headers: HeaderMap,
     Json(body): Json<PublicSubmitRequest>,
 ) -> Result<(StatusCode, Json<PublicSubmitBody>), ApiError> {
-    let site = crate::routes::public::resolve_site(state.db().pool(), params.site.as_deref(), &headers)
-        .await?;
+    let site =
+        crate::routes::public::resolve_site(state.db().pool(), params.site.as_deref(), &headers)
+            .await?;
     let form = omnion_content::find_form_by_key(state.db().pool(), site.id, &key)
         .await?
         .ok_or_else(|| {
@@ -982,7 +978,8 @@ async fn form_detail(
 async fn form_body(state: &AppState, form: &Form) -> Result<FormBody, ApiError> {
     let site_key = site_of(state, form.site_id).await?.key;
     let pool = state.db().pool();
-    let field_count = i64::try_from(omnion_content::list_fields(pool, form.id).await?.len()).unwrap_or(0);
+    let field_count =
+        i64::try_from(omnion_content::list_fields(pool, form.id).await?.len()).unwrap_or(0);
     let counts = inbox_counts(pool, form.id).await?;
     Ok(FormBody {
         id: form.id,
@@ -1112,7 +1109,10 @@ fn sender_fingerprint(headers: &HeaderMap) -> SenderFingerprint {
 /// the doc comment rather than pretended away.
 fn hash_fingerprint(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
-    digest[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn parse_instant(value: &str) -> Result<OffsetDateTime, ApiError> {

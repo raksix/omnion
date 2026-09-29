@@ -305,14 +305,7 @@ impl Fixture {
         // The builder may design a form and may NOT read the inbox. That is the whole point of
         // the third permission, and this account is the fixture that proves it.
         let (builder_id, builder_email) = create_account(&db, Some(org)).await;
-        grant(
-            &db,
-            org,
-            builder_id,
-            &BUILDER_PERMISSIONS,
-            "Form Builder",
-        )
-        .await;
+        grant(&db, org, builder_id, &BUILDER_PERMISSIONS, "Form Builder").await;
 
         let (inbox_id, inbox_email) = create_account(&db, Some(org)).await;
         let mut inbox_keys = BUILDER_PERMISSIONS.to_vec();
@@ -392,7 +385,8 @@ impl Fixture {
             "/api/v1/public/forms/{form_key}/submit?site={}",
             self.site_key
         );
-        let mut body = json!({ "answers": answers, "filled_at_ms": filled_at_ms, "source_path": "/contact" });
+        let mut body =
+            json!({ "answers": answers, "filled_at_ms": filled_at_ms, "source_path": "/contact" });
         if !honeypot.is_empty() {
             body["honeypot"] = json!(honeypot);
         }
@@ -443,7 +437,9 @@ async fn all_eight_field_types_accept_their_answers_and_keep_the_consent_text() 
     let published = fixture.publish(&token, &form_id).await;
     assert_eq!(published.status, StatusCode::OK, "{}", published.body);
 
-    let stored_fields = published.body["fields"].as_array().expect("the fields array");
+    let stored_fields = published.body["fields"]
+        .as_array()
+        .expect("the fields array");
     assert_eq!(
         stored_fields.len(),
         8,
@@ -554,11 +550,12 @@ async fn validation_answers_with_every_field_error_at_once() {
     assert_eq!(errors["terms"], json!("this field has to be accepted"));
 
     // And nothing was stored: an invalid submission is not a half-written row.
-    let count: i64 = sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
-        .bind(Uuid::parse_str(&form_id).expect("a uuid"))
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("a count");
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
+            .bind(Uuid::parse_str(&form_id).expect("a uuid"))
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("a count");
     assert_eq!(count, 0, "a refused submission stores no row");
     fixture.cleanup().await;
 }
@@ -596,7 +593,8 @@ async fn a_filled_honeypot_stores_nothing_and_is_not_told() {
         bot.body
     );
     assert_eq!(
-        bot.body["stored"], json!(false),
+        bot.body["stored"],
+        json!(false),
         "the stored flag is the only signal, and it is not a verdict: {}",
         bot.body
     );
@@ -606,11 +604,12 @@ async fn a_filled_honeypot_stores_nothing_and_is_not_told() {
         bot.body
     );
 
-    let count: i64 = sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
-        .bind(Uuid::parse_str(&form_id).expect("a uuid"))
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("a count");
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
+            .bind(Uuid::parse_str(&form_id).expect("a uuid"))
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("a count");
     assert_eq!(count, 0, "a bot's submission leaves no row");
     fixture.cleanup().await;
 }
@@ -651,11 +650,12 @@ async fn a_too_fast_submission_is_refused_by_the_forms_own_floor() {
         .await;
     assert_eq!(slow.body["stored"], json!(true), "{}", slow.body);
 
-    let count: i64 = sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
-        .bind(Uuid::parse_str(&form_id).expect("a uuid"))
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("a count");
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
+            .bind(Uuid::parse_str(&form_id).expect("a uuid"))
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("a count");
     assert_eq!(count, 1, "only the one that was actually filled in");
     fixture.cleanup().await;
 }
@@ -715,7 +715,8 @@ async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
             )
             .await;
         assert_eq!(
-            sent.body["stored"], json!(true),
+            sent.body["stored"],
+            json!(true),
             "submission {attempt} is inside the limit: {}",
             sent.body
         );
@@ -730,7 +731,8 @@ async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
         )
         .await;
     assert_eq!(
-        third.body["stored"], json!(false),
+        third.body["stored"],
+        json!(false),
         "the third is over the limit: {}",
         third.body
     );
@@ -747,17 +749,22 @@ async fn the_hourly_limit_is_per_sender_and_does_not_stop_the_next_one() {
         )
         .await;
     assert_eq!(
-        other.body["stored"], json!(true),
+        other.body["stored"],
+        json!(true),
         "the limit is per sender: {}",
         other.body
     );
 
-    let count: i64 = sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
-        .bind(Uuid::parse_str(&form_id).expect("a uuid"))
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("a count");
-    assert_eq!(count, 3, "two from the throttled sender plus one from the other");
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from cms_form_submissions where form_id = $1")
+            .bind(Uuid::parse_str(&form_id).expect("a uuid"))
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("a count");
+    assert_eq!(
+        count, 3,
+        "two from the throttled sender plus one from the other"
+    );
     fixture.cleanup().await;
 }
 
@@ -817,9 +824,7 @@ async fn the_export_of_a_filtered_inbox_returns_exactly_the_filtered_rows() {
     .await;
     assert_eq!(marked.status, StatusCode::OK, "{}", marked.body);
 
-    let response = fixture
-        .state
-        .clone();
+    let response = fixture.state.clone();
     let raw = routes::router(response)
         .oneshot(
             Request::builder()
@@ -1044,7 +1049,12 @@ async fn a_form_that_cannot_work_is_refused_at_creation() {
     .await;
     assert_eq!(duplicate.status, StatusCode::CONFLICT, "{}", duplicate.body);
     // `code` lives under `error`, like every other field of the envelope.
-    assert_eq!(duplicate.body["error"]["code"], json!("form_key_taken"), "{}", duplicate.body);
+    assert_eq!(
+        duplicate.body["error"]["code"],
+        json!("form_key_taken"),
+        "{}",
+        duplicate.body
+    );
 
     // Two fields sharing a key: answers are stored by key, so the second would overwrite the
     // first. Refused at save time, where the editor is looking at it.
@@ -1066,7 +1076,12 @@ async fn a_form_that_cannot_work_is_refused_at_creation() {
         ),
     )
     .await;
-    assert_eq!(clashing.status, StatusCode::BAD_REQUEST, "{}", clashing.body);
+    assert_eq!(
+        clashing.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        clashing.body
+    );
     assert!(
         clashing.body.to_string().contains("share the key"),
         "{}",
@@ -1089,7 +1104,12 @@ async fn a_form_that_cannot_work_is_refused_at_creation() {
         ),
     )
     .await;
-    assert_eq!(optionless.status, StatusCode::BAD_REQUEST, "{}", optionless.body);
+    assert_eq!(
+        optionless.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        optionless.body
+    );
     fixture.cleanup().await;
 }
 
@@ -1122,9 +1142,15 @@ async fn the_inbox_stores_a_hash_of_the_sender_and_not_the_address() {
             .await
             .expect("a row");
     let ip_hash = ip_hash.expect("the sender is recorded as a hash");
-    assert!(!ip_hash.contains("203.0.113.80"), "the raw address is stored: {ip_hash}");
+    assert!(
+        !ip_hash.contains("203.0.113.80"),
+        "the raw address is stored: {ip_hash}"
+    );
     assert!(!ip_hash.contains('.'), "a hash, not an address: {ip_hash}");
-    assert!(user_agent_hash.is_some(), "the agent is recorded as a hash too");
+    assert!(
+        user_agent_hash.is_some(),
+        "the agent is recorded as a hash too"
+    );
     fixture.cleanup().await;
 }
 
@@ -1148,7 +1174,7 @@ async fn a_submission_emits_the_event_the_req_names_as_contract() {
             9_000,
             "",
         )
-    .await;
+        .await;
     assert_eq!(sent.body["stored"], json!(true), "{}", sent.body);
 
     // The bus is what an automation reads, so the assertion is on the row rather than on a
@@ -1156,12 +1182,14 @@ async fn a_submission_emits_the_event_the_req_names_as_contract() {
     // `events` and the type is `name` — written from memory as `event_outbox.event_type` the
     // query answers "relation does not exist", which is indistinguishable from "the bus
     // dropped it".
-    let emitted: i64 = sqlx::query_scalar(
-        "select count(*) from events where name = 'content.form.submitted'",
-    )
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("a count");
-    assert!(emitted >= 1, "the submission must reach the bus: {emitted} rows");
+    let emitted: i64 =
+        sqlx::query_scalar("select count(*) from events where name = 'content.form.submitted'")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("a count");
+    assert!(
+        emitted >= 1,
+        "the submission must reach the bus: {emitted} rows"
+    );
     fixture.cleanup().await;
 }

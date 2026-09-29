@@ -162,10 +162,9 @@ pub async fn get_published_page(
     // honest way to serve that is to never build the other one.
     let read_on = read_on_from(query.viewport.as_deref());
     let blocks = match omnion_content::parse_blocks(&revision.blocks) {
-        Ok(parsed) => omnion_content::blocks_to_value(&omnion_content::filter_for_viewport(
-            &parsed,
-            read_on,
-        )),
+        Ok(parsed) => {
+            omnion_content::blocks_to_value(&omnion_content::filter_for_viewport(&parsed, read_on))
+        }
         // A payload the registry cannot read is served exactly as stored: the renderer's own
         // fallback is what a visitor gets, and refusing the page over a bad block would take a
         // working page down for a mistake in one block.

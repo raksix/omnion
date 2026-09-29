@@ -805,13 +805,9 @@ pub async fn diff_revision(
     // A payload either side cannot parse is compared as "no blocks" rather than refused: the
     // page still renders (the renderer's own fallback takes over) and an author asking what
     // changed should get the body compare even if one side's block tree is corrupt.
-    let blocks_of = |value: &Value| {
-        omnion_content::parse_blocks(value).unwrap_or_else(|_| Vec::new())
-    };
-    let diff = omnion_content::diff_blocks(
-        &blocks_of(&base.blocks),
-        &blocks_of(&revision.blocks),
-    );
+    let blocks_of =
+        |value: &Value| omnion_content::parse_blocks(value).unwrap_or_else(|_| Vec::new());
+    let diff = omnion_content::diff_blocks(&blocks_of(&base.blocks), &blocks_of(&revision.blocks));
 
     Ok(Json(RevisionDiffBody {
         page_id: page.id,
