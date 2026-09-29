@@ -3945,3 +3945,51 @@ whole tick. Then the autoresponder section in the source editor (template picker
 delay, `Send test to myself`) — the store already exposes `TEMPLATES`, `template_names()` and
 the delay clamp, so the screen is a real form over shipped behaviour rather than a mock.
 REQ-117 stays **in-progress**.
+## wave 4b · REQ-117 slice 3, take three · the autoresponder's editor (`f01dd17`, `cbe1828`)
+
+**A control nobody can set is not a control.** Last tick fixed the send *delay* so it reserves
+something, and the honest reading of the sentence afterwards was that the delay had nowhere to
+live: `intake-sources.tsx` had no autoresponder section at all, so `autoresponder` was a column
+an operator could only write by hand-made POST and could not see in any screen. The whole
+send path — the claim, the worker, the trail, the 10/10 gate — was invisible and unconfigurable.
+
+**Two endpoints, both behind `crm.intake.manage`.** `GET /crm/intake/autoresponder/templates`
+serves the template list *and* the placeholder table, and both belong to the server:
+`Autoresponder::from_json` reads the template's own `template_body`, so a client-side list would
+let an operator pick a name the send path cannot render — the message would go out as a bare
+subject line and report nothing. `POST /crm/intake/autoresponder/preview` runs the same
+`deliver()` the send path runs, over the same `Recipient`, and answers the verdict, the rendered
+message, whether the send is *held*, and the tokens no recipient can fill. It writes nothing and
+claims nothing: a preview that took the claim would make "send it" a no-op.
+
+**The screen is built around the dangerous state, not the common one.** Enabled-with-no-text is
+not "off" — it eats a lead's single reply and says nothing — so the warning appears before the
+save, in the store's own `InvalidTemplate` words. A delay previews as *held with a due time*,
+because that control's entire effect is invisible until minutes later. An unknown `{{token}}` is
+named in the preview rather than arriving in somebody's inbox as a blank space. `source_name`
+is sent with the preview instead of being hard-coded server-side: the greeting's job is to name
+where the message came from, so a constant would look right for exactly the template that
+matters most.
+
+**Proof.** `cargo test -p omnion-api --lib crm_intake` → **16 passed** (9 new: the server's own
+render, the held-with-a-due preview, enabled-but-empty as `invalid_template` and *not*
+`disabled`, a mapping that lost the address as `no_address`, an absent column as `disabled`, an
+unknown token named, every alias of a known token known, every *served* template renderable with
+its own defaults, and the placeholder table tied to `render`'s match arms).
+`cargo test -p omnion-api --lib` → **204 passed**. `tsc --noEmit` → clean.
+`QA_DB=omnion_qa_w8 bash scripts/qa/run-crm-autoresponder.sh` → **10/10**, so the claim the
+editor configures is still the claim the gate proves.
+`scripts/qa/walkthrough.cjs` now measures the section end to end, including reading the column
+back after the save — a control that lives only in component state fails there.
+
+**What this tick did NOT prove, and the tick it costs.** The browser pass was started at the top
+of the tick as planned and is **still queued**: `qa-slot.sh` holds `QA_SLOTS=1` and w9 has the
+place, so `QA_STACK=w8 … bash scripts/qa/run.sh` has spent the tick in the slot's wait loop with
+an empty artifact dir. The walkthrough steps are written and committed but have not been
+*executed*. That is a deferral, not a pass, and the next tick starts by reading the pass's
+report rather than re-running it blind. REQ-117 stays **in-progress** — the screen is built and
+gated at the unit/DB level, and unproven in a browser.
+
+**Next.** Read the queued pass's result first. Then the remaining slice-3 items that are not
+waiting on another wave: the inbox's SLA countdown column, the retention sweep's control, and the
+`/crm/settings/intake` health line for a source whose mapping lost a key.
