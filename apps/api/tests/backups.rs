@@ -1345,9 +1345,19 @@ async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the
     let second = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
     assert_eq!(second.status, StatusCode::CREATED, "body: {}", second.body);
     let run = &second.body["backup"];
+    // `failed`, not `partial` — and the reason this assertion changed is the scope fix this
+    // tick made. This walk asks for `media` alone, and `produce_all` used to produce all
+    // five parts regardless, so the four healthy ones left `done > 0` and `summarise`
+    // answered `partial`. That is the *correct* answer to "a run whose parts are four good
+    // and one bad", and it was the answer to a question nobody was asking: the operator
+    // asked for one part, one part failed, and the screen said the backup was partly
+    // successful. With the scope honoured the run is honestly `failed`.
+    //
+    // `summarise` is untouched and still right; what changed is the set of parts it was
+    // given. The part-level assertion below is what actually carries the failure detail.
     assert_eq!(
-        run["status"], "partial",
-        "a run that could not copy every object is partial, never succeeded: {run}"
+        run["status"], "failed",
+        "a run whose only part could not be produced is failed, never partial: {run}"
     );
     let (status, error) = sqlx::query_as::<_, (String, Option<String>)>(
         "select status, error from backup_parts \
@@ -1750,4 +1760,481 @@ async fn a_backups_media_part_holds_only_the_runs_own_organizations_files() {
         !their_body.contains("mine.png"),
         "the operator's file leaked into another tenant's archive: {their_index}"
     );
+}
+
+/// Everything one run recorded, read out of PostgreSQL.
+///
+/// A function and not a closure because an `async` closure that borrows the pool cannot be
+/// returned from — and the "did the preview change anything?" assertion needs the *same*
+/// read before and after, which is exactly what a local function gives for free.
+#[allow(clippy::type_complexity)]
+async fn run_snapshot(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    site: Uuid,
+) -> (
+    Vec<(String, String, i32, i64, Option<String>)>,
+    String,
+    String,
+    Option<time::OffsetDateTime>,
+    i64,
+) {
+    let rows: Vec<(String, String, i32, i64, Option<String>)> = sqlx::query_as(
+        "select part, status, item_count, size_bytes, checksum from backup_parts \
+         where backup_id = $1 order by part",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await
+    .expect("the parts must read");
+    let (status, prefix_now, finished): (String, String, Option<time::OffsetDateTime>) =
+        sqlx::query_as("select status, storage_prefix, finished_at from backups where id = $1")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("the run must read");
+    let objects: i64 = sqlx::query_scalar("select count(*) from media where site_id = $1")
+        .bind(site)
+        .fetch_one(pool)
+        .await
+        .expect("the media must read");
+    (rows, status, prefix_now, finished, objects)
+}
+
+// ----------------------------------------------------------------------------------------
+// The restore preview (slice 2)
+// ----------------------------------------------------------------------------------------
+
+
+/// The preview prices a restore against LIVE data, and changes nothing while doing it.
+///
+/// The unit tests in `omnion_backup` can prove what the model does with the numbers it is
+/// handed. Only this walk can prove the two things the model is trusting:
+///
+/// 1. **the artifacts really are re-read** — a preview that answered from the manifest would
+///    offer a truncated file as a restore point, and the earlier `verify` walk is the proof
+///    that the destination can disagree with the manifest;
+/// 2. **a preview writes nothing.** This is the property the whole slice exists for, and it
+///    is invisible to every other test in this file: a `GET` that quietly inserted a
+///    `previewed` row, or flipped a run's status, would pass a hundred assertions.
+///
+/// So the assertions are in this order: read everything, preview, and then prove that the
+/// database is byte-for-byte what it was — parts, statuses, checksums — by reading it again
+/// out of PostgreSQL rather than out of the response.
+#[tokio::test]
+async fn the_restore_preview_prices_the_loss_and_touches_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // One real media object for this organization, so the preview has an index to compare
+    // against and the comparison is not vacuously zero.
+    let site = create_site(fixture.db.pool(), fixture.org, "Preview Site").await;
+    let payload = b"a file that exists in the archive and in the library" as &[u8];
+    let key = format!("preview/{site}/kept.png");
+    fixture
+        .state
+        .storage()
+        .put(&key, payload, "image/png")
+        .await
+        .expect("the object must be storable");
+    sqlx::query(
+        "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+         checksum, created_by) values ($1, $2, 'kept.png', 'image/png', $3, $4, null)",
+    )
+    .bind(site)
+    .bind(&key)
+    .bind(payload.len() as i64)
+    .bind(omnion_backup::bytes_checksum(payload))
+    .execute(fixture.db.pool())
+    .await
+    .expect("the media row must be written");
+
+    let created = take_backup(&fixture.state, &token, &csrf, &["media", "database"]).await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let run_id =
+        Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
+    let prefix = created.body["backup"]["storage_prefix"]
+        .as_str()
+        .expect("a prefix")
+        .to_owned();
+
+    // A file uploaded **after** the run. This is the entire subject of the preview: it is
+    // not in the archive, and restoring drops it. A preview that only echoed the manifest
+    // would say "1 object, 30 bytes" and the operator would learn what they lost by losing
+    // it.
+    let later_key = format!("preview/{site}/uploaded-after-the-run.png");
+    fixture
+        .state
+        .storage()
+        .put(&later_key, b"written after the backup", "image/png")
+        .await
+        .expect("the later object must be storable");
+    sqlx::query(
+        "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+         checksum, created_by) values ($1, $2, 'after.png', 'image/png', $3, $4, null)",
+    )
+    .bind(site)
+    .bind(&later_key)
+    .bind(22_i64)
+    .bind(omnion_backup::bytes_checksum(b"written after the backup"))
+    .execute(fixture.db.pool())
+    .await
+    .expect("the later media row must be written");
+
+    let before = run_snapshot(fixture.db.pool(), run_id, site).await;
+
+    let preview = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/backups/{run_id}/restore-preview"),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "body: {}", preview.body);
+
+    // 1. It is offered, with a phrase bound to this run and to nothing else.
+    assert_eq!(preview.body["restorable"], json!(true), "body: {}", preview.body);
+    let phrase = preview.body["confirm_phrase"]
+        .as_str()
+        .expect("a confirm phrase")
+        .to_owned();
+    assert!(
+        phrase.starts_with("RESTORE ") && phrase.len() == "RESTORE ".len() + 8,
+        "the phrase must be the prefix plus eight characters: {phrase}"
+    );
+    assert_eq!(
+        phrase,
+        omnion_backup::confirm_phrase(&run_id.to_string()),
+        "the phrase must come from this run's own id, not from a constant"
+    );
+
+    // 2. The part table, as the wizard shows it.
+    let media = preview.body["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|part| part["part"] == "media")
+        .expect("a media part");
+    assert_eq!(media["available"], json!(true), "body: {}", preview.body);
+    assert_eq!(media["mode"], "replace", "media replaces live data");
+
+    // 3. **The price.** The archived object overwrites itself and the file written after the
+    //    run is dropped — and because the suite database is shared with every other
+    //    integration walk, the assertion is about the *difference* between the live library
+    //    before and after this walk's own upload rather than about a total. A total would be
+    //    asserting what the other suites left behind, and would go red the moment a sibling
+    //    walk changed.
+    // The MEDIA part is the one this walk built a fixture for; the `database` part is
+    // always in the run and always contributes a row count, so the total is deliberately
+    // not asserted here. The per-part numbers are the ones the wizard shows, and they are
+    // scoped to this organization's own site — the suite database is shared with every other
+    // integration walk, and a total would be asserting what the other suites left behind.
+    assert_eq!(
+        media["live_matches"], json!(1),
+        "the archived object is what the media part overwrites: {}",
+        media
+    );
+    assert_eq!(
+        media["live_dropped"], json!(1),
+        "the file uploaded after the run is what the media part costs: {}",
+        media
+    );
+    let database = preview.body["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|part| part["part"] == "database")
+        .expect("the database part is always in a two-scope run");
+    assert_eq!(database["mode"], "replace");
+    let codes: Vec<&str> = preview.body["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"data_loss"),
+        "dropping a live file must be a danger, not a notice: {codes:?}"
+    );
+    let loss = preview.body["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .find(|warning| warning["code"] == "data_loss")
+        .expect("a data_loss warning");
+    assert_eq!(loss["severity"], "danger");
+
+    // 4. It wrote NOTHING. Parts, statuses, checksums, the run's own row and the media
+    //    library are all exactly as they were — read back out of PostgreSQL, because a
+    //    response body cannot prove the database was not written to.
+    let after = run_snapshot(fixture.db.pool(), run_id, site).await;
+    assert_eq!(
+        before.0, after.0,
+        "a preview must not change a single part row"
+    );
+    assert_eq!(before.1, after.1, "a preview must not change the run's status");
+    assert_eq!(before.2, after.2, "a preview must not change the run's prefix");
+    assert_eq!(
+        before.3, after.3,
+        "a preview must not stamp a second finish time"
+    );
+    assert_eq!(
+        before.4, after.4,
+        "a preview must not touch the media library"
+    );
+    // And the bytes on the destination are still there — a preview that cleaned up after
+    // itself would have deleted the very restore point it was describing.
+    assert!(
+        fixture.root.join(prefix.trim_start_matches('/')).exists(),
+        "the archive must still be on the destination after a preview"
+    );
+
+    // 5. A reader may preview without holding `backup.restore`. The permission that
+    //    overwrites live data is not the permission that reads the warning about it.
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'backup.restore.previewed'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit must read");
+    assert!(audited >= 1, "a restore preview must leave an audit entry");
+}
+
+/// A preview of a run whose artifact has been truncated must not offer it, and must not
+/// hand out a confirm phrase for a restore point that cannot be restored.
+///
+/// The `verify` walk already proved that `verify` reports a mismatch; what is new here is
+/// that **availability** is the question — a truncated artifact is not a smaller restore
+/// point, it is no restore point.
+#[tokio::test]
+async fn a_truncated_artifact_is_not_offered_as_a_restore_point() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // This run asks for `database` and nothing else, so `database` is the ONLY part in it.
+    // That is what makes the assertion below sharp: when the one artifact is truncated there
+    // is nothing left to restore, and a preview that still handed out a confirm phrase would
+    // be offering to overwrite live data from an archive that holds none of it.
+    //
+    // It also pins the scope rule from the other side. `produce_all` used to produce all
+    // five parts whatever the run asked for, and this walk is the one that noticed: with the
+    // extra parts present the run stayed `restorable: true` after the truncation, which read
+    // like a product bug and was actually a test asking the right question of a broken
+    // producer.
+    let created = take_backup(&fixture.state, &token, &csrf, &["database"]).await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let parts = created.body["parts"].as_array().expect("parts");
+    assert_eq!(
+        parts.len(),
+        1,
+        "a run that asked for one scope produces one part, not five: {parts:?}"
+    );
+    assert_eq!(parts[0]["part"], "database");
+    let run_id =
+        Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
+    let prefix = created.body["backup"]["storage_prefix"]
+        .as_str()
+        .expect("a prefix")
+        .to_owned();
+
+    // Find the artifact by its own recorded key rather than recomputing the name, so the
+    // walk and the code cannot agree about a path by both being wrong in the same way.
+    let relative: String = sqlx::query_scalar(
+        "select storage_path from backup_parts where backup_id = $1 and part = 'database'",
+    )
+    .bind(run_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the database part must be recorded");
+    let path = fixture.artifact(&prefix, &relative);
+
+    std::fs::write(&path, b"{\"tables\":[]}")
+        .expect("the artifact must be overwritable");
+    assert_ne!(
+        std::fs::metadata(&path).expect("the file").len() as i64,
+        sqlx::query_scalar::<_, i64>(
+            "select size_bytes from backup_parts where backup_id = $1 and part = 'database'",
+        )
+        .bind(run_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("a size"),
+        "the fixture must actually have truncated the file"
+    );
+
+    let preview = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/backups/{run_id}/restore-preview"),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(preview.status, StatusCode::OK, "body: {}", preview.body);
+    assert_eq!(
+        preview.body["restorable"], json!(false),
+        "a truncated archive is not a restore point: {}",
+        preview.body
+    );
+    assert_eq!(
+        preview.body["confirm_phrase"], json!(""),
+        "nothing to confirm means no phrase, and a phrase would be a guard that guards nothing"
+    );
+    let database = preview.body["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|part| part["part"] == "database")
+        .expect("a database part");
+    assert_eq!(database["available"], json!(false));
+    let reason = database["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("bytes, the manifest recorded"),
+        "the reason must name the disagreement, not say 'missing': {reason}"
+    );
+    let codes: Vec<&str> = preview.body["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .filter_map(|warning| warning["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"part_unavailable"),
+        "an unavailable part must be said out loud: {codes:?}"
+    );
+}
+
+/// Another tenant's run is a 404 from the preview too — and the refusal must not confirm
+/// that the id exists, or the preview becomes a restore-point oracle across tenants.
+#[tokio::test]
+async fn another_tenants_backup_has_no_preview_and_the_404_says_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
+
+    let created = take_backup(&fixture.state, &stranger_token, &stranger_csrf, &["database"]).await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let run_id =
+        Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
+
+    let mine = fixture.session(&fixture.operator_email).await;
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/backups/{run_id}/restore-preview"),
+            Some(&mine.0),
+            Some(&mine.1),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        refused.status, StatusCode::NOT_FOUND,
+        "a stranger's backup must be a 404, never a 403 that confirms the id: {}",
+        refused.body
+    );
+    let message = refused.body["message"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        !message.contains("cross_organization") && !message.contains("organization"),
+        "the 404 must not name the tenancy rule — that is the oracle: {message}"
+    );
+}
+
+/// A run produces the parts it was asked for, and only those.
+///
+/// This is the regression test for a dead control. The scope selector in the create drawer
+/// validated, stored, normalised and rendered the operator's choice, and then
+/// `produce_all` walked all five `PARTS` unconditionally — so `["database"]` produced five
+/// artifacts. Four existing walks requested `["database"]` and none of them noticed, because
+/// each asserted on the part it wanted and the two extra artifacts are perfectly valid
+/// files.
+///
+/// The walk asserts the *count* and the *set*, from PostgreSQL rather than from the
+/// response, because a response that listed five parts while the database held one (or the
+/// other way round) is exactly the disagreement a count is supposed to catch. And it checks
+/// the destination too: producing a part nobody asked for is not only a wrong row, it is
+/// bytes on a volume an operator is paying for.
+#[tokio::test]
+async fn a_run_produces_only_the_scopes_it_was_asked_for() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    for (label, scopes) in [
+        ("one", vec!["database"]),
+        ("two", vec!["database", "themes"]),
+        ("all", omnion_backup::PARTS.to_vec()),
+    ] {
+        let created = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                &backups_uri(),
+                Some(&token),
+                Some(&csrf),
+                Some(json!({ "label": format!("scope-{label}"), "scopes": scopes })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status, StatusCode::CREATED,
+            "{label}: body: {}",
+            created.body
+        );
+        let run_id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id"))
+            .expect("a uuid");
+        let prefix = created.body["backup"]["storage_prefix"]
+            .as_str()
+            .expect("a prefix")
+            .to_owned();
+
+        // From the database, not the response.
+        let stored: Vec<String> = sqlx::query_scalar(
+            "select part from backup_parts where backup_id = $1 order by part",
+        )
+        .bind(run_id)
+        .fetch_all(fixture.db.pool())
+        .await
+        .expect("the parts must read");
+        let mut expected: Vec<String> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
+        expected.sort();
+        assert_eq!(
+            stored, expected,
+            "{label}: a run asked for {scopes:?} and stored {stored:?}"
+        );
+
+        // And nothing is left on the destination that no part claims. A file for a part
+        // nobody asked for is the byte-level version of the same bug.
+        let directory = fixture.root.join(prefix.trim_start_matches('/'));
+        if directory.exists() {
+            for name in omnion_backup::PARTS {
+                let artifact = omnion_backup::local_path_for(
+                    &fixture.root.to_string_lossy(),
+                    &omnion_backup::storage_key(&prefix, name),
+                );
+                if !scopes.iter().any(|scope| *scope == name) {
+                    assert!(
+                        !artifact.exists(),
+                        "{label}: `{name}` was never asked for but {} exists: {}",
+                        artifact.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                        artifact.display()
+                    );
+                }
+            }
+        }
+    }
 }
