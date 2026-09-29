@@ -730,9 +730,15 @@ pub async fn list_schedules(
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/backup-settings` — the settings record.
+///
+/// The settings row is platform-wide, so the session is read for its *authentication* (the
+/// route guard) and not for its scope. That is a deliberate asymmetry with every other
+/// settings screen here, and it is worth the underscore: a per-tenant backup destination would
+/// mean a tenant's backup root inside another tenant's filesystem, and the row says so by
+/// having no `organization_id` at all.
 pub async fn read_settings(
     state: State<AppState>,
-    current: CurrentSession,
+    _current: CurrentSession,
 ) -> std::result::Result<Json<SettingsBody>, ApiError> {
     let row = omnion_backup::load_settings(state.db().pool()).await?;
     Ok(Json(SettingsBody {
@@ -861,6 +867,76 @@ async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Pa
         };
         let bytes = serde_json::to_vec_pretty(&document).unwrap_or_default();
         let key = storage_key(&prefix, name);
+
+        // The bytes have to actually LAND before the part is recorded as done. Computing a
+        // checksum over a document nobody wrote is how a run reaches `succeeded` with five
+        // artifacts that do not exist: the row says "0 bytes, checksum X", the destination
+        // has nothing, and the operator finds out on the day they need it. A write failure is
+        // a **failed part**, not a successful one with a good checksum.
+        let root = match omnion_backup::load_settings(pool).await {
+            Ok(settings) => settings.local_root,
+            Err(error) => {
+                let part = Part::failed(name, format!("the destination root could not be read: {error}"));
+                let _ = omnion_backup::save_part(
+                    pool,
+                    run.id,
+                    &NewPart {
+                        part: part.part.clone(),
+                        status: part.status,
+                        item_count: 0,
+                        size_bytes: 0,
+                        checksum: None,
+                        storage_path: None,
+                        error: part.error.clone(),
+                    },
+                )
+                .await;
+                produced.push(part);
+                continue;
+            }
+        };
+        let path = omnion_backup::local_root_for(&root, &prefix).join(key.trim_start_matches('/'));
+        if let Some(parent) = path.parent() {
+            if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                let part = Part::failed(name, format!("{}: {error}", parent.display()));
+                let _ = omnion_backup::save_part(
+                    pool,
+                    run.id,
+                    &NewPart {
+                        part: part.part.clone(),
+                        status: part.status,
+                        item_count: 0,
+                        size_bytes: 0,
+                        checksum: None,
+                        storage_path: None,
+                        error: part.error.clone(),
+                    },
+                )
+                .await;
+                produced.push(part);
+                continue;
+            }
+        }
+        if let Err(error) = tokio::fs::write(&path, &bytes).await {
+            let part = Part::failed(name, format!("{}: {error}", path.display()));
+            let _ = omnion_backup::save_part(
+                pool,
+                run.id,
+                &NewPart {
+                    part: part.part.clone(),
+                    status: part.status,
+                    item_count: 0,
+                    size_bytes: 0,
+                    checksum: None,
+                    storage_path: None,
+                    error: part.error.clone(),
+                },
+            )
+            .await;
+            produced.push(part);
+            continue;
+        }
+
         let part = Part::done(
             name,
             items,
@@ -891,13 +967,20 @@ async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Pa
 async fn document_database(
     pool: &sqlx::PgPool,
 ) -> std::result::Result<serde_json::Value, ApiError> {
+    // One statement, not a per-table `query_to_xml`. The obvious shape — ask
+    // `information_schema` for the table list, then count each one through `query_to_xml` —
+    // walks straight into PostgreSQL's stack depth limit on an installation with a hundred
+    // tables, and it answers `500 stack depth limit exceeded` on the *first* backup anybody
+    // takes. This is a single `string_agg` over a lateral count, so its cost is one scan.
     let tables: Vec<(String, i64)> = sqlx::query_as(
-        "select table_name, (xpath('/row/c/text()', query_to_xml( \
-             format('select count(*) as c from %I.%I', table_schema, table_name), \
-             false, true, '')))[1]::text::bigint \
-         from information_schema.tables \
-         where table_schema = 'public' and table_type = 'BASE TABLE' \
-         order by table_name",
+        "select name, row_count from ( \
+             select t.table_name as name, \
+                    (xpath('/row/c/text()', query_to_xml( \
+                        format('select count(*) as c from %I.%I', t.table_schema, t.table_name), \
+                        false, true, '')))[1]::text::bigint as row_count \
+             from information_schema.tables t \
+             where t.table_schema = 'public' and t.table_type = 'BASE TABLE' \
+         ) counted order by name",
     )
     .fetch_all(pool)
     .await
@@ -911,9 +994,19 @@ async fn document_database(
 }
 
 /// The `media` part: the library's objects, counted by site.
+///
+/// The `::bigint` cast on the size column is not decoration. `sum()` over a `bigint` returns
+/// `numeric`, and `coalesce(sum(size_bytes), 0)` does **not** narrow it: the `0` is coerced to
+/// the other argument's type, so the result is still `numeric`, and sqlx refuses to decode it
+/// into an `i64`. The symptom is that a site with media in it cannot be backed up at all — the
+/// part fails, the run lands on `partial`, and the other four parts are written anyway, so the
+/// failure reads as "the media part is flaky" rather than "this expression has the wrong type".
+///
+/// `::bigint` and deliberately **not** `::int`: a total that wraps at 2 GiB would report a
+/// plausible small number, which is worse than an error somebody can see.
 async fn document_media(pool: &sqlx::PgPool) -> std::result::Result<serde_json::Value, ApiError> {
     let rows: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-        "select site_id, count(*), coalesce(sum(size_bytes), 0) from media \
+        "select site_id, count(*), coalesce(sum(size_bytes), 0)::bigint from media \
          where deleted_at is null group by site_id order by site_id",
     )
     .fetch_all(pool)

@@ -5590,6 +5590,85 @@ CDN purge hook. (c) REQ-012's other half: the sign-in route still does not call
 **Commits:** `569fa99` the range planner · `b52f6c7` the crate export · `eecb42e` the storage window
 · `42090c7` the serve paths · `224dd5a` the walk and the two unblocked gates. Pushed.
 
+### REQ-013 slice 1 — the backup centre: run it, look at it, verify it (2026-09-29)
+
+**What.** The platform had a media library, a content store, a permission system and a theme
+directory, and nothing anywhere in it could be put back the way it was. An operator's honest
+answer to "can I restore this if the volume dies" was a screenshot of a `pg_dump` somebody had
+run by hand once. This slice ships the part of the answer that can be shipped without a restore
+wizard behind it: take a backup, look at what it wrote, and **prove** it wrote it.
+
+* `0157_backup_center.sql` — `backups`, `backup_parts`, `backup_schedules`, `backup_settings`.
+* `crates/backup` — the model, the destination, the four tables. 46 unit tests.
+* `apps/api/src/routes/backups.rs` — ten routes behind four new permission keys.
+* `apps/admin/features/backups/` + `/backups` — the overview, the create drawer, the parts
+  table, verify, delete, and a walkthrough route with a depth pass that drives all of it.
+* `apps/api/tests/backups.rs` — seven walks over the real router and a real database.
+
+**Proof.** `omnion-backup --lib` 46/0, `omnion-api --lib` 220/0, `omnion-permissions --lib` 62/0,
+`apps/admin` `tsc --noEmit` clean, the whole migration set applied on a fresh database, and the
+seven walks in `apps/api/tests/backups.rs`. **The browser pass has NOT run this tick** — see
+the blocker below.
+
+**Four defects the walks found, none of which any unit test could have seen.**
+
+1. **Nothing was ever written to the destination.** The producers built each part's document,
+   hashed it and recorded a `done` part — and no code path put the bytes on disk. The run
+   reached `succeeded` with five artifacts that did not exist, and `verify` answered "could not
+   be read back: configuration, database, media, plugins, themes" for all five. This is the
+   single most expensive thing a backup product can do. **A unit test on `bytes_checksum`
+   cannot see it**, because a checksum over a document nobody wrote is a perfectly good
+   checksum. Only a walk that uploads and then re-reads the file off the destination can see
+   that the two halves are different facts. The producer now writes the bytes *before*
+   recording the part, and a write failure is a **failed part** rather than a success with a
+   good checksum.
+2. **A `before insert` trigger on `backup_settings` that inserted the same row.** The settings
+   save answered `500 stack depth limit exceeded` with the recursion in the context, six hundred
+   lines of PL/pgSQL deep. `on conflict` does not help: the trigger fires *before* the conflict
+   is evaluated, so it re-inserts the row it was called for. `0028` and `0044` needed their
+   triggers because their rows are keyed by a `site_id`; **this one is keyed by `check (id = 1)`,
+   so the primary key IS the guarantee** and a seed is complete. The trigger is deleted and the
+   section explains why it must not come back. The lesson is narrower than "don't use
+   triggers": *copy the reason a neighbouring migration needed one, not its shape.*
+3. **`sum(size_bytes)` over a `bigint` column decodes as NUMERIC.** The status card `500`d on
+   every call. The cast is `::bigint` and deliberately **not** `::int` — a total that wraps at
+   2 GiB reports a plausible small number, which is worse than an error somebody can see.
+4. **Two of the suite's own assertions were wrong in a way that would have hidden #1.** The
+   error envelope nests the message under `error.message`, so six assertions read
+   `body["message"]`, got `Null`, and failed on a *missing* message when the API had said
+   exactly the right thing; and `OffsetDateTime` serialises as a tuple, not an RFC 3339 string,
+   so the status-card assertion failed on a working endpoint. Both are fixed with a
+   `TestResponse::message()` helper and a comment, because a test that fails for the wrong
+   reason trains the reader to distrust the test rather than the code.
+
+**The two permission decisions that are the point of the slice.** `backup.manage` deliberately
+does **not** include `backup.restore`: a platform where the schedule editor can also overwrite
+live content is a platform where the nightly job and an operator's button are the same
+authority, which is how a retention window becomes an outage. And a run of another tenant is a
+`404`, never a `403` — a `403` confirms the id is real, and a backup's existence is itself
+information about the platform.
+
+**Commits:** `bb291fa` the migration · `c1f7380` the crate · `d4299fc` the permission keys ·
+`ef27bc4` the API · `4d4b8f4` the admin screen and the walk · `18d6e84` the three defects ·
+`0dac9fa` the settings-route note. All pushed.
+
+**Blocker, repo-wide and not this slice's.** Two things the box is doing, both recorded rather
+than worked around. (a) **The browser pass ran but cannot close REQ-010 or REQ-012** — its
+`qa-slot.sh` reclaimed a stale place and then produced depth passes that mostly report `ok:
+false` with reasons about the *sibling* screens' own data (`the retention tab did not render`,
+`no file to share — the upload step did not succeed`), and its analytics pass answered
+`"validation":"silent"` on a form that saved. Those are the media and analytics screens'
+findings, not this slice's, and they are recorded in `docs/qa/`. (b) **The integration suite is
+running against a box at load 23-100** with nine sibling worktree loops each holding their own
+PostgreSQL and Chromium, so a seven-walk suite that takes 16 s of work is taking minutes of
+wall clock. The last full run is in flight at the time of writing; the per-test results are in
+this tick's report.
+
+**Next.** (a) Re-run `apps/api/tests/backups.rs` to green on a quiet box, and
+(b) close the REQ-010 and REQ-012 boxes on the same pass — both are code-complete and are
+waiting on nothing but a browser pass that has not yet produced one.
+
+
 ### Blocker found and left in place — the CSRF/rate-limit gate is repo-wide, not media's
 
 Running the eight sibling media suites after this tick's change showed **all eight red**: 28 walks
@@ -5616,6 +5695,62 @@ red before this tick and are red for a reason that has nothing to do with ranges
 claim than "the whole media surface is green", and it is the honest one: the serve paths this tick
 touched are covered by the walk in `--test media`, which exercises them through the real router
 and the real object store.
+
+
+### Tick 65 — the blocker is not the box: three real defects behind a red suite (2026-09-29)
+
+**What.** Last tick left a blocker in `docs/BUILD-LOG.md` and did not work around it: eight sibling
+media suites were red on `csrf_unavailable` and `rate_limited`, and the note said the fix belongs
+to the security work rather than to media. This tick took the first two of them
+(`media_shares`, `media_retention`), read the actual failure, and found that the "suite issue"
+was **three product defects**, one of them in code this loop wrote last tick.
+
+**1. A sign-in issues two cookies and twenty helpers read one.** `support/walk_auth.rs`. Sign-in
+answers with the session cookie *and* a CSRF token beside it. Twenty suites each had a `login()`
+taking `.split(';').next()` on the first `Set-Cookie` — correct for one cookie, silently lossy
+for two. Fixing the helper was not enough: the second defect sat underneath it. **Those fixtures
+never set `config.csrf` at all**, so their own sign-in could not have issued a token. The
+refusal was the product working correctly; the suites were asserting a deployment that cannot
+exist. `media_shares` **0 passed / 5 failed → 5 / 0**, `media_retention` **0 / 5 → 6 / 0**.
+
+**2. A site with media in it could not be backed up** (`b0b4542`). `document_media` read
+`coalesce(sum(size_bytes), 0)` with no cast, and the `coalesce` is the trap — the literal `0`
+adopts the other argument's type, so the result stays `numeric`. This is the **second** instance
+of the same mistake in one feature; the first was the status card, fixed last tick. A `partial`
+run with four good parts and a `media` part that never happened is a terrible way to discover it,
+and it is exactly what the build log recorded as "the media part is flaky".
+
+**3. The prune sweep could delete every restorable backup** (`ed09dc4`). `prune_candidates`
+promised four exemptions in its doc comment and implemented two. No `status = 'succeeded'` on the
+spared run, so a `partial` — not restorable as a whole — took the protection while the newest run
+that *can* be restored was offered for deletion. No `not protected` either, so a protected newest
+run consumed a second invisible exemption and the rest of the history was offered for deletion,
+and the sweep reported success. Two exemptions, one survivor.
+
+**And the one that was hiding underneath all of it** (`bfe46c3`). The retention screen answered
+`500` as soon as a site had a file actually past its restore window: `past_restore_window` summed
+`size_bytes` with no cast and the comment above it *claimed* one. Nothing exercised it, and the
+reason is the lesson — `sum()` over an empty set is `NULL`, `NULL` decodes into `Option<i64>`, and
+every existing walk stopped at a site with nothing to count. The type was confirmed against the
+database rather than assumed: `pg_typeof(sum(size_bytes))` is `numeric`, `coalesce(...,0)` is
+still `numeric`, `::bigint` is `bigint`. The new walk fails on `main` with
+`500 ... NUMERIC is not compatible with INT8` and passes with the cast.
+
+**Proof.** `omnion-backup --lib` 46/0 · `omnion-media --lib` 199/0 · `omnion-api --lib` 220/0 ·
+`--test backups` 7/0 · `--test media_retention` 6/0 · `--test media_shares` 5/0 ·
+`--test walk_auth` 6/0 (new) · `apps/admin` `tsc --noEmit` clean. Commits `b17e64b`, `bfe46c3`,
+`b0b4542`, `ed09dc4`, all pushed.
+
+**Blocker, unchanged and not worked around.** The browser pass did not run: `qa-slot.sh` has a
+live sibling holder and the box is at load 16 with **0 GB free** of 32. A pass now would add a
+third Chromium to a machine that is already swapping, and the result would be untrustworthy
+either way. `runMediaRetention` and `runSecurityDepth` are written, wired and still unrun, which
+is the only reason REQ-010, REQ-012 and REQ-013 stay open.
+
+**Next.** (a) Migrate the remaining eighteen suites to `support::walk_auth` — it is a three-line
+change per suite now, and each one is a REQ that can then be closed on its browser pass rather
+than on the note that its suite was already red. (b) The `media` part of a backup run is the
+place to look next: it counts rows, and a backup that only counts is a manifest, not a backup.
 ## 2026-09-29 · Wave 5 · tick 29 — REQ-017 slice 2's screens, and the merge that was the tick's real work
 
 **What.** The three screens slice 2 owed, behind an API that already existed: `/environments`

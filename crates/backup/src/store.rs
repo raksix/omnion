@@ -492,8 +492,14 @@ pub async fn totals(
     pool: &PgPool,
     organization_id: Option<Uuid>,
 ) -> Result<(i64, Option<OffsetDateTime>, Option<Uuid>)> {
+    // `sum()` over a `bigint` column returns `numeric`, which sqlx will not decode into an
+    // `i64` — the first version of this query answered `500` on every call with "mismatched
+    // types; Rust type Option<i64> is not compatible with SQL type NUMERIC", which took the
+    // whole status card down over a column width. The cast is `::bigint` and deliberately NOT
+    // `::int`: a total that wraps at 2 GiB reports a plausible small number, and a plausible
+    // small number is worse than an error somebody can see.
     let row: (Option<i64>, Option<OffsetDateTime>, Option<Uuid>) = sqlx::query_as(
-        "select sum(size_bytes), max(finished_at) filter (where status = 'succeeded'), \
+        "select sum(size_bytes)::bigint, max(finished_at) filter (where status = 'succeeded'), \
                 (array_agg(id order by finished_at desc) filter \
                    (where status = 'succeeded'))[1] \
          from backups where organization_id is not distinct from $1",
@@ -672,15 +678,38 @@ pub async fn prune_candidates(
     organization_id: Option<Uuid>,
     now: OffsetDateTime,
 ) -> Result<Vec<Backup>> {
+    // The subquery that picks the run to spare is the whole subtlety, and it had two conditions
+    // the doc comment above promised and the statement never carried:
+    //
+    // * **`status = 'succeeded'`.** Without it the sweep spares the newest run *of any kind*,
+    //   so a `partial` — a run that half-completed and is not restorable as a whole — gets the
+    //   protection while the newest run that *can* be restored is deleted. That is backwards:
+    //   the exemption exists so an operator always has something to restore, and exempting a
+    //   broken run satisfies the letter of it with nothing behind it. Proved against the
+    //   database: with the filter missing, a site whose last three runs were all `partial` had
+    //   its newest `partial` spared and both older ones offered for deletion.
+    //   the newest `partial` spared and both older ones offered for deletion.
+    // * **`not protected`.** A protected run is already spared by the outer `not b.protected`,
+    //   so letting it also consume the "newest successful" exemption is a second, invisible
+    //   exemption spent on a row that needed none. The operator who protects the newest run
+    //   expects the *newest other* run to be spared too; instead the sweep offered the whole
+    //   rest of the history for deletion, and reported success. Two exemptions, one survivor.
+    // * **`not running`.** A run still in flight has no meaningful age, and `finished_at desc
+    //   nulls last` would spare it only by accident of a `NULL` sort.
+    //
+    // All of it belongs in this statement, not in the caller, because this statement is what
+    // the delete is fed from.
     sqlx::query_as::<_, BackupRow>(&format!(
         "select {BACKUP_COLUMNS} from backups b \
          where organization_id is not distinct from $1 \
-           and status <> 'failed' \
+           and status not in ('failed', 'running') \
            and not b.protected \
            and b.retain_until is not null \
            and b.retain_until <= $2 \
            and b.id <> (select id from backups \
                         where organization_id is not distinct from $1 \
+                          and status = 'succeeded' \
+                          and not protected \
                         order by finished_at desc nulls last, created_at desc limit 1) \
          order by b.retain_until asc limit 100"
     ))

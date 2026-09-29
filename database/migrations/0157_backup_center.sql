@@ -347,26 +347,24 @@ insert into backup_settings (id) values (1)
 on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------------------------------
--- The guarantee that a settings read and a settings write are about the same row
+-- Why there is NO trigger here
 -- ---------------------------------------------------------------------------------------------
 
--- Why a trigger and not a seed, again: onboarding, the tenancy API and a future import each
--- insert a site row themselves, so only a trigger sees all of them. The same reasoning
--- applies verbatim to the platform row — the first process to touch the table creates it,
--- and every other process finds the one everybody else found.
-create or replace function backup_settings_bootstrap() returns trigger
-language plpgsql as $$
-begin
-    insert into backup_settings (id) values (1) on conflict (id) do nothing;
-    return null;
-end;
-$$;
-
-comment on function backup_settings_bootstrap() is
-    'Keeps the single settings row present. Called by the before-insert trigger below; kept as '
-    'a function so the statement that creates it is separate from the statement that fires it.';
-
-create trigger backup_settings_ensure_row
-    before insert on backup_settings
-    for each row
-    execute function backup_settings_bootstrap();
+-- `0028` (site presets) and `0044` (scan settings) each needed a trigger, because their row is
+-- keyed by a `site_id` and the sites themselves are inserted by three different callers.
+-- This row is keyed by `check (id = 1)`, so **the primary key is the guarantee**: there is no
+-- second row to seed and no caller that can create one, and a `before insert` trigger that
+-- inserted the row would fire on that very insert and recurse.
+--
+-- That is not a theoretical hazard — it is what the first version of this migration did, and
+-- the settings save answered `500 stack depth limit exceeded` with this in the context:
+--
+--     PL/pgSQL function backup_settings_bootstrap() line 3 at SQL statement
+--     SQL statement "insert into backup_settings (id) values (1) on conflict (id) do nothing"
+--
+-- Six hundred lines of PL/pgSQL stack, growing until PostgreSQL refused. The `on conflict` did
+-- not help: the trigger fires **before** the conflict is ever evaluated, so it re-inserts the
+-- row it is being called for, and the second insert calls the trigger again.
+--
+-- A seed is the right answer here, and it is complete: an installation that ran this
+-- migration has the row, and the primary key means no later process can leave it out.

@@ -24,6 +24,8 @@
 //!   operator meets and cannot act on. The scan removes the stale row and the very next purge
 //!   goes through.
 
+mod support;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
@@ -62,6 +64,9 @@ const EDITOR_PERMISSIONS: [&str; 7] = [
 struct TestResponse {
     status: StatusCode,
     set_cookie: Option<String>,
+    /// **Every** `Set-Cookie`, in order — sign-in answers with the session and the CSRF token
+    /// beside it, and reading only the first is how a walk ends up holding no token at all.
+    set_cookies: Vec<String>,
     body: Value,
     raw: Vec<u8>,
 }
@@ -79,6 +84,13 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .get(header::SET_COOKIE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let set_cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -102,6 +114,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookie,
+        set_cookies,
         body,
         raw,
     }
@@ -110,8 +123,10 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 /// Build a JSON request; `token` becomes the session cookie.
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
+    // A write echoes the CSRF token in a header as well as carrying it in a cookie; unpacking
+    // here means a suite cannot send one without the other.
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => support::walk_auth::apply_credential(token, builder),
         None => builder,
     };
     match body {
@@ -138,16 +153,24 @@ async fn upload(state: &AppState, token: &str, site: Uuid, filename: &str, body:
     parts.push(body.to_vec());
     parts.push(format!("\r\n--{boundary}--\r\n").into_bytes());
 
+    // An upload is a write like any other: the session cookie and the echoed CSRF token travel
+    // together. This is the *second* request builder in the file, and it is why fixing only
+    // `request()` would have left every upload broken while the rest of the suite went green —
+    // a suite that hand-rolls its headers re-opens whatever the shared helper closed.
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/media?site_id={site}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        );
+    if let Some(csrf) = support::walk_auth::unpack(token).csrf {
+        builder = builder.header(support::walk_auth::CSRF_HEADER, csrf);
+    }
+
     let response = call(
         state,
-        Request::builder()
-            .method(Method::POST)
-            .uri(format!("/api/v1/media?site_id={site}"))
-            .header(header::COOKIE, format!("omnion_session={token}"))
-            .header(
-                header::CONTENT_TYPE,
-                format!("multipart/form-data; boundary={boundary}"),
-            )
+        support::walk_auth::apply_credential(token, builder)
             .body(Body::from(parts.concat()))
             .expect("request must build"),
     )
@@ -188,7 +211,11 @@ async fn live_db(config: &Config) -> Option<Db> {
 
 /// A state whose database has all migrations applied and the object store open.
 async fn live_state() -> Option<(AppState, Db, Storage)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    // The suite gets its own CSRF secret, so sign-in issues a token at all. Without one the
+    // deployment refuses every cookie-authenticated write by design — the double-submit check
+    // has nothing to compare — and a test process has no `OMNION_CSRF_SECRET`.
+    support::walk_auth::with_csrf_secret(&mut config);
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
     let storage = live_storage().await?;
@@ -439,16 +466,11 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .and_then(|value| {
-            value
-                .split(';')
-                .next()
-                .and_then(|pair| pair.split_once('='))
-                .map(|(_, token)| token.to_owned())
-        })
-        .expect("a session cookie")
+    // Every `Set-Cookie`, not the first. This helper used to read the first header and take the
+    // first `name=value` out of it, which is correct for one cookie and silently lossy for the
+    // two sign-in issues — so the walk held a session with no token and every write came back
+    // `csrf_unavailable`, a code that blames the deployment rather than the helper.
+    support::walk_auth::Session::from_set_cookies(&response.set_cookies).pack()
 }
 
 /// The storage key of the version the `media` row is currently serving.
@@ -1318,4 +1340,92 @@ async fn foreign_policy(fixture: &Fixture, _token: &str) -> Uuid {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the policy must be created")
+}
+
+/// The retention screen's "past its restore window" count, with something actually past it.
+///
+/// This walk exists because of a query that was wrong and a comment that said it was not.
+/// `past_restore_window` summed `size_bytes` with no cast, and `sum()` over a `bigint` is
+/// `numeric`, which sqlx will not decode into an `i64` — the retention list answered `500` as
+/// soon as a site had a trashed file past its window, and only for such a site. Every existing
+/// walk passed because none of them had one: `sum()` over an empty set is `NULL`, `NULL` decodes
+/// into `Option<i64>` as `None`, and the whole shape of the bug is invisible until the set is
+/// non-empty.
+///
+/// So the walk does the one thing the others did not: it trashes a file, ages the deletion past
+/// the window, and reads the count back. An assertion that can only fail when there is something
+/// to count is the only kind that proves a sum.
+#[tokio::test]
+async fn the_past_restore_window_counts_files_that_are_actually_past_it() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.sites[0];
+    let editor = fixture.editor_token().await;
+
+    // Before anything is trashed the count is zero — and that is the state every other walk
+    // stopped at, which is exactly why the defect survived.
+    let before = call(
+        &fixture.state,
+        request(Method::GET, &retention_uri(site), Some(&editor), None),
+    )
+    .await;
+    assert_eq!(before.status, StatusCode::OK, "{}", before.body);
+    assert_eq!(before.body["past_restore"], json!(0));
+    assert_eq!(before.body["past_restore_bytes"], json!(0));
+
+    // Two files, deliberately different sizes, so the byte total cannot pass by accident.
+    let small = upload(&fixture.state, &editor, site, "small.txt", b"hi").await;
+    let large = upload(&fixture.state, &editor, site, "large.txt", b"twenty bytes here").await;
+    let sizes: Vec<i64> = sqlx::query_scalar("select size_bytes from media where id = any($1)")
+        .bind(vec![small, large])
+        .fetch_all(fixture.db.pool())
+        .await
+        .expect("the sizes must read");
+    let expected_bytes: i64 = sizes.iter().sum();
+
+    for file in [small, large] {
+        let deleted = call(
+            &fixture.state,
+            request(Method::DELETE, &file_uri(site, file), Some(&editor), None),
+        )
+        .await;
+        assert_eq!(deleted.status, StatusCode::OK, "{}", deleted.body);
+        // The site's default trash window is 30 days; 40 is comfortably past it.
+        fixture.age_trash(file, 40).await;
+    }
+
+    // The count the retention tab renders. This is the assertion the old suite could not make:
+    // with a non-empty set the uncast sum decodes as NUMERIC and the whole screen 500s.
+    let after = call(
+        &fixture.state,
+        request(Method::GET, &retention_uri(site), Some(&editor), None),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK, "{}", after.body);
+    assert_eq!(
+        after.body["past_restore"],
+        json!(2),
+        "both files are past the window and the screen must say so"
+    );
+    assert_eq!(
+        after.body["past_restore_bytes"],
+        json!(expected_bytes),
+        "their bytes, added in a type the decoder accepts"
+    );
+
+    // A file still inside its window is not counted. Without this the assertion above would also
+    // pass if the query ignored the cutoff entirely.
+    let _fresh = upload(&fixture.state, &editor, site, "fresh.txt", b"new").await;
+    let still_here = call(
+        &fixture.state,
+        request(Method::GET, &retention_uri(site), Some(&editor), None),
+    )
+    .await;
+    assert_eq!(still_here.status, StatusCode::OK);
+    assert_eq!(
+        still_here.body["past_restore"],
+        json!(2),
+        "a file deleted seconds ago has not aged out"
+    );
 }

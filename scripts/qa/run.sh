@@ -39,6 +39,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -107,7 +108,9 @@ step "API binary: $API_BIN"
 if [ ! -x "$API_BIN" ] \
    || [ -n "$(find database/migrations -name '*.sql' -newer "$API_BIN" -print -quit)" ]; then
   step "building the API (first pass, or a migration changed since the last build)"
-  cargo build -p omnion-api
+  # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
+  # compiling at once instead of every pass grabbing all six threads for itself.
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 # A pm2 entry that exists but points at a binary which is no longer there is *worse* than no
 # entry: `pm2 restart` succeeds, nothing listens, and the pass dies at `wait_http` blaming the
