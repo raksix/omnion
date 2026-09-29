@@ -37,7 +37,10 @@ const FINDING_COLUMNS: &str = "id, organization_id, source, severity, title, des
 /// "Latest" is resolved per check key in SQL rather than in Rust: the panel's read is a few
 /// rows, and a query that returns a whole run's history for the overview is a query whose cost
 /// grows with how long the platform has been up.
-pub async fn latest_results(pool: &PgPool, organization_id: Option<Uuid>) -> Result<Vec<CheckResult>> {
+pub async fn latest_results(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<Vec<CheckResult>> {
     let sql = format!(
         "select {CHECK_COLUMNS} from security_check_results r \
          where r.organization_id is not distinct from $1 \
@@ -130,16 +133,15 @@ pub async fn list_findings(
     push_filter(&mut page, &filter);
     // Worst first, then newest: an operator opening the findings tab is looking for the thing
     // that is worst and still current, not for the oldest open item.
-    page.push(" order by case severity when 'critical' then 0 when 'high' then 1 \
+    page.push(
+        " order by case severity when 'critical' then 0 when 'high' then 1 \
                when 'medium' then 2 when 'low' then 3 when 'info' then 4 else 9 end, \
-               last_seen_at desc, id desc limit ");
+               last_seen_at desc, id desc limit ",
+    );
     page.push_bind(limit);
     page.push(" offset ");
     page.push_bind(query.offset.max(0));
-    let findings = page
-        .build_query_as::<Finding>()
-        .fetch_all(pool)
-        .await?;
+    let findings = page.build_query_as::<Finding>().fetch_all(pool).await?;
 
     Ok(FindingPage {
         findings,
@@ -204,11 +206,12 @@ pub async fn upsert_finding(
     // the DO UPDATE branch. Reading it is how one statement answers created-or-refreshed
     // without a second query, which is a second query that could see a *different* row after a
     // concurrent delete.
-    let created: bool = sqlx::query_scalar("select coalesce(xmax, 0) = 0 from security_findings where id = $1")
-        .bind(row.id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(true);
+    let created: bool =
+        sqlx::query_scalar("select coalesce(xmax, 0) = 0 from security_findings where id = $1")
+            .bind(row.id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(true);
     Ok((row, created))
 }
 
@@ -317,7 +320,11 @@ pub async fn open_counts_by_severity(
                  and (status in ('open', 'acknowledged') \
                       or (status = 'ignored' and (ignored_until is null or ignored_until > $2))) \
                group by severity";
-    let rows: Vec<(String, i64)> = sqlx::query_as(sql).bind(organization_id).bind(now).fetch_all(pool).await?;
+    let rows: Vec<(String, i64)> = sqlx::query_as(sql)
+        .bind(organization_id)
+        .bind(now)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().collect())
 }
 
@@ -389,9 +396,11 @@ pub async fn export_findings(
     push_filter(&mut builder, &filter);
     // The same worst-first order as the table, so a row in the file lines up with a row on
     // screen and a reader comparing the two is not looking for a different order.
-    builder.push(" order by case severity when 'critical' then 0 when 'high' then 1 \
+    builder.push(
+        " order by case severity when 'critical' then 0 when 'high' then 1 \
                   when 'medium' then 2 when 'low' then 3 when 'info' then 4 else 9 end, \
-                  last_seen_at desc, id desc");
+                  last_seen_at desc, id desc",
+    );
     Ok(builder.build_query_as::<Finding>().fetch_all(pool).await?)
 }
 
@@ -414,7 +423,10 @@ enum Condition {
     SeenAfter(time::OffsetDateTime),
     /// `(pattern, negated)` — the title match and the description match share one pattern, so
     /// it is pushed once and referenced twice.
-    Search { pattern: String, negated: bool },
+    Search {
+        pattern: String,
+        negated: bool,
+    },
 }
 
 impl Condition {
@@ -476,7 +488,11 @@ fn push_filter(builder: &mut QueryBuilder<'_, Postgres>, filter: &Filter) {
     for condition in &filter.conditions {
         builder.push(condition.sql());
         condition.push_value(builder);
-        if let Condition::Search { pattern, negated: false } = condition {
+        if let Condition::Search {
+            pattern,
+            negated: false,
+        } = condition
+        {
             builder.push(" escape '\\' or description ilike ");
             builder.push_bind(pattern.clone());
             builder.push(" escape '\\'");
@@ -488,15 +504,14 @@ fn push_filter(builder: &mut QueryBuilder<'_, Postgres>, filter: &Filter) {
 ///
 /// Returns the conditions rather than a finished string, so a caller cannot get the clause and
 /// the binds out of step.
-fn finding_filter(
-    organization: Option<Uuid>,
-    query: &FindingQuery,
-) -> Result<Filter> {
+fn finding_filter(organization: Option<Uuid>, query: &FindingQuery) -> Result<Filter> {
     let mut conditions: Vec<Condition> = Vec::new();
 
     if let Some(severity) = query.severity.as_deref().filter(|s| !s.is_empty()) {
         if !is_severity(severity) {
-            return Err(SecurityError::invalid(format!("unknown severity {severity:?}")));
+            return Err(SecurityError::invalid(format!(
+                "unknown severity {severity:?}"
+            )));
         }
         conditions.push(Condition::Severity(severity.to_string()));
     }
@@ -518,7 +533,12 @@ fn finding_filter(
     if let Some(seen_after) = query.seen_after {
         conditions.push(Condition::SeenAfter(seen_after));
     }
-    if let Some(search) = query.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(search) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         // Escaped because the term goes into a LIKE pattern: an unescaped `%` in a search box
         // turns "search for 100%" into "search for everything", which shows up as a strange
         // total rather than as an error.
@@ -537,7 +557,6 @@ fn finding_filter(
         conditions,
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -624,10 +643,16 @@ mod tests {
         )
         .expect("any term is searchable");
         let Condition::Search { pattern, .. } = &filter.conditions[0] else {
-            panic!("expected a search condition, got {:?}", filter.conditions[0]);
+            panic!(
+                "expected a search condition, got {:?}",
+                filter.conditions[0]
+            );
         };
         assert_eq!(pattern, "%100\\% \\_done\\\\%");
-        assert!(clause_of(&filter).contains("escape '\\'"), "the pattern must be escaped");
+        assert!(
+            clause_of(&filter).contains("escape '\\'"),
+            "the pattern must be escaped"
+        );
     }
 
     #[test]
@@ -635,9 +660,18 @@ mod tests {
         // A filter for a severity the platform does not have would otherwise return an empty
         // list, which reads as "no findings" rather than "that filter is nonsense".
         for bad in [
-            FindingQuery { severity: Some("spicy".into()), ..query() },
-            FindingQuery { status: Some("pending".into()), ..query() },
-            FindingQuery { source: Some("telepathy".into()), ..query() },
+            FindingQuery {
+                severity: Some("spicy".into()),
+                ..query()
+            },
+            FindingQuery {
+                status: Some("pending".into()),
+                ..query()
+            },
+            FindingQuery {
+                source: Some("telepathy".into()),
+                ..query()
+            },
         ] {
             let err = finding_filter(None, &bad).expect_err("a nonsense filter must be refused");
             assert_eq!(err.code(), "invalid_security_input");
@@ -656,7 +690,10 @@ mod tests {
             ..query()
         };
         let filter = finding_filter(None, &empty).expect("empty is not a filter");
-        assert!(filter.conditions.is_empty(), "an empty dropdown is not a filter");
+        assert!(
+            filter.conditions.is_empty(),
+            "an empty dropdown is not a filter"
+        );
     }
 
     #[test]
