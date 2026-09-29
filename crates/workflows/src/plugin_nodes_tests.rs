@@ -5,7 +5,7 @@
 
 use serde_json::json;
 
-use crate::graph::{self, Graph};
+use crate::graph::{self, Finding, Graph};
 use crate::plugin_nodes::{
     is_legal_key, is_reserved_key, namespaced_key, PluginNodeRejection, PluginNodeType,
     PluginParamField, PluginPort, PluginProvider, PluginRegistry, PLUGIN_CATEGORY, Resolution,
@@ -448,6 +448,176 @@ fn a_select_with_no_options_is_dropped_rather_than_drawn_unanswerable() {
     let node = &registry.nodes()[0];
     assert!(node.params.is_empty(), "an unanswerable field must not be drawn");
     assert_eq!(node.defaults, json!({}), "and it must not be prefilled either");
+}
+
+// ---- the projection resolves through the same registry (the save path) ---------------------
+//
+// The three states of the criterion are all about *validation*. The save path has a fourth
+// question after that, and it is the one that used to answer differently from the validation:
+// can the core turn this graph into the step list the runner executes?
+//
+// A graph with a plugin node validates cleanly when the plugin is enabled (the palette drew
+// the node, the author wired it, the findings are empty) and then the store refused it with
+// `"plugin.mailer.send" does not project onto a step` — which is the *core-only* check's
+// sentence. The author had done nothing wrong, and the message sent them to fix a typo they
+// never made. So the projection takes the same registry, and refuses a plugin node with a
+// sentence that names the actual reason.
+
+#[test]
+fn a_graph_with_an_enabled_plugin_node_validates_and_then_is_refused_by_the_projection() {
+    let registry = registry_with_mailer();
+    let graph = graph_with_plugin_node();
+
+    // The validation half passes: the plugin is enabled, so the node is a node type.
+    let findings = graph::validate_with_plugins(&graph, &registry);
+    assert!(
+        !findings.iter().any(Finding::is_error),
+        "an enabled plugin node is a known node type: {findings:?}"
+    );
+
+    // The projection half refuses it — the core has no runner for it — and says why in the
+    // words that name the cause. An author who reads "the platform does not execute plugin
+    // nodes yet" knows what to do; one who reads "is not a node type the platform knows"
+    // goes looking for a typo in a manifest that installed fine.
+    let error = graph::project_with_plugins(&graph, &registry)
+        .expect_err("a plugin node has no core step to project onto");
+    // `code()` and the `Display` form, not the `Invalid` variant's fields: a reader of this
+    // test should not have to know that a refusal *is* always `Invalid` to check what it
+    // says. The accessors are the surface the HTTP layer uses, so the assertions here are
+    // made against exactly what an author's browser receives.
+    let sentence = error.to_string();
+    assert_eq!(error.code(), "plugin_node_not_executable");
+    assert!(
+        sentence.contains("does not execute plugin nodes"),
+        "the sentence must name the real reason, got {sentence:?}"
+    );
+    assert!(
+        !sentence.contains("is not a node type the platform knows"),
+        "and must NOT reuse the typo sentence, got {sentence:?}"
+    );
+}
+
+#[test]
+fn the_projection_and_the_validation_never_disagree_about_what_exists() {
+    // The defect this closes, stated as the property it broke — and stated **narrowly on
+    // purpose**, because the first draft of this assertion was `!(clean && !projects)` and
+    // that was wrong. `clean == false` here is the *designed* outcome: a plugin node is a
+    // known type, so the findings are empty, and the projection then refuses it because the
+    // core has no runner. "Valid but unprojectable" is the intended shape, and an
+    // assertion that forbids it would have deleted the product decision one commit earlier.
+    //
+    // The property that was actually violated is narrower and is the one worth freezing:
+    // the two must never disagree about *existence*. A type the projection resolves as
+    // unknown must also be an `unknown_node_type` finding, and a type with an
+    // `unknown_node_type` finding must not be reported by the projection as something else
+    // — because that is the state where the author is told to hunt a typo they never made.
+    // Executability is a separate question with a separate sentence, and a separate test.
+    let registry = registry_with_mailer();
+    let graph = graph_with_plugin_node();
+    let findings = graph::validate_with_plugins(&graph, &registry);
+    let says_unknown = findings
+        .iter()
+        .any(|finding| finding.code == "unknown_node_type");
+
+    // Enabled plugin: known to both, and the disagreement is about running it, not naming it.
+    assert!(
+        !says_unknown,
+        "an enabled plugin node exists — the findings may not call it unknown: {findings:?}"
+    );
+    let sentence = graph::project_with_plugins(&graph, &registry)
+        .expect_err("the core cannot run it")
+        .to_string();
+    assert!(
+        !sentence.contains("is not a node type the platform knows"),
+        "and the projection may not call it unknown either: {sentence:?}"
+    );
+
+    // Disabled plugin: the second half, and the assertion that is left once the fiction of
+    // "the projection owns a code here" is dropped.
+    //
+    // Two things are true and only the first is obvious. The disabled state IS reported as
+    // `unknown_node_type` — asserted directly, and it is the same code the finding uses.
+    // And the *projection* never gets to answer it at all: the save route runs the same
+    // validation first and returns the whole findings list, so by the time a projection
+    // could run, an unknown type has already been reported as one. Asserting the
+    // projection's code here would freeze a path no client can reach — which is how a test
+    // ends up protecting an implementation detail and calling it a guarantee.
+    //
+    // What IS reachable, and what a client actually sees, is the *sentence*: the walk wraps
+    // the validation's first message rather than composing its own, so the author gets the
+    // identical "re-enable it" the problems panel showed them. Two entry points, one
+    // wording — and if a future refactor lets the walk invent its own sentence, this is the
+    // assertion that catches it.
+    let stripped = graph::validate_with_plugins(&graph, &PluginRegistry::empty());
+    let finding = stripped
+        .iter()
+        .find(|finding| finding.code == "unknown_node_type")
+        .expect("a plugin the registry no longer has is unknown");
+    assert!(
+        finding.message.contains("re-enable"),
+        "the finding keeps the instruction the author needs: {}",
+        finding.message
+    );
+    let walked = graph::project_with_plugins(&graph, &PluginRegistry::empty())
+        .expect_err("nothing runs a node type that does not exist")
+        .to_string();
+    assert!(
+        walked.contains(finding.message.as_str()),
+        "the projection must carry the validation's own sentence, not a second wording: \
+         finding {:?} vs walk {walked:?}",
+        finding.message
+    );
+}
+
+#[test]
+fn the_same_graph_projects_against_the_core_only_wrapper_with_a_different_sentence() {
+    // The two entry points stay distinct, and this is why: a *stored* graph is core-only by
+    // construction (the save refuses plugin nodes), so `project` — the core-only wrapper the
+    // attribution and run-from-here walks use — is correct for them. What it must never do
+    // is answer a save. A plugin node through it reads as a typo, which is the false
+    // accusation the criterion exists to remove.
+    let graph = graph_with_plugin_node();
+    let error = graph::project(&graph).expect_err("core-only cannot project a plugin node");
+    assert_ne!(
+        error.code(),
+        "plugin_node_not_executable",
+        "the core-only wrapper has no registry, so it cannot know the plugin is enabled"
+    );
+}
+
+#[test]
+fn a_core_only_graph_is_unaffected_by_the_new_parameter() {
+    // A regression guard on the ordinary path: pass a registry that has nothing to do with
+    // the graph and every core rule must still behave exactly as it did.
+    let registry = registry_with_mailer();
+    let graph = Graph {
+        nodes: vec![
+            crate::graph::Node {
+                id: "a".to_owned(),
+                node_type: "trigger.manual".to_owned(),
+                label: "Manual".to_owned(),
+                params: json!({}),
+                position: crate::graph::Position { x: 0.0, y: 0.0 },
+            },
+            crate::graph::Node {
+                id: "b".to_owned(),
+                node_type: "end".to_owned(),
+                label: "End".to_owned(),
+                params: json!({}),
+                position: crate::graph::Position { x: 240.0, y: 0.0 },
+            },
+        ],
+        edges: vec![crate::graph::Edge {
+            id: "e1".to_owned(),
+            source: "a".to_owned(),
+            source_port: "out".to_owned(),
+            target: "b".to_owned(),
+        }],
+    };
+    let steps = graph::project_with_plugins(&graph, &registry).expect("core nodes project");
+    let baseline = graph::project(&graph).expect("core nodes project");
+    assert_eq!(steps, baseline, "an unrelated registry must change nothing");
+    assert_eq!(steps.len(), 1, "the end node is the only step");
 }
 
 // ---- fixtures -------------------------------------------------------------------------------
