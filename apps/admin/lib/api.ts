@@ -111,6 +111,7 @@ import type {
   Site,
   User,
 } from "./types";
+import type { MoveReport, Workflow } from "./types";
 
 /** An error answered by the API, or raised before the request could leave the browser. */
 export class ApiError extends Error {
@@ -498,6 +499,46 @@ export function setProjectMember(
 /** Remove a membership. The API refuses the one that would leave nobody owning the project. */
 export function removeProjectMember(id: string, userId: string): Promise<void> {
   return request<void>(`/api/v1/projects/${id}/members/${userId}`, { method: "DELETE" });
+}
+
+/**
+ * The workflows in one project, for the move dialog's host screen (REQ-133 slice 3).
+ *
+ * The API already accepts a `project_id` filter and already scopes the result to the projects the
+ * caller may see, so this passes the project rather than filtering client-side: a client-side
+ * filter over an unscoped list would show a workflow the API deliberately hid.
+ */
+export function fetchWorkflowsInProject(
+  projectId: string,
+  organizationId?: string,
+): Promise<{ workflows: Workflow[] }> {
+  const query = new URLSearchParams({ project_id: projectId });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<{ workflows: Workflow[] }>(`/api/v1/workflows?${query.toString()}`);
+}
+
+/**
+ * Report on a move, or make it. One call for both (REQ-133 slice 3).
+ *
+ * `dryRun` is a flag rather than a second endpoint because the report the dialog renders and the
+ * decision the move is made on come from the same detection -- two endpoints would be two
+ * implementations that could disagree, and the disagreement would only show up as a move that
+ * behaves unlike its own preview.
+ */
+export function moveWorkflow(
+  workflowId: string,
+  toProjectId: string,
+  dryRun: boolean,
+  organizationId?: string,
+): Promise<MoveReport> {
+  return request<MoveReport>(`/api/v1/workflows/${workflowId}/move`, {
+    method: "POST",
+    body: JSON.stringify({
+      organization_id: organizationId,
+      to_project_id: toProjectId,
+      dry_run: dryRun,
+    }),
+  });
 }
 
 /** The sites the account may see, optionally narrowed to one tenant. */

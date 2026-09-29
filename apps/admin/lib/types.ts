@@ -2075,6 +2075,61 @@ export interface BackupSchedule {
  * count and a detail screen that had to ask for each of them separately would
  * be three round trips for one header.
  */
+/** A workflow as the panel reads it (REQ-133's project screens read these). */
+export interface Workflow {
+  id: string;
+  organization_id: string;
+  /** The project it lives in. Never null: 0164 made the column `not null`. */
+  project_id: string;
+  site_id: string | null;
+  name: string;
+  description: string;
+  enabled: boolean;
+  /** `manual` or `schedule` — the API's field is named `trigger`, not `trigger_kind`. */
+  trigger: string;
+  schedule: string | null;
+  trigger_event: string | null;
+  conditions: unknown;
+  next_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * One dependency the move report found (REQ-133 slice 3).
+ *
+ * `kind` is a closed set in the store, and the screen switches on it rather than testing the
+ * variant names: a dependency kind added there renders as "unknown kind" here rather than
+ * silently disappearing, which is the failure a report is supposed to make impossible.
+ */
+export type MoveDependency =
+  | { kind: "run_history"; executions: number }
+  | { kind: "step_history"; steps: number }
+  | { kind: "schedule_cursor"; schedule: string; next_run_at: string | null }
+  | { kind: "source_audit_history"; rows: number };
+
+/**
+ * The move report, dry run or applied.
+ *
+ * **`unchecked` is the field the dialog must show.** The kinds REQ-133 names that cannot exist on
+ * this branch (credential references, sub-workflow calls, webhook subscriptions, published routes,
+ * templates) are listed there rather than silently absent, so the operator is told what the report
+ * is not covering instead of reading "no dependencies" as a clean bill of health.
+ */
+export interface MoveReport {
+  workflow_id: string;
+  workflow_name: string;
+  from_project_id: string;
+  to_project_id: string;
+  from_project_key: string;
+  to_project_key: string;
+  dependencies: MoveDependency[];
+  unchecked: string[];
+  refuses: boolean;
+  reason: string | null;
+  dry_run: boolean;
+}
+
 export interface Project {
   /** The project's own id. */
   id: string;

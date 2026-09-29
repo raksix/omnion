@@ -59,6 +59,13 @@ pub struct WorkflowBody {
     pub organization_id: Uuid,
     /// Site it is scoped to, when it is.
     pub site_id: Option<Uuid>,
+    /// The project it lives in (REQ-133).
+    ///
+    /// **Added by slice 3 and not optional.** The move dialog's host screen lists the workflows of
+    /// one project and has to be able to say which project each row is in; without the field the
+    /// client would have to re-derive it from the query it already sent, which is the kind of
+    /// assumption that quietly stops being true when a second list arrives.
+    pub project_id: Uuid,
     /// Display name.
     pub name: String,
     /// Free-form description.
@@ -102,6 +109,7 @@ impl WorkflowBody {
             id: workflow.id,
             organization_id: workflow.organization_id,
             site_id: workflow.site_id,
+            project_id: workflow.project_id,
             name: workflow.name.clone(),
             description: workflow.description.clone(),
             enabled: workflow.enabled,

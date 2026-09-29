@@ -22,19 +22,21 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ArrowLeft, Archive, ArchiveRestore, Loader2, Save, Trash2, TriangleAlert, UserPlus } from "lucide-react";
+import { ArrowLeft, Archive, ArchiveRestore, FolderInput, Loader2, Save, Trash2, TriangleAlert, UserPlus } from "lucide-react";
 
 import { LoadingTable } from "@/components/loading-table";
 import { EmptyState } from "@/components/empty-state";
 import {
   ApiError,
   fetchProject,
+  fetchWorkflowsInProject,
   removeProjectMember,
   setProjectArchived,
   setProjectMember,
   updateProject,
 } from "@/lib/api";
-import type { Project, ProjectMember, ProjectRole } from "@/lib/types";
+import { MoveDialog } from "@/features/workflows/move-dialog";
+import type { Project, ProjectMember, ProjectRole, Workflow } from "@/lib/types";
 
 /** What each role may do, in the words the members screen needs. */
 const ROLE_ABILITY: Record<ProjectRole, string> = {
@@ -62,6 +64,14 @@ export function ProjectDetail() {
   const [description, setDescription] = useState("");
   const [saved, setSaved] = useState(false);
 
+  // The workflows this project holds, and which one the move dialog is open for. Both are here
+  // rather than on a workflows screen because this branch has none: the API is scoped by project
+  // (REQ-133 slice 2) but the panel has no list to hang the action on, and an action with no host
+  // is an action nobody can reach.
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [workflowsError, setWorkflowsError] = useState<string | null>(null);
+  const [moving, setMoving] = useState<Workflow | null>(null);
+
   const load = useCallback(async () => {
     if (!projectId) return;
     setError(null);
@@ -70,6 +80,18 @@ export function ProjectDetail() {
       const body = await fetchProject(projectId);
       setProject(body.project);
       setMembers(body.members);
+      // The workflow list is a separate read: a project whose detail loads while its workflow
+      // list fails must still be editable, so this one catches into its own strip rather than
+      // failing the screen.
+      setWorkflowsError(null);
+      try {
+        const listed = await fetchWorkflowsInProject(projectId);
+        setWorkflows(listed.workflows);
+      } catch (cause) {
+        setWorkflowsError(
+          cause instanceof ApiError ? cause.message : "the workflows could not be read",
+        );
+      }
       setKey(body.project.key);
       setName(body.project.name);
       setDescription(body.project.description);
@@ -394,6 +416,77 @@ export function ProjectDetail() {
         </p>
       </section>
 
+      <section className="flex flex-col gap-2">
+        <div className="flex items-center gap-2">
+          <h2 className="text-[13.5px] font-medium">Workflows</h2>
+          <span className="text-[11.5px] text-muted">
+            {workflows.length} in this project
+          </span>
+        </div>
+
+        {workflowsError ? (
+          <p role="alert" data-project-workflows-error className="text-[11.5px] text-red-600">
+            {workflowsError}
+          </p>
+        ) : null}
+
+        {workflows.length === 0 && !workflowsError ? (
+          <p data-project-workflows-empty className="text-[12px] text-muted">
+            No workflows in this project. Anything created without a project lands in the
+            organization&apos;s default one.
+          </p>
+        ) : null}
+
+        {workflows.length > 0 ? (
+          <div className="overflow-hidden rounded-xl border border-line bg-surface">
+            <div className="overflow-x-auto">
+              <table data-project-workflows className="w-full border-collapse text-left text-[13px]">
+                <thead>
+                  <tr className="border-b border-line text-[11.5px] text-muted">
+                    <th scope="col" className="px-3 py-2.5">Name</th>
+                    <th scope="col" className="px-3 py-2.5">Trigger</th>
+                    <th scope="col" className="px-3 py-2.5"><span className="sr-only">Actions</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {workflows.map((workflow) => (
+                    <tr key={workflow.id} data-project-workflow={workflow.id} className="border-b border-line last:border-b-0">
+                      <td className="px-3 py-2.5">
+                        {workflow.name}
+                        {!workflow.enabled ? (
+                          <span className="ml-2 tag tag-muted">Disabled</span>
+                        ) : null}
+                      </td>
+                      <td className="px-3 py-2.5 text-[12px] text-muted">
+                        {workflow.trigger}
+                        {workflow.schedule ? ` · ${workflow.schedule}` : ""}
+                      </td>
+                      <td className="px-3 py-2.5 text-right">
+                        <button
+                          type="button"
+                          data-project-move-workflow={workflow.id}
+                          disabled={busy || archived}
+                          title={
+                            archived
+                              ? "This project is archived, so it is read-only — restore it to move a workflow out"
+                              : "Move to another project, with a dependency report first"
+                          }
+                          onClick={() => setMoving(workflow)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-line px-2 py-1 text-[11.5px] transition hover:text-ink disabled:opacity-50"
+                        >
+                          <FolderInput className="size-3.5" aria-hidden />
+                          Move to project…
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : null}
+      </section>
+
       {!project.is_default ? (
         <section>
           <button
@@ -413,6 +506,19 @@ export function ProjectDetail() {
             {archived ? "Restore this project" : "Archive this project"}
           </button>
         </section>
+      ) : null}
+
+      {moving ? (
+        <MoveDialog
+          workflowId={moving.id}
+          workflowName={moving.name}
+          organizationId={project.organization_id}
+          onClose={() => setMoving(null)}
+          onMoved={() => {
+            setMoving(null);
+            void load();
+          }}
+        />
       ) : null}
     </div>
   );
