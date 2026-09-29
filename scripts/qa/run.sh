@@ -122,7 +122,16 @@ if [ "$NEEDS_BUILD" = "1" ]; then
   # the `set -euo pipefail` above already implies costs nothing and cannot be broken by a mode
   # bit; a harness that only runs for the writer who happened to chmod it locally is a
   # harness that fails on every other writer.
-  bash "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
+  # `CARGO_INCREMENTAL=0`: eight writers share one box and their target directories sit side
+  # by side, and a build that is interrupted or raced leaves the incremental session's
+  # `dep-graph.bin` / `query-cache.bin` half-written. The next build then fails with
+  # "failed to move dependency graph ... No such file or directory (os error 2)" - which is
+  # os error 2, NOT the os error 28 of a full tmpfs, and reads like a source problem rather
+  # than a cache one. Incremental compilation buys minutes on a developer's machine and buys
+  # nothing for a pass that must produce a binary it can trust, so the build that a pass
+  # depends on does without it. (The unit tests keep it: they are re-run constantly and are
+  # not gating a browser against a stack somebody else may reset.)
+  CARGO_INCREMENTAL=0 bash "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
 # The CSRF secret is the one variable the platform refuses to invent: a deployment that sets
 # none still boots, and every cookie-authenticated mutation then answers 403
