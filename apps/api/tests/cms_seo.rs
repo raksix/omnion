@@ -1082,3 +1082,363 @@ fn urlencode(value: &str) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------------------------
+// Redirect CSV (REQ-064, slice 3 — the criterion's import/export half)
+// ---------------------------------------------------------------------------------------------
+
+/// How many rules a site holds, read from SQL rather than from the API.
+///
+/// The importer's central promise is *all or nothing*, and no response body can prove it: an
+/// endpoint that reported "0 imported" while having written four rows would be perfectly
+/// well-behaved from the caller's side. The table is the only witness.
+async fn rule_count(db: &Db, site: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from cms_seo_redirects where site_id = $1")
+        .bind(site)
+        .fetch_one(db.pool())
+        .await
+        .expect("the count must read")
+}
+
+#[tokio::test]
+async fn a_csv_round_trips_through_export_and_back() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.editor().await;
+
+    // Two rules written by the API, then exported — the file is what an owner hands to whoever
+    // runs the site, so the export has to be the real table rather than a summary of it.
+    for (from, to) in [("/legacy/pricing", "/pricing"), ("/docs", "/handbook")] {
+        let response = call(
+            &fixture.state,
+            request(
+                Method::POST,
+                "/api/v1/seo/redirects",
+                Some(&token),
+                Some(json!({ "site_id": fixture.site, "from_path": from, "to_path": to })),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::CREATED, "{:?}", response.body);
+    }
+
+    let export = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/seo/redirects/export?site_id={}", fixture.site),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(export.status, StatusCode::OK);
+    let content_type = export
+        .headers
+        .iter()
+        .find(|(name, _)| name == "content-type")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    assert!(
+        content_type.starts_with("text/csv"),
+        "an export the browser will not save as a file: {content_type}"
+    );
+    let disposition = export
+        .headers
+        .iter()
+        .find(|(name, _)| name == "content-disposition")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    assert!(
+        disposition.contains("attachment"),
+        "the export must arrive as a download: {disposition}"
+    );
+
+    let csv = String::from_utf8(export.raw.clone()).expect("the export is utf-8");
+    assert!(csv.starts_with("from,to,status,pattern,enabled"), "{csv}");
+    assert!(csv.contains("/legacy/pricing,/pricing"), "{csv}");
+
+    // A second site, so the imported file cannot collide with the two the export already has.
+    let other_org = Uuid::new_v4();
+    sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
+        .bind(other_org)
+        .bind("SEO Import Org")
+        .bind(format!("seo-import-org-{}", Uuid::new_v4().simple()))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the organization must be created");
+    let other_site = Uuid::new_v4();
+    sqlx::query("insert into sites (id, organization_id, key, name) values ($1, $2, $3, $4)")
+        .bind(other_site)
+        .bind(other_org)
+        .bind(format!("imp{}", &Uuid::new_v4().simple().to_string()[..8]))
+        .bind("SEO Import Site")
+        .execute(fixture.db.pool())
+        .await
+        .expect("the site must be created");
+
+    let (other_user, other_email) = create_account(&fixture.db, Some(other_org)).await;
+    grant(
+        &fixture.db,
+        other_org,
+        other_user,
+        &[EDITOR_EXTRA.as_slice(), READER_PERMISSIONS.as_slice()].concat(),
+        "SEO Import Editor",
+    )
+    .await;
+    let other_token = login(&fixture.state, &fixture.db, &other_email).await;
+
+    let imported = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&other_token),
+            Some(json!({ "site_id": other_site, "csv": csv })),
+        ),
+    )
+    .await;
+    assert_eq!(imported.status, StatusCode::CREATED, "{:?}", imported.body);
+    assert_eq!(imported.body["clean"], json!(true), "{:?}", imported.body);
+    assert_eq!(imported.body["imported"], json!(2), "{:?}", imported.body);
+    assert_eq!(rule_count(&fixture.db, other_site).await, 2);
+
+    // And the rules are *rules*: the resolver answers for a path the file named, which is the
+    // only way to know the import wrote working rows rather than rows that merely exist.
+    let resolved = omnion_content::seo::SeoStore::new(fixture.db.pool().clone())
+        .resolve_redirect(other_site, "/legacy/pricing")
+        .await
+        .expect("the resolver must answer");
+    assert!(
+        resolved.is_some(),
+        "the imported rule does not answer the path it names"
+    );
+}
+
+#[tokio::test]
+async fn a_file_with_one_bad_row_writes_nothing_and_names_the_line() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.editor().await;
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&token),
+            Some(json!({
+                "site_id": fixture.site,
+                // Three good rows and one that cannot be right. A per-row importer would have
+                // written the first three and reported "1 failed".
+                "csv": "from,to,status,pattern,enabled\n\
+                        /good-one,/new,301,literal,true\n\
+                        /good-two,/new,301,literal,true\n\
+                        /good-three,/new,301,literal,true\n\
+                        /bad,/new,999,literal,true\n\
+                        /good-four,/new,301,literal,true\n"
+            })),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        response.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused file must not answer as a success: {:?}",
+        response.body
+    );
+    assert_eq!(response.body["clean"], json!(false));
+    assert_eq!(response.body["imported"], json!(0));
+    assert_eq!(response.body["accepted"], json!(4), "the good rows are still counted");
+    let rejected = response.body["rejected"]
+        .as_array()
+        .expect("rejections are a list")
+        .clone();
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert_eq!(rejected[0]["line"], json!(5), "line 5 is the bad row");
+    assert!(
+        rejected[0]["reason"].as_str().unwrap_or("").contains("999"),
+        "the reason must name what is wrong: {rejected:?}"
+    );
+
+    // The whole point. Four good rows and the table is still empty.
+    assert_eq!(
+        rule_count(&fixture.db, fixture.site).await,
+        0,
+        "a refused import wrote rows anyway — the all-or-nothing promise is the feature"
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_closes_a_loop_is_refused_before_a_single_rule_is_written() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.editor().await;
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&token),
+            Some(json!({
+                "site_id": fixture.site,
+                // The circle closes *inside* the file, on rows 2 and 3. Neither row is wrong on
+                // its own; a per-row check that only asked the database would have written the
+                // first of them before it ever read the second.
+                "csv": "from,to\n/a,/b\n/b,/a\n",
+            })),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(rule_count(&fixture.db, fixture.site).await, 0);
+    let summary = response.body["summary"].as_str().unwrap_or("");
+    assert!(summary.contains("circle"), "{summary}");
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_the_file_and_writes_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.editor().await;
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&token),
+            Some(json!({
+                "site_id": fixture.site,
+                "dry_run": true,
+                "csv": "from,to\n/one,/new\n/two,/new\n",
+            })),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
+    assert_eq!(response.body["clean"], json!(true));
+    assert_eq!(response.body["accepted"], json!(2), "the file was read");
+    assert_eq!(response.body["imported"], json!(0), "and nothing was written");
+    assert_eq!(rule_count(&fixture.db, fixture.site).await, 0);
+}
+
+#[tokio::test]
+async fn a_reader_may_export_but_may_not_import() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let reader = fixture.reader().await;
+
+    let exported = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/seo/redirects/export?site_id={}", fixture.site),
+            Some(&reader),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(exported.status, StatusCode::OK, "reading the rules is a read");
+
+    let imported = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&reader),
+            Some(json!({ "site_id": fixture.site, "csv": "from,to\n/sneaky,/new\n" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        imported.status,
+        StatusCode::FORBIDDEN,
+        "an account that may READ the rules must not be able to paste a file into them"
+    );
+    assert_eq!(rule_count(&fixture.db, fixture.site).await, 0);
+}
+
+#[tokio::test]
+async fn an_import_for_another_organizations_site_is_refused() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.editor().await;
+
+    let other_org = Uuid::new_v4();
+    sqlx::query("insert into organizations (id, name, slug) values ($1, $2, $3)")
+        .bind(other_org)
+        .bind("Someone Else")
+        .bind(format!("seo-else-{}", Uuid::new_v4().simple()))
+        .execute(fixture.db.pool())
+        .await
+        .expect("the organization must be created");
+    let other_site = Uuid::new_v4();
+    sqlx::query("insert into sites (id, organization_id, key, name) values ($1, $2, $3, $4)")
+        .bind(other_site)
+        .bind(other_org)
+        .bind(format!("els{}", &Uuid::new_v4().simple().to_string()[..8]))
+        .bind("Their Site")
+        .execute(fixture.db.pool())
+        .await
+        .expect("the site must be created");
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&token),
+            Some(json!({ "site_id": other_site, "csv": "from,to\n/theirs,/mine\n" })),
+        ),
+    )
+    .await;
+    assert_ne!(response.status, StatusCode::CREATED, "a tenant boundary is not optional");
+    assert_eq!(rule_count(&fixture.db, other_site).await, 0);
+}
+
+#[tokio::test]
+async fn a_file_with_no_usable_header_is_refused_with_the_names_it_needs() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let token = fixture.editor().await;
+
+    let response = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/seo/redirects/import",
+            Some(&token),
+            Some(json!({ "site_id": fixture.site, "csv": "alpha,beta\n1,2\n" })),
+        ),
+    )
+    .await;
+    assert!(
+        response.status.is_client_error(),
+        "a file with no from/to is not importable: {:?}",
+        response.body
+    );
+    // The refusal may arrive as a JSON body or as plain text (the parser's own error), and the
+    // caller has to see the column names either way, so both renderings are searched.
+    let rendered = format!(
+        "{:?}{}",
+        response.body,
+        String::from_utf8_lossy(&response.raw)
+    );
+    assert!(
+        rendered.contains("from") && rendered.contains("to"),
+        "the refusal must say which columns it needs: {rendered}"
+    );
+    assert_eq!(rule_count(&fixture.db, fixture.site).await, 0);
+}
