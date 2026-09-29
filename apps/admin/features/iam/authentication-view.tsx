@@ -42,9 +42,12 @@ import { AttributeMapEditor } from "@/features/iam/attribute-map-editor";
 import { RoleRulesEditor } from "@/features/iam/role-rules-editor";
 import { SyncLedger } from "@/features/iam/sync-ledger";
 import {
+  ProviderDeletionDialog,
+  type ProviderDeletionOutcome,
+} from "@/features/iam/provider-deletion-dialog";
+import {
   ApiError,
   createIamProvider,
-  deleteIamProvider,
   disableIamProvider,
   enableIamProvider,
   fetchIamProviderEvents,
@@ -221,7 +224,10 @@ export function AuthenticationView() {
   const [busy, setBusy] = useState(false);
 
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  /* The provider whose removal is being negotiated, as an object rather than an id. The dialog
+   * needs the name and the slug for its own heading, and holding the whole provider here means
+   * the list can re-render underneath without the dialog losing what it was opened for. */
+  const [deleting, setDeleting] = useState<IamAuthProvider | null>(null);
   const [tests, setTests] = useState<Record<string, IamProviderTest>>({});
   const [events, setEvents] = useState<Record<string, IamProviderEvent[]>>({});
   const [showLog, setShowLog] = useState<string | null>(null);
@@ -399,19 +405,28 @@ export function AuthenticationView() {
     }
   };
 
-  const remove = async (provider: IamAuthProvider) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await deleteIamProvider(provider.id);
-      setNotice(`${provider.name} was removed, with its sign-in log.`);
-      setConfirmDelete(null);
-      await load(activeOrg);
-    } catch (cause) {
-      setError(cause instanceof ApiError ? cause.message : "The provider could not be removed.");
-    } finally {
-      setBusy(false);
+  /* What the dialog reports back. The list is re-read either way, because a reassignment and a
+   * deletion change different things but neither of them can be reflected in the row that was
+   * rendered before the click. */
+  const finishDeletion = async (outcome: ProviderDeletionOutcome) => {
+    if (outcome.kind === "deleted") {
+      setDeleting(null);
+      setNotice("The provider was removed, with its sign-in log.");
+    } else if (outcome.deleted) {
+      setDeleting(null);
+      setNotice(
+        `${outcome.moved} accounts fell back to a local sign-in and the provider was removed.`,
+      );
+    } else {
+      /* The provider is still there, so the dialog stays open with a fresh impact read. The
+       * announcement is written as what happened, not as what the operator should do next: the
+       * dialog is the thing that offers the next step. */
+      setNotice(
+        `${outcome.moved} accounts fell back to a local sign-in. The connector stays until you remove it.`,
+      );
+      return;
     }
+    await load(activeOrg);
   };
 
   return (
@@ -656,37 +671,22 @@ export function AuthenticationView() {
                       <KeyRound className="size-3.5" aria-hidden />
                       Sign-in log
                     </button>
-                    {confirmDelete === provider.id ? (
-                      <span className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          data-provider-delete-confirm={provider.slug}
-                          disabled={busy}
-                          onClick={() => void remove(provider)}
-                          className="flex h-8 items-center gap-1.5 rounded-lg border border-danger/50 px-2.5 text-[12px] text-caution"
-                        >
-                          <Trash2 className="size-3.5" aria-hidden />
-                          Remove for good
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDelete(null)}
-                          className="h-8 rounded-lg border border-line px-2.5 text-[12px] text-ink"
-                        >
-                          Keep
-                        </button>
-                      </span>
-                    ) : (
-                      <button
-                        type="button"
-                        data-provider-delete={provider.slug}
-                        onClick={() => setConfirmDelete(provider.id)}
-                        className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-ink transition hover:bg-panel"
-                      >
-                        <Trash2 className="size-3.5" aria-hidden />
-                        Remove
-                      </button>
-                    )}
+                    {/* One button, not a confirm pair. The pair could not know whether the delete
+                        would be refused until it pressed, and a refusal discovered that way
+                        arrives as an error payload with no repair attached. The dialog reads
+                        the impact first, so the count and the way out are on screen before
+                        anything is at stake. `data-provider-delete-confirm` survives on the
+                        dialog's final button so the walkthrough's existing selector still
+                        drives the same action it did when this was inline. */}
+                    <button
+                      type="button"
+                      data-provider-delete={provider.slug}
+                      onClick={() => setDeleting(provider)}
+                      className="flex h-8 items-center gap-1.5 rounded-lg border border-line px-2.5 text-[12px] text-ink transition hover:bg-panel"
+                    >
+                      <Trash2 className="size-3.5" aria-hidden />
+                      Remove
+                    </button>
                   </div>
                 </div>
 
@@ -1217,6 +1217,18 @@ export function AuthenticationView() {
             </div>
           </form>
         </div>
+      ) : null}
+
+      {/* Rendered outside the section's flow but inside its markup, so the overlay stacks above
+          the table and the provider drawer alike. Only one of the two can be open at a time: the
+          dialog owns the decision, and a draft open behind a deletion dialog is a draft
+          somebody cannot see they are editing. */}
+      {deleting && !draft ? (
+        <ProviderDeletionDialog
+          provider={{ id: deleting.id, slug: deleting.slug, name: deleting.name }}
+          onClose={() => setDeleting(null)}
+          onDone={(outcome) => void finishDeletion(outcome)}
+        />
       ) : null}
     </section>
   );
