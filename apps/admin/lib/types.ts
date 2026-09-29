@@ -1306,6 +1306,19 @@ export type Form = {
   key: string;
   name: string;
   status: string;
+  /**
+   * The settings travel with the form rather than in a second endpoint: the settings drawer and
+   * the builder's Publish button are one screen, and a drawer that has to fetch before it can
+   * show what the form currently does renders the defaults half the time.
+   */
+  submit_action: string;
+  submit_message: string | null;
+  redirect_url: string | null;
+  notify_emails: string[];
+  honeypot: boolean;
+  min_fill_seconds: number;
+  rate_limit_per_hour: number;
+  retention_days: number;
   field_count: number;
   unread_count: number;
   spam_count: number;

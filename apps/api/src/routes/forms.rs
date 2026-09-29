@@ -212,8 +212,23 @@ pub struct FormBody {
     pub name: String,
     /// `draft` or `published`.
     pub status: String,
+    /// What happens after a submission: `message` or `redirect`.
+    pub submit_action: String,
+    /// The message the form shows, when it shows one.
+    pub submit_message: Option<String>,
+    /// Where a redirect form sends the visitor.
+    pub redirect_url: Option<String>,
+    /// Who the submission notification goes to.
+    pub notify_emails: Vec<String>,
+    /// Whether the honeypot is armed.
+    pub honeypot: bool,
+    /// The fill-time floor, in seconds.
+    pub min_fill_seconds: i32,
+    /// Submissions one sender may make in an hour.
+    pub rate_limit_per_hour: i32,
+    /// How long a submission is kept.
+    pub retention_days: i32,
     /// Field count — the list card's number.
-    pub field_count: usize,
     /// Unread submissions — the inbox badge.
     pub unread_count: i64,
     /// Spam submissions counted, never silently dropped.
@@ -975,6 +990,18 @@ async fn form_body(state: &AppState, form: &Form) -> Result<FormBody, ApiError> 
         key: form.key.clone(),
         name: form.name.clone(),
         status: form.status.clone(),
+        // The settings travel with the form rather than in a second endpoint, because the
+        // settings drawer and the builder's Publish button are one screen: a drawer that had to
+        // fetch before it could show what the form currently does is a drawer that renders the
+        // form's *defaults* half the time, and a defaults panel is a settings panel nobody trusts.
+        submit_action: form.submit_action.clone(),
+        submit_message: form.submit_message.clone(),
+        redirect_url: form.redirect_url.clone(),
+        notify_emails: form.notify_emails.clone(),
+        honeypot: form.honeypot,
+        min_fill_seconds: form.min_fill_seconds,
+        rate_limit_per_hour: form.rate_limit_per_hour,
+        retention_days: form.retention_days,
         field_count: usize::try_from(field_count).unwrap_or(0),
         unread_count: counts.new,
         spam_count: counts.spam,
