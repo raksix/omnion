@@ -2766,3 +2766,49 @@ the ledger is append-only, so this is `0053` with the REQ's own table and column
 refresh, and `needs_reauth` reaching the canvas. Then slice 4 — the package ledger's installer
 pipeline and the SDK validator. The palette wiring (REQ-086 slice 2) stays the one clause slice
 1 could not close.
+
+**The browser pass was queued behind three other stacks, and that turned out to be the most
+useful thing that happened to this slice.** Rather than wait, I wrote
+`scripts/qa/credential-contract.sh` to drive the same endpoints directly against the same
+private stack — and it found a `500` on `/usage` and on the delete that guards with it, which
+every unit test had missed because none of them touch a database.
+
+The cause is a lesson about *parallel branches*, not about SQL. A workflow's nodes live in
+`graph` once REQ-086's builder migration (`0051`) is merged, and in `steps` before it — and
+those two migrations live in different worktrees. My probe named `w.graph` directly, which the
+planner rejects **before the query runs**, so it was a `500` on every install that has not
+merged the builder yet. A `coalesce` around it cannot rescue a statement that does not parse;
+only projecting the row can. `to_jsonb(w) -> 'graph' -> 'nodes'` compiles whether or not the
+column exists, and a missing key is null rather than a syntax error.
+
+The same probe then revealed the second half of that bug: the two representations disagree
+about names. A `steps` node calls its name `name` and its type `action`; a `graph` node calls
+them `label` and `type`. So on exactly the installs the first bug broke, every usage row was
+also blank — the guard fired correctly and the screen had nothing to show. Both spellings are
+read now.
+
+**And a second copy of that query is a second query that can disagree.** The guard's
+in-transaction copy and the public usage view now run one shared `SQL_USAGE` constant. A guard
+that disagrees with the screen that explains it is the worst pair on this surface: the reader is
+told a credential is unused, presses delete, and is refused for a reason neither of them can
+see.
+
+**Three probes, all against the live private w10 stack:**
+
+| Probe | Result | What it is |
+|---|---|---|
+| `credential-contract.sh` | **43/43** | The whole surface, plus a structural check that the table has no `api_key`/`token`/`password` column at all — read from `information_schema`, not from the migration text, so a future migration adding one is caught here |
+| `delete-guard.sh` | **20/20** | The refusal direction: `409 credential_in_use` with the workflow, node label and node type in `details`, the row surviving, then a forced delete that reports what it broke and leaves the workflow's dangling reference alone |
+| `usage-probe.sh` | **5/5** | The expression parsed and run on a schema with **no `graph` column at all**, and a `steps`-only row read exactly once rather than twice by the coalesce |
+
+**A probe will lock itself out.** The security policy refuses an address after a run of failed
+sign-ins, and a contract probe logs in on every run — after a handful of iterations every
+request answered `address_blocked`, which reads exactly like an authorization bug.
+`scripts/qa/unblock-w10.sh` clears it and *proves* it with a real login rather than trusting
+its own row count, because the first version of that script used the wrong column name
+(`address` instead of `ip_address`), deleted nothing, and cheerfully printed `after: 0`.
+
+**Next.** REQ-087 slice 3: OAuth start/callback against a fixture provider (state + PKCE), the
+single-flight refresh behind a lock, and `needs_reauth` reaching the canvas. The browser pass
+itself is still queued; the three probes above are what this slice is closed on, and the pass
+will confirm the three screens when it gets a slot.
