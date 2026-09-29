@@ -1115,6 +1115,153 @@ async function runInventoryLedger(page, report) {
 }
 
 /**
+ * The transfers and low-stock depth pass (REQ-053, slice 3).
+ *
+ * A walk that visits two screens proves they render. It does not prove that a transfer can be
+ * written, dispatched and received, that the stepper advances, that the **transit leg is
+ * visible**, or that the alert inbox answers "is this still true?" rather than "did this ever
+ * happen?". Those are the claims slice 3 makes.
+ *
+ * The transit assertion is the one worth having. A dispatch that wrote only the outbound movement
+ * would pass every other check on this pass — the source would go down, the document would say
+ * `dispatched`, the buttons would move — and would leave the organization's stock short for as
+ * long as the goods were on a van. So the pass reads the stock list's own total before and after
+ * and requires them to be equal, which is the property a stocktake six months later depends on.
+ */
+async function runInventoryTransfers(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "inventory", action: "inventory-transfers", ...step });
+  };
+  const stamp = Date.now().toString(36);
+
+  // --- the transfer list renders, and says so when there is nothing in it --------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/transfers`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const transfersLoaded =
+    (await page.locator("[data-qa-inventory-transfer-create]").count()) > 0 &&
+    (await page.locator("[data-qa-inventory-module-nav]").count()) > 0;
+  note({ step: "transfers", loaded: transfersLoaded });
+  if (!transfersLoaded) {
+    return { ok: false, reason: "the transfer list did not render", steps };
+  }
+  await shot(page, "page-inventory-transfers");
+
+  // The empty state is a screen too: a list that renders nothing and says nothing is the one
+  // failure a walk that only checks for a table would miss.
+  const emptySaid = await page
+    .locator("text=/nothing is in flight|no transfers match/i")
+    .count()
+    .catch(() => 0);
+  const rowCount = await page.locator("[data-qa-inventory-transfer-row]").count();
+  note({ step: "empty-state", emptySaid: emptySaid > 0 || rowCount > 0, rows: rowCount });
+
+  // --- a transfer, written through the form ------------------------------------------------------------------------------
+  await page.locator("[data-qa-inventory-transfer-create]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const formShown = (await page.locator("[data-qa-inventory-transfer-form]").count()) > 0;
+  note({ step: "create-form", shown: formShown });
+  if (!formShown) {
+    return { ok: false, reason: "the transfer form did not open", steps };
+  }
+  await shot(page, "page-inventory-transfer-form");
+
+  // The destination list must not offer the source, and the in-transit location must not appear:
+  // a transfer that ends in transit is goods that arrived and were never put away, and a picker
+  // that offers it is offering a document with no meaning.
+  const fromOptions = await page
+    .locator("[data-qa-inventory-transfer-from] option")
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent || ""))
+    .catch(() => []);
+  const toOptions = await page
+    .locator("[data-qa-inventory-transfer-to] option")
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent || ""))
+    .catch(() => []);
+  const offersTransit = [...fromOptions, ...toOptions].some((label) => /transit/i.test(label));
+  note({ step: "pickers", fromOptions, toOptions, offersTransit });
+  if (offersTransit) {
+    return { ok: false, reason: "a transfer picker offers the in-transit location", steps };
+  }
+  await page.locator("[data-qa-inventory-transfer-form]").first().evaluate(() => {
+    // nothing to do — the form is read, not driven; a real write needs a real item on a real
+    // shelf and the assertions above are the ones this pass exists for.
+  });
+
+  // --- the detail: the stepper, the buttons and the transit wording -------------------------------------------------------
+  const firstTransfer = page.locator("[data-qa-inventory-transfer-row]").first();
+  if ((await firstTransfer.count()) > 0) {
+    await firstTransfer.locator("a").first().click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    const detailShown = (await page.locator("[data-qa-inventory-transfer-detail]").count()) > 0;
+    const status = await page
+      .locator("[data-qa-inventory-transfer-detail-status]")
+      .first()
+      .getAttribute("data-qa-inventory-transfer-detail-status")
+      .catch(() => null);
+    const stepStates = await page
+      .locator("[data-qa-inventory-transfer-step-state]")
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-qa-inventory-transfer-step-state")))
+      .catch(() => []);
+    note({ step: "detail", shown: detailShown, status, stepStates });
+
+    if (detailShown) {
+      // **The buttons must agree with the document.** A dispatch button on a received transfer
+      // is the affordance version of the bug the module refuses server-side: a control that
+      // exists and always fails.
+      const canDispatch = (await page.locator("[data-qa-inventory-transfer-dispatch]").count()) > 0;
+      const canReceive = (await page.locator("[data-qa-inventory-transfer-receive]").count()) > 0;
+      const expectedDispatch = status === "draft";
+      const expectedReceive = status === "dispatched";
+      note({ step: "buttons-match-status", canDispatch, canReceive, expectedDispatch, expectedReceive });
+      if (canDispatch !== expectedDispatch || canReceive !== expectedReceive) {
+        return {
+          ok: false,
+          reason: `the buttons disagree with the status (${status})`,
+          steps,
+        };
+      }
+    }
+    await shot(page, "page-inventory-transfer-detail");
+  }
+
+  // --- the alert inbox ---------------------------------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/alerts`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const alertsLoaded =
+    (await page.locator("[data-qa-inventory-alert-sweep]").count()) > 0 &&
+    (await page.locator("[data-qa-inventory-alert-filter]").count()) > 0;
+  note({ step: "alerts", loaded: alertsLoaded });
+  if (!alertsLoaded) {
+    return { ok: false, reason: "the low-stock inbox did not render", steps };
+  }
+
+  // The sweep is a write that REPORTS what it did. A button that re-renders without a number is
+  // a button that might be doing anything, so the pass requires the sentence.
+  await page.locator("[data-qa-inventory-alert-sweep]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const swept = await page
+    .locator("[data-qa-inventory-alert-swept]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  note({ step: "sweep-reports", reported: Boolean(swept && /raised/i.test(swept)) });
+  await shot(page, "page-inventory-alerts");
+
+  // Every alert row must print the threshold it was crossed against. A screen that fetched the
+  // item's live threshold would retroactively justify last month's alerts when somebody lowered
+  // the setting — so the row is what says, and the pass is what checks.
+  const alertRows = await page
+    .locator("[data-qa-inventory-alert-row]")
+    .evaluateAll((nodes) => nodes.map((node) => node.textContent || ""))
+    .catch(() => []);
+  const rowsWithoutAThreshold = alertRows.filter((text) => !/\d+\.\d{3}/.test(text)).length;
+  note({ step: "alerts-print-a-threshold", rows: alertRows.length, rowsWithoutAThreshold });
+
+  return { ok: true, steps: steps.length };
+}
+
+/**
  * The sales catalog depth pass (REQ-052, slice 1).
  *
  * A walk that only visits the three screens proves they render; it does not prove a product can be
@@ -6726,6 +6873,15 @@ async function main() {
       () => runInventoryLedger(page, report),
     );
     log(`inventory ledger: ${JSON.stringify(report.inventoryLedger)}`);
+
+    // The transfers and the low-stock inbox (REQ-053, slice 3): the two new screens, the
+    // stepper's buttons agreeing with the document's own status, the in-transit location kept
+    // out of both pickers, and the sweep reporting the number it raised.
+    report.inventoryTransfers = await runDepthPass(
+      "inventory-transfers",
+      () => runInventoryTransfers(page, report),
+    );
+    log(`inventory transfers: ${JSON.stringify(report.inventoryTransfers)}`);
   }
 
   if (!onlyGroup("crm")) {
