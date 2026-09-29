@@ -172,6 +172,38 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .map_err(IdentityError::from)
 }
 
+/// Attach an account to the organization it administers.
+///
+/// The first run creates the organization *after* the owner, and the owner is deliberately
+/// platform-level (`organization_id = null`) — an Owner runs the platform, not one tenant.
+/// Nothing ever moved it afterwards, so the account that finished the wizard owned an
+/// organization it was not a member of: `users.organization_id` stayed `null` and no
+/// organization-scoped binding existed, and every organization-scoped surface then answered
+/// `no_organization`. The wizard completed, the panel loaded, and the first business screen
+/// a new installation ever opens was refused.
+///
+/// `null` is the only value accepted here, and it is accepted for a reason: this is the
+/// first run's "the platform owner also runs this tenant" statement, not a transfer. A second
+/// call is a no-op rather than a silent move, because moving a running account between
+/// tenants is a different operation with its own permission and its own audit line.
+pub async fn attach_to_organization(pool: &PgPool, id: Uuid, organization_id: Uuid) -> Result<User> {
+    let sql = format!(
+        "update users set organization_id = $2, updated_at = now() \
+         where id = $1 and organization_id is null returning {USER_COLUMNS}"
+    );
+    sqlx::query_as::<_, User>(&sql)
+        .bind(id)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(IdentityError::from)?
+        .ok_or_else(|| {
+            IdentityError::InvalidUser(format!(
+                "account {id} does not exist, or already belongs to an organization"
+            ))
+        })
+}
+
 /// Look an account up by email address.
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
     let email = normalize_email(email)?;

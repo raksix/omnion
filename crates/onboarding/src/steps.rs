@@ -136,6 +136,34 @@ pub async fn create_organization(
 
     state::set_organization(pool, organization.id).await?;
 
+    // The owner becomes a member of the organization it just created.
+    //
+    // Without this the first run *completes* and the account cannot use the installation it
+    // just built: the owner is created platform-level on purpose (an Owner runs the platform,
+    // not one tenant), `set_organization` only writes the onboarding-state singleton, and so
+    // `users.organization_id` stays `null` with no organization-scoped binding. Every
+    // organization-scoped surface then answers `no_organization` — the lead inbox, the media
+    // library, the analytics — while the wizard reports success and the overview loads. The
+    // two statements are the same statement: the account that creates the tenant runs it.
+    //
+    // A global Owner binding already carries every permission, so this is about *scoping* the
+    // account rather than granting more power. Both are idempotent by construction (the attach
+    // only fires on `null`, the grant skips a binding that exists), because the first run may
+    // be retried after a failed step.
+    let attached = users::attach_to_organization(pool, actor, organization.id).await?;
+    if let Err(error) = omnion_permissions::seed::bind_owner_in(pool, attached.id, organization.id).await {
+        return Err(error.into());
+    }
+
+    record(
+        pool,
+        NewAuditEntry::by_user(actor, "onboarding.owner_attached")
+            .target("user", actor.to_string())
+            .metadata(json!({ "organization_id": organization.id }))
+            .organization(organization.id),
+    )
+    .await?;
+
     record(
         pool,
         NewAuditEntry::by_user(actor, "onboarding.organization_created")

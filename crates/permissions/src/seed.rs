@@ -326,6 +326,44 @@ pub async fn bind_owner(pool: &PgPool, user_id: Uuid) -> Result<Option<Uuid>> {
     Ok(binding.map(|binding| binding.id))
 }
 
+/// Give one account the Owner role *inside* one organization (idempotent).
+///
+/// The companion to [`bind_owner`], and the reason the first run can be used afterwards. A
+/// global Owner binding answers every permission question, so a brand-new installation never
+/// lacked power — it lacked *scope*: `users.organization_id` was still `null` and no
+/// organization-scoped binding existed, so every surface that asks "which tenant?" answered
+/// `no_organization` to the account that had just created the tenant.
+///
+/// Granting the role at organization scope is what makes the account a member of the tenant
+/// its own first run created, and it is deliberately not a move: the global binding stays, and
+/// an account that later joins another organization is a different operation with its own
+/// permission.
+pub async fn bind_owner_in(pool: &PgPool, user_id: Uuid, organization_id: Uuid) -> Result<Option<Uuid>> {
+    // The *role* is the platform-level base role; the *binding* is what carries the scope.
+    // Looking the role up with the organization would ask for a per-tenant copy of a base role
+    // that does not exist, and answer `RoleNotFound` on the first run of every installation —
+    // which is exactly the moment this function has to work. `seed_base_roles` writes the
+    // catalogue at platform scope, and a tenant-specific role would be a different, opt-in
+    // thing with its own lifecycle.
+    let owner = roles::find_role_by_key(pool, None, "owner")
+        .await?
+        .ok_or(crate::error::PermissionsError::RoleNotFound)?;
+
+    let binding = bindings::grant_if_missing(
+        pool,
+        NewBinding {
+            role_id: owner.id,
+            user_id,
+            scope: Scope::Organization { organization_id },
+            granted_by: None,
+            expires_at: None,
+        },
+    )
+    .await?;
+
+    Ok(binding.map(|binding| binding.id))
+}
+
 /// Guarantee the "at least one Owner" invariant.
 ///
 /// When no live Owner binding exists and accounts do, the earliest active account receives it:
