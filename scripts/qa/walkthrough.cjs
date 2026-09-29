@@ -6409,6 +6409,11 @@ async function runAiSkillsDepth(page, report) {
         // The disagreement check: the server's order changed, so the client is not sorting for
         // itself. A client that reordered only its own table would leave this string equal.
         steps.reorderReachedTheServer = beforeKeys !== afterKeys && afterKeys !== "";
+        // And one attachment must produce exactly one row. A key shared with a built-in made
+        // the old join return the skill twice, which reads on screen as "attached twice" and
+        // injects the guidance twice.
+        steps.oneRowPerAttachment =
+          new Set((after?.skills ?? []).map((s) => s.key)).size === (after?.skills ?? []).length;
         steps.reorderChangedPrompt =
           (before?.prompt_block ?? "") !== (after?.prompt_block ?? "") &&
           Boolean(after?.prompt_block);

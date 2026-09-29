@@ -448,8 +448,17 @@ fn scope_is_valid(source: &str, organization_id: Option<Uuid>) -> bool {
     }
 }
 
+/// The column list every read shares.
+///
+/// `tools` is a `jsonb` column and the Rust side wants `Vec<String>`. sqlx decodes a JSON
+/// array into a `serde_json::Value`, not into a Rust `Vec`, so reading the column as `tools`
+/// fails with `ColumnDecode` — the same trap `run_store.rs` documents for an agent's own
+/// `tools`. The array is therefore expanded in **SQL**, through a scalar subquery, and
+/// coalesced to `'{}'` because a NULL array is a decode error too. Writing the plain column
+/// name instead would make every skill with an empty tool list a 500 rather than a row.
 const SKILL_COLUMNS: &str = "id, organization_id, key, name, description, when_to_use, \
-     instructions, tools, version, checksum, source, enabled, created_by, created_at, updated_at";
+     instructions, coalesce((select array_agg(value) from jsonb_array_elements_text(tools)), '{}') \
+     as tools, version, checksum, source, enabled, created_by, created_at, updated_at";
 
 /// The registry list for one organization: its own skills plus every built-in.
 ///
@@ -471,7 +480,7 @@ pub async fn list_skills(
         .bind(organization_id)
         .fetch_all(pool)
         .await?;
-    Ok(rows.into_iter().map(decode_tools).collect())
+    Ok(rows)
 }
 
 /// One skill by key, visible to this organization.
@@ -484,22 +493,23 @@ pub async fn get_skill(
     organization_id: Uuid,
     key: &str,
 ) -> Result<Option<Skill>> {
+    // `order by (organization_id is not null) desc … limit 1` is load-bearing, not cosmetic.
+    // A custom skill may legally reuse a built-in key — the folded index treats
+    // `(NULL, 'citation')` and `(org, 'citation')` as two different keys — so a plain
+    // `where key = $1` matches BOTH and the store returns whichever the planner produced
+    // first. The rule, applied everywhere: **the organization's own row wins; the built-in is
+    // the fallback.** Without it, shadowing a built-in is a coin flip.
     let sql = format!(
         "select {SKILL_COLUMNS} from ai_skills where key = $1 \
-         and (organization_id = $2 or organization_id is null)"
+         and (organization_id = $2 or organization_id is null) \
+         order by (organization_id is not null) desc limit 1"
     );
     let row = sqlx::query_as::<_, Skill>(&sql)
         .bind(key)
         .bind(organization_id)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(decode_tools))
-}
-
-/// Turn the `tools` column into a real vector.
-fn decode_tools(mut row: Skill) -> Skill {
-    row.tools = tools_from_json(&serde_json::to_value(&row.tools).unwrap_or_default());
-    row
+    Ok(row)
 }
 
 /// Write a custom skill, refusing an invalid definition.
@@ -546,8 +556,9 @@ pub async fn create_skill(
         .bind(draft.created_by)
         .fetch_optional(pool)
         .await?;
-    row.map(decode_tools)
-        .ok_or_else(|| AiHubError::SkillConflict(format!("the skill `{}` already exists", draft.key)))
+    row.ok_or_else(|| {
+        AiHubError::SkillConflict(format!("the skill `{}` already exists", draft.key))
+    })
 }
 
 /// What a caller may change about a skill.
@@ -586,10 +597,22 @@ pub async fn update_skill(
     let Some(existing) = get_skill(pool, organization_id, key).await? else {
         return Ok(None);
     };
-    if existing.is_built_in() {
-        // A built-in may be disabled but never rewritten: the seed is the installation's
-        // documented behaviour, and an installation that has quietly edited it has a
-        // definition nobody can reproduce after an upgrade.
+    // A built-in may be disabled but never rewritten. The seed is the installation's
+    // documented behaviour, and an installation that has quietly edited it has a definition
+    // nobody can reproduce after an upgrade.
+    //
+    // The check is therefore *per field*, not per request: a body that only flips `enabled` is
+    // the one change a built-in accepts, and refusing it would make the panel's most ordinary
+    // action — turning a skill off — a 403. A body that touches the definition is refused even
+    // when it happens to re-send what the row already holds, because a caller sending a
+    // definition for a built-in is a caller this route should not serve.
+    let touches_definition = changes.name.is_some()
+        || changes.description.is_some()
+        || changes.when_to_use.is_some()
+        || changes.instructions.is_some()
+        || changes.tools.is_some()
+        || changes.version.is_some();
+    if existing.is_built_in() && touches_definition {
         return Err(AiHubError::SkillReadOnly(
             "a built-in skill can be enabled or disabled, but its definition cannot be edited"
                 .to_owned(),
@@ -636,26 +659,50 @@ pub async fn update_skill(
     }
     draft.instructions = draft.instructions.trim().to_owned();
 
-    let sql = format!(
+    // `organization_id = $2 or organization_id is null` — spelled exactly as `get_skill` reads
+    // the row. Two earlier attempts got this wrong and both failed the same silent way:
+    // `= $2` never matches a built-in (its organization_id IS NULL), and
+    // `is not distinct from $2` compares NULL to the caller's id, which is never NULL either.
+    // In both cases the UPDATE matched zero rows, the store answered `Ok(None)`, and the route
+    // reported "no skill with that key" — a toggle that makes a skill *disappear*.
+    //
+    // Sharing the predicate with the read is the point, not tidiness: two spellings of "may
+    // this caller touch this row" is exactly how a control that works in the drawer 404s on
+    // the next click.
+    //
+    // `organization_id = $2` in the predicate (not `is not distinct from`) is also what keeps
+    // a *custom* row private: another tenant's row has a non-NULL organization that matches
+    // neither arm.
+    // The write carries no `returning` clause, and then reads the row back. The reason is
+    // `SKILL_COLUMNS`: it holds a scalar subquery aliased `as tools`, which is not legal in an
+    // UPDATE's RETURNING list. The failure mode that produces is worse than a syntax error —
+    // the UPDATE matches the row, changes it, and returns a row the caller cannot decode, so
+    // the store answers `Ok(None)` and the route reports "no skill with that key" *after*
+    // successfully writing. A write that reports its own failure is the one a caller cannot
+    // safely retry, so the round trip is worth the extra statement.
+    let written = sqlx::query(
         "update ai_skills set name = $3, description = $4, when_to_use = $5, \
          instructions = $6, tools = $7, checksum = $8, enabled = $9, \
          version = coalesce($10, version), updated_at = now() \
-         where key = $1 and organization_id = $2 returning {SKILL_COLUMNS}"
-    );
-    let row = sqlx::query_as::<_, Skill>(&sql)
-        .bind(key)
-        .bind(organization_id)
-        .bind(draft.name.trim())
-        .bind(draft.description.trim())
-        .bind(draft.when_to_use.trim())
-        .bind(draft.instructions.trim())
-        .bind(serde_json::to_value(&draft.tools).unwrap_or_else(|_| serde_json::json!([])))
-        .bind(&verdict.checksum)
-        .bind(draft.enabled)
-        .bind(changes.version)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(decode_tools))
+         where key = $1 \
+           and (organization_id = $2 or organization_id is null)",
+    )
+    .bind(key)
+    .bind(organization_id)
+    .bind(draft.name.trim())
+    .bind(draft.description.trim())
+    .bind(draft.when_to_use.trim())
+    .bind(draft.instructions.trim())
+    .bind(serde_json::to_value(&draft.tools).unwrap_or_else(|_| serde_json::json!([])))
+    .bind(&verdict.checksum)
+    .bind(draft.enabled)
+    .bind(changes.version)
+    .execute(pool)
+    .await?;
+    if written.rows_affected() == 0 {
+        return Ok(None);
+    }
+    get_skill(pool, organization_id, key).await
 }
 
 /// Turn problems into one message a form can show under its field.
@@ -683,16 +730,37 @@ pub async fn list_agent_skills(
     // The left join is what makes a *stale* attachment visible: the key is attached but the
     // registry row is gone, and an inner join would drop the row the Skills tab exists to
     // tell the operator about.
-    let sql = "select s.id, s.organization_id, s.key, s.name, s.description, s.when_to_use, \
-               s.instructions, s.tools, s.version, s.checksum, s.source, s.enabled, \
-               s.created_by, s.created_at, s.updated_at, a.position \
+    // A LATERAL with `limit 1`, not a plain join. Two reasons, and the second is a bug this
+    // walk caught:
+    //
+    // 1. the left join must be able to MISS, so a key that left the registry stays visible as
+    //    stale rather than the row silently vanishing — the tab exists to report that;
+    // 2. a plain `on s.key = a.skill_key` matches **both** a custom skill and a built-in that
+    //    share a key (which the folded index permits), so one attachment came back twice and
+    //    the prompt listed the skill twice. `order by (organization_id is not null) desc
+    //    limit 1` restores "one attachment, one definition, and the tenant's own wins".
+    //
+    // `s.tools` stays raw because the lateral can produce a NULL, and the tuple wants
+    // `serde_json::Value` so a missing array becomes an empty list rather than a decode error.
+    let sql = "select a.skill_key, s.id, s.organization_id, s.name, s.description, \
+               s.when_to_use, s.instructions, s.tools, s.version, s.checksum, s.source, \
+               s.enabled, s.created_by, s.created_at, s.updated_at, a.position \
                from ai_agent_skills a \
-               left join ai_skills s on s.key = a.skill_key \
-                 and (s.organization_id = $1 or s.organization_id is null) \
+               left join lateral ( \
+                 select k.* from ai_skills k \
+                 where k.key = a.skill_key \
+                   and (k.organization_id = $1 or k.organization_id is null) \
+                 order by (k.organization_id is not null) desc limit 1 \
+               ) s on true \
                where a.agent_id = $2 order by a.position, a.skill_key";
-    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>, String, String, String, String, String,
-        serde_json::Value, i32, String, String, bool, Option<Uuid>, OffsetDateTime,
-        OffsetDateTime, i32)>(&sql)
+    // Every registry column is `Option`, because every one of them is NULL on a stale
+    // attachment. The first two are `a.skill_key` and `a.position` — the attachment's OWN
+    // values, which exist whether or not the registry row does. That is the difference between
+    // "this skill is missing" and "something is missing", and only the first is actionable.
+    let rows = sqlx::query_as::<_, (String, Option<Uuid>, Option<Uuid>, Option<String>,
+        Option<String>, Option<String>, Option<String>, Option<serde_json::Value>, Option<i32>,
+        Option<String>, Option<String>, Option<bool>, Option<Uuid>, Option<OffsetDateTime>,
+        Option<OffsetDateTime>, i32)>(&sql)
     .bind(organization_id)
     .bind(agent_id)
     .fetch_all(pool)
@@ -702,17 +770,16 @@ pub async fn list_agent_skills(
         .into_iter()
         .map(|r| {
             let position = r.15;
-            // `Uuid::nil` is a function, not a constant, so it cannot be a pattern. The
-            // left join is expressed as `Option` instead, and a miss is the only `None`.
-            match Some(r.0).filter(|id| !id.is_nil()) {
+            let key = r.0.clone();
+            match r.1 {
                 None => AttachedSkill {
-                    // A nil uuid is the left-join miss. It is not `Option<Skill>` because the
-                    // tab needs to *show* the gap, and an absent entry in a list is a gap
-                    // nobody can report.
+                    // The registry row is gone. It is still a row here rather than an absent
+                    // entry in a list, because the Skills tab exists to say exactly this — and
+                    // the key comes from the *attachment*, which outlived the definition.
                     skill: Skill {
                         id: Uuid::nil(),
                         organization_id: None,
-                        key: r.2.clone(),
+                        key,
                         name: String::new(),
                         description: String::new(),
                         when_to_use: String::new(),
@@ -730,23 +797,29 @@ pub async fn list_agent_skills(
                     withheld: Some(Withheld::Stale),
                 },
                 Some(id) => {
-                    let skill = decode_tools(Skill {
+                    let skill = Skill {
                         id,
-                        organization_id: r.1,
-                        key: r.2,
-                        name: r.3,
-                        description: r.4,
-                        when_to_use: r.5,
-                        instructions: r.6,
-                        tools: tools_from_json(&r.7),
-                        version: r.8,
-                        checksum: r.9,
-                        source: r.10,
-                        enabled: r.11,
+                        organization_id: r.2,
+                        // The attachment's own key, not `s.key`. They are equal for a live row,
+                        // and only the attachment's survives a row that was deleted.
+                        key,
+                        name: r.3.unwrap_or_default(),
+                        description: r.4.unwrap_or_default(),
+                        when_to_use: r.5.unwrap_or_default(),
+                        instructions: r.6.unwrap_or_default(),
+                        tools: r.7.as_ref().map(tools_from_json).unwrap_or_default(),
+                        version: r.8.unwrap_or_default(),
+                        checksum: r.9.unwrap_or_default(),
+                        source: r.10.unwrap_or_default(),
+                        enabled: r.11.unwrap_or(false),
                         created_by: r.12,
-                        created_at: r.13,
-                        updated_at: r.14,
-                    });
+                        created_at: r.13.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                        updated_at: r.14.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                    };
+                    // The checksum is checked FIRST, so a row that is both disabled and
+                    // tampered with reports the tampering: the operator has to know which of the
+                    // two to act on, and "turn it back on" does nothing for a row somebody
+                    // edited in the database.
                     let withheld = if !checksum_matches(&skill) {
                         Some(Withheld::ChecksumMismatch)
                     } else if !skill.enabled {
@@ -776,7 +849,7 @@ pub async fn list_agent_skills(
 ///    move its position without telling anybody;
 /// 3. **the skill names a tool the agent does not hold.** The skill stays a relevance list,
 ///    so attaching one that mentions `web.search` to an agent without it is allowed — but the
-///    panel is told, because a skill that says "use web.search" and an agent that cannot is a
+///    caller is told, because a skill that says "use web.search" and an agent that cannot is a
 ///    mismatch somebody will otherwise debug from a run transcript.
 pub async fn attach_skill(
     pool: &PgPool,
@@ -820,6 +893,8 @@ pub async fn attach_skill(
         )));
     }
 
+    // The next free position, from the same statement shape `set_agent_skills` writes, so a
+    // single attach and a bulk reorder cannot disagree about where "the end" is.
     let position: i32 = sqlx::query_scalar(
         "select coalesce(max(position), -1) + 1 from ai_agent_skills where agent_id = $1",
     )
@@ -865,9 +940,7 @@ pub async fn set_agent_skills(
     for key in keys {
         let key = validate_key(key)?;
         if seen.contains(&key) {
-            return Err(AiHubError::InvalidSkill(format!(
-                "the skill `{key}` is listed twice"
-            )));
+            return Err(AiHubError::InvalidSkill(format!("the skill `{key}` is listed twice")));
         }
         seen.push(key);
     }
