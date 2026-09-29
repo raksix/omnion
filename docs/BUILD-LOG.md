@@ -6129,3 +6129,52 @@ free of 32 G), and a sixth Chromium here is not a result to trust.
 default row, the not-found state; (2) slice 3, the move with dependency checks; (3) slice 4,
 limits, usage, delegated administration and the ownership transfer.
 
+
+
+## w8 · tick 28 · REQ-118 slice 1a — the storefront foundation, and the blocker found before it
+
+**What.** Picked REQ-118 (Storefront & Checkout) — the first `pending` request in my queue, since
+REQ-117 and REQ-133 are both `in-progress` and skipped by the rule. Before writing anything I read
+its data model against the tree, and the request **cannot be built as written**: it is a surface
+over REQ-008's commerce engine, and its tables declare foreign keys into `commerce_products`,
+`commerce_variants`, `commerce_orders`, `commerce_shipping_methods`, `commerce_payment_providers`
+and `commerce_customers`.
+
+**The evidence, checked rather than assumed.** `REQ-008` is `pending`, and `commerce_products`
+appears in **zero** migration files in **all eight** worktrees:
+
+    for d in /mnt/apopic/omnion /mnt/apopic/omnion-w{2,3,4,5,6,7,8}; do
+      echo -n "$d: "; grep -rl commerce_products $d/database/migrations/ | wc -l; done
+    → 0 for every one
+
+So a cart migration today would either fail to apply on a fresh database, or — with the keys
+dropped — be a second commerce engine with its own idea of what a product is. REQ-118's own "Out"
+section forbids the second one by name. The catalogue, cart and checkout are **not started**,
+deliberately, and the reason is a dependency rather than a difficulty.
+
+**What shipped instead is the whole of REQ-118 with no commerce dependency** — which is not a
+smaller ambition, it is the foundation every other customer-visible number is read from
+(acceptance 16 by name). Four commits: `dcaad39` the migration, `0ccf98a` the module, `c762073`
+the API + two permissions, `cfd951f` the gate.
+
+**Proof.**
+
+    cargo test -p omnion-module-ecommerce --lib      → 19 passed, 0 failed
+    cargo clippy -p omnion-module-ecommerce --all-targets → 0 warnings
+    cargo build -p omnion-api                        → clean
+    pnpm typecheck (admin)                           → 2 successful, 0 errors
+    bash scripts/qa/run-storefront-settings.sh       → 6/6, and PROVEN TO FAIL at 5/6
+
+The "proven to fail" is the number worth reading: with the `where exists` tenancy guard deleted
+from the write, **the cross-organization assertion fails and the five that do not involve tenancy
+stay green**. A gate that only ever goes green proves nothing; one that names its defect and not
+its neighbourhood is worth its runtime.
+
+**Two fixture defects the gate caught before any product defect**, both of them the constraints
+working: `organizations.slug` is NOT NULL (all six tests, 23502) and `updated_by` is a real
+foreign key (a random editor uuid is 23503). A fixture is code, and this branch's standing lesson
+is that a `check` constraint and a Rust constant are written twice with nothing to compare them.
+
+**Next, in order.** (1) the admin screen `/commerce/storefront` with its walkthrough route — the
+one screen slice 1a still owes, and the reason acceptance 16 cannot close without it; (2) slice
+1b's catalogue, gated on REQ-008 arriving, not on this branch being ready.
