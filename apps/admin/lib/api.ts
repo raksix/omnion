@@ -4138,6 +4138,75 @@ export function fetchAutomationRun(executionId: string): Promise<AutomationRunDe
   return request<AutomationRunDetail>(`/api/v1/workflow-executions/${executionId}`);
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * *Listen for a real event* (REQ-004 slice 3, criterion 5)
+ *
+ * Arming and reading are **two calls and not one that does both**, and the reason is the
+ * one that only shows up in production: a panel that polls by POSTing re-arms its own
+ * listener on every tick, so the row the matcher fills is a row the previous tick deleted —
+ * the capture appears for one frame and the author watches a spinner and nothing else. The
+ * `readWorkflowListeners` call is the only one the panel repeats.
+ */
+
+/** One armed (or spent) listener, as the builder's inspector reads it. */
+export interface WorkflowListener {
+  id: string;
+  node_id: string;
+  event_name: string;
+  /** `armed` | `captured` | `expired` — derived by the server, never stored. */
+  status: "armed" | "captured" | "expired";
+  armed_at: string;
+  expires_at: string;
+  /** Seconds left, clamped at zero by the server so a bar can be drawn from it. */
+  expires_in_seconds: number;
+  captured_at?: string;
+  event_id?: number;
+  payload: Record<string, unknown> | null;
+  payload_text?: string;
+}
+
+/** What arming answers. The token is here and nowhere else. */
+export interface WorkflowListenerArmed {
+  listener: WorkflowListener;
+  token: string;
+  expires_in_seconds: number;
+}
+
+/** What the read answers. */
+export interface WorkflowListenerList {
+  listeners: WorkflowListener[];
+  armed: number;
+  captured?: WorkflowListener;
+}
+
+/** Arm a one-shot listener for one node. This is the only call that mints a token. */
+export function armWorkflowListener(
+  workflowId: string,
+  nodeId: string,
+): Promise<WorkflowListenerArmed> {
+  return request<WorkflowListenerArmed>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listen`,
+    { method: "POST", body: JSON.stringify({ node_id: nodeId }) },
+  );
+}
+
+/** The rule's listeners and whatever they captured. Safe to repeat; arms nothing. */
+export function readWorkflowListeners(workflowId: string): Promise<WorkflowListenerList> {
+  return request<WorkflowListenerList>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listeners`,
+  );
+}
+
+/** Read one listener back by its token — the handle a caller scripts against. */
+export function readWorkflowListener(
+  workflowId: string,
+  token: string,
+): Promise<WorkflowListener> {
+  return request<WorkflowListener>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/listeners/${encodeURIComponent(token)}`,
+  );
+}
+
 /**
  * Try a failed run again from one step.
  *

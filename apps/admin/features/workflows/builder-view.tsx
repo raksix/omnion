@@ -98,6 +98,7 @@ import {
   traceSubheading,
   type DescribedPayload,
 } from "@/features/workflows/step-detail";
+import { ListenerPanel } from "@/features/workflows/listener-panel";
 import {
   clearSelection,
   deleteTarget,
@@ -2025,6 +2026,27 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
           className="w-[320px] shrink-0 overflow-y-auto border-l border-line bg-surface"
           data-builder-inspector
         >
+          {/* *Listen for a real event* sits above the node editor, not inside it, for the
+              same reason the problems panel sits below the canvas: it is a property of the
+              *rule* and the current selection, not of whichever node happens to be open. A
+              panel nested in the inspector would vanish the moment the author clicked the
+              desk, which is exactly when they want to see the captured payload. */}
+          <div className="border-b border-line p-3">
+            <ListenerPanel
+              workflowId={workflowId}
+              selected={
+                selectedNode
+                  ? [
+                      {
+                        id: selectedNode.id,
+                        type: selectedNode.type,
+                        label: selectedNode.label,
+                      },
+                    ]
+                  : null
+              }
+            />
+          </div>
           {selectedNode ? (
             <NodeInspector
               node={selectedNode}
