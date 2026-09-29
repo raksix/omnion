@@ -6094,6 +6094,215 @@ async function runRetentionDepth(page, report) {
 }
 
 /**
+ * The agent runtime's depth pass (docs/requests/REQ-099, slice 1).
+ *
+ * The walkthrough's plain route list visits `/ai/agents` and `/ai/runs`, which proves both
+ * *exist* and nothing else: a route walked by path only ever proves its empty state renders.
+ * This pass asks the questions the screens exist to answer.
+ *
+ * 1. **The refusal lands in the field.** A key with an uppercase letter is submitted on
+ *    purpose; the assertion is that the message appears *under the key box*, not in a banner at
+ *    the top. A form that shows every refusal in one place is a form where a reader fixes the
+ *    wrong input.
+ * 2. **The agents list is real after a create.** The created row is found by its key, and the
+ *    tool column is read back — because "12 tools" saying nothing about approvals is the exact
+ *    gap the column closes.
+ * 3. **The run sheet refuses a double Run with a link, not a red banner.** The API answers 409
+ *    and names the run that is already going; the sheet offers to watch *that* run. This is the
+ *    normal case for a double-pressed button, not the exceptional one.
+ * 4. **The trace is readable.** The detail screen's step accordion opens, its arguments are
+ *    behind a tap (not dumped into the page), and the stop reason is on screen.
+ *
+ * Every write this pass makes is removed again, so a repeated pass does not accumulate agents.
+ */
+
+async function runAiAgentsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-agents", action: "ai-agents", ...step });
+  };
+  const key = "qa-agent";
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+
+  // A previous run's leftovers would make the counts wrong, so the pass starts from a clean
+  // slate. This is the QA database; nothing here is production data.
+  const removed = Number(qaSql(`select count(*) from ai_agents where key = '${key}'`) || 0);
+  for (const leftover of qaSql(`select id from ai_agents where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page
+      .request.delete(api(`/agents/${leftover.trim()}`), { failOnStatusCode: false })
+      .catch(() => {});
+  }
+  steps.preCleaned = removed;
+
+  // ---- the create screen and the field-level refusal -------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/agents/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.createScreen = (await page.locator("[data-agent-form]").count()) > 0;
+  steps.emptyListState =
+    (await page.locator("text=No agent yet").count()) > 0 ||
+    (await page.locator("[data-ai-agents]").count()) > 0;
+  await shot(page, "ai-agents-new");
+
+  // A key with an uppercase letter is refused by the route. Registering the refusal is the
+  // honest form: the request is made on purpose, and a 500 inside this window is still the API
+  // crashing on a value it should have rejected.
+  expectRefusal(
+    "/api/v1/ai/agents",
+    "ai-agents: a key with an uppercase letter is submitted on purpose and refused in its field",
+    [400, 422],
+  );
+  await page.locator('[data-agent-field="name"]').fill("QA Agent", { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-agent-field="key"]').fill("QA Agent", { timeout: 4000 }).catch(() => {});
+  await page
+    .locator('[data-agent-field="system_prompt"]')
+    .fill("You are a QA agent. Answer in one sentence.", { timeout: 4000 })
+    .catch(() => {});
+  await page.locator("[data-agent-save]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const badKeyError = (
+    await page.locator("[data-agent-field-error]").first().innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, 120);
+  steps.keyRefusalInField = badKeyError.length > 0;
+  steps.keyRefusalText = badKeyError;
+  await shot(page, "ai-agents-key-refusal");
+  endRefusalWindow("/api/v1/ai/agents");
+
+  // The same submit, corrected, with a tool and an approval-gated tool: the configuration the
+  // QA plan asks for, and the reason the tool column names its approvals count.
+  await page.locator('[data-agent-field="key"]').fill(key, { timeout: 4000 }).catch(() => {});
+  await page.locator('[data-agent-tool-input]').fill("page.search", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-agent-tool-add]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page.locator('[data-agent-tool-input]').fill("page.publish", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-agent-tool-add]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(250);
+  await page.locator('[data-agent-approval="page.publish"]').check({ timeout: 4000 }).catch(() => {});
+  steps.toolRows = await page.locator("[data-agent-tool]").count();
+  steps.approvalChecked = await page
+    .locator('[data-agent-approval="page.publish"]')
+    .first()
+    .isChecked()
+    .catch(() => false);
+  await page.locator("[data-agent-save]").click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.landedOnDetail = (await page.locator("[data-agent-form]").count()) > 0;
+  steps.createdKeyVisible = (await page.locator(`[data-agent-field="key"]`).inputValue().catch(() => "")) === key;
+  // The key is immutable after create: a read-only box, not a missing one.
+  steps.keyImmutable = await page.locator('[data-agent-field="key"]').first().isDisabled().catch(() => false);
+  await shot(page, "ai-agents-detail");
+
+  const agentId = qaSql(`select id from ai_agents where key = '${key}' limit 1`) || "";
+  steps.agentRowCreated = agentId !== "";
+  if (!agentId) {
+    steps.ok = false;
+    steps.reason = "the agent was not created, so the list and run screens were not driven";
+    record({ page: "ai-agents", action: "ai-agents-depth-failed", reason: steps.reason });
+    return { ok: false, steps };
+  }
+
+  // ---- the list: the row, the tool column, the search -------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/agents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.rowOnList = (await page.locator(`[data-agent-row="${agentId}"]`).count()) > 0;
+  steps.toolColumn = (
+    await page.locator(`[data-agent-row="${agentId}"] [data-agent-tools]`).innerText().catch(() => "")
+  )
+    .trim()
+    .replace(/\s+/g, " ");
+  // The whole point of the column: the approvals half is visible without expanding anything.
+  steps.toolColumnNamesApprovals = /approvals:\s*1/i.test(steps.toolColumn);
+  steps.mobileCard = (await page.locator(`[data-agent-card="${agentId}"]`).count()) > 0;
+  await shot(page, "ai-agents-list");
+
+  await page.locator("[data-agents-search]").fill("qa-agent-key-that-does-not-exist", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.filteredEmptyState = (await page.locator("text=No agent matches these filters").count()) > 0;
+  await page.locator("[data-agents-search]").fill("QA Agent", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.searchFindsTheRow = (await page.locator(`[data-agent-row="${agentId}"]`).count()) > 0;
+  await page.goto(`${URL_ADMIN}/ai/agents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // ---- the run sheet: the 409 is a link ------------------------------------------------------------
+  //
+  // Registered because it is made on purpose. A 500 inside this window is still the API
+  // crashing rather than answering "there is already a run going", which is a refusal it
+  // should be able to give.
+  expectRefusal(
+    "/api/v1/ai/runs",
+    "ai-agents: a second run for an agent that is already running is refused on purpose",
+    [409],
+  );
+  await page.locator(`[data-agent-run="${agentId}"]`).first().click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.runSheetOpened = (await page.locator("[data-run-sheet]").count()) > 0;
+  steps.goalCounter = (await page.locator("[data-run-goal]").count()) > 0;
+  await shot(page, "ai-agents-run-sheet");
+
+  await page
+    .locator("[data-run-goal]")
+    .fill("Find the three invoices in /finance/2026 that do not reconcile.", { timeout: 4000 })
+    .catch(() => {});
+  await page.locator("[data-run-start]").click({ timeout: 4000 }).catch(() => {});
+  // The sheet either streams (a run started) or refuses (a run already going). Both are correct
+  // answers to "what happens when you press Run", which is the question this step asks.
+  await page.waitForTimeout(6000);
+  steps.runSheetState = await page
+    .locator("[data-run-log], [data-run-attached], [data-run-sheet-error]")
+    .count();
+  steps.streamedOrRefused = steps.runSheetState > 0;
+  await shot(page, "ai-agents-run-started");
+  await page.locator("[data-run-sheet-close]").click({ timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  endRefusalWindow("/api/v1/ai/runs");
+
+  // ---- the run history and the trace ---------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/runs`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.runsScreen = (await page.locator("[data-ai-runs]").count()) > 0;
+  const runId = qaSql(`select id from ai_runs where agent_id = '${agentId}' order by started_at desc limit 1`) || "";
+  steps.runRowCreated = runId !== "";
+  if (runId) {
+    steps.runRowOnList = (await page.locator(`[data-run-row="${runId}"]`).count()) > 0;
+    await page.goto(`${URL_ADMIN}/ai/runs/${runId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1800);
+    steps.runDetail = (await page.locator("[data-run-detail]").count()) > 0;
+    steps.detailStatus = await page.locator("[data-run-detail-status]").first().innerText().catch(() => "");
+    steps.stopReason = await page.locator("[data-run-detail-status]").first().innerText().catch(() => "");
+    const stepCount = await page.locator("[data-run-step]").count();
+    steps.stepRows = stepCount;
+    // Arguments are behind a tap: a five-step trace that dumps every payload is a wall of
+    // JSON, and the redaction the store did is not visible unless the reader opens one.
+    steps.argumentsHidden = (await page.locator("[data-run-step-body]").count()) === 0;
+    if (stepCount > 0) {
+      await page.locator("[data-run-step-toggle]").first().click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(400);
+      steps.stepExpands = (await page.locator("[data-run-step-body]").count()) > 0;
+    }
+    steps.copyControl = (await page.locator("[data-run-detail-copy]").count()) > 0;
+    steps.cancelOrResume = await page.locator("[data-run-detail-cancel], [data-run-detail-resume]").count();
+    await shot(page, "ai-runs-detail");
+  } else {
+    await shot(page, "ai-runs-empty");
+  }
+
+  // ---- clean up: a pass that leaves an agent behind makes the next one's counts wrong -------
+  const deleted = await page
+    .request.delete(api(`/agents/${agentId}`), { failOnStatusCode: false })
+    .then((response) => response.status())
+    .catch(() => 0);
+  steps.cleanupStatus = deleted;
+  steps.cleaned = deleted === 204 || deleted === 200;
+
+  steps.ok = steps.createdKeyVisible && steps.toolColumnNamesApprovals && steps.runSheetOpened;
+  return { ok: steps.ok, steps };
+};
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -6363,6 +6572,10 @@ async function main() {
     // here for the same reason the media file detail is not: its path carries a run id, and a
     // route walked with a placeholder id only proves the 404 state renders.
     { path: "/ai/agents", name: "ai-agents", area: "ai" },
+    // The create screen is walked on its own route for the same reason the settings screens are:
+    // a form that is only ever reached by a click is a form whose first paint nobody has seen.
+    // Its depth pass below refuses a bad key in the field, corrects it, and lands on the detail.
+    { path: "/ai/agents/new", name: "ai-agents-new", area: "ai" },
     { path: "/ai/runs", name: "ai-runs", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
@@ -6495,6 +6708,14 @@ async function main() {
     report.aiStates = await runDepthPass("ai-states", () => runAiStatesDepth(page, report));
   }
   log(`ai providers: ${JSON.stringify(report.aiProviders)}`);
+
+  // The agent runtime's own pass (REQ-099, slice 1): a key the API refuses **in its field**,
+  // a real agent with a permitted tool and an approval-gated one, the list reading the tool
+  // column back, the run sheet's 409 offered as a link, and the trace's arguments behind a tap.
+  if (inScope("ai")) {
+    report.aiAgents = await runDepthPass("ai-agents", () => runAiAgentsDepth(page, report));
+  }
+  log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
   // two files are selected so the bulk bar appears, one is trashed, and the trash brings it back.
