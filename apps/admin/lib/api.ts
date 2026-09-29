@@ -15,6 +15,17 @@ import type {
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
+  LockedAccountsPage,
+  LockoutPolicy,
+  RateLimitScope,
+  RateLimitsDocument,
+  RateLimitsSave,
+  RateLimitsSaved,
+  RateLimitTestRequest,
+  RateLimitTestResponse,
+  SignInProtectionDocument,
+  SignInProtectionSave,
+  SignInProtectionSaved,
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   WebhookEndpoint,
@@ -100,24 +111,59 @@ export class ApiError extends Error {
    * `action`; without this the panel could only print the sentence.
    */
   readonly details: Record<string, unknown> | null;
+  /**
+   * Seconds the API asked the caller to wait, from `Retry-After`.
+   *
+   * `null` on everything that is not a refusal with a window behind it, and that distinction is
+   * the point: a screen that retried blindly would spin against the very limiter it exists to
+   * diagnose, and an operator watching a page refresh into `429` learns less from the error than
+   * from the number of seconds the platform is willing to wait.
+   */
+  readonly retryAfterSeconds: number | null;
 
   constructor(
     status: number,
     code: string,
     message: string,
     details: Record<string, unknown> | null = null,
+    retryAfterSeconds: number | null = null,
   ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 
   /** `true` when the session is missing or expired. */
   get isUnauthenticated(): boolean {
     return this.status === 401;
   }
+
+  /**
+   * `true` when the platform refused the request because a scope's budget is spent.
+   *
+   * A screen handles this differently from every other error: it says what was refused, by which
+   * scope and when to try again — instead of a "something went wrong" banner that implies the
+   * panel is broken when it is in fact doing exactly what it was configured to do.
+   */
+  get isRateLimited(): boolean {
+    return this.status === 429;
+  }
+}
+
+/**
+ * Read the wait the API attached, or `null` when there is none.
+ *
+ * Parsed rather than trusted: a header the platform sent is still a string that came off a wire,
+ * and `Number("soon")` is a number.
+ */
+function retryAfterOf(response: Response): number | null {
+  const raw = response.headers.get("retry-after");
+  if (!raw) return null;
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
 type ErrorBody = {
@@ -214,6 +260,7 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
       body.error?.code ?? "unknown_error",
       body.error?.message ?? `The API answered with status ${response.status}.`,
       body.error?.details ?? null,
+      retryAfterOf(response),
     );
   }
 
@@ -4647,4 +4694,85 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
     method: "PUT",
     body: JSON.stringify(save),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 3) — rate limiting and sign-in protection
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The five scopes, merged with the baseline.
+ *
+ * `no-store` for the same reason the overview and the header policy carry it: a stale limiter
+ * table is a screen that says "600 per minute" while the platform enforces something else, and
+ * the whole value of the screen is that the two agree.
+ */
+export function fetchRateLimits(): Promise<RateLimitsDocument> {
+  return request<RateLimitsDocument>("/api/v1/security/rate-limits", { cache: "no-store" });
+}
+
+/**
+ * Save the limiter document.
+ *
+ * `expected_scopes` is the document the form was opened with and is the compare-and-swap key:
+ * a form somebody else has since saved is **refused** rather than silently overwriting them. The
+ * client validates nothing — the server owns every range, and a second rule that disagreed with
+ * it would be a second place to be wrong about a limit that is refusing real traffic.
+ */
+export function saveRateLimits(save: RateLimitsSave): Promise<RateLimitsSaved> {
+  return request<RateLimitsSaved>("/api/v1/security/rate-limits", {
+    method: "PUT",
+    body: JSON.stringify(save),
+  });
+}
+
+/**
+ * Dry-run one request through the limiter.
+ *
+ * This is a **server** call rather than a local computation on purpose, and the reason is the
+ * acceptance criterion it satisfies: the tester's verdict must match the real middleware
+ * decision. Only the server holds the same `decide` the middleware runs, so a client that
+ * reimplemented the arithmetic would agree with it on the day it was written and drift the
+ * first time somebody tunes a limit — which is the day somebody is relying on it.
+ */
+export function testRateLimit(body: RateLimitTestRequest): Promise<RateLimitTestResponse> {
+  return request<RateLimitTestResponse>("/api/v1/security/rate-limits/test", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** The lockout document, its ranges, and how many accounts are locked right now. */
+export function fetchSignInProtection(): Promise<SignInProtectionDocument> {
+  return request<SignInProtectionDocument>("/api/v1/security/sign-in-protection", {
+    cache: "no-store",
+  });
+}
+
+/** Save the lockout document. `expected_policy` is the compare-and-swap key. */
+export function saveSignInProtection(save: SignInProtectionSave): Promise<SignInProtectionSaved> {
+  return request<SignInProtectionSaved>("/api/v1/security/sign-in-protection", {
+    method: "PUT",
+    body: JSON.stringify(save),
+  });
+}
+
+/** Who is locked out right now, soonest to expire first. */
+export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
+  return request<LockedAccountsPage>("/api/v1/security/locked-accounts", { cache: "no-store" });
+}
+
+/**
+ * Release one account early.
+ *
+ * The REQ calls out that lockout can be weaponised against a known account, so the unlock path
+ * is deliberately not hidden behind a confirmation dialog with no escape: it is one click, and
+ * it is audited server-side with the actor. The remaining `lockout_minutes` is the thing a
+ * cautious operator narrows, not this button.
+ */
+export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
+  return request<LockedAccountsPage>(
+    `/api/v1/security/locked-accounts/${encodeURIComponent(userId)}/unlock`,
+    { method: "POST" },
+  );
 }

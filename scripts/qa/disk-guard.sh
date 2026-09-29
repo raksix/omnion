@@ -7,6 +7,7 @@
 # twice, so the ceiling is enforced here rather than left to chance.
 #
 #   WORKTREE_TARGET_MAX_MB  how large one worktree's target/ may get (default 6000)
+#   NEXT_MAX_MB           how large one .next cache may get before it is dropped (default 1200)
 #   MIN_FREE_GB            below this, drop the fattest target/ (default 10)
 #
 # A cold target/ is not a loss: cargo rebuilds the workspace in about ninety seconds.
@@ -15,6 +16,7 @@ set -uo pipefail
 
 ROOT="${OMNION_ROOT:-/mnt/apopic}"
 MAX_MB="${WORKTREE_TARGET_MAX_MB:-6000}"
+NEXT_MAX_MB="${NEXT_MAX_MB:-1200}"
 MIN_FREE_GB="${MIN_FREE_GB:-10}"
 # The second cliff, and the one that actually stopped a QA pass.
 #
@@ -91,7 +93,19 @@ for inc in "$ROOT"/omnion*/target/debug/incremental; do
   fi
 done
 
-# 2. keep the newest QA artifacts only (each pass writes ~90 MB of screenshots)
+# 2. Next.js build cache. A QA pass starts a Turbopack dev server, and its cache is the
+# single biggest thing on this disk: ten worktrees held 13 GB of it. The dev server
+# rebuilds what it needs, so a stale cache is pure waste.
+for nx in "$ROOT"/omnion*/apps/*/.next; do
+  [ -d "$nx" ] || continue
+  m=$(dir_mb "$nx")
+  if [ "$m" -gt "$NEXT_MAX_MB" ]; then
+    say "drop next cache ${m}M: $(basename "$(dirname "$(dirname "$(dirname "$nx")")")")/$(basename "$nx")"
+    freed=$((freed + m)); rm -rf "$nx"
+  fi
+done
+
+# 3. keep the newest QA artifacts only (each pass writes ~90 MB of screenshots)
 for art in "$ROOT"/omnion*/qa-artifacts; do
   [ -d "$art" ] || continue
   while read -r old; do
@@ -102,7 +116,7 @@ for art in "$ROOT"/omnion*/qa-artifacts; do
   done < <(find "$art" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | head -n -2)
 done
 
-# 3. per-worktree ceiling: never let one target/ grow past the cap
+# 4. per-worktree ceiling: never let one target/ grow past the cap
 for t in "$ROOT"/omnion*/target; do
   [ -d "$t" ] || continue
   m=$(dir_mb "$t")
@@ -146,7 +160,7 @@ if [ "$(shm_free_pct)" -lt "$SHM_MIN_FREE_PCT" ]; then
   done
 fi
 
-# 4. last resort while the disk is still tight: the fattest one that is not main
+# 5. last resort while the disk is still tight: the fattest one that is not main
 while [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; do
   victim=""; best=0
   for t in "$ROOT"/omnion*/target; do
