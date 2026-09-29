@@ -1174,7 +1174,17 @@ async fn produce_media(state: &AppState, run: &omnion_backup::Backup) -> Part {
     // writer joins it to this and to nothing else. See `local_path_for`.
     let base = std::path::PathBuf::from(root.trim());
 
-    let objects = match omnion_backup::pending_objects(pool, None).await {
+    // The library is the run's **own organization's**, never the whole deployment's.
+    //
+    // The unscoped form — every `media` row with no deleted or purged flag — is correct on a
+    // single-tenant installation and is a data leak on a multi-tenant one: tenant A's backup
+    // would contain tenant B's files, with a green `succeeded` beside it. Every other read
+    // and write in this file is scoped by `organization_id`, and the backup was the one
+    // place that was not. A run with no organization is the single-tenant case, where
+    // `is not distinct from null` matches the sites that have no organization either.
+    let objects = match
+        omnion_backup::pending_objects_for_organization(pool, run.organization_id).await
+    {
         Ok(objects) => objects,
         Err(error) => return record_media_failure(pool, run.id, format!("the media library could not be listed: {error}")).await,
     };
