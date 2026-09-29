@@ -4255,3 +4255,93 @@ override** and tick the screen boxes for slices 1–3 of REQ-016 together, then 
 then REQ-010's slice 4 (the retention tab walk, `runMediaRetention`, is written and unrun for
 the same reason). If the slot is still held, name the holder and its ports in the log rather
 than writing "the slot is held" — a blocker with a name is a blocker somebody can act on.
+
+
+## 2026-09-29 · tick 12 · REQ-065 slice 4 part 6 — a group rule that could never have matched
+
+**What.** The third clause of a criterion slice 4 part 5 opened and left standing: *"a group rule
+grants the mapped role on the next request"*. The event it depends on has been firing for a tick,
+into a subscriber that did not exist.
+
+`when_group` read `identity.groups` — the group **claim** the token carried. That is the whole
+story for an interactive sign-in and none of it for a provisioned one. A connector creates the
+account through `/scim/v2/Users` and adds them to a group through `/scim/v2/Groups`; both write
+`group_members`. The IdP that signs them in next is a separate system that knows nothing about
+SCIM, and its token carries no group claim at all. So the membership exists, the rule is correct,
+and the evaluator can never see it. The audit says `no rule matched → default role` — a sentence
+about the *rules*, which is false. And the panel's dry run, run against a pasted sample that
+happens to carry a group claim, says the rule is fine. The operator edits a rule that was never
+wrong, and the fix is not there.
+
+`GroupContext` names the two sources rather than merging them, so the evaluator takes an explicit
+context and the caller says which sources it consulted. Three things that buys, each of which a
+silent union would have lost:
+
+* **"The token carried no groups and the account is in one" becomes a state the panel renders.**
+  Before this it was an empty list, which reads as a broken rule.
+* **`source_of` says which clock revokes a grant.** A claim group is revoked by the next sign-in; a
+  stored membership by the next SCIM sync. Same person, same role, different operational fact.
+* **A failed membership read is its own fifth state.** Collapsing it into "no groups" grants the
+  default role to somebody who was about to be granted a real one — a privilege change caused by a
+  database blip, which is the one outcome a sign-in must not produce on its own.
+
+**The test that failed first is the one worth keeping.** `summary()` matched
+`(claim_non_empty, membership_empty, _)` → `ClaimOnly` before it considered the failure flag, so a
+context whose read failed *and* whose token carried a claim reported `claim_only` — precisely the
+two states the flag exists to separate, collapsed back into one. The assertion that caught it is
+`a_failed_membership_read_is_not_an_empty_membership`, and it fails against the obvious ordering.
+
+**Two boundaries I did not take.** The **union** matches either source, with first-match-wins
+across both: "the claim beats the membership" is the other plausible design and it is not what the
+rule order says, so both source assignments are asserted against the same rule set. And the
+membership read is **organization-scoped** — a group name is not unique across tenants, this read
+sits on the sign-in path, and an unscoped one would let another organization's group satisfy a rule
+in this one. A privilege grant caused by a name collision, refused in the query rather than at a
+call site somebody would forget.
+
+**The dry run could not rehearse the case either.** It evaluates a pasted sample, and a pasted
+sample is a claims document — the case where group rules already worked. It grew a `subject` field
+naming an account in this organization whose stored membership is folded into the run. A foreign
+subject and an unknown one are refused *identically*, because the difference would turn the
+endpoint into a probe for which account ids exist in another tenant, and a read failure is a `500`
+rather than an empty list.
+
+**Proof.** `cargo test -p omnion-identity --lib` → **216 passed** (199 before, +17).
+`-p omnion-permissions --lib` → **62**, `-p omnion-api --lib` → **197**.
+`bash scripts/qa/run-media-walk.sh iam_group_membership` → **2 passed** (29.3s) against a
+disposable database; the walk asserts the *grant*, not a returned variant, and drives the dry run
+twice — with and without `subject` — because a one-sided test passes a dry run that quietly
+consulted the database for every sample. `iam_role_rules` → **1 passed** and `sso_live` → **3
+passed** are the walks that break first if the evaluator drifts, and both are green.
+`scim` → **2 passed** (the group event's own walk), `events every_` → **2 passed** (the drift gate
+walks the source tree, so it would have flagged any name this change stopped emitting; it did not).
+`tsc --noEmit` in `apps/admin` → exit 0.
+
+**A migration collision the merge caused, and what it looked like.** Main independently claimed
+`0123` for `0123_event_retention`; the merge put two files on one version and *every* database-backed
+suite died with `VersionMismatch(123)` before reaching an assertion — a report of "the database is
+wrong" that read as "the code is wrong" and cost a walk cycle. Renumbered to `0125`, the high-water
+mark, rather than renumbering main's: the ledger is append-only and the owner merges main.
+
+**And the merge helper, which has now cost this branch twice.** `docs/BUILD-LOG.md` is
+append-only at *both* ends — main appends at the tail, a wave writer prepends under the first line
+— so it conflicts on every merge, and hand resolution silently dropped 84 lines once and duplicated
+a block another time. It is now `scripts/merge-build-log.py` with a test of its own (**4/4**).
+Writing the test found the two things the first version got wrong: it spliced by index into a list
+it was growing, so a 713-line head insert pushed the tail run 713 lines too early, and it proved
+correctness with an in-order subsequence scan that mis-aligns on this file's fourth `**Proof.**`
+and reports a correct merge as broken. The check that is actually exact is the cheap one — splicing
+a side's own runs back must reproduce that side byte for byte — and it is what caught the first bug.
+The refs are arguments rather than constants precisely so the test can drive it.
+
+**Not claimed.** The browser pass has still not run on this branch: the QA slot is held by a live
+w4 pass, the box is at 22 of 32 GB with `available` at 9, and the last attempt here died at
+`ECONNREFUSED` with the admin process OOM-killed. So slice 3's wizard and dry run, and this
+slice's `subject` field in the panel, are unobserved. A provisioned account's *sign-in* binding is
+asserted by the unit tests and the dry run; the one thing that would close it is a live OIDC round
+trip against the stub IdP with a SCIM-provisioned subject, which is the next thing to write.
+
+**Next.** Run the pass on the private stack (`QA_STACK=w9`, ports 18088/3108/3208) when the slot
+frees, and drive the provisioning screen — the Revoke button now has a working route behind it for
+the first time since `0124`. Then the `subject` field in the role-mapping tab, which is the panel
+half of what `115cce4` proves on the API side.
