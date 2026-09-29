@@ -3894,3 +3894,35 @@ again afterwards, and the doc reference to the old filename was updated with it.
 across every worktree, and "the next free number in my branch" is how two writers collide. Read
 the high-water off `origin/*`, not off your own tree — and when a pass dies on a *just-reset*
 database, suspect the migration set before anything you have been debugging for two days.
+
+
+## 2026-09-29 (cont.) — the pass did not get a turn, and the box said why
+
+Re-queued after the renumber at 03:33. Twenty-three minutes of queue behind w4's pass (holder
+verified alive with a live `walkthrough.cjs`, so the queue was working), and then the two numbers
+that end the argument:
+
+```
+loadavg: 20.65 39.80 36.77
+/dev/shm   32G  30G  2.3G  93%
+/mnt/apopic 60G  57G  365M 100%
+```
+
+`/mnt/apopic` at 100% is the failure this box produces rather than avoids: `write_file` returns
+success and writes **zero bytes**, a `cargo build` reports `could not compile <crate>` with no
+cause, and `git commit` fails with ENOSPC while `git status` works perfectly. A pass needs a
+`cargo build` (its binary is stale by the renumber) and a Chromium, and running it into that
+would have produced an artifact directory full of empty files and a report full of phantom
+findings — worse than no pass, because the next tick has to work out which of the two it was.
+
+So the pass was **not** run, and I killed my own queued waiter rather than steal a place from
+w4 or force the build. The three acceptance boxes stay unticked. Nothing was left half-written:
+`git status` is clean, HEAD equals `origin/wave3-automation`, and every file this tick wrote was
+checked non-zero.
+
+**What the next tick must do, in order.** `df -h /mnt/apopic` and `df -h /dev/shm` *first* — if
+either is over ~95%, the correct action is to report the box is full and stop, because the
+next most likely symptom (an empty build) will lie about the cause. If there is room, run the
+pass with a **long** `QA_SLOT_WAIT` (3600) so a 25-minute queue does not cost a second attempt,
+and read the six notes named in `next_hint`. The migration is already renumbered and the suite
+database dropped, so the boot failure is gone; what remains is only the queue.
