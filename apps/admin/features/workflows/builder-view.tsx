@@ -78,6 +78,7 @@ import {
   type History,
   type HistorySnapshot,
 } from "./builder-history";
+import { decideConnection } from "./connect-edge";
 
 /** The snap grid the canvas draws and drops onto. */
 const GRID = 8;
@@ -622,71 +623,40 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   const removeNode = useCallback((id: string) => removeNodes([id]), [removeNodes]);
 
+  // The rules live in `connect-edge.ts` so they can be tested without a canvas; this is the
+  // part only the component can do — turn a decision into one undoable step and a notice.
+  //
+  // The decision reads the *live* graph off the ref rather than the render's `nodes`/`edges`
+  // closure, because a gesture drawn during a drag must not be judged against a stale graph.
   const connect = useCallback(
     (source: string, sourcePort: string, target: string) => {
-      const sourceType = nodeTypes.get(source);
-      const sourceLabel = sourceType?.label ?? source;
-      // A refusal the user cannot read is indistinguishable from a broken builder, and the
-      // acceptance criteria ask for the reason to be *visible*: every branch below names
-      // what is wrong in the author's own terms (which node, which port, which alternatives
-      // are legal) rather than dropping the gesture on the floor.
-      const refuse = (text: string) => {
-        setLinkNotice({ tone: "error", text });
-        setLinkDraft(null);
-      };
-
-      const port = sourceType?.outputs.find((candidate) => candidate.key === sourcePort);
-      if (!sourceType || !port) {
-        const legal = (sourceType?.outputs ?? []).map((candidate) => candidate.key);
-        refuse(
-          legal.length > 0
-            ? `${sourceLabel} has no “${sourcePort}” port. It exports ${legal.join(", ")}.`
-            : `${sourceLabel} has no output ports, so nothing can leave it.`,
-        );
-        return false;
-      }
-
-      // A self-connection is a cycle of length one. The server's validator would catch it, but
-      // the user is watching the canvas, not the problems panel, and a line drawn from a node
-      // back into itself looks like it worked.
-      if (source === target) {
-        refuse(`${sourceLabel} cannot connect to itself.`);
-        return false;
-      }
-
-      const already = edges.some(
-        (edge) =>
-          edge.source === source && edge.source_port === sourcePort && edge.target === target,
-      );
-      if (already) {
-        // Not an error: the port is simply taken. Saying so keeps the second attempt from
-        // looking like the button is broken.
-        setLinkNotice({
-          tone: "error",
-          text: `${sourceLabel} · ${port.label} already leads to that node.`,
-        });
-        setLinkDraft(null);
-        return false;
-      }
-
-      const edge: GraphEdge = {
-        id: uniqueEdgeId(edges),
+      const decision = decideConnection(
         source,
-        source_port: sourcePort,
+        sourcePort,
         target,
-      };
+        graphRef.current.nodes,
+        nodeTypes,
+        graphRef.current.edges,
+        uniqueEdgeId(graphRef.current.edges),
+      );
+      setLinkNotice({ tone: decision.ok ? "ok" : "error", text: decision.text });
+      if (!decision.ok) {
+        setLinkDraft(null);
+        return false;
+      }
       // Routed through `commit` like every other change, so a connection is one undoable
       // step. The criteria ask undo to "restore add, move, connect, delete …"; an edge added
       // behind the history's back is the one case that could not be undone.
-      commit("edge-add", currentSnapshot(), graphRef.current.nodes, [...graphRef.current.edges, edge]);
-      setLinkNotice({
-        tone: "ok",
-        text: `${sourceLabel} · ${port.label} → ${nodeTypes.get(target)?.label ?? target}`,
-      });
+      commit(
+        "edge-add",
+        currentSnapshot(),
+        graphRef.current.nodes,
+        [...graphRef.current.edges, decision.edge],
+      );
       setLinkDraft(null);
       return true;
     },
-    [commit, currentSnapshot, edges, nodeTypes],
+    [commit, currentSnapshot, nodeTypes],
   );
 
   const removeEdge = useCallback(
