@@ -52,6 +52,35 @@ in_use() {
   return 1
 }
 
+# Is a compiler writing into THIS target right now, whatever its environment says?
+#
+# `in_use` above answers the question for a build that *chose* a target directory
+# (`CARGO_TARGET_DIR=… cargo build`). It cannot answer it for the ordinary case, which is most
+# of them: a plain `cargo build` in a worktree takes the **default** target, `<cwd>/target`, and
+# sets no environment variable at all. The disk guard then concluded "nobody is building" and
+# deleted the directory a live `rustc` was writing into, which the compiler reports as
+#
+#   error: could not write output to …/target/debug/deps/….rcgu.o: No such file or directory
+#   error: couldn't create a temp dir: No such file or directory (os error 2)
+#
+# — a message that reads like a source fault and is not one. `os error 2` on an output path
+# means the output directory vanished; `os error 28` is the real "disk full". The two are
+# routinely confused, and the second one is worth no one's build.
+#
+# So the honest test is a compiler process whose cwd is the worktree that owns the target:
+# that is the process writing into it, and its environment is irrelevant.
+building_here() {
+  local target="$1" wt p
+  wt="$(dirname "$target")"
+  for p in /proc/[0-9]*; do
+    [ "$(readlink "$p/cwd" 2>/dev/null)" = "$wt" ] || continue
+    case "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" in
+      *rustc*|*cargo*|*/cargo\ *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # Is a QA pass running against the worktree that owns this tmpfs target?
 #
 # `in_use` alone was not enough, and this function exists because of the day it was not. A
@@ -121,6 +150,16 @@ for t in "$ROOT"/omnion*/target; do
   [ -d "$t" ] || continue
   m=$(dir_mb "$t")
   if [ "$m" -gt "$MAX_MB" ]; then
+    # The ceiling drops a cache, never a *running* build. Step 3's original form had no
+    # `in_use` check at all and cost this worktree two builds: cargo takes the DEFAULT target
+    # (`<worktree>/target`) from its own cwd and never sets `CARGO_TARGET_DIR`, so the one
+    # directory a plain `cargo build` writes into was the one directory the environment test
+    # could not see. A `rustc` whose cwd is this worktree is writing into that target right
+    # now, whatever its environment says.
+    if in_use "$t" || building_here "$t"; then
+      say "target ${m}M over the ${MAX_MB}M ceiling but a build is live in $(basename "$(dirname "$t")") — keeping it"
+      continue
+    fi
     w="$(dirname "$t")"
     say "target ${m}M over the ${MAX_MB}M ceiling — dropping: $(basename "$w")"
     freed=$((freed + m)); rm -rf "$t"
@@ -169,8 +208,11 @@ while [ "$(free_gb)" -lt "$MIN_FREE_GB" ]; do
     [ "$w" = "$ROOT/omnion" ] && continue      # the deploy script runs this binary
     # Same rule as the tmpfs sweep: a target a live build is writing into is not a victim, no
     # matter how full the disk is. Step 4 is the step that used to skip this, and a disk at 100%
-    # is exactly when a wrong `rm -rf` looks like a reasonable idea.
+    # is exactly when a wrong `rm -rf` looks like a reasonable idea. `building_here` is here for
+    # the same reason as in step 3: a plain `cargo build` names no target directory, so the
+    # environment test alone cannot see it.
     in_use "$t" && continue
+    building_here "$t" && continue
     m=$(dir_mb "$t")
     [ "${m:-0}" -gt "$best" ] && { best=$m; victim="$t"; }
   done
