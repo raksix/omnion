@@ -5873,3 +5873,81 @@ eight files were staged.
 **Next.** Re-run the scoped pass on a box that can hold a browser (the QA slot was free and the
 load was 10 — the failure is memory, not contention over the slot) and close the browser half of
 slice 2. Then REQ-017 slice 3: promotion.
+
+
+## 2026-09-29 · REQ-017 slice 3 (promotions: the frozen change set, and the apply that honours it)
+
+**What.** The backend half of slice 3. Migration `0161_promotions.sql`, `crates/environment/src/promotion.rs`
+(the frozen change set and its step log), `promotion_store.rs` (persistence, the conflict re-check and the
+one-transaction apply), and `apps/api/src/routes/promotions.rs` (four routes, two reads and two writes).
+Five commits: `0f6779f`, `57275bf`, `9547b5b`, `530dff5`, `491810c`.
+
+**The one design decision everything else follows from.** A promotion stores the change set as a *value* —
+`FrozenItem`s serialized into a `jsonb` column — and not as ids resolved at apply time. The tempting design
+stores ids and re-reads the rows, and it publishes anything that landed in staging between "requested" and
+"approved" without anybody having seen it: the approval becomes a rubber stamp on a list that moved after it
+was printed. Each frozen item therefore carries the two values that decide whether production still says
+what it said — `base_updated_at` (the clock the clone preserves on both sides) and `base_digest` (the
+published revision's SHA-256, which catches an edit that did not move the clock).
+
+The conflict check runs **twice**: once at request, so the dialog can lead with the list as the request
+insists, and once at approve, because the window between the two is exactly when production moves on. Only
+the second one is load-bearing.
+
+**Proof.**
+
+- `cargo test -p omnion-environment --lib` — **50/50** (33 before this tick; 17 new).
+- The six new integration walks, run **one at a time** — 6/6:
+  - `promoting_a_clean_change_set_applies_every_item_and_says_how_many` — all three kinds at once; the added
+    page reaches production, the deleted one is gone, the edited one carries staging's title, and
+    `promotion.completed` carries the 3 affected ids with `written: 2` / `removed: 1`.
+  - `a_production_edit_after_the_request_is_refused_with_the_item_id` — the refusal names the `page_id`; the
+    row ends `failed` with the refreshed list and its log stopping at `validate`.
+  - `a_failure_midway_through_the_apply_leaves_production_unchanged` — production holds exactly its
+    original rows.
+  - `self_approval_is_refused_without_the_deploy_key_and_allowed_with_it`
+  - `promotion_history_detail_and_the_gates` — 403 and 404 proven separately.
+  - `an_empty_change_set_and_a_withdrawn_request`
+- `pnpm typecheck` — 2/2 (cache hit, no admin/web change in this tick).
+- **The full `environments` suite is NOT claimed green.** At load 21–31 with 30 of 32 GB of RAM used, walks
+  that create four accounts each die at `the IAM seed must run: PoolTimedOut` before any assertion. That is
+  box contention from the other writers, not a product failure; every walk above passes when run alone.
+
+**Three defects this tick's own tests found, all of them mine.**
+
+1. **The conflict logic had all three branches inverted.** An `Added` item was reported as a conflict
+   precisely *because* production lacked the row, and a `Deleted` item precisely *because* production held
+   it — both are the normal case and the entire purpose of the change set. Every promotion of every kind
+   would have reported conflicts and none could ever have been applied. The decision is now a pure
+   function (`item_conflicts`) with unit tests per kind, because a test that needs a database to check three
+   branches is a test that does not run on a loaded box — which is when this class of bug ships.
+2. **The apply left the row `running` when it died.** The failure bookkeeping was the *caller's* job, so a
+   store-level failure left the promotion in `running` forever. The route happened to mark it, which is why
+   no browser ever saw it — and why `promotions_single_running` would have refused every later promotion of
+   that environment for as long as the row lived. The apply now marks its own failure; the rollback walk
+   caught this on its first run.
+3. **The schema's own constraint caught the third.** I declared `changes jsonb` with
+   `jsonb_typeof = 'array'`, and the value is an *object* with an `items` array inside it. The constraint did
+   its job on the first insert and answered `500`. Fixed to `object`, plus a second check on
+   `changes -> 'items'` so a future writer that stores a bare array cannot either.
+
+**Two environment traps hit, both already in the ledger, both re-learned the hard way.**
+
+- `/dev/shm` reached **100%** (nine writers' `*-target` directories, ~29 GB of 32 GB). `cargo check -p
+  omnion-api` died with `No space left on device (os error 28)` on `icu_properties` — which reads like a
+  toolchain fault. I swept my own `w5-target` and moved to the worktree target. The API dependency tree does
+  not fit in a shared 32 GB tmpfs alongside eight other writers.
+- **Migration numbers are a shared namespace.** I took `0160` after scanning every worktree; by commit time
+  w2 had taken `0160` as well. Renumbered to `0161` and re-ran the walk green. This is the third recurrence of
+  this in the fleet and the symptom (`sqlx VersionMismatch`) fails every test at once while reading as a
+  corrupt database.
+
+Also: `page_revisions.blocks` is **REQ-063's column** and arrives with wave 2's migration. My apply named it
+and failed at runtime with `column r.blocks does not exist` on a branch whose migration set has not got there.
+The apply now reads and writes `title`/`body`/`summary` only, and says why at the query — a promotion must
+migrate on its own branch.
+
+**Next.** The Promotions tab, the promotion dialog and the Changes-tab bulk action — the UI half of slice 3,
+which is why the slice is still open. Then the scoped QA pass with the w5 stack (`QA_STACK=w5 QA_API_PORT=18084
+QA_ADMIN_PORT=3104 QA_WEB_PORT=3204`), which this tick could not run: it needs a browser and the box is at
+load 30+.

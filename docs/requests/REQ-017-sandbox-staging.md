@@ -1,6 +1,9 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** in-progress (slice 2 of 4 — API, list screen, create wizard, detail screen and the `changes` diff endpoint shipped in `39aa999…f1e1bb9`; the browser gate is still owed) · **Captured:** 2026-09-25 · **Layer:** platform
+> **Status:** in-progress (slice 3 of 4 — the promotion API is shipped in `0f6779f…491810c`: migration
+> `0161_promotions.sql`, the frozen change set, the conflict re-check at approve, and the one-transaction apply with six walks
+> green. The **Promotions tab, the promotion dialog and the browser gate are still owed**) · **Captured:** 2026-09-25 ·
+> **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -147,11 +150,16 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 - [x] Staging nesting is refused with `staging_nesting_refused` for a staging source.
 - [x] Editing a page in staging leaves the production row byte-identical (asserted by comparing `updated_at` and revision hashes).
 - [x] `GET /api/v1/environments/{id}/changes` lists the edited page as `updated`, a new page as `added`, a deleted page as `deleted`, each with author and timestamp — `the_change_set_names_what_staging_holds_that_production_does_not` asserts all three kinds in one walk, the untouched page's absence, and that production still holds every row it held before.
-- [ ] A production edit made after the clone marks the item `Conflict`, and promoting a change set that contains conflicts is refused with `promotion_conflict` listing item ids.
-- [ ] Promotion of a clean change set applies every item in one transaction: production pages match staging content afterwards, and `promotion.completed` carries the same item count.
-- [ ] A failure injected mid-apply leaves production unchanged (transaction rolled back) and the promotion status `failed` with a readable error.
-- [ ] Self-approval is refused for a requester without the deploy permission, and the same person holding the deploy permission can approve (both paths covered by tests).
-- [ ] Promotion keeps a history row with requester, approver, timestamps and the frozen change set, visible in the Promotions tab.
+- [x] A production edit made after the clone marks the item `Conflict`, and promoting a change set that contains conflicts is refused with `promotion_conflict` listing item ids.
+  *(walk `a_production_edit_after_the_request_is_refused_with_the_item_id`: the conflict re-check runs at **approve**, not only at request, and the refusal carries the offending `page_id` in `error.details.items`; the row ends `failed` with the refreshed list on it and its step log stopping at `validate`.)*
+- [x] Promotion of a clean change set applies every item in one transaction: production pages match staging content afterwards, and `promotion.completed` carries the same item count.
+  *(walk `promoting_a_clean_change_set_applies_every_item_and_says_how_many`: all three kinds at once — the added page reaches production, the deleted one is gone, the edited one carries staging's title — and the event carries the 3 affected ids with `written: 2` / `removed: 1`.)*
+- [x] A failure injected mid-apply leaves production unchanged (transaction rolled back) and the promotion status `failed` with a readable error.
+  *(walk `a_failure_midway_through_the_apply_leaves_production_unchanged`, deliberately a **store** walk: through the route the failure is unreachable by design, because the conflict re-check refuses anything that would collide. The walk builds the frozen set by hand with two items sharing a slug; production holds exactly its original rows afterwards and the row is `failed` with an error.)*
+- [x] Self-approval is refused for a requester without the deploy permission, and the same person holding the deploy permission can approve (both paths covered by tests).
+  *(walk `self_approval_is_refused_without_the_deploy_key_and_allowed_with_it`. **A decision worth recording:** the refusal fires only when the requester *lacks* `deployment.deploy`. A holder may approve their own, because the deploy key *is* the authority that says "I may decide" — refusing would leave a one-person team unable to ship at all. Two-person approval belongs to REQ-069's policy engine, and a half-built version of it does not belong in the core.)*
+- [x] Promotion keeps a history row with requester, approver, timestamps and the frozen change set, visible in the Promotions tab.
+  *(walk `promotion_history_detail_and_the_gates`: `GET /environments/{id}/promotions` returns the history newest-first with the set's own counts, `GET /promotions/{id}` returns the frozen items, and 403/404 are each proven separately. **The tab itself is not built** — see below.)*
 - [ ] `promotion.*` events arrive at an endpoint subscribed to `promotion.*` within the delivery window.
 - [ ] The environment chip appears in the panel header while staging is active, the staging banner cannot be dismissed, and staging hosts answer with `X-Robots-Tag: noindex`.
 - [x] All new routes answer `403` without their permission and `404` for another organization's environment — `the_change_set_is_404_for_another_organization_and_403_without_the_key` proves both on the new route; the existing walks cover the other six.
@@ -178,6 +186,17 @@ conflicted item, and no dead buttons or placeholder text.
 *Done line:* editing a page in staging appears in Changes as `updated` with the editor's name, and production is untouched.
 3. **Promotion.** Promotion records, approve endpoint, frozen-change-set apply with conflict detection, Promotions tab, `promotion.*` events. *Done line:* a requested promotion is
 approved, applied atomically, visible in history, and emitted to a subscribed endpoint.
+   **The backend half of this slice is done and green (`0f6779f…491810c`). Still owed, and it is what
+   keeps the slice open:**
+   - the **Promotions tab** on `/environments/[id]` — history rows, status badges, the
+     requester/approver pair and the conflict list;
+   - the **promotion dialog** — the frozen summary, the conflict list, the typed confirmation above
+     25 items, and the step timeline that survives a refresh;
+   - the **bulk action** the Changes tab promises ("select non-conflicting rows → Promote
+     selection"). The API honours `items: []` today, but no screen sends a selection yet;
+   - `promotion.*` reaching a **subscribed webhook endpoint** end to end. The events are emitted and
+     the row is written; the delivery half is REQ-016's runner, and is not yet proven against a
+     real endpoint from here.
 4. **Hardening.** Clone cancel/retry, `noindex` on staging hosts, large-site batching, conflict refresh, error states and the archive path. *Done line:* a cancelled clone leaves no
 partial environment marked active, and a conflicted promotion is refused with item-level detail.
 
