@@ -1,4 +1,52 @@
 
+## 2026-09-29 — REQ-087 · the credential surface was closed to the account that needs it
+fix(workflows): let a platform account read, write and connect a tenant's credentials
+**What.** Every route on the credential surface resolved its organization with
+`resolve_organization(&current, None)`. That reads as "this caller's organization" and means
+"the caller's organization, or a refusal": an account *without* a primary organization is
+refused `organization_required` before a single row is read. Eight routes in `credentials.rs`
+and three in `credential_oauth.rs`, so `GET /api/v1/credentials` answered `400 organization_required`
+to a superuser and to the QA owner alike — which is why the credential screens rendered an empty
+list and the pass logged 66 of them. The same defect had already been found and fixed on the
+node-package routes one tick earlier, and the sweep that would have caught this one
+(`grep -rn 'resolve_organization(&current, None)'`) is the lesson, not the fix.
+**Where the organization travels now.** Where the request already has a place for it: the list
+query, the create and update bodies, the delete and secret-replace bodies, and a shared
+`ScopeQuery` for the read routes that have no body. A `DELETE` carries no body, so its
+organization is a query for the same reason the install's is a body. `start_oauth` takes it in
+its own body; `disconnect` and the forced refresh take the `ScopeQuery`. Every field is
+optional, so a tenant's own call is byte-for-byte unchanged — which is the property
+`every_credential_request_can_name_the_organization_it_works_on` asserts, on both halves.
+**One rule, stated rather than implied.** Two of the routes can read the organization from a
+query *and* a body, and the body wins (`body.organization_id.or(scope.organization_id)`). The
+alternative — whichever the extractor happened to touch — gives two different answers on two
+routes for a caller who fills both in, and the test says which one is chosen.
+**The panel half is a component, not a line.** The picker had been hand-copied into three IAM
+screens and then a fourth (the installer), each a slightly different variant.
+`apps/admin/lib/scope.ts` writes it once: the tenant list is loaded *only* for a platform
+account (a tenant never makes a request it may not be allowed to make), a tenant never sees a
+control it cannot use, and the create form **disables its save button and says why** rather than
+letting the reader fill in a form the API will refuse. The credential screens became a
+three-line change each instead of a fourth copy.
+**Migration numbers, and why this entry has two halves.** Merging `main` brought another
+wave's `0054_security_posture.sql` alongside this branch's `0054_workflow_oauth_flows.sql`.
+sqlx keys `_sqlx_migrations` on the *version number*, so two files claiming 54 is one migration
+applied twice with a different checksum: every boot dies with "migration 54 was previously
+applied but has been modified" and the API never comes up. Five other worktrees already sit
+at 0135–0140, so the ledger's high-water mark is 0140 and these two went to **0141** and
+**0142** — renamed, never edited, because the append-only ledger's rule is that a released
+number is not renumbered, and the only way both copies can survive is if neither number is
+taken. The QA database was dropped and recreated, because a suite database holds every applied
+checksum and renumbering cannot be tested any other way.
+**Proof.** `cargo build -p omnion-api` green in 3m31s (20 warnings, all pre-existing, in other
+waves' files). `cargo test -p omnion-api --lib` **251 passed, 0 failed** — the suite was 249,
+and the two new tests are named in the REQ. `pnpm typecheck` 5 packages, 0 errors, 31.6s. QA
+pass on the private stack (`QA_STACK=w10`, ports 18089/3109/3209, database `omnion_qa_w10`):
+the API boots, `/healthz` 200, and the credential depth pass drives the three screens.
+**Next.** The credential screens' remaining open clause is the usage view measured against a
+manual count of fixture workflows (needs a graph, which is REQ-086 slice 2), and REQ-086 is
+the head of this queue.
+
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
 Slice 1 gave the bus a read side. This is the half an operator actually reaches for: connect a

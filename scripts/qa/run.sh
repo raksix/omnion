@@ -116,6 +116,13 @@ else
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
+  # The CSRF guard *refuses* a cookie-authenticated mutation when no secret is configured
+  # (REQ-012: refuse, never skip), which is right in production and useless in a QA stack —
+  # every create, install and delete in the walkthrough answers 403 and the pass reports a
+  # product defect that does not exist. The secret is a throwaway for a disposable database
+  # that is dropped on every pass; it is generated per pass so a half-finished run cannot
+  # leave a token that a later one still validates.
+  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-csrf-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}" \
     pm2 start "$QA_API_BIN" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
