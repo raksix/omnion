@@ -7451,12 +7451,20 @@ async function main() {
   // The empty / loading / error state sweep (REQ-051's last acceptance box). It runs last of the
   // CRM passes and **restores the network before it returns**: it answers the CRM list reads by
   // hand, and a stub left installed would make the sign-out step below look like a broken panel.
-  await runCrmStateSweep(page, report);
+  // The state sweep answers the CRM list reads by hand, so it runs through the guard like every
+  // other depth pass: an unguarded pass is a pass whose crash ends the whole walkthrough, and the
+  // passes that follow it — the two below — would then be **skipped silently**, which is how two
+  // acceptance boxes sit unticked for days with a green run behind them.
+  report.crmStateSweep = await runDepthPass("crm-state-sweep", () => runCrmStateSweep(page, report));
+  log(`crm state sweep: ${JSON.stringify(report.crmStateSweep)}`);
 
   // The keyboard contract and the phone layout (REQ-051's last two boxes). It runs after the
   // state sweep because that one leaves the network stubbed and the sweep restores it, and this
   // pass needs a live stack to press keys against.
-  await runCrmKeyboardAndMobile(page, report);
+  report.crmKeyboardMobile = await runDepthPass("crm-keyboard-mobile", () =>
+    runCrmKeyboardAndMobile(page, report),
+  );
+  log(`crm keyboard + mobile: ${JSON.stringify(report.crmKeyboardMobile)}`);
 
   if (!onlyGroup("crm")) {
   // Sign-out is exercised last so it cannot break the walk.
