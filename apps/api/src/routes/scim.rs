@@ -23,6 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use omnion_identity::provisioning::{self, ProvisioningToken};
+use omnion_identity::sso::scim_runs;
 use omnion_identity::users;
 use omnion_permissions::groups;
 use serde::Deserialize;
@@ -530,7 +531,21 @@ struct SyncLine<'a> {
 }
 
 /// Write one line of the sync log, ignoring a log failure (the operation itself already landed).
+///
+/// This is also where a provider-scoped push is folded into the run ledger (REQ-065, slice 4
+/// part 3), and it is here rather than at fifteen call sites for the reason the log helper
+/// exists: every SCIM outcome passes through this function, so a run cannot miss a line and
+/// cannot double-count one.
+///
+/// A token that provisions a whole *organization* has no provider to hang a run off, and that is
+/// not a degraded case — an organization-scoped connector is a legitimate configuration whose
+/// work is answered by the provisioning screen it already appears on. Inventing a provider row
+/// for it would put a sync ledger entry on a tenant that never configured a directory.
 async fn log(state: &AppState, organization_id: Uuid, line: SyncLine<'_>) {
+    // The detail is cloned rather than moved: `touch_run` reads it afterwards, and taking it by
+    // reference here would make the struct partially moved, which the borrow checker refuses at
+    // the next line. One sentence of duplication, and the alternative is a log entry and a run
+    // entry that can say different things about the same failure.
     let entry = provisioning::NewSyncEntry {
         direction: "inbound".to_owned(),
         resource: line.resource.to_owned(),
@@ -538,11 +553,64 @@ async fn log(state: &AppState, organization_id: Uuid, line: SyncLine<'_>) {
         entity_id: line.entity_id,
         action: line.action.to_owned(),
         outcome: line.outcome.to_owned(),
-        detail: line.detail,
+        detail: line.detail.clone(),
     };
 
     if let Err(error) = provisioning::log_sync(state.db().pool(), organization_id, &entry).await {
         tracing::warn!(error = %error, "the sync-log line could not be written");
+        return;
+    }
+
+    touch_run(state, organization_id, &line).await;
+}
+
+/// Fold one logged line into the provider's open SCIM run, when there is a provider to fold it
+/// into.
+///
+/// The action is namespaced as `scim/<action>` so the run's recount can tell a provisioning line
+/// from anything else that may share the table, and so the log stays readable: `scim/create` says
+/// which surface wrote the line, and a bare `create` would be ambiguous the moment a second
+/// surface writes one.
+async fn touch_run(state: &AppState, organization_id: Uuid, line: &SyncLine<'_>) {
+    let provider: Option<Uuid> = sqlx::query_scalar(
+        "select p.id from auth_providers p \
+         where p.organization_id = $1 and p.kind in ('ldap', 'active_directory') \
+           and exists (select 1 from provisioning_tokens t \
+                       where t.organization_id = p.organization_id and t.revoked_at is null) \
+         order by p.created_at limit 1",
+    )
+    .bind(organization_id)
+    .fetch_optional(state.db().pool())
+    .await
+    .ok()
+    .flatten();
+
+    let Some(provider_id) = provider else { return };
+
+    match scim_runs::current_run(state.db().pool(), provider_id, time::OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(Some(run_id)) => {
+            if line.outcome == "failed" {
+                // A failure has no retry button in the protocol, but it has an operator: the
+                // person who configured the connector. Without this row the failure lives only
+                // in a log line nobody reads, and a run that reports `error_count: 0` over three
+                // refusals is a run lying by omission.
+                if let Err(error) = scim_runs::record_failure(
+                    state.db().pool(),
+                    run_id,
+                    line.external_id.unwrap_or(""),
+                    "scim_refused",
+                    &line.detail,
+                )
+                .await
+                {
+                    tracing::warn!(error = %error, "the SCIM run failure could not be recorded");
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(error = %error, "the SCIM run could not be opened"),
     }
 }
 
