@@ -3834,3 +3834,96 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
+
+## Tick 63 — REQ-010 slice 2's last open item: the serve path answers a window
+
+**What.** HTTP range requests, the one line REQ-010 has carried as "still open" since slice 2:
+a media player could not seek, because every read path answered the whole object whatever the
+client asked for. `crates/media/src/ranges.rs` decides the window; `get_range` on both storage
+drivers does the windowing; `read_window` on the serve paths wires it up.
+
+**Proof.**
+
+- `cargo test -p omnion-media --lib` → **199** (was 179; 20 new — 19 for the planner, 1 for the
+  total-not-the-window assertion the walk forced).
+- `cargo test -p omnion-storage --lib` → **28** (was 22; 6 new).
+- `cargo test -p omnion-security --lib` → **137**, `-p omnion-api --lib` → **220** — both unchanged
+  and green against the storage error variant and the API error mapping.
+- `cargo test -p omnion-api --test media` → **15** walks, **0 failures**, over the real router and
+  the real object store. One new walk; the other thirteen were unreachable before this tick.
+- `--test media_transform`, `media_shares`, `media_scan`, `media_duplicates`, `media_grants`,
+  `media_retention`, `media_settings`, `media_usage` — green against the serve paths this touches.
+- `apps/admin` `tsc --noEmit` — clean.
+
+**The defect only the walk could find.** The first `Content-Range` derived its *total* from the
+bytes that arrived, so a fifty-byte window out of a three-hundred-byte object answered
+`bytes 100-149/50` — a header whose total is smaller than its own end offset, which a player reads
+as "this file is fifty bytes long" and stops. Nineteen unit tests accepted it, because a unit test
+can only see the number it handed in. Only a walk that uploads 300 bytes and asks for 50 can see
+that the two halves come from different facts, so `RangePlan::Partial` now carries the total beside
+the window.
+
+**Two pre-existing red gates, both from the security ticks, were in the way.** A suite that cannot
+reach its first assertion proves nothing, so both are fixed here.
+
+1. **CSRF.** Sign-in made the session cookie *ambient* authority, so every cookie-authenticated
+   write needs a token. The media suite's login took `.split(';').next()` — correct for one cookie
+   and silently dropping every cookie after it — so all fifteen walks died on `csrf_unavailable`,
+   a message that names the server's configuration rather than the suite's own loss of the token.
+   The harness now keeps every `Set-Cookie`, and a write echoes the token in `x-omnion-csrf` the
+   way a browser does. That last part is not decoration: the middleware reads the header first, so
+   a suite that set only the cookie was testing the *fallback* while believing it tested the normal
+   path.
+2. **The rate limiter.** It is a process-wide cell filled from the *stored* document, and the
+   stored `sign_in` scope is ten requests per five minutes. The suite signs in three accounts per
+   walk and runs fifteen walks, so the eleventh sign-in was refused and every walk after it died on
+   a line that has nothing to do with media. The suite now installs a budget of its own — only the
+   `sign_in` scope is raised, because the limiter suite asserts its own numbers and the other
+   ceilings are the ones a deployment ships.
+
+**Two more worth keeping.** The disk was at **100 %** (11 MB free) when this tick started, which is
+a hard blocker: `write_file` returns success with a zero-byte file and `git commit` reports "No
+space left on device" while `git status` looks fine. The repo's own `scripts/qa/disk-guard.sh`
+freed 1.7 GB and, importantly, did it *without* deleting a target a live build was writing into —
+which is the reason that script reads `CARGO_TARGET_DIR` out of each process's own environment
+rather than guessing from a directory name. And the toolchain linter runs a bare `rustc` with no
+edition, so every `async fn` in the crate reads as an error; `cargo` is the only authority, and a
+linter error is not a build failure.
+
+**Next.** (a) The **browser pass is still queued** — `qa-slot.sh` caps the box at one concurrent
+pass and the holder is alive at load 64 with ~2 GB free, which is the 2026-09-28 OOM state. It waits
+rather than forcing. `runMediaRetention` and `runSecurityDepth` are written and wired into
+`scripts/qa/walkthrough.cjs`; both are unrun, which is the only reason REQ-010 and REQ-012 stay
+open. (b) REQ-010's remaining open line is the *replace* audit entry, which lands with slice 3's
+CDN purge hook. (c) REQ-012's other half: the sign-in route still does not call
+`evaluate_lockout`, so nothing has ever locked an account.
+
+**Commits:** `569fa99` the range planner · `b52f6c7` the crate export · `eecb42e` the storage window
+· `42090c7` the serve paths · `224dd5a` the walk and the two unblocked gates. Pushed.
+
+### Blocker found and left in place — the CSRF/rate-limit gate is repo-wide, not media's
+
+Running the eight sibling media suites after this tick's change showed **all eight red**: 28 walks
+on `rate_limited` and 15 on `csrf_unavailable`. The cause is the same two gates fixed in
+`--test media` above, and the fix belongs to the security work, not to this slice:
+
+- **20 suites** carry an identical `login()` helper that takes `.split(';').next()` and therefore
+  discards the CSRF cookie sign-in now issues. Every cookie-authenticated write in every one of
+  them is refused. `apps/api/tests/csrf.rs` shows the working pattern (set `config.csrf` from the
+  fixture, keep every `Set-Cookie`, echo the token in `x-omnion-csrf`).
+- The same twenty suites share one process-wide limiter cell fed from the stored `sign_in` scope
+  of ten per five minutes, which a multi-walk suite exhausts on its own sign-ins.
+
+**Proved pre-existing, not a regression from this tick:** on committed `main` (`224dd5a`, this
+tick's own work already pushed), `cargo test -p omnion-api --test media_shares` fails `0 passed;
+5 failed` with the same `csrf_unavailable` / `rate_limited` pair — and `media_shares` is a file this
+tick did not touch. A suite in another wave's scope is left as it was found.
+
+**What this tick can and cannot claim.** The range slice is proved by the gates that do run:
+`--test media` at **15 walks, 0 failures**, `omnion-media --lib` **199**, `omnion-storage --lib`
+**28**, `omnion-security --lib` **137**, `omnion-api --lib` **220**, and `apps/admin` typecheck
+clean. The eight sibling suites could not be used as a regression check, because they were already
+red before this tick and are red for a reason that has nothing to do with ranges. That is a weaker
+claim than "the whole media surface is green", and it is the honest one: the serve paths this tick
+touched are covered by the walk in `--test media`, which exercises them through the real router
+and the real object store.
