@@ -597,7 +597,7 @@ pub async fn create(
     let prefixed = omnion_backup::set_prefix(pool, row.id, &prefix).await?;
     omnion_backup::start_run(pool, row.id).await?;
 
-    let parts = produce_all(pool, &prefixed).await;
+    let parts = produce_all(&state, &prefixed).await;
     let stored = omnion_backup::list_parts(pool, row.id).await?;
     let finished = omnion_backup::finish_run(pool, row.id, &stored, &now_string()).await?;
 
@@ -828,16 +828,24 @@ pub async fn write_settings(
 /// The five producers, in the order the parts are stored.
 ///
 /// Each one is a small JSON document describing what it accounted for, plus a real
-/// checksum. The `plugins` producer is deliberately honest: it reports zero components,
-/// because no package installer exists yet, and it says so in the document rather than
-/// failing — an empty part is a fact, a missing part is a bug.
-async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Part> {
+/// checksum — except `media`, which copies the bytes. The `plugins` producer is
+/// deliberately honest: it reports zero components, because no package installer exists yet,
+/// and it says so in the document rather than failing — an empty part is a fact, a missing
+/// part is a bug.
+async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part> {
+    let pool = state.db().pool();
     let prefix = run.storage_prefix.clone();
     let mut produced = Vec::new();
     for name in omnion_backup::PARTS {
+        // `media` is not a document. It is the library's bytes, copied one object at a time
+        // into the run's own directory, and it is produced outside the JSON pipeline below
+        // because no amount of describing a file puts the file anywhere.
+        if name == "media" {
+            produced.push(produce_media(state, run).await);
+            continue;
+        }
         let document = match name {
             "database" => document_database(pool).await,
-            "media" => document_media(pool).await,
             "configuration" => document_configuration(pool).await,
             "themes" => document_themes(pool).await,
             "plugins" => document_plugins(pool).await,
@@ -895,7 +903,7 @@ async fn produce_all(pool: &sqlx::PgPool, run: &omnion_backup::Backup) -> Vec<Pa
                 continue;
             }
         };
-        let path = omnion_backup::local_root_for(&root, &prefix).join(key.trim_start_matches('/'));
+        let path = omnion_backup::local_path_for(&root, &key);
         if let Some(parent) = path.parent() {
             if let Err(error) = tokio::fs::create_dir_all(parent).await {
                 let part = Part::failed(name, format!("{}: {error}", parent.display()));
@@ -993,31 +1001,236 @@ async fn document_database(
     }))
 }
 
-/// The `media` part: the library's objects, counted by site.
+/// Record a media part that could not be produced, and return it.
 ///
-/// The `::bigint` cast on the size column is not decoration. `sum()` over a `bigint` returns
-/// `numeric`, and `coalesce(sum(size_bytes), 0)` does **not** narrow it: the `0` is coerced to
-/// the other argument's type, so the result is still `numeric`, and sqlx refuses to decode it
-/// into an `i64`. The symptom is that a site with media in it cannot be backed up at all — the
-/// part fails, the run lands on `partial`, and the other four parts are written anyway, so the
-/// failure reads as "the media part is flaky" rather than "this expression has the wrong type".
-///
-/// `::bigint` and deliberately **not** `::int`: a total that wraps at 2 GiB would report a
-/// plausible small number, which is worse than an error somebody can see.
-async fn document_media(pool: &sqlx::PgPool) -> std::result::Result<serde_json::Value, ApiError> {
-    let rows: Vec<(Uuid, i64, i64)> = sqlx::query_as(
-        "select site_id, count(*), coalesce(sum(size_bytes), 0)::bigint from media \
-         where deleted_at is null group by site_id order by site_id",
+/// One function rather than a closure at each of the two call sites, and not for tidiness: an
+/// `async` closure is not expressible on stable Rust, so the natural shape — a local `fail`
+/// that saves the row and returns the value — does not compile at all, and the only way to get
+/// something compiling is to duplicate the save-and-return block and hope the copies stay in
+/// step. They would not have: the second copy is the one that forgets `storage_path: None`.
+async fn record_media_failure(pool: &sqlx::PgPool, backup_id: Uuid, reason: String) -> Part {
+    let part = Part::failed("media", reason);
+    let _ = omnion_backup::save_part(
+        pool,
+        backup_id,
+        &NewPart {
+            part: part.part.clone(),
+            status: part.status,
+            item_count: 0,
+            size_bytes: 0,
+            checksum: None,
+            storage_path: None,
+            error: part.error.clone(),
+        },
     )
-    .fetch_all(pool)
+    .await;
+    part
+}
+
+/// Write one archived object under the run's own directory, creating its parent as it goes.
+///
+/// A standalone function rather than an `async move` block inline at the call site, and the
+/// reason is a borrow: the block would have to capture `base` — a `PathBuf` — by move, so the
+/// second object would find it moved, and by reference the future would outlive the borrow the
+/// compiler cannot see is fine. Taking the base and the bytes **by value** is both simpler and
+/// honest: the crate's writer is called once per object and the copy loop hands it a buffer it
+/// is about to drop anyway.
+async fn write_media_object(
+    base: std::path::PathBuf,
+    key: String,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), omnion_backup::BackupError> {
+    // `key` is the run-prefix-relative key the crate built; the writer is the only place that
+    // knows about the local root, so the key can never escape it.
+    let path = base.join(key.trim_start_matches('/'));
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| {
+                omnion_backup::BackupError::Rejected(format!("{}: {error}", parent.display()))
+            })?;
+    }
+    tokio::fs::write(&path, &bytes).await.map_err(|error| {
+        omnion_backup::BackupError::Rejected(format!("{}: {error}", path.display()))
+    })
+}
+
+/// The `media` part: the library's **bytes**, copied into the run's own directory.
+///
+/// # Why this function replaced one that only counted
+///
+/// The first implementation of this part ran one `select site_id, count(*), sum(size_bytes)
+/// from media` and wrote the resulting JSON to disk. The run was `succeeded`, `verify` read
+/// the artifact back and agreed with its checksum, and **not one byte of the library had been
+/// copied anywhere**. The screen said "media: 412 files, 88 MiB" and meant "there are 412 rows
+/// in a table, and the number 88 MiB is their sum".
+///
+/// It is the same defect the crate documents for the very first implementation of the *other*
+/// four parts — a checksum over a document nobody wrote is a perfectly good checksum — wearing
+/// a different mask. Counting is what a database can do with the object store switched off, so
+/// the count was available on exactly the run where the store was unreachable, and the count
+/// is what made the row look healthy.
+///
+/// Three consequences are designed in rather than hoped for:
+///
+/// * **The part is proved by reading an object back out of the archive.** The index is
+///   written last, after the objects, and the part's own size is the sum of the bytes the copy
+///   loop actually wrote — so a run that copied nothing reports a small artifact, not a
+///   cheerful `done` with a 40-byte "media" JSON in it.
+/// * **A part that copied only some of the library is a FAILED part.** `summarise` turns one
+///   failure into `partial`, and the run stops claiming a restore point it cannot honour. The
+///   objects that did land are kept, and the two that did not are named in the error column.
+/// * **The library's rows are an index, not the content.** Each object's bytes are re-hashed
+///   after they come back from the store and compared with the row; a disagreement is a
+///   failure, never a silent copy of something that is not what the library says it is.
+///
+/// The destination is the backup's own local root, not the media bucket: a run's artifacts all
+/// live under one prefix so that "delete this backup" can delete all of them, and an archive
+/// split across two stores cannot be deleted or verified as one thing.
+async fn produce_media(state: &AppState, run: &omnion_backup::Backup) -> Part {
+    let pool = state.db().pool();
+    let prefix = run.storage_prefix.clone();
+
+    let root = match omnion_backup::load_settings(pool).await {
+        Ok(settings) => settings.local_root,
+        Err(error) => {
+            return record_media_failure(
+                pool,
+                run.id,
+                format!("the destination root could not be read: {error}"),
+            )
+            .await;
+        }
+    };
+    // The root itself: every key the copy loop builds is already prefix-qualified, and the
+    // writer joins it to this and to nothing else. See `local_path_for`.
+    let base = std::path::PathBuf::from(root.trim());
+
+    let objects = match omnion_backup::pending_objects(pool, None).await {
+        Ok(objects) => objects,
+        Err(error) => return record_media_failure(pool, run.id, format!("the media library could not be listed: {error}")).await,
+    };
+
+    // An empty library is a legitimate result, not a failure and not a part that did nothing:
+    // it is the honest answer to "how much media is there" on a platform that has none yet.
+    if objects.is_empty() {
+        return finish_media_part(pool, run.id, &prefix, &omnion_backup::MediaCopyReport::default())
+            .await;
+    }
+
+    let report = match omnion_backup::copy_objects(
+        state.storage(),
+        &objects,
+        &prefix,
+        |key: String, bytes: Vec<u8>| write_media_object(base.clone(), key, bytes),
+    )
     .await
-    .map_err(|error| ApiError::from(omnion_backup::BackupError::from(error)))?;
-    let total: i64 = rows.iter().map(|(_, count, _)| count).sum();
-    Ok(json!({
-        "part": "media",
-        "item_count": total,
-        "sites": rows.into_iter().map(|(site, count, size)| json!({ "site_id": site, "files": count, "size_bytes": size })).collect::<Vec<_>>(),
-    }))
+    {
+        Ok(report) => report,
+        Err(error) => {
+            return record_media_failure(
+                pool,
+                run.id,
+                format!("the media part could not run: {error}"),
+            )
+            .await;
+        }
+    };
+
+    if !report.is_complete() {
+        // The report is the reason, and it is kept: the objects that did copy are on the
+        // destination and an operator debugging this needs to know which files they are.
+        tracing::warn!(
+            run = %run.id,
+            copied = report.objects_copied,
+            failed = report.objects_failed,
+            "the media part copied only part of the library"
+        );
+        return record_media_failure(pool, run.id, report.failure_summary()).await;
+    }
+
+    finish_media_part(pool, run.id, &prefix, &report).await
+}
+
+/// Write the media part's index and record the part, and say plainly what the archive holds.
+///
+/// The index is the artifact the restore path reads, and it is written **before** the part is
+/// recorded — the same order every other part uses, and for the same reason: a `done` part
+/// whose artifact is not on the destination is the failure this whole crate is about.
+///
+/// The recorded size is `bytes_copied + index bytes`, not one or the other. A part's `size_bytes`
+/// is what `verify_manifest` compares against the artifact on disk, so recording only the
+/// payload would make every media part report a mismatch against a perfectly good archive —
+/// and recording only the index would claim a size the archive does not have. The media part is
+/// also the one part whose artifact is a *directory*, so the number is stated as the sum and the
+/// index carries the per-object breakdown the restore actually walks.
+async fn finish_media_part(
+    pool: &sqlx::PgPool,
+    backup_id: Uuid,
+    prefix: &str,
+    report: &omnion_backup::MediaCopyReport,
+) -> Part {
+    let index = omnion_backup::build_index(prefix, &report.objects);
+    let document = serde_json::to_vec_pretty(&index).unwrap_or_default();
+    let key = format!(
+        "{}{}",
+        omnion_backup::storage_prefix(prefix),
+        omnion_backup::INDEX_FILENAME
+    );
+
+    let root = match omnion_backup::load_settings(pool).await {
+        Ok(settings) => settings.local_root,
+        Err(error) => {
+            return record_media_failure(
+                pool,
+                backup_id,
+                format!("the destination root could not be read: {error}"),
+            )
+            .await;
+        }
+    };
+    let path = omnion_backup::local_path_for(&root, &key);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            return record_media_failure(
+                pool,
+                backup_id,
+                format!("{}: {error}", parent.display()),
+            )
+            .await;
+        }
+    }
+    if let Err(error) = tokio::fs::write(&path, &document).await {
+        return record_media_failure(
+            pool,
+            backup_id,
+            format!("{}: {error}", path.display()),
+        )
+        .await;
+    }
+
+    let part = Part::done(
+        "media",
+        report.objects_copied,
+        report.bytes_copied + document.len() as i64,
+        omnion_backup::bytes_checksum(&document),
+        key,
+    );
+    let _ = omnion_backup::save_part(
+        pool,
+        backup_id,
+        &NewPart {
+            part: part.part.clone(),
+            status: part.status,
+            item_count: part.item_count,
+            size_bytes: part.size_bytes,
+            checksum: part.checksum.clone(),
+            storage_path: part.storage_path.clone(),
+            error: None,
+        },
+    )
+    .await;
+    part
 }
 
 /// The `configuration` part: the settings tables, with no secret values.
@@ -1096,8 +1309,7 @@ async fn observe(
         let Some(relative) = part.storage_path.as_deref() else {
             continue;
         };
-        let path = omnion_backup::local_root_for(&root, &run.storage_prefix)
-            .join(relative.trim_start_matches('/'));
+        let path = omnion_backup::local_path_for(&root, relative);
         // A part that cannot be read is reported as `unreadable` by `verify_manifest`, not
         // as a mismatch: "the file is gone" and "the file is different" are different
         // answers and an operator acts on them differently.
