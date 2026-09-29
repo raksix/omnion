@@ -44,6 +44,19 @@ export interface RunStep {
   skip_reason?: string | null;
   /** Attempts made, shown on the pill of a step that took more than one. */
   attempts?: number;
+  /**
+   * What the engine handed the step, as stored JSON.
+   *
+   * Distinct from the node's `params` on the canvas, and deliberately so: the canvas
+   * carries what the *author* wrote, this carries what the *engine was given*. A run from
+   * a node, a retry, or an edit that was never saved leave the two different, and an
+   * operator reading a trace wants the second.
+   */
+  params?: unknown;
+  /** What the step returned, or the failure it recorded in `error`. */
+  output?: unknown;
+  /** Message of the last failure, shown above the output in the trace panel. */
+  error?: string | null;
 }
 
 /** The one thing a card needs in order to paint a pill. */

@@ -91,6 +91,12 @@ import {
   type RunStep,
 } from "@/features/workflows/node-status";
 import {
+  runDetailForNode,
+  traceHeading,
+  traceSubheading,
+  type DescribedPayload,
+} from "@/features/workflows/step-detail";
+import {
   clearSelection,
   deleteTarget,
   EMPTY_SELECTION,
@@ -203,6 +209,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const [runByNode, setRunByNode] = useState<Map<string, RunStep[]>>(
     () => new Map<string, RunStep[]>(),
   );
+  // The same run's steps as a LIST, for the trace panel. Deliberately a second piece of
+  // state rather than a flatten of the map above: the map is keyed by node and drops steps
+  // with no node (a rule predating the builder), and the trace panel answers "which steps
+  // is this node" — the question the map exists to make fast but not to answer, because the
+  // flattened map cannot say "no run has been read yet" and "the node took no part in the
+  // run" apart. `null` is "no run read"; `[]` is "a run with no steps".
+  const [runSteps, setRunSteps] = useState<RunStep[] | null>(null);
 
   const [dragging, setDragging] = useState<{
     id: string;
@@ -328,6 +341,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         steps?: RunStep[];
       } | null;
       setRunByNode(indexStepsByNode(run?.steps ?? []));
+      setRunSteps(run?.steps ?? []);
     } catch {
       // See above: no status layer is better than no builder.
     }
@@ -1380,6 +1394,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         // re-reading the run is unnecessary — and re-reading it immediately would race
         // the engine, which is still claiming the first step.
         setRunByNode(indexStepsByNode(body?.steps ?? []));
+        setRunSteps(body?.steps ?? []);
       } catch (error) {
         setRunMessage(
           error instanceof Error ? error.message : "The run could not be started.",
@@ -1930,6 +1945,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                 const target = nodes.find((entry) => entry.id === nodeId);
                 if (target) void runFrom(target);
               }}
+              runSteps={runSteps}
               running={running}
             />
           ) : (
@@ -2278,6 +2294,7 @@ function NodeInspector({
   onDelete,
   onRemoveConnection,
   onRunFromHere,
+  runSteps,
   running,
 }: {
   node: GraphNode;
@@ -2288,6 +2305,7 @@ function NodeInspector({
   onDelete: () => void;
   onRemoveConnection: (edgeId: string) => void;
   onRunFromHere: (nodeId: string) => void;
+  runSteps: RunStep[] | null;
   running: boolean;
 }) {
   if (!nodeType) {
@@ -2441,6 +2459,148 @@ function NodeInspector({
       >
         Delete this node
       </button>
+
+      {/* The click half of "clicking the node opens that step's inputs and output". It sits
+          below the authored parameters on purpose: the form above is what the node is set
+          to, the panel below is what the last run actually did with it, and an operator
+          debugging a run is reading the second one. */}
+      <StepTracePanel nodeId={node.id} runSteps={runSteps} />
+    </div>
+  );
+}
+
+/**
+ * What the last run did on one node: its inputs, its output, and its failure.
+ *
+ * The criterion's second clause is *"clicking the node opens that step's inputs and
+ * output"*, and the load-bearing part is that the panel opens **from the click** — the
+ * node's own steps, not a global trace the reader has to go and find. That is why this
+ * takes a node id and not a run: the selection is the query.
+ *
+ * Three states, and each one is a different sentence rather than an empty box, because a
+ * blank panel is indistinguishable from a panel that failed to load:
+ *
+ * * **no run** — nothing has been read for this rule yet, so there is nothing to open.
+ * * **node absent** — a run exists but this node was not in it. A trigger, a note, or a
+ *   node the run never reached. The authored parameters are still shown, because they are
+ *   the node's, and "the run did not touch this" is a fact about the run, not an absence
+ *   of data.
+ * * **steps** — one or more, in run order. More than one means the node branches, and both
+ *   sides are shown: the one that ran and the one that did not are the whole story behind
+ *   a `diverged` pill.
+ */
+function StepTracePanel({ nodeId, runSteps }: { nodeId: string; runSteps: RunStep[] | null }) {
+  const detail = runDetailForNode(nodeId, runSteps);
+
+  return (
+    <section
+      className="rounded-md border border-line p-2"
+      data-step-trace={nodeId}
+      data-step-trace-kind={detail.kind}
+    >
+      <h3 className="text-[12px] font-medium">Last run</h3>
+      <p className="mt-0.5 text-[11.5px] text-muted" data-step-trace-heading>
+        {traceHeading(detail)}
+      </p>
+      <p className="mt-0.5 text-[11.5px] text-muted" data-step-trace-subheading>
+        {traceSubheading(detail)}
+      </p>
+
+      {detail.kind !== "node" ? (
+        <p className="mt-2 text-[11.5px] text-muted" data-step-trace-empty>
+          {detail.kind === "no-run"
+            ? "No run has been read for this rule yet."
+            : "This node contributed no step to the last run."}
+        </p>
+      ) : (
+        detail.steps.map((entry) => (
+          <div
+            key={entry.step.step_no}
+            className="mt-2 rounded-md border border-line p-2"
+            data-step-trace-step={entry.step.step_no}
+            data-step-trace-status={entry.step.status}
+          >
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11.5px] font-medium">Step {entry.step.step_no}</span>
+              <span
+                className="rounded-full border border-line px-1.5 text-[10.5px] text-muted"
+                data-step-trace-status-label
+              >
+                {entry.step.status}
+              </span>
+              {entry.step.attempts && entry.step.attempts > 1 ? (
+                <span className="text-[10.5px] text-muted">
+                  {entry.step.attempts} attempts
+                </span>
+              ) : null}
+            </div>
+
+            {entry.step.skip_reason ? (
+              <p className="mt-1 text-[11.5px] text-muted" data-step-trace-skip>
+                {entry.step.skip_reason}
+              </p>
+            ) : null}
+            {entry.step.error ? (
+              <p
+                className="mt-1 rounded-md bg-accent-soft px-2 py-1 text-[11.5px] text-ink"
+                data-step-trace-error
+              >
+                {entry.step.error}
+              </p>
+            ) : null}
+
+            <PayloadBlock label="Inputs" payload={entry.inputs} />
+            <PayloadBlock label="Output" payload={entry.output} />
+          </div>
+        ))
+      )}
+    </section>
+  );
+}
+
+/**
+ * One side of a step — its inputs or its output.
+ *
+ * The heading is never omitted for an empty payload. "The step ran and returned an empty
+ * object" and "the step never produced anything" are different debugging facts, and a
+ * heading that appears only when there is data makes them look the same.
+ */
+function PayloadBlock({ label, payload }: { label: string; payload: DescribedPayload }) {
+  return (
+    <div className="mt-2" data-step-trace-payload={label.toLowerCase()}>
+      <div className="flex items-baseline justify-between gap-2">
+        <h4 className="text-[11.5px] font-medium">{label}</h4>
+        <span className="text-[10.5px] text-muted" data-step-trace-payload-shape>
+          {payload.hasContent ? payload.shape : "nothing"}
+        </span>
+      </div>
+      <p className="mt-0.5 text-[11.5px] text-muted" data-step-trace-payload-headline>
+        {payload.hasContent
+          ? payload.headline
+          : label === "Inputs"
+            ? "No inputs — this step takes none."
+            : "No output: the step did not produce one."}
+      </p>
+      {payload.entries.length > 0 ? (
+        <dl className="mt-1 flex flex-col gap-0.5">
+          {payload.entries.map((entry) => (
+            <div key={entry.key} className="flex gap-1.5 text-[11px]">
+              <dt className="shrink-0 font-mono text-muted">{entry.key}</dt>
+              <dd className="min-w-0 flex-1 break-words font-mono">{entry.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {payload.items.length > 0 ? (
+        <ol className="mt-1 flex flex-col gap-0.5">
+          {payload.items.map((item, position) => (
+            <li key={position} className="flex gap-1.5 text-[11px]">
+              <span className="shrink-0 text-muted">{position + 1}.</span>
+              <span className="min-w-0 flex-1 break-words font-mono">{item}</span>
+            </li>
+          ))}
+        </ol>
+      ) : null}
     </div>
   );
 }
