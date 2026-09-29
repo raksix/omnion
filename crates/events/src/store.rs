@@ -88,9 +88,14 @@ pub async fn enqueue_for_endpoints(
         return Ok(0);
     }
 
+    // `trigger` is stamped here rather than left to the column's default. The default is
+    // `event`, which is right for the fan-out and wrong here: a row queued by an operator
+    // pressing "Test" is not traffic, and the stats read deliberately keeps it out of the
+    // success rate. Stamping it at the only place a test is queued is what makes the column
+    // true rather than aspirational.
     let result = sqlx::query(
-        "insert into webhook_deliveries (endpoint_id, event_id, max_attempts) \
-         select w.id, $1, $3 from webhook_endpoints w where w.id = any ($2) \
+        "insert into webhook_deliveries (endpoint_id, event_id, max_attempts, trigger) \
+         select w.id, $1, $3, 'test' from webhook_endpoints w where w.id = any ($2) \
          on conflict (endpoint_id, event_id) do nothing",
     )
     .bind(event.id)
@@ -335,7 +340,14 @@ pub struct DeliveryStats {
     pub pending: i64,
     /// Rows queued, in the window.
     pub total: i64,
-    /// Share of settled rows that were accepted, 0.0–1.0; `None` when nothing settled yet.
+    /// Rows in the window an operator asked for by hand (the `test` trigger).
+    ///
+    /// Reported rather than folded in, because a test delivery is a probe somebody pressed and
+    /// not traffic the platform produced. It is counted in `total` — it really is a row in the
+    /// history — and left out of `success_rate`, where it would otherwise let an operator make
+    /// a broken receiver look healthy by pressing the button.
+    pub tests: i64,
+    /// Share of settled **non-test** rows that were accepted, 0.0–1.0; `None` when none settled.
     pub success_rate: Option<f64>,
     /// 95th percentile receiver duration in the window; `None` when nothing ran.
     pub p95_duration_ms: Option<i32>,
@@ -343,23 +355,36 @@ pub struct DeliveryStats {
 
 /// Summarise one endpoint's history since `since`.
 ///
-/// `success_rate` counts only **settled** rows (`delivered` + `failed`). Including `pending`
-/// in the denominator is the single most misleading thing a webhook dashboard can do: a queue
-/// that just took a thousand deliveries shows 0% while every one of them is about to succeed,
-/// which sends the operator to debug a receiver that is working perfectly.
+/// `delivered` and `failed` count **traffic** only — rows whose trigger is not `test` — and
+/// `success_rate` is their ratio over the settled ones. Two exclusions, each for a reason:
+///
+/// * `pending` is not in the denominator. It is the single most misleading thing a webhook
+///   dashboard can do: a queue that just took a thousand deliveries reads 0% while every one
+///   of them is about to succeed, which sends the operator to debug a receiver that is working
+///   perfectly.
+/// * A `test` row is not in either. It was asked for by a button, and counting it would let an
+///   operator make a broken receiver look healthy by pressing the button — the one number on
+///   this screen that must not be under the operator's own control.
+///
+/// `total` still counts every row in the window, tests included, because the history really
+/// does contain them and a header that hid them would make the table disagree with its own
+/// count.
 pub async fn endpoint_stats(
     pool: &PgPool,
     endpoint_id: Uuid,
     since: OffsetDateTime,
 ) -> Result<DeliveryStats> {
-    // Four counts, no `max`: the slowest single delivery is not a number anybody acts on, and
-    // the percentile below is computed from the full sample where it is.
-    let row: (i64, i64, i64, i64) = sqlx::query_as(
+    // The two outcome columns and the two test-aware ones are counted separately: the rate is
+    // built from traffic, and `total`/`tests` describe the whole history. `max` is absent on
+    // purpose — the slowest single delivery is not a number anybody acts on, and the percentile
+    // below is computed from the full sample where it is.
+    let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "select \
-             count(*) filter (where status = 'delivered'), \
-             count(*) filter (where status = 'failed'), \
+             count(*) filter (where status = 'delivered' and trigger <> 'test'), \
+             count(*) filter (where status = 'failed' and trigger <> 'test'), \
              count(*) filter (where status = 'pending'), \
-             count(*) \
+             count(*), \
+             count(*) filter (where trigger = 'test') \
          from webhook_deliveries \
          where endpoint_id = $1 and created_at >= $2",
     )
@@ -368,13 +393,22 @@ pub async fn endpoint_stats(
     .fetch_one(pool)
     .await?;
 
+    let (delivered, failed, pending, total, tests) = row;
+
+    // The rate's denominator is the *traffic* that actually reached a receiver and got an
+    // answer. It excludes `pending` (a queue that just took a thousand deliveries would read
+    // 0% while every one of them is about to succeed) and the test rows (a probe somebody
+    // pressed is not the platform delivering anything, and counting it would let an operator
+    // make a broken receiver look healthy by pressing the button).
+    let settled = delivered + failed;
+
     // The percentile is a second, smaller read rather than a window function: the 95th
     // percentile of the *delivered* rows is the number, and filtering to delivered first means
     // a pile of slow failures cannot drag it — a slow failure is a retry, not a latency budget.
     let durations: Vec<i32> = sqlx::query_scalar(
         "select duration_ms from webhook_deliveries \
          where endpoint_id = $1 and status = 'delivered' and duration_ms is not null \
-           and created_at >= $2 \
+           and created_at >= $2 and trigger <> 'test' \
          order by duration_ms asc",
     )
     .bind(endpoint_id)
@@ -382,16 +416,14 @@ pub async fn endpoint_stats(
     .fetch_all(pool)
     .await?;
 
-    let p95 = percentile_95(&durations);
-
-    let settled = row.0 + row.1;
     Ok(DeliveryStats {
-        delivered: row.0,
-        failed: row.1,
-        pending: row.2,
-        total: row.3,
-        success_rate: (settled > 0).then(|| row.0 as f64 / settled as f64),
-        p95_duration_ms: p95,
+        delivered,
+        failed,
+        pending,
+        total,
+        tests,
+        success_rate: (settled > 0).then(|| delivered as f64 / settled as f64),
+        p95_duration_ms: percentile_95(&durations),
     })
 }
 
@@ -458,8 +490,18 @@ pub const MAX_REDELIVERIES: i32 = 10;
 /// A `pending` row is refused rather than reset, and that is the one place this operation could
 /// double-send: the runner has already claimed it and is holding a lease, so a reset would hand
 /// the same row to the next claim while the first attempt is still in flight.
-pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> Result<()> {
-    let updated = sqlx::query(
+/// Returns the row's new `redeliver_count`, so the caller can report how many times it has now
+/// been forced without a second read — and, more importantly, so the number it reports is the
+/// one the *update* wrote rather than one a follow-up query might observe after somebody else
+/// pressed the button again.
+pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> Result<i32> {
+    // `query_scalar` rather than `query`: this is a single `integer` column, and the count it
+    // returns is the number the *update* wrote — the same statement, so there is no window in
+    // which a second reader could see a different value.
+    //
+    // `fetch_optional`, not `fetch_one`: the `where` clause is the whole refusal policy, so
+    // "no row" is the normal answer for a pending row or a capped one, not an error.
+    let updated: Option<i32> = sqlx::query_scalar(
         "update webhook_deliveries \
          set status = 'pending', attempts = 0, next_attempt_at = now(), \
              claimed_at = null, response_status = null, error = null, \
@@ -468,16 +510,17 @@ pub async fn redeliver(pool: &PgPool, endpoint_id: Uuid, delivery_id: Uuid) -> R
              redeliver_count = redeliver_count + 1, replayed_at = now() \
          where id = $1 and endpoint_id = $2 \
            and status <> 'pending' \
-           and redeliver_count < $3",
+           and redeliver_count < $3 \
+         returning redeliver_count",
     )
     .bind(delivery_id)
     .bind(endpoint_id)
     .bind(MAX_REDELIVERIES)
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
 
-    if updated.rows_affected() == 1 {
-        return Ok(());
+    if let Some(redeliver_count) = updated {
+        return Ok(redeliver_count);
     }
 
     // Nothing was updated, so find out which of the three reasons it was — the operator's next
@@ -522,13 +565,24 @@ pub async fn redeliver_many(
     pool: &PgPool,
     endpoint_id: Uuid,
     delivery_ids: &[Uuid],
-) -> Result<Vec<(Uuid, Result<()>)>> {
+) -> Result<Vec<(Uuid, Result<i32>)>> {
     let mut outcomes = Vec::with_capacity(delivery_ids.len());
     for id in delivery_ids {
-        // A store error (the database not answering) does stop the batch, because nothing
-        // after it could be reached either. A *refusal* does not: those are per-row answers
-        // and the point of the batch is to report them individually.
-        outcomes.push((*id, redeliver(pool, endpoint_id, *id).await));
+        // A store error (the database not answering) *does* stop the batch, because nothing
+        // after it could be reached either and a partial answer presented as a complete one is
+        // worse than an error. A *refusal* does not stop it: those are per-row answers, and
+        // the point of the batch is to report each one separately.
+        match redeliver(pool, endpoint_id, *id).await {
+            // A store error (the database not answering) *does* stop the batch, because
+            // nothing after it could be reached either, and a partial answer presented as a
+            // complete one is worse than an error. A *refusal* does not stop it: those are
+            // per-row answers, and the point of the batch is to report each one separately.
+            Ok(count) => outcomes.push((*id, Ok(count))),
+            Err(refusal @ EventsError::RedeliveryRefused { .. }) => {
+                outcomes.push((*id, Err(refusal)));
+            }
+            Err(other) => return Err(other),
+        }
     }
     Ok(outcomes)
 }

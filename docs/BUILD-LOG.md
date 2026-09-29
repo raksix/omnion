@@ -1,3 +1,65 @@
+
+## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
+
+build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
+
+Slice 1 gave the bus a read side. This is the half an operator actually reaches for: connect a
+receiver, watch what it was sent, send it again, and find out whether it is still working.
+
+**0052_webhook_delivery_ops.sql**, four routes on `/webhooks/{id}` (`deliveries`, `redeliver`,
+`redeliver` batch, `stats`, `secret/rotate`), and four screens: `/webhooks`, `/webhooks/new`,
+`/webhooks/[id]` (Overview / Deliveries / Stats) and the edit form.
+
+**Six decisions, each a shortcut that produces a plausible wrong answer.** The **redelivery
+resets the row** rather than inserting a second one — the `(endpoint_id, event_id)` unique index
+would refuse the insert anyway, and it should: two rows for one fact means the receiver cannot
+tell a replay from a duplicate, and it is also what makes `attempts` mean "attempts in this
+round" instead of "attempts ever", which is the number compared against `max_attempts`. A
+**pending row is refused**, and its checkbox is disabled rather than offered: the runner holds
+that row's lease, so a reset would hand it to the next claim while the attempt is in flight —
+the one place this operation could double-send. **The three refusals carry three codes**, because
+"wait a moment" and "fix your receiver instead" are different advice, and the refusal travels
+*inside* `EventsError` (as a `409`, not a `400` — the row's state is the problem, not the
+request) so a store error stays an error instead of being reported as "no such delivery". The
+**success rate counts settled traffic only**: pending in the denominator would read 0% for a
+queue whose every delivery is about to succeed, and a test row in it would let an operator make
+a broken receiver look healthy by pressing the button — so a history that is only probes answers
+`null` and the screen prints "No traffic" with the excluded count underneath. The **cursor is
+`(created_at, id)`**, because the read sorts by both and a cursor on one column of a two-column
+order repeats rows whenever two deliveries share a timestamp, which is normal when the bus fans
+out; half a cursor is refused by name because a null id there is a `500` on a request the panel
+builds itself. **Rotation is a separate route from `PATCH`**, because it is the one write whose
+answer carries the secret — a receiver cannot be reconfigured with a value it never saw.
+
+**Two defects the walks found, both of the "the column exists" kind.** Migration 0052 added
+`trigger` and nothing wrote it, so every test delivery was stamped `event` and the stats read was
+counting a button press as the platform delivering something; the column is now stamped at the
+one place a test is queued. And `redeliver` originally reported its count through a follow-up
+read, which can observe a different value after somebody else pressed the same button — it now
+returns the count from the update itself.
+
+**The rotation is proved against a receiver, not a status code.** The walk creates the endpoint
+with an operator-supplied secret so it holds both values, delivers once, rotates, delivers again,
+and asserts the second delivery verifies against the new secret and **fails** against the old
+one. The receiver is `infra/mocks/webhook-receiver.mjs`, started by the depth pass and killed in
+its `finally`, so a throw mid-pass does not leave a port bound.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **45** (42 before, +3)
+- `cargo test -p omnion-api --test events` → **9/9** (6 before, +3) against real Postgres
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `cdba36e` (the store and the migration), `b826899` (the routes and the walks),
+  `17d87cd` (the screens and the depth pass)
+
+**Not done, and not claimed: no browser pass.** A sibling writer held the QA slot for the whole
+window at load 18–20, so `runWebhooksDepth` is written and **unrun** and every acceptance box
+that names a screen stays unticked with the reason written into the box. The fast gates ran
+instead and the pass is queued.
+
+**Next.** When the slot frees, run `bash scripts/qa/run.sh` with no `QA_STACK` override. If it is
+green, tick the screen boxes and close slice 2. Then slice 3, which is the retention sweeper
+plus the delivery-failed notification REQ-021 turns into an operator alert.
 ## 2026-09-28 — REQ-010 slice 4 (retention half) · the part of a file manager that forgets
 
 build media: retention policies, the run log, the hold, and the reference repair
