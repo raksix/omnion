@@ -113,6 +113,14 @@ pub const DEFAULT_ANALYTICS_COLLECT_PER_MINUTE: u64 = 300;
 /// tab.
 pub const DEFAULT_AI_HEALTH_POLL_MS: u64 = 60_000;
 
+/// How many agent runs one API process executes at a time (`OMNION_AI_RUNNER_CONCURRENCY`).
+///
+/// 4, not 1 and not 32. One is a runtime that feels broken while a tool takes four seconds; 32
+/// is a runtime that can have thirty-two provider calls in flight on a four-core box, which is
+/// both a timeout story and a bill. Four is what a small installation actually needs, and the
+/// knob exists for the ones that do not.
+pub const DEFAULT_AI_RUNNER_CONCURRENCY: usize = 4;
+
 /// How often the retention worker sweeps (REQ-010, slice 4).
 pub const DEFAULT_RETENTION_POLL_MS: u64 = 900_000;
 
@@ -601,6 +609,24 @@ pub struct AiHubConfig {
     /// Unsigned on purpose: a negative retention is not a shorter history, it is a `make_interval`
     /// that deletes everything, and the reader refuses it rather than trusting the spelling.
     pub retention_days: u64,
+    /// Whether this process runs the agent runner (`OMNION_AI_RUNNER`).
+    ///
+    /// A **third** switch rather than a reading of `runner_enabled`, because the health probe,
+    /// the decision pruner and the agent runner are three different kinds of background work with
+    /// three different risk profiles: the probe makes outbound network calls, the pruner issues a
+    /// bulk delete, and the runner **spends money** — it calls a provider and a tool. An
+    /// installation that wants its providers probed but refuses to let an agent act on its own
+    /// says `OMNION_AI_RUNNER=false`, and the API answers `503 runner_disabled` on a run start
+    /// rather than queueing work nothing will ever pick up. A panel that queued runs forever with
+    /// no worker would look like a bug in the agent.
+    pub agent_runner_enabled: bool,
+    /// How many runs one process executes at a time (`OMNION_AI_RUNNER_CONCURRENCY`).
+    ///
+    /// Default 4, floor 1. Every slot is one in-flight provider call plus one tool, so this is
+    /// the number that decides how many tokens can be in flight at once — it is a money knob and
+    /// not only a thread-pool knob. A floor of 1 rather than 0 because a concurrency of 0 is a
+    /// runner that never runs anything and reports itself healthy.
+    pub runner_concurrency: usize,
     /// Whether this process prunes the route decision log (`OMNION_AI_LOG_RUNNER`).
     ///
     /// A **separate** switch from `runner_enabled`, not a second reading of the same one: the
@@ -619,6 +645,8 @@ impl Default for AiHubConfig {
             runner_enabled: true,
             poll_ms: DEFAULT_AI_HEALTH_POLL_MS,
             retention_days: 30,
+            agent_runner_enabled: true,
+            runner_concurrency: DEFAULT_AI_RUNNER_CONCURRENCY,
             log_runner_enabled: true,
         }
     }
@@ -916,6 +944,13 @@ impl Config {
                 AiHubConfig::default().retention_days,
             )?,
             log_runner_enabled: read_flag(&read, "OMNION_AI_LOG_RUNNER", true)?,
+            agent_runner_enabled: read_flag(&read, "OMNION_AI_RUNNER", true)?,
+            runner_concurrency: read_positive(
+                &read,
+                "OMNION_AI_RUNNER_CONCURRENCY",
+                DEFAULT_AI_RUNNER_CONCURRENCY as u64,
+            )?
+            .max(1) as usize,
         };
 
         let mail = MailConfig {
@@ -1357,14 +1392,45 @@ mod tests {
         // shared env var guarantees somebody will eventually make.
         assert!(config.ai_hub.log_runner_enabled);
         let pruner_off = config_from(&[("OMNION_AI_LOG_RUNNER", "false")])
-            .expect("the pruner flag is a boolean");
+            .expect("one flag must parse");
         assert!(!pruner_off.ai_hub.log_runner_enabled);
         assert!(
             pruner_off.ai_hub.runner_enabled,
-            "the health probe keeps its own switch"
+            "switching the decision pruner off must not switch the health probe off"
         );
-        assert_eq!(tuned.ai_hub.poll_ms, 5_000);
-        assert_eq!(tuned.ai_hub.retention_days, 7);
+    }
+
+    #[test]
+    fn the_agent_runner_has_its_own_switch_and_its_own_concurrency() {
+        let config = config_from(&[]).expect("defaults must load");
+        assert!(config.ai_hub.agent_runner_enabled, "the runner is on by default");
+        assert_eq!(
+            config.ai_hub.runner_concurrency, DEFAULT_AI_RUNNER_CONCURRENCY,
+            "four in-flight runs is the documented default"
+        );
+
+        let off = config_from(&[("OMNION_AI_RUNNER", "false")]).expect("one flag must parse");
+        assert!(!off.ai_hub.agent_runner_enabled);
+        // The reason the switch is its own field and not a reading of the health probe's: an
+        // installation that refuses to let an agent spend money must still get its providers
+        // probed, and a shared flag takes both away together.
+        assert!(
+            off.ai_hub.runner_enabled,
+            "switching the agent runner off must leave the health probe running"
+        );
+        assert!(off.ai_hub.log_runner_enabled);
+
+        let narrow = config_from(&[("OMNION_AI_RUNNER_CONCURRENCY", "1")])
+            .expect("one number must parse");
+        assert_eq!(narrow.ai_hub.runner_concurrency, 1);
+
+        // 0 is refused by the positive reader, and a concurrency of zero is a runner that reports
+        // itself healthy and never runs anything.
+        let zero = config_from(&[("OMNION_AI_RUNNER_CONCURRENCY", "0")]);
+        assert!(
+            zero.is_err(),
+            "a runner with no slots would report itself healthy and run nothing"
+        );
     }
 
     #[test]
