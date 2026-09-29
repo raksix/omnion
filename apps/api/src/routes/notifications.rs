@@ -33,7 +33,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_events::{NewEvent, bus};
 use omnion_notifications::{
-    CATEGORIES, CategoryCount, ListQuery, MAX_BULK_IDS, NewNotification, Notification, Summary,
+    CATEGORIES, CategoryCount, ListQuery, MAX_BULK_IDS, NewNotification, Notification,
+    PreferenceCell, Settings, StatedPreference, Summary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -572,6 +573,197 @@ pub async fn emit(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Preferences (REQ-021, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/// The `PUT` body: the cells this person is stating, and the settings row to go with them.
+///
+/// **`settings` is required rather than optional.** A `PUT` that carried only cells would
+/// leave the caller guessing whether its quiet hours were saved, wiped, or never sent — and
+/// three possible answers to "did my digest preference save?" is not an API. The settings
+/// screen always has the current values loaded, so sending them back is free, and the
+/// `settings` block is a *replace* of one row rather than a patch of eight columns.
+///
+/// `deny_unknown_fields` is load-bearing, not tidiness: serde **ignores** unknown fields by
+/// default, so a client that sends `quiet_hour_start` (one s) gets a `200` that saved nothing
+/// and concludes the setting is broken. A `400` naming the unknown field is the only answer
+/// that helps. The same rule refuses a `user_id` in the body — the owner is the session's, and
+/// a field that is silently dropped is a field somebody will eventually rely on.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutPreferencesBody {
+    /// The cells the reader is changing. Cells not named keep the platform default.
+    #[serde(default)]
+    pub cells: Vec<StatedPreference>,
+    /// The settings row in full.
+    pub settings: SettingsBody,
+}
+
+/// The settings row as the panel reads and writes it.
+///
+/// Deny-unknown for the same reason as the body above: a mistyped `digest_hours` must be a
+/// `400` and not a save that quietly kept the old value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsBody {
+    /// Quiet hours begin, `HH:MM` in the reader's own timezone.
+    pub quiet_hours_start: Option<String>,
+    /// Quiet hours end, `HH:MM`.
+    pub quiet_hours_end: Option<String>,
+    /// The IANA timezone the two are read in.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// `off`, `daily` or `weekly`.
+    #[serde(default = "default_cadence")]
+    pub digest_cadence: String,
+    /// Which weekday a weekly digest goes out on, 0 = Monday.
+    pub digest_weekday: Option<i16>,
+    /// Which hour a digest goes out in.
+    #[serde(default = "default_digest_hour")]
+    pub digest_hour: i16,
+}
+
+fn default_timezone() -> String {
+    "UTC".to_owned()
+}
+
+fn default_cadence() -> String {
+    "off".to_owned()
+}
+
+fn default_digest_hour() -> i16 {
+    8
+}
+
+impl From<Settings> for SettingsBody {
+    fn from(settings: Settings) -> Self {
+        Self {
+            quiet_hours_start: settings.quiet_hours_start,
+            quiet_hours_end: settings.quiet_hours_end,
+            timezone: settings.timezone,
+            digest_cadence: settings.digest_cadence,
+            digest_weekday: settings.digest_weekday,
+            digest_hour: settings.digest_hour,
+        }
+    }
+}
+
+impl SettingsBody {
+    /// The store's row, owned by the caller's id.
+    ///
+    /// The `user_id` is taken from the session and never from the body — a settings body that
+    /// could name its owner is a settings body that can rewrite somebody else's quiet hours.
+    fn to_settings(&self, user_id: Uuid) -> Settings {
+        Settings {
+            user_id,
+            quiet_hours_start: self.quiet_hours_start.clone(),
+            quiet_hours_end: self.quiet_hours_end.clone(),
+            timezone: self.timezone.clone(),
+            digest_cadence: self.digest_cadence.clone(),
+            digest_weekday: self.digest_weekday,
+            digest_hour: self.digest_hour,
+        }
+    }
+}
+
+/// The preferences answer: the complete matrix plus the settings row.
+#[derive(Debug, Serialize)]
+pub struct PreferencesBody {
+    /// Every category × channel cell, in the vocabulary's order.
+    pub cells: Vec<PreferenceCell>,
+    /// The settings row.
+    pub settings: SettingsBody,
+    /// The channel that cannot be switched off, so the form can render it locked without
+    /// hard-coding the name in two places.
+    pub locked_channel: &'static str,
+}
+
+/// `GET /api/v1/notifications/preferences` — this person's own channel configuration.
+///
+/// **The answer is always a complete matrix.** A form that renders only the stated cells shows
+/// a reader a grid with holes in it, and a hole and a checked box look identical until the
+/// reader tries to change one.
+pub async fn get_preferences(
+    State(state): State<AppState>,
+    session: CurrentSession,
+) -> Result<Json<PreferencesBody>, ApiError> {
+    let preferences = omnion_notifications::read_preferences(state.db().pool(), session.user.id)
+        .await
+        .map_err(map_store)?;
+    Ok(Json(PreferencesBody {
+        cells: preferences.matrix,
+        settings: SettingsBody::from(preferences.settings),
+        locked_channel: omnion_notifications::IN_APP,
+    }))
+}
+
+/// `PUT /api/v1/notifications/preferences` — save the cells and the settings row.
+///
+/// The answer carries the **whole matrix back, not the changed count**, and that is the
+/// deliberate choice over "2 preferences saved": the form needs the authoritative state to
+/// render from, and a count is a number the client has to trust without being able to check
+/// it. The changed count rides along for the toast, because a reader who flipped two boxes
+/// deserves to know they landed.
+pub async fn put_preferences(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Json(body): Json<PutPreferencesBody>,
+) -> Result<Json<PutPreferencesResult>, ApiError> {
+    let settings = body.settings.to_settings(session.user.id);
+    let changed = omnion_notifications::write_preferences(
+        state.db().pool(),
+        session.user.id,
+        &body.cells,
+        &settings,
+    )
+    .await
+    .map_err(map_store)?;
+
+    let preferences = omnion_notifications::read_preferences(state.db().pool(), session.user.id)
+        .await
+        .map_err(map_store)?;
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("notification.preferences.changed")
+            .organization(session.user.organization_id)
+            .actor(session.user.id)
+            .payload(json!({
+                "cells": changed,
+                "digest_cadence": settings.digest_cadence,
+                "quiet_hours": settings.quiet_hours_start.is_some(),
+            })),
+    )
+    .await
+    .ok();
+
+    Ok(Json(PutPreferencesResult {
+        changed,
+        cells: preferences.matrix,
+        settings: SettingsBody::from(preferences.settings),
+        locked_channel: omnion_notifications::IN_APP,
+    }))
+}
+
+/// What a save changed and what the server now believes.
+#[derive(Debug, Serialize)]
+pub struct PutPreferencesResult {
+    /// How many cells actually changed value. The store counts *rows that changed*, so this
+    /// is a `u64` from a `rows_affected` and is rendered as a number in the toast — the JSON
+    /// carries it unchanged rather than through an `i64` cast that would add a panic path
+    /// for a count that is bounded by the size of the request.
+    pub changed: u64,
+    /// The full matrix after the save.
+    pub cells: Vec<PreferenceCell>,
+    /// The settings row after the save.
+    pub settings: SettingsBody,
+    /// See [`PreferencesBody::locked_channel`].
+    pub locked_channel: &'static str,
+}
+
+// ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -656,6 +848,10 @@ fn build_query(params: ListParams) -> Result<ListQuery, ApiError> {
         priorities: params.priority,
         channel: params.channel,
         include_archived: params.archived,
+        // `with_read` is a plain `bool` that already defaults to true, so a client that
+        // named nothing is asking for the whole list. The panel's State menu says "Unread
+        // and read" for exactly this state, so anything else would be the server quietly
+        // filtering a list it is displaying in full.
         include_read: params.with_read,
         before,
         limit: params.limit.unwrap_or(50),
@@ -667,7 +863,6 @@ fn build_query(params: ListParams) -> Result<ListQuery, ApiError> {
 /// Exported as a constant rather than a route: a client that has to make a round trip to learn
 /// the closed list will cache it anyway, and a cached list is a list that goes stale.
 pub const KNOWN_CATEGORIES: [&str; 6] = CATEGORIES;
-
 #[cfg(test)]
 mod tests {
     use super::*;

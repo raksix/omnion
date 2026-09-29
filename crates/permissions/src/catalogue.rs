@@ -416,19 +416,17 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "cdn",
         description: "Invalidate cached URLs, tags or a whole zone",
     },
-    // Notifications (docs/requests/REQ-021). Three powers, split by *who is affected* rather
+    // Notifications (docs/requests/REQ-021). Four powers, split by *who is affected* rather
     // than by what the button does:
     //
     // * `notifications.read` is a person's own inbox, which every account holds — it is
     //   owner-scoped in the store, so it grants nothing about anybody else.
     // * `notifications.send` is writing to *other* people's inboxes, and it is the one worth
     //   guarding: an account that may only notify itself cannot be used to reach the rest of
-    //   the organization, and a module that legitimately needs to says so in its manifest.
+    //   the organization, and a module that legitimately needs it says so in its manifest.
     // * `notifications.manage` is the reader's own channel configuration and preferences.
-    //
-    // `notifications.admin` (the org-wide outbox, slice 3) is deliberately not here yet — a
-    // permission with no route behind it is a role entry that grants a promise the platform
-    // cannot keep.
+    // * `notifications.admin` is the organization-wide delivery log and the router's rules
+    //   (below — it arrived with slice 3, the first build with routes behind it).
     PermissionDef {
         key: "notifications.read",
         category: "notifications",
@@ -443,6 +441,20 @@ pub const CATALOGUE: &[PermissionDef] = &[
         key: "notifications.manage",
         category: "notifications",
         description: "Change your notification channels and preferences",
+    },
+    // `notifications.admin` is the org-wide delivery log and the router's rules. It arrived with
+    // slice 3, which is the first build where it has routes behind it — a permission with no
+    // route is a role entry granting a promise the platform cannot keep, which is why it was
+    // absent from the catalogue for the two slices before.
+    //
+    // It is the widest key in the notification family and the only one that reads *anybody's*
+    // activity: the outbox shows who was told what and whether it arrived. The rows carry ids
+    // and states, never a title or a body, so the log is safe to show — but "safe to show" is
+    // not the same as "harmless to grant", and it belongs to an administrator on purpose.
+    PermissionDef {
+        key: "notifications.admin",
+        category: "notifications",
+        description: "Read the organization-wide delivery outbox and manage routing rules",
     },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each

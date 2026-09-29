@@ -193,6 +193,49 @@ pub struct EventsResponse {
     pub events: Vec<EventBody>,
 }
 
+/// One payload field of one event, as the catalogue describes it.
+#[derive(Debug, Serialize)]
+pub struct CatalogueFieldBody {
+    /// Field name, as it appears in the payload.
+    pub name: &'static str,
+    /// What it carries: `uuid`, `string`, `integer`, `boolean`, `timestamp`, `json` or `any`.
+    pub kind: &'static str,
+    /// Whether a receiver may rely on it being there.
+    pub required: bool,
+}
+
+/// One entry of the catalogue.
+#[derive(Debug, Serialize)]
+pub struct CatalogueEntryBody {
+    /// Dotted, lower-case name.
+    pub name: &'static str,
+    /// Which part of the platform it belongs to.
+    pub area: &'static str,
+    /// The group a receiver subscribes to as a whole (`page.*`).
+    pub group: &'static str,
+    /// One sentence a consumer can read before subscribing.
+    pub description: &'static str,
+    /// `live` or `reserved`.
+    pub status: &'static str,
+    /// The fields the payload carries.
+    pub payload_fields: Vec<CatalogueFieldBody>,
+}
+
+/// The whole catalogue, grouped for the picker.
+#[derive(Debug, Serialize)]
+pub struct CatalogueResponse {
+    /// Areas in table order; the picker's groups.
+    pub areas: Vec<&'static str>,
+    /// Every event the platform knows.
+    pub events: Vec<CatalogueEntryBody>,
+    /// How many entries are `live` right now.
+    pub live_count: usize,
+    /// How many are `reserved` — named, subscribable, and not emitted yet.
+    pub reserved_count: usize,
+    /// The most selections one endpoint may subscribe to.
+    pub max_subscriptions: usize,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Request shapes
 // ---------------------------------------------------------------------------------------------
@@ -266,6 +309,52 @@ pub struct TestDeliveryBody {
 // Handlers
 // ---------------------------------------------------------------------------------------------
 
+/// `GET /api/v1/events/catalogue` — every event name the platform knows.
+///
+/// The registry is compiled in, so this read needs no database and no organization: the
+/// catalogue is a fact about the *platform*, not about a tenant, and two organizations asking
+/// must get the same answer. That is also why it carries no filter — the panel's filtering is
+/// done on the list the picker already has, and a server-side filter over a constant would
+/// only move the cost to a round trip.
+///
+/// The route is declared **before** `/events/{id}` would shadow it (a sibling of `/events`,
+/// not a child), and it is `events.read` like the feed: describing what an event means is
+/// reading the bus, not administering an endpoint.
+pub async fn list_catalogue(_current: CurrentSession) -> Result<Json<CatalogueResponse>, ApiError> {
+    let entries = omnion_events::catalogue::all();
+    let live_count = entries
+        .iter()
+        .filter(|entry| entry.status == omnion_events::catalogue::Status::Live)
+        .count();
+    let reserved_count = entries.len() - live_count;
+
+    Ok(Json(CatalogueResponse {
+        areas: omnion_events::catalogue::areas(),
+        live_count,
+        reserved_count,
+        max_subscriptions: validation::MAX_SUBSCRIPTIONS,
+        events: entries
+            .iter()
+            .map(|entry| CatalogueEntryBody {
+                name: entry.name,
+                area: entry.area,
+                group: entry.group(),
+                description: entry.description,
+                status: entry.status.as_str(),
+                payload_fields: entry
+                    .payload_fields
+                    .iter()
+                    .map(|field| CatalogueFieldBody {
+                        name: field.name,
+                        kind: field.kind.as_str(),
+                        required: field.required,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }))
+}
+
 /// `GET /api/v1/webhooks` — the endpoints this account may see.
 pub async fn list_webhooks(
     State(state): State<AppState>,
@@ -301,7 +390,10 @@ pub async fn create_webhook(
     let organization_id = resolve_organization(&current, body.organization_id)?;
     let name = validation::validate_endpoint_name(&body.name)?;
     let url = validation::validate_url(&body.url)?;
-    let events = validation::validate_subscriptions(&body.events)?;
+    // Reconciliation, not just validation: a `page.*` group is stored expanded *and* as the
+    // wildcard, so the endpoint is ready for an event added next release without anybody
+    // editing it then.
+    let events = omnion_events::catalogue::reconcile(&body.events)?;
 
     let provided = body.secret.is_some();
     let secret = match &body.secret {
@@ -364,7 +456,7 @@ pub async fn update_webhook(
         .transpose()?;
     let events = body
         .events
-        .map(|raw| validation::validate_subscriptions(&raw))
+        .map(|raw| omnion_events::catalogue::reconcile(&raw))
         .transpose()?;
     let secret = body
         .secret
