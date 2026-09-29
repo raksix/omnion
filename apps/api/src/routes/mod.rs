@@ -666,6 +666,14 @@ pub fn router(state: AppState) -> Router {
     let workflow_run_from_node =
         post(workflows::run_workflow_from_node).layer(guards::require(&state, "workflows.run"));
 
+    // *Retry this node* (REQ-004 slice 3) re-runs work, so it is guarded by
+    // `workflows.run` on the same reasoning as *Run from here*: a viewer who may start a
+    // rule may re-run one of its steps, and a manager who cannot start runs still cannot
+    // re-run one. It is deliberately NOT `workflows.manage` — a graph edit is a definition
+    // change, and this changes nothing about the definition.
+    let workflow_execution_retry_node =
+        post(workflows::retry_workflow_node).layer(guards::require(&state, "workflows.run"));
+
     let workflow_executions =
         get(workflows::list_executions).layer(guards::require(&state, "workflows.read"));
 
@@ -1308,6 +1316,10 @@ pub fn router(state: AppState) -> Router {
         // sends `node_id` to the plain endpoint and gets a full run back would be a
         // silent wrong answer rather than a refusal.
         .route("/workflows/{id}/run-from-node", workflow_run_from_node)
+        .route(
+            "/workflow-executions/{id}/retry-node",
+            workflow_execution_retry_node,
+        )
         .route(
             "/workflows/{id}/graph",
             workflow_graph_read.merge(workflow_graph_write),

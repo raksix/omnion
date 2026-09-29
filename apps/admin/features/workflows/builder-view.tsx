@@ -52,6 +52,7 @@ import {
   Maximize,
   Minus,
   Play,
+  RotateCcw,
   Plus,
   RefreshCw,
   Redo2,
@@ -82,6 +83,7 @@ import { decideConnection } from "./connect-edge";
 import { readVersionFrom, resolveConflict } from "./conflict";
 import { arbitrateSave } from "./save-arbitration";
 import { startability, startMessage } from "@/features/workflows/run-from-here";
+import { retryAnswer, retryMessage } from "@/features/workflows/retry-node";
 import {
   indexStepsByNode,
   nodeRunStatus,
@@ -153,6 +155,17 @@ type SaveState =
  */
 /** What `POST /workflows/{id}/run-from-node` answers with. */
 interface RunFromNodeBody {
+  /**
+   * The run's own id and status.
+   *
+   * The run is flattened into this body by the server (`#[serde(flatten)]`), so both come
+   * on the same object. The id is what a node retry addresses, and the status is what two
+   * of the node controls refuse on — neither can be derived from `steps`, because a
+   * `running` run whose steps are all `pending` and a settled run that never started have
+   * the same step list.
+   */
+  id?: string;
+  status?: string;
   /** The node the run started at. */
   started_from_node?: string;
   /** The steps it passed over, each with the reason the trace shows. */
@@ -216,6 +229,26 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   // flattened map cannot say "no run has been read yet" and "the node took no part in the
   // run" apart. `null` is "no run read"; `[]` is "a run with no steps".
   const [runSteps, setRunSteps] = useState<RunStep[] | null>(null);
+  /** The node a retry is in flight for, so only that card shows the spinner. */
+  const [retrying, setRetrying] = useState<string | null>(null);
+  /**
+   * The run the status layer belongs to.
+   *
+   * Held as an id rather than as "the latest run" because *Retry this node* addresses a
+   * **specific** run, and a canvas that re-read "the latest" between the click and the
+   * write would retry a node of a run the operator is not looking at — the same
+   * run-answering-a-different-run hazard the plan guards against in `retry_node.rs`.
+   */
+  const [runId, setRunId] = useState<string | null>(null);
+  /**
+   * The run's own status, which two of the node controls refuse on.
+   *
+   * Held separately from the step list because it is a fact about the *run* that a client
+   * cannot infer from its steps: a `running` run whose steps are all `pending` looks
+   * exactly like a settled run that never started, and a retry offered on either would be
+   * refused by the server — one as a race, the other as nothing to do.
+   */
+  const [runStatus, setRunStatus] = useState<string | null>(null);
 
   const [dragging, setDragging] = useState<{
     id: string;
@@ -338,10 +371,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       });
       if (!detail.ok) return;
       const run = (await detail.json().catch(() => null)) as {
+        status?: string;
         steps?: RunStep[];
       } | null;
       setRunByNode(indexStepsByNode(run?.steps ?? []));
       setRunSteps(run?.steps ?? []);
+      setRunId(latest.id);
+      setRunStatus(run?.status ?? null);
     } catch {
       // See above: no status layer is better than no builder.
     }
@@ -1389,6 +1425,8 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         // autosave those are the same graph at two moments. Reporting the server's count
         // keeps the message true even in the tick between them.
         setRunMessage(startMessage(node.label, body?.skipped ?? []));
+        setRunId(body?.id ?? null);
+        setRunStatus(body?.status ?? "running");
         // The pills are read back from what the engine actually wrote, not from this
         // screen's guess. The response already carries every step with its node, so
         // re-reading the run is unnecessary — and re-reading it immediately would race
@@ -1404,6 +1442,61 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       }
     },
     [workflowId],
+  );
+
+  /**
+   * *Retry this node* — re-run one node of the last run, and only that node.
+   *
+   * The whole point of the control is its **scope**, so the response is re-read into the
+   * status layer rather than assumed: `retryMessage` shouts when the server re-queued more
+   * than one step, because a count above one is a tail re-run wearing this button's name
+   * and it has already repeated whatever came before. Painting the run from the rows the
+   * engine now holds is also what makes the retried node's own pill change on the canvas.
+   */
+  const retryNode = useCallback(
+    async (node: GraphNode, executionId: string) => {
+      setRetrying(node.id);
+      setRunMessage(null);
+      try {
+        const response = await fetch(
+          `/api/v1/workflow-executions/${executionId}/retry-node`,
+          {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { accept: "application/json", "content-type": "application/json" },
+            body: JSON.stringify({ node_id: node.id }),
+          },
+        );
+        // The retry response flattens the run into the body, so it carries the run's own
+        // `id` and `status` as well as the fresh steps — which is why the status layer is
+        // re-read here rather than assumed to be unchanged.
+        const body = (await response.json().catch(() => null)) as
+          | (RunFromNodeBody & {
+              step_no?: number;
+              requeued?: number;
+              status?: string;
+            })
+          | null;
+        if (!response.ok) {
+          throw new Error(
+            body?.error?.message ?? `The node could not be retried (status ${response.status}).`,
+          );
+        }
+        setRunMessage(
+          retryMessage(node.label, body?.step_no ?? 0, body?.requeued ?? 0),
+        );
+        setRunByNode(indexStepsByNode(body?.steps ?? []));
+        setRunSteps(body?.steps ?? []);
+        setRunStatus(body?.status ?? null);
+      } catch (error) {
+        setRunMessage(
+          error instanceof Error ? error.message : "The node could not be retried.",
+        );
+      } finally {
+        setRetrying(null);
+      }
+    },
+    [],
   );
 
   const runOnce = useCallback(async () => {
@@ -1945,8 +2038,12 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                 const target = nodes.find((entry) => entry.id === nodeId);
                 if (target) void runFrom(target);
               }}
+              onRetryNode={(target, executionId) => void retryNode(target, executionId)}
               runSteps={runSteps}
               running={running}
+              runId={runId}
+              runStatus={runStatus}
+              retrying={retrying}
             />
           ) : (
             <div className="p-3">
@@ -2236,6 +2333,80 @@ function RunFromHereControl({
 }
 
 /**
+ * *Retry this node*, on one node.
+ *
+ * The second of the two run controls on a card, and the one whose whole meaning is its
+ * **scope**: re-run this node and nothing else. That is why it is not the run-detail's
+ * `Retry` with a node filter — that one deliberately re-runs the whole tail, because a run
+ * whose middle failed must not march on to completion with a hole in it. Reusing it here
+ * would re-send the earlier e-mail, which is the one outcome this button must never cause.
+ *
+ * It is offered only where a node actually failed, and disabled with a **stated reason**
+ * everywhere else. A node that succeeded is the interesting refusal: *Run from here*
+ * answers yes on the very same card, because starting a new run there is a real thing to
+ * want, and a button that inherited that answer would fail on every press.
+ */
+function RetryNodeControl({
+  node,
+  steps,
+  runId,
+  runStatus,
+  onRetry,
+  busy,
+}: {
+  node: GraphNode;
+  steps: RunStep[] | null;
+  runId: string | null;
+  runStatus: string | null;
+  onRetry: (node: GraphNode, executionId: string) => void;
+  busy: boolean;
+}) {
+  const mine = steps?.filter((step) => step.node_id === node.id) ?? null;
+  // A node with two branches is `diverged` on the card, and the one that failed is what can
+  // be retried. Taking the first row would offer a retry on the branch that succeeded and
+  // refuse the branch the canvas is painting red.
+  const failed = mine?.find((step) =>
+    step.status === "failed" || step.status === "cancelled" || step.status === "ignored",
+  );
+  const answer = retryAnswer(node.label, {
+    runStatus: (runStatus as never) ?? null,
+    nodeStatus: mine === null ? null : (failed?.status ?? "succeeded"),
+  });
+
+  const disabled = !answer.canRetry || busy || !runId;
+
+  return (
+    <div
+      className="rounded-md border border-line p-2"
+      data-retry-node={node.id}
+      data-can-retry={answer.canRetry ? "true" : "false"}
+      data-refusal={answer.code ?? undefined}
+    >
+      <button
+        type="button"
+        onClick={() => runId && onRetry(node, runId)}
+        disabled={disabled}
+        title={answer.reason ?? `Re-run ${node.label} on its own`}
+        className="inline-flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-[12px] disabled:cursor-not-allowed disabled:opacity-60"
+        data-retry-node-button
+      >
+        {busy ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+        ) : (
+          <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
+        Retry this node
+      </button>
+      {answer.reason ? (
+        <p className="mt-1.5 text-[11.5px] text-muted" data-retry-node-reason>
+          {answer.reason}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
  * The status pill on a node card.
  *
  * Criterion: *"After a run each node shows its status pill, and clicking the node opens that
@@ -2294,8 +2465,12 @@ function NodeInspector({
   onDelete,
   onRemoveConnection,
   onRunFromHere,
+  onRetryNode,
   runSteps,
   running,
+  runId,
+  runStatus,
+  retrying,
 }: {
   node: GraphNode;
   nodeType: GraphNodeType | null;
@@ -2305,8 +2480,12 @@ function NodeInspector({
   onDelete: () => void;
   onRemoveConnection: (edgeId: string) => void;
   onRunFromHere: (nodeId: string) => void;
+  onRetryNode: (node: GraphNode, executionId: string) => void;
   runSteps: RunStep[] | null;
   running: boolean;
+  runId: string | null;
+  runStatus: string | null;
+  retrying: string | null;
 }) {
   if (!nodeType) {
     return (
@@ -2341,6 +2520,15 @@ function NodeInspector({
         edges={edges}
         onRun={() => onRunFromHere(node.id)}
         running={running}
+      />
+
+      <RetryNodeControl
+        node={node}
+        steps={runSteps}
+        runId={runId}
+        runStatus={runStatus}
+        onRetry={onRetryNode}
+        busy={retrying === node.id}
       />
 
       <label className="block text-[12px] font-medium" htmlFor={`label-${node.id}`}>

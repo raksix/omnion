@@ -14,12 +14,14 @@
 //! The walks run **one at a time** (see `walk_lock`): the engine's sweep pass works on the whole
 //! `workflows` table, so two walks in flight could settle each other's rows.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration as StdDuration;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+use omnion_automation::actions::AutomationActions;
+use omnion_automation::mail::MailSettings;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_core::config::Config;
@@ -35,6 +37,8 @@ use omnion_workflows::{
 };
 use serde_json::{Value, json};
 use time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, MutexGuard};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -1919,6 +1923,453 @@ async fn run_from_here_starts_at_the_node_and_marks_the_prefix_skipped() {
             .all(|step| step["node_id"].is_null() || step["node_id"].is_string()),
         "node_id is either absent or a string, never a number: {steps:?}"
     );
+
+    fixture.cleanup().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Criterion 3 — "Retry this node" re-runs only that node (REQ-004 slice 3)
+// ------------------------------------------------------------------------------------------
+
+/// A minimal SMTP server that records what it was sent.
+///
+/// It exists because the criterion names the proof: *"without duplicating earlier side
+/// effects (proven with the mail sink)"*. A status column cannot see a duplicated
+/// e-mail — a run whose first step re-runs looks **identical** to one that did not, and the
+/// only difference is a message that left the process. So the assertion that matters is a
+/// count of messages, not a comparison of statuses.
+///
+/// The greeting is sent before anything is read. An SMTP client that connects and waits
+/// for `220` before it says anything hangs on a sink that only replies to commands, and the
+/// hang is indistinguishable from "the mail server is down".
+struct MailSink {
+    port: u16,
+    received: Arc<Mutex<Vec<String>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl MailSink {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the mail sink must bind");
+        let port = listener.local_addr().expect("an address").port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+
+        let handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let _ = serve_one(stream, sink).await;
+                });
+            }
+        });
+
+        Self {
+            port,
+            received,
+            handle,
+        }
+    }
+
+    /// How many messages carried `needle` in their body or headers.
+    async fn count(&self, needle: &str) -> usize {
+        self.received
+            .lock()
+            .await
+            .iter()
+            .filter(|message| message.contains(needle))
+            .count()
+    }
+}
+
+impl Drop for MailSink {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn serve_one(stream: TcpStream, sink: Arc<Mutex<Vec<String>>>) -> std::io::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    writer
+        .write_all(b"220 omnion test sink ready\r\n")
+        .await?;
+
+    let mut body = String::new();
+    let mut envelope = String::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        let command = line.trim_end().to_owned();
+        let upper = command.to_ascii_uppercase();
+
+        if upper.starts_with("EHLO") {
+            writer
+                .write_all(b"250-sink\r\n250-SIZE 102400\r\n250 AUTH PLAIN\r\n")
+                .await?;
+        } else if upper.starts_with("AUTH") {
+            writer.write_all(b"235 authenticated\r\n").await?;
+        } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
+            envelope.push_str(&command);
+            envelope.push('\n');
+            writer.write_all(b"250 ok\r\n").await?;
+        } else if upper == "DATA" {
+            writer.write_all(b"354 go ahead\r\n").await?;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await? == 0 {
+                    break;
+                }
+                if line == ".\r\n" {
+                    break;
+                }
+                body.push_str(&line);
+            }
+            writer.write_all(b"250 queued\r\n").await?;
+        } else if upper == "QUIT" {
+            writer.write_all(b"221 bye\r\n").await?;
+            break;
+        }
+    }
+
+    // The envelope is stored with the body so a test can assert on the recipient rather
+    // than on a subject line it also has to choose.
+    sink.lock().await.push(format!("{envelope}{body}"));
+    Ok(())
+}
+
+/// Tick the engine with a real action handler, the way a process with host actions does.
+///
+/// `drive_until_settled` in this file ticks with the **no-op** handler, which is right for
+/// the synthetic steps the other walks use and wrong for this one: a `send_email` step run
+/// against `NoActionHandler` reports a host action it cannot do, so the step fails for a
+/// reason that has nothing to do with retrying — and the criterion's mail count would be
+/// zero before the retry ever happened, which is a test that passes for the wrong reason.
+async fn drive_until_settled_with(
+    state: &AppState,
+    runner: &RunnerConfig,
+    actions: &AutomationActions,
+    execution_id: Uuid,
+) -> RunState {
+    for _ in 0..400 {
+        engine::tick_with(
+            state.db().pool(),
+            runner,
+            actions,
+            &omnion_workflows::NoRunGuard,
+        )
+        .await
+        .expect("a tick must run");
+
+        let current = run_state(state, execution_id).await;
+        if current.status != "running" {
+            return current;
+        }
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+    }
+
+    panic!(
+        "the run never settled; last state: {:#?}",
+        run_state(state, execution_id).await
+    );
+}
+
+#[tokio::test]
+async fn retry_this_node_reruns_one_step_and_sends_no_second_email() {
+    let Some(fixture) = Fixture::new().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    // The fixture holds the walk lock itself for its whole lifetime (see `Fixture::new`),
+    // so there is no second acquisition here: taking it again would deadlock the walk
+    // against itself, which is a hang with no message.
+    let token = login(&fixture.state, &fixture.operator_email).await;
+    let runner = test_runner();
+
+    let sink = MailSink::start().await;
+    let actions = AutomationActions::new(
+        fixture.state.db().pool().clone(),
+        MailSettings::new("127.0.0.1", sink.port, "omnion@localhost"),
+    );
+
+    // trigger → notify (sends mail) → boom (fails) → settle (records the run)
+    //
+    // The three-node spine is the shape the criterion needs and no shorter one proves it:
+    // a side effect BEFORE the failing node, and a step AFTER it. Retrying the middle node
+    // must not re-send the first one's mail (the criterion) and must not silently re-run
+    // the third (which is the difference between this and a tail re-run).
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/workflows",
+            Some(&token),
+            Some(json!({
+                "organization_id": fixture.organization_a,
+                "name": "Retry this node",
+                "trigger": { "kind": "manual" },
+                "steps": [ { "name": "prepare", "kind": "task", "action": "noop" } ]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let workflow_id = created.body["id"]
+        .as_str()
+        .expect("a created rule has an id")
+        .to_owned();
+
+    let version = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await
+    .body["graph_version"]
+        .clone();
+
+    let spine = json!({
+        "nodes": [
+            { "id": "trigger", "type": "trigger.manual", "label": "Trigger",
+              "params": { "kind": "manual" }, "position": { "x": 0, "y": 0 } },
+            { "id": "notify", "type": "action", "label": "Tell the editor",
+              "params": { "action": "send_email",
+                          "parameters": { "to": "editor@example.com",
+                                          "subject": "Published", "body": "once" } },
+              "position": { "x": 1, "y": 0 } },
+            { "id": "boom", "type": "action", "label": "Upstream is down",
+              "params": { "action": "fail",
+                          "parameters": { "message": "the upstream is down" } },
+              "position": { "x": 2, "y": 0 } },
+            { "id": "settle", "type": "action", "label": "Record",
+              "params": { "action": "noop", "parameters": {} },
+              "position": { "x": 3, "y": 0 } },
+            { "id": "end", "type": "end", "label": "End", "params": {},
+              "position": { "x": 4, "y": 0 } }
+        ],
+        "edges": [
+            { "id": "e1", "source": "trigger", "source_port": "out", "target": "notify" },
+            { "id": "e2", "source": "notify", "source_port": "success", "target": "boom" },
+            { "id": "e3", "source": "boom", "source_port": "success", "target": "settle" },
+            { "id": "e4", "source": "settle", "source_port": "success", "target": "end" }
+        ]
+    });
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &format!("/api/v1/workflows/{workflow_id}/graph"),
+            Some(&token),
+            Some(json!({ "graph": spine, "graph_version": version })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "the spine was refused: {}", saved.body);
+
+    // Run it once: the mail goes out, the second step fails, the run stops there.
+    let started = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflows/{workflow_id}/run"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::ACCEPTED, "{}", started.body);
+    let execution_id =
+        Uuid::parse_str(started.body["id"].as_str().expect("a run has an id")).expect("a uuid");
+
+    let first = drive_until_settled_with(&fixture.state, &runner, &actions, execution_id).await;
+    assert_eq!(first.status, "failed", "the second step was meant to fail: {first:?}");
+    assert_eq!(
+        sink.count("editor@example.com").await,
+        1,
+        "exactly one message, before the retry"
+    );
+
+    // The node click. `boom` is the failed one; `notify` succeeded and is exactly the node
+    // whose side effect must not be duplicated.
+    let retried = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflow-executions/{execution_id}/retry-node"),
+            Some(&token),
+            Some(json!({ "node_id": "boom" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        retried.status,
+        StatusCode::OK,
+        "Retry this node was refused: {}",
+        retried.body
+    );
+
+    // **One row.** The response's own count is the assertion, because it is the only value
+    // that notices a `WHERE` clause widened back to `step_no >= N` — which would re-send the
+    // e-mail below, but only *after* this line had already passed.
+    assert_eq!(
+        retried.body["requeued"], 1,
+        "a node retry re-opens exactly one step: {}",
+        retried.body
+    );
+    assert_eq!(retried.body["node_id"], "boom", "{}", retried.body);
+
+    // **The stored rows**, read out of PostgreSQL: the step that went back on the queue is
+    // the one that failed, and its neighbours are exactly as they were.
+    let after: Vec<(i32, String)> = sqlx::query_as(
+        "select step_no, status from workflow_steps where execution_id = $1::uuid \
+         order by step_no asc",
+    )
+    .bind(execution_id)
+    .fetch_all(fixture.state.db().pool())
+    .await
+    .expect("the run's steps are readable");
+    let status_of = |no: i32| {
+        after
+            .iter()
+            .find(|(step_no, _)| *step_no == no)
+            .map(|(_, status)| status.clone())
+    };
+
+    assert_eq!(
+        status_of(1).as_deref(),
+        Some("succeeded"),
+        "the step that sent the mail must be left alone: {after:?}"
+    );
+    assert_eq!(
+        status_of(2).as_deref(),
+        Some("pending"),
+        "the failed node is the one that goes back on the queue: {after:?}"
+    );
+    // **The tail is left exactly as the stop policy closed it.** This is the difference from
+    // a tail re-run and it is worth being precise about which direction it points: a tail
+    // re-run would have re-opened steps 3 and 4 to `pending` and run them again, while this
+    // re-opened one row. The engine then claims step 2, and if it succeeds the run settles
+    // without ever touching the cancelled tail — which is the whole promise of "this node,
+    // on its own".
+    assert_eq!(
+        status_of(3).as_deref(),
+        Some("cancelled"),
+        "the tail must stay closed: a tail re-run would have re-opened it: {after:?}"
+    );
+    assert_eq!(status_of(4).as_deref(), Some("cancelled"), "{after:?}");
+
+    // The attempts counter is zeroed, and **this assertion is the second thing the walk
+    // corrected**. The first draft reasoned that re-running one node is not a new budget
+    // and left the counter alone — and the database refused the write outright:
+    // `workflow_steps_attempts_shape` caps `attempts` at `max_attempts`, and
+    // `claim_due_step` increments on claim, so a re-queued step that had spent its budget
+    // produces a row the engine is forbidden to claim. The retry would have been accepted,
+    // audited, and then never run. The counter is therefore read BEFORE the retry, and the
+    // step is given `max_attempts` enough headroom to show the reset is real rather than
+    // incidental.
+    let reset: i32 = sqlx::query_scalar(
+        "select attempts from workflow_steps where execution_id = $1::uuid and step_no = 2",
+    )
+    .bind(execution_id)
+    .fetch_one(fixture.state.db().pool())
+    .await
+    .expect("the retried step is readable");
+    assert_eq!(
+        reset, 0,
+        "the re-queued step spends no attempt until it is claimed again, which is what lets \
+         the engine claim it at all: `workflow_steps_attempts_shape` caps attempts at \
+         max_attempts and the claim increments"
+    );
+
+    // **The proof the criterion names.** Run it out: the failed node fails again (the same
+    // definition fails the same way) and the mail count must not move.
+    let second = drive_until_settled_with(&fixture.state, &runner, &actions, execution_id).await;
+    assert_eq!(second.status, "failed", "it fails again: {second:?}");
+    assert_eq!(
+        sink.count("editor@example.com").await,
+        1,
+        "THE CLAUSE: the earlier e-mail was NOT sent a second time by retrying one node. \
+         A tail re-run would make this 2."
+    );
+
+    // A node that did not fail is refused by name, and the refusal is a **different** one
+    // from a node the run never reached: both are "nothing to do", and the two sentences
+    // are the only thing that tells an operator which of the two happened.
+    let succeeded = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflow-executions/{execution_id}/retry-node"),
+            Some(&token),
+            Some(json!({ "node_id": "notify" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        succeeded.status,
+        StatusCode::BAD_REQUEST,
+        "a node that succeeded has nothing to retry: {}",
+        succeeded.body
+    );
+    assert_eq!(
+        succeeded.body["error"]["code"], "nothing_to_retry",
+        "{}",
+        succeeded.body
+    );
+
+    let absent = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/workflow-executions/{execution_id}/retry-node"),
+            Some(&token),
+            Some(json!({ "node_id": "island" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        absent.status,
+        StatusCode::BAD_REQUEST,
+        "a node with no step is refused too: {}",
+        absent.body
+    );
+    assert_eq!(
+        absent.body["error"]["code"], "node_not_in_run",
+        "a node the run never touched is a different answer from one that succeeded: {}",
+        absent.body
+    );
+
+    // The two refusals reach the client with sentences, because a refusal that only refuses
+    // teaches an operator nothing about what to do next.
+    let message = absent.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.is_empty(),
+        "a refusal must carry a message: {}",
+        absent.body
+    );
+
+    // The audit trail names the node, so "who re-ran that" is answerable months later.
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'workflow.retry.node' \
+         and organization_id = $1",
+    )
+    .bind(fixture.organization_a)
+    .fetch_one(fixture.state.db().pool())
+    .await
+    .expect("the audit log is readable");
+    assert_eq!(audited, 1, "the retry left exactly one audit row");
 
     fixture.cleanup().await;
 }

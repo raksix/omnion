@@ -227,6 +227,54 @@ pub async fn pin_execution_graph(
     Ok(())
 }
 
+/// Attribute every step of a run to the node of the graph it came from.
+///
+/// The canvas paints run status per node, and *Retry this node* addresses a run's steps by
+/// the node they came from. Both read this one column, and a run whose steps carry no node
+/// id has **no status layer at all** — not a partial one: the pills are empty, the click
+/// opens nothing, and the retry answers "this node took no part in this run" on every
+/// card. So the attribution is not a nicety of the *Run from here* feature that happens to
+/// be useful elsewhere; it is what makes a run readable by node at all, and it belongs to
+/// **every** path that starts a run.
+///
+/// It is a separate function rather than part of `create_execution` because the mapping is
+/// `step_no → node_id`, and the two are produced by different code: the store materialises
+/// steps from the *definition*, the walk resolves them against the *graph*. Doing the join
+/// here means both run paths call the same join, and a third one added later gets it by
+/// calling this.
+///
+/// A graph that does not project cleanly yields **no attribution at all** rather than a
+/// partial one. A half-attributed run paints half its cards and leaves the rest blank,
+/// which reads as "those nodes were skipped" — a claim about work the engine actually did.
+/// An unrunnable graph is a validation problem the overview already reports.
+pub async fn attribute_steps_to_graph(
+    pool: &PgPool,
+    execution_id: Uuid,
+    graph: &crate::graph::Graph,
+) -> Result<u64> {
+    let walk = crate::graph::project_walk(graph)?;
+
+    let mut attributed = 0_u64;
+    for walked in &walk.nodes {
+        let Some(step_no) = walked.step_no else {
+            continue;
+        };
+        let updated = sqlx::query(
+            "update workflow_steps set node_id = $3 where execution_id = $1::uuid \
+               and step_no = $2 and node_id is null",
+        )
+        .bind(execution_id)
+        .bind(step_no)
+        .bind(&walked.node_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        attributed += updated;
+    }
+
+    Ok(attributed)
+}
+
 /// Mark which node of the graph a step came from, and which port carried into it.
 ///
 /// The canvas paints run status per node from these rows, so a step written before the

@@ -588,6 +588,39 @@ pub async fn run_workflow(
     )
     .await?;
 
+    // The steps are attributed to the graph's nodes here, not only on the *Run from here*
+    // path. A run started the ordinary way is the **common** case, and a run whose steps
+    // carry no node id has no status layer at all: the canvas paints nothing, a click opens
+    // nothing, and *Retry this node* answers "took no part in this run" on every card. The
+    // walk that proved it was a walk for *retry*, and the defect it found was not in retry.
+    //
+    // A rule whose graph does not project is left unattributed rather than half-attributed:
+    // a partially painted canvas reads as "those nodes were skipped", which is a claim
+    // about work the engine did. Such a rule's validation problem is already on its
+    // overview, so the run still starts — it just cannot be read by node.
+    if let Some(definition) = omnion_workflows::graph_store::find_graph(state.db().pool(), workflow.id)
+        .await?
+    {
+        // The attribution is best-effort *for the decoration only*. It is not allowed to
+        // fail the run it describes: the work has already started, and reporting an error
+        // here would tell an operator their run did not happen when it did.
+        if let Err(err) = omnion_workflows::graph_store::attribute_steps_to_graph(
+            state.db().pool(),
+            execution.id,
+            &definition.graph,
+        )
+        .await
+        {
+            tracing::warn!(
+                workflow_id = %workflow.id,
+                execution_id = %execution.id,
+                error = %err,
+                "a run started without per-node attribution; the canvas will show no status \
+                 for this run"
+            );
+        }
+    }
+
     let steps = store::list_steps(state.db().pool(), execution.id).await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -747,6 +780,166 @@ pub struct RunFromNodeInput {
     /// The node the run starts at, as the canvas draws it.
     pub node_id: String,
 }
+
+/// `POST /api/v1/workflow-executions/{id}/retry-node` — *Retry this node* on a canvas node.
+///
+/// The criterion (REQ-004 slice 3): **"Retry this node" re-runs only that node without
+/// duplicating earlier side effects** — proven with the mail sink, because the earlier
+/// side effect of a workflow is very often an e-mail and no assertion on a status column
+/// can see it.
+///
+/// Three things are decided in the crate rather than here, and each is one this handler
+/// could get wrong invisibly:
+///
+/// * **which step** ([`omnion_workflows::retry_node::plan_retry_node`]) — a branching node
+///   is two rows, and retrying whichever the query returned first would report "nothing to
+///   retry" on a node the canvas is painting red;
+/// * **one row** ([`store::retry_single_step`]) — this is not a narrowed
+///   `retry_step_from`. The tail re-run re-opens everything after the step, and reusing it
+///   here would re-send the earlier e-mail, which is the one outcome the criterion names;
+/// * **the attempt counter is left alone.** The operator re-ran one node; they did not
+///   grant it a new budget, and nothing on the screen would show an unbounded one.
+///
+/// The response carries the run's refreshed steps so the canvas repaints from the engine's
+/// own rows rather than from an optimistic guess — the same reason the run-from response
+/// re-reads rather than echoing the plan.
+pub async fn retry_workflow_node(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(execution_id): Path<Uuid>,
+    Json(input): Json<RetryNodeInput>,
+) -> Result<Json<RetryNodeResponse>, ApiError> {
+    let execution = omnion_workflows::store::find_execution(state.db().pool(), execution_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "execution_not_found",
+                "no such run — it may have been cleared while the builder was open",
+            )
+        })?;
+    ensure_same_organization(&current, Some(execution.organization_id))?;
+
+    let node_id = input.node_id.trim();
+    if node_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "node_id_required",
+            "say which node to retry — the builder sends the node that was clicked",
+        ));
+    }
+
+    // The plan reads the *stored* rows, so the answer is about the run that exists rather
+    // than about the graph this screen happens to be holding.
+    let rows = omnion_workflows::store::list_steps(state.db().pool(), execution_id).await?;
+    let readable: Vec<omnion_workflows::retry_node::RetryableStep> = rows
+        .iter()
+        .map(|row| omnion_workflows::retry_node::RetryableStep {
+            step_no: row.step_no,
+            status: row.status.clone(),
+            node_id: row.node_id.clone(),
+            name: row.name.clone(),
+        })
+        .collect();
+
+    let plan = omnion_workflows::retry_node::plan_retry_node(
+        omnion_workflows::retry_node::RunState {
+            status: execution.status.to_string(),
+        },
+        node_id,
+        &readable,
+    )
+    .map_err(|refusal| {
+        // A refusal is a 409 rather than a 400 for the two that are about the run's
+        // current state: "it is still going" and "it was cancelled" are facts that will
+        // change on their own, and a client caching a 400 as a permanent rejection of the
+        // node is caching the wrong thing.
+        let status = match refusal {
+            omnion_workflows::retry_node::RetryRefusal::RunStillRunning
+            | omnion_workflows::retry_node::RetryRefusal::RunCancelled => {
+                StatusCode::CONFLICT
+            }
+            _ => StatusCode::BAD_REQUEST,
+        };
+        ApiError::new(status, refusal.code(), refusal.message(node_id))
+    })?;
+
+    let requeued = omnion_workflows::store::retry_single_step(
+        state.db().pool(),
+        execution_id,
+        plan.step_no,
+    )
+    .await?;
+
+    if requeued != 1 {
+        // The plan and the write disagreeing means the run changed between the read and
+        // the write — a second operator's retry, or a run that settled on its own. Saying
+        // so is the honest answer; re-queueing until the count matches would be a write
+        // loop fighting a concurrent change.
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "retry_raced",
+            format!(
+                "step {} was already re-queued by someone else — reload the run to see where \
+                 it is now",
+                plan.step_no
+            ),
+        ));
+    }
+
+    omnion_audit::record(
+        state.db().pool(),
+        omnion_audit::NewAuditEntry::by_user(current.user.id, "workflow.retry.node")
+            .organization(execution.organization_id)
+            .target("workflow_execution", execution_id.to_string())
+            .metadata(json!({
+                "node_id": plan.node_id,
+                "step_no": plan.step_no,
+                "requeued": requeued,
+                "reason": plan.reason,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    let refreshed = omnion_workflows::store::list_steps(state.db().pool(), execution_id).await?;
+    let after = omnion_workflows::store::find_execution(state.db().pool(), execution_id)
+        .await?
+        .unwrap_or(execution);
+
+    Ok(Json(RetryNodeResponse {
+        execution: ExecutionDetail::build(&after, &refreshed),
+        node_id: plan.node_id.unwrap_or_else(|| node_id.to_owned()),
+        step_no: plan.step_no,
+        requeued,
+        reason: plan.reason,
+    }))
+}
+
+/// The body of a *Retry this node* request.
+#[derive(Debug, Deserialize)]
+pub struct RetryNodeInput {
+    /// The node to retry, as the canvas draws it.
+    pub node_id: String,
+}
+
+/// What a *Retry this node* press produced.
+#[derive(Debug, Serialize)]
+pub struct RetryNodeResponse {
+    /// The run afterwards, with every step as the engine has it now.
+    #[serde(flatten)]
+    pub execution: ExecutionDetail,
+    /// The node that was retried.
+    pub node_id: String,
+    /// The one step that went back on the queue.
+    pub step_no: i32,
+    /// How many rows the write re-opened. Always 1, and asserted on the walk — a value of 2
+    /// is a tail retry wearing a node retry's name, and it re-sends earlier e-mails.
+    pub requeued: u64,
+    /// The sentence the panel shows.
+    pub reason: String,
+}
+
 
 /// What a *Run from here* press produced.
 #[derive(Debug, Serialize)]

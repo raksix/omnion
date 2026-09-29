@@ -990,6 +990,66 @@ pub async fn retry_step_from(pool: &PgPool, execution_id: Uuid, step_no: i32) ->
     Ok(requeued)
 }
 
+/// Re-open **exactly one** step of a settled run, leaving every other row alone.
+///
+/// This is *Retry this node* on the canvas, and it is deliberately **not** a narrower
+/// [`retry_step_from`]. The tail re-run re-opens `step_no >= N` because the steps after a
+/// failed one depend on a result it never produced — a run with a hole in the middle must
+/// not be allowed to march on. A node click is the other question: the operator is
+/// re-running *one* action they watched fail, and re-running its neighbours is a second
+/// side effect they did not ask for.
+///
+/// Three columns are the difference, and each one is a decision rather than an omission:
+///
+/// * **one row.** The `WHERE` names one `step_no`, so a retry cannot widen into the tail
+///   by accident — the walk asserts the returned count, which is the only thing that
+///   catches a later edit of this query.
+/// * **the attempt counter is reset, and that is not an oversight.** It was the opposite at
+///   first: the reasoning was "a single node is not a new budget", and the walk killed it
+///   with a constraint. `workflow_steps_attempts_shape` caps `attempts` at `max_attempts`,
+///   and `claim_due_step` *increments* on claim — so re-queuing a step that had spent its
+///   budget produces a row the engine is forbidden to claim, and the retry is accepted,
+///   audited, and then silently never runs. The honest reading is the other one: pressing
+///   this button is an operator asking for that node to be attempted again, and a control
+///   whose stated purpose is "try this again" that cannot try again is a dead control. The
+///   reset is bounded by `max_attempts`, which is the ceiling the step was authored with —
+///   not an unbounded budget.
+/// * **the run is re-opened.** `claim_due_step` only looks at runs whose status is
+///   `running`, so a step queued against a `failed` run would sit there forever. Only
+///   `failed` is re-opened — a `cancelled` run was closed on purpose and
+///   `retry_node_plan` refuses it before this is ever reached.
+///
+/// The `ignored` flag is cleared for the same reason it is cleared in the tail re-run: a
+/// step that once failed and was deliberately outlived must not stay exempt when it is
+/// tried again. Its `error` is cleared too, so a re-opened step does not show the previous
+/// failure as its own current one.
+pub async fn retry_single_step(pool: &PgPool, execution_id: Uuid, step_no: i32) -> Result<u64> {
+    let requeued = sqlx::query(
+        "update workflow_steps set status = 'pending', error = null, ignored = false, \
+             attempts = 0, available_at = now(), started_at = null, finished_at = null, \
+             output = null \
+         where execution_id = $1 and step_no = $2 \
+           and status in ('failed', 'cancelled', 'ignored')",
+    )
+    .bind(execution_id)
+    .bind(step_no)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if requeued > 0 {
+        sqlx::query(
+            "update workflow_executions set status = 'running', finished_at = null, error = null \
+             where id = $1 and status = 'failed'",
+        )
+        .bind(execution_id)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(requeued)
+}
+
 /// One step of a run, as the retry/resume endpoints need to address it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct StepPosition {
