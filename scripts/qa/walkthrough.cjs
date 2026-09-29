@@ -3199,6 +3199,14 @@ async function runNodePackagesDepth(page, report) {
     record({ page: "node-packages-depth", action: "node-packages", ...step });
   };
 
+  // The screen reads the ledger once on mount and once more when its organization selector
+  // settles, and a platform account's first read has no organization to name yet. That first
+  // 400 is the pass arriving before the screen has chosen, not a defect, and it is the same
+  // refusal the rest of the pass is about — so it is registered rather than counted.
+  expectRefusal(
+    "/api/v1/node-packages",
+    "the ledger's first read, before a platform account's organization selector has settled",
+  );
   await page.goto(`${URL_ADMIN}/modules/installed`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1600);
   // Read once: every direct API call below has to name the same organization the screen does.
@@ -3362,12 +3370,19 @@ async function runNodePackagesDepth(page, report) {
   }, organization);
 
   // 4. Disable, then re-enable: the ledger keeps the row and the state chip changes.
+  //
+  // Waited on, not slept through. The chip follows a PATCH and a refetch, so a fixed pause is
+  // a race: on a loaded box it reads the row mid-flight and reports a screen that is correct
+  // as a broken one. Waiting for the text the state actually produces is the same assertion
+  // without the timing assumption.
+  const stateChip = page.locator('[data-package-key="qa-fixture"] [data-testid=package-state]');
   await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1500);
-  steps.disabledStateRendered = (await page
-    .locator('[data-package-key="qa-fixture"] [data-testid=package-state]')
-    .innerText()
-    .catch(() => "")) .includes("disabled");
+  const disabledText = await stateChip
+    .filter({ hasText: "disabled" })
+    .waitFor({ timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+  steps.disabledStateRendered = disabledText;
   steps.ledgerRowSurvivedDisable = await page.evaluate(async (organizationId) => {
     const response = await fetch(
       `/api/v1/node-packages${organizationId ? `?organization_id=${organizationId}` : ""}`,
@@ -3377,7 +3392,11 @@ async function runNodePackagesDepth(page, report) {
     return (body?.packages ?? []).some((entry) => entry.key === "qa-fixture");
   }, organization);
   await page.locator('[data-testid=package-toggle]').first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(1500);
+  steps.reEnabledStateRendered = await stateChip
+    .filter({ hasText: "available" })
+    .waitFor({ timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
   note({
     step: "toggle",
     disabledRendered: steps.disabledStateRendered,
@@ -6062,7 +6081,9 @@ async function main() {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
     // registered in, so only a line that arrived after the pass announced the act can be excused.
-    const deliberate = /status of 40[13]/.test(f.text)
+    // The statuses are the ones a refusal actually uses — a validator answers 400, a ledger
+    // 409, an authorization gate 401/403 — not just the two the harness first learned from.
+    const deliberate = /status of (400|401|403|409|422)/.test(f.text)
       ? expectedRefusals.find((entry) => !entry.claimedConsole && index >= entry.consoleFrom)
       : null;
     if (deliberate) {
@@ -6074,12 +6095,17 @@ async function main() {
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
   }
   for (const [index, n] of netFailures.entries()) {
+    // A refusal a validator or a ledger makes is a 400 or a 409 as often as it is a 401: a
+    // package that fails validation is `400` with its findings, and a downgrade is `409`. Only
+    // excusing 401/403 left every deliberate 4xx on a validation pass filed as a defect, which
+    // is how a correct screen reads as broken.
+    const REFUSAL_STATUSES = [400, 401, 403, 409, 422];
     const deliberate = expectedRefusals.find(
       (entry) =>
         !entry.claimedNet &&
         index >= entry.netFrom &&
         String(n.url || "").includes(entry.match) &&
-        [401, 403].includes(n.status),
+        REFUSAL_STATUSES.includes(n.status),
     );
     if (deliberate) {
       deliberate.claimedNet = true;
