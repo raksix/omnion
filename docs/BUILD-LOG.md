@@ -3456,8 +3456,31 @@ naming a screen stay unticked. It asserts the one thing a fresh QA database make
 with no MFA rows, no backup history and no header policy, the screen must say "Not checked
 yet" rather than "Verified".
 
+**Then, in the same tick, slice 1's last item: the CSV export.** An export is the one screen
+output that *leaves* the platform, so `crates/security/src/csv.rs` is written as though every
+row will be pasted into a ticket, an email and an auditor's spreadsheet. Three decisions, and
+one of them is the actual security fix:
+
+* **The export is the filter, not the page.** It ignores the page size on purpose. An operator
+  who filters to "critical", exports 50 of 300 rows and hands that to an auditor has produced
+  a document that reads as a complete list and is not one. A 50k-row cap applies instead, and
+  its refusal names the count and says "narrow the filter".
+* **A cell starting with `=`, `+`, `-` or `@` is prefixed with a tab.** Correctly quoting
+  `"=1+1"` does not help: a findings title can be a hostile package name, and a findings export
+  is exactly the document a person opens in a spreadsheet. This is the CSV injection the
+  security-export literature is actually about, and it is the reason this module is hand-written
+  rather than delegated to a helper nobody can check.
+* **The evidence blob is not exported.** Evidence is the raw report entry and this file leaves
+  the building. The ingest already refuses a document carrying something shaped like a
+  credential, but "the ingest checked" is not a reason to put the raw blob in a spreadsheet.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **51 passed** (39 + 12 CSV)
+- `cargo build -p omnion-api` → clean; `tsc --noEmit` in `apps/admin` → exit 0
+- Commits: `2585d72` (the CSV), `0d5a72e` (the endpoint and the button), `ab157fd` (this record)
+
 **Next.** When the slot frees, run `bash scripts/qa/run.sh` with **no `QA_STACK` override** and
-tick the screen boxes for slice 1 together. Slice 1's one remaining item is the findings CSV
-export — the filter echo and the total are in place, so it is the export itself. Then slice 2
-(headers + CSRF), which is where the CSP, referrer-policy and HSTS settings finally give the
-two `unknown` rows in the overview something to report.
+tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
+referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
+real to report, which is why those two rows are the most useful thing this tick left behind.
