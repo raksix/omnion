@@ -5108,3 +5108,89 @@ a row per line, and inventory is what turns that into a ledger.
 **Migrations.** None this slice — a search provider is an entry in a registry, not a schema. The
 shared high-water still reads: main 0051, wave2 0052, wave3 0056, w5 0054, w6 0051, w7 0055,
 w8 0058, wave9 0119; mine are 0053/0054/0055/0057.
+
+## 2026-09-29 · wave 4 · REQ-052 slices 6 and 6b — the fourth registration, which is a data row
+
+**What.** Slices 6 and 6b of REQ-052: `quotes` and `orders` as search providers, the ⌘K commands
+that open and create the sales screens, the walkthrough's two new measurements, and six
+database-backed walks that drive the real endpoints. Commits `600e9c7`, `aef1bfe`, `a2cd89e`.
+
+**A search provider is registered in FOUR places, and the fourth is data.** The first three are
+code and a unit test can hold them to it: the **registry** (`crates/search/src/providers.rs`)
+decides what the indexer reads, the **panel** (`apps/admin/lib/search-palette.ts`) decides whether a
+section renders, the **vocabulary** (`intent.rs`) decides which words narrow to a provider. The
+fourth is `search_settings.enabled_providers` — a **row**, written the first time somebody saves
+the settings screen — and `read_settings` only falls back to the full registry when that row is
+**absent**. So every installation that ever saved its settings froze the provider list of that day,
+and a provider registered afterwards indexes its rows on every reindex, appears on the status
+screen, and is filtered out of every query by `d.provider = any(enabled)`.
+
+**REQ-051's three CRM providers were in exactly that state, one level shallower** — registered and
+upserted, with no panel entry and no vocabulary, so all three sections rendered *nothing* while
+their own tests passed. My two would have shipped the same way. The walk found it, not a test:
+
+```
+14 indexed rows, 0 hits
+```
+
+That pair of facts is the whole defect, and it is the most expensive single observation in the
+tick: it took four wrong turns to reach, and every one of them produced a **plausible** answer.
+`&type=quote` as a query parameter is silently ignored, so the box answered with every kind at once
+and the first hit was the company the walk had just created — "the title must be the number" then
+failed on `"Northwind Trading"`, which is a *correct* company row answering an unfiltered
+question. `type:quotes` (the provider key) filters to nothing, because the clause matches
+`entity_type`. The scoped syntax lives **inside** `q`, not in a parameter. And the reindex report is
+a **list**, so reading `.indexed` off the object panicked on a report that had indexed fourteen
+rows. None of those four is a compiler error and each one is a sentence in the diff explaining
+itself.
+
+`0125` unions the new keys in rather than replacing the array, so an operator who deliberately
+searches fewer providers keeps that choice across an upgrade; it re-runs as `UPDATE 0`; and it
+prunes keys the registry no longer knows, so a withdrawn provider does not sit in the row forever
+filtering nothing. Verified against the real row rather than a fresh one — the stale row is the
+whole point.
+
+**The second half of the tick was an assertion that could not fail.** REQ-052's mobile box asks that
+the totals footer stay visible while the lines scroll. The footer was a plain `<dl>`, and my first
+fix put the pin behind `lg:` — **desktop only, on a criterion titled "Mobile 390×844"**, which is
+backwards. The walkthrough then reported `stuck: true` on a `position: static` element, because an
+empty builder is shorter than an 844px viewport: `scrollTo(0, 600)` moved nothing, so "the footer
+did not move" was trivially true. A sticky assertion that cannot fail is worse than no assertion,
+because the next writer reads it as evidence. The pass now adds two lines so the grid exceeds the
+viewport, records the scroll offset it achieved, and requires the conjunction: **the page moved and
+the footer's gap did not.**
+
+**Proof.**
+
+```
+cargo test -p omnion-search --lib                       51 passed, 0 failed   (+7)
+cargo test -p omnion-api --lib                         249 passed, 0 failed
+cargo test -p omnion-api --test search_business_providers   6 passed, 0 failed
+  -- OMNION_DATABASE_URL=…/omnion_qa_w4 OMNION_REQUIRE_DB=1 --test-threads=1
+apps/admin + apps/web  tsc --noEmit                    2/2 clean
+node --check scripts/qa/walkthrough.cjs                 clean
+```
+
+The six walks reindex through `POST /search/reindex` — the call the status screen makes — and read
+the rows back through `GET /search`, which is the only tier that can see any of the four
+registrations. `OMNION_REQUIRE_DB=1` makes a missing database a **panic** rather than a skip: a
+walk that quietly reports SKIP when PostgreSQL is down is a green tick that proved nothing, and
+this suite's whole subject is an absence.
+
+**Not proved this tick, and said so rather than ticked.** The **browser pass is still running**
+(90 minutes in, against `600e9c7` — before the `a2cd89e` fix), so the palette sections it records
+were measured while the harness sat on `/login` and the assertion was not evaluated. The mobile
+box stays **unticked**: the fix and its measurement are in, the pass that measures them is not
+finished. `Order → invoice draft` also stays unticked, on the same grounds as before — REQ-054 is
+not built and the criterion is a hand-off to a module that does not exist.
+
+**Next.** Re-run the pass against `a2cd89e` and require the `business-sections` step to list all
+five providers rather than `missing: contacts,companies,deals,quotes,orders`, and the
+`mobile-builder` step to report a non-`static` footer with `pageScrolled: true`. Then **REQ-053
+inventory** — the first of the nine untouched wave-4 requests, and the one with the most downstream
+weight: sales records the *intent to hold* stock as a row per line, and inventory is what turns
+that into a ledger.
+
+**Migrations.** `0125_search_provider_enablement.sql` — taken above the shared high-water, which
+now reads main 0052/0123, wave3 0056, w5 0054, w6 0052, w7 0064, w8 0058, wave9 0124. Mine are
+0053, 0054, 0055, 0057 and now 0125.
