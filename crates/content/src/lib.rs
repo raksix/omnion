@@ -12,9 +12,11 @@ pub mod blockdiff;
 pub mod blocks;
 pub mod comments;
 pub mod error;
+pub mod menus;
 pub mod model;
 pub mod pages;
 pub mod patterns;
+pub mod publishing;
 pub mod sanitize;
 pub mod templates;
 pub mod translations;
@@ -32,6 +34,21 @@ pub use comments::{
     COMMENT_COLUMNS, CommentSource, MAX_COMMENT_BODY, NewRevisionComment, RevisionComment,
 };
 pub use error::{ContentError, Result};
+// `MAX_NAME_LENGTH` is deliberately *not* re-exported from here: `patterns` already exports one
+// with the same meaning, and two public names for two different bounds is a call site that
+// guesses. A menu name and a pattern name are both 120 characters, so the value agrees — but
+// the modules keep their own constant so a bound may move without editing the other.
+pub use menus::{
+    Audience, ITEM_TYPES, LOCATIONS, MAX_ITEMS, MAX_LABEL_LENGTH, Menu, MenuChanges, MenuItem,
+    MenuSave, NewMenuItem, RenderedItem, RenderedMenu, VISIBILITIES, create_menu, delete_menu,
+    find_menu, find_menu_by_key, find_menu_by_location, list_items, list_menus, read_menu,
+    rendered_menu, save_menu, update_menu,
+};
+pub use publishing::{
+    ACTIONS, NewSchedule, PublishingEntry, QueueQuery, cancel, claim_due, claim_entry,
+    find_entry, find_pending, finish, list_queue, publish_now, reschedule, retry, run_entry,
+    schedule,
+};
 pub use patterns::{
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate, PageTemplate,
     Pattern, PatternChanges, delete_pattern, delete_template, find_pattern, find_pattern_by_key,
@@ -45,7 +62,8 @@ pub use model::{
 };
 pub use pages::{
     create_page, current_draft, delete_page, find_page, find_page_by_slug, find_revision,
-    latest_revision, list_pages, list_revisions, publish_page, restore_revision, update_page,
+    latest_revision, list_pages, list_revisions, publish_page, restore_revision, unpublish_page,
+    update_page,
 };
 pub use sanitize::{
     ALLOWED_ATTRIBUTES, ALLOWED_TAGS, ALLOWED_URL_SCHEMES, SanitizeReport, allowed_embed_hosts,

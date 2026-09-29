@@ -3,6 +3,8 @@
 //! Like the rest of the crates, this one never decides HTTP status codes: it returns
 //! [`ContentError`] and the API layer maps it onto the HTTP surface (`apps/api/src/error.rs`).
 
+use uuid::Uuid;
+
 /// Errors returned by the content store.
 #[derive(Debug, thiserror::Error)]
 pub enum ContentError {
@@ -78,6 +80,43 @@ pub enum ContentError {
     /// Publication was requested but the page holds no draft revision.
     #[error("this page has no draft revision to publish")]
     NoDraftRevision,
+    /// A theme location is not one the renderer reads (REQ-064 slice 1).
+    #[error("invalid location: {0}")]
+    InvalidLocation(String),
+    /// An item's visibility rule is not one of the documented values (REQ-064 slice 1).
+    #[error("invalid visibility: {0}")]
+    InvalidVisibility(String),
+    /// A menu item is unusable — no label, no target, a page link with no page, or a tree that
+    /// names a parent which is not part of the submission.
+    #[error("invalid menu item: {0}")]
+    InvalidMenuItem(String),
+    /// A menu branch nests deeper than the renderer draws.
+    #[error("menu nesting is too deep: {0}")]
+    TooDeep(String),
+    /// No menu carries this identifier.
+    #[error("no such menu")]
+    MenuNotFound,
+    /// The site already has a menu with this key.
+    #[error("this site already has a menu with this key")]
+    MenuKeyTaken(String),
+    /// A location is already held by another menu. The holder is named so the editor can be
+    /// pointed at the menu to move, rather than guessing which of the site's menus it was.
+    #[error("the {location} location is already held by another menu; move it there first")]
+    MenuLocationTaken {
+        /// The contested location.
+        location: String,
+        /// The menu that holds it today.
+        holder: Uuid,
+    },
+    /// A publishing queue entry does not carry this identifier.
+    #[error("no such publishing entry")]
+    PublishingEntryNotFound,
+    /// A scheduling action is not `publish` or `unpublish`.
+    #[error("invalid publishing action: {0}")]
+    InvalidPublishAction(String),
+    /// A schedule is not a usable instant (before now, or unparseable as a timestamp).
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
 }
 
 /// Result alias used across the content crate.
@@ -112,6 +151,16 @@ impl ContentError {
             Self::TemplateKeyTaken(_) => "template_key_taken",
             Self::TemplateIsSystem => "template_is_system",
             Self::NoDraftRevision => "no_draft_revision",
+            Self::InvalidLocation(_) => "invalid_location",
+            Self::InvalidVisibility(_) => "invalid_visibility",
+            Self::InvalidMenuItem(_) => "invalid_menu_item",
+            Self::TooDeep(_) => "menu_too_deep",
+            Self::MenuNotFound => "menu_not_found",
+            Self::MenuKeyTaken(_) => "menu_key_taken",
+            Self::MenuLocationTaken { .. } => "menu_location_taken",
+            Self::PublishingEntryNotFound => "publishing_entry_not_found",
+            Self::InvalidPublishAction(_) => "invalid_publish_action",
+            Self::InvalidSchedule(_) => "invalid_schedule",
         }
     }
 }

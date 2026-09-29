@@ -303,6 +303,53 @@ pub async fn publish_page(pool: &PgPool, id: Uuid) -> Result<(Page, PageRevision
     Ok((page, published))
 }
 
+/// Take a published page back off the public site (REQ-064, slice 1).
+///
+/// Unpublishing archives the published revision and clears the page's pointer at it — the
+/// content is *not* deleted, because history is never rewritten and an unpublish is undoable by
+/// publishing the same revision again. The page falls back to `draft`, so a visitor gets the
+/// platform's not-found answer rather than a page whose revisions all say `published` and whose
+/// renderer would still find one.
+///
+/// Fails with [`ContentError::PageNotFound`] for a page that does not exist, and is a no-op
+/// returning `false` for a page that is not currently published: "unpublish something that is
+/// not published" is a state the row is already in, not an error a scheduler should fail over.
+pub async fn unpublish_page(pool: &PgPool, id: Uuid) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+
+    let page_sql = format!("select {PAGE_COLUMNS} from pages where id = $1 for update");
+    let Some(page) = sqlx::query_as::<_, Page>(&page_sql)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Err(ContentError::PageNotFound);
+    };
+    if page.published_revision_id.is_none() {
+        tx.commit().await?;
+        return Ok(false);
+    }
+
+    sqlx::query(
+        "update page_revisions set state = 'archived' \
+         where page_id = $1 and state = 'published'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "update pages set status = 'draft', published_revision_id = null, updated_at = now() \
+         where id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Restore an earlier revision: copy it forward as a new draft.
 ///
 /// History is never rewritten — the older content becomes a new draft revision that records
