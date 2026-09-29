@@ -271,6 +271,17 @@ pub struct AreaOptionBody {
     pub label: String,
     /// What it costs, in words rather than a fake number.
     pub weight: String,
+    /// Whether ticking this actually copies anything, and why not when it does not.
+    ///
+    /// This is the field the whole change turns on. The wizard used to render six
+    /// identically-shaped checkboxes over three areas that copy and three that return `0` from
+    /// the runner, so a tick on "Site settings" was accepted, stored on the job, priced in the
+    /// estimate and then quietly did nothing. The request's Definition of Done forbids dead
+    /// controls, and this was a live one — so the answer travels with the option and the panel
+    /// renders it, rather than being left to a comment in the runner.
+    pub copies: bool,
+    /// The reason, for the areas that copy nothing. `None` for the ones that do.
+    pub note: Option<String>,
 }
 
 /// Response of `GET /api/v1/environments/{id}`.
@@ -334,6 +345,8 @@ pub async fn list_environments(
                 name: area.as_str().to_string(),
                 label: area.label().to_string(),
                 weight: area.weight().to_string(),
+                copies: area.copies(),
+                note: area.note().map(str::to_string),
             })
             .collect(),
         source_key: production.key,

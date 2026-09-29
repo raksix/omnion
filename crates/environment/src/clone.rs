@@ -87,6 +87,47 @@ impl Area {
             .expect("every Area is in ALL")
     }
 
+    /// Whether this area actually copies rows into the staging environment.
+    ///
+    /// This is the difference between an area that is *implemented* and an area that is
+    /// *offered*, and the request's own Definition of Done forbids the difference: a checkbox
+    /// that promises a copy and produces nothing is a dead control wearing a working one's
+    /// label. Three areas copy — pages, translations and workflow definitions. The other three
+    /// are boundaries the data model has not crossed, and the runner's own comments say why:
+    /// `organization_settings` is keyed by tenant alone, so a second row would collide with
+    /// production's, and the theme is a column on `sites`, which every environment shares.
+    ///
+    /// The declaration lives here rather than in the wizard so the runner and the panel cannot
+    /// disagree about it, and so it can be checked against what the runner *does* rather than
+    /// against what it is supposed to do — see `an_area_that_offers_a_copy_offers_one`.
+    pub const fn copies(self) -> bool {
+        match self {
+            Self::Pages | Self::Translations | Self::Workflows => true,
+            Self::Menus | Self::SiteSettings | Self::Theme => false,
+        }
+    }
+
+    /// What the wizard says under an area, once the area's real behaviour is known.
+    ///
+    /// `None` for the three that copy: there is nothing to qualify, and a line of hedging under
+    /// every working checkbox is noise that trains the reader to skip the lines that matter.
+    /// The three that copy nothing each get their reason, because "0 rows" on its own reads
+    /// like an empty site rather than like a design decision.
+    pub const fn note(self) -> Option<&'static str> {
+        match self {
+            Self::Pages | Self::Translations | Self::Workflows => None,
+            Self::Menus => Some(
+                "Menus are shared with production — this platform keeps one navigation set per tenant, not per environment.",
+            ),
+            Self::SiteSettings => Some(
+                "The settings row is keyed by tenant, so a staging copy would collide with production's. Staging shows the same settings.",
+            ),
+            Self::Theme => Some(
+                "The theme is chosen on the site, which every environment shares. Changing it here would change production's too.",
+            ),
+        }
+    }
+
     /// What copying this area costs the organization, in words the wizard can show.
     pub fn weight(self) -> AreaWeight {
         match self {
@@ -325,6 +366,124 @@ mod tests {
         let mut p = Progress::new();
         p.advance(Area::Pages, 12);
         assert_eq!(p.items_done(), 12);
+    }
+
+    #[test]
+    fn an_area_that_offers_a_copy_offers_one() {
+        // The defect this catches, stated plainly: the wizard offered six checkboxes, three of
+        // which were the same label and weight as the three that work, and every one of those
+        // three returned 0 from the runner. The request's Definition of Done lists "dead
+        // buttons" and "hidden/disabled features" as forbidden, and this was both at once — a
+        // live, ticked, priced control that produced nothing.
+        //
+        // The runner is read off disk rather than restated here. That is the whole technique: a
+        // second hand-written list of which areas copy would agree with `Area::copies()` on the
+        // day it was written and disagree with it the first time somebody implemented a fourth
+        // area. Reading `runner.rs` means the check is against the code that actually runs, and
+        // it fails the moment an area starts copying without `copies()` being updated — the
+        // direction that is a *silent* wrong promise, since the panel would start quoting a
+        // "nothing to copy here" note above an area that copies hundreds of rows.
+        let runner = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runner.rs"),
+        )
+        .expect("the runner that does the copying must be readable from its own crate");
+
+        // A row that copies is one whose arm in the *copy* match is a block rather than a bare
+        // literal. The match is the second one in the file; the first is the delete half, which
+        // every area has — including the ones that then copy nothing.
+        let copy_arms = runner
+            .split("let copied: u64 = match area {")
+            .nth(1)
+            .expect("the runner must have a copy match");
+        let copy_arms = copy_arms
+            .split("tx.commit()")
+            .next()
+            .expect("the copy match must end before the commit");
+
+        /// The text of the arm covering `area`, up to the next `Area::` label.
+        ///
+        /// A variant can sit on either side of a `|` — the runner writes
+        /// `Area::Menus | Area::SiteSettings => 0,` for the two that share a table — so a plain
+        /// `Area::Menus =>` search would find nothing and report "copies nothing" for an arm that
+        /// does real work. That is the false negative that matters: the check has to fail when an
+        /// area starts copying, and it has to keep failing when it stops.
+        fn arm_for<'a>(arms: &'a str, area: Area) -> &'a str {
+            // The *Rust* variant name, which is what a match arm spells, and not the wire name
+            // `as_str()` returns: `Area::Pages` versus `Area::pages`. Searching for the wire name
+            // finds nothing at all, and "nothing found" then reads as "this area has no arm"
+            // rather than as "this test looked in the wrong place" — a gate that fails for the
+            // wrong reason is one nobody trusts. `{:?}` on the derived Debug is the same string
+            // the source spells, so the two cannot drift apart silently.
+            let needle = format!("Area::{area:?}");
+            let rest = arms
+                .match_indices(&needle)
+                .map(|(index, _)| index)
+                .find_map(|index| {
+                    let tail = &arms[index + needle.len()..];
+                    (tail.starts_with(" =>") || tail.starts_with(" |")).then_some(tail)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the copy match has no arm for {} ({needle}) — the runner and this test \
+                         disagree about which areas exist",
+                        area.as_str()
+                    )
+                });
+
+            // From the `=>`, not from the variant. The two arms that share a table are written
+            // `Area::Menus | Area::SiteSettings => 0,`, so the variant text is followed by the
+            // *other* variant — measuring from there reads "| Area::SiteSettings => 0," as a
+            // non-empty arm and decides the runner copies menus. Cutting at the arrow first is
+            // what makes a shared arm mean the same thing for both of its variants.
+            let arrow = rest
+                .find("=>")
+                .expect("an arm always has an arrow");
+            rest[arrow + 2..]
+                .split("Area::")
+                .next()
+                .unwrap_or_default()
+        }
+
+        for area in Area::ALL {
+            // The body of the arm, reduced to the two shapes a no-op takes here: `{}` and a bare
+            // `0`. Commas are noise, and the block arms start on the next line, so a copy has to
+            // be judged on what follows the arrow rather than on the line the arrow is on.
+            let body: String = arm_for(copy_arms, area)
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',')
+                .collect();
+            let copies = !matches!(body.as_str(), "" | "{}" | "0");
+
+            assert_eq!(
+                copies,
+                area.copies(),
+                "Area::{} {} in the runner but Area::copies() says the opposite — the wizard \
+                 would promise a copy that does not happen, or hide a copy that does",
+                area.as_str(),
+                if copies {
+                    "copies rows"
+                } else {
+                    "copies nothing"
+                },
+            );
+        }
+
+        // And the shape the panel depends on: an area with nothing to copy must say why, and an
+        // area that copies must not hedge. A note on all six trains the reader to skip notes.
+        for area in Area::ALL {
+            assert_eq!(
+                area.note().is_some(),
+                !area.copies(),
+                "Area::{} has the wrong note: a quiet area that copies needs no excuse, and an \
+                 area that copies nothing needs one",
+                area.as_str()
+            );
+        }
+
+        assert!(
+            Area::ALL.iter().any(|area| !area.copies()),
+            "if every area copied, this test would pass without proving it can still fail"
+        );
     }
 
     #[test]

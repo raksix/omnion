@@ -1931,6 +1931,17 @@ export type EnvironmentAreaOption = {
   label: string;
   /** What it costs, in words rather than a fake number. */
   weight: string;
+  /**
+   * Whether ticking this actually copies anything.
+   *
+   * Three of the six areas do not copy: menus and site settings are one row per tenant, and the
+   * theme is a column on the shared site. They used to render as ordinary checkboxes, so a tick
+   * was accepted, priced in the estimate and then did nothing. `false` renders the area as a
+   * disclosed boundary rather than a promise, and `note` is the reason.
+   */
+  copies: boolean;
+  /** Why an area copies nothing. `null` for the ones that do. */
+  note: string | null;
 };
 
 /** `GET /api/v1/environments`. */

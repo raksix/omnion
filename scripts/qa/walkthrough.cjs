@@ -6105,11 +6105,65 @@ async function runEnvironmentsDepth(page, report) {
     if (areaBoxes === 0) {
       return { ok: false, reason: "the wizard offered no clone areas" };
     }
+
+    // ---- An area that promises a copy must copy one (REQ-017) ---------------------------
+    // Three of the six areas — menus, site settings and the theme — are shared with production
+    // and return 0 from the runner. They used to be priced and labelled exactly like the three
+    // that work, so ticking one produced an environment with nothing in it. The API now says
+    // which is which on each option (`data-env-area-copies`), and these four claims are the
+    // ones that would fail if the two halves ever drifted apart again:
+    //   1. at least one area really copies — otherwise nothing in the wizard is a promise;
+    //   2. every non-copying area says WHY, so it reads as a boundary and not as an empty site;
+    //   3. the non-copying areas are NOT pre-ticked, so the default is a real copy;
+    //   4. the summary repeats the shared note, rather than listing them as content again.
+    const areaRows = await page.locator("[data-env-area-option]").evaluateAll((els) =>
+      els.map((el) => ({
+        name: el.getAttribute("data-env-area-option"),
+        copies: el.getAttribute("data-env-area-copies") === "true",
+        box: el.querySelector("input[type=checkbox]"),
+        note: el.querySelectorAll("span")[1]?.textContent?.trim() ?? "",
+      })),
+    );
+    const copying = areaRows.filter((row) => row.copies);
+    const shared = areaRows.filter((row) => !row.copies);
+    steps.areasThatCopy = copying.length;
+    steps.areasThatAreShared = shared.length;
+    steps.sharedAreasExplained = shared.every((row) => row.note.length > 0);
+    steps.sharedAreasNotPreselected = shared.every((row) => row.box && !row.box.checked);
+    steps.areaNotePresent = (await page.locator("[data-env-area-note]").count()) > 0;
+    report.findings.push(
+      ...(copying.length === 0
+        ? [
+            {
+              severity: "high",
+              where: "/environments wizard",
+              what: "no clone area claims to copy anything, so a staging environment could be created empty",
+            },
+          ]
+        : []),
+      ...(shared.length > 0 && !steps.sharedAreasExplained
+        ? [
+            {
+              severity: "high",
+              where: "/environments wizard",
+              what: "an area that copies nothing is offered without saying so",
+            },
+          ]
+        : []),
+      ...(shared.length > 0 && !steps.sharedAreasNotPreselected
+        ? [
+            {
+              severity: "medium",
+              where: "/environments wizard",
+              what: "an area that copies nothing is pre-ticked, so the default clone promises work it does not do",
+            },
+          ]
+        : []),
+    );
+
     // Unchecking everything must block the next step: a clone that copies nothing is not an
     // environment, and the API refuses it — the screen must not be the one to discover that.
-    for (const name of await page.locator("[data-env-area]").evaluateAll((els) =>
-      els.map((el) => el.getAttribute("data-env-area")),
-    )) {
+    for (const name of areaRows.map((row) => row.name)) {
       await page.locator(`[data-env-area="${name}"]`).uncheck().catch(() => {});
     }
     await page.waitForTimeout(250);
@@ -6117,10 +6171,44 @@ async function runEnvironmentsDepth(page, report) {
     steps.nextBlockedWithoutAreas = areasBlocked;
     await shot(page, "environments-wizard-areas");
 
-    await page.locator("[data-env-area]").first().check().catch(() => {});
+    // Ticking ONLY the shared areas must still block the step. The rule is "at least one thing
+    // that copies", not "at least one box" — the second reading is how a browser could produce
+    // the environment the crate's own `require_areas` guard exists to prevent.
+    for (const row of shared) {
+      await page.locator(`[data-env-area="${row.name}"]`).check().catch(() => {});
+    }
+    await page.waitForTimeout(250);
+    steps.nextBlockedWithOnlySharedAreas = await page
+      .locator("[data-env-wizard-next]")
+      .isDisabled()
+      .catch(() => false);
+    for (const row of shared) {
+      await page.locator(`[data-env-area="${row.name}"]`).uncheck().catch(() => {});
+    }
+
+    // Re-tick a copying area — `.first()` is not safe here, because the first checkbox may be
+    // one of the shared areas and an environment created from it would be empty by design.
+    const firstCopying = copying[0]?.name;
+    if (firstCopying) {
+      await page.locator(`[data-env-area="${firstCopying}"]`).check().catch(() => {});
+    }
     await page.waitForTimeout(250);
     await page.click("[data-env-wizard-next]").catch(() => {});
     await page.waitForTimeout(400);
+    // The summary is the last screen before the button, so it is where a repeated promise
+    // would do the most damage — the step-2 note is already two clicks in the operator's past.
+    steps.sharedNoteOnSummary = (await page.locator("[data-env-wizard-shared]").count()) > 0;
+    report.findings.push(
+      ...(steps.sharedNoteOnSummary
+        ? []
+        : [
+            {
+              severity: "medium",
+              where: "/environments wizard",
+              what: "the confirmation does not repeat that navigation, settings and theme are shared rather than copied",
+            },
+          ]),
+    );
     await shot(page, "environments-wizard-confirm");
     await page.click("[data-env-wizard-submit]").catch(() => {});
     await page.waitForTimeout(2500);

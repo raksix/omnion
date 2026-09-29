@@ -48,10 +48,16 @@ export function EnvironmentCreateWizard({ areas, sourceKey, onClose, onCreated }
   const nameRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
 
-  // Default to every area the API offers. A clone that copies nothing is not a staging
-  // environment; choosing a subset is the deliberate act, so the default is the whole thing.
+  // Default to every area the API offers **that copies**. A clone that copies nothing is not a
+  // staging environment, and choosing a subset is the deliberate act, so the working areas are
+  // the default. The three that copy nothing are deliberately not in that default: they were
+  // ticked by default before, stored on the job, priced in the estimate and then produced zero
+  // rows, so an operator who never looked closely believed a settings copy had happened.
+  //
+  // They stay on screen, unticked and explained. Hiding them would be the request's forbidden
+  // "hidden feature" and would cost the operator the knowledge that staging shares those rows.
   useEffect(() => {
-    setSelected(areas.map((area) => area.name));
+    setSelected(areas.filter((area) => area.copies).map((area) => area.name));
   }, [areas]);
 
   // Escape closes, and the first step takes focus so the wizard is usable from the keyboard
@@ -88,7 +94,19 @@ export function EnvironmentCreateWizard({ areas, sourceKey, onClose, onCreated }
     return null;
   }, [host]);
 
-  const areaError = selected.length === 0 ? "Choose at least one thing to copy." : null;
+  // Validation counts areas that actually **copy**, not boxes that are ticked. Un-ticking the
+  // working areas while leaving the three shared ones ticked used to satisfy this check and then
+  // produce an environment with nothing in it — the exact "looks cloned and is empty" state the
+  // `require_areas` guard in the crate exists to prevent, reachable through the browser because
+  // the panel's rule was a different rule.
+  const copyingAreas = useMemo(
+    () => areas.filter((area) => area.copies).map((area) => area.name),
+    [areas],
+  );
+  const areaError =
+    selected.filter((name) => copyingAreas.includes(name)).length === 0
+      ? "Choose at least one thing to copy."
+      : null;
 
   const submit = async () => {
     setBusy(true);
@@ -257,8 +275,11 @@ export function EnvironmentCreateWizard({ areas, sourceKey, onClose, onCreated }
               {areas.map((area) => (
                 <li key={area.name}>
                   <label
-                    className="flex items-start gap-2.5 rounded-lg border border-line bg-surface px-3 py-2"
+                    className={`flex items-start gap-2.5 rounded-lg border bg-surface px-3 py-2 ${
+                      area.copies ? "border-line" : "border-line/60"
+                    }`}
                     data-env-area-option={area.name}
+                    data-env-area-copies={area.copies}
                   >
                     <input
                       type="checkbox"
@@ -268,13 +289,30 @@ export function EnvironmentCreateWizard({ areas, sourceKey, onClose, onCreated }
                       className="mt-0.5"
                     />
                     <span className="flex flex-col">
-                      <span className="text-[12.5px] font-medium">{area.label}</span>
-                      <span className="text-[11.5px] text-muted">{area.weight}</span>
+                      <span
+                        className={`text-[12.5px] font-medium ${area.copies ? "" : "text-muted"}`}
+                      >
+                        {area.label}
+                      </span>
+                      <span className="text-[11.5px] text-muted">
+                        {area.copies ? area.weight : area.note}
+                      </span>
                     </span>
                   </label>
                 </li>
               ))}
             </ul>
+            {/* The boundary, stated once for all three, instead of only in three places a
+                reader has to notice. A note under every checkbox would be noise; a note under
+                exactly the three that do nothing is the difference between "0 rows because the
+                site is empty" and "0 rows because this row is shared with production". */}
+            {areas.some((area) => !area.copies) ? (
+              <p className="text-[11.5px] text-muted" data-env-area-note>
+                Staging shares its navigation, settings and theme with production. Those three
+                are listed so you can see what is not being copied, not so you can tick it — a
+                staging environment and production always show the same ones.
+              </p>
+            ) : null}
             <label className="mt-1 flex items-center gap-2 text-[12.5px]">
               <input
                 type="checkbox"
@@ -302,13 +340,19 @@ export function EnvironmentCreateWizard({ areas, sourceKey, onClose, onCreated }
               <dt className="text-muted">From</dt>
               <dd className="font-mono">{sourceKey || "production"}</dd>
               <dt className="text-muted">Content</dt>
+              {/* Only the areas that will actually be copied. Listing the shared ones here
+                  would repeat the promise the step-2 note withdrew, on the last screen the
+                  operator reads before pressing the button. */}
               <dd>
                 {areas
-                  .filter((area) => selected.includes(area.name))
+                  .filter((area) => area.copies && selected.includes(area.name))
                   .map((area) => area.label)
                   .join(", ") || "nothing"}
               </dd>
             </dl>
+            <p className="text-[11.5px] text-muted" data-env-wizard-shared>
+              Navigation, settings and theme stay shared with production and are not copied.
+            </p>
             <p className="text-[11.5px] text-muted">
               The copy runs in the background. The environment appears on the list immediately, in
               the `cloning` state, and the row shows its progress until it finishes.
