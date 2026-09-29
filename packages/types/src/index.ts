@@ -245,6 +245,36 @@ export interface PatternBlocksResponse {
   block_count: number;
 }
 
+/**
+ * A page's featured image, ready for a theme to draw (REQ-064 slice 4d).
+ *
+ * `null` is the answer for BOTH "this page has no image" and "this page's image is in the
+ * trash" — a renderer's only decision is whether to emit an `<img>`, and the two cases answer it
+ * identically. The *panel* is where the difference shows, because there the operator has something
+ * to do about one and nothing to do about the other.
+ */
+export interface PublicFeaturedImage {
+  /** Media id, for the DOM and for a "open the file" link. */
+  media_id: string;
+  /** The URL the API serves the object at. Never build this by hand in a theme. */
+  url: string;
+  /** Alt text. Guaranteed non-blank by the store and by the schema. */
+  alt: string;
+  /** Caption to draw under the image; possibly empty. */
+  legend: string;
+  /**
+   * The focal point as a CSS `object-position`, or `null` when the page has never been cropped.
+   *
+   * A string rather than two numbers because every consumer writes it into CSS, and handing them
+   * `Some((0.5, 0.5))` is handing them the question of how to format it.
+   */
+  object_position: string | null;
+  /** Pixel width, or `null` when the format carries none. */
+  width: number | null;
+  /** Pixel height. */
+  height: number | null;
+}
+
 /** Response of `GET /api/v1/public/pages/{slug}` — one renderable page. */
 export interface PublishedPage {
   /** Site the page belongs to. */
@@ -253,4 +283,11 @@ export interface PublishedPage {
   page: PublicPage;
   /** The revision visitors see. */
   revision: PublicRevision;
+  /**
+   * The page's featured image, or `null` when there is nothing to draw.
+   *
+   * On THIS response rather than behind a second request on purpose: a renderer that has to ask
+   * whether a page has a picture is a renderer that can render a page without one.
+   */
+  featured_image: PublicFeaturedImage | null;
 }

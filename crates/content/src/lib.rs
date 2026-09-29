@@ -12,6 +12,7 @@ pub mod blockdiff;
 pub mod blocks;
 pub mod comments;
 pub mod error;
+pub mod featured;
 pub mod forms;
 pub mod menus;
 pub mod members;
@@ -43,6 +44,10 @@ pub use error::{ContentError, Result};
 // with the same meaning, and two public names for two different bounds is a call site that
 // guesses. A menu name and a pattern name are both 120 characters, so the value agrees — but
 // the modules keep their own constant so a bound may move without editing the other.
+pub use featured::{
+    Availability, FeaturedChanges, FeaturedImage, FeaturedMedia, FeaturedStore, MAX_ALT,
+    MAX_LEGEND, PickableMedia, is_renderable, object_position, renderable, validate_changes,
+};
 pub use forms::{
     FIELD_TYPES, FORM_STATUSES, Form, FormChanges, FormField, MAX_ANSWER_LENGTH, MAX_ANSWERS,
     MAX_FIELD_TEXT_LENGTH, MAX_FORM_NAME_LENGTH, MAX_OPTIONS, NewFormField, NewSubmission,

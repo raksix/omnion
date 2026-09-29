@@ -132,6 +132,15 @@ pub enum ContentError {
     /// No form carries this identifier (REQ-064 slice 2).
     #[error("no such form")]
     FormNotFound,
+    /// A page cannot feature this file: it is another site's, already gone, in the trash, or not
+    /// an image at all.
+    ///
+    /// One variant for the four cases on purpose. The caller — a panel operator choosing a file —
+    /// has exactly one thing to do about any of them (pick another one), and four error codes
+    /// would tell them four different things about a library that is not the problem. The
+    /// *message* still names which of the four it was, because the four have different fixes.
+    #[error("{0}")]
+    FeaturedMediaUnavailable(String),
     /// The site already has a form with this key. It is the form's public address, so two forms
     /// cannot share it — a visitor has no way to choose between them.
     #[error("this site already has a form with this key")]
@@ -290,6 +299,7 @@ impl ContentError {
             Self::InvalidSchedule(_) => "invalid_schedule",
             Self::InvalidFormField(_) => "invalid_form",
             Self::FormNotFound => "form_not_found",
+            Self::FeaturedMediaUnavailable(_) => "featured_media_unavailable",
             Self::FormKeyTaken(_) => "form_key_taken",
             Self::SubmissionNotFound => "submission_not_found",
             Self::InvalidRedirect(_) => "invalid_redirect",

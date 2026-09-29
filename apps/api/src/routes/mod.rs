@@ -77,6 +77,7 @@ pub mod blocks;
 pub mod commands;
 pub mod comments;
 pub mod content;
+pub mod featured_media;
 pub mod forms;
 pub mod health;
 pub mod iam;
@@ -1052,6 +1053,27 @@ pub fn router(state: AppState) -> Router {
     let seo_overview = get(seo::get_seo_overview).layer(guards::require(&state, "seo.read"));
     let page_seo_read = get(seo::get_page_seo).layer(guards::require(&state, "seo.read"));
     let page_seo_write = put(seo::put_page_seo).layer(guards::require(&state, "seo.manage"));
+
+    // A page's featured image (REQ-064, slice 4d). **Three guards across two routes, and the
+    // first version had two and got it wrong.** The mistake was guarding the page's own read with
+    // `media.read` "because the body mentions a file" — which locked a page editor who can edit
+    // the page's title, body and crop out of reading the alt they are required to write. The three
+    // questions are genuinely different and each gets its own key:
+    //
+    //   * reading THIS page's image      → `content.pages.read`   — it is the page's own field
+    //   * writing it                     → `content.pages.update` — the same power as its body
+    //   * listing what it could point at  → `media.read`           — that is a question about the
+    //     LIBRARY, and it is the one that can enumerate files rather than name one
+    //
+    // The picker is a separate route for the third reason alone: one endpoint serving both would
+    // need one guard for both, and the weaker one wins — either an editor with an empty picker or
+    // a page editor holding the whole library.
+    let featured_read =
+        get(featured_media::get_featured_media).layer(guards::require(&state, "content.pages.read"));
+    let featured_write = put(featured_media::put_featured_media)
+        .layer(guards::require(&state, "content.pages.update"));
+    let featured_candidates =
+        get(featured_media::list_candidates).layer(guards::require(&state, "media.read"));
     let seo_redirect_create =
         post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
     let seo_redirect_write = put(seo::update_redirect)
@@ -1583,6 +1605,14 @@ pub fn router(state: AppState) -> Router {
         // a different scope and a single one would have made a page's SEO a site-level route
         // with a page id in the query.
         .route("/pages/{id}/seo", page_seo_read.merge(page_seo_write))
+        .route(
+            "/pages/{id}/featured-media",
+            featured_read.merge(featured_write),
+        )
+        .route(
+            "/sites/{site_id}/featured-media/candidates",
+            featured_candidates,
+        )
         .route("/seo/settings", seo_overview)
         .route("/seo/redirects", seo_redirect_create)
         .route("/seo/redirects/{id}", seo_redirect_write)

@@ -84,6 +84,14 @@ pub struct PublishedPageResponse {
     pub page: PublicPageBody,
     /// The revision visitors see.
     pub revision: PublicRevisionBody,
+    /// The page's featured image, or `None` when there is nothing to draw (REQ-064 slice 4d).
+    ///
+    /// `None` covers both "no image" and "the image is in the trash". That is deliberate: the
+    /// renderer's only decision is whether to emit an `<img>`, and both cases answer it the same
+    /// way — while a *panel* that printed a dead URL would ship a broken image to every visitor.
+    /// The store decides that, so the public surface carries the answer rather than re-deriving
+    /// it, and the degradation shows up in the operator's tab instead of in a visitor's page.
+    pub featured_image: Option<omnion_content::featured::FeaturedImage>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -195,6 +203,14 @@ pub async fn get_published_page(
         Err(_) => revision.blocks.clone(),
     };
 
+    // The featured image is read AFTER the gate, never before: a refused visitor must not learn
+    // anything about the page's contents from the shape of a 404, and one extra indexed read on
+    // the render path is the cheaper of the two mistakes.
+    let featured_image = omnion_content::FeaturedStore::new(pool.clone())
+        .renderer_image(site.id, page.id)
+        .await
+        .unwrap_or(None);
+
     Ok(Json(PublishedPageResponse {
         site: PublicSiteBody {
             key: site.key,
@@ -206,6 +222,7 @@ pub async fn get_published_page(
             page_type: page.page_type,
             updated_at: page.updated_at,
         },
+        featured_image,
         revision: PublicRevisionBody {
             revision_no: revision.revision_no,
             title: revision.title,

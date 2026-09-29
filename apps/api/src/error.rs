@@ -486,6 +486,13 @@ impl From<ContentError> for ApiError {
             ContentError::FormNotFound => {
                 Self::new(StatusCode::NOT_FOUND, "form_not_found", "no such form")
             }
+            // A file the page cannot feature. 400 rather than 404: the row either exists and is
+            // unusable (in the trash, another site's, not an image) or does not exist, and the
+            // message says which — a 404 here would be indistinguishable from "no such page",
+            // which is the one answer an operator staring at a *working* page must not get.
+            ContentError::FeaturedMediaUnavailable(message) => {
+                Self::new(StatusCode::BAD_REQUEST, "featured_media_unavailable", message)
+            }
             ContentError::FormKeyTaken(key) => Self::new(
                 StatusCode::CONFLICT,
                 "form_key_taken",
