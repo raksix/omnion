@@ -73,9 +73,19 @@ fn map_store(error: omnion_notifications::NotificationError) -> ApiError {
 
 /// The query of the list read.
 ///
-/// `category` repeats rather than being comma-separated: a comma inside a value is then
-/// impossible, and a panel that sends `category=a,b` gets a `400` naming the field instead of
-/// a filter that silently matched nothing.
+/// `category` and `priority` repeat rather than being comma-separated: a comma inside a value
+/// is then impossible, and a panel that sends `category=a,b` gets a `400` naming the field
+/// instead of a filter that silently matched nothing.
+///
+/// **This type is not what axum's `Query` extractor deserializes.** It is built by
+/// [`parse_list_params`] from the raw query string, because `serde_urlencoded` — which backs
+/// `Query<T>` in axum 0.8 — cannot put a repeated key into a `Vec`: it answers
+/// `invalid type: string "approval", expected a sequence` for *both* `?category=approval` and
+/// `?category=approval&category=ticket`, so every category and priority filter on this
+/// surface was a `400` and the list fell back to its error state. The QA pass found it as two
+/// `request-failed` findings against values that are perfectly legal; the fix is here rather
+/// than in the client, because a client that comma-joins its filters would then be unable to
+/// express a category and a priority together with the same escaping rules.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListParams {
     /// Keep only this category. Repeat for several.
@@ -92,12 +102,109 @@ pub struct ListParams {
     #[serde(default)]
     pub archived: bool,
     /// Include the rows that have been read.
+    ///
+    /// **Defaults to on.** `bool` cannot tell "absent" from "false", so this used to be a
+    /// `bool` defaulting to `false` — and the list silently answered *unread only* to every
+    /// reader who asked for no filter at all. The panel's own State menu labels that state
+    /// "Unread and read", so the screen promised a list it was not sending, and a reader who
+    /// worked through their inbox came back to "You're all caught up" over three rows that
+    /// were right there. `with_read=0` / `=off` is the explicit way to hide them, and the walk
+    /// through the keyboard path caught this the only way it could be caught: it marked its
+    /// three rows read and then found nothing to drive `j` on.
+    ///
+    /// [`Option<bool>`] carries the third state: `parse_list_params` sets it only when the
+    /// client actually sent the parameter, so "absent" and "off" stay distinguishable.
     #[serde(default)]
-    pub with_read: bool,
+    pub with_read: Option<bool>,
     /// Page from this instant, exclusive (the keyset cursor).
     pub before: Option<String>,
     /// Page size.
     pub limit: Option<i64>,
+}
+
+/// Parse the list read's query string by hand, keeping every repetition of a repeated key.
+///
+/// Three rules, all of them things a generic deserializer gets wrong for this shape:
+///
+/// * **A repeated key accumulates.** `?category=approval&category=ticket` is two categories,
+///   not one and an error.
+/// * **A single value is a one-element list.** `?category=approval` is one category — the case
+///   `serde_urlencoded` refuses outright, which is what broke the filter.
+/// * **A valueless key is a flag, not a malformed pair.** `?archived` is legal URI syntax and
+///   means "on"; only a key that is *neither* valueless nor `name=value` — impossible, in fact,
+///   which is why the third case below exists — is a refusal. The refusal that does happen is
+///   for a **non-numeric `limit`**, because "lots" has no second sensible reading and a page
+///   size that silently defaulted would be a list that lies about how much of it there is.
+///
+/// Percent-decoding failures are the one thing tolerated rather than refused: a `cursor` that
+/// arrived unreadable is a `400` from `build_query` a moment later with a better message.
+fn parse_list_params(raw: Option<&str>) -> Result<ListParams, ApiError> {
+    let mut params = ListParams::default();
+    let Some(raw) = raw else {
+        return Ok(params);
+    };
+
+    for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
+        // A key with no `=` is a bare flag (`?archived`), which is legal URI syntax and means
+        // "on" — so `split_once` yielding nothing is not an error here, it is a valueless key.
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = decode(key);
+        let value = decode(value);
+        match name.as_str() {
+            "category" if !value.is_empty() => params.category.push(value),
+            "priority" if !value.is_empty() => params.priority.push(value),
+            "read" if !value.is_empty() => params.read = Some(value),
+            "channel" if !value.is_empty() => params.channel = Some(value),
+            "before" if !value.is_empty() => params.before = Some(value),
+            "limit" if !value.is_empty() => {
+                params.limit = Some(value.parse().map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_notification",
+                        format!("limit=\"{value}\" is not a whole number"),
+                    )
+                })?);
+            }
+            // The flags are *present*, not true: a checkbox that was ticked sends `archived=1`
+            // and one that was not sends nothing at all, so a bare `?archived` is the same
+            // answer as `?archived=true`. Anything else is ignored rather than refused, so a
+            // client that adds a filter this build does not know still gets its list — and so
+            // does a valueless key that is not a flag at all (`?category`, `?sort`).
+            "archived" => params.archived = parse_flag(&value),
+            // `Some(parse_flag(..))` rather than a bare assignment: absent and off have to
+            // stay different, because absent is the honest "show me everything" and off is
+            // the reader who asked for the inbox. Collapsing them is what made the bare list
+            // unread-only.
+            "with_read" => params.with_read = Some(parse_flag(&value)),
+            _ => {}
+        }
+    }
+    Ok(params)
+}
+
+/// A flag that is present is on unless it explicitly says otherwise.
+///
+/// `1`, `true`, `yes` and `on` are on; `0`, `false`, `no` and `off` are off. **An empty value
+/// is on**, because an empty value is what a *bare* `?archived` carries and a bare flag means
+/// "present" — the same answer as `?archived=true`. The unit test caught this: the first
+/// version listed `""` among the "off" values, which is the one reading that makes `?archived`
+/// do the opposite of what a bare flag means, and the failure is silent because a filtered
+/// list is still a list.
+///
+/// An unrecognised value is **on** too, because a client that sent `?archived=maybe` meant to
+/// filter and the reader's next question would otherwise be "why is my filter being ignored".
+fn parse_flag(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Percent-decode one query-string token, `+` meaning a space.
+fn decode(value: &str) -> String {
+    let bytes = value.replace('+', " ");
+    percent_encoding::percent_decode_str(&bytes)
+        .decode_utf8_lossy()
+        .to_string()
 }
 
 /// A list read's answer.
@@ -259,9 +366,9 @@ pub struct EmitResult {
 pub async fn list(
     State(state): State<AppState>,
     session: CurrentSession,
-    Query(params): Query<ListParams>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Result<Json<ListBody>, ApiError> {
-    let query = build_query(params)?;
+    let query = build_query(parse_list_params(raw.as_deref())?)?;
 
     let page = omnion_notifications::store::list(state.db().pool(), session.user.id, &query)
         .await
@@ -507,6 +614,32 @@ pub async fn emit(
             StatusCode::TOO_MANY_REQUESTS,
             "notification_rate_limited",
             "this actor has emitted too many notifications in the last minute",
+        ));
+    }
+
+    // Recipients are checked *before* the loop, not by the foreign key inside it. The key
+    // answers a bad address by refusing the whole batch, so one stale id in a list of five
+    // costs the caller the four good rows and returns a 500 that quotes the constraint name
+    // to whoever is holding the response. The list is the same fact said in a sentence, and
+    // the caller is told *which* id is wrong so it can drop that one and send the rest.
+    let known = omnion_notifications::store::existing_users(state.db().pool(), &body.user_ids)
+        .await
+        .map_err(map_store)?;
+    if known.len() != body.user_ids.len() {
+        let unknown: Vec<String> = body
+            .user_ids
+            .iter()
+            .filter(|id| !known.contains(id))
+            .map(|id| id.to_string())
+            .collect();
+        return Err(ApiError::bad_request(
+            "unknown_recipient",
+            format!(
+                "{} of {} recipients are not accounts: {}",
+                unknown.len(),
+                body.user_ids.len(),
+                unknown.join(", ")
+            ),
         ));
     }
 
@@ -762,8 +895,6 @@ pub struct PutPreferencesResult {
 }
 
 // ---------------------------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
@@ -848,11 +979,10 @@ fn build_query(params: ListParams) -> Result<ListQuery, ApiError> {
         priorities: params.priority,
         channel: params.channel,
         include_archived: params.archived,
-        // `with_read` is a plain `bool` that already defaults to true, so a client that
-        // named nothing is asking for the whole list. The panel's State menu says "Unread
-        // and read" for exactly this state, so anything else would be the server quietly
-        // filtering a list it is displaying in full.
-        include_read: params.with_read,
+        // `unwrap_or(true)`: a client that named no `with_read` asked for the whole list.
+        // The panel's State menu says "Unread and read" for exactly this state, so anything
+        // else would be the server quietly filtering a list it is displaying in full.
+        include_read: params.with_read.unwrap_or(true),
         before,
         limit: params.limit.unwrap_or(50),
     })
@@ -863,6 +993,7 @@ fn build_query(params: ListParams) -> Result<ListQuery, ApiError> {
 /// Exported as a constant rather than a route: a client that has to make a round trip to learn
 /// the closed list will cache it anyway, and a cached list is a list that goes stale.
 pub const KNOWN_CATEGORIES: [&str; 6] = CATEGORIES;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,7 +1020,7 @@ mod tests {
             priority: vec!["high".to_owned()],
             channel: Some("email".to_owned()),
             archived: true,
-            with_read: true,
+            with_read: Some(true),
             before: None,
             limit: Some(25),
         })

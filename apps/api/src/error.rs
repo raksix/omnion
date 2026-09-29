@@ -1084,15 +1084,11 @@ impl From<AiHubError> for ApiError {
 
 // `ApiError` is `Debug` but not `Display`, so any caller that wants to put a refusal into a
 // log line, a test assertion or a `format!` has to reach for the private `message` field or
-// write `{:?}` and read the whole struct. The message is the only part that is prose a person
-// reads, so that is what `Display` prints — `Display` is the human-facing view of a value and
-// `Debug` is the structural one, and collapsing them would dump `status` and `details` into
-// every test failure that mentions a refusal.
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
+// write `{:?}` and read the whole struct. The `Display` impl above answers that, and it prints
+// the code alongside the message: a refusal read in a test failure names both *what* happened
+// and *why*, where the message alone leaves the reader reaching for the call site. `Display` is
+// the human-facing view of a value and `Debug` is the structural one, and collapsing them
+// would dump `status` and `details` into every test failure that mentions a refusal.
 
 #[derive(Serialize)]
 struct ErrorBody {

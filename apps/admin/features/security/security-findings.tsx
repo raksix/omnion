@@ -50,6 +50,7 @@ import type {
   SecurityFindingStatus,
   SecuritySeverity,
 } from "@/lib/types";
+import { SecurityTabs } from "@/features/security/security-tabs";
 
 const SEVERITIES: SecuritySeverity[] = ["critical", "high", "medium", "low", "info"];
 const STATUSES: SecurityFindingStatus[] = ["open", "acknowledged", "fixed", "ignored"];
@@ -517,6 +518,7 @@ export function SecurityFindingsScreen() {
 
   return (
     <div className="space-y-4" data-security-findings>
+      <SecurityTabs current="findings" />
       <header className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-[12px] text-muted">
           {/* The count is the server's, for the current filter. */}
