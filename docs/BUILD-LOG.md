@@ -4751,3 +4751,56 @@ written and unexecuted, as before.
 **Next.** Read the pass's summary rather than its tail, then the duplicate-queue walkthrough steps.
 The unticked box that was hiding the 500 was the first line I had skipped reading closely for a
 while, which is the argument for reading the *unticked* acceptance criteria, not the ticked ones.
+
+## w8 · tick 15 — one submission, one lead, made true of the data
+
+**What.** The last unticked acceptance box in REQ-117 was "one submission, one lead, no
+duplicates", and reading it found the third read-then-write this branch has shipped. `store::capture`
+enforced idempotency with `find_lead_by_submission(...)` returning early — a `select … where exists`
+**before** an unguarded insert. Between the two statements there was no lock and nothing to
+collide with, so two deliveries of the same `content.form.submitted` arriving together both read
+"not found" and both wrote a lead. The second raised nothing: it is a well-formed row with its own
+dedupe verdict, which is why fifteen ticks of tests never saw it.
+
+**Why it survived so long.** Every way of failing it is invisible, and *every sequential test passes
+against the old code* — two calls in a row find each other's row. `run-crm-assignment.sh` already
+carries the sentence for the round-robin cursor: "a read-then-write cursor passes every sequential
+test and fails here, intermittently." The same shape, a different column, a different request.
+
+**The fix.** `0150_crm_lead_submission_claims.sql` + `modules/crm-intake/src/claims.rs`. A claim
+row per delivery identity, keyed `(source_id, submission_id)`, where the insert's
+`on conflict do nothing` **row count** is the answer — a primary key doing the work the application
+logic used to promise. The claim is taken before the work and completed at all three exits,
+including the rejected and spam rows (they are this submission's one lead too; leaving them open
+would answer "already being captured" for ever on a redelivery, and an operator re-submitting a
+broken form is exactly that case). A claim left open by a crash is **inherited by the next
+delivery**, on the delivery's own path — no sweeper, no schedule, no cleanup job to forget to
+install. That inheritance is the step a bare unique index cannot have, and it is the difference
+between a duplicate lead and a form wedged for ever.
+
+**Proof.**
+
+    scripts/qa/run-crm-claims.sh          7/7
+      — eight barrier-released deliveries of one id → exactly one lead row
+      — proven to fail: neutralising the claim in store.rs → 8 leads, both uuids printed
+    cargo test -p omnion-module-crm-intake --lib    143 passed (was 137)
+    scripts/qa/run-crm-dedupe.sh           10/10   (unchanged)
+    scripts/qa/run-crm-convert.sh           6/6    (unchanged)
+    scripts/qa/run-crm-assign.sh           14/14   (unchanged)
+    cargo build -p omnion-api              0 errors
+
+Migration numbering: high-water across all nine worktrees was 0147 (w5), so this is 0150. The
+claim table's own gate asserts the primary key on `(source_id, submission_id)` exists *before*
+running anything — without it the gate measures nothing, because every sequential test in it still
+passes. Same reason every crm gate refuses to start when pointed at the QA pass's own database:
+they open with `DROP DATABASE`, which kills the pass's API connections twenty routes from the
+cause.
+
+**Not proved.** The browser pass has still not reached the CRM screens — the QA slot was held by
+another writer for this whole tick (load 15, five live stacks). Unit/DB gates only, and the REQ
+says so.
+
+**Next.** The `content.form.submitted` consumer: today the keyed endpoint is the capture path
+because REQ-064's forms module is not on this branch, and the walkthrough drives intake through
+it. When the slot frees, read the pass's *summary* rather than its tail and drive the CRM depth
+steps.
