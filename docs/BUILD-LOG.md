@@ -4004,3 +4004,53 @@ compile error: `disk-guard.sh` dropped a worktree's `target/` for being over its
 incantation is both: build with `CARGO_TARGET_DIR=/dev/shm/w8-target`, then
 `cp /dev/shm/w8-target/debug/omnion-api target/debug/omnion-api` before the pass. A pass that
 builds into a directory another process is allowed to delete will always lose this race.
+
+## wave 4b · REQ-117 slice 3, take four · the retention sweep's control (`a1599a7`)
+
+**A dead API is a promise nobody can keep.** Slice 3 shipped `POST /crm/leads/retention/sweep`,
+permission-guarded and audited, and then two ticks went by with no screen calling it. The
+REQ's own risk line says "retention is configurable with an archive sweep" — an operator who
+reads that has no way to keep it, and the code reads as if they do.
+
+**The dry run is not a nicety; it is the whole design.** This is the one control on
+`/crm/settings/intake` with no undo and no second copy: it clears the only stored body of what
+somebody wrote to the business. Deleting a source keeps its leads; rotating a key can be
+rotated again. So the screen **counts first**, and `data-retention-sweep` does not exist in the
+DOM until a dry run has answered a number *for this window*. Editing the window clears the
+count, and the button with it — the number that justified the press was for a different
+window, and a stale one is how "Clear 412 bodies" becomes "Clear 0". The zero case renders a
+sentence rather than a disabled button, because "nothing is old enough" is information and a
+greyed control is a shrug. `dry_run` reuses the sweep's own predicate as a `select`, so the
+count and the archive cannot disagree, and it **audits nothing** — a preview that appends to
+the audit log on every render is a log full of events that never happened.
+
+**Proof.** `QA_DB=omnion_qa_w8 bash scripts/qa/run-crm-convert.sh` → **6 passed** (one new:
+`the_dry_run_counts_the_sweep_without_erasing_anything` — the count equals what the sweep then
+archives, asking twice answers the same and leaves `payload_bytes` intact, a 3650-day window
+says zero rather than falling back to a default, and the count follows reality after the
+press). `run-crm-autoresponder.sh` → **10/10**, unchanged. `tsc --noEmit` → clean.
+`scripts/qa/walkthrough.cjs` gains fifteen retention steps whose load-bearing assertion is
+**not** that a number appeared but that the erase button is absent before the count and
+absent again after the window changes.
+
+**Two environment facts cost real time and both are worth writing down.** (1) `/dev/shm` is
+shared by nine writers and filled to 99 %; a second `CARGO_TARGET_DIR` for a parallel test run
+dies with `No space left on device (os error 28)` while the first target's **own deps are
+already cached**. Reuse the existing target rather than making a second one. (2) A
+`postgres://omnion:omnion@…:5432` guess is wrong twice over: the QA Postgres is on **5433**,
+and the password is not the obvious one. `scripts/qa/run-crm-*.sh` is the contract — it
+exports the URL and applies the migrations, and guessing its contents produces "14 failed"
+that is the script's configuration, not a regression. The same files also settle the
+`--test-threads=1` question: this module creates and drops a database per test.
+
+**The browser pass is finally running.** It took the slot after the reaper cleared a stale
+place from a holder pid that had been gone for half an hour, and the tmpfs build plus the copy
+back into `target/debug/omnion-api` worked exactly as recorded last tick. It has already
+walked through `crm-leads`, `crm-lead-duplicates`, `crm-intake-sources`, `crm-assignment-rules`
+and `crm-sla-policies`. **The retention steps above were committed after the pass had already
+loaded the old walkthrough, so they have not executed** — that is a deferral, not a pass, and
+the next tick reads the report for the six screens it did walk.
+
+**Next.** Read the pass's report. Then the last slice-3 item that is not blocked on another
+wave — the health line's rendering for a source whose mapping lost a key is present, so what
+remains is the REQ-064 form-editor card, which waits on a module this branch does not carry.
