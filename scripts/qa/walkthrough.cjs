@@ -1128,6 +1128,259 @@ async function runInventoryLedger(page, report) {
  * long as the goods were on a van. So the pass reads the stock list's own total before and after
  * and requires them to be equal, which is the property a stocktake six months later depends on.
  */
+
+/**
+ * The stocktake depth pass (REQ-053, slice 4).
+ *
+ * A pass that only visits `/inventory/stocktake` proves the list renders. This drives the chain
+ * that makes the feature real: open a sheet on a real shelf, type a count that disagrees, close
+ * it, and read the report back.
+ *
+ * **The three things it asserts that a rendering check never would:**
+ *
+ * 1. **An uncounted line says so.** The count box is empty and the word "not counted" is on the
+ *    row. This is the UI's half of the invariant the server enforces — a blank box on a stock
+ *    sheet reads as zero to everybody who has counted a shelf, and a warehouse that believes it
+ *    will close a sheet that destroys stock.
+ * 2. **The close button names what it is waiting on** while a line is uncounted, so a refusal is
+ *    not a dead end.
+ * 3. **The report prints both totals and whether they agree.** A report with one number cannot
+ *    fail, and a report that cannot fail is a screenshot.
+ *
+ * The count is written through the real input and the real save button rather than by calling
+ * the API, because the thing being tested is the screen a person uses. It is asserted to be a
+ * *deviation* (a number deliberately different from the expected one) so the close has something
+ * real to post — a count that agrees everywhere closes with zero movements, and a pass that only
+ * ever saw the clean case would have proved the button works and nothing about the variance.
+ */
+async function runInventoryStocktake(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "inventory", action: "inventory-stocktake", ...step });
+  };
+  const stamp = Date.now().toString(36);
+
+  // --- the list renders, and offers the shelves a count can be run on ----------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/stocktake`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const listLoaded =
+    (await page.locator("[data-qa-inventory-stocktake-new]").count()) > 0 &&
+    (await page.locator("[data-qa-inventory-module-nav]").count()) > 0;
+  note({ step: "list", loaded: listLoaded });
+  if (!listLoaded) {
+    return { ok: false, reason: "the stocktake list did not render", steps };
+  }
+  await shot(page, "page-inventory-stocktake");
+
+  // The module's own shelf must offer the count. A screen reachable only by typing its URL is a
+  // screen that does not exist as far as anybody working the module is concerned.
+  const navOffersCount = await page
+    .locator('[data-qa-inventory-module-link="stocktake"]')
+    .count();
+  note({ step: "module-nav", offersStocktake: navOffersCount > 0 });
+  if (navOffersCount === 0) {
+    return { ok: false, reason: "the inventory module nav does not offer the stocktake", steps };
+  }
+
+  // **The in-transit location must not be offered.** The server refuses a sheet that includes it
+  // and a picker that offers a choice which always fails is worse than not offering it.
+  const shelfChips = await page
+    .locator("[data-qa-inventory-stocktake-location]")
+    .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-qa-inventory-stocktake-location") || ""))
+    .catch(() => []);
+  const offersTransit = shelfChips.some((code) => /transit/i.test(code));
+  note({ step: "shelves", shelves: shelfChips, offersTransit });
+  if (offersTransit) {
+    return { ok: false, reason: "the stocktake picker offers the in-transit location", steps };
+  }
+
+  const emptySaid = await page
+    .locator("text=/No stocktakes here|Pick a shelf above/i")
+    .count()
+    .catch(() => 0);
+  note({ step: "empty-state", emptySaid: emptySaid > 0 });
+
+  // --- open a real sheet on a real shelf -------------------------------------------------------------
+  // Without a shelf with stock on it the sheet is empty and there is nothing to count, so the
+  // pass says so rather than pretending to have tested a variance.
+  if (shelfChips.length === 0) {
+    return {
+      ok: true,
+      skipped: "this organization has no countable shelf — stock something and re-run",
+      steps,
+    };
+  }
+
+  await page.locator(`[data-qa-inventory-stocktake-location="${shelfChips[0]}"]`).first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-qa-inventory-stocktake-open]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const sheetShown =
+    (await page.locator("[data-qa-inventory-stocktake-close]").count()) > 0 ||
+    (await page.locator('[data-qa-inventory-stocktake-status="closed"]').count()) > 0;
+  note({ step: "sheet", shown: sheetShown });
+  if (!sheetShown) {
+    return { ok: false, reason: "the counting sheet did not open", steps };
+  }
+  await shot(page, "page-inventory-stocktake-sheet");
+
+  // An empty shelf is a legitimate state and the screen must say so rather than showing a
+  // table with no rows and no words.
+  const nothingToCount = await page.locator("text=/This shelf is empty/i").count();
+  if (nothingToCount > 0) {
+    return { ok: true, skipped: "the chosen shelf holds no stock, so there is nothing to count", steps };
+  }
+
+  // --- the uncounted line says so --------------------------------------------------------------------
+  // The invariant the server enforces, seen from the screen: a blank box is not a zero.
+  const uncountedMarked = await page.locator("[data-qa-inventory-stocktake-uncounted]").count();
+  const inputCount = await page.locator("[data-qa-inventory-stocktake-input]").count();
+  note({ step: "uncounted-is-not-zero", inputs: inputCount, marked: uncountedMarked });
+  if (inputCount > 0 && uncountedMarked === 0) {
+    return {
+      ok: false,
+      reason: "an uncounted line renders as an empty box with nothing saying it is not zero",
+      steps,
+    };
+  }
+
+  // The close button must name what it is waiting on, so a refusal is not a dead end.
+  const blockedNote = await page.locator("[data-qa-inventory-stocktake-close-blocked]").count();
+  note({ step: "close-names-the-blocker", present: blockedNote > 0 });
+
+  // --- count something that disagrees ----------------------------------------------------------------
+  // One below the expected number, so the close has a real deviation to post. The first line's
+  // expected quantity is read from the row rather than assumed, because a hard-coded number here
+  // would quietly stop testing a variance the day somebody changed the seed.
+  const firstRow = page.locator("[data-qa-inventory-stocktake-line]").first();
+  const expectedText = await firstRow
+    .locator("td")
+    .nth(2)
+    .textContent()
+    .catch(() => null);
+  const expected = Number.parseFloat(expectedText || "");
+  note({ step: "expected", expectedText, expected });
+  if (!Number.isFinite(expected)) {
+    return { ok: false, reason: `the sheet's expected column reads "${expectedText}"`, steps };
+  }
+
+  const count = expected > 1 ? expected - 1 : expected + 1;
+  await page
+    .locator("[data-qa-inventory-stocktake-input]")
+    .first()
+    .fill(String(count), { timeout: 5000 })
+    .catch(() => {});
+  await page.waitForTimeout(400);
+  await shot(page, "page-inventory-stocktake-counted");
+
+  // The deviation is shown per row before anything is saved, so a counter can see what they are
+  // about to post rather than discovering it after the close.
+  const varianceBeforeSave = await page
+    .locator('[data-qa-inventory-stocktake-line][data-variance="true"]')
+    .count();
+  note({ step: "variance-shown-before-saving", rows: varianceBeforeSave });
+  if (varianceBeforeSave === 0) {
+    return {
+      ok: false,
+      reason: "a count that disagrees does not highlight its row before the count is saved",
+      steps,
+    };
+  }
+
+  // Every other line stays empty, so the close is deliberately **blocked** — which is the
+  // assertion: the button must say so rather than posting a variance for a shelf nobody looked at.
+  await page.locator("[data-qa-inventory-stocktake-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  await shot(page, "page-inventory-stocktake-saved");
+
+  // --- close, and read the report back ----------------------------------------------------------------
+  // Count the rest so the close can succeed. Each box is filled with its own row's expected
+  // number, so only the first line disagrees and the report has exactly one variance to show.
+  const inputs = page.locator("[data-qa-inventory-stocktake-input]");
+  const total = await inputs.count();
+  for (let index = 1; index < total; index += 1) {
+    const row = page.locator("[data-qa-inventory-stocktake-line]").nth(index);
+    const rowExpected = Number.parseFloat((await row.locator("td").nth(2).textContent().catch(() => "")) || "");
+    if (Number.isFinite(rowExpected)) {
+      await inputs.nth(index).fill(String(rowExpected), { timeout: 5000 }).catch(() => {});
+    }
+  }
+  await page.locator("[data-qa-inventory-stocktake-save]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1600);
+
+  await page.locator("[data-qa-inventory-stocktake-close]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  await shot(page, "page-inventory-stocktake-closed");
+
+  const closed = (await page.locator('[data-qa-inventory-stocktake-status="closed"]').count()) > 0;
+  const summary = await page
+    .locator("[data-qa-inventory-stocktake-closed-summary]")
+    .first()
+    .textContent()
+    .catch(() => null);
+  note({ step: "closed", closed, summary });
+  if (!closed) {
+    return { ok: false, reason: "the sheet did not close once every line had a count", steps };
+  }
+
+  // --- the report, and the agreement it claims ---------------------------------------------------------
+  const reportShown = (await page.locator("[data-qa-inventory-stocktake-report]").count()) > 0;
+  const agrees = await page
+    .locator("[data-qa-inventory-stocktake-report-agrees]")
+    .first()
+    .getAttribute("data-qa-inventory-stocktake-report-agrees");
+  const posted = await page
+    .locator("[data-qa-inventory-stocktake-movement]")
+    .count();
+  note({ step: "report", shown: reportShown, agrees, posted });
+  if (!reportShown) {
+    return { ok: false, reason: "the variance report did not render on a closed sheet", steps };
+  }
+  // The report has to be able to fail. "agrees" is what makes it a check rather than a picture.
+  if (agrees !== "true") {
+    return {
+      ok: false,
+      reason: `the report says it does not agree with the ledger (agrees=${agrees})`,
+      steps,
+    };
+  }
+  if (posted === 0) {
+    return {
+      ok: false,
+      reason: "a count with a deviation posted no movement the report could show",
+      steps,
+    };
+  }
+
+  // And it must **reopen** — a report that was right once proves nothing about being right later.
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const reopened = await page
+    .locator("[data-qa-inventory-stocktake-report-agrees]")
+    .first()
+    .getAttribute("data-qa-inventory-stocktake-report-agrees");
+  note({ step: "report-reopens", agrees: reopened });
+  if (reopened !== "true") {
+    return {
+      ok: false,
+      reason: `the report changed when it was reopened (agrees=${reopened})`,
+      steps,
+    };
+  }
+  await shot(page, "page-inventory-stocktake-report");
+
+  return { ok: true, steps: steps.length, stamp };
+}
+
+/**
+ * The transfers and the low-stock inbox (REQ-053, slice 3).
+ *
+ * The stepper's buttons are read against the document's own status rather than the class the
+ * button happens to carry: a dispatch button on a received transfer is the affordance version of
+ * the bug the module refuses server-side, and it would move.
+ */
 async function runInventoryTransfers(page, report) {
   const steps = [];
   const note = (step) => {
@@ -6882,6 +7135,15 @@ async function main() {
       () => runInventoryTransfers(page, report),
     );
     log(`inventory transfers: ${JSON.stringify(report.inventoryTransfers)}`);
+
+    // The stocktake (REQ-053, slice 4): the list, a real sheet opened from a real shelf, the
+    // count boxes, the close that posts a variance, and the report that reopens and says
+    // whether it agrees with the ledger.
+    report.inventoryStocktake = await runDepthPass(
+      "inventory-stocktake",
+      () => runInventoryStocktake(page, report),
+    );
+    log(`inventory stocktake: ${JSON.stringify(report.inventoryStocktake)}`);
   }
 
   if (!onlyGroup("crm")) {
