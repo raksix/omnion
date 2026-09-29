@@ -108,14 +108,30 @@ fi
 if [ "$NEEDS_BUILD" = "1" ]; then
   cargo build -p omnion-api
 fi
+# The CSRF secret is the one variable the platform refuses to invent: a deployment that sets
+# none still boots, and every cookie-authenticated mutation then answers 403
+# `csrf_unavailable` (apps/api/src/headers_middleware.rs). Refusing writes beats silently
+# dropping the control, so the product is right -- but a QA stack started without the secret
+# loses EVERY write, and the pass reports that as a product defect: the builder could not
+# create its rule, the rule list stayed empty, and every depth note downstream read as a
+# broken screen rather than a stack that cannot write.
+#
+# It is a test-only value derived from the stack name, it never leaves this box, and it is
+# passed to the RESTART branch too on purpose: `pm2 restart` re-reads the env the process was
+# created with, so a stack started before this line existed keeps the old (empty) env and
+# stays broken for every later pass until it is deleted.
+API_ENV=(
+  "OMNION_DATABASE_URL=postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME"
+  "OMNION_REDIS_URL=redis://127.0.0.1:6380"
+  "OMNION_PORT=$API_PORT"
+  "OMNION_ENV=development"
+)
+API_ENV+=("OMNION_CSRF_SECRET=qa-${QA_STACK:-default}-$(printf %s "$QA_DB_NAME" | cksum | cut -d' ' -f1)")
+
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  pm2 restart "$API_NAME" >/dev/null
+  env "${API_ENV[@]}" pm2 restart "$API_NAME" --update-env >/dev/null
 else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
-  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-  OMNION_PORT="$API_PORT" \
-  OMNION_ENV=development \
-    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+  env "${API_ENV[@]}" pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
