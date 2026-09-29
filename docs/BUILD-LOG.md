@@ -4786,3 +4786,78 @@ first one's leftovers. One stack, one pass, and `ps` before `run.sh`, not after.
 **Honest position: criterion 8 is BUILT, TESTED and PUSHED; the box that would prove it never
 came up.** Nothing is claimed that was not measured. Next tick runs the pass on its own — with
 `free -g` and `ps` checked first — and reads the five notes before anything is ticked.
+
+## 2026-09-29 · omnion-w3 · REQ-004 slice 3 (the three criteria with no code)
+
+**What.** Two commits, and the choice of what to build was decided by reading the
+acceptance list rather than by the queue: fourteen boxes were unticked, ten of them had
+code and were waiting only for a browser pass, and **three had no code at all**. A pass is
+the thing this box has not been able to finish, so building the three that were missing was
+the only work that did not depend on it.
+
+1. `b2d7b7a` — the narrow-screen lock and the missing keyboard verb.
+2. `393687f` — plugin node types in the palette, and an honest error when they vanish.
+
+**The keyboard criterion was unsatisfiable, and that only shows up when you try the thing
+by hand.** Four of its five verbs had a key; the fifth — *connects them* — was bound to a
+10px port dot you have to aim a mouse at. A keyboard author could place two nodes perfectly
+and then be unable to make a rule out of them, and the graph would validate with "trigger
+has no connection" — the one error whose cause is invisible on a screen that looks finished.
+`C` arms the source, the arrows move to the target, `Enter` commits, `Escape` cancels.
+
+Two guards in that commit are the parts worth keeping. **`Enter` commits only while a
+gesture is in flight**, because it also activates whatever is focused and would otherwise
+fire a connect attempt out of every inspector field. And **`preventDefault` is per-case,
+not per-intent**: Escape is shared with the pointer gesture, so preventing on read and
+deciding afterwards that the key was not ours leaves the browser's own Escape cancelled by
+a shortcut that did nothing.
+
+**The narrow-screen lock has a hole exactly the size of a Bluetooth keyboard.** A lock
+written in the pointer handlers lets a phone with a case press `Del` and delete a node on a
+screen the banner calls read-only — so `isReadingKey` is a whitelist (navigation and
+inspection, never mutation) and a shortcut added next year mutates *by default*. `inert` on
+the editing regions, not a pile of `disabled`s: one attribute takes a region out of the tab
+order and out of hit testing, and twelve `disabled`s would each have to be kept in step with
+a new palette entry. The inspector goes inert only when a node is selected, because with
+nothing selected it holds the read-only rule settings a narrow-screen reader came for.
+
+**The plugin criterion's third clause costs nothing, and that is the design rather than a
+convenience.** `graph.rs` already admitted that a plugin node is "added beside" the core
+types, because the core registry is a `const`. The question was whether the plugin registry
+becomes a parameter of the core's *knowledge* or of the *check*; it is the check
+(`validate_with_plugins`). A disabled plugin resolves to `Unknown` — the state a typo
+resolves to — so the existing `unknown_node_type` finding already reports it at edit time
+with the node named, and the only new thing is *which sentence*: "came from a plugin node
+type this organization no longer has enabled — re-enable it". Telling an author their
+working rule is nonsense because an admin disabled something is the fastest way to teach
+people to ignore the problems panel, so a test asserts the two sentences stay apart.
+
+Namespacing (`plugin.<plugin>.<node>`) is the security property and is asserted from both
+sides: a manifest declaring `node: "action"` installs `plugin.mailer.action` and `action`
+still resolves to the core node. **No defaults are invented** — only a `select` seeds a
+value, because that is the one choice the manifest itself made; a `false` in an unset
+boolean is the same lie as a fake `example.com`.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **135 passed, 0 failed** (was 113; 22
+new). `cargo build -p omnion-api` → clean. `apps/admin` `node --test` → **166 passed, 0
+failed** across the workflow suite (was 138; 28 new). `npx tsc --noEmit` → exit 0. Three
+commits' worth of compile errors fixed in the tick, all of them mine and all of them the
+same class: a `&'static str` core type reaching for a run-time value.
+
+**Not ticked, and the reason is the box, not the code.** No browser pass ran: `free -g`
+reads 6 available (my own gate is >8) and `/proc/loadavg` is 15.1 (gate <10), with two live
+walkthroughs from other writers. Fourteen boxes still need a pass — the eleven from earlier
+ticks plus these three — and none of them is closer to closed than it was, because closing
+any of them means running the thing this box cannot finish. The three built here are the
+three that were *missing* rather than *unproven*, which is the only work available that does
+not depend on a pass.
+
+**Next.** One pass, on the w3 stack only, with `free -g` and `ps` checked *first* — and the
+pass carries fourteen notes: `plugin-palette` (badge, tooltip, then absent when disabled),
+`keyboard-pass` (the whole `KEYBOARD_PASS` list, edge and parameter read from the *server*),
+`narrow-lock` (banner, five mutations that change nothing, a card still selectable, Table
+mode still saving), plus the eleven older ones — `workflow-table`, `escape-clears`,
+`shift-click-multi`, `edge-delete`, `validate-classes`, `cmd-s-writes-once`,
+`two-tab-conflict`, `run-from-here`, `pillsPainted`, `step-trace`, `listener`. If the box is
+still short of the gate, the honest move is again to say so rather than to start an
+unwinnable pass.
