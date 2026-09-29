@@ -1002,6 +1002,10 @@ pub fn router(state: AppState) -> Router {
             post(security::bulk).layer(guards::require(&state, "security.manage")),
         )
         .route(
+            "/security/findings.csv",
+            get(security::export).layer(guards::require(&state, "security.read")),
+        )
+        .route(
             "/security/findings",
             get(security::list).layer(guards::require(&state, "security.read")),
         )
