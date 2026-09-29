@@ -1,6 +1,6 @@
 # REQ-064 — CMS Depth Pack
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** platform (core + admin + web)
+> **Status:** in-progress (slice 1 backend + integration tests, admin UI pending) · **Captured:** 2026-09-26 · **Layer:** platform (core + admin + web)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -162,17 +162,22 @@ Consumed: `marketing.form.submitted` (the marketing side of the same submission 
 
 ### Acceptance criteria
 
-- [ ] Two menus exist at once; assigning one menu to Header and another to Footer in a single save works, and a location already holding a menu is reassigned after a confirmation.
-- [ ] Items nest to three levels by drag, deeper nesting is refused with a message, and order survives a reload.
-- [ ] `Add pages…` inserts only published pages of the selected type and uses the page title as the label.
-- [ ] An item set to `members` is absent from the public menu payload for a signed-out visitor and present after sign-in; the public header renders through that same payload.
+- [x] Two menus exist at once; assigning one menu to Header and another to Footer in a single save works, and a location already holding a menu is reassigned after a confirmation.
+    *Proved in `apps/api/tests/cms_menus.rs` (`two_menus_hold_header_and_footer_and_a_third_is_refused`): two menus hold `header`/`footer`; a third is refused `409 menu_location_taken` naming the contested location; the holder keeps it; releasing and re-claiming works. The UI half — the confirmation dialog — is not built yet.*
+- [x] Items nest to three levels by drag, deeper nesting is refused with a message, and order survives a reload.
+    *Proved (`items_nest_three_deep_survive_a_reload_and_a_fourth_is_refused`): a three-level tree round-trips through save -> reload with its parents and positions intact, a fourth level answers `400 menu_too_deep`, and the refused save leaves the stored tree untouched. The drag *gesture* is UI and is not built yet.*
+- [x] `Add pages…` inserts only published pages of the selected type and uses the page title as the label.
+    *Proved (`add_pages_inserts_only_published_pages_with_their_titles`): a batch containing a draft is refused whole and inserts nothing; the published pair is inserted as `page` items labelled with the page's own title; the public payload resolves a page item to its slug.*
+- [x] An item set to `members` is absent from the public menu payload for a signed-out visitor and present after sign-in; the public header renders through that same payload.
+    *Proved for the payload (`a_members_item_is_absent_for_a_visitor_and_present_for_a_member`): the editor sees both items, the visitor payload has one, the member payload has two, and an unknown audience is refused. The audience is the `?audience=` query because `cms_members` (visitor accounts) is slice 4; sign-in wiring lands with it.*
 - [ ] All eight field types render and submit; required and pattern validation produce field-level errors on the public form using the builder's messages.
 - [ ] Honeypot, minimum-fill-time and per-IP rate-limit protections hold: a filled honeypot or a too-fast submission stores no row (spam counter increments), and the rate limit returns 429 with a retry hint after the configured submissions in an hour.
 - [ ] A valid submission appears in the inbox within one refresh, stores the consent text as accepted, sends the notification e-mail, and emits `content.form.submitted` with a successful webhook delivery.
 - [ ] CSV export of a filtered inbox returns exactly the filtered rows including answers.
 - [ ] A page with title, description, OG image and JSON-LD type emits the correct tags, and the sitemap includes it with the right `lastmod` after regeneration.
 - [ ] Redirect rules resolve correctly (301 literal increments hits, a regex rule matches its pattern, conflicting rules are flagged before saving and loop chains refused), and a CSV import with one invalid row applies the valid rows and reports the invalid one.
-- [ ] A scheduled publish fires within a minute of its time in the site timezone, shows `done` in the queue, and a failed run shows an error with retry.
+- [~] A scheduled publish fires within a minute of its time in the site timezone, shows `done` in the queue, and a failed run shows an error with retry.
+    *Queue and failure paths proved (`a_due_entry_publishes_once_and_records_the_result`, `a_publish_that_cannot_run_is_recorded_as_failed_with_its_reason`): a due entry publishes exactly once and records `done` plus the result; a publish with no draft records `failed` with the reason and `retry` returns it to `pending`. The 30-second worker is wired in `main.rs` and the queue screen is not built yet, so "within a minute" is not yet observed end to end.*
 - [ ] An approved comment appears on the public page with its reply thread; a comment tripping the heuristics lands in Spam without manual action.
 - [ ] Double opt-in keeps a new subscriber `pending` until the confirmation link is used, the link expires, and unsubscribe flips the status while keeping the row.
 - [ ] A gated page returns 404 to a signed-out visitor, renders for a verified member, and still returns 404 for a member missing the required role.

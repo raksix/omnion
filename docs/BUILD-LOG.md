@@ -3325,3 +3325,56 @@ Slice 1 is not closed until it reports zero high findings from `runNotifications
 
 **Next.** Close slice 1 on the browser pass, then REQ-021 slice 2: the preference matrix, quiet
 hours, the digest job, the e-mail and webhook adapters and the delivery rows in the drawer.
+
+## 2026-09-28 · wave2 (#13) · REQ-064 slice 1 — menus and scheduled publishing
+
+**What.** The CMS depth pack's first slice: site menus (`/api/v1/menus`, one audience-filtered
+public payload) and the scheduled publishing queue (`/api/v1/publishing/queue`, a 30-second
+worker in this process). Migration `0051_cms_menus_publishing.sql` adds `cms_menus`,
+`cms_menu_items` and `cms_publishing_queue`; `crates/content/src/menus.rs` is the store,
+`crates/content/src/publishing.rs` the queue; `apps/api/src/routes/menus.rs` the HTTP surface
+and `apps/api/src/publishing_runner.rs` the worker.
+
+**Five decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **A location holds one menu, and the conflict is refused.** The natural database expression —
+   a partial unique index over an unnested array — cannot be written, and a `menu_locations`
+   table buys a second write path and a second place for the conflict to hide. So the claim is
+   taken in the store's transaction and refused with the holder named. A navigation that quietly
+   changed shape under two people editing it is how a site's header breaks with nobody to ask.
+2. **The whole tree is one write, with the editor's own ids.** A drag is a reorder and a drop is
+   a reparent, and both are expressed by writing the tree the editor holds. Per-item PATCHes
+   would make "reorder six rows" six requests that can half-apply.
+3. **"Publish now" does not publish.** It moves the instant into the past and the worker runs it.
+   A button with its own lighter publish would leave two definitions of "published" in one
+   platform, and they would disagree within a week.
+4. **The claim is the write.** `claim_due` takes rows with `for update skip locked` and stamps
+   `claimed_at` in the transaction that hands them back, so two workers cannot publish the same
+   revision twice and a stalled one does not stop the queue for everybody else.
+5. **A branch that lost its whole subtree is absent, not an empty disclosure.** A dead control is
+   what the REQ forbids, and "prune what has no visible child" gets this wrong twice — see below.
+
+**Four real defects the tests found, all of which unit tests had passed.**
+
+- `unique (page_id, action) where status = 'pending'` is legal as an **index** and not as a
+  **constraint**: written as a constraint it fails the whole migration file, not the statement.
+- `pages` has no `title` column — the title lives on the *revision* — so the queue's join
+  selected a column that does not exist and every queue read was a 500.
+- `now()` in PostgreSQL is the **transaction** timestamp, so every row in one menu save shares
+  it and the insert-order tie-break did nothing. The column existed and was inert.
+- A submenu whose only child is members-gated rendered as an empty disclosure, because "had
+  children" was measured *after* the audience filter — by which point the child is gone. It is a
+  fact about the tree, and the tree is the tree before anybody's audience is applied.
+
+**Proof.** `cargo test -p omnion-content --lib` -> **118 passed** (8 new, including a test that
+reads the migration file and proves the Rust `LOCATIONS`/`ITEM_TYPES`/`VISIBILITIES` lists and
+the SQL check constraints are the same list). `cargo test -p omnion-permissions --lib` -> **63
+passed**. `cargo test -p omnion-api --lib` -> **163 passed**. `cargo test -p omnion-api --test
+cms_menus` against PostgreSQL -> **13 passed, 0 failed** (acceptance 1-4 and the queue half of 13,
+plus tenancy scoping, read/write permission separation and the cross-organization refusals). All
+34 migrations apply clean in order from empty. `pnpm typecheck` -> 2 successful, 0 errors.
+
+**Next.** The admin UI: `/menus` list, the menu editor (nested tree with drag handles, per-item
+settings, the location rail, the rendered preview strip with the audience toggle) and
+`/publishing/queue`. Then extend `scripts/qa/walkthrough.cjs` so both are in the inventory and
+run the browser pass — which is what closes this slice.
