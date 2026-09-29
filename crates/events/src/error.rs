@@ -29,6 +29,18 @@ pub enum EventsError {
     /// The delivery HTTP client could not be built.
     #[error("webhook client error: {0}")]
     Client(String),
+    /// A redelivery was refused, with the reason the operator needs to act on.
+    ///
+    /// The code travels in the variant rather than being derived, because the three refusals
+    /// (`Unknown`, `AlreadyPending`, `OverCap`) have different codes and one generic code would
+    /// make "wait a moment" and "fix your receiver" look identical in the panel.
+    #[error("cannot redeliver: {message}")]
+    RedeliveryRefused {
+        /// Stable machine-readable code, from [`crate::store::RedeliverRefusal`].
+        code: &'static str,
+        /// The sentence the operator reads.
+        message: &'static str,
+    },
 }
 
 impl EventsError {
@@ -45,6 +57,7 @@ impl EventsError {
             Self::InvalidEndpoint(_) => "invalid_webhook_endpoint",
             Self::InvalidEvent(_) => "invalid_event",
             Self::Client(_) => "internal_error",
+            Self::RedeliveryRefused { code, .. } => code,
         }
     }
 }
