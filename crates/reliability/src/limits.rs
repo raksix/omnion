@@ -345,14 +345,36 @@ pub fn pick<'a>(policies: &'a [LimitPolicy], subject: &Subject) -> Option<&'a Li
 
 /// A lower number is more specific.
 fn specificity(p: &LimitPolicy) -> u8 {
-    match RATE_SCOPES
+    // Scope first, then HOW NARROW the row is inside that scope.
+    //
+    // The second component is the one this used to leave out, and leaving it out is the defect the
+    // request's own words forbid: "the most specific matching policy wins". A policy naming one
+    // subject is plainly more specific than a policy naming every subject in the scope — it is
+    // the difference between "this account gets 1/minute" and "every account gets 4/minute" — and
+    // ordering them only by scope left `priority` to decide, so the operator's tiebreaker silently
+    // became the specificity rule and a broad default could outrank the narrow row that was
+    // written to override it.
+    //
+    // Scale: the scope component is multiplied by 4, which leaves room for the three narrowness
+    // steps below without ever letting a narrowness outrank a whole scope. `u8` is enough for
+    // 4 * 4 + 2 = 18.
+    //
+    // The narrowness offsets INCREASE with broadness, because `pick` takes the MINIMUM: 0 is the
+    // most specific and must therefore be the smallest number. Writing it the other way round
+    // (subtracting) is the same class of mistake as the missing component itself — a score that
+    // ranks correctly on paper and picks the wrong row at runtime, which is precisely what the
+    // first version of this function did and what the test below pins.
+    let scope = RATE_SCOPES
         .iter()
         .position(|s| *s == p.scope)
-        .unwrap_or(RATE_SCOPES.len())
-    {
-        // `usize -> u8` is safe: RATE_SCOPES has four entries and the fallback is its length.
-        i => i as u8,
-    }
+        .unwrap_or(RATE_SCOPES.len());
+    let narrow = match (p.target_id.as_deref(), p.route_pattern.as_deref()) {
+        (Some(_), Some(_)) => 0_u8,
+        (Some(_), None) | (None, Some(_)) => 1,
+        (None, None) => 2,
+    };
+    // `usize -> u8` is safe: RATE_SCOPES has four entries and the fallback is its length.
+    (scope as u8) * 4 + narrow
 }
 
 /// Whether one policy applies to one request.
@@ -607,6 +629,82 @@ mod tests {
         assert_eq!(pick(&all, &subject()).unwrap().scope, "user");
         assert_eq!(pick(&all[..2], &subject()).unwrap().scope, "organization");
         assert_eq!(pick(&all[..1], &subject()).unwrap().scope, "ip");
+    }
+
+    /// "The most specific matching policy wins" means **narrower wins inside a scope**, not
+    /// only "user beats organization beats ip".
+    ///
+    /// This is the half the test above never covered, and the omission was the defect: a policy
+    /// naming one subject and a policy naming every subject in the scope both had the same
+    /// specificity score, so `priority` silently became the specificity rule. An operator who
+    /// wrote "this one account gets 1/minute" to override a broad default got the broad default
+    /// whenever the numbers came out the other way — and the panel showed both rows as
+    /// configured, so there was nothing on screen to contradict the outcome.
+    ///
+    /// `priority` is set to the SAME low number on the broad policy on purpose: the narrow row
+    /// has to win without help from the tiebreaker, or this is a priority test wearing a
+    /// specificity test's name.
+    #[test]
+    fn a_narrower_policy_beats_a_broad_one_in_the_same_scope_regardless_of_priority() {
+        let address: IpAddr = "198.51.100.9".parse().expect("the literal parses");
+        let request = Subject {
+            user_id: None,
+            organization_id: None,
+            ip: Some(address),
+            route: None,
+        };
+
+        let mut broad = policy("ip", 1000, 0, 60);
+        broad.priority = 0;
+        let mut narrow = policy("ip", 1, 0, 60);
+        narrow.target_id = Some(address.to_string());
+        narrow.priority = 100;
+
+        // Order in the vector is deliberately the other way round: a resolver that stopped at
+        // the first match would pass the reverse case and fail this one.
+        let both = vec![broad.clone(), narrow.clone()];
+        let winner = pick(&both, &request).expect("both policies match the address");
+        assert_eq!(
+            winner.limit_count, 1,
+            "the policy that NAMES the subject must win over the one that names every subject"
+        );
+        assert_eq!(winner.target_id.as_deref(), Some("198.51.100.9"));
+
+        // Both orderings, because "the list is in resolution order" is a promise the panel makes
+        // and a resolver that depended on the caller sorting it would break the moment a row is
+        // edited in the panel rather than created through the API.
+        let reversed = vec![narrow, broad];
+        assert_eq!(
+            pick(&reversed, &request).map(|p| p.limit_count),
+            Some(1),
+            "specificity must not depend on where the row sits in the list"
+        );
+    }
+
+    /// Scope still outranks narrowness: a per-IP row must not outrank a per-user one, or an
+    /// operator tuning an account's budget would be beaten by a row about a shared address.
+    #[test]
+    fn a_scope_wide_policy_beats_a_narrower_policy_in_a_broader_scope() {
+        let address: IpAddr = "198.51.100.9".parse().expect("the literal parses");
+        let user = uuid::Uuid::from_u128(42);
+        let request = Subject {
+            user_id: Some(user),
+            organization_id: None,
+            ip: Some(address),
+            route: None,
+        };
+
+        let mut broad_user = policy("user", 100, 0, 60);
+        broad_user.priority = 0;
+        let mut narrow_ip = policy("ip", 1, 0, 60);
+        narrow_ip.target_id = Some(address.to_string());
+        narrow_ip.priority = 0;
+
+        assert_eq!(
+            pick(&[narrow_ip, broad_user], &request).map(|p| p.scope.clone()),
+            Some("user".to_owned()),
+            "the scope list's order is the outer rule; narrowness only breaks ties inside it"
+        );
     }
 
     #[test]

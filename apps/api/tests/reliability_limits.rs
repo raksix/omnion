@@ -44,6 +44,18 @@ use uuid::Uuid;
 
 /// A client address used only by this suite, so its counter cannot collide with anything else on
 /// the shared development Redis. `198.51.100.x` is the RFC 5737 documentation range.
+/// The address the suite spends its budget against.
+///
+/// **One per test, not one for the suite.** The counter key is
+/// `scope + window bucket + hash(subject)` with no policy id in it, and that is deliberate:
+/// adding the id would hand every new policy a FRESH budget for a subject that is already
+/// over its old one, which turns "raise this limit" into a way to bypass it. The consequence is
+/// that the counter belongs to the SUBJECT, so two tests sharing an address share a counter and
+/// the second one inherits the first one's spending. A shared `CLIENT_IP` therefore made the
+/// suite order-dependent — every test after the first read a counter that was already spent.
+///
+/// The address is a parameter of the helpers rather than a constant, so a test that wants its own
+/// budget says so at the call site.
 const CLIENT_IP: &str = "198.51.100.88";
 
 /// The ceiling this suite writes. Small enough that the burst is short, large enough that the
@@ -277,7 +289,7 @@ fn suite_policy() -> LimitPolicy {
 /// asserted there, because a saved policy the running process keeps ignoring turns every
 /// assertion below into a test of whatever was loaded at boot. The counter is cleared through the
 /// same key builder the middleware uses — not a hand-built string that could drift.
-async fn install_suite_policy(state: &AppState) -> LimitPolicy {
+async fn install_suite_policy(state: &AppState, client_ip: &str) -> LimitPolicy {
     let policy = suite_policy();
     let saved = omnion_reliability::store::insert_policy(state.db().pool(), &policy)
         .await
@@ -286,7 +298,7 @@ async fn install_suite_policy(state: &AppState) -> LimitPolicy {
     let subject = omnion_reliability::limits::Subject {
         user_id: None,
         organization_id: None,
-        ip: Some(CLIENT_IP.parse().expect("the literal address parses")),
+        ip: Some(client_ip.parse().expect("the literal address parses")),
         route: None,
     };
     let key = subject
@@ -343,14 +355,14 @@ async fn a_burst_over_the_ceiling_is_refused_with_the_headers_the_request_demand
     let Some(state) = live_state().await else {
         return;
     };
-    let policy = install_suite_policy(&state).await;
+    let policy = install_suite_policy(&state, "198.51.100.101").await;
 
     let mut statuses = Vec::new();
     let mut refused = None;
 
     // One request past the line, so the refusal cannot be an off-by-one in the harness.
     for attempt in 1..=ceiling() + 1 {
-        let response = call_from(&state, search_request(), CLIENT_IP).await;
+        let response = call_from(&state, search_request(), "198.51.100.101").await;
         statuses.push(response.status);
         if response.status == StatusCode::TOO_MANY_REQUESTS {
             refused = Some((attempt, response));
@@ -442,9 +454,9 @@ async fn an_allowed_request_carries_the_remaining_budget() {
     let Some(state) = live_state().await else {
         return;
     };
-    let policy = install_suite_policy(&state).await;
+    let policy = install_suite_policy(&state, "198.51.100.102").await;
 
-    let response = call_from(&state, search_request(), CLIENT_IP).await;
+    let response = call_from(&state, search_request(), "198.51.100.102").await;
     assert_ne!(
         response.status,
         StatusCode::TOO_MANY_REQUESTS,
@@ -469,18 +481,18 @@ async fn the_dry_run_names_the_same_policy_and_does_not_spend_the_budget() {
     let Some(state) = live_state().await else {
         return;
     };
-    let policy = install_suite_policy(&state).await;
+    let policy = install_suite_policy(&state, "198.51.100.103").await;
     let (_user, token) = sign_in(&state).await;
 
     // Spend two real requests first, so the dry-run has something true to report.
     for _ in 0..2 {
-        let _ = call_from(&state, search_request(), CLIENT_IP).await;
+        let _ = call_from(&state, search_request(), "198.51.100.103").await;
     }
 
     let ask = || {
         let mut request = json_post(
             "/api/v1/reliability/rate-limits/evaluate",
-            json!({ "scope": "ip", "ip": CLIENT_IP }),
+            json!({ "scope": "ip", "ip": "198.51.100.103" }),
         );
         request
             .headers_mut()
@@ -488,7 +500,7 @@ async fn the_dry_run_names_the_same_policy_and_does_not_spend_the_budget() {
         request
     };
 
-    let first = call_from(&state, ask(), CLIENT_IP).await;
+    let first = call_from(&state, ask(), "198.51.100.103").await;
     assert_eq!(
         first.status,
         StatusCode::OK,
@@ -516,7 +528,7 @@ async fn the_dry_run_names_the_same_policy_and_does_not_spend_the_budget() {
     // diagnostic tool that consumes what it measures is a tool an operator cannot use twice, and
     // a refusal they are diagnosing would be explained by a number the explanation itself
     // changed.
-    let second = call_from(&state, ask(), CLIENT_IP).await;
+    let second = call_from(&state, ask(), "198.51.100.103").await;
     assert_eq!(
         second.body["counted"]["count"],
         json!(2),
@@ -534,10 +546,10 @@ async fn a_probe_is_never_refused_however_much_it_is_polled() {
     let Some(state) = live_state().await else {
         return;
     };
-    let policy = install_suite_policy(&state).await;
+    let policy = install_suite_policy(&state, "198.51.100.104").await;
 
     for _ in 0..(ceiling() + 3) {
-        let response = call_from(&state, get("/healthz"), CLIENT_IP).await;
+        let response = call_from(&state, get("/healthz"), "198.51.100.104").await;
         assert_ne!(
             response.status,
             StatusCode::TOO_MANY_REQUESTS,
@@ -556,11 +568,11 @@ async fn refusals_roll_up_into_one_row_per_window() {
     let Some(state) = live_state().await else {
         return;
     };
-    let policy = install_suite_policy(&state).await;
+    let policy = install_suite_policy(&state, "198.51.100.105").await;
 
     let mut refusals = 0;
     for _ in 0..(ceiling() + 3) {
-        let response = call_from(&state, search_request(), CLIENT_IP).await;
+        let response = call_from(&state, search_request(), "198.51.100.105").await;
         if response.status == StatusCode::TOO_MANY_REQUESTS {
             refusals += 1;
         }
@@ -572,7 +584,7 @@ async fn refusals_roll_up_into_one_row_per_window() {
         .expect("the rollup must be readable");
     let mine: Vec<_> = rows
         .iter()
-        .filter(|row| row.scope == "ip" && row.target_id.as_deref() == Some(CLIENT_IP))
+        .filter(|row| row.scope == "ip" && row.target_id.as_deref() == Some("198.51.100.105"))
         .collect();
 
     assert_eq!(
@@ -713,15 +725,19 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     let Some(state) = live_state().await else {
         return;
     };
-    let policy = install_suite_policy(&state).await;
+    let policy = install_suite_policy(&state, "198.51.100.108").await;
     let (_user, token) = sign_in(&state).await;
 
-    // A second, stricter policy for the same scope: priority decides, so this one wins.
+    // A second, stricter policy for the same scope. `pick` orders by SPECIFICITY first and only
+    // then by priority, and a policy that names a target is more specific than one that does not
+    // — so the narrower row wins on specificity alone and `priority` is what settles two rows of
+    // equal shape. The suite's own policy is broad (no target), which is what makes this a
+    // specificity test rather than a priority one.
     let stricter = LimitPolicy {
         id: None,
         name: "w6 stricter".to_owned(),
         scope: "ip".to_owned(),
-        target_id: Some(CLIENT_IP.to_owned()),
+        target_id: Some("198.51.100.108".to_owned()),
         route_pattern: None,
         limit_count: 1,
         window_seconds: WINDOW_SECONDS,
@@ -735,11 +751,51 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
         .expect("the stricter policy must be stored");
     omnion_api::reliability_middleware::reload_from_store(&state).await;
 
+    // `reload_from_store` re-reads the WHOLE table, so a policy an earlier test left behind —
+    // or one a sibling writer's walk put in the same database — is in the list this request is
+    // decided by. That is correct behaviour for the product (a save must reach the running
+    // process) and it is exactly why this walk has to assert WHICH policy won rather than that
+    // *something* was refused. Without the check, a broader stale policy silently outranks the
+    // strict one and the failure reads as "the save did not take effect" when the save worked.
+    let installed = omnion_api::reliability_middleware::installed()
+        .expect("the layer is installed — this test installed it")
+        .current();
+    let winning = omnion_reliability::limits::pick(
+        &installed,
+        &omnion_reliability::limits::Subject {
+            user_id: None,
+            organization_id: None,
+            ip: Some("198.51.100.108".parse().expect("the literal address parses")),
+            route: None,
+        },
+    );
+    // `p.id` is `Option<Option<Uuid>>` — an in-memory policy has no id, a stored one does — so
+    // the comparison flattens. A leftover row with no id would be a different policy than the
+    // one this test stored, and flattening is what makes that visible.
+    let saved_id = saved.id.expect("a stored policy carries its id");
+    assert_eq!(
+        winning.and_then(|p| p.id),
+        Some(saved_id),
+        "the stricter policy must win the resolution; a broader leftover outranked it"
+    );
+
     // The first request is served, the second is refused — under the NEW ceiling of one, not the
     // four the layer was holding a moment ago.
-    let first = call_from(&state, search_request(), CLIENT_IP).await;
+    //
+    // Both go out with the session cookie, deliberately: an authenticated request resolves a
+    // `user` subject as well as an address, so this walks the case where a caller is subject to
+    // BOTH scopes and the stricter one has to win. Sending these signed out would prove only the
+    // address scope, and the test above already covers that.
+    let signed_in = || {
+        let mut request = search_request();
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie_header(&token));
+        request
+    };
+    let first = call_from(&state, signed_in(), "198.51.100.108").await;
     assert_ne!(first.status, StatusCode::TOO_MANY_REQUESTS);
-    let second = call_from(&state, search_request(), CLIENT_IP).await;
+    let second = call_from(&state, signed_in(), "198.51.100.108").await;
     assert_eq!(
         second.status,
         StatusCode::TOO_MANY_REQUESTS,
@@ -754,7 +810,7 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     // And the dry-run agrees, because it reads the same list.
     let mut ask = json_post(
         "/api/v1/reliability/rate-limits/evaluate",
-        json!({ "scope": "ip", "ip": CLIENT_IP }),
+        json!({ "scope": "ip", "ip": "198.51.100.108" }),
     );
     ask.headers_mut().insert(header::COOKIE, cookie_header(&token));
     let evaluate = call_from(&state, ask, "127.0.0.1").await;
