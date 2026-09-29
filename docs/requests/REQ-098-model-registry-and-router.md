@@ -1,6 +1,6 @@
 # REQ-098 — Model Registry & Router
 
-> **Status:** done (5 slices: `a417ce9` … `3611819`, gates closed `f0f0e00`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** done (5 slices: `a417ce9` … `3611819`, closing gate `5f1387d`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > Slice 1 shipped (`a417ce9` · `13c3146` · `32e4442`): the price columns and their two vocabularies,
 > the narrowable listing, the price write path and the catalog screen. Slice 2 (`0244b29` · `7fa1f89` ·
 > `b0a3a25` · `1a14298`): the task maps, the feature pins, the resolution order and the dry run.
