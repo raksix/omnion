@@ -1122,6 +1122,9 @@ async function runEarlyDepthPass(name, run, { context, adopt, prepare }) {
   log(`depth pass ${name} failed: ${lastReason}`);
   record({ page: "qa", action: "depth-pass-failed", pass: name, reason: lastReason });
   return { ok: false, steps: 0, reason: lastReason };
+}
+
+/**
  * The backup centre, driven end to end (REQ-013, slice 1).
  *
  * The assertion that matters is not "the screen rendered" — it is that the five parts
