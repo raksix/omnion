@@ -5451,3 +5451,64 @@ panel, which no store test can do.
 **Six ticks of "the slot is held" were four different causes wearing one sentence**: a live foreign pass, a
 crashed pass's corpse, a reaper that only ran on entry, and a missing CSRF secret. The cheapest check on this
 box — `git status` before believing a pass failure — is still the one nobody runs.
+
+### 2026-09-29 · w8 tick 24 · REQ-117 slice 3 — the first-touch merge, and a lookup that compared two names
+
+`f3ec12f` — **acceptance 6 was broken and its own box said so.** The line reads "a second submission
+from the same visitor keeps the original first touch", and `Attribution::merge_first_touch` has
+implemented that correctly since slice 1 with a unit test over it. The defect sat one level above,
+in `store::merge_attribution`, the impure function that decides *whose* first touch to merge:
+
+```text
+let Some(key) = submission.payload.get("email")        // the RAW payload's key
+else { return Ok(later.clone()) };
+select ... where organization_id = $1 and source_id = $2 and lower(email) = $3
+```
+
+`insert_lead` writes `mapped.get("email")` into that column. **Two names for one value, one level
+apart.** Every source whose form calls the field anything but `email` — `e_mail`, `contact_email`,
+`eposta`, `your_email`, the single most ordinary thing a form does — found no first row, the merge
+returned the later visit untouched, and the second submission **overwrote the campaign that first
+brought the visitor in**. A phone-identified visitor lost it as well: the lookup had no phone arm,
+though `dedupe_key` falls back to one.
+
+**Fixed by asking one function the question instead of two.** `dedupe::dedupe_key(mapped)` is the
+key now, plus a phone arm. It is the function that already answers "which stored lead is this the
+same person as" for the duplicate queue, so the attribution merge and the queue can no longer
+disagree about who somebody is. The phone arm compares the *mapped* value to the *stored* column,
+which `e164_lite` has already normalized — like with like.
+
+**Why it survived a season of gates: every fixture maps `email` from a key called `email`.** The two
+names coincided, so the wrong lookup answered the right question and every test in the crate was
+green. The unit tests could not reach it either — they drive `merge_first_touch` with hand-built
+`Attribution` values and never touch the call that decides *whose row* to read. **The cheapest way to
+write a test that cannot fail is to name a source key that differs from the target**, and no fixture
+in this crate did until today.
+
+**This is the fifth time this module has shipped a correct, unit-tested function with no caller able
+to produce the state it describes** — after the round-robin cursor, the autoresponder reservation, the
+SLA reminder and the binding-health check. It is the **mirror image** of those four: there the
+*caller* was missing; here the caller existed, ran on every submission, and the *pure* half was the
+one nobody doubted. A test on the pure function is not a test of the impure one that decides when to
+apply it.
+
+**Proof.** `scripts/qa/run-crm-attribution.sh` **4/4**, and **proven to fail** — with the store fix
+stashed the gate is **2/4**, both failures quoting the wrong campaign verbatim
+(`left: Some("autumn-sale")` where the first touch is `spring-sale`). The two regression guards (an
+`email`-named field; a campaign-less second visit) stay green, which is what shows the gate names the
+defect rather than its neighbourhood. All nine sibling CRM gates unchanged: intake PASS, dedupe 10,
+claims 7, verdict-rows 7, binding-health 5, autoresponder 10, convert 6, module lib 159, 0 clippy in
+the files touched.
+
+**Not closed, stated rather than buried.** The REQ-064 form-editor card is still the one screen slice
+3 owes, and no full `scripts/qa/run.sh` has completed on this branch since the walkthrough roll-up fix
+(`793ce78`) landed — the last run's counts live in `diagnostics.json` because that fix came after it.
+This tick therefore does not close the REQ, and says so instead of implying otherwise.
+
+**Left alone deliberately.** `scripts/qa/run.sh` is still dirty from a parallel session in this
+worktree and `scripts/qa/cargo-slot{,-test}.sh` are untracked additions there. Not my wave's file,
+not committed, not reverted.
+
+**Next.** (1) The REQ-064 form-editor card — the last screen of slice 3. (2) A full QA pass on the
+private stack now that the roll-up is fixed, to get real high/medium counts. (3) `git status` first:
+the dirty `run.sh` is a gate precondition, and that is a one-command check.
