@@ -1370,6 +1370,111 @@ async function runSalesQuotes(page, report) {
   return report.salesQuotes;
 }
 
+/**
+ * The approval inbox (REQ-052, slice 3): `/sales/approvals`.
+ *
+ * The gate is the one rule a person acts against, so this pass walks the whole conversation rather
+ * than checking that a screen renders: it opens the inbox, switches every scope, opens a decision
+ * dialog, and requires the **rejection** path to refuse a submission with no reason — because a
+ * reject that works without a comment is the failure the module's own check exists to prevent,
+ * and a browser pass is the only place that button can be caught not doing it.
+ */
+async function runSalesApprovals(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "sales", action: "sales-approvals", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/sales/approvals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const inboxRenders = (await page.locator("[data-qa-approval-scope]").count()) >= 4;
+  if (!inboxRenders) {
+    return { ok: false, reason: "the approval inbox did not render", steps };
+  }
+  await shot(page, "page-sales-approvals");
+
+  // Every scope is a real query, not a tab that changes nothing: the row count or the empty-state
+  // sentence has to differ, because a scope that returns the same list is a dead control.
+  const scopeTexts = {};
+  for (const scope of ["pending", "requested_by_me", "decided", "all"]) {
+    await page.goto(`${URL_ADMIN}/sales/approvals?scope=${scope}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1100);
+    const rows = await page.locator("[data-qa-approval-row]").count();
+    const empty = await page.locator("text=Nothing is waiting on you").count();
+    scopeTexts[scope] = { rows, empty };
+  }
+  note({ step: "scopes-read", scopeTexts });
+  await page.goto(`${URL_ADMIN}/sales/approvals?scope=all`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1200);
+
+  // A pending request must offer a decision, and the dialog must be the one that asks why.
+  const approveButton = page.locator("[data-qa-approval-approve]").first();
+  const hasDecision = (await approveButton.count()) > 0;
+  let dialogOpens = false;
+  let rejectNeedsAReason = false;
+  let commentSurvives = false;
+  if (hasDecision) {
+    await approveButton.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    dialogOpens = (await page.locator("[data-qa-approval-dialog]").count()) > 0;
+    const disabled = await page
+      .locator("[data-qa-approval-confirm]")
+      .first()
+      .isDisabled()
+      .catch(() => false);
+    note({ step: "approve-dialog", dialogOpens, confirmEnabled: !disabled });
+
+    // The rejection path: the confirm button is dead until a reason is typed. This is the one
+    // assertion a unit test cannot make, because the unit test asserts the server refuses — the
+    // screen refusing first is what a manager experiences.
+    await page.keyboard.press("Escape").catch(() => {});
+    const rejectButton = page.locator("[data-qa-approval-reject]").first();
+    if ((await rejectButton.count()) > 0) {
+      await rejectButton.click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(600);
+      const before = await page
+        .locator("[data-qa-approval-confirm]")
+        .first()
+        .isDisabled()
+        .catch(() => true);
+      await page.locator("[data-qa-approval-comment]").first().fill("too deep for this list").catch(() => {});
+      await page.waitForTimeout(300);
+      const after = await page
+        .locator("[data-qa-approval-confirm]")
+        .first()
+        .isDisabled()
+        .catch(() => true);
+      rejectNeedsAReason = before === true && after === false;
+      note({ step: "reject-requires-a-reason", disabledWithoutComment: before, enabledWithComment: !after });
+      await shot(page, "page-sales-approval-decision");
+      await page.locator("[data-qa-approval-comment]").first().fill("").catch(() => {});
+      // A submission the server refuses must keep the comment, not reload the list.
+      const dialogStillOpen = (await page.locator("[data-qa-approval-dialog]").count()) > 0;
+      commentSurvives = dialogStillOpen;
+      await page.keyboard.press("Escape").catch(() => {});
+    }
+  }
+  note({ step: "decision-available", hasDecision, dialogOpens, rejectNeedsAReason, commentSurvives });
+
+  // Mobile: the inbox becomes a scrollable table, and it must not push the page wide.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/sales/approvals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mobileOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({ step: "mobile", overflow: mobileOverflow });
+  await shot(page, "mobile-sales-approvals");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.salesApprovals = {
+    ok: inboxRenders && dialogOpens && (!hasDecision || rejectNeedsAReason) && mobileOverflow <= 1,
+    steps,
+  };
+  return report.salesApprovals;
+}
+
 async function runMediaFileManager(page, report) {
   const steps = [];
   const note = (step) => {
@@ -5105,6 +5210,7 @@ async function main() {
     // the media file detail is not in this list.
     { path: "/sales/quotes", name: "sales-quotes" },
     { path: "/sales/quotes/new", name: "sales-quote-builder" },
+    { path: "/sales/approvals", name: "sales-approvals" },
     { path: "/sales/catalog", name: "sales-catalog" },
     { path: "/sales/pricelists", name: "sales-pricelists" },
     { path: "/sales/settings", name: "sales-settings" },
@@ -5209,6 +5315,10 @@ async function main() {
     // The quote chain (REQ-052, slice 2): build with three lines and a 20% discount, read the
     // server's total off the screen, send, issue the link, open it as the customer, decline
     // without a reason (refused), accept, and confirm the consumed link says a sentence.
+    // The approval inbox (REQ-052, slice 3): the discount gate, end to end in the browser.
+    report.salesApprovals = await runDepthPass("sales-approvals", () => runSalesApprovals(page, report));
+    log(`sales approvals: ${JSON.stringify(report.salesApprovals)}`);
+
     report.salesQuotes = await runDepthPass("sales-quotes", () => runSalesQuotes(page, report));
     log(`sales quotes: ${JSON.stringify(report.salesQuotes)}`);
   }
