@@ -36,6 +36,7 @@ use omnion_content::{
 use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration as StdDuration;
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -64,6 +65,26 @@ pub struct CreateFormRequest {
     /// empty form that accepts nothing, which is worse than one that is obviously not ready.
     #[serde(default)]
     pub fields: Vec<FieldBody>,
+    /// Who the submission notification goes to.
+    ///
+    /// This used to be settable only by a follow-up `PUT`, which made a form born without
+    /// recipients: the panel saved the form, published it, and the notification had nobody to
+    /// go to until somebody remembered to open the settings tab. The settings are the
+    /// definition of a form, so they are part of creating one.
+    #[serde(default)]
+    pub notify_emails: Option<Vec<String>>,
+    /// Subject template, with `{{form_name}}` and `{{submitted_at}}` placeholders.
+    #[serde(default)]
+    pub notify_subject: Option<String>,
+    /// What happens after a submission: `message` or `redirect`.
+    #[serde(default)]
+    pub submit_action: Option<String>,
+    /// Inline success message, when the action is `message`.
+    #[serde(default)]
+    pub submit_message: Option<String>,
+    /// Post-submission redirect, when the action is `redirect`.
+    #[serde(default)]
+    pub redirect_url: Option<String>,
 }
 
 /// One field as the builder submits it.
@@ -477,6 +498,33 @@ pub async fn create_form(
         Some(current.user.id),
     )
     .await?;
+
+    // The notification settings arrive with the form, and go through the same validation the
+    // settings tab applies — an address that is not one is refused here too, rather than being
+    // stored and then discovered by the first send that fails.
+    let wants_settings = body.notify_emails.is_some()
+        || body.notify_subject.is_some()
+        || body.submit_action.is_some()
+        || body.submit_message.is_some()
+        || body.redirect_url.is_some();
+    let form = if wants_settings {
+        omnion_content::update_form(
+            state.db().pool(),
+            site.id,
+            form.id,
+            &FormChanges {
+                notify_emails: body.notify_emails,
+                notify_subject: body.notify_subject,
+                submit_action: body.submit_action,
+                submit_message: body.submit_message,
+                redirect_url: body.redirect_url,
+                ..FormChanges::default()
+            },
+        )
+        .await?
+    } else {
+        form
+    };
 
     record(
         &state,
@@ -902,6 +950,12 @@ pub async fn public_submit(
             }),
         )
         .await;
+
+        // The builder's own notification, sent through the platform mail path the workflow
+        // engine uses. It runs AFTER the row exists and AFTER the event, so a visitor is never
+        // kept waiting on a mail server, and so an owner who wired an automation to
+        // `content.form.submitted` still gets theirs even if SMTP is down.
+        notify(&state, &form, &fields, stored).await;
     }
 
     Ok((
@@ -1156,5 +1210,160 @@ fn emit(
         if let Err(error) = bus::emit(pool, NewEvent::new(event).payload(payload)).await {
             tracing::warn!(event, %error, "event bus refused an event");
         }
+    }
+}
+
+/// What became of a submission's notification. The owner of a contact form has to be able to
+/// answer "did the mail go out?", and the only way to answer it is for the attempt to leave a
+/// record — a send that is silent in both directions is indistinguishable from a broken form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotificationOutcome {
+    /// Sent to every recipient.
+    Sent,
+    /// The builder named nobody, so there was nothing to send.
+    NoRecipients,
+    /// Platform mail is switched off (`OMNION_MAIL_ENABLED`), so nothing was attempted.
+    MailDisabled,
+    /// A transport error, with the transport's own words. The submission is stored either way.
+    ///
+    /// The reason is a `String` and not a `&'static str` because the only thing that knows why
+    /// a send failed is the client that tried: an operator looking at the inbox wants to see the
+    /// server's refusal ("550 no such user", "connection refused"), and replacing it with a
+    /// fixed phrase throws away the only part they can act on.
+    Failed(String),
+}
+
+/// Send a stored submission's notification to the addresses the builder named.
+///
+/// Three rules, and each of them is a decision rather than an implementation detail:
+///
+/// * **The words come from the content crate, the transport from the platform mail path.**
+///   `omnion_automation::mail` is the same client the workflow engine's `send_email` step
+///   uses, so a site that has configured SMTP for its automations gets its form notifications
+///   for free and there is exactly one place where "this platform can send mail" is decided.
+///
+/// * **A failure never fails the submission.** The visitor's message is already a row, and
+///   answering 500 to somebody who just sent you a contact form because your mail server is
+///   unreachable makes them send it again — which is how a site gets five copies of the same
+///   message and an owner with no idea why. The failure is recorded and logged instead.
+///
+/// * **The attempt is recorded, not just logged.** A log line rotates away and is invisible to
+///   the person who actually needs it; the submission row carries the outcome forever, and the
+///   inbox can show it.
+#[allow(clippy::too_many_lines)]
+async fn notify(
+    state: &AppState,
+    form: &Form,
+    fields: &[FormField],
+    submission: &omnion_content::Submission,
+) -> NotificationOutcome {
+    let note = omnion_content::forms_notify::render(form, fields, submission);
+    if note.to.is_empty() {
+        // Recording happens on EVERY outcome, including the two that send nothing — and the
+        // first version of this returned early without it, which quietly undid the reason the
+        // columns exist: "the builder named nobody" is an owner's fix in the form editor and
+        // "platform mail is switched off" is an operator's fix in the environment, and the
+        // walk caught both rows sitting at NULL, which is indistinguishable from a route that
+        // was never reached.
+        record_notification(state, form, submission, NotificationOutcome::NoRecipients).await;
+        return NotificationOutcome::NoRecipients;
+    }
+    let mail = &state.config().mail;
+    if !mail.is_usable() {
+        tracing::warn!(
+            form = %form.key,
+            recipients = note.to.len(),
+            "a submission is waiting to be notified but platform mail is switched off"
+        );
+        record_notification(state, form, submission, NotificationOutcome::MailDisabled).await;
+        return NotificationOutcome::MailDisabled;
+    }
+
+    let mut settings =
+        omnion_automation::MailSettings::new(mail.host.clone(), mail.port, mail.from.clone())
+            .with_sending(true)
+            .with_timeout(StdDuration::from_millis(mail.timeout_ms.max(1)));
+    if let (Some(username), Some(password)) = (&mail.username, &mail.password) {
+        settings = settings.with_credentials(username.clone(), password.clone());
+    }
+
+    // One message per recipient rather than one message with twenty `To:` headers: a shared
+    // inbox then shows which address was reached, and nobody's address is disclosed to the
+    // other nineteen. A recipient that fails does not stop the others — a form that notifies
+    // three people and reaches one is still worth having sent, and the failure is reported.
+    let mut sent = 0usize;
+    let mut last_error: Option<String> = None;
+    for address in &note.to {
+        let email =
+            omnion_automation::Email::new(address.clone(), note.subject.clone(), note.body.clone());
+        match omnion_automation::mail::send(&settings, &email).await {
+            Ok(()) => sent += 1,
+            Err(error) => {
+                tracing::warn!(%address, form = %form.key, %error, "a form notification did not send");
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    let outcome = if sent == note.to.len() {
+        NotificationOutcome::Sent
+    } else {
+        NotificationOutcome::Failed(
+            last_error.unwrap_or_else(|| format!("{sent} of {} recipients reached", note.to.len())),
+        )
+    };
+    record_notification(state, form, submission, outcome.clone()).await;
+    outcome
+}
+
+/// Persist what happened to the notification, on the submission's own row.
+async fn record_notification(
+    state: &AppState,
+    form: &Form,
+    submission: &omnion_content::Submission,
+    outcome: NotificationOutcome,
+) {
+    let (status, detail): (&str, Option<&str>) = match &outcome {
+        NotificationOutcome::Sent => ("sent", None),
+        NotificationOutcome::NoRecipients => ("skipped", Some("no recipients configured")),
+        NotificationOutcome::MailDisabled => ("skipped", Some("platform email is switched off")),
+        NotificationOutcome::Failed(reason) => ("failed", Some(reason.as_str())),
+    };
+    if let Err(error) = sqlx::query(
+        "update cms_form_submissions set notified_at = now(), notify_status = $2, \
+         notify_error = $3 where id = $1",
+    )
+    .bind(submission.id)
+    .bind(status)
+    .bind(detail)
+    .execute(state.db().pool())
+    .await
+    {
+        // The notification itself already went out (or did not); failing to note that down is
+        // a bookkeeping problem, not a reason to take the site down.
+        tracing::warn!(submission = %submission.id, %error, "could not record the notification outcome");
+        return;
+    }
+    // The owner's audit trail: a form notification is a message leaving the platform with
+    // somebody's words in it, and it is the first thing asked about when one goes missing.
+    // The actor is the platform itself, not a signed-in user — nobody clicked anything — so
+    // the entry is built the way the other system-written entries are.
+    let entry = NewAuditEntry {
+        organization_id: Some(form.organization_id),
+        actor_user_id: None,
+        actor_type: omnion_audit::ActorType::System,
+        action: "form.notification",
+        target_type: Some("form_submission"),
+        target_id: Some(submission.id.to_string()),
+        metadata: json!({
+            "form_id": form.id,
+            "form_key": form.key,
+            "status": status,
+            "detail": detail,
+        }),
+        ip_address: None,
+    };
+    if let Err(error) = omnion_audit::record(state.db().pool(), entry).await {
+        tracing::warn!(%error, "could not audit the form notification");
     }
 }
