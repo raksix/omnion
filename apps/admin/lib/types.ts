@@ -1537,6 +1537,139 @@ export type HeaderPolicySave = {
 /** The save's answer: the stored policy, flattened, plus the history row it wrote. */
 export type HeaderPolicySaved = HeaderPolicyDocument & { change_id: number | null };
 
+// -------------------------------------------------------------------------------------------
+// Security centre, slice 3 — rate limiting and sign-in protection
+//
+// The verdict type is the important one. `retry_after` is `number | null` and NOT optional:
+// the server always sends the field, and a `?:` would let a client read a missing field as
+// "no wait" — the one reading that turns a refusal into a suggestion. Likewise `ceiling` is
+// the *merged* ceiling (limit + burst), sent by the server so the table and the tester cannot
+// each compute it and disagree on one row.
+// -------------------------------------------------------------------------------------------
+
+/** One rate-limit scope, as `GET /api/v1/security/rate-limits` returns it. */
+export type RateLimitScope = {
+  scope: string;
+  window_seconds: number;
+  limit: number;
+  burst: number;
+  enabled: boolean;
+  /** `limit + burst`, computed by the server. */
+  ceiling: number;
+  /** Seconds until this window frees a place. */
+  window_remaining_seconds: number;
+};
+
+/** The limiter document, merged with the platform's baseline. */
+export type RateLimitsDocument = {
+  /** Always all five scopes: a missing row and an unconfigured row are different states. */
+  scopes: RateLimitScope[];
+  /** The scope names this build knows — the form's own vocabulary check. */
+  vocabulary: string[];
+  updated_by: string | null;
+  updated_at: string | null;
+  /** `false` means the baseline is showing because nobody has saved one. */
+  is_saved: boolean;
+};
+
+/** The save request. `expected_scopes` is the compare-and-swap key. */
+export type RateLimitsSave = {
+  scopes: Array<{
+    scope: string;
+    window_seconds: number;
+    limit: number;
+    burst: number;
+    enabled: boolean;
+  }>;
+  expected_scopes?: unknown;
+};
+
+/** The save's answer: the stored document plus the row it wrote. */
+export type RateLimitsSaved = RateLimitsDocument & { change_id: number | null };
+
+/** A dry run of one request through the limiter. */
+export type RateLimitTestRequest = {
+  method: string;
+  path: string;
+  client_ip?: string | null;
+  user_id?: string | null;
+  /** The counter to assume — what makes the tester usable during a real incident. */
+  count?: number | null;
+  machine_key?: boolean;
+};
+
+/**
+ * The limiter's answer, produced by the *same* function the middleware calls.
+ *
+ * `counter_identity` and `counter_key` are shown on purpose: an operator explaining a refusal
+ * to a developer needs to say "your budget is `ip:203.0.113.7` in the `sign_in` scope", and
+ * the key is what makes that checkable against a Redis dump.
+ */
+export type RateLimitTestResponse = {
+  scope: string;
+  verdict: {
+    limited: boolean;
+    scope: string;
+    reason: string;
+    count: number;
+    ceiling: number;
+    retry_after: number | null;
+  };
+  counter_identity: string;
+  counter_key: string;
+};
+
+/** The brute-force policy, as `GET /api/v1/security/sign-in-protection` returns it. */
+export type LockoutPolicy = {
+  window_seconds: number;
+  attempts: number;
+  lockout_minutes: number;
+  progressive_delay: boolean;
+  base_delay_seconds: number;
+  reset_on_success: boolean;
+};
+
+/** The accepted ranges, sent by the server so the form does not hard-code them twice. */
+export type LockoutBounds = {
+  window_seconds: [number, number];
+  attempts: [number, number];
+  lockout_minutes: [number, number];
+  base_delay_seconds: [number, number];
+  max_delay_seconds: number;
+};
+
+/** The lockout document, with the live count so the form can say so before the table. */
+export type SignInProtectionDocument = {
+  policy: LockoutPolicy;
+  locked_accounts: number;
+  is_saved: boolean;
+  bounds: LockoutBounds;
+};
+
+/** The save request. `expected_policy` is the compare-and-swap key. */
+export type SignInProtectionSave = {
+  policy: LockoutPolicy;
+  expected_policy?: unknown;
+};
+
+/** The save's answer: the stored document plus the row it wrote. */
+export type SignInProtectionSaved = SignInProtectionDocument & { change_id: number | null };
+
+/** One account currently locked out. */
+export type LockedAccount = {
+  user_id: string;
+  email: string;
+  locked_until: string;
+  seconds_remaining: number;
+  failed_sign_in_count: number;
+};
+
+/** The locked list, soonest to expire first, with the true total behind the page. */
+export type LockedAccountsPage = {
+  accounts: LockedAccount[];
+  total: number;
+};
+
 /** The directives this build recognises, in render order — the form's own dropdown. */
 export const CSP_DIRECTIVE_NAMES = [
   "default-src",
