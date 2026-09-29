@@ -80,6 +80,7 @@
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
+pub mod accounting;
 pub mod ai;
 pub mod analytics;
 pub mod auth;
@@ -1481,6 +1482,56 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "sales.quotes.update"));
 
+    // The accounting surface (docs/requests/REQ-054, slice 1): the chart of accounts, the tax
+    // rates and the journal.
+    //
+    // Two keys guard reads and two guard writes, and the split is the same argument the other
+    // three families make — **what a mistake costs, not which screen**. The chart and the rates
+    // share a pair because an account code is what a journal line picks and a rate is what a line
+    // defaults to: they are one decision about what a document will say. The journal's write key
+    // is separate because posting is a claim with the poster's name on it, not an edit: a
+    // prepared entry and a posted entry are different acts, and the balance invariant means
+    // everything posted is a promise that the books add up.
+    //
+    // The deactivate route is a `POST` and not a `DELETE` on purpose. **Nothing in this module
+    // deletes.** A journal line references an account with `on delete restrict`, so a delete is a
+    // database error naming a constraint; deactivating is the operation that answers "we do not
+    // use this any more" while leaving every historical reference readable. A `DELETE` route that
+    // quietly deactivated would be a lie in the method name.
+    let accounting_accounts_read = Router::new()
+        .route("/accounting/accounts", get(accounting::list_accounts))
+        .route("/accounting/tax-rates", get(accounting::list_tax_rates))
+        .route_layer(guards::require(&state, "accounting.accounts.read"));
+
+    let accounting_accounts_manage = Router::new()
+        .route("/accounting/accounts", post(accounting::create_account))
+        .route(
+            "/accounting/accounts/{id}",
+            patch(accounting::update_account),
+        )
+        .route(
+            "/accounting/accounts/{id}/deactivate",
+            post(accounting::deactivate_account),
+        )
+        .route("/accounting/tax-rates", post(accounting::create_tax_rate))
+        .route(
+            "/accounting/tax-rates/{id}",
+            patch(accounting::update_tax_rate),
+        )
+        .route_layer(guards::require(&state, "accounting.accounts.manage"));
+
+    let accounting_journal_read = Router::new()
+        .route("/accounting/journal", get(accounting::list_journal))
+        .route(
+            "/accounting/journal/{id}",
+            get(accounting::get_journal_entry),
+        )
+        .route_layer(guards::require(&state, "accounting.journal.read"));
+
+    let accounting_journal_manage = Router::new()
+        .route("/accounting/journal", post(accounting::post_journal_entry))
+        .route_layer(guards::require(&state, "accounting.journal.manage"));
+
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
     // a document would be prefetched by a crawler and accepted on the customer's behalf.
@@ -1507,7 +1558,11 @@ pub fn router(state: AppState) -> Router {
         .merge(sales_quotes_create)
         .merge(sales_quotes_update)
         .merge(sales_quotes_send)
-        .merge(sales_quotes_public);
+        .merge(sales_quotes_public)
+        .merge(accounting_accounts_read)
+        .merge(accounting_accounts_manage)
+        .merge(accounting_journal_read)
+        .merge(accounting_journal_manage);
 
     // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
     // stock rollup and the append-only ledger.

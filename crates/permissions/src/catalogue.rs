@@ -823,6 +823,40 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "inventory",
         description: "Count a location and post the variances a count finds",
     },
+    // Accounting (docs/requests/REQ-054, slice 1). The family splits the way the other three do —
+    // read, write, release — with one key whose reason is worth reading twice, because it is the
+    // one that could plausibly have been folded into a neighbour and should not have been:
+    //
+    // * `accounting.accounts.read` / `.manage` cover the chart and the rates together. They are
+    //   the same decision: an account code is what a journal line picks, and a rate is what a
+    //   line defaults to. Splitting them would let a role maintain the tree it is judged against
+    //   without being able to change what a document defaults to — or the reverse, which is
+    //   worse, because the rate is the one that changes numbers somebody already issued.
+    // * **`accounting.journal.manage` is a permission of its own because posting is a claim, not
+    //   an edit.** A bookkeeper who may prepare a journal is a normal role; the person who may
+    //   post is the one whose name is on the entry, and the balance invariant means every posted
+    //   entry is a promise that the books add up. That is the same argument that separated
+    //   `inventory.movements.record` from `inventory.stocktake.manage` one wave earlier.
+    PermissionDef {
+        key: "accounting.accounts.read",
+        category: "accounting",
+        description: "Read the chart of accounts and the organization's tax rates",
+    },
+    PermissionDef {
+        key: "accounting.accounts.manage",
+        category: "accounting",
+        description: "Add and edit accounts and tax rates; deactivate an account",
+    },
+    PermissionDef {
+        key: "accounting.journal.read",
+        category: "accounting",
+        description: "Read journal entries, their lines and both totals",
+    },
+    PermissionDef {
+        key: "accounting.journal.manage",
+        category: "accounting",
+        description: "Post a manual journal entry (a balanced, attributed, permanent record)",
+    },
 ];
 
 /// Look a permission up by key.
@@ -1098,6 +1132,31 @@ mod tests {
                 "{key} belongs to the sales category"
             );
         }
+    }
+
+    #[test]
+    fn the_accounting_family_is_catalogued_and_posting_is_its_own_key() {
+        // REQ-054, slice 1. Four keys: the chart and the rates read/manage as one pair (they are
+        // the same decision — what a line picks and what it defaults to), and the journal split
+        // read/post because posting is a claim with the poster's name on it, not an edit. The
+        // assertion is the first half of the guarantee; the comment in
+        // `routes/accounting.rs` is the second.
+        for key in [
+            "accounting.accounts.read",
+            "accounting.accounts.manage",
+            "accounting.journal.read",
+            "accounting.journal.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+        }
+        assert!(
+            get("accounting.invoices.read").is_none(),
+            "the invoice keys belong to slice 2 and must not appear before their routes do"
+        );
     }
 
     #[test]

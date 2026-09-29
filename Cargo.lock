@@ -1370,6 +1370,7 @@ dependencies = [
  "omnion-events",
  "omnion-identity",
  "omnion-media",
+ "omnion-module-accounting",
  "omnion-module-analytics",
  "omnion-module-crm",
  "omnion-module-inventory",
@@ -1535,6 +1536,19 @@ dependencies = [
  "rand 0.8.8",
  "serde_json",
  "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-module-accounting"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror",
  "time",
