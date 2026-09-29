@@ -5591,6 +5591,125 @@ export function fetchAiRunAgent(
   );
 }
 
+/** One file in an agent's workspace (REQ-099 slice 2). */
+export type AiAgentFile = {
+  /** Row identity — what Download and Delete address. */
+  id: string;
+  /** The path inside the workspace, relative to the agent. */
+  path: string;
+  /** Size in bytes. */
+  size_bytes: number;
+  /** The declared content type. */
+  content_type: string;
+  /** Hex SHA-256 of the bytes, so two versions of a path are tellable apart. */
+  checksum: string;
+  /** The run that wrote it, when a run wrote it. */
+  run_id: string | null;
+  /** When it was added. */
+  created_at: string;
+  /** When a run last named it. */
+  last_used_at: string | null;
+};
+
+/**
+ * How full a workspace is, as the usage bar reads it.
+ *
+ * `percent` is already clamped by the API rather than computed here: the bar's width is a
+ * percentage of a number the server owns, and a client that recomputes it can disagree with the
+ * quota that produced the refusal.
+ */
+export type AiAgentFileUsage = {
+  /** Bytes stored across the agent's files. */
+  used_bytes: number;
+  /** The per-agent ceiling (100 MB). */
+  limit_bytes: number;
+  /** How many files count against it. */
+  file_count: number;
+  /** Whole percent, 0–100. */
+  percent: number;
+  /** The per-file ceiling (10 MB), so the upload hint names the same number. */
+  max_file_bytes: number;
+};
+
+/** The workspace listing and its quota, in one answer. */
+export type AiAgentWorkspace = {
+  /** The agent whose workspace this is. */
+  agent_id: string;
+  /** Its files, newest first. */
+  files: AiAgentFile[];
+  /** The quota, so the bar cannot disagree with the table above it. */
+  usage: AiAgentFileUsage;
+};
+
+/** The agent's workspace. */
+export function fetchAiAgentWorkspace(
+  agentId: string,
+  organizationId?: string | null,
+): Promise<AiAgentWorkspace> {
+  return request<AiAgentWorkspace>(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/files${agentScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * Add or replace one workspace file.
+ *
+ * The path is sent as its own form part rather than being taken from the picked file's name: a
+ * filename is the browser's opinion about the user's disk, and the API deliberately refuses a
+ * request that omits the path so a name it did not choose cannot reach a namespace it does not
+ * validate.
+ */
+export async function uploadAiAgentFile(input: {
+  agentId: string;
+  path: string;
+  file: File;
+  organizationId?: string | null;
+}): Promise<AiAgentFile> {
+  const form = new FormData();
+  form.append("path", input.path);
+  form.append("file", input.file);
+  return request<AiAgentFile>(
+    `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files${agentScopeParams(input.organizationId)}`,
+    { method: "POST", body: form },
+  );
+}
+
+/** Remove one workspace file. */
+export function deleteAiAgentFile(input: {
+  agentId: string;
+  path: string;
+  organizationId?: string | null;
+}): Promise<null> {
+  return request<null>(
+    `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files/${encodeWorkspacePath(input.path)}${agentScopeParams(input.organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * The download address for one workspace file.
+ *
+ * Built rather than fetched, because the route answers the bytes directly and a download that
+ * had to round-trip a `blob` first would hold a copy of a 10 MB file in the tab's memory. The
+ * path is encoded **once**, segment by segment: encoding the whole string turns the separators
+ * into `%2F`, which is a file named `data%2Fq3.csv` rather than the file at `data/q3.csv`.
+ */
+export function aiAgentFileHref(input: {
+  agentId: string;
+  path: string;
+  organizationId?: string | null;
+}): string {
+  return `/api/v1/ai/agents/${encodeURIComponent(input.agentId)}/files/${encodeWorkspacePath(input.path)}${agentScopeParams(input.organizationId)}`;
+}
+
+/** Percent-encode each segment of a workspace path and keep the separators. */
+function encodeWorkspacePath(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
 /** One frame of a run's event stream, as the Run sheet and the live trace read it. */
 export type AiRunFrame = {
   /**

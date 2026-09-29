@@ -39,6 +39,7 @@ import {
 import { useSession } from "@/lib/session";
 
 import { RunSheet } from "./run-sheet";
+import { AgentWorkspace } from "./agent-workspace";
 
 /** The memory scopes the column accepts; the route refuses anything else. */
 const MEMORY_SCOPES = [
@@ -171,6 +172,15 @@ export function AgentForm({ agentId }: AgentFormProps) {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [running, setRunning] = useState(false);
   const [toolInput, setToolInput] = useState("");
+  /**
+   * Which tab is open.
+   *
+   * The tabs exist only on an existing agent: `Config · Skills · Runs · Workspace` on the create
+   * screen would be three tabs that list nothing, and a tab that lies about what exists is worse
+   * than a tab that is not there. Skills and Runs arrive with slice 3; Workspace is slice 2 and
+   * is the fourth entry below.
+   */
+  const [tab, setTab] = useState<"config" | "skills" | "runs" | "workspace">("config");
   const nameRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -334,6 +344,36 @@ export function AgentForm({ agentId }: AgentFormProps) {
         Back to agents
       </Link>
 
+      {/* The tab bar, only on an existing agent. Config and Workspace are real now; Skills and
+          Runs arrive with slice 3 and are not rendered until they are, because a tab that
+          opens onto nothing is a tab that lies. */}
+      {agentId ? (
+        <div role="tablist" aria-label="Agent sections" className="flex gap-1 overflow-x-auto border-b border-line">
+          {([
+            ["config", "Config"],
+            ["workspace", "Workspace"],
+          ] as const).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              aria-selected={tab === key}
+              data-agent-tab={key}
+              onClick={() => setTab(key)}
+              className={`-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-[12.5px] font-medium ${
+                tab === key ? "border-accent text-ink" : "border-transparent text-muted hover:text-ink"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {tab === "workspace" && agentId ? (
+        <AgentWorkspace agentId={agentId} organizationId={organizationId} />
+      ) : null}
+
       {error && !Object.keys(fieldErrors).length ? (
         <p data-agent-form-error role="alert" className="rounded-xl border border-danger/40 bg-danger/5 px-3.5 py-3 text-[12.5px] text-danger">
           {error}
@@ -345,6 +385,10 @@ export function AgentForm({ agentId }: AgentFormProps) {
         </p>
       ) : null}
 
+      {/* The config body. On a saved agent it renders only while the Config tab is open, so the
+          Workspace tab is not stacked underneath a form the reader did not ask for. On create
+          there is no tab bar and `tab` is always `config`. */}
+      <div className={tab === "config" ? "space-y-4" : "hidden"}>
       <div className="grid gap-4 lg:grid-cols-2">
         <div className="space-y-3">
           <Field
@@ -636,6 +680,7 @@ export function AgentForm({ agentId }: AgentFormProps) {
         <Link href="/ai/agents" className="ml-auto text-[12.5px] text-muted hover:text-ink">
           Cancel
         </Link>
+      </div>
       </div>
 
       {running && agent ? (
