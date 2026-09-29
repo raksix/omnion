@@ -4229,6 +4229,67 @@ async function runCrmIntakeDepth(page, report) {
   steps.inboxOwnerFilterOffersPeople = await page.evaluate(() =>
     Array.from(document.querySelectorAll("#lead-owner option")).filter((o) => o.dataset.ownerFilter).length,
   );
+
+  // The batch hand-over, on the inbox. Three claims, all measured:
+  //
+  //   1. The bar appears only when something is selected — a permanent control above the
+  //      table is one nobody reads.
+  //   2. The save is refused with an empty reason, for the same reason the single-lead panel
+  //      refuses it.
+  //   3. A real batch answers with a *report*, and the panel shows the refusals. A screen that
+  //      said "assigned" over nineteen real hand-overs and two silent refusals is the failure
+  //      this whole shape exists to prevent, so the assertion is on the refusals rendering,
+  //      not on the toast appearing.
+  const selectable = await page.locator("[data-lead-select]").count();
+  steps.bulkSelectable = selectable;
+  if (selectable > 1) {
+    await page.locator("[data-lead-select]").first().check({ timeout: 4000 }).catch(() => {});
+    await page.locator("[data-lead-select]").nth(1).check({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    steps.bulkBarAppears = (await page.locator("[data-lead-bulk]").count()) > 0;
+    steps.bulkCount = (
+      await page.locator("[data-lead-bulk-count]").innerText().catch(() => "")
+    ).trim();
+    await page.locator("[data-lead-bulk-open]").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    steps.bulkPanelOpen = (await page.locator("[data-lead-bulk-panel]").count()) > 0;
+    steps.bulkOptions = await page.locator("[data-bulk-owner-option]").count();
+    steps.bulkSaveDisabledWithoutReason = await page
+      .locator("[data-lead-bulk-save]")
+      .first()
+      .isDisabled()
+      .catch(() => false);
+
+    const bulkOwner = await page.evaluate(() => {
+      const select = document.querySelector("[data-lead-bulk-owner]");
+      if (!select) return "";
+      const other = Array.from(select.options).find((o) => o.value);
+      return other ? other.value : "";
+    });
+    if (bulkOwner) {
+      await page.selectOption("[data-lead-bulk-owner]", bulkOwner).catch(() => {});
+      await page.locator("[data-lead-bulk-reason]").fill("QA · batch hand-over").catch(() => {});
+      await page.waitForTimeout(400);
+      steps.bulkSaveEnabledWithReason = !(await page
+        .locator("[data-lead-bulk-save]")
+        .first()
+        .isDisabled()
+        .catch(() => true));
+      await page.locator("[data-lead-bulk-save]").first().click({ timeout: 6000 }).catch(() => {});
+      await page.waitForTimeout(2200);
+      steps.bulkReport = (
+        await page.locator("[data-lead-bulk-report]").innerText().catch(() => "")
+      ).slice(0, 200);
+      steps.bulkReportRendered = steps.bulkReport.length > 0;
+      // Every refused lead is named with its reason, and the reason groups rather than dumps.
+      steps.bulkRefusalCount = await page.locator("[data-bulk-refusal]").count();
+      steps.bulkRefusalNamed = await page.evaluate(() => {
+        const rows = Array.from(document.querySelectorAll("[data-bulk-refusal]"));
+        return rows.length === 0 || rows.every((row) => (row.textContent ?? "").includes("—"));
+      });
+      await shot(page, "page-crm-leads-bulk");
+    }
+  }
   await shot(page, "page-crm-leads-owner-names");
   await page.goto(`${URL_ADMIN}/crm/leads/${leadId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1200);

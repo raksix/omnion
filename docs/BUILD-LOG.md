@@ -4675,3 +4675,33 @@ panel. An id-shaped control in a human screen is unfinished work, and the test f
 has had a browser pass queued for. Then slice 2's remaining screen work: the REQ-064 form-editor
 `Lead delivery` card (the one screen of the seven still missing, and the one whose module is not
 on this branch), and the SLA list column.
+
+---
+
+## w8 · tick 14, second slice — the batch hand-over
+
+**What.** `store::bulk_assign_owner` returning a `BulkAssignReport` (per-lead `done` + `reason`,
+plus `applied`/`refused`/`summary`), `POST /api/v1/crm/leads/bulk-assign` behind
+`crm.leads.assign`, `bulkAssignLeads` in the admin client, and the inbox's selection column plus
+a sticky bulk bar that renders the refusals **grouped by reason**.
+
+**Proof.** `bash scripts/qa/run-crm-assign.sh` → `crm_assign … 9 passed`, `crm_bulk … 5 passed`
+— **14/14**. `pnpm typecheck` clean. The gate script now names both binaries.
+
+**Three decisions that were not free.**
+
+* **Each lead is its own transaction.** The single-transaction version rolls back nineteen
+  legitimate hand-overs because one row was filed as spam, reports failure for work that
+  already happened, and invites the operator to press again — after which the trail says every
+  lead changed hands twice. Hence a report rather than a count.
+* **The cap is in the store.** `MAX_BULK_IDS` had existed for two ticks with nothing reading it.
+  A handler-only check would leave it looking enforced while any second caller got an unbounded
+  batch; the rule this crate keeps is that a value one layer refuses and another accepts reads
+  as *nothing happened* from whichever caller forgot.
+* **Refusals are grouped, not listed.** Twenty identical "this lead is spam" lines is a dump;
+  `2 x this lead is spam; 1 x no such lead` is a sentence an operator pastes into a ticket. The
+  gate asserts the grouping, because it is the whole difference between a report and a log.
+
+**Next.** The narrowed `QA_ROUTES=crm` pass. Then the walkthrough for the bulk bar itself
+(`bulkSelectsRows`, `bulkRefusalsNamed`) — written next to the hand-over steps so both halves of
+this tick's screen work are measured by the same run that finally reaches the CRM screens.
