@@ -4200,6 +4200,42 @@ export function fetchSsoProviders(): Promise<{
   return request("/api/v1/auth/sso/providers");
 }
 
+/** What a bulk provider action did to one provider. */
+export type IamProviderBulkRow = {
+  id: string;
+  slug: string;
+  enabled: boolean | null;
+  error?: string;
+  message?: string;
+};
+
+/**
+ * The answer of a bulk enable/disable.
+ *
+ * `results` is one row per **requested** id — a refusal is a row with a code, never a hole, so
+ * the panel can render "3 switched on, 2 need a passing test" from the same list that carries
+ * the slugs. `missing` is separate because a provider in another tenant is not a gate refusal
+ * and must not be counted as one.
+ */
+export type IamProviderBulkResult = {
+  action: string;
+  results: IamProviderBulkRow[];
+  applied: number;
+  refused: number;
+  missing: string[];
+};
+
+/** Switch several providers on or off in one request. */
+export function bulkIamProviders(
+  action: "enable" | "disable",
+  ids: string[],
+): Promise<IamProviderBulkResult> {
+  return request("/api/v1/iam/providers/bulk", {
+    method: "POST",
+    body: JSON.stringify({ action, ids }),
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Transformation presets (docs/requests/REQ-010, slice 3)
 // ---------------------------------------------------------------------------------------------
