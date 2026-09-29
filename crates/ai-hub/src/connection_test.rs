@@ -338,9 +338,22 @@ fn tls_step(base_url: &str) -> TestStep {
     }
 }
 
-/// Milliseconds since `started`, never negative.
+/// Milliseconds since `started`, never negative and never zero.
+///
+/// `as_millis()` **truncates**, so a probe that answers in 400 µs stores `0`. That is not a
+/// rounding detail: `latency_ms` feeds the p95 and the baseline, and a column that reports every
+/// fast endpoint as "no time at all" makes the p95 of a healthy local provider indistinguishable
+/// from the p95 of one that never answered. A measurement in the same unit as its column must be
+/// at least one unit — `max(1)` is the floor, and a sub-millisecond probe genuinely *is* fast, it
+/// is not unmeasured.
+///
+/// The floor is `max(1)`, not a rounding: a sub-millisecond probe genuinely *is* fast, and `0`
+/// in this column means "no time at all", which is indistinguishable from a probe that never
+/// answered. Truncation is left as-is above the floor — rounding a 1.4 ms probe down to 1 would
+/// under-report, and under-reporting a latency is the direction that hides a problem.
 fn elapsed(started: Instant) -> i64 {
-    started.elapsed().as_millis().min(i64::MAX as u128) as i64
+    let millis = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    millis.max(1)
 }
 
 /// The host part of a base URL, or the whole string when it has no path.

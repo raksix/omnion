@@ -2160,6 +2160,7 @@ async fn health_samples_compute_a_status_and_the_order_is_a_permutation() {
                 latency_ms: 100 + index as i32,
                 substituted_from: None,
                 first_byte_at: None,
+                cost: None,
             },
         )
         .await
@@ -2196,6 +2197,7 @@ async fn health_samples_compute_a_status_and_the_order_is_a_permutation() {
             latency_ms: 90,
             substituted_from: None,
             first_byte_at: None,
+            cost: None,
         },
     )
     .await
