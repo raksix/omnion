@@ -49,17 +49,24 @@ wait_http() { # url, seconds
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
     last="$code"
-    # Only a 2xx means ready. Accepting any non-000 is how a Next dev server that is still
-    # compiling its first route looked ready: it answers 500 while it compiles, the pass walked
-    # in, and the walkthrough reported "admin panel unreachable ... responded 500" — a product
-    # failure invented entirely by the readiness check. A 5xx here is the server booting, and
-    # the panel is not a thing that should be left half-compiled for a browser to look at.
+    # "Something answered" is the readiness test, and 000 is the only answer that means it did
+    # not: a closed port, or a process that has not bound yet. A 5xx is the exception that matters
+    # — a Next dev server answering 500 is still compiling its first route, and treating that as
+    # ready produced a walkthrough fatal ("admin panel unreachable ... responded 500") that read
+    # as a product failure and was invented entirely by the check. The same panel answered 200
+    # seconds later.
+    #
+    # 404 is accepted on purpose: the public renderer answers 404 for "/" until the pass seeds the
+    # site, and that 404 is the proof the server compiled and is routing requests. Requiring 2xx
+    # there failed a perfectly healthy renderer, which is the mirror image of the bug above — a
+    # readiness check that is wrong in the direction that hides nothing and breaks everything.
     case "$code" in
-      2*) return 0 ;;
+      000|5*) : ;;
+      *) return 0 ;;
     esac
     sleep 2
   done
-  echo "[qa] $url never answered 2xx (last: ${last:-none})" >&2
+  echo "[qa] $url never answered (last: ${last:-none})" >&2
   return 1
 }
 
