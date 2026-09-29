@@ -56,10 +56,17 @@ reap() {
     fi
   done
 }
-reap
-
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  # Reap INSIDE the loop, not once before it. The single pre-loop call only covers a place
+  # that was already stale when this writer arrived; a place that goes stale while a writer
+  # is already queued is never reclaimed, so the queue sits on a dead place and every writer
+  # behind it burns its whole deadline waiting for a pass that is not running. That is the
+  # same failure the grace period was added to fix, one step later in time: on a box where
+  # one crashed pass costs the other seven writers 40 minutes each, "reclaimed eventually" is
+  # not a repair. The holder check is cheap and the reap is idempotent, so running it every
+  # turn costs one `find` and buys the queue its capacity back within 15 seconds.
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
@@ -72,6 +79,10 @@ while :; do
     holder=$!
     echo "$holder" > "${HOLDERDIR}/${mine##*/}"
     echo "$holder"                                # stdout: the holder pid for run.sh
+    # Carry the reap output off stdout: run.sh reads this script's stdout with `| tail -n 1`
+    # to get the holder pid, and a "[qa-slot] reclaimed..." line after the pid would be the
+    # last line instead. The message is real information, so it goes to stderr, where the
+    # first (pre-loop) reap already proved it is visible.
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
     exit 0
   fi
