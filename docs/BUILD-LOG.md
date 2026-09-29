@@ -1,4 +1,62 @@
 
+## 2026-09-29 — REQ-062 slice 2 (customize + history) · the screens a draft/live split exists for
+
+Last tick built the layer: `theme_settings_revisions`, the published pointer, the draft row,
+the store's contrast check and the five routes. What it did not build is the thing the REQ's
+acceptance 6-9 are actually about — **a screen**. So this tick is the two screens, the entry
+points that reach them, and a pass that drives the three properties only a browser can see.
+
+**`/themes/<key>/customize`.** Six sections over the store's five-section payload, and the
+header line carries BOTH numbers: the draft revision being edited and the revision that is
+live. That line is the whole reason the split exists. Without it "Save draft" is a button
+whose effect is nowhere on screen, and an operator learns to click it expecting a deploy. The
+three states the header has to be able to say are separate sentences: *editing a draft that is
+live*, *a draft that is not live*, and *nothing published yet, so the theme's own defaults are
+what visitors get*. A single "current settings" field can express one of them and lies about
+the other two.
+
+**`/themes/<key>/history`.** Three badges per row, not one: which revision is live, which is
+the draft, and which is itself a restore of another. And the restore dialog says it writes a
+NEW revision, because "Restore revision 2?" invites exactly the wrong reading of an
+append-only ledger. The diff is per-field from the server, and revision 1's empty state is
+prose ("there is nothing before it to compare against") rather than a blank panel that looks
+identical to a diff that failed.
+
+**The preview is real DOM, not an iframe.** An iframe here would need a server round-trip per
+keystroke to show the same thing, and the public preview route does not exist until the
+package work lands. So the panel applies the edited tokens as CSS custom properties to a small
+sample page — the same mechanism the renderer uses, which makes it a preview rather than a
+mock — and hangs the resolved token list underneath it for the values a browser cannot lay out
+(an exotic font stack is still reported). The light/dark switch is on the preview, because a
+preview that only works in one mode lies in the other.
+
+**The contrast badge is the server's, and the acknowledgement is earned.** The panel never
+re-measures a ratio: it renders `view.contrast` and sends `acknowledgeContrast: true` only
+when there ARE findings and the operator has ticked the box. A client that always sent `true`
+would make the guard unsatisfiable in exactly the way last tick's missing `serde(default)` did
+— which is the same defect wearing the opposite sign.
+
+**Proof.** `omnion-content --lib` **249 passed / 0 failed** · `apps/admin` `tsc --noEmit` clean
+across 747 files · `walkthrough.cjs` bundles (`bun build --external playwright-core`). The
+depth pass `runThemeSettingsDepth` (**43 steps**, `--only=theme-settings`) drives the three
+properties a screenshot cannot: **a save must not publish** (it saves, then reads
+`theme_settings_published` out of the database and asserts the pointer did not move), **the
+contrast guard must be a gate and not a wall** (a near-white-on-near-white pair is typed,
+publish is refused with 422 and nothing is written, the acknowledgement is ticked, and the
+publish then succeeds), and **a restore appends** (three rows afterwards, revision 1 still
+there, the restored row badged). It also refuses a hostile token value at the panel, not with
+a 400 three lines later.
+
+**Not yet proved.** The pass has not completed: at tick start the QA slot was held by a live
+sibling and the volume was at **99% (864 MB free)**, and a pass started into a full disk is a
+pass that dies halfway and reports nothing — the lesson from the last tick, respected rather
+than re-learned. The volume came back to 88% (7.0 GB) while this tick ran and the pass is
+queued behind the slot.
+
+**Next.** (a) The pass result, then acceptance 6-9 can be ticked on its evidence rather than on
+the store's. (b) REQ-062 slice 3 — the builder on REQ-063's editor, slot reset, and the
+export/import package with its validation report.
+
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
