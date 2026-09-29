@@ -40,20 +40,33 @@ pub async fn insert_event(executor: impl sqlx::PgExecutor<'_>, new: NewEvent) ->
 /// belong to organizations, and matching a tenant's endpoint against a fact that belongs to no
 /// tenant would leak. The unique index on `(endpoint_id, event_id)` makes the statement
 /// idempotent.
+///
+/// **The subscription test carries the group wildcard.** `catalogue::reconcile` stores a
+/// `page.*` subscription both as the wildcard and as today's expansion, so a plain
+/// `= any (w.events)` would already find today's members. It tests the wildcard anyway, for
+/// one honest reason: a row whose list carries only `page.*` — written before reconciliation
+/// existed, or by an operator's own SQL — would otherwise silently stop receiving, and the
+/// cost of a missing group test is a receiver that never hears about a page again with no
+/// error anywhere. The clause is indexed on the same column either way.
 pub async fn enqueue_fanout(executor: impl sqlx::PgExecutor<'_>, event: &Event) -> Result<u64> {
     let Some(organization_id) = event.organization_id else {
         return Ok(0);
     };
 
+    let group = event.name.split('.').next().unwrap_or_default();
+    let wildcard = format!("{group}.*");
+
     let result = sqlx::query(
         "insert into webhook_deliveries (endpoint_id, event_id, max_attempts) \
-         select w.id, $1, $4 from webhook_endpoints w \
-         where w.enabled and w.organization_id = $2 and $3 = any (w.events) \
+         select w.id, $1, $5 from webhook_endpoints w \
+         where w.enabled and w.organization_id = $2 \
+           and ($3 = any (w.events) or $4 = any (w.events)) \
          on conflict (endpoint_id, event_id) do nothing",
     )
     .bind(event.id)
     .bind(organization_id)
     .bind(event.name.as_str())
+    .bind(wildcard.as_str())
     .bind(DEFAULT_MAX_ATTEMPTS)
     .execute(executor)
     .await?;
@@ -197,27 +210,111 @@ pub async fn list_deliveries(
     Ok(deliveries)
 }
 
-/// Recorded events, newest first, optionally filtered by organization and exact name.
-pub async fn list_events(
-    pool: &PgPool,
-    organization_id: Option<Uuid>,
-    name: Option<&str>,
-    limit: i64,
-) -> Result<Vec<Event>> {
+/// What the event feed is narrowed to.
+///
+/// Every field is optional and every field is a *conjunction*: a name list plus a site plus a
+/// window together mean all three, which is the only reading an operator can predict without a
+/// manual. `before` is a keyset cursor on the row id rather than a timestamp, because the id is
+/// a monotonic sequence: two events recorded inside the same microsecond are still ordered, and
+/// a page that arrives late cannot skip a row that landed behind it — exactly the failure a
+/// timestamp cursor invites on a bus as fast as this one.
+#[derive(Debug, Clone, Default)]
+pub struct EventFilter {
+    /// Organization the events belong to; `None` reads every organization's.
+    pub organization_id: Option<Uuid>,
+    /// Exact event names, any of which may match. An empty list matches everything.
+    pub names: Vec<String>,
+    /// Site the event happened on.
+    pub site_id: Option<Uuid>,
+    /// Account that caused it.
+    pub actor_user_id: Option<Uuid>,
+    /// Only events recorded at or after this instant.
+    pub from: Option<OffsetDateTime>,
+    /// Only events recorded at or before this instant.
+    pub to: Option<OffsetDateTime>,
+    /// Exclusive upper bound of the page: the id of the previous page's last row.
+    pub before: Option<i64>,
+    /// How many rows this read may return.
+    pub limit: i64,
+}
+
+/// One page of the event feed.
+#[derive(Debug)]
+pub struct EventPage {
+    /// The rows, newest first.
+    pub events: Vec<Event>,
+    /// Whether a further page exists behind the last row of this one.
+    pub has_more: bool,
+}
+
+/// Recorded events, newest first, narrowed by [`EventFilter`].
+///
+/// One row more than asked for is selected, so the caller can say whether a further page
+/// exists without a second `count` query — and without the possibility of the count and the
+/// list disagreeing, which is a list that is lying.
+pub async fn list_events(pool: &PgPool, filter: &EventFilter) -> Result<EventPage> {
     let sql = format!(
         "select {EVENT_COLUMNS} from events \
          where ($1::uuid is null or organization_id = $1) \
-           and ($2::text is null or name = $2) \
+           and (cardinality($2::text[]) = 0 or name = any ($2)) \
+           and ($3::uuid is null or site_id = $3) \
+           and ($4::uuid is null or actor_user_id = $4) \
+           and ($5::timestamptz is null or created_at >= $5) \
+           and ($6::timestamptz is null or created_at <= $6) \
+           and ($7::bigint is null or id < $7) \
          order by id desc \
-         limit $3"
+         limit $8"
     );
-    let events = sqlx::query_as(&sql)
-        .bind(organization_id)
-        .bind(name)
-        .bind(limit)
+    let mut rows = sqlx::query_as(&sql)
+        .bind(filter.organization_id)
+        .bind(&filter.names)
+        .bind(filter.site_id)
+        .bind(filter.actor_user_id)
+        .bind(filter.from)
+        .bind(filter.to)
+        .bind(filter.before)
+        .bind(filter.limit + 1)
         .fetch_all(pool)
         .await?;
-    Ok(events)
+
+    let has_more = rows.len() as i64 > filter.limit;
+    // The extra row is the existence proof, not content: keeping it would show the operator a
+    // row the "next page" button is about to show again.
+    if has_more {
+        rows.truncate(filter.limit.max(0) as usize);
+    }
+
+    Ok(EventPage {
+        events: rows,
+        has_more,
+    })
+}
+
+/// How many deliveries each event name collected since an instant.
+///
+/// The number is per *name* and not per id because the catalogue is about names: an operator
+/// looking at `page.published` wants to know whether the name is alive on their own endpoints,
+/// not how many rows one instance of it produced. The join keeps both ends honest — a delivery
+/// whose event was swept by retention stops counting rather than leaving behind a number
+/// nothing can explain.
+pub async fn delivery_counts_since(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+    since: OffsetDateTime,
+) -> Result<Vec<(String, i64)>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "select e.name as name, count(*) as deliveries \
+         from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where d.created_at >= $2 \
+           and ($1::uuid is null or e.organization_id = $1) \
+         group by e.name",
+    )
+    .bind(organization_id)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Claim up to `batch` deliveries that are due, and return them with everything needed to send.

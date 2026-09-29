@@ -773,6 +773,13 @@ pub fn router(state: AppState) -> Router {
 
     let events = get(webhooks::list_events).layer(guards::require(&state, "events.read"));
 
+    // The catalogue is the platform's own registry of event names (REQ-016 slice 1), read with
+    // the same key as the feed: describing what an event means is reading the bus, not
+    // administering an endpoint. It is a sibling of `/events`, not a child, so the literal
+    // `catalogue` segment can never be read as an event id.
+    let event_catalogue =
+        get(webhooks::list_catalogue).layer(guards::require(&state, "events.read"));
+
     // Automations (docs/requests/REQ-003, P13): a rule is an event-triggered workflow, so its
     // read and write powers are the workflow keys the engine already defines — being allowed to
     // define an automation and being allowed to run it are the same two powers a workflow
@@ -1339,6 +1346,7 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
         .route("/webhooks/{id}/test", webhook_test)
         .route("/events", events)
+        .route("/events/catalogue", event_catalogue)
         .route("/automations", automations)
         .route("/automations/catalogue", automation_catalogue)
         .route("/automations/{id}", automation_entry)

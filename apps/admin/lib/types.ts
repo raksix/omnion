@@ -1373,3 +1373,66 @@ export type RenderedMenu = {
   name: string;
   items: RenderedMenuItem[];
 };
+
+/** One row of the event feed, as `/api/v1/events` answers it. */
+export type EventRow = {
+  id: number;
+  name: string;
+  organization_id: string | null;
+  site_id: string | null;
+  actor_user_id: string | null;
+  payload: unknown;
+  created_at: string;
+};
+
+/** One page of the feed: the rows plus the keyset the next page is read with. */
+export type EventPage = {
+  events: EventRow[];
+  /** Id of the last row, to pass back as `cursor`. `null` at the end of the feed. */
+  next_cursor: number | null;
+  /** Whether a further page exists behind this one. */
+  has_more: boolean;
+};
+
+/** What narrows the feed. Every field is optional; set fields are combined with AND. */
+export type EventFilters = {
+  /** Exact names, any of which may match. */
+  name?: string[];
+  site_id?: string;
+  actor_user_id?: string;
+  /** RFC 3339 lower bound. */
+  from?: string;
+  /** RFC 3339 upper bound. */
+  to?: string;
+  /** Keyset cursor: the previous page's last row id. */
+  cursor?: number;
+  limit?: number;
+};
+
+/** One payload field of one event name, as the catalogue describes it. */
+export type CatalogueField = {
+  name: string;
+  kind: "uuid" | "string" | "integer" | "boolean" | "timestamp" | "json" | "any";
+  required: boolean;
+};
+
+/** One entry of the event catalogue. */
+export type CatalogueEntry = {
+  name: string;
+  area: string;
+  group: string;
+  description: string;
+  status: "live" | "reserved";
+  payload_fields: CatalogueField[];
+  /** Deliveries this name produced in the last 24 hours, for this organization. */
+  deliveries_24h: number;
+};
+
+/** The whole catalogue, grouped by area for the picker. */
+export type EventCatalogue = {
+  areas: string[];
+  events: CatalogueEntry[];
+  live_count: number;
+  reserved_count: number;
+  max_subscriptions: number;
+};

@@ -254,6 +254,99 @@ else
   fail "grouped=$grouped total=$unread_summary"
 fi
 
+# 5. **A read notification is still a notification.** The bare list — no `with_read`, no `read`
+#    — has to include rows that have been read, and `?with_read=0` has to exclude them.
+#
+#    This is a regression gate for a real defect rather than a new claim. `with_read` was a
+#    `bool` defaulting to `false`, and a `bool` cannot tell "the client said nothing" from
+#    "the client said no" — so *every* caller that named no filter silently got unread-only,
+#    while the admin panel's State menu labelled that same state "Unread and read". Nothing
+#    failed loudly: the list rendered, the badge was right, and the screen simply stopped
+#    showing mail the reader had already seen. The browser pass found it only because it
+#    marks its own rows read and then walks straight into the keyboard step.
+#
+#    Both halves are asserted over a real socket, in this order: mark one row read, then the
+#    bare list must still be longer than the inbox list. Asserting the counts separately
+#    would pass against a list that returns nothing at all.
+#
+#    The row to mark is read from SQL here rather than reusing `$target` from the 404 check
+#    below: that variable is assigned further down, and a shell script that reads a value
+#    before the line that sets it runs with an empty string and reports it as "the endpoint
+#    refused" — a failure that names this gate and belongs to the next one.
+read_target=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select id from notifications where user_id = '$OWNER_ID' and archived_at is null limit 1")
+marked=$(curl -s -X POST "$URL/api/v1/notifications/$read_target/read" -b "$COOKIE_A" \
+  -H 'content-type: application/json' -d '{"read":true}')
+
+# `grep -c` on a body with no matches exits 1, and the script runs under `set -e`, so the
+# *inbox* leg — which is allowed to be empty, and is empty here on purpose — would abort the
+# whole gate before it printed a verdict. Counting with `tr` alone avoids the non-zero exit
+# entirely: it converts whatever came back into a digit count and never fails.
+count_rows() {
+  curl -s "$1" -b "$COOKIE_A" | tr ',' '\n' | grep -c '"id"' || true
+}
+all_rows=$(count_rows "$URL/api/v1/notifications?limit=100")
+inbox_rows=$(count_rows "$URL/api/v1/notifications?limit=100&with_read=0")
+live_rows=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select count(*) from notifications
+    where user_id = '$OWNER_ID' and archived_at is null")
+if [ -n "$marked" ] && [ "$all_rows" -gt "$inbox_rows" ] && [ "$all_rows" -eq "$live_rows" ]; then
+  pass "the bare list keeps read rows (all=$all_rows inbox=$inbox_rows live=$live_rows)"
+else
+  fail "all=$all_rows inbox=$inbox_rows live=$live_rows"
+fi
+
+# 8. **A quiet window that comes back is a quiet window that is still a window.**
+#
+#    This is a regression gate for a real defect, and it is the one that makes the settings
+#    screen's two unproven claims (`quietSaved`, `digestPersisted`) provable at all. The store
+#    read the `time` columns with `::text`, and Postgres prints a `time` that way as
+#    `22:00:00` — seconds always present — while the platform's clock vocabulary is `HH:MM`.
+#    So the row was written correctly, read back in a shape nothing could parse, and
+#    `in_quiet_hours` took its documented "no window means not quiet" arm: the setting the
+#    reader had just turned on did nothing from the next request onwards, and the form could
+#    not read back what it had written.
+#
+#    The order here is the point. Save through the API, read the row out of Postgres to prove
+#    the write really happened, then read it back through the API and compare the *string* —
+#    because "the window is set" and "the window is set in a shape the platform can read" are
+#    two different claims, and only the second one is the bug that was fixed.
+saved_prefs=$(curl -s -X PUT "$URL/api/v1/notifications/preferences" -b "$COOKIE_A" \
+  -H 'content-type: application/json' \
+  -d '{"cells":[],"settings":{"quiet_hours_start":"22:00","quiet_hours_end":"07:00","timezone":"Europe/Istanbul","digest_cadence":"weekly","digest_weekday":3,"digest_hour":17}}')
+quiet_row=$(psql -h "$PGHOST" -p "$PGPORT" -U omnion -d "$DB" -t -A -c \
+  "select coalesce(to_char(quiet_hours_start,'HH24:MI'),'-') || ' ' || coalesce(to_char(quiet_hours_end,'HH24:MI'),'-') || ' ' || digest_cadence || ' ' || coalesce(digest_weekday::text,'-') || ' ' || digest_hour::text
+    from notification_settings where user_id = '$OWNER_ID'")
+read_back=$(curl -s "$URL/api/v1/notifications/preferences" -b "$COOKIE_A")
+back_start=$(echo "$read_back" | sed -n 's/.*"quiet_hours_start":"\([^"]*\)".*/\1/p')
+back_end=$(echo "$read_back" | sed -n 's/.*"quiet_hours_end":"\([^"]*\)".*/\1/p')
+back_hour=$(echo "$read_back" | sed -n 's/.*"digest_hour":\([0-9]*\).*/\1/p')
+# A `::text` read-back arrives as `22:00:00`; the platform's own shape is `22:00`. Asserting
+# the exact string is what makes this a gate rather than a smoke test — `22:00:00` would
+# satisfy a "starts with 22:00" check while still being unreadable by `parse_clock`.
+if [ "$quiet_row" = "22:00 07:00 weekly 3 17" ] && [ "$back_start" = "22:00" ] \
+   && [ "$back_end" = "07:00" ] && [ "$back_hour" = "17" ]; then
+  pass "a saved quiet window reads back in the platform's own HH:MM shape"
+else
+  fail "quiet hours did not round trip: row=[$quiet_row] api=[$back_start..$back_end hour=$back_hour]"
+fi
+
+# The digest half, same gate, because the browser pass's `digestPersisted` needs it: a
+# `weekly` cadence with a weekday is a row the weekly branch can actually act on.
+back_cadence=$(echo "$read_back" | sed -n 's/.*"digest_cadence":"\([^"]*\)".*/\1/p')
+back_weekday=$(echo "$read_back" | sed -n 's/.*"digest_weekday":\([0-9]*\).*/\1/p')
+if [ "$back_cadence" = "weekly" ] && [ "$back_weekday" = "3" ]; then
+  pass "the weekly digest reads back with the weekday it was saved with"
+else
+  fail "digest read back as cadence=$back_cadence weekday=$back_weekday"
+fi
+
+# Restore, so a later pass in the same run starts from the defaults rather than from whatever
+# this one left behind — the quiet window belongs to the account, not to the gate.
+curl -s -o /dev/null -X PUT "$URL/api/v1/notifications/preferences" -b "$COOKIE_A" \
+  -H 'content-type: application/json' \
+  -d '{"cells":[],"settings":{"quiet_hours_start":null,"quiet_hours_end":null,"timezone":"UTC","digest_cadence":"off","digest_weekday":null,"digest_hour":8}}'
+
 # 2. Another person's notification is a 404, and the body does not carry the title.
 #    Read the base `member` role's id first: the binding below needs it, and a role that does
 #    not exist is a 404 from the IAM route that would read as "the member could not be bound".

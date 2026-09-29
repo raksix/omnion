@@ -10,6 +10,9 @@ import type {
   ContentBlock,
   ContentPattern,
   CreatedMediaShare,
+  EventCatalogue,
+  EventFilters,
+  EventPage,
   NewMediaGrant,
   Media,
   MediaBulkResult,
@@ -4172,10 +4175,22 @@ export function releaseMediaQuarantine(
  * meant to apply, and forwarding it would ask the server for the empty category — which the
  * server refuses with a 400, so a cleared `<select>` would turn the list into an error screen
  * instead of an unfiltered one.
+ *
+ * **`with_read` is the exception, and it is not a special case so much as the rule's own
+ * limit.** A skipped `false` is right for every other flag, because there `false` is the same
+ * as absent. For `with_read` absent means *show read and unread* and `false` means *unread
+ * only*, so a generic falsy skip would drop the reader's inbox filter on the floor and hand
+ * back a list they did not ask for. It is sent as `with_read=0` — the same value the server's
+ * `parse_flag` reads as off — rather than as `false`, which would serialize to "false" and is
+ * the kind of asymmetry that later reads as a bug in the wrong place.
  */
 function notificationQuery(filters: NotificationFilters = {}): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) {
+    if (key === "with_read") {
+      if (value === false) params.set(key, "0");
+      continue;
+    }
     if (value === undefined || value === "" || value === false) continue;
     params.set(key, String(value));
   }
@@ -4551,3 +4566,44 @@ export function retryEntry(entryId: string): Promise<PublishingEntry> {
 
 /** One item as the editor submits it — the same shape the stored item has. */
 export type MenuItemInput = MenuItem;
+// The event feed and the catalogue (REQ-016, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Build the feed's query string from its filters.
+ *
+ * `name` is repeated rather than joined: `?name=a&name=b` is the only shape that survives a
+ * value containing a comma, and an event name is a controlled vocabulary that will never
+ * contain one — but a filter that quietly mis-splits on a comma the day somebody registers a
+ * plugin's own name is a filter that will be debugged from the wrong end.
+ */
+function eventQuery(filters: EventFilters = {}): string {
+  const search = new URLSearchParams();
+  for (const name of filters.name ?? []) {
+    if (name) search.append("name", name);
+  }
+  if (filters.site_id) search.set("site_id", filters.site_id);
+  if (filters.actor_user_id) search.set("actor_user_id", filters.actor_user_id);
+  if (filters.from) search.set("from", filters.from);
+  if (filters.to) search.set("to", filters.to);
+  if (filters.cursor && filters.cursor > 0) search.set("cursor", String(filters.cursor));
+  if (filters.limit) search.set("limit", String(filters.limit));
+  const query = search.toString();
+  return query ? `?${query}` : "";
+}
+
+/** One page of the platform's recent events, newest first. */
+export function fetchEvents(filters: EventFilters = {}): Promise<EventPage> {
+  return request<EventPage>(`/api/v1/events${eventQuery(filters)}`);
+}
+
+/**
+ * Every event name the platform knows, with its area, description and payload fields.
+ *
+ * The counts (`live_count`, `reserved_count`, `max_subscriptions`) are part of the answer
+ * rather than something the screen recomputes: they are the registry's own totals, and a
+ * screen that counted the rows it happened to receive would report a number that changes with
+ * a filter the user cannot see.
+ */
+export function fetchEventCatalogue(): Promise<EventCatalogue> {
+  return request<EventCatalogue>("/api/v1/events/catalogue");
+}
