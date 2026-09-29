@@ -6819,3 +6819,50 @@ what might be there. (b) `objects/` grows one file per object, and the delete ro
 remove the directory as well as the run's own JSON — check that before the restore wizard
 exists, because an operator who deletes a backup and finds the files still there will assume
 the product lied.
+
+---
+
+## Tick 34 — main moved 25 commits; the QA pass was dying at the sign-in screen and calling it "already installed"
+
+**What.** The merge first. Five conflicts, all additive: two lucide icons wanted the same import in
+`app-shell.tsx` (union), main's rate limiter against wave4's request id in `routes/mod.rs` (both
+kept, layer order decided), a byte-identical `cargo-slot.sh` (ours), two independent depth passes in
+one region of `walkthrough.cjs` (both concatenated), and two pure appends to `BUILD-LOG.md`
+(concatenated, then verified by heading multiset rather than by line count — 0 of 44 headings lost).
+
+**The find.** The QA pass could not sign in, and it explained why it did not need to: "installation
+already exists". That was a guess about a state it had never observed. It reads the URL 900 ms after
+`goto('/')`, but on a fresh database the chain is `proxy.ts` → `/login` → a `useEffect` calling
+`fetchOnboarding()` → `/setup`, so the read lands on `/login`. The pass skipped the wizard and then
+tried to sign in with an account it had just decided did not need creating. `select count(*) from
+users` on that database was **0** — the log line and the database disagreed, which is the only reason
+this is worth writing down.
+
+Two fixes, both in `runWizard`. The authority is now `GET /api/v1/onboarding`, the same call the
+sign-in screen makes; anything short of a definite `needs_setup: false` goes to the wizard, because
+replaying completed first-run steps is refused by the API while skipping them is a dead pass. And a
+`null` step read is now a paint race to wait out, not the end of the wizard: the loop `break`ed on
+the first null and stopped on step 1 of 5, so the owner account existed and the organization did not
+— and every later screen then answered `organization_required`, which reads exactly like a broken CRM
+and is not one. That is the second shape the same symptom takes, which is why the fix is "ask the API"
+rather than "wait longer on the URL".
+
+**Proof.**
+- `cargo build -p omnion-api` — clean, 0 errors. The merge was compiled, not read.
+- `cargo test -p omnion-api --lib routes::crm` — **27 passed, 0 failed**.
+- `cargo test -p omnion-module-crm --lib` — **172 passed, 0 failed**.
+- `pnpm turbo run typecheck --force` — **2/2**.
+- `node --check scripts/qa/walkthrough.cjs` — OK.
+- Live stack: API on :18083 against `omnion_qa_w4`, `/healthz` 200, `/readyz` ok, admin on :3103.
+- After the fixes the wizard created the owner account and reached the organization step
+  (`010-setup-organization.png` exists in the artifacts).
+
+**Not proven, and not ticked.** The CRM browser pass did not finish. The box reached load 171–224
+with 24.7 GB of 32 GB swap in use and every `page.screenshot` timing out at 15 s — the documented
+"tab died under parallel writers" condition. I stopped it rather than let it draw conclusions from a
+saturated machine. REQ-051's keyboard and mobile boxes therefore stay unticked, which is where they
+already were.
+
+**Next.** The CRM pass alone, once load is under ~40. It is the only thing REQ-051 owes, and the two
+wizard defects above cost four earlier passes their sign-in, which is likely why this one looked
+impossible for a week.
