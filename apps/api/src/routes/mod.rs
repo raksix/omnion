@@ -96,6 +96,7 @@ pub mod media_shares;
 pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
+pub mod forms;
 pub mod menus;
 pub mod notifications;
 pub mod notifications_admin;
@@ -1008,6 +1009,42 @@ pub fn router(state: AppState) -> Router {
     let page_schedule =
         post(menus::schedule_page).layer(guards::require(&state, "content.pages.schedule"));
 
+    // Forms (REQ-064, slice 2). Three powers, not two: `forms.read` draws the builder and the
+    // list, `forms.manage` writes the definition, and `forms.submissions.read` reads what
+    // visitors sent. The third key is the one that matters — a person who may design the form
+    // has no business reading the answers, and every owner of a contact form has been that
+    // person at some point. The public submit route carries no guard at all: it is the endpoint
+    // a stranger's browser posts to.
+    let forms_list = get(forms::list_forms).layer(guards::require(&state, "forms.read"));
+    let forms_create =
+        post(forms::create_form).layer(guards::require(&state, "forms.manage"));
+    let form_read = get(forms::get_form).layer(guards::require(&state, "forms.read"));
+    let form_write = put(forms::update_form)
+        .layer(guards::require(&state, "forms.manage"))
+        .merge(delete(forms::delete_form).layer(guards::require(&state, "forms.manage")));
+    let form_fields =
+        put(forms::save_form_fields).layer(guards::require(&state, "forms.manage"));
+    let form_publish =
+        post(forms::set_form_status).layer(guards::require(&state, "forms.manage"));
+    // The inbox: reading it AND changing a row's state take the same key, because an inbox you
+    // may read but not act on is a screen with buttons that answer 403.
+    let submissions_list = get(forms::list_submissions)
+        .layer(guards::require(&state, "forms.submissions.read"));
+    let submissions_bulk = patch(forms::bulk_submission_status)
+        .layer(guards::require(&state, "forms.submissions.read"));
+    let submissions_export = get(forms::export_submissions)
+        .layer(guards::require(&state, "forms.submissions.read"));
+    let submission_read = get(forms::get_submission)
+        .layer(guards::require(&state, "forms.submissions.read"));
+    let submission_write = patch(forms::set_submission_status)
+        .layer(guards::require(&state, "forms.submissions.read"))
+        .merge(
+            delete(forms::delete_submission).layer(guards::require(&state, "forms.submissions.read")),
+        );
+    // Unauthenticated, like the rendered menu: a form on a live page is posted to by browsers
+    // that have no account on this installation.
+    let public_form_submit = post(forms::public_submit);
+
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
     // resolve the site through the caller's own organization. The collection endpoint is the
@@ -1300,6 +1337,20 @@ pub fn router(state: AppState) -> Router {
         .route("/publishing/queue/{id}/retry", publishing_entry_retry)
         .route("/pages/{id}/schedule", page_schedule)
         .route("/public/menus/{location}", public_menu)
+        // Forms and their inbox (REQ-064, slice 2). The static segments are declared before the
+        // parameter ones so axum ranks them ahead of `{id}` — `/forms/{id}/submissions/export`
+        // is a literal, and a route registered after `/forms/{id}/submissions/{sid}` would never
+        // be reached.
+        .route("/forms", forms_list)
+        .route("/forms", forms_create)
+        .route("/forms/{id}", form_read.merge(form_write))
+        .route("/forms/{id}/fields", form_fields)
+        .route("/forms/{id}/publish", form_publish)
+        .route("/forms/{id}/submissions", submissions_list)
+        .route("/forms/{id}/submissions", submissions_bulk)
+        .route("/forms/{id}/submissions/export", submissions_export)
+        .route("/forms/{id}/submissions/{sid}", submission_read.merge(submission_write))
+        .route("/public/forms/{key}/submit", public_form_submit)
 
         .route("/pages/{id}/preview", page_preview)
         .route("/pages/{id}/restore", page_restore)

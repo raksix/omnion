@@ -51,13 +51,17 @@ omnion-workflows = { path = "../../crates/workflows" }
 url.workspace = true
 base64.workspace = true
 
+# The form builder hashes a sender's address and user agent before they reach the inbox
+# (`routes/forms.rs`): the rate limiter only asks whether the same sender came back, and a
+# raw address in a form inbox turns the owner's database into a log of every visitor who used
+# the contact form.
+sha2.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
 # signs the ceremony's own message, so the verification runs exactly as it does in production.
 p256.workspace = true
 base64.workspace = true
-sha2 = "0.10"
 rand = "0.8"
 # The enterprise sign-in walk (tests/sso_live.rs) runs a *real* identity provider — a loopback
 # OIDC/SAML server it starts itself — so the round trip is proven over a socket with real RSA

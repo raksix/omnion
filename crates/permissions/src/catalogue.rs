@@ -92,6 +92,27 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Create, edit and remove site menus",
     },
+    // Forms (REQ-064, slice 2) are THREE powers, and the third is the point. `forms.read`
+    // draws the builder, `forms.manage` writes the definition — and `forms.submissions.read`
+    // reads what visitors sent. Somebody who may design a contact form has no business reading
+    // its answers: every owner of a site with a contact form is somebody who can edit it, and
+    // folding the inbox into `forms.read` would hand that person the inbox as a side effect of a
+    // permission whose name says "forms", not "answers".
+    PermissionDef {
+        key: "forms.read",
+        category: "content",
+        description: "Read form definitions and the builder vocabulary",
+    },
+    PermissionDef {
+        key: "forms.manage",
+        category: "content",
+        description: "Create, edit, publish and remove forms",
+    },
+    PermissionDef {
+        key: "forms.submissions.read",
+        category: "content",
+        description: "Read and moderate form submissions",
+    },
     // Media.
     PermissionDef {
         key: "media.read",

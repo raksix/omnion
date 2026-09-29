@@ -40,7 +40,8 @@ pub use error::{ContentError, Result};
 // guesses. A menu name and a pattern name are both 120 characters, so the value agrees — but
 // the modules keep their own constant so a bound may move without editing the other.
 pub use forms::{
-    FIELD_TYPES, FORM_STATUSES, Form, FormChanges, FormField, MAX_ANSWERS, MAX_FIELD_TEXT_LENGTH,
+    FIELD_TYPES, FORM_STATUSES, Form, FormChanges, FormField, MAX_ANSWER_LENGTH, MAX_ANSWERS,
+    MAX_FIELD_TEXT_LENGTH,
     MAX_FORM_NAME_LENGTH, MAX_OPTIONS, NewFormField, NewSubmission, SUBMISSIONS_STATUSES,
     SUBMIT_ACTIONS, Submission, SubmissionOutcome, SubmissionQuery, answers_summary,
     bulk_submission_status,
