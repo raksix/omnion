@@ -56,9 +56,15 @@ impl Outcome {
 /// yet is released by [`release_claim`] if the mailer refused it, so a failed send does not
 /// silence the lead forever.
 pub async fn existing_claim(pool: &PgPool, lead_id: Uuid) -> Result<Option<Value>> {
+    // `detail ? 'sent'` is what makes this the CLAIM rather than merely the newest line of
+    // this kind. `record_skip` writes the same `kind` — the trail shows "autoresponder_sent:
+    // no address" as a fact about the autoresponder — and ordering by `id desc` alone would
+    // return that note, which carries no `sent` key, so `was_sent` reads `false` and the next
+    // attempt believes the lead was never answered.
     let row: Option<Value> = sqlx::query_scalar(
         "select detail from crm_lead_events \
-         where lead_id = $1 and kind = $2 order by id desc limit 1",
+         where lead_id = $1 and kind = $2 and detail ? 'sent' \
+         order by id desc limit 1",
     )
     .bind(lead_id)
     .bind(SENT_KIND)
@@ -85,12 +91,27 @@ pub fn was_sent(detail: &Value) -> bool {
 /// one caller can win — a read-then-write pair cannot, because the read is not part of the
 /// same statement.
 pub async fn claim(pool: &PgPool, lead: &Lead, message: &Message) -> Result<bool> {
+    // `due_at` is written as the *formatted string*, never as the `OffsetDateTime` itself.
+    // `serde_json::json!` has no special case for `time::OffsetDateTime`, so the value
+    // serialises as serde's component array — `[2026, 272, 3, 11, 51, 855202933, 0, 0, 0]` —
+    // and `detail->>'due_at'` then yields NULL for a JSON *array*, not the text. The sweep's
+    // `->>` predicate would match nothing, forever, and the row would look like a reservation
+    // with no due instant: a lead waiting for a message no query can ever find.
+    //
+    // The gate caught this one only because it reads the stored JSON rather than the struct
+    // that produced it. `message.due_at` in Rust is a perfect `Option<OffsetDateTime>`, the
+    // unit tests are green, and the column is the only place the two disagree.
+    //
+    // The format is `date_header` (RFC 2822) rather than RFC 3339 for one reason: it is what
+    // the reader already expects, it is fixed-width and zero-padded, and therefore sorts
+    // chronologically as text — which is what lets the due index be a plain text expression
+    // index (a `::timestamptz` cast is STABLE and Postgres refuses it there).
     let detail = serde_json::json!({
         "to": message.to,
         "subject": message.subject,
         "template": message.template,
         "delayed": message.delayed,
-        "due_at": message.due_at,
+        "due_at": message.due_at.map(crate::autoresponder::date_header),
         "sent": !message.delayed,
     });
     // The claim is a plain insert whose *uniqueness* arbitrates the race, not a `where not
@@ -145,7 +166,8 @@ pub async fn release_claim(pool: &PgPool, lead_id: Uuid, to: &str) -> Result<boo
         "delete from crm_lead_events \
          where id = ( \
            select id from crm_lead_events \
-           where lead_id = $1 and kind = $2 and detail->>'to' = $3 and detail->>'sent' <> 'true' \
+           where lead_id = $1 and kind = $2 and detail->>'to' = $3 \
+             and detail ? 'sent' and detail->>'sent' <> 'true' \
            order by id desc limit 1 \
          ) returning id",
     )
@@ -167,7 +189,8 @@ pub async fn mark_sent(pool: &PgPool, lead_id: Uuid, sent_at: OffsetDateTime) ->
         "update crm_lead_events set detail = detail || jsonb_build_object('sent', true, 'sent_at', $2::text) \
          where id = ( \
            select id from crm_lead_events \
-           where lead_id = $1 and kind = $3 and detail->>'sent' <> 'true' \
+           where lead_id = $1 and kind = $3 \
+             and detail ? 'sent' and detail->>'sent' <> 'true' \
            order by id desc limit 1 \
          ) returning id",
     )
@@ -238,11 +261,14 @@ pub async fn prepare(
         .is_some_and(was_sent);
     let verdict = autoresponder.deliver(&context, now, already_sent);
 
-    // A claim is only taken for a message that is ready *now*; a delayed one is reserved by
-    // the worker that sends it, so `capture` does not write a reservation the moment nobody
-    // is going to honour for an hour.
+    // A claim is taken for *every* ready message, delayed or not, because the claim is what
+    // arbitrates the send. The earlier version skipped the reservation for a delayed message
+    // on the reasoning that "the worker will claim it" — and the worker does not: it only
+    // *completes* reservations. The result was a dead control: a source with any send delay at
+    // all reserved nothing, the worker found nothing, and the visitor was never answered. The
+    // delay is the feature; the reservation is what makes it happen later instead of never.
     if let Delivery::Ready(message) = &verdict {
-        if !message.delayed && !claim(pool, lead, message).await? {
+        if !claim(pool, lead, message).await? {
             return Ok(Outcome {
                 verdict: Delivery::AlreadySent,
                 lead_id: lead.id,
@@ -254,4 +280,172 @@ pub async fn prepare(
         verdict,
         lead_id: lead.id,
     })
+}
+
+/// A reservation that has come due and is waiting to be sent.
+///
+/// `PartialEq` without `Eq`: both members carry a `serde_json::Value`, which is not `Eq`.
+/// Deriving `Eq` on `Lead` and `IntakeSource` to satisfy a struct that only ever gets
+/// compared in a test would put a promise about two shared model types into a third file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DueReservation {
+    /// The lead the message answers.
+    pub lead: Lead,
+    /// The source that reserved it.
+    pub source: IntakeSource,
+    /// The message, re-rendered from the source's template at the moment it is sent.
+    pub message: Message,
+}
+
+/// The reservations whose delay has elapsed, oldest first.
+///
+/// A source can configure a send delay so the acknowledgement lands *after* the
+/// salesperson's own reply instead of racing it. That is a real feature, and it has a
+/// consequence that only shows up later: `capture` reserves the slot and something has to
+/// come back and send it. Without this function the delay is a control that makes the reply
+/// silently never go out — worse than not having it, because the operator watches the
+/// autoresponder working on every source they left at zero and has no reason to suspect the
+/// ones they did not.
+///
+/// Ordered by the instant the message came due, so a lead that waited a week is answered
+/// before one that waited a minute, and bounded by `limit` so one tick cannot pick up ten
+/// thousand reservations and hold the pool for the length of ten thousand mailers.
+pub async fn due_reservations(
+    pool: &PgPool,
+    now: OffsetDateTime,
+    limit: i64,
+) -> Result<Vec<DueReservation>> {
+    let rows: Vec<(Uuid, Value)> = sqlx::query_as(
+        // The comparison is on the *string*, not on a cast, and that is what lets the partial
+        // expression index serve this query. It is also only correct because one function
+        // writes this key: `claim` formats `due_at` with `date_header` (RFC 2822), which is
+        // fixed-width and zero-padded, so lexical order is chronological order within a zone.
+        // A cast here would be `STABLE` and would make Postgres fall back to a full scan of
+        // the trail once a minute — or, worse, an index that sorts differently per machine.
+        // `nullif` covers the two shapes a hand-edited row can hold: no key at all (NULL) and
+        // an empty string, which a cast would reject with `invalid input syntax for type
+        // timestamp` and turn the whole worker into a 500.
+        "select e.lead_id, e.detail \
+         from crm_lead_events e \
+         where e.kind = $1 \
+           and e.detail->>'sent' = 'false' \
+           and nullif(e.detail->>'due_at', '') is not null \
+           and e.detail->>'due_at' <= $2 \
+         order by e.detail->>'due_at' asc, e.id asc \
+         limit $3",
+    )
+    .bind(SENT_KIND)
+    .bind(crate::autoresponder::date_header(now))
+    .bind(limit.clamp(1, 500))
+    .fetch_all(pool)
+    .await?;
+
+    let mut due = Vec::with_capacity(rows.len());
+    for (lead_id, detail) in rows {
+        // A reservation whose lead or source is gone is not an error. The trail outlives
+        // both — a deleted lead keeps its lines for the audit export — and a sweep that
+        // refused to move on would retry the same dead row on every tick for ever.
+        let Some(lead) = find_lead_any_org(pool, lead_id).await? else {
+            tracing::debug!(lead_id = %lead_id, "a due autoresponder has no lead left");
+            continue;
+        };
+        let Some(source) = source_of(pool, lead.source_id).await? else {
+            tracing::debug!(lead_id = %lead_id, "a due autoresponder has no source left");
+            continue;
+        };
+
+        // The message is *re-rendered* from the source's template, not read back out of the
+        // claim. The claim stores the recipient, the subject and the template name, and
+        // deliberately not the body: `crm_lead_events.detail` is read by the lead's detail
+        // screen and by every audit export, and a rendered body is the lead's own words back
+        // to them. Re-rendering costs one thing — a template edited inside the delay sends
+        // the new wording — and buys the other: a source that was *switched off* inside the
+        // delay stops answering, which is what an operator who turned it off asked for.
+        let autoresponder = Autoresponder::from_json(&source.autoresponder);
+        if !autoresponder.is_configured() {
+            tracing::info!(
+                lead_id = %lead_id,
+                "a reserved autoresponder's source is no longer configured — not sending"
+            );
+            record_skip(
+                pool,
+                &lead,
+                &source,
+                "source_disabled",
+                serde_json::json!({ "reserved_at": detail.get("due_at").cloned().unwrap_or(Value::Null) }),
+            )
+            .await?;
+            continue;
+        }
+        let context = Recipient {
+            address: lead.email.as_deref(),
+            first_name: lead.first_name.as_deref().unwrap_or_default(),
+            source_name: source.name.as_str(),
+            product_interest: lead.product_interest.as_deref().unwrap_or_default(),
+            accepted: matches!(
+                lead.status.as_str(),
+                "new" | "assigned" | "contacted" | "qualified"
+            ),
+            reason: "",
+        };
+        let message = match autoresponder.deliver(&context, now, false) {
+            Delivery::Ready(message) => message,
+            other => {
+                // The lead was rejected or turned to spam inside the delay. The reservation
+                // is released rather than left pending, so the trail stops promising a mail
+                // that will never be justified to answer.
+                if matches!(other, Delivery::AlreadySent) {
+                    release_claim(pool, lead_id, detail.get("to").and_then(Value::as_str).unwrap_or_default())
+                        .await?;
+                } else {
+                    record_skip(
+                        pool,
+                        &lead,
+                        &source,
+                        other.reason(),
+                        serde_json::json!({ "reserved": true }),
+                    )
+                    .await?;
+                }
+                continue;
+            }
+        };
+
+        due.push(DueReservation {
+            lead,
+            source,
+            message,
+        });
+    }
+    Ok(due)
+}
+
+/// Read a lead without an organization filter, for the sweeper.
+///
+/// The sweep is already scoped — it starts from a reservation, and the reservation is on the
+/// lead — and the organization is a property of the lead rather than of the caller. A sweep
+/// that filtered by the caller's organization would need one, and a reservation whose source
+/// was moved between organizations would then be stranded.
+async fn find_lead_any_org(pool: &PgPool, lead_id: Uuid) -> Result<Option<Lead>> {
+    Ok(sqlx::query_as::<_, Lead>(&format!(
+        "select {} from crm_leads where id = $1",
+        crate::store::LEAD_COLUMNS
+    ))
+        .bind(lead_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// The source a lead's autoresponder belongs to.
+async fn source_of(pool: &PgPool, source_id: Option<Uuid>) -> Result<Option<IntakeSource>> {
+    let Some(source_id) = source_id else {
+        return Ok(None);
+    };
+    Ok(sqlx::query_as::<_, IntakeSource>(&format!(
+        "select {} from crm_intake_sources where id = $1",
+        crate::store::SOURCE_COLUMNS
+    ))
+    .bind(source_id)
+    .fetch_optional(pool)
+    .await?)
 }

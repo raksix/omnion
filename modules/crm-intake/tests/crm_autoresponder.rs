@@ -227,8 +227,12 @@ async fn a_pending_claim_is_not_a_sent_one() {
         .expect("prepare");
     assert!(outcome.sent());
 
-    // A delayed autoresponder does not claim at capture time — the worker will. Nothing is
-    // written, so nothing can later be mistaken for a send.
+    // A delayed autoresponder *reserves* at capture time, and the reservation is the whole
+    // mechanism: the worker completes it when the delay elapses, it never claims one. The
+    // earlier version of this test asserted the opposite ("a delayed message must not claim
+    // at capture time") and it was right about what the code did and wrong about what the
+    // code should do — a control that reserves nothing is a control whose reply never goes
+    // out, on exactly the sources that asked for it to wait.
     let delayed = source_with_autoresponder(&pool, org, 30).await;
     let other = accepted_lead(&pool, org, &delayed, "later@example.com").await;
     let verdict = ar_store::prepare(&pool, &other, &delayed, now)
@@ -239,12 +243,28 @@ async fn a_pending_claim_is_not_a_sent_one() {
         matches!(verdict, Delivery::Ready(ref message) if message.delayed),
         "a delayed autoresponder is a reserved message, got {verdict:?}"
     );
+    let reservation = ar_store::existing_claim(&pool, other.id)
+        .await
+        .expect("reading the claim")
+        .expect("a delayed message reserves its slot at capture time");
+    // `sent` is a JSON boolean, not the string "false" — `was_sent` reads it with
+    // `as_bool`, and asserting the string form passes for the wrong reason on one shape and
+    // fails on another.
+    assert_eq!(
+        reservation["sent"],
+        serde_json::json!(false),
+        "a reservation reads as pending, never as sent"
+    );
     assert!(
-        ar_store::existing_claim(&pool, other.id)
-            .await
-            .expect("reading the claim")
-            .is_none(),
-        "a delayed message must not claim at capture time"
+        !ar_store::was_sent(&reservation),
+        "a reserved message has not been sent"
+    );
+    let due_at = reservation["due_at"]
+        .as_str()
+        .expect("`due_at` is stored as a formatted string, not a serde component array");
+    assert!(
+        !due_at.is_empty(),
+        "a reservation names the instant it becomes due, or the worker cannot find it"
     );
 
     drop_org(&pool, org).await;
@@ -309,10 +329,18 @@ async fn a_rejected_submission_is_answered_by_nothing_and_says_why() {
     )
     .await
     .expect("the skip is recorded");
-    let detail = ar_store::existing_claim(&pool, captured.lead.id)
-        .await
-        .expect("reading the trail")
-        .expect("a line was written");
+    // The skip is a note, not a claim: `existing_claim` deliberately ignores rows without a
+    // `sent` key, so the reason has to be read from the row that carries it.
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "select detail from crm_lead_events \
+         where lead_id = $1 and kind = $2 and detail ? 'reason' \
+         order by id desc limit 1",
+    )
+    .bind(captured.lead.id)
+    .bind(ar_store::SENT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("a line was written");
     assert_eq!(detail["reason"], "not_accepted");
     assert_eq!(detail["source"], source.name);
 
@@ -352,4 +380,236 @@ async fn the_shipped_templates_are_usable_as_the_column_stores_them() {
         assert!(parsed.is_configured(), "{name} must be usable as shipped");
     }
     assert!(!omnion_module_crm_intake::autoresponder::template_names().is_empty());
+}
+
+/// Rewrite a source's autoresponder delay, through the real column.
+///
+/// The gate has to move a reservation's due instant into the past without waiting for a real
+/// minute to pass, and it must do it through the same JSON the editor writes — a test that
+/// rewrote the column with a different shape would prove the sweep works against a row no
+/// operator can create.
+async fn set_delay(pool: &PgPool, source: &IntakeSource, delay_minutes: i64) {
+    let column = sqlx::query_scalar::<_, serde_json::Value>(
+        "select autoresponder from crm_intake_sources where id = $1",
+    )
+    .bind(source.id)
+    .fetch_one(pool)
+    .await
+    .expect("reading the source's autoresponder column");
+    let mut column = column;
+    column["delay_minutes"] = serde_json::json!(delay_minutes);
+    sqlx::query("update crm_intake_sources set autoresponder = $2 where id = $1")
+        .bind(source.id)
+        .bind(&column)
+        .execute(pool)
+        .await
+        .expect("the delay is written back");
+}
+
+#[tokio::test]
+async fn a_delayed_autoresponder_is_sent_when_its_time_comes() {
+    // The defect this test exists for. A send delay is a *promise about when*, and the code
+    // that made it a promise was a reservation nothing ever completed: `prepare` skipped the
+    // claim for a delayed message, so the sweep had no row to find and the reply never went
+    // out. Every unit test was green — the pure half produced the right verdict, the delayed
+    // `Message` carried the right `due_at` — and the feature was dead on the one path where
+    // deadness shows.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder delay").await;
+    let source = source_with_autoresponder(&pool, org, 45).await;
+    let lead = accepted_lead(&pool, org, &source, "patient@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    let outcome = ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("prepare");
+    assert!(matches!(outcome.verdict, Delivery::Ready(ref m) if m.delayed));
+    assert_eq!(outcome.verdict.reason(), "sent");
+
+    // Before the delay, the sweep finds nothing. This is the half that says "not early",
+    // and it is the half a "just send it" implementation passes by accident.
+    let early = ar_store::due_reservations(&pool, now + time::Duration::minutes(44), 50)
+        .await
+        .expect("the sweep runs");
+    assert!(
+        !early.iter().any(|r| r.lead.id == lead.id),
+        "a message 44 minutes into a 45-minute delay is not due"
+    );
+
+    // After it, exactly one due row — for this lead.
+    let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(46), 50)
+        .await
+        .expect("the sweep runs");
+    let mine: Vec<_> = due.iter().filter(|r| r.lead.id == lead.id).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "a due delay is offered to the mailer exactly once"
+    );
+    assert_eq!(mine[0].message.to, "patient@example.com");
+    assert!(
+        !mine[0].message.body.trim().is_empty(),
+        "the re-rendered message must carry a body, or the mailer sends an empty letter"
+    );
+    assert_eq!(mine[0].source.id, source.id);
+
+    // The completion is what turns the reservation into a send, and it is one-shot: the
+    // second worker's pass must not find the same row again.
+    assert!(
+        ar_store::mark_sent(&pool, lead.id, now + time::Duration::minutes(46))
+            .await
+            .expect("marking the reservation sent"),
+        "the first completion wins"
+    );
+    assert!(
+        !ar_store::mark_sent(&pool, lead.id, now + time::Duration::minutes(47))
+            .await
+            .expect("the second completion is not an error, it is a loss"),
+        "a second worker must not also mark it sent"
+    );
+    let after = ar_store::due_reservations(&pool, now + time::Duration::minutes(60), 50)
+        .await
+        .expect("the sweep runs");
+    assert!(
+        !after.iter().any(|r| r.lead.id == lead.id),
+        "a completed reservation is never offered twice"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn a_source_switched_off_inside_its_delay_is_not_answered() {
+    // An operator who turns the autoresponder off has asked for the silence to be real. The
+    // message is re-rendered at send time rather than stored on the claim precisely so that
+    // this holds: a reservation made an hour ago does not keep a switched-off source talking.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder off mid-delay").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let lead = accepted_lead(&pool, org, &source, "cancelled@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved");
+
+    sqlx::query("update crm_intake_sources set autoresponder = $2 where id = $1")
+        .bind(source.id)
+        .bind(serde_json::json!({ "enabled": false }))
+        .execute(&pool)
+        .await
+        .expect("the source is switched off");
+
+    let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(31), 50)
+        .await
+        .expect("the sweep runs");
+    assert!(
+        !due.iter().any(|r| r.lead.id == lead.id),
+        "a switched-off source must not answer its reservation"
+    );
+
+    // And the trail says why, so the lead's timeline does not show a pending reply for ever.
+    // The reason lives on the *skip* line, which is a different row from the claim — the
+    // claim is the reservation, the skip is the note explaining it was abandoned. Reading
+    // them through one function is exactly the conflation this file's readers now avoid.
+    let note: serde_json::Value = sqlx::query_scalar(
+        "select detail from crm_lead_events \
+         where lead_id = $1 and kind = $2 and detail ? 'reason' \
+         order by id desc limit 1",
+    )
+    .bind(lead.id)
+    .bind(ar_store::SENT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("the skip line was written");
+    // `source_disabled`, not `not_configured`: the two are different facts and the trail is
+    // the only place an operator can tell them apart. "not_configured" is what the pure half
+    // says when asked at capture time; "source_disabled" says the operator changed their mind
+    // in the hour between the reservation and the send, which is a different repair.
+    assert_eq!(note["reason"], "source_disabled");
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn a_lead_that_became_spam_inside_its_delay_is_not_answered() {
+    // The reservation was made when the submission looked fine. The platform later decides it
+    // is spam, and mailing a spammer an acknowledgement is how a form ends up on a blocklist.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder late spam").await;
+    let source = source_with_autoresponder(&pool, org, 30).await;
+    let lead = accepted_lead(&pool, org, &source, "late-spam@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved");
+
+    sqlx::query("update crm_leads set status = 'spam' where id = $1")
+        .bind(lead.id)
+        .execute(&pool)
+        .await
+        .expect("the lead is marked as spam");
+    let lead = store::find_lead(&pool, org, lead.id)
+        .await
+        .expect("reading the lead back")
+        .expect("the lead is still there");
+
+    let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(31), 50)
+        .await
+        .expect("the sweep runs");
+    assert!(
+        !due.iter().any(|r| r.lead.id == lead.id),
+        "a lead that turned to spam must not be answered"
+    );
+    let note: serde_json::Value = sqlx::query_scalar(
+        "select detail from crm_lead_events \
+         where lead_id = $1 and kind = $2 and detail ? 'reason' \
+         order by id desc limit 1",
+    )
+    .bind(lead.id)
+    .bind(ar_store::SENT_KIND)
+    .fetch_one(&pool)
+    .await
+    .expect("the skip line was written");
+    assert_eq!(note["reason"], "not_accepted");
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn a_delay_shortened_to_zero_is_due_at_once() {
+    // The operator edits the source from "answer in an hour" to "answer now" and expects the
+    // waiting visitor to be answered, not to keep waiting out the old hour.
+    let pool = pool().await;
+    let org = fresh_org(&pool, "Autoresponder shortened").await;
+    let source = source_with_autoresponder(&pool, org, 120).await;
+    let lead = accepted_lead(&pool, org, &source, "impatient@example.com").await;
+    let now = time::OffsetDateTime::now_utc();
+
+    ar_store::prepare(&pool, &lead, &source, now)
+        .await
+        .expect("the slot is reserved for two hours");
+    assert!(ar_store::due_reservations(&pool, now + time::Duration::minutes(119), 50)
+        .await
+        .expect("the sweep runs")
+        .iter()
+        .all(|r| r.lead.id != lead.id));
+
+    set_delay(&pool, &source, 0).await;
+    let due = ar_store::due_reservations(&pool, now + time::Duration::minutes(121), 50)
+        .await
+        .expect("the sweep runs");
+    let mine: Vec<_> = due.iter().filter(|r| r.lead.id == lead.id).collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "a shortened delay is honoured on the reservation that is already waiting"
+    );
+    assert!(
+        !mine[0].message.delayed,
+        "the re-rendered message follows the source's *current* delay"
+    );
+
+    drop_org(&pool, org).await;
 }

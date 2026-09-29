@@ -28,7 +28,7 @@ use crate::model::{
 };
 use crate::vocabulary::{MAX_PAGE, MAX_PAYLOAD_BYTES, is_status};
 
-const SOURCE_COLUMNS: &str = "id, organization_id, site_id, name, kind, form_key, \
+pub const SOURCE_COLUMNS: &str = "id, organization_id, site_id, name, kind, form_key, \
      endpoint_key_hash, endpoint_key_hint, mapping, required_targets, consent_required, \
      consent_text, dedupe_policy, pipeline_id, stage_id, auto_tags, autoresponder, active, \
      rate_limit_per_hour, last_received_at, last_error, broken_mappings, created_by, \
