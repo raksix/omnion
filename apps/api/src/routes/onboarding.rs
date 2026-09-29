@@ -391,7 +391,24 @@ pub async fn choose_theme(
     current: CurrentSession,
     Json(body): Json<ThemeRequest>,
 ) -> Result<Json<StatusBody>, ApiError> {
-    onboarding::choose_theme(state.db().pool(), current.user.id, &body.theme).await?;
+    let site = onboarding::choose_theme(state.db().pool(), current.user.id, &body.theme).await?;
+
+    // A theme change re-renders the whole site, so it is a fact worth broadcasting: a cache
+    // layer, a static export or a preview service keyed on the theme keys off it. The
+    // step function returns the site it updated, which is what carries the organization \u2014
+    // the route never has to look the site up separately.
+    omnion_events::bus::emit(
+        state.db().pool(),
+        omnion_events::NewEvent::new("theme.activated")
+            .organization(site.organization_id)
+            .site(site.id)
+            .actor(current.user.id)
+            .payload(serde_json::json!({
+                "theme": site.theme,
+                "site_id": site.id,
+            })),
+    )
+    .await?;
 
     let status = onboarding_state::status(state.db().pool()).await?;
     Ok(Json(StatusBody::from(status)))
