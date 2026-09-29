@@ -3782,6 +3782,89 @@ export function deleteIamProvider(id: string): Promise<null> {
   return request(`/api/v1/iam/providers/${id}`, { method: "DELETE" });
 }
 
+/** One account the deletion would take away, as the dialog shows it. */
+export type IamDeletionAccount = {
+  user_id: string;
+  email: string;
+  /** Which system owns the account: `local`, `sso`, `scim`, … */
+  source: string;
+  /** What the directory calls it, when it has said. */
+  external_id: string | null;
+};
+
+/** One row of the per-source breakdown. */
+export type IamDeletionSourceCount = {
+  source: string;
+  count: number;
+};
+
+/**
+ * What removing this provider would do, read *before* the button is pressed.
+ *
+ * `by_source` is carried alongside the total rather than instead of it, and the panel adds it up
+ * in front of the operator: "7 accounts" is a number to wave through, "7 accounts: 5 LDAP, 2
+ * SCIM" says a directory sweep created these people. `unknown_sources` is why a total that does
+ * not add up is still renderable — a source string a newer migration wrote must not leave the
+ * dialog showing a number it cannot account for.
+ */
+export type IamProviderDeletionImpact = {
+  provider_id: string;
+  slug: string;
+  affected_accounts: number;
+  by_source: IamDeletionSourceCount[];
+  /** A bounded sample, not the whole set: a directory of 4000 people must not render 4000 rows. */
+  accounts: IamDeletionAccount[];
+  unknown_sources: boolean;
+  /** `true` when the delete would be refused, so the panel never re-derives the rule itself. */
+  blocked: boolean;
+};
+
+/**
+ * Read the deletion impact.
+ *
+ * Separate from the delete on purpose. A dialog that discovers the block only after the click is
+ * a dialog that failed, and the refusal it would then show arrives as an error body rather than
+ * as the answer to a question somebody asked.
+ */
+export function fetchIamProviderDeletionImpact(id: string): Promise<IamProviderDeletionImpact> {
+  return request(`/api/v1/iam/providers/${id}/deletion-impact`);
+}
+
+/**
+ * The answer of a reassignment: four numbers, and the caller shows them rather than the count
+ * they asked for.
+ *
+ * `requested` is what the button sent, `reassigned` is what the update actually moved. A batch
+ * that named a local account and another tenant's account is a batch of two, and printing
+ * "4 reassigned" would be the lie. `not_moved` is always zero today and is carried anyway —
+ * an update reporting fewer rows than the scope query matched means something moved
+ * concurrently, and a caller that could not see the difference would report a success one
+ * account short.
+ */
+export type IamProviderReassignResult = {
+  requested: number;
+  reassigned: number;
+  not_moved: number;
+  skipped: number;
+};
+
+/**
+ * Fall accounts back to local sign-in — the action the refusal tells the operator to take.
+ *
+ * Every id is checked against the caller's organization *and* the provider's, so a batch cannot
+ * quietly take an account from a different tenant that happens to be in the list; an id from
+ * elsewhere comes back in `skipped` instead.
+ */
+export function reassignIamProviderAccounts(
+  id: string,
+  userIds: string[],
+): Promise<IamProviderReassignResult> {
+  return request(`/api/v1/iam/providers/${id}/reassign`, {
+    method: "POST",
+    body: JSON.stringify({ user_ids: userIds }),
+  });
+}
+
 /** Ask the provider what it actually is. A broken provider is a result, not a transport error. */
 export function testIamProvider(id: string): Promise<IamProviderTest> {
   return request(`/api/v1/iam/providers/${id}/test`, { method: "POST" });
