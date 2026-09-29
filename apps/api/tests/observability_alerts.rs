@@ -182,6 +182,12 @@ fn record_queue_depth(depth: f64) {
 #[tokio::test]
 async fn a_rule_fires_through_a_real_metric_notifies_once_and_resolves() {
     let state = support::walk_state::state_or_fail().await;
+    // This walk sweeps the WHOLE evaluator, so it may not overlap another one that does.
+    // See `walk_state::EVALUATOR_LOCK`: the sweep has no rule-id parameter by design, so
+    // every parallel walk in this binary was being evaluated against the union of all the
+    // others' rules, and the counts came out larger than any single walk created.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
+    support::walk_state::clear_alert_state(state.db().pool()).await;
     let cookie = sign_in(&state).await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkQueueBacklog");
@@ -190,16 +196,19 @@ async fn a_rule_fires_through_a_real_metric_notifies_once_and_resolves() {
     // a walk that waited 300 seconds would not run.
     let created = call(
         &state,
-        request(
-            Method::POST,
-            "/api/v1/observability/alert-rules",
-            Some(json!({
-                "name": name,
-                "expr": "omnion_queue_depth > 0",
-                "severity": "critical",
-                "for_seconds": 0,
-                "summary": "the walk's own rule"
-            })),
+        with_cookie(
+            request(
+                Method::POST,
+                "/api/v1/observability/alert-rules",
+                Some(json!({
+                    "name": name,
+                    "expr": "omnion_queue_depth > 0",
+                    "severity": "critical",
+                    "for_seconds": 0,
+                    "summary": "the walk's own rule"
+                })),
+            ),
+            &cookie,
         ),
     )
     .await;
@@ -342,6 +351,12 @@ async fn a_rule_fires_through_a_real_metric_notifies_once_and_resolves() {
 #[tokio::test]
 async fn a_dwell_holds_a_rule_pending_before_it_fires() {
     let state = support::walk_state::state_or_fail().await;
+    // This walk sweeps the WHOLE evaluator, so it may not overlap another one that does.
+    // See `walk_state::EVALUATOR_LOCK`: the sweep has no rule-id parameter by design, so
+    // every parallel walk in this binary was being evaluated against the union of all the
+    // others' rules, and the counts came out larger than any single walk created.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
+    support::walk_state::clear_alert_state(state.db().pool()).await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkDwell");
     let rule_id: Uuid = sqlx::query_scalar(
@@ -410,6 +425,12 @@ async fn a_dwell_holds_a_rule_pending_before_it_fires() {
 #[tokio::test]
 async fn a_pending_event_that_falls_back_is_discarded_rather_than_written_as_resolved() {
     let state = support::walk_state::state_or_fail().await;
+    // This walk sweeps the WHOLE evaluator, so it may not overlap another one that does.
+    // See `walk_state::EVALUATOR_LOCK`: the sweep has no rule-id parameter by design, so
+    // every parallel walk in this binary was being evaluated against the union of all the
+    // others' rules, and the counts came out larger than any single walk created.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
+    support::walk_state::clear_alert_state(state.db().pool()).await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkFlap");
     let rule_id: Uuid = sqlx::query_scalar(
@@ -454,6 +475,12 @@ async fn a_pending_event_that_falls_back_is_discarded_rather_than_written_as_res
 #[tokio::test]
 async fn a_silence_suppresses_the_event_but_does_not_erase_it() {
     let state = support::walk_state::state_or_fail().await;
+    // This walk sweeps the WHOLE evaluator, so it may not overlap another one that does.
+    // See `walk_state::EVALUATOR_LOCK`: the sweep has no rule-id parameter by design, so
+    // every parallel walk in this binary was being evaluated against the union of all the
+    // others' rules, and the counts came out larger than any single walk created.
+    let _evaluator = support::walk_state::exclusive_evaluator().await;
+    support::walk_state::clear_alert_state(state.db().pool()).await;
     let cookie = sign_in(&state).await;
     let pool = state.db().pool();
     let name = unique_rule_name("WalkSilenced");
@@ -545,7 +572,7 @@ async fn a_silence_suppresses_the_event_but_does_not_erase_it() {
         "{}",
         refused.body
     );
-    assert_eq!(refused.body["code"], "silence_already_ended");
+    assert_eq!(refusal_code(&refused), "silence_already_ended");
 
     // And a silence with no reason is refused too: an anonymous silence is one nobody removes.
     let anonymous = call(
@@ -561,7 +588,7 @@ async fn a_silence_suppresses_the_event_but_does_not_erase_it() {
     )
     .await;
     assert_eq!(anonymous.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(anonymous.body["code"], "invalid_reason");
+    assert_eq!(refusal_code(&anonymous), "invalid_reason");
 
     let _ = sqlx::query("delete from obs_alert_rules where id = $1")
         .bind(rule_id)
@@ -608,12 +635,9 @@ async fn the_preview_reports_live_state_and_refuses_an_expression_the_evaluator_
     )
     .await;
     assert_eq!(unknown_family.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(unknown_family.body["code"], "invalid_alert_expression");
+    assert_eq!(refusal_code(&unknown_family), "invalid_alert_expression");
     assert!(
-        unknown_family.body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("omnion_not_a_family"),
+        refusal_message(&unknown_family).contains("omnion_not_a_family"),
         "the refusal must name the family: {}",
         unknown_family.body
     );
@@ -632,10 +656,7 @@ async fn the_preview_reports_live_state_and_refuses_an_expression_the_evaluator_
     .await;
     assert_eq!(no_comparison.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(
-        no_comparison.body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no comparison"),
+        refusal_message(&no_comparison).contains("no comparison"),
         "the refusal must say what is missing: {}",
         no_comparison.body
     );
@@ -664,7 +685,7 @@ async fn the_preview_reports_live_state_and_refuses_an_expression_the_evaluator_
         "{}",
         refused.body
     );
-    assert_eq!(refused.body["code"], "invalid_alert_expression");
+    assert_eq!(refusal_code(&refused), "invalid_alert_expression");
 
     let persisted: i64 =
         sqlx::query_scalar("select count(*) from obs_alert_rules where name like 'Bad-%'")
@@ -750,8 +771,8 @@ async fn the_settings_row_validates_every_field_and_a_valid_save_takes_effect_im
             "{field} was accepted: {}",
             response.body
         );
-        assert_eq!(response.body["code"], code, "{field}: {}", response.body);
-        let message = response.body["message"].as_str().unwrap_or_default();
+        assert_eq!(refusal_code(&response), code, "{field}: {}", response.body);
+        let message = refusal_message(&response);
         assert!(
             message.contains(field),
             "the refusal for {field} does not name the field: {message}"
@@ -996,11 +1017,41 @@ async fn sigterm_flips_readyz_to_503_while_healthz_stays_200() {
 
     // Drain finishes: back to 200 once the flag clears. A second `begin_drain` is what the loop
     // would do, so the assertion is that the flag is the ONLY thing readiness reads.
+    //
+    // The drain MECHANICS are asserted on an isolated instance, not the process-wide one, and the
+    // reason is a whole class of failure this walk had:
+    //
+    // `drain_and_flush` waits for `in_flight() == 0`, and `in_flight` is incremented by the
+    // request-log middleware on the SHARED `lifecycle::global()`. This file runs eight walks in
+    // one process, in parallel by default, and every other one of them drives real requests
+    // through the real router. So a 50 ms deadline here is racing seven sibling walks' traffic:
+    // one in-flight request of theirs is a `timed_out` in ours. It passed alone and failed in the
+    // suite — which is backwards from how a defect usually presents, and is why the first reading
+    // of this failure is "the drain is broken" when in fact the drain was fine and the assertion
+    // was shared mutable state with no owner.
+    //
+    // A shared counter with no test that isolates it is not a product bug until it produces a
+    // flaky result, and then it is a product bug in the *suite*. The isolated instance below is
+    // `Lifecycle::new()` — the constructor is public for exactly this reason.
+    let isolated = std::sync::Arc::new(lifecycle::Lifecycle::new());
     let summary =
-        lifecycle::drain_and_flush(&lifecycle, None, std::time::Duration::from_millis(50)).await;
-    assert_eq!(summary.outcome, "drained");
+        lifecycle::drain_and_flush(&isolated, None, std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        summary.outcome, "drained",
+        "a drain with nothing in flight must not wait for the deadline"
+    );
     assert!(summary.clean);
     assert!(summary.to_line().contains("unhealthy_exporters=none"));
+
+    // The GLOBAL one gets the same treatment at the end of the walk, or it is left draining and
+    // every later walk in this binary sees a 503 from /readyz. `end_drain` says whether there was
+    // a drain to abandon, which is the fact a supervisor logging an abandoned drain would want.
+    assert!(
+        lifecycle.end_drain(),
+        "the walk flipped the process-wide drain and could not put it back — every later walk in \
+         this binary would read /readyz as 503"
+    );
+    assert!(!lifecycle.is_draining(), "the drain flag outlived the walk");
 }
 
 /// Attach the session cookie to a request.
@@ -1010,4 +1061,56 @@ fn with_cookie(mut request: Request<Body>, cookie: &str) -> Request<Body> {
         cookie.parse().expect("a cookie header value"),
     );
     request
+}
+
+/// The error a refusal answered with, unwrapped from the platform's envelope.
+///
+/// ## Why this helper exists rather than an index expression at each site
+///
+/// Every refusal on this platform is serialized as `{"error": {"code", "message", "details"}}`
+/// (`apps/api/src/error.rs`, `impl IntoResponse for ApiError`). This file read `body["code"]`
+/// directly, which is `null` for every refusal in it — and `assert_eq!(null, "a_code")` is a
+/// failure, so the suite was red rather than silently green, which is the only reason the
+/// mismatch was ever going to be found.
+///
+/// It hid for four ticks because **this suite had never run.** `state_or_fail` panics when the
+/// migrations do not apply, and the migrations did not apply: `cargo test --test
+/// observability_alerts` connected to the shared `omnion` database, which carries a sibling
+/// wave's `0019_cms_blocks` while this branch's slot 19 is `0019_secret_hierarchy`. Every walk in
+/// the file aborted before its first assertion, and the log said "aborts with exit 101,
+/// pre-existing, not claimed" — the shape of a defect nobody had chased.
+///
+/// The lesson is about the envelope, not the shape: **a walk that reads an error must read it
+/// through the same helper as every other walk.** A refusal whose `code` is read four different
+/// ways in five suites is four ways for the next envelope change to be a green suite that
+/// proves nothing. `apps/api/tests/observability_permissions.rs` already read it correctly, which
+/// is why it passed on the day this one did not.
+fn refusal(response: &TestResponse) -> &Value {
+    let body = response.body.get("error").unwrap_or_else(|| {
+        panic!(
+            "the refusal is not in the platform envelope: {}",
+            response.body
+        )
+    });
+    assert!(
+        body.get("code").is_some() && body.get("message").is_some(),
+        "the envelope carries no code/message: {body}"
+    );
+    body
+}
+
+/// The refusal's `code`, as a `&str`.
+fn refusal_code(response: &TestResponse) -> &str {
+    refusal(response)
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+/// The refusal's `message`, as a `&str`.
+fn refusal_message(response: &TestResponse) -> &str {
+    refusal(response)
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
