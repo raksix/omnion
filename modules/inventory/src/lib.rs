@@ -40,6 +40,7 @@ pub mod items;
 pub mod ledger;
 pub mod model;
 pub mod money;
+pub mod reports;
 pub mod reservations;
 pub mod store;
 pub mod stocktake;

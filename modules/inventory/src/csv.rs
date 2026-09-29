@@ -24,7 +24,7 @@ use crate::store::{Page, StockLevel};
 /// opened, so a note reading "=SUM(A1:A9)" — or an item name somebody chose — becomes code on
 /// the approver's machine. Prefixing the cell with an apostrophe is the conventional neutraliser
 /// and keeps the text readable.
-fn csv_cell(value: &str) -> String {
+pub(crate) fn csv_cell(value: &str) -> String {
     let guarded = if starts_a_formula(value) {
         // A leading apostrophe inside a quoted cell is literal, so it has to go outside the
         // quotes to work: `'=` is the form Excel treats as text.
@@ -172,7 +172,7 @@ pub fn approvals_csv(page: &Page<crate::approvals::ApprovalView>) -> String {
 }
 
 /// Prepend the UTF-8 BOM Excel wants, and be honest about the line ending.
-fn with_bom(body: String) -> String {
+pub(crate) fn with_bom(body: String) -> String {
     // A BOM, because Excel opens a CSV holding an item's name and mangles every non-ASCII
     // character without one — and a Turkish organization is the first thing this module's users
     // are. Same reason and same trade-off as `modules/sales`.

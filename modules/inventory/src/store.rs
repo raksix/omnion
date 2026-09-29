@@ -1540,6 +1540,24 @@ pub async fn list_stock(
     Ok(Page::new(levels, next_cursor, total))
 }
 
+/// The stock list's total — **the row count under the same filter the list used**.
+///
+/// This exists as its own function because a count that answers a *different*
+/// question than the list it sits above is a lie with a number on it. The list
+/// filters on `search`, `category` and `status`; the first version of this count
+/// only knew about `item_id`, `location_id`, `warehouse_id` and `idle_days`, so
+/// filtering a warehouse of 120 rows down to 3 negatives rendered "3 results" in
+/// the table and "120 records" in the count beside it. Both numbers were read
+/// off the same page, by the same person, in the same second.
+///
+/// The status arm is the same four-case expression as the badge and the same
+/// union the list uses, written out rather than shared: a `case` cannot be a
+/// `bind` parameter, and a second copy that drifted is the exact bug this
+/// function's doc comment is warning about. It is a *count*, so a drifted copy
+/// is invisible until somebody counts the wrong thing — which is why the
+/// integration walk asserts the count **as a conjunction with the list**: after
+/// asking for negatives, `total == items.len()` whenever the list fits in one
+/// page, and every row shown really is negative.
 async fn count_stock(pool: &PgPool, organization_id: Uuid, query: &StockQuery) -> Result<i64> {
     let mut count: QueryBuilder<Postgres> = QueryBuilder::new(
         "select count(*) from inventory_stock s \
@@ -1556,6 +1574,38 @@ async fn count_stock(pool: &PgPool, organization_id: Uuid, query: &StockQuery) -
     }
     if let Some(warehouse_id) = query.warehouse_id {
         count.push(" and l.warehouse_id = ").push_bind(warehouse_id);
+    }
+    if let Some(category) = query.category.as_deref() {
+        count.push(" and i.category = ").push_bind(category);
+    }
+    if let Some(term) = query.search.as_deref().map(str::trim) {
+        if !term.is_empty() {
+            count
+                .push(" and (i.name ilike ")
+                .push_bind(format!("%{term}%"))
+                .push(" or i.sku ilike ")
+                .push_bind(format!("%{term}%"))
+                .push(")");
+        }
+    }
+    if let Some(status) = query.status.as_deref().map(str::trim) {
+        if !status.is_empty() {
+            // The same rank the badge and the list's filter use: 1 negative,
+            // 2 critical, 3 low, 4 ok. `below_threshold` is the union of the two
+            // amber states in both places — a fourth badge would make "what
+            // needs reordering?" answer differently from the inbox.
+            count
+                .push(" and case when s.on_hand - s.reserved < 0 then 1 ")
+                .push("when s.on_hand - s.reserved <= i.min_threshold then 2 ")
+                .push("when s.on_hand - s.reserved <= i.reorder_point then 3 else 4 end ")
+                .push(match status {
+                    "negative" => "= 1",
+                    "critical" => "= 2",
+                    "low" => "= 3",
+                    "ok" => "= 4",
+                    _ => "in (2, 3)",
+                });
+        }
     }
     if let Some(days) = query.idle_days {
         count
