@@ -1602,6 +1602,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-security"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-storage"
 version = "0.1.0"
 dependencies = [
