@@ -423,6 +423,11 @@ export function fetchStock(filters: StockFilters = {}): Promise<Page<StockLevel>
 }
 
 /** The warehouse tree. */
+/** Every location of the organization, for the pickers. */
+export function fetchLocations(): Promise<Location[]> {
+  return inventoryRequest<Location[]>("/api/v1/inventory/locations");
+}
+
 export function fetchWarehouses(): Promise<Warehouse[]> {
   return inventoryRequest<Warehouse[]>("/api/v1/inventory/warehouses");
 }
@@ -503,6 +508,157 @@ export function cancelApproval(id: string): Promise<AdjustmentApproval> {
     `/api/v1/inventory/approvals/${encodeURIComponent(id)}/cancel`,
     { method: "POST" },
   );
+}
+
+/** Where a transfer is in its life. */
+export type TransferStatus = "draft" | "dispatched" | "received" | "cancelled";
+
+/** One line of a transfer. */
+export type TransferLine = {
+  id: string;
+  item_id: string;
+  sku: string;
+  item_name: string;
+  quantity: Quantity;
+  received_qty: Quantity;
+  note: string;
+};
+
+/**
+ * A transfer document.
+ *
+ * **`outstanding` is not sent by the server** — it is the line's own subtraction — but the type
+ * declares it because the server does, and the screen reads it rather than recomputing. A
+ * screen that computed it would be right today and wrong the moment partial receiving changed
+ * the rule.
+ */
+export type StockTransfer = {
+  id: string;
+  organization_id: string;
+  number: string;
+  status: TransferStatus;
+  from_location_id: string;
+  from_location_code: string;
+  to_location_id: string;
+  to_location_code: string;
+  scheduled_on: string | null;
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  dispatched_at: string | null;
+  received_at: string | null;
+  cancelled_at: string | null;
+  lines: TransferLine[];
+  quantity_total: Quantity;
+  received_total: Quantity;
+};
+
+/** One low-stock alert — an episode, not a crossing event. */
+export type StockAlert = {
+  id: string;
+  item_id: string;
+  sku: string;
+  item_name: string;
+  location_id: string | null;
+  location_code: string | null;
+  kind: "low_stock" | "negative_stock";
+  /** The threshold **as it stood when the alert was raised** — a snapshot, never today's value. */
+  threshold: Quantity;
+  observed: Quantity;
+  raised_at: string;
+  notified_at: string | null;
+  cleared_at: string | null;
+};
+
+/** What one run of the sweep did. */
+export type AlertSweep = {
+  examined: number;
+  raised: number;
+  cleared: number;
+  open: number;
+};
+
+/** The transfer list's filter. */
+export type TransferFilters = {
+  search?: string;
+  /** Repeated, or comma separated — a `<select multiple>` and a pasted URL both arrive. */
+  status?: string;
+  open_only?: boolean;
+  limit?: number;
+  cursor?: string;
+};
+
+export function fetchTransfers(filters: TransferFilters = {}): Promise<Page<StockTransfer>> {
+  return inventoryRequest<Page<StockTransfer>>(`/api/v1/inventory/transfers${query(filters as Record<string, unknown>)}`);
+}
+
+export function fetchTransfer(id: string): Promise<StockTransfer> {
+  return inventoryRequest<StockTransfer>(
+    `/api/v1/inventory/transfers/${encodeURIComponent(id)}`,
+  );
+}
+
+/** Write a draft. It moves nothing — the shelf is checked at dispatch, where the stock leaves. */
+export function createTransfer(body: {
+  from_location_id: string;
+  to_location_id: string;
+  lines: { item_id: string; quantity: string; note?: string }[];
+  scheduled_on?: string;
+  note?: string;
+}): Promise<StockTransfer> {
+  return inventoryRequest<StockTransfer>("/api/v1/inventory/transfers", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Book the goods out of the source and into transit. */
+export function dispatchTransfer(id: string): Promise<StockTransfer> {
+  return inventoryRequest<StockTransfer>(
+    `/api/v1/inventory/transfers/${encodeURIComponent(id)}/dispatch`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Book goods in, per line and possibly partially.
+ *
+ * The lines are explicit because a receive of "everything still outstanding" and a receive of
+ * "these two pallets" are different acts, and a screen that sent the first would book in goods
+ * nobody said had arrived.
+ */
+export function receiveTransfer(
+  id: string,
+  lines: { line_id: string; quantity: string }[],
+): Promise<StockTransfer> {
+  return inventoryRequest<StockTransfer>(
+    `/api/v1/inventory/transfers/${encodeURIComponent(id)}/receive`,
+    { method: "POST", body: JSON.stringify({ lines }) },
+  );
+}
+
+/** Withdraw it. Before dispatch that moves nothing; after dispatch the goods come home. */
+export function cancelTransfer(id: string): Promise<StockTransfer> {
+  return inventoryRequest<StockTransfer>(
+    `/api/v1/inventory/transfers/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" },
+  );
+}
+
+export function fetchAlerts(
+  filters: { search?: string; kind?: string; open_only?: boolean; limit?: number; cursor?: string } = {},
+): Promise<Page<StockAlert>> {
+  return inventoryRequest<Page<StockAlert>>(`/api/v1/inventory/alerts${query(filters as Record<string, unknown>)}`);
+}
+
+/** The nav badge. */
+export function fetchOpenAlertCount(): Promise<{ open: number }> {
+  return inventoryRequest<{ open: number }>("/api/v1/inventory/alerts/open-count");
+}
+
+/** Run the sweep. Idempotent, so a second run over an unchanged shelf raises nothing. */
+export function sweepAlerts(): Promise<AlertSweep> {
+  return inventoryRequest<AlertSweep>("/api/v1/inventory/alerts/sweep", { method: "POST" });
 }
 
 /** Download the stock list as a CSV, with the same filters the table is showing. */
