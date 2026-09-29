@@ -546,6 +546,24 @@ impl Registry {
             .fetch_add(minutes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Forget every sample this registry holds.
+    ///
+    /// Only ever called from a test, and only through [`clear_global_samples`] on the global
+    /// registry — the reasoning is there. On an instance it is a plain reset, which is what makes
+    /// the global case testable at all.
+    ///
+    /// `known` goes with the series, deliberately, and not because it is convenient. The
+    /// per-position label set is the state that made a value collapse to `other`, and leaving it
+    /// behind means the next recording's labels are decided by this one's — so a walk expecting
+    /// its own value verbatim would be handed the previous run's `other` series instead, for
+    /// reasons that have nothing to do with what it did.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().expect("the registry lock is not poisoned");
+        inner.series.clear();
+        inner.known.clear();
+        inner.budget_events.clear();
+    }
+
     /// The minute this registry buckets into.
     fn minute(&self) -> i64 {
         // A plain OFFSET from the wall clock, never a replacement for it. The first draft used
@@ -1092,6 +1110,35 @@ pub fn global() -> &'static Registry {
     REGISTRY.get_or_init(Registry::new)
 }
 
+/// Drop every recorded sample, for a test that needs a metric history to start empty.
+///
+/// ## Why the global registry needs a reset at all
+///
+/// Everything else here is instanced, and the doc comment on `advance_minutes` says why the
+/// clock is an offset on the instance: "a test that shifted the process-wide registry's clock
+/// would redraw every real metric's history, and the next test in the binary would inherit it".
+///
+/// The samples have the same property, and the alert evaluator is what exposes it. `evaluate_pass`
+/// reads [`global`] — the series an expression names are the *live process's* series, because an
+/// alert that read a private registry would never fire on real traffic. So a walk that asserts
+/// "no data never breaches" is asserting about a global, and a sibling walk that recorded
+/// `omnion_queue_depth 7.0` a moment earlier makes it false: the event opens, and the failure
+/// reads as a defect in the evaluator rather than as a test that could not set up its premise.
+///
+/// `advance_minutes` is therefore not enough on its own, for the same reason it was not enough
+/// there: rolling the clock forward does not remove a sample that is still inside the window.
+///
+/// ## Why this is not a footgun
+///
+/// It is `pub` for tests and the name says what it is. There is no production caller, and there
+/// must never be one: clearing a live registry's history mid-flight makes every chart on screen lie
+/// about a gap that did not happen. The alternative — a private registry the evaluator could read
+/// — would mean the evaluator no longer sees real traffic, which is the property the whole
+/// subsystem is built on.
+pub fn clear_global_samples() {
+    global().clear();
+}
+
 /// The current unix minute, the bucket the history ring writes into.
 fn current_minute() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp().div_euclid(60)
@@ -1505,6 +1552,45 @@ mod tests {
             .expect("declared")
             .max_series;
         assert!(after <= before, "{after} should not exceed {before}");
+    }
+
+    #[test]
+    fn clearing_empties_the_history_and_the_label_memory() {
+        let reg = registry();
+        reg.counter_add("omnion_exporter_dropped_total", &["backend", "x"], 3.0);
+        reg.gauge_set("omnion_queue_depth", &["smoke", "ready"], 7.0);
+        assert!(
+            reg.series_of("omnion_queue_depth", 5).len() > 0,
+            "the sample was not recorded, so clearing it proves nothing"
+        );
+
+        reg.clear();
+
+        assert_eq!(
+            reg.series_of("omnion_queue_depth", 5).len(),
+            0,
+            "a gauge series survived the clear — an alert over it would still see the value the \
+             previous walk recorded"
+        );
+        assert!(
+            !reg.render().contains("omnion_queue_depth{queue=\"smoke\",state=\"ready\"}"),
+            "the exposition still shows the cleared sample"
+        );
+
+        // The label memory goes too, so the next recording is judged by its own labels rather
+        // than by the set this one left behind. `known` is read through the instance here
+        // rather than through `label_catalogues()`, which is a free function over the GLOBAL
+        // registry — asserting on that would be asserting about a different registry than the
+        // one the test just cleared.
+        reg.gauge_set("omnion_queue_depth", &["other-run", "ready"], 2.0);
+        let known = {
+            let guard = reg.inner.lock().expect("the registry lock is not poisoned");
+            guard.known.clone()
+        };
+        assert!(
+            !known.values().any(|set| set.contains("smoke")),
+            "a cleared registry still remembers the previous run's label values: {known:?}"
+        );
     }
 
     #[test]
