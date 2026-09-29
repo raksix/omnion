@@ -28,6 +28,10 @@ import type {
   WebhookTestReport,
 
   CreatedMediaShare,
+  Form,
+  FormDetail,
+  Inbox,
+  Submission,
   EventCatalogue,
   EventFilters,
   EventPage,
@@ -4448,6 +4452,195 @@ export function runNotificationRoute(input: {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Forms and the submission inbox (REQ-064, slice 2)
+// ---------------------------------------------------------------------------------------------
+
+/** The forms of one site. */
+export function fetchForms(siteId: string): Promise<Form[]> {
+  return request<Form[]>(`/api/v1/forms?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/**
+ * One form with its fields and the vocabulary the builder draws from.
+ *
+ * The vocabulary travels with the document rather than being hard-coded in the panel, for the
+ * same reason the menu's does: a palette that offers a field type the server then refuses is a
+ * palette whose rejection arrives as an unexplained 400.
+ */
+export function fetchForm(formId: string): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}`);
+}
+
+/** A field as the builder submits it. */
+export type FormFieldInput = {
+  key: string;
+  label: string;
+  field_type: string;
+  required: boolean;
+  placeholder?: string | null;
+  help_text?: string | null;
+  width: string;
+  rules: Record<string, unknown>;
+  options: unknown;
+};
+
+export function createForm(input: {
+  site_id: string;
+  key: string;
+  name: string;
+  fields: FormFieldInput[];
+}): Promise<FormDetail> {
+  return request<FormDetail>("/api/v1/forms", { method: "POST", body: JSON.stringify(input) });
+}
+
+/**
+ * Save a form's settings.
+ *
+ * The server validates the *pair*: a message action with no message and a redirect action with no
+ * URL are both refused. So the panel sends both fields on every save rather than pretending the
+ * two are independent, and the store decides which one the form actually uses.
+ */
+export function updateForm(
+  formId: string,
+  input: {
+    name?: string;
+    key?: string;
+    submit_action?: string;
+    submit_message?: string | null;
+    redirect_url?: string | null;
+    notify_emails?: string[];
+    notify_subject?: string | null;
+    honeypot?: boolean;
+    min_fill_seconds?: number;
+    rate_limit_per_hour?: number;
+    retention_days?: number;
+  },
+): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Replace a form's whole canvas — the builder's Save. */
+export function saveFormFields(formId: string, fields: FormFieldInput[]): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}/fields`, {
+    method: "PUT",
+    body: JSON.stringify({ fields }),
+  });
+}
+
+/** Publish or unpublish a form. */
+export function setFormStatus(formId: string, status: string): Promise<FormDetail> {
+  return request<FormDetail>(`/api/v1/forms/${encodeURIComponent(formId)}/publish`, {
+    method: "POST",
+    body: JSON.stringify({ status }),
+  });
+}
+
+export function deleteForm(formId: string): Promise<void> {
+  return request<void>(`/api/v1/forms/${encodeURIComponent(formId)}`, { method: "DELETE" });
+}
+
+/** The inbox filters, as the screen and the export both send them. */
+export type SubmissionFilters = {
+  status?: string;
+  search?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+};
+
+/** The query string of a filter set, shared by the list and the export. */
+function submissionQuery(filters: SubmissionFilters): string {
+  const parts = Object.entries(filters)
+    .filter(([, value]) => value !== undefined && value !== "" && value !== null)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
+  return parts.length === 0 ? "" : `?${parts.join("&")}`;
+}
+
+/** The inbox, under exactly the filters the screen shows. */
+export function fetchSubmissions(formId: string, filters: SubmissionFilters = {}): Promise<Inbox> {
+  return request<Inbox>(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions${submissionQuery(filters)}`,
+  );
+}
+
+/** Change one submission's inbox state. */
+export function setSubmissionStatus(
+  formId: string,
+  submissionId: string,
+  status: string,
+): Promise<Submission> {
+  return request<Submission>(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}`,
+    { method: "PATCH", body: JSON.stringify({ status }) },
+  );
+}
+
+/** Move several submissions at once — the inbox's bulk bar. */
+export function bulkSubmissionStatus(
+  formId: string,
+  ids: string[],
+  status: string,
+): Promise<Inbox> {
+  return request<Inbox>(`/api/v1/forms/${encodeURIComponent(formId)}/submissions`, {
+    method: "PATCH",
+    body: JSON.stringify({ ids, status }),
+  });
+}
+
+export function deleteSubmission(formId: string, submissionId: string): Promise<void> {
+  return request<void>(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Download the filtered inbox as CSV.
+ *
+ * A plain fetch and a blob, not the JSON client: the endpoint answers `text/csv`, and routing it
+ * through `request` would hand the owner a JSON parse error instead of a file. The filters are
+ * the ones the list sends, and that is the whole contract of the button — a download that ignored
+ * them would be a way to export the unfiltered inbox from a screen that says "Export 12".
+ */
+export async function exportSubmissionsCsv(
+  formId: string,
+  filters: SubmissionFilters = {},
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/forms/${encodeURIComponent(formId)}/submissions/export${submissionQuery(filters)}`,
+    { credentials: "include" },
+  );
+  if (!response.ok) {
+    // The CSV route answers the platform's own error envelope, so the message is read out of it
+    // rather than dumping raw HTML into an error strip: a filter the server refused has a code
+    // and a sentence, and printing the body would show the visitor markup.
+    const text = await response.text();
+    let code = "export_failed";
+    let message = "the export failed";
+    try {
+      const body = JSON.parse(text) as { code?: string; message?: string };
+      if (body?.code) code = body.code;
+      if (body?.message) message = body.message;
+    } catch {
+      // Not JSON: keep the defaults rather than showing markup.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "submissions.csv";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
 // ---------------------------------------------------------------------------------------------
 // Menus and the scheduled publishing queue (REQ-064, slice 1)
 // ---------------------------------------------------------------------------------------------
