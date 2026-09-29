@@ -575,17 +575,33 @@ pub async fn restore_revision(
     )
     .await?;
 
-    for (table, by) in [("theme_settings_draft", "updated_by"), ("theme_settings_published", "published_by")] {
-        sqlx::query(&format!(
-            "insert into {table} (site_id, revision_id, {by}) values ($1, $2, $3) \
+    // Two UPSERTs, written out rather than generated from one template. The earlier version
+    // looped over a `[table, column]` pair and shared the statement, which is exactly the kind
+    // of symmetry that hides a fact: the two tables stamp a DIFFERENT column (`updated_at` on
+    // the draft, `published_at` on the pointer), and a shared statement wrote `updated_at`
+    // into a table that has none — a 500 on every restore, discovered by a walk.
+    for (sql, by) in [
+        (
+            "insert into theme_settings_draft (site_id, revision_id, updated_by) \
+             values ($1, $2, $3) \
              on conflict (site_id) do update set revision_id = excluded.revision_id, \
-                 {by} = excluded.{by}, updated_at = now()"
-        ))
-        .bind(site_id)
-        .bind(restored.id)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await?;
+                 updated_by = excluded.updated_by, updated_at = now()",
+            "updated_by",
+        ),
+        (
+            "insert into theme_settings_published (site_id, revision_id, published_by) \
+             values ($1, $2, $3) \
+             on conflict (site_id) do update set revision_id = excluded.revision_id, \
+                 published_by = excluded.published_by, published_at = now()",
+            "published_by",
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(site_id)
+            .bind(restored.id)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await?;
     }
 
     transaction.commit().await?;

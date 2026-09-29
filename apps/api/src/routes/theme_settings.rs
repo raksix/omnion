@@ -54,11 +54,14 @@ pub type SaveBody = SettingsInput;
 
 /// `POST /theme-settings/publish` — the body.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PublishBody {
     /// The caller has seen the contrast findings and is publishing anyway.
     ///
     /// `#[serde(default)]` is deliberate: a client that has never heard of the flag still
-    /// gets a clean 400 naming the reason, rather than "missing field".
+    /// gets a clean 422 naming the reason, rather than "missing field". The `alias` is the
+    /// other half — the wire name is camelCase like the rest of this API, and a body field
+    /// that silently reads `false` is a guard the caller can never satisfy.
     #[serde(default)]
     pub acknowledge_contrast: bool,
 }
@@ -243,7 +246,10 @@ pub async fn read_revision(
 
     Ok(Json(json!({
         "revision": revision,
-        "diff": previous.map(|before| diff(&before, &revision)),
+        // An empty list, never `null`. The history screen maps over this to render per-field
+        // rows, and `null` there is a panel that has to special-case the FIRST revision — the
+        // one case where "nothing changed because nothing came before" is the whole answer.
+        "diff": previous.map(|before| diff(&before, &revision)).unwrap_or_default(),
     })))
 }
 

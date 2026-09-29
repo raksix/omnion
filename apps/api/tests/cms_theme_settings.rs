@@ -37,7 +37,7 @@ use omnion_identity::sites::{self, NewSite};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
-use omnion_security::{CSRF_HEADER, derive_csrf_token};
+use omnion_security::{CSRF_HEADER, RatePolicy, derive_csrf_token};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -166,6 +166,30 @@ async fn live_state() -> Option<(AppState, Db)> {
         }
     };
     db.migrate().await.expect("migrations must apply");
+    // Sign-in is limited to 10 per 300 s per IP and this file signs in once per walk, so
+    // without this the suite measures the limiter instead of the product. The row is written
+    // BEFORE the state exists because the limiter layer is installed once per process from
+    // whatever the document says at that moment — writing it afterwards has no effect at all,
+    // which is a silent no-op that looks like a fix.
+    let raised: Vec<serde_json::Value> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            if policy.scope == "sign_in" {
+                policy.limit = 1_000;
+                policy.burst = 0;
+            }
+            serde_json::to_value(&policy).unwrap_or(serde_json::Value::Null)
+        })
+        .filter(|value| !value.is_null())
+        .collect();
+    let _ = sqlx::query(
+        "insert into security_settings (id, rate_limits) values (1, $1::jsonb) \
+         on conflict (id) do update set rate_limits = excluded.rate_limits",
+    )
+    .bind(serde_json::to_value(&raised).unwrap_or(serde_json::Value::Null))
+    .execute(db.pool())
+    .await;
+
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
         BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -174,6 +198,16 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
+    // `ensure_installed` seeds the process-wide limiter from the SHIPPED defaults (a test
+    // harness builds the router without main.rs having read the store), so the row above is
+    // not enough on its own — the layer is re-read here, which is the same call
+    // `security_limiter::put_rate_limits` makes after a real save.
+    let _ = omnion_api::rate_limit_middleware::reload_from_store(&state).await;
+    // `ensure_installed` seeds the process-wide limiter from the SHIPPED defaults (a test
+    // harness builds the router without main.rs having read the store), so the row above is
+    // not enough on its own — the layer is re-read here, which is the same call
+    // `security_limiter::put_rate_limits` makes after a real save.
+    let _ = omnion_api::rate_limit_middleware::reload_from_store(&state).await;
     Some((state, db))
 }
 
@@ -477,7 +511,16 @@ async fn saving_twice_creates_revisions_one_and_two() -> TestResult {
         let site = create_site(&db, organization_id, "ts-two-saves").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // `themes.read` is a separate power (the split this REQ argues for), and a customizer
+        // in practice holds both: the panel loads the view and then writes to it.
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         let first = save(&state, &auth, site.id, save_body(good_tokens())).await;
@@ -533,7 +576,16 @@ async fn a_save_is_invisible_to_a_visitor_and_a_publish_is_not() -> TestResult {
         mirror_theme(&db, "minimal").await;
         publish_page(&db, site.id, "settings").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // `themes.read` is a separate power (the split this REQ argues for), and a customizer
+        // in practice holds both: the panel loads the view and then writes to it.
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         let mut tokens = good_tokens();
@@ -568,9 +620,16 @@ async fn a_save_is_invisible_to_a_visitor_and_a_publish_is_not() -> TestResult {
         assert_eq!(pointer, 1, "the published pointer must name revision 1");
 
         // The visiter's request answers, which is the state the criterion is really about.
+        // The public route addresses a site by a registered domain or an explicit `?site=`.
+        // This walk's site has neither (a domain is a separate fixture), so the query is the
+        // documented way to say which site a visitor request is about.
         let page = call(
             &state,
-            visitor(Method::GET, "/api/v1/public/pages/settings", &site.key),
+            visitor(
+                Method::GET,
+                &format!("/api/v1/public/pages/settings?site={}", site.key),
+                &site.key,
+            ),
         )
         .await;
         assert_eq!(page.status, StatusCode::OK, "{}", page.body);
@@ -588,7 +647,16 @@ async fn publishing_low_contrast_tokens_needs_an_acknowledgement() -> TestResult
         let site = create_site(&db, organization_id, "ts-contrast").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // `themes.read` is a separate power (the split this REQ argues for), and a customizer
+        // in practice holds both: the panel loads the view and then writes to it.
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         // The SAVE is allowed. A palette being compared against the theme is the normal state
@@ -647,7 +715,16 @@ async fn restoring_a_revision_writes_a_new_one_rather_than_rewriting_the_old() -
         let site = create_site(&db, organization_id, "ts-restore").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // `themes.read` is a separate power (the split this REQ argues for), and a customizer
+        // in practice holds both: the panel loads the view and then writes to it.
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         // Revision 1: the theme's own look.
@@ -734,7 +811,16 @@ async fn a_restored_revision_reports_what_it_changed() -> TestResult {
         let site = create_site(&db, organization_id, "ts-diff").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // Both powers: this walk OPENS the history, and `themes.read` is deliberately not
+        // implied by `themes.customize` (that split is the whole argument for having two keys).
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         save(&state, &auth, site.id, save_body(good_tokens())).await;
@@ -799,11 +885,28 @@ async fn publishing_a_stale_draft_is_refused_with_both_numbers() -> TestResult {
         let site = create_site(&db, organization_id, "ts-stale").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
-        // A second account holds an open panel at revision 1.
-        let (_, other_email) = create_account(&db, organization_id).await;
+        // A second account holds an open panel at revision 1. It needs the SAME powers: the
+        // walk is about a race between two editors, and an account that could not publish
+        // would make the stale-draft guard unreachable rather than proven.
+        let (other_id, other_email) = create_account(&db, organization_id).await;
+        grant(
+            &db,
+            organization_id,
+            other_id,
+            &["themes.customize", "themes.read"],
+            "Second Editor",
+        )
+        .await;
         let other = login(&state, &db, &other_email).await;
 
         save(&state, &auth, site.id, save_body(good_tokens())).await;
@@ -915,7 +1018,16 @@ async fn a_token_that_smuggles_a_css_declaration_is_refused() -> TestResult {
         let site = create_site(&db, organization_id, "ts-injection").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // `themes.read` is a separate power (the split this REQ argues for), and a customizer
+        // in practice holds both: the panel loads the view and then writes to it.
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         let mut hostile = good_tokens();
@@ -959,7 +1071,16 @@ async fn publishing_without_a_draft_names_the_action_that_would_work() -> TestRe
         let site = create_site(&db, organization_id, "ts-nothing").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        // `themes.read` is a separate power (the split this REQ argues for), and a customizer
+        // in practice holds both: the panel loads the view and then writes to it.
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
 
         let refused = publish(&state, &auth, site.id, false).await;
@@ -985,7 +1106,14 @@ async fn a_missing_revision_is_a_404_that_names_the_number() -> TestResult {
         let other_site = create_site(&db, organization_id, "ts-missing-other").await;
         mirror_theme(&db, "minimal").await;
         let (user_id, email) = create_account(&db, organization_id).await;
-        grant(&db, organization_id, user_id, &["themes.customize"], "Customizer").await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Customizer",
+        )
+        .await;
         let auth = login(&state, &db, &email).await;
         save(&state, &auth, site.id, save_body(good_tokens())).await;
 
