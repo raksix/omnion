@@ -39,6 +39,7 @@ use omnion_ai_hub::{
     TestReport, protocol_infos, stream_chat, test_provider,
 };
 use omnion_audit::NewAuditEntry;
+use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -618,6 +619,11 @@ pub struct ChatBody {
     pub temperature: Option<f64>,
     /// Answer budget in tokens.
     pub max_tokens: Option<u32>,
+    /// Agent run this request belongs to, so the decision log can link the row to the run.
+    pub run_id: Option<Uuid>,
+    /// Feature pin to resolve against (`copilot`, `translate`, …) — the key the override table
+    /// stores, so a caller can ask as a feature rather than as a raw model name.
+    pub feature: Option<String>,
 }
 
 /// Read `null` as "clear this", an absent field as "leave it".
@@ -1554,12 +1560,72 @@ pub async fn chat(
     // Everything decidable before the first byte is decided here, with a normal HTTP status: a
     // stream asked of a model that cannot stream is refused with 400 and the model's key in the
     // message, rather than opening a stream that can only end in an error frame.
-    let resolved = omnion_ai_hub::resolve_for(
+    //
+    // This is also where REQ-098's decision log gets written: the routing decision is settled
+    // here, before any provider is dialled, so the row exists whether the call answers, times
+    // out or is refused. A log written after the answer would lose exactly the rows an operator
+    // needs — the ones where nothing answered.
+    let requirements = chat_requirements(&messages);
+    let organization_id = current.user.organization_id;
+    let decision = omnion_ai_hub::resolve_and_record(
         state.db().pool(),
+        omnion_ai_hub::DecisionContext {
+            organization_id,
+            site_id: None,
+            user_id: Some(current.user.id),
+            run_id: body.run_id,
+            task: Some("chat"),
+            feature: body.feature.as_deref(),
+            requested: body.model.as_deref(),
+            requirements: &requirements,
+        },
+        omnion_ai_hub::Scope::Installation,
         body.model.as_deref(),
-        &[ModelCapability::Chat, ModelCapability::Streaming],
     )
     .await?;
+
+    // A walk that could not answer is the operator's problem, not a 500: the request named no
+    // model and no map could supply one. The row is already written with the reasons, so the
+    // panel can show the walk — and the event fires here, which is the moment it is about.
+    let Some(resolved) = decision.model.clone() else {
+        announce_unresolved(
+            state.db().pool(),
+            &decision,
+            "chat",
+            body.feature.as_deref(),
+            body.model.as_deref(),
+            current.user.id,
+            organization_id,
+        )
+        .await;
+        // `422`, not `500`: nothing failed *here* — the routing maps simply hold nothing that can
+        // answer. A 500 would tell the caller the platform is broken and tell the operator to
+        // look at the server, when the fix is one row on the routing screen.
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ai.route.unresolved",
+            decision_reason(&decision),
+        ));
+    };
+
+    // The capabilities the chosen model still has to claim, checked inside the process with the
+    // model's key in the message rather than through a provider that answers 400.
+    //
+    // `Chat` and `Streaming` are **not** in `requirements` and never can be: they are properties
+    // of the endpoint, not of the request. Dropping them when the routing walk replaced
+    // `resolve_for` is the kind of regression that only shows on a model an operator has
+    // deliberately configured — a streamed answer to a model that cannot stream reaches the
+    // provider as a malformed request and comes back as somebody else's error.
+    omnion_ai_hub::require_capability(&resolved.model, ModelCapability::Chat)?;
+    omnion_ai_hub::require_capability(&resolved.model, ModelCapability::Streaming)?;
+
+    // Then whatever the request itself needs: a long conversation wants a long window, a
+    // tool-using caller wants the tools flag.
+    for requirement in &requirements {
+        if let Some(capability) = omnion_ai_hub::requirement_capability(requirement) {
+            omnion_ai_hub::require_capability(&resolved.model, capability)?;
+        }
+    }
     let request = ChatRequest {
         model: resolved.model.model_key.clone(),
         messages,
@@ -1932,6 +1998,83 @@ async fn announce_failover(
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// The routing requirements a chat request carries.
+///
+/// These are the same four vocabulary words the task routes use (`tools`, `vision`, `json`,
+/// `long_context`) and they are derived from **what the request actually is**, not from what a
+/// route happens to demand: a route that names a `tools` requirement must refuse a model that
+/// cannot call tools, and the only honest way to know this request needs tools is to look at the
+/// request.
+///
+/// The one judgement call is `long_context`, which is a size rather than a capability. It is
+/// measured in characters because that is what the conversation holds before the tokenizer sees
+/// it, and the threshold is the crate's own constant — the same line the panel draws, so a
+/// request the router skipped for length is one the operator would have predicted.
+fn chat_requirements(messages: &[ChatMessage]) -> Vec<String> {
+    let mut requirements = Vec::new();
+
+    // A conversation carrying an image is a vision request whatever the caller called it.
+    // (Multipart image input arrives on the vision routes, not here; a caller that has images
+    // to send names the capability on the route, so this stays a pure function of the text.)
+    let characters: usize = messages.iter().map(|message| message.content.len()).sum();
+    if characters >= omnion_ai_hub::LONG_CONTEXT_TOKENS as usize * 4 {
+        requirements.push("long_context".to_owned());
+    }
+
+    requirements
+}
+
+/// Why an unresolved walk refused, in the sentence the caller and the panel both read.
+///
+/// The row the decision was written to already carries the walk, so this does not re-derive the
+/// reasons — it names the rule and hands over the decision id, which is enough for a caller to
+/// open the log and a panel to link to it. A refusal that only says "unresolved" sends the
+/// operator back to the routing screen to work out the same thing a second time.
+fn decision_reason(decision: &omnion_ai_hub::Resolved) -> String {
+    format!(
+        "no candidate could answer (rule: {}; decision #{}). Open the route log for the walk.",
+        decision.rule, decision.decision_id
+    )
+}
+
+/// Announce a routing failure: `ai.route.unresolved`.
+///
+/// This is the event the request names, and it fires on the **resolve** path rather than on the
+/// delete path. That is the moment that matters: a model removed from a route is a configuration
+/// change an operator already knows about, while a request that *nothing could answer* is the
+/// thing nobody is watching for until somebody notices a feature stopped working. The payload
+/// carries the decision id, so the webhook and the log row are the same fact.
+async fn announce_unresolved(
+    pool: &sqlx::PgPool,
+    decision: &omnion_ai_hub::Resolved,
+    task: &str,
+    feature: Option<&str>,
+    requested: Option<&str>,
+    user_id: uuid::Uuid,
+    organization_id: Option<uuid::Uuid>,
+) {
+    let mut event = NewEvent::new("ai.route.unresolved")
+        .actor(user_id)
+        .payload(json!({
+            "decision_id": decision.decision_id,
+            "task": task,
+            "feature": feature,
+            "requested": requested,
+            "rule": decision.rule,
+            "requirements": decision.requirements,
+        }));
+
+    // An installation-wide event carries no organization: it is not a tenant's fact, and
+    // delivering it to one tenant's endpoints would be a leak in the other direction.
+    if let Some(organization_id) = organization_id {
+        event = event.organization(organization_id);
+    }
+
+    if let Err(error) = bus::emit(pool, event).await {
+        tracing::warn!(%error, "the ai.route.unresolved event could not be emitted");
+    }
+}
 
 /// Describe models against the providers they belong to, in the providers' own order.
 fn models_in_provider_order(providers: &[Provider], models: &[AiModel]) -> Vec<ModelBody> {
