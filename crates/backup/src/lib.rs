@@ -36,6 +36,7 @@ pub mod error;
 pub mod media;
 pub mod part;
 pub mod purge;
+pub mod restore;
 pub mod store;
 pub mod sweep;
 
@@ -59,6 +60,11 @@ pub use part::{
 pub use purge::{
     MAX_REPORTED_PURGE_FAILURES, PROBE_MARKER, PurgeFailure, PurgeReport, remove_run_artifacts,
     run_directory,
+};
+pub use restore::{
+    LiveCounts, MAX_REPORTED_SITES, PartEvidence, RestoreMode, RestorePreview, RestoreWarning,
+    RestoreWarningCode, STALE_AFTER_DAYS, WarningSeverity, build_preview, confirm_phrase,
+    reported_sites,
 };
 pub use store::{
     Backup, BackupPage, BackupQuery, BackupSchedule, BackupSettings, NewBackup, NewPart,
