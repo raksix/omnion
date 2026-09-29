@@ -108,6 +108,7 @@ pub mod scim;
 pub mod search;
 pub mod security;
 pub mod security_headers;
+pub mod security_limiter;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -1097,6 +1098,56 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/security/headers",
             put(security_headers::put).layer(guards::require(&state, "security.manage")),
+        )
+        // Rate limiting and sign-in protection (REQ-012, slice 3).
+        //
+        // Reading either document is `security.read` — the same read the overview already makes,
+        // and a deployment where a viewer could not see its own limits would make the screen
+        // useless to the person diagnosing a refusal. Writing is `security.manage`, the same
+        // power that dismisses a finding, because raising a limit until nothing is refused is
+        // the same act as making the refusals stop mattering.
+        //
+        // The tester is `security.read`, not `security.scan`: it changes nothing, and it is the
+        // screen an operator has open at 3am with a client being refused. Requiring a write power
+        // to *look* at why something was refused would make the screen unusable exactly when it
+        // is needed.
+        .route(
+            "/security/rate-limits",
+            get(security_limiter::get_rate_limits)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    put(security_limiter::put_rate_limits)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
+        .route(
+            "/security/rate-limits/test",
+            post(security_limiter::test_rate_limit)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/sign-in-protection",
+            get(security_limiter::get_sign_in_protection)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    put(security_limiter::put_sign_in_protection)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
+        .route(
+            "/security/sign-in-protection/probe",
+            post(security_limiter::probe_lockout)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/locked-accounts",
+            get(security_limiter::get_locked_accounts)
+                .layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/locked-accounts/{user_id}/unlock",
+            post(security_limiter::unlock)
+                .layer(guards::require(&state, "security.manage")),
         )
         .route(
             "/security/findings/{id}",
