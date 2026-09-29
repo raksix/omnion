@@ -6949,23 +6949,23 @@ async function main() {
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
   // settings screen with slice 4 — this pass visits what exists today.
-  report.analyticsDepth = await runAnalyticsDepth(page, report);
+  report.analyticsDepth = await runDepthPass("analyticsDepth", () => runAnalyticsDepth(page, report))
 
   // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
   // completes it after it exists, and the funnel and the live counters are read back.
-  report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
+  report.analyticsGoals = await runDepthPass("analyticsGoals", () => runGoalAndRealtimeDepth(page, report))
   log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
-  report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  report.analyticsSettings = await runDepthPass("analyticsSettings", () => runAnalyticsSettingsDepth(page, report))
 
   // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
   // path, and the three states. It runs after the analytics passes because it emits into the
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
-  report.notifications = await runNotificationsDepth(page, report);
+  report.notifications = await runDepthPass("notifications", () => runNotificationsDepth(page, report))
   log(`notifications: ${JSON.stringify(report.notifications)}`);
 
   // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
@@ -6996,13 +6996,13 @@ async function main() {
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.
-  report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  report.notificationSettings = await runDepthPass("notificationSettings", () => runNotificationSettingsDepth(page, report))
   log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
 
   // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
   // passes because it emits into the same inbox, and it cleans up every row it creates — a QA
   // database that grows a notification per pass is one whose counts stop meaning anything.
-  report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  report.notificationOutbox = await runDepthPass("notificationOutbox", () => runNotificationOutboxDepth(page, report))
   log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
@@ -7011,59 +7011,109 @@ async function main() {
   // reorder that leaves a dense priority run, the toggle and the duplicate, the error state
   // and the mobile cards. It runs after the notification pass so the two do not both own the
   // same database rows.
-  report.cdnRules = await runCdnRulesDepth(page, report);
+  report.cdnRules = await runDepthPass("cdnRules", () => runCdnRulesDepth(page, report))
   log(`cdn rules: ${JSON.stringify(report.cdnRules)}`);
 
   // The purge pipeline (REQ-011, slice 2): the console's own refusals, the whole-zone
   // confirmation as a real gate, a purge that reaches the history, a failed row with the
   // provider's message, and a retry whose label names what it will re-send.
-  report.cdnPurges = await runCdnPurgeDepth(page, report);
+  report.cdnPurges = await runDepthPass("cdnPurges", () => runCdnPurgeDepth(page, report))
   log(`cdn purges: ${JSON.stringify(report.cdnPurges)}`);
 
   // The tenant depth pass (REQ-005, slice 1): the organization list, the Members tab, the
   // invite dialog's field refusal, a real invitation and its revocation.
-  const organizationDepth = await runOrganizationDepth(page, report);
-  log(`organizations: ${JSON.stringify(report.organizations)}`);
+  //
+  // This pass OPENS the organization the five passes below then drive, so it goes through
+  // `runDepthPass` like every other one and can be scoped out on its own. That leaves the
+  // dependents with no organization, and a scope that names only a dependent would then read
+  // `undefined.organizationId` out of the skip record and throw. The id is therefore checked
+  // once, here, and a dependent asked for without its parent is recorded as a finding naming
+  // the reason — never as a crash that takes the summary with it.
+  const organizationDepth = await runDepthPass("organizationDepth", () =>
+    runOrganizationDepth(page, report),
+  );
+  const tenantId = organizationDepth && organizationDepth.organizationId;
+  // A dependent asked for without its parent is a finding naming the reason, and the pass is
+  // skipped. It must NOT `return` from here: returning would abandon the remaining screens and
+  // the run would end with no `summary.json` at all, which is the one shape a QA artifact must
+  // never have — a missing summary reads like a crash and hides every finding behind it.
+  const tenantMissing = (name) => {
+    if (tenantId) return false;
+    const reason = `the "${name}" pass needs the organization the tenant pass opens, and it did not return one`;
+    log(`tenant pass ${name} failed: ${reason}`);
+    record({ page: "organizations", action: "depth-pass-failed", pass: name, reason });
+    return true;
+  };
 
   // The Departments tab (REQ-005, slice 2): create a department through the real dialog, refuse
   // an unusable key, open the drawer, bind and revoke a role, try the move the API refuses and
   // clean up again. It needs the organization the pass above just opened.
-  await runOrganizationDepartments(page, report, organizationDepth.organizationId);
+  if (!inScope("organizationDepartments")) {
+    log(`depth pass organizationDepartments skipped (out of scope)`);
+  } else if (tenantMissing("organizationDepartments")) {
+    /* recorded above */
+  } else {
+    await runDepthPass("organizationDepartments", () => runOrganizationDepartments(page, report, tenantId));
+  }
   log(`organization departments: ${JSON.stringify(report.organizationDepartments)}`);
 
   // The member drawer (REQ-005, slice 4): open a member, grant a role, extend a temporary grant
   // and revoke one. It runs after the departments pass because that pass leaves the organization
   // with its members, its roles and a live tab to open the drawer from.
-  await runOrganizationMemberDrawer(page, report, organizationDepth.organizationId);
+  if (!inScope("organizationMemberDrawer")) {
+    log(`depth pass organizationMemberDrawer skipped (out of scope)`);
+  } else if (tenantMissing("organizationMemberDrawer")) {
+    /* recorded above */
+  } else {
+    await runDepthPass("organizationMemberDrawer", () => runOrganizationMemberDrawer(page, report, tenantId));
+  }
 
   // The Modules, Settings and Billing tabs (REQ-005, slice 3): switch a module off and on and
   // read it back after a reload, change the locale and accent and prove both persisted, and
   // check that every usage bar names its metric and its number. Same organization, so it runs
   // straight after the departments pass rather than opening a second one.
-  await runOrganizationTenantTabs(page, report, organizationDepth.organizationId);
+  if (!inScope("organizationTenantTabs")) {
+    log(`depth pass organizationTenantTabs skipped (out of scope)`);
+  } else if (tenantMissing("organizationTenantTabs")) {
+    /* recorded above */
+  } else {
+    await runDepthPass("organizationTenantTabs", () => runOrganizationTenantTabs(page, report, tenantId));
+  }
   log(`organization tenant tabs: ${JSON.stringify(report.organizationTenantTabs)}`);
 
   // The invite policy, the owner-approval queue and the Audit tab (REQ-005, slice 3 remainder):
   // the two screens that change what the API does. Runs straight after the tenant tabs because
   // it edits the same organization's policy and has to put it back.
-  await runOrganizationInvitePolicy(page, report, organizationDepth.organizationId);
+  if (!inScope("organizationInvitePolicy")) {
+    log(`depth pass organizationInvitePolicy skipped (out of scope)`);
+  } else if (tenantMissing("organizationInvitePolicy")) {
+    /* recorded above */
+  } else {
+    await runDepthPass("organizationInvitePolicy", () => runOrganizationInvitePolicy(page, report, tenantId));
+  }
 
   // The suspend/archive pass (REQ-005, slice 3's last part): the banner on a frozen tenant,
   // a refused write with the reason on screen, and the reactivation that clears both.
-  await runOrganizationSuspend(page, report, organizationDepth.organizationId);
+  if (!inScope("organizationSuspend")) {
+    log(`depth pass organizationSuspend skipped (out of scope)`);
+  } else if (tenantMissing("organizationSuspend")) {
+    /* recorded above */
+  } else {
+    await runDepthPass("organizationSuspend", () => runOrganizationSuspend(page, report, tenantId));
+  }
   log(`organization suspend: ${JSON.stringify(report.organizationSuspend)}`);
   log(`organization invite policy: ${JSON.stringify(report.organizationInvitePolicy)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
-  report.iamRoles = await runIamRolesDepth(page, report);
+  report.iamRoles = await runDepthPass("iamRoles", () => runIamRolesDepth(page, report))
 
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
   await runDepthPass("iam-subjects-depth", () => runIamSubjectsDepth(page, report));
 
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
-  report.iamPolicies = await runIamPoliciesDepth(page, report);
+  report.iamPolicies = await runDepthPass("iamPolicies", () => runIamPoliciesDepth(page, report))
   log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
