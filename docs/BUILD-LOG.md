@@ -6072,3 +6072,60 @@ index is written and `pending_objects_for_organization` says whose files a run m
 so `restore preview` can count what it can put back. (b) The prune sweep must use
 `remove_run_artifacts` too — it deletes the same directories by its own path today, which is
 the third half that could disagree with this one.
+
+## Wave 4b / w8 tick 27 — REQ-133 slice 2, and the 23502 slice 1 was hiding
+
+**What shipped.** Three commits: `d0e9d8f` (the write path names `project_id`), `4deb108`
+(`visible_project_ids` · `can_see_workflow` · `list_workflows_in_projects`, the `404` read
+semantics, and the default-is-shared decision as a test), `bce57cf` (the automations surface
+scoped the same way). Plus a merge of `origin/main` (`23a7b54`, backup retention sweep), whose
+three conflicts were independent append-only unions.
+
+**The find, and why no gate had seen it.** Slice 1 shipped migration 0164, which makes
+`workflows.project_id` `not null` after backfilling existing rows. `NewWorkflow` had no project
+field, `WORKFLOW_COLUMNS` did not select the column, and `insert_workflow` named twelve columns
+of which none was it. So **every workflow creation raised `23502`** the moment 0164 was applied —
+on both create surfaces — while `cargo test -p omnion-workflows` reported **48/48 passing**.
+
+Nothing was wrong with the tests. **A `not null` column is a contract between a migration and
+every write path, and no unit test executes SQL, so no unit test can connect the two.** The
+`run-automation-projects.sh` gate asserts the constraint exists and that the backfill fills it; it
+never calls the insert. A gate on the schema and a test on the code were both green about a
+feature that could not be used.
+
+**Proof.** `scripts/qa/run-project-isolation.sh` **9/9, proven to fail**: dropping `project_id`
+from the insert gives **5/9** with the production error quoted verbatim
+(`null value in column "project_id" of relation "workflows" violates not-null constraint`), and
+**the four pure-isolation tests stay green** — which is what shows the gate names the defect and
+not its neighbourhood. Restore was md5-checked. `run-automation-projects.sh` **12/12**,
+`omnion-workflows` lib **48**, `omnion-api` lib **249** (the `--lib` gate `cargo build` skips),
+admin `tsc --noEmit` clean, 0 clippy in the files touched.
+
+**A required field instead of an optional one.** `project_id` is `Uuid`, not `Option<Uuid>`, on
+both `NewWorkflow` and `Workflow`. An optional field would have let the next caller omit it and
+put the identical 23502 back; a required one moves that failure to compile time — and the compile
+error is how the three test fixtures were found (`missing field 'project_id'` in three places),
+which is the shape of proof this codebase wants.
+
+**The decision recorded as a test.** The default project is visible to everyone in the
+organization, and isolation does not apply inside it. Requiring a membership row for it makes a
+fresh installation unable to see its own first workflow, and hides pre-existing automations from
+the people who already relied on them. `the_default_project_is_the_shared_bucket_by_design` says
+so in a test rather than leaving it to be discovered as a leak.
+
+**A fixture that lies about the suite's shape.** My first isolation fixture used a fixed uuid base
+with a per-*entity* marker — ids distinct from each other, **identical from test to test** — so
+eight concurrent tests shared one organization and one default project. The symptom was a
+plausible-looking isolation failure (a scoped list carrying a default project id nobody in that
+test had written). A namespace must be unique per **test**, not per entity within a test.
+
+**Not done, stated rather than implied.** No `credentials` table on this branch (it ships with
+wave 7's REQ-099 runtime), so the save-time cross-reference validation has nothing to validate
+against and global search is untouched. **The two new screens remain un-walked**: the QA slot is
+held by a sibling's live pass (holder pid alive under `/mnt/apopic/omnion-w3`, load 9.4, ~900 MB
+free of 32 G), and a sixth Chromium here is not a result to trust.
+
+**Next, in order.** (1) the QA pass when the slot clears — the list, the detail, the protected
+default row, the not-found state; (2) slice 3, the move with dependency checks; (3) slice 4,
+limits, usage, delegated administration and the ownership transfer.
+
