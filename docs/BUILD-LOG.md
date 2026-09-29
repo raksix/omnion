@@ -1,3 +1,75 @@
+## omnion-w10 · REQ-087 slice 4 — the package SDK, and a scaffold its own validator refuses
+
+The ledger's read side shipped in slice 2 and so did a placeholder install that recorded
+whatever key, version and checksum a caller named. That placeholder is the shape the REQ
+refuses: a ledger row is the only thing that makes a package's nodes *appear*, so a row
+written without validation is a palette entry that fails when somebody places it. This tick
+replaces it with the SDK, the validating install, and a removal that can name what it breaks.
+
+**What shipped.** `crates/workflows/src/node_package.rs` (the manifest, the validator, the
+canonical checksum, `pack`, `scaffold`, `removal_plan`); `0055_workflow_node_package_nodes.sql`
+— `node_keys` on the ledger row; `apps/api/src/routes/node_packages.rs`; `tools/cli/src/node.rs`
+— `omnion node scaffold|validate|pack`; and `/modules/installed` with a walkthrough depth pass.
+
+**The decision the whole slice rests on.** The install body carries the **manifest**, not a
+summary of it. There is no `checksum` field in the request, so the only checksum the ledger
+can hold is the one the server computed over the canonical manifest (sorted keys, so
+re-indenting a file does not read as a new package). And the validator lints each definition
+with the *bundled registry's own* `lint_node`/`lint_credential`, on the same object it is about
+to install — not on a second copy written beside it, which is what I wrote first and which
+drifted the moment the type grew a field.
+
+**The bundled lint refused this slice's own scaffold three times.** A `secret_field` parameter
+must render as a `select` (a credential reference in a text box is a key somebody has to
+memorise rather than choose); a package's credential type is not orphaned when the package's
+own node names it; and a package whose nodes run out of process must declare the `sandbox`
+permission. A validator that had not been run against the example would have taught a stranger
+all three. There is also a companion test now pinning that a **closed** main output is legal and
+a **missing** one is not — the fixture that proves the bundled lint is the real lint had to stop
+closing a port and start emptying the list.
+
+**Why the removal needed a migration.** The REQ says a removal "flags dependent workflows
+instead of breaking them", and a flag without a list is a flag without an action. The manifest
+that knows which nodes a package owned belongs to whoever installed it, so `0055` records the
+**namespaced** keys (`acme.echo`) at install time — not the manifest's local names, which a
+graph never holds and a remover matching on them would silently never find. The shape check
+could not be a CHECK constraint: PostgreSQL forbids a subquery in one, and "every element of
+this array matches a pattern" is inherently a subquery, so it lives in an `IMMUTABLE` function
+over `jsonb_path_query_array`. Probed directly: `[]` true, `["acme.echo"]` true, `["echo"]`
+false, `["acme."]` false, `["Acme.Echo"]` false.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **155 passed** (132 → 155, +23 for the
+package module). `cargo test -p omnion-api --lib` → **227 passed**. `cargo test -p omnion-cli` →
+**11 passed**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check scripts/qa/walkthrough.cjs`
+→ clean. The migration applies to `omnion_qa_w10` and its function answers correctly. And a real
+round trip on the built binary, not a test: scaffold wrote `manifest.json`, two fixtures and a
+README; `validate` printed *installable — 2 node(s), 1 credential type(s), permissions: network,
+credentials, sandbox* (exit 0); `pack` wrote the packed file with checksum
+`f22fdf27…9e421` (exit 0). The same manifest broken three ways was refused with **four**
+findings at once, exit 1, and `pack` wrote nothing. Exit codes are separated — 1 for a package
+that does not validate, 2 for a bad command line — so a CI job can tell "your package is wrong"
+from "your command was wrong".
+
+**Not proven, and not claimed: the browser pass.** `QA_STACK=w10 QA_API_PORT=18089
+QA_ADMIN_PORT=3109 QA_WEB_PORT=3209 bash scripts/qa/run.sh` sat on `waiting for a QA slot (max 1
+concurrent pass)` for the whole tick, with the box at load 10 and then 22 and `/mnt/apopic` and
+`/dev/shm` both at 100%. That is the slot guard working, not a hang — but it means
+`report.nodePackages` has not been read once, and the slice's "appears in the palette" clause
+stays open. The screen exists and is in the routes list; the pass that drives it has never run.
+
+**One fix to the harness itself, forced by the disk.** `run.sh` hardcoded
+`target/debug/omnion-api`, so a writer building off a saturated mount got `Script not found` for
+a binary that existed — a full filesystem reported as a broken API. `QA_API_BIN` now overrides
+the path and `CARGO_TARGET_DIR` is honoured by the rebuild inside the branch, because a version
+that honoured the binary but rebuilt into the default `target/` would have rebuilt into the very
+disk the override exists to avoid.
+
+**Next.** Run the pass on the private w10 stack and require `report.nodePackages`: the list and
+its empty state, a refusal rendering all four findings, the install row with the namespaced node
+key, a downgrade refused by name, a toggle that keeps the ledger row, and a removal whose dialog
+named `qa-fixture.echo` before the button. Zero high findings from this change. Only then does
+slice 4 close, and only after the palette clause can REQ-086's canvas answer it.
+
 ## omnion-w10 · REQ-087 slice 3 (API half) — four endpoints, and a key that never matched
 
 The slice's algebra and persistence landed in the last two ticks. This tick is the half that

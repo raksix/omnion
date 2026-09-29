@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** in-progress (slices 1–3, `c3ec2d0`…`77c60fb`) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slices 1–4, `c3ec2d0`…`50fff1a`; slice 4 code shipped, browser pass queued) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -198,9 +198,35 @@ back to untested), `workflows.graph.saved` (usage refresh).
       canvas needs to disable the nodes. **"Disables the affected nodes" waits on REQ-086
       slice 2** — the canvas has nowhere to disable them.*
 - [ ] The usage view matches a manual count of fixture workflows and node keys referencing a credential.
-- [ ] Installing a third-party node package adds its nodes to the registry and palette without a restart; removal disables them and flags dependent workflows.
-- [ ] A package failing the SDK validator is refused with the findings and nothing reaches the ledger.
-- [ ] SDK scaffold → validate → pack yields an installable package whose fixtures pass for one action node and one credential-bearing node.
+- [~] Installing a third-party node package adds its nodes to the registry and palette without a restart; removal disables them and flags dependent workflows.
+      *Proven for everything except the palette's own rendering. `POST /node-packages` takes the
+      **manifest**, not a summary of it, so the nodes travel with the request and the ledger row
+      records the **namespaced** keys (`acme.echo`) — the form a graph actually holds, and the
+      only form a remover can match on. `PATCH` disables and keeps the row, `DELETE` marks it
+      removed and returns the dependent workflows by name from `removal_plan`, which is a pure
+      function so the installer screen and the remove response render the *same* warning.
+      `0055` added the `node_keys` column the remover needs. **Outstanding:** the palette
+      reading the ledger, which is REQ-086 slice 2's job — the library reports
+      `node_package_missing` with the cause, and a workflow whose node's package is gone loads
+      and says why rather than breaking.*
+- [x] A package failing the SDK validator is refused with the findings and nothing reaches the ledger.
+      *Proven. The install body carries the manifest, `validate` runs first, and *any* finding
+      is a 400 whose `details` holds **every** finding rather than the first. The refusal
+      happens before the tenant is even scoped, so a refused package leaves no row to clean up,
+      and the checksum is computed server-side — there is no `checksum` field in the request, so
+      a caller cannot assert its own integrity.*
+- [x] SDK scaffold → validate → pack yields an installable package whose fixtures pass for one action node and one credential-bearing node.
+      *Proven by a real round trip on the built binary, not by a test: `omnion node scaffold
+      acme-tools --out pkg` wrote `manifest.json`, `fixtures/echo.json`,
+      `fixtures/send_message.json` and a `README.md`; `validate` printed *installable — 2
+      node(s), 1 credential type(s), permissions: network, credentials, sandbox* (exit 0);
+      `pack` wrote `acme-tools.omnion-node.json` with checksum
+      `f22fdf2743198aeefbdfd5ef242db63b4b62b6a7e9aaf397415f5b4f6999e421` (exit 0). The same
+      manifest broken three ways at once — an undeclared permission, a node naming a credential
+      type the package does not ship — was refused with **four** findings, exit 1, and `pack`
+      wrote nothing. The scaffold is one action node (`echo`, no credential) and one
+      credential-bearing node (`send_message`, `acme.api_key`). Exit codes are separated: 1 for
+      a package that does not validate, 2 for a bad command line, so a CI job can tell them apart.*
 - [~] Credential search and filters return correct subsets, the expired-credential amber state appears for a past expiry, and the walkthrough traffic contains no fixture secret string.
       *Proven: the search, type, health and scope filters narrow the list and the URL carries
       them; the expired-credential amber state is computed (`effective_health`), not read from
@@ -290,6 +316,26 @@ match the tested state, usage data is real.
    (REQ-086 slice 2 — the event carries `credential_key`, and the canvas has nowhere to
    disable nodes yet).
 4. **Node packages and SDK** — ledger, install/remove via REQ-044, scaffold/validate/pack CLI, fixtures. Done: a fixture package installs, appears in the palette, and removal degrades instead of breaking.
+   *Code shipped (`e4c41ce`, `4488a05`, `77fad33`, `dc7b897`, `76e0bd1`, `50fff1a`); the
+   browser pass is queued, so the "appears in the palette" clause is not yet closed.*
+   `crates/workflows/src/node_package.rs` — the manifest, the validator, the canonical
+   checksum, `pack`, `scaffold` and `removal_plan`. The validator lints each definition with
+   the **bundled registry's own** `lint_node`/`lint_credential` on the same object it installs,
+   so a package cannot satisfy a weaker contract than a bundled node; it adds the rules that
+   only make sense for third parties (namespaced keys, `sandbox: required` only, declared ==
+   implied permissions, no self-installing as `bundled`), and refuses on *any* finding.
+   `0055_workflow_node_package_nodes.sql` — `node_keys` on the ledger row, with the shape
+   check in an `IMMUTABLE` function because a CHECK cannot contain a subquery.
+   `apps/api/src/routes/node_packages.rs` — the validating install (manifest in, server-side
+   checksum out, equal-or-newer enforced against the live row), the toggle and the removal
+   that names its dependents. `tools/cli/src/node.rs` — `omnion node scaffold|validate|pack`,
+   running the *same* validator as the API so the two cannot disagree. `apps/admin/app/modules/installed`
+   with a `runNodePackagesDepth` walkthrough pass.
+
+   **The three the bundled lint caught in this slice's own scaffold**, which is the argument
+   for reusing it: a `secret_field` parameter must render as a `select`; a package's credential
+   type is not orphaned when the package's own node names it; and a package whose nodes run out
+   of process must declare the `sandbox` permission.
 
 ### Risks / notes
 
