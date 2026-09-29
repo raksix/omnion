@@ -3521,3 +3521,81 @@ data source does.
 **Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
 on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
 turns "did I remember?" into a red line with a file and a line number.
+
+## 2026-09-29 · Tick 8 (w9) — REQ-065 slice 4 part 1 · `d94ef58` `a8bbcef` `664eee0` — the sync ledger, and the lock that outlived the pass
+
+**What.** `0119_provider_sync_runs.sql` gives the sync side of the provider registry the three
+tables it has never had — `directory_sync_runs`, `directory_sync_errors`, `provider_group_links` —
+and `crates/identity/src/sso/sync_runs.rs` is the store. `0011_iam_advanced.sql` carried
+`provisioning_tokens` and `provisioning_log`, so the platform could record that a *request*
+arrived; what it could not answer was the question an operator actually has at 09:00, which is
+whether the nightly run worked and, if not, for whom. A log row has no start, no end and no counts.
+
+**Why the errors are a table and not a jsonb array on the run.** They outlive it. An array means
+every retry rewrites the run, so the record of what failed the *first* time is destroyed by the
+act of retrying it — and the first failure is the only copy of "the directory was refusing this
+account at 02:14" that will ever exist.
+
+**Two constraints exist so the list screen cannot lie.** A finished run carries its `finished_at`
+and a running one carries neither: "how long did it take" is unreadable without the second date,
+and "finished at" on a run still going is a statement about the future. And no counter may go
+negative, because an operator reading "−3 users deactivated" has no repair.
+
+**The store derives the outcome rather than trusting the caller.** `finish_run` recounts
+`directory_sync_errors` inside the same transaction that finalises the run, so `ok` with three
+recorded failures is not expressible — otherwise the panel puts a green chip over a directory that
+refused every account it was sent. `partial` and `failed` are separated by whether real work
+happened, because that is the operator's "retry the rest" versus "start over", and one boolean
+flattens it. A run still going reports *no* duration rather than "time since it started", which
+makes a slow run look permanently unfinished.
+
+**A defect in the shared QA harness, found the expensive way.** This tick's first browser pass died
+in the middle of `cargo build` (the disk guard dropped a worktree `target/` under its 10 GB floor
+mid-compile) and left its QA lock behind as an orphan. Five writers then printed "waiting for a QA
+slot" for their whole 1800 s timeout. The reaper that exists to prevent exactly this could not see
+it: it tested the **holder** pid, the `while :; do sleep 30; done` child that `run.sh` kills on
+EXIT INT TERM — and none of those signals arrive on a SIGKILL or an OOM kill, so the holder
+answers `kill -0` for ever in precisely the orphan case. `664eee0` has `run.sh` record its own pid
+as a second line of the holder file and tests *that*, and a **missing** owner line is deliberately
+not a reclaim: that is what a place looks like in the second between creation and the file being
+written, and the grace period already covers that race.
+
+**Two more bugs in the same function, caught by the new test rather than by reading.** The pid in
+the place *filename* must never be tested — `$$` inside `qa-slot.sh` is that script's own pid,
+which exits the moment it takes the place, so testing it would have deleted the lock of a pass
+that is running. And the reaper `cat`ed the two-line holder file, so `kill -0` was handed
+`"1483750\n1483739"`, which never matches a pid: every place looked dead and the first reap would
+have cleared the whole queue. The opposite failure, in the same file, from the same fix, one commit
+after the bug it was fixing. `sed -n Np` per line.
+
+**Proof.**
+
+- `bash scripts/qa/run-iam-sync-runs.sh` → **PASS 30/30** — 36 migrations in filename order, every
+  index present, a **populated** provider table, four runs (three finished, one running) surviving,
+  and all nine constraints asserted as refusals rather than successes
+- `bash scripts/qa/run-qa-slot-reaper.sh` → **PASS 8/8** — a live place survives a reap round, a
+  place whose owner is gone is reclaimed *even though its holder is alive*, a live holder with no
+  owner line is left alone, a holder-less place is still reclaimed, and a handed-out place records
+  the right owner. Cases 1 and 2 were **both red on the first run**, in opposite directions, and
+  each found a real bug rather than a bad fixture
+- `cargo test -p omnion-identity --lib` → **197 passed** (was 191)
+- `cargo test -p omnion-api --lib` → **194 passed**
+- `pnpm --filter @omnion/admin typecheck` → clean
+
+**A gate that runs against an empty database is not a gate.** The first version of the migration
+script created three tables in a fresh database and reported 20 of 20 failing for the uninteresting
+reason that `auth_providers` did not exist. Nine of its constraint assertions were then wrong in a
+way only a running script could have said: a "finished run with no `finished_at`" that passed
+because the statement supplied `now()`, and two duplicate-key collisions where the fixture inserted
+the row the next step was meant to create. A refusal test is only a refusal test if the refusal is
+the *only* possible outcome.
+
+**Not claimed.** No route, panel or sync worker reads these tables yet — slice 4 is schema and store
+only. The browser pass has again not observed slice 3's wizard and dry run, so that box stays
+unticked. The QA pass for this tick is queued behind a sibling writer for the sixth time running.
+
+**Next.** Wait the queue out and run
+`QA_STACK=w9 QA_API_PORT=18088 QA_ADMIN_PORT=3108 QA_WEB_PORT=3208 bash scripts/qa/run.sh`; close
+slice 3 only when the wizard and the dry run are *observed*. Then slice 4 part 2 — the sync-runs
+route, the retry path and the provider Sync tab.
+

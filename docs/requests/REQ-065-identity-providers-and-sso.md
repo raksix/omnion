@@ -10,7 +10,10 @@
 > cleanup, `f017948` the walkthrough reads the ladders it renders. Part 5: `dd3e08a` the
 > local-password half of the sign-in invariant — and it was broken, not merely unproven. Part 6: `d9638e3` the identity migrations moved out of a band four writers took, `a7966d1` ordered role rules with a dry run that runs the sign-in's own evaluator, `3caad0c` the editor that shows the whole walk, `a5f58cd` the walk that proves the stored set survives a refused write,
 > `f0b0fe3` the rules decide on the sign-in path and the audit names the one that did, `2512e7e`
-> a walk step that had been passing on a developer's second tenant) ·
+> a walk step that had been passing on a developer's second tenant. Slice 4 part 1: `d94ef58`
+> `0119` — the sync run, its failures and the groups a sync has seen, as three tables; `a8bbcef`
+> the store, with the outcome derived from the table rather than taken on trust; `664eee0` a defect
+> in the shared QA slot reaper that was holding four writers hostage behind a crashed pass) ·
 > **Captured:** 2026-09-26 · **Layer:** core (`crates/identity`, `crates/auth`) + admin
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
