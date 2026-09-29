@@ -5200,3 +5200,54 @@ were lost** · scoped pass, first run → `179 findings (high 170)`, all traced 
 
 **Next.** Re-run the scoped pass against the seeded fixture. If `/cdn` and the two CDN depth
 passes go green, REQ-011 slice 2 closes and REQ-005's browser gate unblocks with it.
+
+## 2026-09-29 · tick 27 — REQ-017 slice 1: the environment model, and a spec that named two tables this platform does not have
+
+**What.** Started REQ-017 (sandbox/staging) with slice 1: a new `crates/environment` holding the
+decisions — key and host legality, the clone's areas and copy order, the progress fold — and
+migration `0145_environments.sql` with `environments`, `environment_clone_jobs` and the
+`environment_id` boundary on content. The routes, the runner and the screens are the next slices.
+
+**The spec's data model does not describe this platform.** REQ-017 names `menus` and
+`site_settings`, and neither table exists. Navigation has no table of its own; site configuration
+lives in `organization_settings`. I did not create the two missing tables: an empty table created
+to satisfy a spec line is a second, competing home for configuration that already has one, and it
+would be discovered later by somebody assuming it was the real one. The environment boundary goes
+on the tables that carry content: `pages`, `translations`, `workflows`, `organization_settings`.
+A clone copies what the platform actually stores.
+
+Second correction: `pages` has no `organization_id` — it reaches its organization through
+`sites`. The spec's backfill is written as if it did not.
+
+**Two invariants live in the database, not in a route.** One production environment per
+organization, and one open clone per environment. Both are partial unique indexes, because a
+per-row `check` cannot express "one of this type" — `check (type <> 'production')` forbids the
+first row along with every later one. The clone one matters most: a check-then-insert in the
+route is correct only until two requests arrive together, and `clone_already_running` is a promise
+the caller can be given.
+
+**The backfill is three statements, not one.** Create the production environments, attach the
+content, then set `NOT NULL`. The single-statement form cannot be written (step 2 needs the id
+step 1 created), and applying `NOT NULL` first is exactly how a migration ends up applying only to
+an empty database.
+
+**Proof.** `cargo test -p omnion-environment` → **29 passed, 0 failed** (0.01s) ·
+applied on a **fresh** database (105 tables) and on one **seeded with two organizations** plus
+their sites, pages, revisions, translations, workflows and settings: every row landed in its own
+organization's production environment, and `insert into pages (site_id, slug)` with no environment
+is refused by the `NOT NULL` · each refusal the API names is a real constraint error, checked
+against the database rather than assumed: duplicate key → `environments_key_unique_per_org`,
+second production → `environments_single_production`, `Bad_Key` → `environments_key_format`,
+duplicate host → `environments_staging_host_unique`, second open clone →
+`environment_clone_jobs_single_open`, `items_done > items_total` → the column check · a finished
+clone is followed by a new one, which is what makes "re-clone" possible at all ·
+`cargo test -p omnion-api --lib` → **255 passed** · `pnpm typecheck` → **2/2, 0 errors** ·
+`origin/main` merged (5 commits, security centre + `migration_gap.rs`), merge audit with the
+`Counter(origin/main) - Counter(merge-base)` metric → **0 lines main introduced were lost**.
+
+**Commits.** `516f335` merge of `origin/main` · `40b67e5` `feat(environment)`.
+
+**Next.** The QA confirmation pass for REQ-011 slice 2 and REQ-005's browser gate is still
+queued behind another writer's live pass (slot holder alive, correctly serialised). While it
+waited, REQ-017 slice 1 was built and verified. Next: the environment store and the routes, then
+`/environments`.
