@@ -4205,9 +4205,16 @@ export async function replaceCredentialSecret(
     body: JSON.stringify({ secrets }),
   });
 }
-/** The installer ledger. */
-export async function fetchNodePackages(): Promise<NodePackagePage> {
-  return request<NodePackagePage>("/api/v1/node-packages");
+/**
+ * The installer ledger.
+ *
+ * `organizationId` is sent by a platform account, which has no primary organization of its
+ * own: without it the API refuses the read `organization_required` and the screen shows an
+ * error instead of a ledger.
+ */
+export async function fetchNodePackages(organizationId?: string | null): Promise<NodePackagePage> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<NodePackagePage>(`/api/v1/node-packages${query}`);
 }
 /**
  * Install a package from its manifest.
@@ -4216,25 +4223,33 @@ export async function fetchNodePackages(): Promise<NodePackagePage> {
  * computes the checksum itself, so there is no `checksum` field here to send and no way for a
  * client to talk the ledger into a checksum that does not match the package.
  */
-export async function installNodePackage(manifest: unknown): Promise<NodePackageInstall> {
+export async function installNodePackage(
+  manifest: unknown,
+  organizationId?: string | null,
+): Promise<NodePackageInstall> {
   return request<NodePackageInstall>("/api/v1/node-packages", {
     method: "POST",
-    body: JSON.stringify({ manifest }),
+    body: JSON.stringify({ manifest, organization_id: organizationId ?? null }),
   });
 }
 /** Enable or disable a package. Disabling never touches a workflow. */
 export async function setNodePackageEnabled(
   key: string,
   enabled: boolean,
+  organizationId?: string | null,
 ): Promise<NodePackageToggle> {
   return request<NodePackageToggle>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
     method: "PATCH",
-    body: JSON.stringify({ enabled }),
+    body: JSON.stringify({ enabled, organization_id: organizationId ?? null }),
   });
 }
 /** Remove a package; the ledger row stays, marked removed, and the dependents come back. */
-export async function removeNodePackage(key: string): Promise<NodePackageRemoval> {
-  return request<NodePackageRemoval>(`/api/v1/node-packages/${encodeURIComponent(key)}`, {
+export async function removeNodePackage(
+  key: string,
+  organizationId?: string | null,
+): Promise<NodePackageRemoval> {
+  const query = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<NodePackageRemoval>(`/api/v1/node-packages/${encodeURIComponent(key)}${query}`, {
     method: "DELETE",
   });
 }

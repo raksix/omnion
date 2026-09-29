@@ -387,6 +387,14 @@ pub struct TestCredentialResponse {
     pub credential: CredentialBody,
 }
 
+/// The package list query. A platform account has no primary organization, so it names the
+/// one whose ledger it is reading.
+#[derive(Debug, Default, Deserialize)]
+pub struct NodePackageListQuery {
+    #[serde(default)]
+    pub organization_id: Option<uuid::Uuid>,
+}
+
 /// The package list payload.
 #[derive(Debug, Serialize)]
 pub struct NodePackageListResponse {
@@ -1193,8 +1201,9 @@ fn evaluate_test(
 pub async fn list_node_packages(
     State(state): State<AppState>,
     current: CurrentSession,
+    Query(query): Query<NodePackageListQuery>,
 ) -> Result<Json<NodePackageListResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, query.organization_id)?;
     let packages = credential_store::list_packages(state.db().pool(), organization_id)
         .await
         .map_err(map_store)?;

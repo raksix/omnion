@@ -48,6 +48,7 @@ import {
   type ApiError,
 } from "@/lib/api";
 import type { NodePackage, PackageFinding } from "@/lib/types";
+import { useSession } from "@/lib/session";
 
 /** What the screen is doing, so the header never lies about it. */
 type Phase = "loading" | "ready" | "error";
@@ -74,6 +75,11 @@ const PERMISSION_LABEL: Record<string, string> = {
 };
 
 export function InstalledPackages() {
+  const { user } = useSession();
+  // A platform account has no organization of its own, so every call has to name one — the
+  // API refuses `organization_required` otherwise, and the screen renders that refusal where
+  // the ledger should be.
+  const organizationId = user?.organization_id ?? null;
   const [packages, setPackages] = useState<NodePackage[] | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [notice, setNotice] = useState<Notice>(null);
@@ -87,14 +93,14 @@ export function InstalledPackages() {
   const load = useCallback(async () => {
     setPhase("loading");
     try {
-      const page = await fetchNodePackages();
+      const page = await fetchNodePackages(organizationId);
       setPackages(page.packages);
       setPhase("ready");
     } catch (error) {
       setNotice({ tone: "error", text: describe(error) });
       setPhase("error");
     }
-  }, []);
+  }, [organizationId]);
 
   useEffect(() => {
     void load();
@@ -119,7 +125,7 @@ export function InstalledPackages() {
       setBusy(entry.key);
       setNotice(null);
       try {
-        const result = await setNodePackageEnabled(entry.key, !entry.enabled);
+        const result = await setNodePackageEnabled(entry.key, !entry.enabled, organizationId);
         setNotice({ tone: result.package.enabled ? "ok" : "warn", text: result.message });
         await load();
       } catch (error) {
@@ -138,7 +144,7 @@ export function InstalledPackages() {
     setBusy(entry.key);
     setNotice(null);
     try {
-      const result = await removeNodePackage(entry.key);
+      const result = await removeNodePackage(entry.key, organizationId);
       setNotice({
         tone: result.affected_workflows.length > 0 ? "warn" : "ok",
         text: result.message,
@@ -172,7 +178,7 @@ export function InstalledPackages() {
       return;
     }
     try {
-      const result = await installNodePackage(manifest);
+      const result = await installNodePackage(manifest, organizationId);
       const dropped = result.replaced_node_keys;
       setNotice({
         tone: "ok",
@@ -200,7 +206,7 @@ export function InstalledPackages() {
       setInstalling(false);
       window.setTimeout(() => errorRef.current?.focus(), 0);
     }
-  }, [load, manifestText]);
+  }, [load, manifestText, organizationId]);
 
   return (
     <div className="flex flex-col gap-4">

@@ -26,7 +26,7 @@
 //! the panel passed the same function — two validators is two answers.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_events::{NewEvent, bus};
 use omnion_workflows::credential_store::{self, NewNodePackage};
@@ -89,6 +89,13 @@ fn refuse(findings: Vec<omnion_workflows::registry::LintFinding>) -> ApiError {
 pub struct InstallPackageRequest {
     /// The manifest, as `manifest.json`.
     pub manifest: Manifest,
+    /// The organization the package is installed for.
+    ///
+    /// A platform account has no primary organization, so without this field every installer
+    /// call it makes — a superuser installing a package for a tenant, and the QA owner that
+    /// walks this screen — is refused `organization_required` before the manifest is even read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 /// The install response: the ledger row plus what it means.
@@ -120,7 +127,7 @@ pub async fn install_node_package(
     current: CurrentSession,
     Json(body): Json<InstallPackageRequest>,
 ) -> Result<(StatusCode, Json<InstallPackageResponse>), ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, body.organization_id)?;
 
     // 1. Validate. This is the gate the REQ asks for ("a package must pass the validator to
     //    install") and it happens *before* the organization is touched at all — a refused
@@ -233,6 +240,9 @@ pub async fn install_node_package(
 pub struct SetPackageEnabledRequest {
     /// Whether the package's nodes are available.
     pub enabled: bool,
+    /// The organization whose ledger row is toggled; a platform account names one.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
 }
 
 /// The enable/disable response, with the consequence spelled out.
@@ -261,7 +271,7 @@ pub async fn set_node_package_enabled(
     Path(key): Path<String>,
     Json(body): Json<SetPackageEnabledRequest>,
 ) -> Result<Json<SetPackageEnabledResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, body.organization_id)?;
     let package = credential_store::set_package_enabled(
         state.db().pool(),
         organization_id,
@@ -346,6 +356,14 @@ pub struct AffectedWorkflowBody {
     pub node_keys: Vec<String>,
 }
 
+/// The removal query. A `DELETE` carries no body, so a platform account names the
+/// organization here for the same reason the install body carries it.
+#[derive(Debug, Deserialize)]
+pub struct RemovePackageQuery {
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
 /// `DELETE /api/v1/node-packages/{key}` — remove a package from the ledger.
 ///
 /// # Errors
@@ -360,8 +378,9 @@ pub async fn remove_node_package(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(key): Path<String>,
+    Query(query): Query<RemovePackageQuery>,
 ) -> Result<Json<RemovePackageResponse>, ApiError> {
-    let organization_id = resolve_organization(&current, None)?;
+    let organization_id = resolve_organization(&current, query.organization_id)?;
     let node_keys = installed_node_keys(state.db().pool(), organization_id, &key).await?;
     let references =
         credential_store::workflow_node_references(state.db().pool(), organization_id, &node_keys)
@@ -444,6 +463,9 @@ mod tests {
     use axum::response::IntoResponse as _;
     use omnion_workflows::node_package;
 
+    /// A stand-in organization id, so the test says "names one" without inventing a tenant.
+    const ORG: Uuid = Uuid::from_u128(0x0192_a1b2_c3d4_e5f6_0708_090a_0b0c_0d0e);
+
     #[tokio::test]
     async fn a_refusal_reports_every_finding_not_just_the_first() {
         let mut manifest = node_package::scaffold("acme").manifest;
@@ -500,7 +522,29 @@ mod tests {
         // checksum the ledger can hold is the one this module computed.
         let body = InstallPackageRequest {
             manifest: node_package::scaffold("acme").manifest,
+            organization_id: None,
         };
         assert_eq!(body.manifest.key, "acme");
+    }
+
+    /// A platform account names the organization it installs for.
+    ///
+    /// Without this field every installer call such an account makes is refused
+    /// `organization_required` before the manifest is read — which is exactly what a
+    /// superuser installing a package on a tenant's behalf, and the QA owner that walks this
+    /// screen, both do.
+    #[test]
+    fn the_install_body_carries_the_organization_a_platform_account_names() {
+        let manifest = node_package::scaffold("acme").manifest;
+        let body: InstallPackageRequest =
+            serde_json::from_value(json!({ "manifest": manifest, "organization_id": ORG }))
+                .expect("a body naming an organization deserializes");
+        assert_eq!(body.organization_id, Some(ORG));
+
+        // And it stays optional, so a tenant's own call does not have to send one.
+        let tenant: InstallPackageRequest =
+            serde_json::from_value(json!({ "manifest": node_package::scaffold("acme").manifest }))
+                .expect("a body without one still deserializes");
+        assert_eq!(tenant.organization_id, None);
     }
 }
