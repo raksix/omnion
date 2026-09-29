@@ -227,15 +227,39 @@ fn hour_minute(local: OffsetDateTime) -> i32 {
 }
 
 /// `HH:MM` as minutes past midnight.
+///
+/// **Three shapes are accepted, and the third one is why this function is not a `split_once`.**
+/// `22:00` is what the form sends, `22:00:00` is what `time::Time`'s own `Display` produces, and
+/// ` 22:00 ` is what a hand-written client sends. Accepting only the first means a string the
+/// platform wrote itself is one the platform cannot read back — and the caller cannot tell the
+/// two apart, because it only ever sees `None`.
 fn parse_clock(value: Option<&str>) -> Option<i32> {
     let raw = value?.trim();
     let (hour, minute) = raw.split_once(':')?;
     let hour: i32 = hour.trim().parse().ok()?;
-    let minute: i32 = minute.trim().parse().ok()?;
+    // A seconds field is tolerated and dropped, never parsed as the hour. `22:00:00` split
+    // once is `("22", "00:00")`, and `"00:00".parse::<i32>()` is `None` — so the seconds case
+    // fails on the minute, not on a "too many colons" rule that would have had to be
+    // re-remembered at the call site.
+    let minute: i32 = minute.trim().split(':').next()?.trim().parse().ok()?;
     if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
         return None;
     }
     Some(hour * 60 + minute)
+}
+
+/// `HH:MM` from a `time::Time`, as the platform stores and speaks it.
+///
+/// **This is the other half of `parse_clock`, and it exists because the two used to disagree.**
+/// The settings row is a Postgres `time` column, and the two ways to turn that column into a
+/// string are not interchangeable: `quiet_hours_start::text` yields `22:00:00` (seconds always
+/// present, zero-padded) while `to_char(quiet_hours_start, 'HH24:MI')` yields `22:00`. The
+/// store read the column the first way, so every value that came back was in a shape the
+/// platform's own parser rejected — which is why a saved quiet window silently stopped
+/// deciding anything, and why the settings form could not read back what it had just written.
+#[must_use]
+pub fn format_clock(value: time::Time) -> String {
+    format!("{:02}:{:02}", value.hour(), value.minute())
 }
 
 /// The weekday of a date, 0 = Monday — the same numbering Postgres's `extract(dow)` uses
@@ -664,5 +688,96 @@ mod tests {
         // the validator refuses to let a person save, so the two agree.
         assert!(in_window(9 * 60, 3 * 60, 3 * 60));
         assert!(validate_quiet_hours(Some("03:00"), Some("03:00")).is_err());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The clock's two spellings. Everything below is about one fact: a string this module
+    // *writes* has to be a string this module can *read*. These are the tests for the case
+    // where it was not — where `read_settings` produced `22:00:00` (Postgres' `::text` on a
+    // `time` column) and `parse_clock` answered `None` to it, so a quiet window that had been
+    // saved correctly came back as no window at all.
+    //
+    // The shape is deliberately a *round trip through the real cast*, not a pair of
+    // `assert_eq!`s over hand-written literals: a test that feeds `parse_clock` the literal
+    // `"22:00:00"` proves the parser tolerates seconds, and says nothing about whether the
+    // store still *produces* that shape. The defect lived in the seam between the two, so the
+    // test has to own the seam.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_parser_reads_every_spelling_of_a_clock_the_platform_produces() {
+        assert_eq!(parse_clock(Some("22:00")), Some(22 * 60), "the form's own shape");
+        assert_eq!(
+            parse_clock(Some("22:00:00")),
+            Some(22 * 60),
+            "Postgres `::text` on a time column — the shape the store used to hand back"
+        );
+        assert_eq!(parse_clock(Some(" 22:00 ")), Some(22 * 60), "a hand-written client");
+        assert_eq!(parse_clock(Some("7:05")), Some(7 * 60 + 5), "unpadded hour");
+        assert_eq!(parse_clock(Some("00:00")), Some(0), "midnight");
+    }
+
+    #[test]
+    fn the_parser_still_refuses_what_is_not_a_clock() {
+        // Widening the accepted shapes must not turn the function into "everything that has
+        // a colon in it": these are the values a `None` is *for*, and losing them would make a
+        // corrupt row look like a quiet window that happens to cover the whole day.
+        assert_eq!(parse_clock(Some("")), None);
+        assert_eq!(parse_clock(Some("not a time")), None);
+        assert_eq!(parse_clock(Some("24:00")), None, "there is no 24th hour");
+        assert_eq!(parse_clock(Some("12:60")), None, "there is no 60th minute");
+        assert_eq!(parse_clock(Some("12")), None);
+        assert_eq!(parse_clock(None), None);
+    }
+
+    #[test]
+    fn formatting_a_clock_produces_exactly_what_the_parser_reads() {
+        // The round trip that matters, in the direction that was broken. `format_clock` is the
+        // store's answer shape and `parse_clock` is every consumer's input, so the invariant
+        // is one line: what one writes, the other reads.
+        for (hour, minute) in [(0u8, 0u8), (7, 5), (9, 30), (22, 0), (23, 59)] {
+            let value = time::Time::from_hms(hour, minute, 0).expect("a valid instant of a day");
+            let written = format_clock(value);
+            assert_eq!(
+                parse_clock(Some(&written)),
+                Some(i32::from(hour) * 60 + i32::from(minute)),
+                "format_clock wrote {written:?}, which parse_clock could not read back"
+            );
+            // And the two always-past or always-future edges, because `22:00` is the default
+            // the form offers and a parser that read it but not `00:00` would be bizarre.
+            assert_eq!(written.len(), 5, "the platform's clock shape is HH:MM, five characters");
+        }
+    }
+
+    #[test]
+    fn a_window_survives_the_trip_through_a_padded_clock_string() {
+        // The end-to-end shape of the defect, expressed without a database: a settings row
+        // whose clock fields arrived in Postgres' padded spelling — the exact strings
+        // `quiet_hours_start::text` produced — must still be a *window*, not the absence of
+        // one. Before the fix this pair fell through `parse_clock` to `None`, and
+        // `in_quiet_hours` documented "no window means false" for exactly this reason.
+        let padded = Settings {
+            quiet_hours_start: Some("22:00:00".to_owned()),
+            quiet_hours_end: Some("07:00:00".to_owned()),
+            ..settings_at(8)
+        };
+        assert!(
+            padded.in_quiet_hours(datetime!(2026-09-28 23:30 UTC)),
+            "23:30 is inside 22:00→07:00 even when the row spells the bounds with seconds"
+        );
+        assert!(
+            !padded.in_quiet_hours(datetime!(2026-09-28 12:00 UTC)),
+            "midday is outside the same window"
+        );
+        // The validator has to agree with the parser on the same strings, or the API accepts a
+        // row and then cannot honour it: validation is the door, parsing is the room.
+        assert!(
+            validate_quiet_hours(
+                padded.quiet_hours_start.as_deref(),
+                padded.quiet_hours_end.as_deref()
+            )
+            .is_ok(),
+            "a window that the runtime understands must pass the door"
+        );
     }
 }

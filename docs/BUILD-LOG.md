@@ -4362,6 +4362,217 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
 
+## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
+
+**What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
+landed, and it answered the question the last two ticks were holding open. `report.notificationOutbox`
+exists for the first time: five chips all carrying counts, `chiptotalMatchesSql` true,
+`targetHiddenForActor` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, a removal that
+answers 204 and leaves the table, and `retryIsNotRetryable` true. `report.notificationSettings` is green
+on the matrix, the honest save notice, the round trip and the error state. `runMediaRetention` came back
+`ok: true` for the first time, which is REQ-010's blocker clearing.
+
+**The pass also produced one string that says everything.** `report.notifications` ended with
+
+```json
+"keyboardRows": 0,
+"keyboard": "no rows to drive — the list did not load"
+```
+
+which reads like a timing problem and is not one. The pass had marked its own three rows read four lines
+earlier, and the list then showed none of them. `with_read` was a `bool` defaulting to `false`, and a
+`bool` cannot tell "the client said nothing" from "the client said no" — so **every** caller that named no
+filter got an unread-only list, while the panel's own State menu labelled that same state "Unread and
+read". The screen promised a list it was not sending. Nothing failed loudly: the list rendered, the badge
+was right, and the screen simply stopped showing mail the reader had already seen.
+
+**What this tick fixed.** `ab3c105` gives `with_read` an `Option<bool>`, so absent and off stay
+distinguishable and absence means *everything*; `4933c10` fixes the three client places that assumed a
+positive flag — `filtersFrom` never sent it, `notificationQuery` dropped the `false` that *is* the
+inbox filter, and the empty state's "Show read notifications" button **set** the flag to switch read
+rows on when the correct action is to clear it. `797a3e8` adds the two gates that were missing, which
+is the part that matters: `readRowsStayVisible` immediately after the bulk action, and `inboxFilterIsHonest`
+on the other half, so a default nobody can turn off cannot pass as a fix.
+
+**Proof.** `cargo test -p omnion-api --lib` → **188 passed** (187 + the absent-vs-off test, which
+asserts the parse *and* the built query — a parser that keeps them apart and a builder that throws the
+distinction away are two different bugs and only the pair is the fix). `-p omnion-notifications` → **79**;
+`-p omnion-permissions` → **62**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check
+scripts/qa/walkthrough.cjs` → clean. `scripts/qa/run-notifications-http.sh` → **PASS 13/13** over a real
+socket, the new leg reading `all=1 inbox=0 live=1`. Browser pass: 36 pages, 1095 clicks, 88 field fills,
+39 form submissions, 84 findings (79 high, 5 medium).
+
+**On those 79 high findings, honestly.** 74 are `/media/*` and belong to REQ-010, which is the other
+in-progress REQ in this wave — 30 of them are one 422 on `/api/v1/media/{id}/raw?preset=standard` and 22
+more of the same from a second file. The remaining 5 are **this pass's own deliberate refusal probes**:
+three the 400 in-app-column lock and two the routed-500 error state, each of which the pass asserts as
+*expected* two lines later. Neither group is caused by this tick's change.
+
+**Also fixed, incidentally.** The gate I extended had two defects of its own, both caught because the
+first version of the assertion failed in a way the change had nothing to do with: `grep -c` exits 1 on
+an empty body, so under `set -e` the *inbox* leg — which is meant to be empty — aborted the whole gate
+before printing a verdict; and the row to mark is read from SQL rather than reusing the `$target` that
+the 404 check *below* assigns, because a shell script that reads a value before the line that sets it
+reports an empty id as "the endpoint refused".
+
+**Not proven, and not claimed.** No pass has yet run against the `with_read` fix, so the keyboard leg —
+`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`, `shiftEMarkedVisible`,
+`slashFocusedFilter` — is still unproven and the REQ stays **in-progress**. `quietSaved` and
+`digestPersisted` are still false: the widgets render, but the pass does not change them yet, so those
+two halves of the settings box are honestly unproven despite the box being ticked for what was proven.
+
+**Next.** Run `bash scripts/qa/run.sh` again (verify `stat -c %y target/debug/omnion-api` is newer than
+`ab3c105` first). Require `report.notifications.readRowsStayVisible`, `inboxFilterIsHonest`,
+`keyboardRows > 0` and then the five keyboard keys, plus `notificationSettings.quietSaved` and
+`digestPersisted` — and extend the settings pass to change those two fields rather than merely render
+them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
+REQ-010 slice 4's remaining gate.
+
+## Tick 50 — the quiet window that came back wearing a different spelling
+
+Two commits, `c48db9d` (the fix) and `60a28ea` (the gate), both pushed, tree clean.
+
+**What.** The previous tick's `next_hint` told this one to go and run the browser pass. It could
+not: `qa-slot.sh` allows one pass at a time and the box was at load 13 with six sibling passes
+compiling, so a pass started under those conditions would have timed out having measured
+nothing. The two settings boxes the hint named — `quietSaved` and `digestPersisted` — were the
+honest place to start instead, and reading why they were false turned up something the browser
+pass had been reporting faithfully for two ticks.
+
+**The defect.** `notification_settings.quiet_hours_start` is a Postgres `time` column, and
+`read_settings` selected it with `::text`. Postgres prints a `time` that way as `22:00:00` —
+seconds always present, zero-padded. The platform's clock vocabulary is `HH:MM`: the shape the
+form sends, the shape `validate_quiet_hours` accepts, and the shape `parse_clock` reads. So
+every window that was saved correctly came back in a spelling nothing could parse,
+`parse_clock` answered `None`, and `in_quiet_hours` took the arm its own doc comment promises
+("no window at all means `false`"). The setting a reader had just turned on decided nothing from
+the next request onwards, and the settings form could not read back what it had written.
+
+Nothing about it fails loudly. The save is a `200`. The row in Postgres is exactly what was
+asked for. The digest half of the same row — a string column — came back fine, which is why
+`digestPersisted` failed for a *second*, unrelated reason in the pass while the two fields
+looked equally broken.
+
+**Why the pass could not have told you.** `quietSaved` asserts the time input still reads
+`22:00` after a save, and `digestPersisted` asserts the two selects. Both were false, but they
+were false for different reasons, and only one of them was a defect. Reading the *values* the
+pass had collected — not the booleans — is what separated them: `timezoneSaved` was true
+alongside two false fields, and timezone is a plain `text` column.
+
+**The fix.** `to_char(quiet_hours_start, 'HH24:MI')` in the read, so the shape is produced by
+one literal in the SQL. `parse_clock` also tolerates a seconds field, so a row written before
+this change is still a window rather than its absence — a widening that has to be paid for
+with a test, because "accepts more" is how a parser turns into a function that accepts
+anything with a colon in it. `format_clock` is the write-side counterpart that names the shape,
+and the round trip between the two is asserted over five instants.
+
+**One mistake worth recording.** The first version of the fix declared the columns
+`Option<time::Time>` and let `format_clock` do the work. It compiled — `query_as` checks its
+types at *decode* time, not at compile time — and came back as a `500` on the settings screen:
+`mismatched types; Rust type Option<time::Time> (as SQL type TIME) is not compatible with SQL
+type TEXT`. The fix for that is the one line the comment now explains: `to_char` returns
+`text`, so the column is decoded as `Option<String>`.
+
+**Proof, in both directions.** `scripts/qa/run-notifications-http.sh` now has two legs that
+own the seam, and the order is the point: save through the API, read the row out of Postgres to
+prove the write happened, *then* read it back through the API and compare the exact string.
+Against the pre-fix tree (stashed, rebuilt, re-run) the gate printed
+`FAIL quiet hours did not round trip: row=[22:00 07:00 weekly 3 17] api=[22:00:00..07:00:00 hour=17]`
+— the row correct, the API's own answer unusable. Against the fix: **PASS 15/15**. A gate that
+only read the API back would have passed against a store answering with whatever it was handed.
+
+`cargo test -p omnion-notifications` → **83** (79 + 4 new). `cargo test -p omnion-api --lib` →
+**188**. `tsc --noEmit` in `apps/admin` → exit 0.
+
+**Still not proven, and not claimed.** No browser pass has run against a binary built after
+this, so the keyboard leg (`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`,
+`shiftEMarkedVisible`, `slashFocusedFilter`) and the browser's own `quietSaved` /
+`digestPersisted` are open. REQ-021 stays **in-progress** for that reason alone.
+
+**Next.** Run `bash scripts/qa/run.sh` with no `QA_STACK` override when the box is under load
+~6 and `qa-slot` is free — verify `stat -c %y target/debug/omnion-api` is newer than `c48db9d`
+*before* reading any finding, because the pass tears the stack down. Require
+`report.notifications.keyboardRows > 0` and the five keyboard keys, and
+`notificationSettings.quietSaved` + `digestPersisted`, which the data path can now support.
+The other open item is unchanged: the 74 `/media/*` high findings, which are REQ-010 slice 4's
+remaining gate.
+
+## Tick 51 — REQ-016 slice 1: the event catalogue (the registry the platform never had)
+
+**What.** `crates/events/src/catalogue.rs` — 68 event names (67 live, 1 reserved) with their
+area, a one-sentence description, their payload fields and a required flag. Compiled in, not
+stored. `GET /api/v1/events/catalogue` serves it, a group subscription (`page.*`) is stored as
+the wildcard *and* as today's expansion, and `enqueue_fanout` matches either.
+
+**The gap this closes.** Before this, the only truth about an event name was the string literal
+at the call site. The endpoint form had nothing to build a picker from, `/events` had nothing to
+describe, and a typo in one emitter became a name no receiver could ever subscribe to — silently,
+with the bus recording the fact and the delivery queuing normally. Nothing was broken and nothing
+said so.
+
+**Two decisions, and the reasons are the interesting part.**
+
+*A group is stored twice.* Storing only today's expansion means `page.*` silently stops covering
+an event added next release — the exact surprise a group exists to remove. Storing only the
+wildcard means a receiver can be subscribed to a group whose members do not exist, and cannot
+tell what it is getting. So the wildcard is the subscription and the expansion is the readable
+copy, and the fan-out tests both. The SQL grew one `or $4 = any (w.events)` clause; the clause
+is there for the row written before reconciliation existed, or by an operator's own SQL, which
+would otherwise stop receiving with no error anywhere.
+
+*`order.created` is listed, described and subscribable while commerce is unshipped* — and marked
+`reserved` so the panel can say *which module ships it* rather than implying the platform is
+broken. A reserved name is a name: `order.*` expands today.
+
+**The registry writes itself, and its first two findings were real.** The table is a macro
+(`crates/events/src/catalogue.rs`), one row per event, and `apps/api/tests/events.rs`
+`every_emitted_name_is_in_the_catalogue` walks the source tree for `NewEvent::new("…")` and fails
+with the file and line when an emitter names something the table does not carry. A unit test
+inside `omnion-events` cannot do this — it cannot see the modules. It immediately earned its
+place: it caught that the upload fact is emitted as **`media.created`**, not the `media.uploaded`
+the request imagined. The table was written to match the code rather than the spec, and the
+reason is in the source: renaming the row would make the catalogue agree with the request and
+disagree with every receiver that already subscribed.
+
+**A gate that cannot fail proves nothing**, so the drift test was proved in both directions:
+with a `totally.made_up` emitter injected into `media_settings.rs` it failed with
+`1 emitted name(s) are not in the catalogue … totally.made_up (apps/api/src/routes/media_settings.rs:24)`,
+and green again once restored.
+
+**Also found, by a test I wrote to check a different thing.** `group_members` matches the first
+dotted segment, so a group is `order` while the area is `commerce` — I had written a test
+asserting `commerce.*` would expand. Area and group are different vocabularies and conflating
+them would make `commerce.*` look correct while matching nothing. Pinned by
+`an_area_is_not_a_group`.
+
+**Macro rules, for the fourth time.** A `*` repetition may not be followed by another
+repetition, a field tuple needs its literal parens in the pattern, `req`/`opt` are idents not
+literals, and a `const fn` cannot match on `&str` on this toolchain — so the status and the
+required flag are matched as *tokens* and turned into the values by the macro. The table is now
+stricter than it was designed to be: a row that says `Reserved` in the wrong case is a compile
+error rather than a row that silently reads as `live`.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **41** (24 before, 17 new)
+- `cargo test -p omnion-api --test events -- --test-threads=1` → **4/4**, real Postgres + a real
+  loopback receiver; the group subscription delivers a `page.published` and the signature
+  verifies against the secret the creation response returned
+- `cargo test -p omnion-api --lib` → **188**
+- `tsc --noEmit` in `apps/admin` → exit 0
+
+**Not done, and not claimed.** Slice 1 is not closed. Missing: the emission calls for names the
+modules do not record yet (`page.created|updated|unpublished|deleted|restored`,
+`user.updated|deleted`, `site.archived`, `domain.*`, `plugin.*`, `theme.activated`,
+`workflow.run.*`) — the catalogue names them and the table asserts they are listed, which is the
+honest direction: the registry is the specification the emitters are measured against, and they
+have not caught up. And the `/events` screen with its Feed and Catalogue tabs does not exist; the
+data source does.
+
+**Next.** The emission calls, then the `/events` screen. The catalogue made the work mechanical
+on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
+turns "did I remember?" into a red line with a file and a line number.
+
 ---
 
 ## Wave 4 · REQ-052 slice 3 · the discount gate (5a26ca6, d0745f8, 6f62881)
