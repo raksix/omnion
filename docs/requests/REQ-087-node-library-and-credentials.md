@@ -167,12 +167,14 @@ back to untested), `workflows.graph.saved` (usage refresh).
       missing a required field names it, one with a secret attached says the connection was not
       made. The `ok: true` branch is still open: it needs a live provider, which slice 3's OAuth
       fixture and an outbound-capable hook provide.*
-- [ ] Deleting a referenced credential returns `credential_in_use` with the workflow list; a forced delete disables and names the dependent nodes.
-      *The guard is in and proven from the store side: the usage probe and the delete share one
-      transaction with the row locked `for update`, and the refusal carries the list in
-      `details`. The walkthrough proves the *allow* direction end to end; a referenced-delete
-      refusal needs a fixture workflow whose graph names the key, which lands with the canvas
-      (REQ-086 slice 2) and is the last clause outstanding.*
+- [~] Deleting a referenced credential returns `credential_in_use` with the workflow list; a forced delete disables and names the dependent nodes.
+      *Proven end to end by `scripts/qa/delete-guard.sh` (20/20): a workflow whose nodes name
+      the key, a delete refused with `409 credential_in_use` whose `details` carry the workflow,
+      the node label and the node type, the row surviving the refusal, and a forced delete that
+      reports what it broke while leaving the workflow's now-dangling reference alone — the
+      guard degrades, it does not edit somebody's automation. **The last clause outstanding** is
+      "disables the dependent nodes", which needs the canvas (REQ-086 slice 2) to have somewhere
+      to disable them.*
 - [ ] OAuth start → callback stores a token set, shows the connected identity, and rejects a tampered `state` with `credential_oauth_state`.
 - [ ] A refresh failure lands as `needs_reauth`, emits its event, and disables the affected nodes on the canvas.
 - [ ] The usage view matches a manual count of fixture workflows and node keys referencing a credential.
