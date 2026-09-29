@@ -5325,3 +5325,359 @@ export function importSecurityReport(
     body: JSON.stringify({ report, source }),
   });
 }
+
+// -------------------------------------------------------------------------------------------
+// The agent runtime (REQ-099, slice 1).
+//
+// The screen is a queue's front end, so the client mirrors the store's own vocabulary rather
+// than inventing labels: a status a human reads is a status the loop wrote. Every call carries
+// the organization through `agentScopeParams`, because a platform-level account has to name one
+// and an organization account passing a different one is refused with `403 cross_organization`.
+// -------------------------------------------------------------------------------------------
+
+/** One agent as the table renders it. */
+export type AiAgent = {
+  id: string;
+  organization_id: string;
+  site_id: string | null;
+  key: string;
+  name: string;
+  description: string;
+  system_prompt: string;
+  model_id: string | null;
+  temperature: number;
+  max_steps: number;
+  deadline_seconds: number;
+  token_budget: number;
+  tools: string[];
+  /** How many of `tools` park the run for a person; the table shows it beside the count. */
+  approvals_count: number;
+  approvals: string[];
+  memory_scope: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+/** One run as the history list renders it. */
+export type AiRun = {
+  id: string;
+  agent_id: string | null;
+  user_id: string | null;
+  /** `chat`, `agent`, `workflow` or `schedule` — who started it, not just that it started. */
+  trigger: string;
+  goal: string;
+  status: string;
+  stop_reason: string | null;
+  model_id: string | null;
+  current_step: number;
+  resume_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+};
+
+/** One step of a run's trace. `arguments` is the **redacted** form the store wrote. */
+export type AiRunStep = {
+  step_no: number;
+  kind: string;
+  tool: string | null;
+  arguments: Record<string, unknown> | null;
+  result: unknown;
+  status: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micros: number;
+  duration_ms: number | null;
+  error: string | null;
+};
+
+/** One run with its trace — the run detail screen's whole payload. */
+export type AiRunDetail = AiRun & { steps: AiRunStep[] };
+
+/** The organization selector the agent and run routes accept. */
+function agentScopeParams(organizationId?: string | null): string {
+  if (!organizationId) return "";
+  return `?organization_id=${encodeURIComponent(organizationId)}`;
+}
+
+/** The agents table. */
+export function fetchAiAgents(organizationId?: string | null): Promise<AiAgent[]> {
+  return request<AiAgent[]>(`/api/v1/ai/agents${agentScopeParams(organizationId)}`);
+}
+
+/** The run history, narrowed by whichever filters the list sets. */
+export function fetchAiRuns(input: {
+  organizationId?: string | null;
+  agentId?: string;
+  status?: string;
+  stopReason?: string;
+  limit?: number;
+}): Promise<AiRun[]> {
+  const params = new URLSearchParams();
+  if (input.organizationId) params.set("organization_id", input.organizationId);
+  if (input.agentId) params.set("agent_id", input.agentId);
+  if (input.status) params.set("status", input.status);
+  if (input.stopReason) params.set("stop_reason", input.stopReason);
+  if (input.limit) params.set("limit", String(input.limit));
+  const query = params.toString();
+  return request<AiRun[]>(`/api/v1/ai/runs${query ? `?${query}` : ""}`);
+}
+
+/** One run with its trace. */
+export function fetchAiRun(id: string, organizationId?: string | null): Promise<AiRunDetail> {
+  return request<AiRunDetail>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
+  );
+}
+
+/** One agent in full — the config form's load. */
+export function fetchAiAgent(id: string, organizationId?: string | null): Promise<AiAgent> {
+  return request<AiAgent>(
+    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
+  );
+}
+
+/**
+ * Create an agent.
+ *
+ * `tools` and `approvals` are the agent's own ordered lists rather than a catalogue pick, so a
+ * form that drops an approval-gated tool is refused by the API with `agent.approval_not_allowed`
+ * instead of silently losing the gate.
+ */
+export function createAiAgent(input: {
+  organizationId?: string | null;
+  key: string;
+  name: string;
+  description?: string;
+  system_prompt?: string;
+  model_id?: string | null;
+  temperature?: number;
+  max_steps?: number;
+  deadline_seconds?: number;
+  token_budget?: number;
+  tools?: string[];
+  approvals?: string[];
+  memory_scope?: string;
+  enabled?: boolean;
+}): Promise<AiAgent> {
+  return request<AiAgent>(`/api/v1/ai/agents${agentScopeParams(input.organizationId)}`, {
+    method: "POST",
+    body: JSON.stringify({
+      key: input.key,
+      name: input.name,
+      description: input.description ?? "",
+      system_prompt: input.system_prompt ?? "",
+      model_id: input.model_id ?? null,
+      temperature: input.temperature,
+      max_steps: input.max_steps,
+      deadline_seconds: input.deadline_seconds,
+      token_budget: input.token_budget,
+      tools: input.tools ?? [],
+      approvals: input.approvals ?? [],
+      memory_scope: input.memory_scope,
+      enabled: input.enabled,
+    }),
+  });
+}
+
+/**
+ * Change an agent.
+ *
+ * `model_id` is a double option on purpose: `null` un-pins the agent (let the router choose),
+ * while omitting the key leaves the current pin alone. A single nullable field cannot express
+ * the difference, and the difference is the difference between a pinned agent and a routed one.
+ */
+export function updateAiAgent(
+  id: string,
+  input: {
+    organizationId?: string | null;
+    name?: string;
+    description?: string;
+    system_prompt?: string;
+    model_id?: string | null;
+    temperature?: number;
+    max_steps?: number;
+    deadline_seconds?: number;
+    token_budget?: number;
+    tools?: string[];
+    approvals?: string[];
+    memory_scope?: string;
+    enabled?: boolean;
+  },
+): Promise<AiAgent> {
+  return request<AiAgent>(
+    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(input.organizationId)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/** Remove an agent. The API answers 409 while a run is still active for it. */
+export function deleteAiAgent(id: string, organizationId?: string | null): Promise<null> {
+  return request<null>(
+    `/api/v1/ai/agents/${encodeURIComponent(id)}${agentScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** Ask a run to stop at its next step boundary. */
+export function cancelAiRun(id: string, organizationId?: string | null): Promise<AiRun> {
+  return request<AiRun>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}/cancel${agentScopeParams(organizationId)}`,
+    { method: "POST" },
+  );
+}
+
+/** Requeue an interrupted or approval-parked run. */
+export function resumeAiRun(id: string, organizationId?: string | null): Promise<AiRun> {
+  return request<AiRun>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}/resume${agentScopeParams(organizationId)}`,
+    { method: "POST" },
+  );
+}
+
+/** The run's agent, for the history table's link column. */
+export function fetchAiRunAgent(
+  id: string,
+  organizationId?: string | null,
+): Promise<AiAgent | null> {
+  return request<AiAgent | null>(
+    `/api/v1/ai/runs/${encodeURIComponent(id)}/agent${agentScopeParams(organizationId)}`,
+  );
+}
+
+/** One frame of a run's event stream, as the Run sheet and the live trace read it. */
+export type AiRunFrame = {
+  /**
+   * `run`, `step_started`, `text`, `tool_call`, `tool_result`, `usage`, `awaiting_approval`,
+   * `loop_done`, `error` or `done`.
+   */
+  event: string;
+  data: Record<string, unknown>;
+};
+
+/** A consumer the stream calls as frames arrive. */
+export type AiRunStreamHandlers = {
+  onFrame?: (frame: AiRunFrame) => void;
+};
+
+/**
+ * Read an SSE response the one way.
+ *
+ * The chat stream and the run stream are the same protocol in two places, so the frame parser
+ * lives here once: a client that re-implemented it per screen is a client that will eventually
+ * read a frame boundary differently from the writer. Split on the blank line, take the `event:`
+ * and `data:` lines, hand the pair over — the caller branches on the *event name*, which is the
+ * loop's own vocabulary rather than a transport word.
+ */
+async function readEventStream(
+  response: Response,
+  handlers: AiRunStreamHandlers,
+): Promise<void> {
+  if (!response.body) {
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const chunk = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of chunk.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(data) as Record<string, unknown>;
+      } catch {
+        // A frame that is not JSON is a transport frame (a comment, a keep-alive), not a
+        // lifecycle event. Dropping it is correct; throwing would kill a live run over a
+        // keep-alive, which is the worst possible trade.
+        continue;
+      }
+      handlers.onFrame?.({ event, data: parsed });
+    }
+  }
+}
+
+/**
+ * Start a run and stream its steps.
+ *
+ * Everything decidable before the first byte arrives as a normal HTTP status: a disabled agent,
+ * an empty goal, a runner that is switched off (`503 runner_disabled`), or a run already in
+ * progress (`409 run_in_progress`, whose details carry the existing run's id so the client
+ * attaches to it rather than pressing Run again). After the stream opens the frames are the
+ * run's own lifecycle.
+ */
+export async function startAiRun(
+  agentId: string,
+  input: { goal: string; files?: string[]; organizationId?: string | null },
+  handlers: AiRunStreamHandlers = {},
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/ai/agents/${encodeURIComponent(agentId)}/runs${agentScopeParams(input.organizationId)}`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json", accept: "text/event-stream" },
+      body: JSON.stringify({ goal: input.goal, files: input.files ?? [] }),
+    },
+  );
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+      payload?.error?.details ?? null,
+    );
+  }
+
+  await readEventStream(response, handlers);
+}
+
+/**
+ * Re-attach to a run that is still going.
+ *
+ * A replay, not a subscription: the API has nothing to publish to on a request that is not the
+ * one running the loop, so the frames come from the step rows. That is the property the spec's
+ * "replay matches SSE" box asks for — the same rows produce both.
+ */
+export async function attachAiRun(
+  runId: string,
+  handlers: AiRunStreamHandlers = {},
+  organizationId?: string | null,
+): Promise<void> {
+  const response = await fetch(
+    `/api/v1/ai/runs/${encodeURIComponent(runId)}/events${agentScopeParams(organizationId)}`,
+    { credentials: "same-origin", headers: { accept: "text/event-stream" } },
+  );
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+      payload?.error?.details ?? null,
+    );
+  }
+  await readEventStream(response, handlers);
+}

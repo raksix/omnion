@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, History as HistoryIcon, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -32,6 +32,12 @@ const NAV = [
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
+  // The agent runtime (REQ-099, slice 1). Two entries rather than one, because the two screens
+  // answer two different questions: "what may I let this do" (the configuration) and "what did
+  // it already do, and what did that cost" (the history). An operator reads them in that order
+  // and very rarely in the other one.
+  { href: "/ai/agents", label: "Agents", icon: Bot },
+  { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
