@@ -3615,3 +3615,88 @@ route, the retry path and the provider Sync tab.
   under load average 101. That is the documented sibling-interference case, not my change — and
   the honest report is that the observation did not happen, not that it nearly did.
 - **Check `uptime` before queueing a browser pass, not after.** Eight consecutiv
+
+## 2026-09-29 · tick 9 · REQ-065 slice 4 part 2 — the sync ledger, and the lock that ate the pass
+
+**The tables from part 1 had no reader.** `last_sync_at` on the provider row is one value that
+hides everything the question at 09:00 is about, so the surface is a route and a screen rather
+than a column.
+
+- `GET /iam/providers/{id}/sync-runs` — newest first, the verdict **derived from the failures**,
+  and `?problems_only=true` for the query an operator runs *because* the chip is amber
+- `GET .../sync-runs/{run_id}` — the drawer; `attempts` and `subjects` are two numbers on purpose
+- `POST .../sync-runs/{run_id}/retry` — names its subjects, opens a **new** run, emits
+  `iam.sync_retry_requested`
+- `GET .../sync-groups` — the groups a sync has seen, and the ones whose membership was unreadable
+
+Three refusals that would otherwise have written a run row claiming work nobody asked for: an
+empty subject list, a subject that never failed in that run, and a run that is still going.
+
+**Proof**
+
+- `apps/api/tests/iam_sync_runs.rs` → **1 passed** (9.8s), against the real router, with runs
+  written through the real store rather than hand-made rows
+- `cargo test -p omnion-identity --lib` → **197 passed**
+- `cargo test -p omnion-api --lib` → **197 passed** (was 194)
+- `pnpm --filter @omnion/admin typecheck` → clean
+- `bash scripts/qa/run-qa-slot-reaper.sh` → **PASS 11/11**
+
+**The walk caught two things it could not have been written to expect.** The error envelope nests
+under `error`, so four assertions were reading `Null` — a passing assertion about nothing, and the
+same trap the attribute-map walk documents. And the **cross-tenant answer is genuinely
+inconsistent in this tree**: the provider route answers 403, the attribute-map sub-route answers
+404, and the new surface inherits the parent. Rather than freeze today's answer with a hard-coded
+status, the walk asserts the property that actually matters — *the child agrees with the parent* —
+plus that the refusal happens at all. Asserting a literal 403 would have frozen the answer the
+system gives and called it a requirement; asserting 404 would have frozen one it does not.
+Unifying the two into a single deliberate choice is a separate, documented decision, not something
+a test should smuggle in.
+
+**A green `cargo build` is not a green crate.** Removing an import to clear a warning broke
+`cargo test --lib`, which compiles the same file in a second configuration. The gate that catches
+this is not the command that builds it.
+
+**And the QA slot had been deadlocking two writers for 39 minutes.** `664eee0` (tick 8) made the
+reaper test the owner pid and, in the same commit, correctly refused to reclaim a place whose owner
+line is missing. Both halves were right, and together they opened a hole neither rule could see:
+a place whose holder is **alive** and whose holder file has **no owner line** — which is every
+place written by a writer that has not taken the owner-line commit — is declined twice over and
+held for ever. On this box it was not hypothetical: `/tmp/omnion-qa-slot` held one such place and
+two writers printed "waiting for a QA slot" until their own timeouts, with no pass running.
+
+The signal is the **process-group leader**, not parentage. Parentage was the obvious choice and
+the box disproved it: this host reparents orphans to the systemd *user* manager (pid 338), not
+init, so `ppid <= 1` is false for a genuinely orphaned holder. A live pass's holder has a live
+group leader; a dead one is the last member of a group whose leader is gone. Unlike `ppid`, that
+does not depend on whether anything is configured as a subreaper.
+
+The test that proves it took four attempts, and three of them **passed while proving nothing**:
+
+- `setsid` without `--fork` inherits the test's own process group, so the per-pid sweep reached the
+  test and SIGTERMed it
+- `setsid --fork` makes the holder its own group leader, so the leader is alive *by construction*
+  and the case under test is never exercised
+- `kill -- -PGID` kills the holder too, leaving a dead holder — which the reaper reclaims for the
+  boring reason it already had
+- case 4c was missing its holder file entirely, so it was silently re-running case 4 and reporting
+  that the reaper ignored the opt-out. The reaper was doing exactly the right thing on a fixture
+  the previous case never set up.
+
+That last one is the general lesson: **a case that only passes because of the previous case's
+leftovers is a case that tests the leftovers.** It now starts from an empty queue and *fails* when
+it cannot build the orphan, instead of skipping — a skip line reads like a pass.
+
+`QA_SLOT_REAP_ORPHAN=0` opts out, because a shared script cannot be forced on writers that have
+not merged it. The log line names the evidence ("holder 2643862 in dead process group 2643823"),
+because "reclaimed a place" with no reason is a thing an operator learns to distrust.
+
+**Not claimed.** The panel half is built and typechecks, and the walkthrough drives the tab
+(`sync-ledger-empty`, `sync-drawer`, `sync-problems-filter`), but this box's pass has not
+observed it yet — so slice 3's wizard/dry-run box and criterion 15's visual half both stay
+unticked. The pass finally got the slot this tick; whether it reaches the IAM screens is the
+question.
+
+**Next.** Read the pass. If it observed the wizard, the dry run and the new Sync tab, close slice 3
+and move to slice 4 part 3 — SCIM tokens and the `Users`/`Groups` endpoints the QA plan drives
+end to end. If it died on the tab again, record that and build the SCIM half, which is the part
+that does not need the browser to be correct.
