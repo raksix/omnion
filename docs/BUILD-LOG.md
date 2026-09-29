@@ -5265,3 +5265,66 @@ red before this tick and are red for a reason that has nothing to do with ranges
 claim than "the whole media surface is green", and it is the honest one: the serve paths this tick
 touched are covered by the walk in `--test media`, which exercises them through the real router
 and the real object store.
+### The boot order left the first account with no role at all, and the QA queue could not drain
+
+Two independent defects, one of them the reason this request's close gate had not run.
+
+**The Owner invariant was asserted before the account existed.** `main` seeds IAM in this order:
+`seed_iam` calls `permissions::seed::ensure` — catalogue, base roles, Owner invariant — and only
+then `bootstrap_admin` creates the very first account from `OMNION_ADMIN_EMAIL`. The invariant was
+therefore evaluated against a database with no accounts, bound nobody, and the account created on
+the next line was left holding no role.
+
+Nothing about that shape looks broken from outside. The sign-in succeeds, the panel renders, and
+every permission-guarded route answers `403 permission_denied`. The onboarding screen does not
+catch it either: `status()` derives `steps.owner` from *are there accounts*, not from *does
+somebody hold the Owner role*, so the wizard reported the account as the owner while it held
+nothing. `5e06b04` re-asserts the invariant after the bootstrap — idempotent, one `exists` query
+in the ordinary case.
+
+Proved by `apps/api/tests/bootstrap_owner.rs`, 3/3 against throwaway databases. The suite pins
+the **ordering**, not the query: it asserts `live_owner_count == 0` at exactly the point the
+defect lived (after `ensure` on an empty database, after the bootstrap created the account) and
+exactly `1` after the re-assertion. Two of the three tests had to be corrected mid-write — they
+called `ensure_owner_binding` on a bare database and got `RoleNotFound`, because `seed_iam` always
+runs `ensure` first and that is what creates the roles. The fix belongs in the test, not the
+product: the production order is the thing under test, so a test that skipped it proved nothing.
+
+**A QA place was kept alive by another writer's process.** This is why the browser pass had not
+run. The slot queue could not drain: passes printed `waiting for a QA slot` and died at their own
+timeout with no report while the counter insisted one was running. Caught mid-pass — a place named
+after this writer's waiter recorded a holder whose working directory was `/mnt/apopic/omnion-w4`.
+
+Nothing tied a running pass to the place that authorised it. The place file was named after the
+*acquiring* script's pid and the holder pid was written beside it, so a place whose holder file had
+been written by another writer — a pid collision after a recycle, or a pass killed between taking
+the place and writing the holder down — read as occupied for as long as that unrelated process
+lived. `kill -0` was the entire liveness test. `04b934c` mints a token from the acquiring process
+that names the place, the holder file *and* the holder's argv, so `holder_is_ours` reads the token
+back out of `/proc/<pid>/cmdline`: a live pid carrying a different token is somebody else's process
+and the place is reclaimable, while a genuine holder still cannot be stolen from.
+
+`scripts/qa/qa-slot-test.sh`, 12 checks, run against both versions: against the previous script
+the two reclamation checks fail (`a place with a foreign holder was reclaimed` → `still-there`), so
+the regression is not theoretical.
+
+**Gates.** `cargo test -p omnion-api --test bootstrap_owner` 3/3. `cargo build -p omnion-api`
+exit 0. `pnpm typecheck` (tsc --noEmit) clean. Merge of `origin/main` (11 commits) resolved in four
+files: `cargo-slot.sh` was add/add and byte-identical (main wrote the same semaphore in
+parallel — same md5), `run.sh` and `routes/mod.rs` were formatting-level, and
+`tests/support/mod.rs` needed **both** modules — main added `walk_auth`, this branch `walk_state`.
+
+One compile break surfaced by the merge and fixed in it rather than in a follow-up:
+`routes/backups.rs` built its `NewAuditEntry` with a struct literal, and REQ-125 slice 4 added
+`lease_id`, `deployment_key_id` and `pipeline` to that struct. That call site now goes through
+`NewAuditEntry::by_user(...).organization(...)`, which is what a constructor is for.
+
+**One gap found by reading the spec against the tree, not by a test.** The request lists seven
+screens; six ship. `apps/admin/app/observability/page.tsx` — the overview (request rate, error
+ratio, p95, queue depth, AI spend, exporter health) — does not exist. The REQ file's recorded
+blocker ("`api.ts` is missing its entire observability AND secrets section") is **stale**: `api.ts`
+is 6187 lines with all ~70 symbols present, and typecheck has been green for two ticks. Next slice.
+
+**Next.** (a) The `/observability` overview screen plus its endpoint — a real gap against "every
+screen works", and no untested screen is accepted. (b) The private-stack walkthrough, which is in
+flight for this tick.

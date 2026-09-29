@@ -1,6 +1,6 @@
 # REQ-126 — Observability Stack
 
-> **Status:** in-progress (the Rust gates are green under the merged rate limiter, the CSRF layer and the request log; the close gate is still the browser pass, which has not run since the merge) · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress (seven of seven screens now exist; the Rust and web gates are green, and the browser pass is red for a box reason rather than a product one — ten writer worktrees on six cores) · **Captured:** 2026-09-26 · **Layer:** infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -246,3 +246,40 @@ The lifecycle pass sends SIGTERM while requests are in flight and asserts the re
 - `/metrics` and the probe paths are the only unauthenticated surfaces; bind them to the internal interface by default and document the token or allow-list option when an instance exposes them publicly.
 - Clock skew between services breaks naive ordering; timestamps stay UTC RFC 3339, durations come from monotonic clocks, and the waterfall draws from span-relative offsets.
 - Alert thresholds must state their window and their deduplication behaviour, or a flapping dependency floods every subscriber.
+
+
+**Fourth close-gate tick: the blocker named above was stale, and the real gap was one screen.**
+
+  The recorded blocker — "`apps/admin/lib/api.ts` is missing its entire observability AND secrets
+  section" — is no longer true. `api.ts` is 6187 lines, carries all ~70 symbols the screens
+  import, and `pnpm typecheck` has been clean for several ticks. A REQ file's blocker is a
+  record of what a tick believed, and reading it as current is how a fixed problem gets rebuilt.
+
+  **What was actually missing: `/observability` itself.** The request lists seven screens. Six
+  shipped. The landing screen — request rate, error ratio, p95, queue depth, AI spend today,
+  exporter health, and a door into each area — had never been built, so the centre had no front
+  door and no route for the parent nav entry to point at. `95656bb` adds the screen, its
+  `GET /api/v1/observability/overview` endpoint, the client binding, the nav entries for the whole
+  centre (which had **none**), and a walkthrough depth pass for it.
+
+  The endpoint is one read rather than six, and composes defensively: a source that cannot be
+  read degrades to `null` and is named in `unavailable` rather than failing the screen. An
+  operator opening this page during an incident must not get a 500 because the alert store is
+  unhappy, and must not read "no alerts" where the truth is "we cannot see the alerts".
+
+  **The close gate is still red, and this time for a box reason that is measured, not guessed.**
+  The private-stack pass ran and visited **30 screens** — all six observability areas, all six
+  secrets areas, and the sibling areas — producing 627 screenshots, and then died with
+  `page.waitForTimeout: Target page, context or browser has been closed`. That is the known
+  tab-death under parallel load, not a defect in anything this request changed: `uptime` read
+  **load average 25** during the pass and **64** an hour later, with `free -g` reporting 32 GB
+  total, 29 used and **0 free**, across ten writer worktrees on six cores.
+
+  So the box is the finding. Nothing on this request is closed on a pass that ended in a browser
+  crash, and the box stays UNTICKED — which is now the fourth tick to end that way, for three
+  different reasons, which is itself worth saying out loud: a stale blocker, a missing screen, and
+  a saturated machine. Only the third is anybody's luck.
+
+**Next.** (a) Re-run the private-stack pass on a box below load 15 with 4 GB free; the route and
+its depth pass are in place, so the only thing owed is the screenshots. (b) Nothing else on this
+request is blocked — the remaining slices are code-complete.
