@@ -92,10 +92,19 @@ step "API on :$API_PORT (database omnion_qa)"
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
 # than the newest migration, which is cheap when nothing changed and correct when something did.
-if [ ! -x target/debug/omnion-api ] \
-   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+# A writer whose worktree cannot hold a build (a full /mnt/apopic) builds elsewhere and points
+# at the result. Without this the pass rebuilds into a full disk and then reports "script not
+# found" for a binary that exists — a failure that reads as a broken API rather than a full
+# filesystem. `QA_API_BIN` is the escape hatch; the default is unchanged.
+QA_API_BIN="${QA_API_BIN:-$ROOT/target/debug/omnion-api}"
+if [ ! -x "$QA_API_BIN" ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer "$QA_API_BIN" -print -quit)" ]; then
+  log "building the API (missing or stale at $QA_API_BIN)"
   step "building the API (first pass, or a migration changed since the last build)"
-  cargo build -p omnion-api
+  # `CARGO_TARGET_DIR` has to be honoured, or a caller that points `QA_API_BIN` at an
+  # out-of-tree build gets a rebuild into the default `target/` — the full disk this override
+  # exists to avoid.
+  cargo build ${CARGO_TARGET_DIR:+--target-dir "$CARGO_TARGET_DIR"} -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
