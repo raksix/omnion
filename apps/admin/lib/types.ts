@@ -1342,3 +1342,120 @@ export type SweepResult = {
   deliveries_deleted: number;
   run_id: string;
 };
+
+
+// ---------------------------------------------------------------------------------------------
+// Security centre (REQ-012, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** What a posture check can say. `unknown` is the honest one and is never a failure. */
+export type SecurityCheckState = "pass" | "warn" | "fail" | "unknown";
+
+/** Where a finding came from. */
+export type SecurityFindingSource = "config" | "dependency" | "platform" | "report";
+
+/** How bad a finding is, worst first. */
+export type SecuritySeverity = "critical" | "high" | "medium" | "low" | "info";
+
+/** What has been done about a finding. */
+export type SecurityFindingStatus = "open" | "acknowledged" | "fixed" | "ignored";
+
+/**
+ * One posture check row.
+ *
+ * `checked_at` is `null` when the check has **never been evaluated**, which is different from
+ * an old timestamp and must not be rendered as one: the panel shows the "Run checks" call to
+ * action next to it instead of a date in 1970. The action link is present on every row,
+ * including passing ones, because a row whose action is empty renders a dead button.
+ */
+export type SecurityCheck = {
+  key: string;
+  label: string;
+  state: SecurityCheckState;
+  detail: Record<string, unknown>;
+  checked_at: string | null;
+  action_href: string;
+  action_label: string;
+};
+
+/** The posture overview's answer. */
+export type SecurityOverview = {
+  checks: SecurityCheck[];
+  /** 0-100. An `unknown` check counts as a question, never as a clearance. */
+  score: number;
+  /** How many checks are in each state, all four keys always present. */
+  summary: Record<SecurityCheckState, number>;
+  open_findings: SecuritySeverityCount[];
+  last_run_at: string | null;
+  registry: string[];
+};
+
+/** One bucket of the score ring's legend. */
+export type SecuritySeverityCount = {
+  severity: SecuritySeverity;
+  count: number;
+};
+
+/**
+ * A finding.
+ *
+ * `ignore_lapsed` is read rather than stored: an ignore with a date in the past is not an
+ * ignore, the row is not rewritten (a job that did not fire would hide a finding), and the
+ * panel greys the row and offers "reopen" instead of pretending the ignore still holds.
+ */
+export type SecurityFinding = {
+  id: string;
+  source: SecurityFindingSource;
+  severity: SecuritySeverity;
+  title: string;
+  description: string;
+  component: string | null;
+  component_version: string | null;
+  fixed_in: string | null;
+  status: SecurityFindingStatus;
+  ignore_reason: string | null;
+  ignored_until: string | null;
+  ignore_lapsed: boolean;
+  note: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  is_open: boolean;
+};
+
+/** The findings screen's filters, echoed back so the UI can show what it is looking at. */
+export type SecurityFindingFilter = {
+  severity?: SecuritySeverity | "";
+  status?: SecurityFindingStatus | "";
+  source?: SecurityFindingSource | "";
+  component?: string;
+  search?: string;
+};
+
+/** One page of findings. `total` is the filter's whole count, not this page's length. */
+export type SecurityFindingPage = {
+  findings: SecurityFinding[];
+  total: number;
+  offset: number;
+  filter: {
+    severity: string | null;
+    status: string | null;
+    source: string | null;
+    component: string | null;
+    search: string | null;
+    limit: number;
+  };
+};
+
+/** What a bulk status change did — reported per row, never silently. */
+export type SecurityBulkResult = {
+  updated: string[];
+  /** Ids that matched nothing: stale selections, not failures. */
+  missing: string[];
+};
+
+/** What an ingest did: what is new, what was already known, what was refused. */
+export type SecurityImportReport = {
+  created: number;
+  refreshed: number;
+  rejected: string[];
+};
