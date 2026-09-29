@@ -25,6 +25,8 @@ pub mod cron;
 pub mod definition;
 pub mod engine;
 pub mod error;
+pub mod graph;
+pub mod graph_store;
 pub mod handler;
 pub mod model;
 pub mod node_package;
@@ -38,6 +40,11 @@ pub mod store;
 pub use definition::{StepDefinition, Trigger, WorkflowDefinition};
 pub use engine::{RunnerConfig, SweepReport, TickReport};
 pub use error::{Result, WorkflowError};
+pub use graph::{
+    Compiled, Connection, Graph, GraphNode, Issue, Position, StickyNote, compile,
+    compile_or_refuse, validate,
+};
+pub use graph_store::{SaveOutcome, StoredGraph};
 pub use handler::{ActionContext, ActionFuture, ActionHandler, NoActionHandler};
 pub use model::{
     ExecutionStatus, NewWorkflow, StepKind, StepStatus, TriggerKind, Workflow, WorkflowExecution,

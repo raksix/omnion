@@ -104,7 +104,38 @@ impl WorkflowError {
             Self::CredentialScopeDenied { .. } => "credential_scope_denied",
         }
     }
+
+    /// The human-readable explanation of an [`WorkflowError::Invalid`].
+    ///
+    /// A *method*, not a field, for the same reason `code()` is one: the enum has nine variants
+    /// and only one of them carries a message, so a caller that wants the sentence would have to
+    /// pattern-match a type that is mostly a database error. One accessor keeps that knowledge in
+    /// `error.rs` — the graph's issue list puts the engine's own wording on the canvas, and reads
+    /// it here without depending on `Display`'s shape.
+    ///
+    /// A store or audit failure has no sentence of its own and answers with
+    /// [`STORE_FAILURE_MESSAGE`]; a caller that needs to tell the two apart asks
+    /// [`WorkflowError::invalid_message`].
+    #[must_use]
+    pub fn message(&self) -> &str {
+        self.invalid_message().unwrap_or(STORE_FAILURE_MESSAGE)
+    }
+
+    /// The message of an [`WorkflowError::Invalid`], or `None` for a store or audit failure.
+    ///
+    /// The version to reach for when the caller *branches* on whether there is a message to
+    /// show, rather than always having a string to print.
+    #[must_use]
+    pub fn invalid_message(&self) -> Option<&str> {
+        match self {
+            Self::Invalid { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
+
+/// What [`WorkflowError::message`] returns for a variant that carries no sentence of its own.
+const STORE_FAILURE_MESSAGE: &str = "the workflow store refused the operation";
 
 /// Result alias of the crate.
 pub type Result<T> = std::result::Result<T, WorkflowError>;
