@@ -4600,3 +4600,49 @@ sibling passes for three consecutive ticks. **Next tick:** build the `/security/
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
 
+
+## 2026-09-29 — omnion-w8 tick 13 · the pass could be narrowed, and the hand-over that was
+missing
+
+**What.** Two things, and the first is the one the four previous ticks needed. A full pass walks
+61 routes and then runs fourteen depth passes — about seventy-five minutes on a box nine writers
+share, before the *last* pass begins. The slowness is the small problem. The expensive one is
+that a run can be cut off, and everything after the cut is never reported, so the passes with the
+hardest-to-reproduce assertions are exactly the ones that never execute — and a REQ cannot close
+on evidence that was never gathered. `QA_ROUTES=<substring>` now narrows the walk to the routes
+and depth passes whose name or path contains it, honoured by both runners (the route loop and
+each of the two depth-pass helpers), so no call site changed and a filtered pass is a full pass
+minus what it skipped.
+
+A narrow pass must never read as a whole one, or the document that decides whether a REQ may close
+stops being able to decide. So the filter is first-class: every skipped route and pass is recorded
+in `summary.json` under `coverage` by name, `counts` gains `pagesWalked`, and QA-LATEST.md opens
+with "PARTIAL — filtered pass" and states what was *not measured*. Silence reads as a pass. Proven
+against three synthetic summaries rather than a live browser: a full pass and a filtered one
+produce visibly different documents, and a summary from before the field existed still renders as
+a full pass.
+
+**Then the product.** `POST /crm/leads/{id}/assign` is in this REQ's API table and under
+`crm.leads.assign` in its permission family, and neither existed — four ticks of walkthrough have
+clicked an inbox with no way to hand a lead over. The store is one transaction (read `for update`,
+write, trail line, commit) because the panel's timeline is the only record of who had a lead: a
+commit that moved a lead and then failed to write its line leaves a screen asserting an owner and
+a history that says it was never touched, and no later read detects the gap because both halves
+look valid alone. `crm.leads.assign` is its own power rather than a wing of `manage` — manage is
+what the lead *says*, assign is who is answerable for it — and it is seeded to the moderator,
+where `convert` is not.
+
+**Proof.** `scripts/qa/run-crm-assign.sh` **5/5** on a real database · `cargo test -p omnion-permissions
+--lib` 62 passed · `cargo test -p omnion-module-crm-intake --lib` 137 passed · `pnpm typecheck` 2/2 ·
+`cargo build -p omnion-api` green.
+
+**Not proved, and not claimed.** The browser pass has still not reached the CRM screens. The
+harness can now be asked for them with `QA_ROUTES=crm`, and the pass is running — but it has
+waited on the QA slot for this entire tick behind another writer's pass, so nothing about the
+screens is established. The assign *store* is gated at the database; its *screen* is not yet
+walked, and the REQ stays in-progress for that reason and not for any other.
+
+**Next.** Re-run `QA_ROUTES=crm` and let it reach `/crm/leads` and the detail, then extend
+`runCrmIntakeDepth` to open the hand-over panel and press it: the walkthrough should assert that
+`Save owner` is disabled with an empty reason, that the save writes a `reassigned` line the
+timeline renders, and that the queue round trip is visible on screen.
