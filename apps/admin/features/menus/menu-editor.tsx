@@ -193,16 +193,22 @@ export function MenuEditor({ menuId }: { menuId: string }) {
 
   const addItem = useCallback(
     (parentId: string | null) => {
-      setItems((current) => {
-        const siblings = (current ?? []).filter((item) => item.parent_id === parentId);
-        const item = newItem(parentId, siblings.length);
-        return [...(current ?? []), item];
-      });
+      const siblings = (items ?? []).filter((item) => item.parent_id === parentId);
+      const item = newItem(parentId, siblings.length);
+      setItems([...(items ?? []), item]);
       if (parentId) setExpanded((current) => new Set([...current, parentId]));
       setDirty(true);
-      setSelected(parentId ?? null);
+      // The new row is selected, not its parent. Selecting the parent looks equivalent and is
+      // not: "Add item" at the top level left the selection on `null`, so the settings panel
+      // never opened and the editor looked like a tree you could not configure — the button
+      // worked, the row appeared, and the thing you came to fill in was nowhere.
+      setSelected(item.id);
     },
-    [],
+    // `items` is in the list because the row is built from it. Building it inside a `setItems`
+    // updater and reading it back out is the version that type-checks and intermittently
+    // selects nothing: React may defer or re-invoke the updater, and the local capture is not
+    // guaranteed to have run by the time the next line reads it.
+    [items],
   );
 
   const removeItem = useCallback(
