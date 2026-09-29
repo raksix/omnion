@@ -5523,3 +5523,57 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
+
+## 2026-09-29 · Wave 5 · tick 29 — REQ-017 slice 2's screens, and the merge that was the tick's real work
+
+**What.** The three screens slice 2 owed, behind an API that already existed: `/environments`
+(list), the four-step create wizard, and `/environments/{id}` (detail, re-clone, job history,
+archive). Plus the nav entry, tones for `cloning`/`error`/`cancelled` that had none, and
+`runEnvironmentsDepth` in the walkthrough — which drives them rather than only visiting them.
+
+**Proof.**
+- `pnpm typecheck` — 2/2 (twice: before and after the merge).
+- `cargo test -p omnion-api --test environments` — **isolated walks green**: `the_permission_split_is_real`
+  and `a_reclone_refuses_until_the_operator_confirms_what_is_discarded` each pass on their own.
+  The full 25-walk run did **not** complete inside its timeout under the current box load
+  (load average 206, seven writers), so the suite is **not** claimed green this tick.
+- `node --check scripts/qa/walkthrough.cjs` — syntax OK.
+
+**Four defects, three of them in code this branch shipped earlier.**
+
+1. **The suite was eating its own acceptance gate.** It connected to whatever
+   `OMNION_DATABASE_URL` named and dropped 54 accounts into the shared QA database. The
+   walkthrough seeds its owner at boot and `bootstrap_first_admin` only runs while `users` is
+   empty, so tick 28's `could not sign in after wizard` was the harness deleting the account its
+   own gate signs in with — not a product failure, and invisible from inside the suite. Each run
+   now creates and migrates its own database (`ac0ef60`).
+2. **`origin/main` survived the merge in two files.** Git wrote *2-way* markers, so the tail line
+   was a bare ` origin/main` with no `>`; `git status` was clean, the conflict list was empty, and
+   a grep for the `>>>>>>>` fence finds nothing. `rustc` named both (`165884e`, `fe0372e`). The
+   sweep that actually catches it matches the fence as *optional*:
+   `^\s*(<{7}|>{7}|\|{7}|={7})?\s*(HEAD|origin/...)`.
+3. **The tick-23 file-level loss happened again, in the same place.** Git's conflict list was
+   clean while 7 client functions and 13 types of main's were absent from `lib/api.ts` and
+   `lib/types.ts`, and the panel did not compile. A file main *added* inside a region git
+   considers merged never lands and no marker points at it. The compiler named it; the merge diff
+   would not have.
+4. **Naive conflict concatenation produced two `.nest("/api/v1", v1)` calls** — the second wins
+   silently and would have dropped the module guard with no error anywhere.
+
+**And one interaction with a feature that landed on main while this tick ran.** The rate limiter
+caps `sign_in` at 10 per 300 seconds, the counter is in Redis, and Redis is shared by every
+writer's suite on this box. This suite creates a distinct account per walk, so 25 walks cannot
+fit in that budget — and the failures arrived as `login body: … rate_limited` on tests whose
+subject is *cloning*, which is a lie about where the problem is. `ensure_installed` documents this
+exact case: harnesses that build a router without a `main.rs` fall back to the shipped defaults.
+The suite now installs its own policy, raising `sign_in` rather than disabling it, so the layer
+stays real and only the *production* number stops being the measure (`3a300f6`, `a441824`).
+
+The scratch databases the harness creates are also reclaimed at the start of the next run: a
+`Drop` guard cannot work here (the value lives in a `OnceCell` and the process exits first), and
+two were already sitting on the server from runs killed by their timeout.
+
+**Next.** Run the scoped QA pass (`QA_STACK=w5 QA_API_PORT=18084 QA_ADMIN_PORT=3104
+QA_WEB_PORT=3204 bash scripts/qa/run.sh`) and close the browser half of the slice — the depth
+pass needs a box it can have to itself. Then REQ-017 slice 3: the changes diff and the
+environment chip and banner.

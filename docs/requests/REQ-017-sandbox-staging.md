@@ -1,6 +1,6 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** in-progress (slice 2 of 4, `71a32ca`) · **Captured:** 2026-09-25 · **Layer:** platform
+> **Status:** in-progress (slice 2 of 4 — API, list screen, create wizard and detail screen shipped in `39aa999…165884e`; the browser gate is still owed) · **Captured:** 2026-09-25 · **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -155,7 +155,9 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 - [ ] `promotion.*` events arrive at an endpoint subscribed to `promotion.*` within the delivery window.
 - [ ] The environment chip appears in the panel header while staging is active, the staging banner cannot be dismissed, and staging hosts answer with `X-Robots-Tag: noindex`.
 - [ ] All new routes answer `403` without their permission and `404` for another organization's environment.
-- [ ] Archive releases the staging host and leaves the content readable in the archived state.
+- [x] Archive releases the staging host and leaves the content readable in the archived state.
+  *(integration walk `archiving_releases_the_host_and_keeps_the_content`; the browser half is
+  still owed by the depth pass below)*
 - [ ] The QA walkthrough visits `/environments`, `/environments/new` and `/environments/[id]` with zero high findings.
 
 ### QA plan
