@@ -730,9 +730,15 @@ pub async fn list_schedules(
 // ---------------------------------------------------------------------------------------------
 
 /// `GET /api/v1/backup-settings` — the settings record.
+///
+/// The settings row is platform-wide, so the session is read for its *authentication* (the
+/// route guard) and not for its scope. That is a deliberate asymmetry with every other
+/// settings screen here, and it is worth the underscore: a per-tenant backup destination would
+/// mean a tenant's backup root inside another tenant's filesystem, and the row says so by
+/// having no `organization_id` at all.
 pub async fn read_settings(
     state: State<AppState>,
-    current: CurrentSession,
+    _current: CurrentSession,
 ) -> std::result::Result<Json<SettingsBody>, ApiError> {
     let row = omnion_backup::load_settings(state.db().pool()).await?;
     Ok(Json(SettingsBody {
