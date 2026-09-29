@@ -3720,10 +3720,50 @@ the fixed path, and nothing copied between them. `run.sh` now copies the binary 
 `CARGO_TARGET_DIR` differs from `target/`, which also covers the case where the disk guard dropped
 `target/` between the build and the pm2 start.
 
+**Two more, and both are the same lesson.** A pass runs for about two and a half hours before it
+reaches a new screen's depth pass, so "the editor did not load" is a two-hour-old fact by the time
+anyone reads it — and it is what *four* different failures look like from the outside.
+
+- **The editor never painted.** React reported `Rendered more hooks than during the previous
+  render`: the `actionsFor` `useCallback` sat *below* the component's early returns, so the
+  skeleton render ran three hooks and the loaded render ran four. Legal JavaScript, a hard crash,
+  and the panel's own log had it verbatim while the depth pass reported a bare `editorReady:
+  false`. The hook is above the returns now.
+- **"Add item" created a row nobody could configure.** The new row was not selected, so its
+  settings panel never opened. The row *is* in the tree, so any check that counts rows calls
+  this working; the probe asserts the inspector and catches it in four seconds.
+
+`scripts/qa/probe-menu-editor.cjs` is the answer to both, and to the next one: sign in, create a
+menu, open it, and report the ready/error/loading marker, the item count, the inspector and the
+console — one screen, seconds, not a two-hour run. A depth pass is the right place to prove
+behaviour; it is the wrong place to *diagnose*.
+
 **Proof.** `pnpm typecheck` -> 2 successful, 0 errors. `cargo test -p omnion-content --lib` ->
 **118 passed** (the migration-consistency test reads the renumbered file). `cargo test -p
-omnion-api --lib` -> **191 passed**. `bash scripts/qa/run.sh` under `QA_STACK=w2` ->
-see the report entry below.
+omnion-api --lib` -> **191 passed**. The full `bash scripts/qa/run.sh` under `QA_STACK=w2` reached
+`/menus` and `/publishing/queue` in the route sweep and clicked both; its depth pass then found
+the hooks defect above, which the probe reproduced and the fix resolved
+(`editor: {ready: 1, treeEmpty: 1}` -> `after-add: {treeRows: 1, inspector: 1}`). **Slice 1 stays
+`in-progress` until a clean pass runs end to end** — the run that would prove it is the one
+launched next tick.
 
 **Next.** Close slice 1 on the browser pass, then REQ-062 (`themes`) and the rest of the wave-2
 queue: REQ-019, REQ-018, REQ-020, REQ-031, REQ-029, REQ-026, then wave 2b (REQ-109..116, 082, 084).
+
+## 2026-09-29 · wave2 (#14, addendum) · the probe, and why a depth pass is the wrong place to diagnose
+
+**What.** `scripts/qa/probe-menu-editor.cjs`: sign in, create a menu, open it, and report the
+screen's own markers plus the console. One screen, about forty seconds.
+
+**Why it exists, in numbers.** The full pass takes ~2.5 hours, and a new screen's depth pass runs
+at the very end of it. The tick that found the hooks defect spent two hours of walking to learn
+one boolean, and that boolean (`editorReady: false`) was identical for a React crash, a 404, a
+refused permission and a client-side exception. Two of the three defects found this tick —
+the hooks violation and the unselectable new row — were invisible to the pass and obvious to the
+probe, which is the whole argument: **a depth pass is the right place to prove behaviour and the
+wrong place to diagnose.** Keep both, and know which one you are running.
+
+**The general rule this tick paid for twice.** Two of the three defects were of the shape "the
+thing under test asserts the wrong thing": a boolean for "the screen loaded" where the panel's log
+held the exact React error, and a row count where the claim was "you can configure what you just
+created". Both are cheap to avoid and cost a 2.5-hour run each to discover.
