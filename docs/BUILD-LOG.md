@@ -3015,3 +3015,55 @@ and the new `escapeWithNoRowUnderCursor` to be true, `eToggledRead` / `shiftEMar
 `report.notificationOutbox` to be **present** — that last one is the first pass that can close
 slice 3. If `/media/settings` 422s survive a fresh binary, they are REQ-010's and this tick's
 after that.
+
+## 2026-09-29 — REQ-117 slice 2, server half · who gets the lead, and how long they have
+
+build assignment: the ordered rule chain with an atomic round-robin claim, SLA policies with
+business hours, the breach sweep, and the HTTP surface for both
+
+Slice 2's server half. The claim is a transaction — `select … for update` reads the rule,
+evaluates it and writes the cursor under the lock — and that is the whole design: a
+read-then-write is correct for one app instance and silently wrong for two, because both
+callers read cursor n before either writes n+1. The update is additionally guarded on the
+cursor it read, so a concurrent move is refused rather than overwritten.
+
+`ensure_defaults` is called from the READ path, not only the migration. A migration seeds the
+organizations that exist when it runs, which is correct for the day it runs and incomplete
+forever after: every organization created later would evaluate its first lead against an
+empty chain and land unassigned with no deadline — indistinguishable in the panel from an
+operator who turned everything off on purpose. A test reads the migration and pins the two
+seed names, because the seed exists in two places and two spellings of one string is how an
+organization ends up with two default policies.
+
+Four defects the gate found, every one of which had a symptom pointing elsewhere:
+
+* `create_rule` used max(position)+1 and the seeded catch-all sits at 1000, so every
+  operator-created rule landed BELOW the rule that matches everything — saved, listed, and
+  never fired. Creation now goes through `reorder_rules`, so a create and a drag share one
+  definition of "second from the top".
+* A `user` rule whose person was deleted evaluated to a match with no owner. It is now a
+  skip, like an emptied pool: a chain must never silently hand a lead to nobody.
+* `crm_sla_policies` had no `(organization_id, name)` unique constraint, so the seed's
+  `on conflict do nothing` failed 42P10 for EVERY organization on its first read. The
+  constraint the code depends on was declared in no file.
+* The gate compared a stored deadline against the process clock while the rows were stamped
+  by the database clock. That produced a deadline in the future, which is correctly "not
+  overdue", which read as a product bug five times in a row. Every instant in the gate is
+  now the database's.
+
+Also: migration 0051 renamed to 0055 — main took 0051 for `notification_routes` while this
+branch was idle, and two files with one version number makes sqlx refuse the whole suite
+with `VersionMismatch(51)`.
+
+proof `scripts/qa/run-crm-assignment.sh` PASS: 14 tests, 14/14, including ten concurrent
+claims across a three-person pool with no member served twice and the cursor at exactly 20 % 3
+· `cargo test -p omnion-module-crm-intake` 103 passed (65 in slice 1) · `cargo test -p
+omnion-permissions` 194, `omnion-api` 62 · `cargo clippy --all-targets` 0 warnings ·
+`scripts/qa/run-crm-intake.sh` PASS (slice 1 unaffected) · `pnpm typecheck` 2/2.
+
+next slice 2's admin half: `/crm/settings/assignment` and `/crm/settings/sla`, both already
+linked from the intake screen's footer, then add both to `scripts/qa/walkthrough.cjs`.
+
+open the browser gate (`bash scripts/qa/run.sh`) has been queued for a QA slot for the whole
+tick — six other writers are waiting on the same single slot — so slice 1's four screens
+still have no browser pass. That is the one open item on them.
