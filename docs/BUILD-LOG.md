@@ -6484,3 +6484,47 @@ ten results — the fixture bugs are fixed and the queue should have cleared ove
 `/inventory/reports` needs its QA pass, which is the last thing slice 4b owes. After that:
 the ⌘K entries, the empty/loading/error sweep, and the 390×844 pass — the three boxes still
 open on this REQ.
+
+---
+
+## tick 33 — REQ-051: the merge, and the two passes that were never running (`a511bfa`, `46681cf`)
+
+**What.** main moved 13 commits and the merge hit four conflicts, all of them the same shape: two
+waves wanting the same slot for two different features. main added the rate limiter
+(`rate_limit_middleware`, `ApiError.retryAfterSeconds`); wave4 added the request id
+(`apps/api/src/request_id.rs`, `ApiError.requestId`). Both are shipped and tested on their own
+branch, so the resolution keeps both and decides only the **order** of the two router layers: the
+limiter stays outermost — a request it refuses never reaches a handler — and the request-id stamp
+sits directly beneath it so that a limiter refusal is still correlatable. `ApiError`'s constructor
+is now six positional arguments, which is the real hazard: a call site passing one of them compiles
+happily and attaches the wrong property, so the call site was read rather than trusted.
+
+**The find.** `runCrmStateSweep` and `runCrmKeyboardAndMobile` — the two passes that prove REQ-051's
+last two acceptance boxes — were awaited **bare**, while every other depth pass in the file runs
+through `runDepthPass`, which catches and reports. A crash upstream ends the walkthrough, so those
+two never ran and said nothing. That is the mechanism behind the boxes staying unticked through
+three earlier passes that each looked complete. Both are guarded now, and the state sweep joins them
+because it leaves the network stubbed.
+
+**Proof.**
+- `cargo build -p omnion-api` — clean, 0 errors (the merge resolution compiled, not just read).
+- `pnpm turbo run typecheck --force` — **2/2** (the merged six-argument `ApiError`).
+- `cargo test -p omnion-module-crm --lib` — **172 passed, 0 failed**.
+- `cargo test -p omnion-api --lib routes::crm` — **27 passed, 0 failed**.
+- `node --check scripts/qa/walkthrough.cjs` — syntax OK.
+
+**Not proven, and not ticked.** The QA pass did not land, in four attempts, none of them a code
+fault: a pass I killed by renaming its target directory mid-build (`os error 2` on an `.rmeta`,
+which reads like a compile error); `/dev/shm` at 100% across nine writers' targets with
+`/mnt/apopic` at 97%, so a cold build could not finish; a two-and-a-half-hour run in which the
+harness was logged out by the time it reached IAM (`iam roles depth: url=.../login`) and every later
+selector timed out — the session died under load 165–298, the documented 'tab died under parallel
+writers' condition; and a wrong `CARGO_TARGET_DIR`, where cargo succeeded and the pass died with
+`Script not found: target/debug/omnion-api` because `run.sh` resolves the binary through
+`cargo metadata`, which reports the default target. The boxes stay unticked: unticked means
+unproven, and this REQ does not close on code I have not watched run.
+
+**Next.** `walkthrough.cjs --only crm` against the running stack — minutes instead of the two and a
+half hours the full pass took on a loaded box. That proves the keyboard and mobile boxes, REQ-051
+closes, and the queue moves to REQ-052 (sales, slices 6/6b) and REQ-053 (inventory, slice 4b — it
+owes the same reports pass and the palette entries).
