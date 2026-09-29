@@ -119,6 +119,7 @@ pub mod public;
 pub mod readyz;
 pub mod sales;
 pub mod sales_approvals;
+pub mod sales_orders;
 pub mod sales_quotes;
 pub mod scim;
 pub mod search;
@@ -1199,6 +1200,27 @@ pub fn router(state: AppState) -> Router {
     // may not send may not clear the gate that lets it be sent. Raising a request is on the send
     // key too, because asking for a discount and granting one are the same conversation and a
     // seller with `.update` but not `.send` is exactly the person who needs this.
+    // The order chain (docs/requests/REQ-052, slice 4). Reading a delivery is `sales.orders.read`
+    // and writing a hand-made draft is `sales.orders.create`; **confirming, cancelling and
+    // raising an invoice draft are all `sales.orders.confirm`**, because each of them commits the
+    // organization: stock is held, stock is given back, or a document goes to accounting. A role
+    // that may look at the deliveries may not promise one.
+    let sales_orders_read = Router::new()
+        .route("/sales/orders", get(sales_orders::list_orders))
+        .route("/sales/orders/{id}", get(sales_orders::get_order))
+        .route_layer(guards::require(&state, "sales.orders.read"));
+    let sales_orders_create = Router::new()
+        .route("/sales/orders", post(sales_orders::create_order))
+        .route_layer(guards::require(&state, "sales.orders.create"));
+    let sales_orders_confirm = Router::new()
+        .route("/sales/orders/{id}/confirm", post(sales_orders::confirm_order))
+        .route("/sales/orders/{id}/cancel", post(sales_orders::cancel_order))
+        .route(
+            "/sales/orders/{id}/invoice-draft",
+            post(sales_orders::raise_invoice_draft),
+        )
+        .route_layer(guards::require(&state, "sales.orders.confirm"));
+
     let sales_approvals_read = Router::new()
         .route("/sales/approvals", get(sales_approvals::list_approvals))
         .route("/sales/approvals/{id}", get(sales_approvals::get_approval))
@@ -1242,6 +1264,9 @@ pub fn router(state: AppState) -> Router {
 
     let sales = sales_products_read
         .merge(sales_approvals_read)
+        .merge(sales_orders_read)
+        .merge(sales_orders_create)
+        .merge(sales_orders_confirm)
         .merge(sales_approvals_ask)
         .merge(sales_approvals_send)
         .merge(sales_products_manage)
