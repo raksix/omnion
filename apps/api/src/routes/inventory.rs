@@ -1,0 +1,1348 @@
+//! `/api/v1/inventory` — items, warehouses, locations, stock and the ledger
+//! (docs/requests/REQ-053, slice 1).
+//!
+//! The shape every module on this platform follows, written once by REQ-051 and followed here
+//! rather than reinvented:
+//!
+//! * the caller's organization is resolved by the CRM's rule, so a screen opened on `/inventory/*`
+//!   with no query string shows **its** records rather than a prompt to pick a tenant;
+//! * a record of another organization is a `404`, never a `403` — a `403` would confirm it
+//!   exists, and one organization's stock is the one thing this module exists to keep apart;
+//! * every mutation writes an audit row with the actor, the target and the before/after, and
+//!   emits the documented `inventory.*` events.
+//!
+//! Two rules are particular to this module and live here rather than in the screens:
+//!
+//! * **`inventory.negative.manage` is asked here and passed down as a boolean.** The negative
+//!   stock rule is a service rule — the schema cannot know who is calling — and the HTTP layer is
+//!   the only place that can answer it, so [`NewMovement::may_go_negative`] is filled from the
+//!   caller's keys on every write rather than assumed.
+//! * **The ledger has no `PATCH` and no `DELETE` route.** Not a route that refuses: no route. The
+//!   acceptance criterion asks for a `405`, and axum answers that for a path it does not
+//!   implement — which is the only answer that cannot be changed by a later handler.
+
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use omnion_audit::NewAuditEntry;
+use omnion_events::{NewEvent, bus};
+use omnion_module_inventory::ledger::{self, Movement, MovementQuery, NewMovement, Recorded};
+use omnion_module_inventory::store::{
+    self, ItemPatch, ItemQuery, ItemView, LocationPatch, LocationView, NewItem, NewLocation,
+    NewWarehouse, Overview, Page, SettingsPatch, StockLevel, StockPosition, StockQuery,
+    WarehousePatch, WarehouseView,
+};
+use omnion_module_inventory::{InventoryError, money::Quantity};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::auth::CurrentSession;
+use crate::client_ip::ClientAddress;
+use crate::error::ApiError;
+use crate::routes::crm::organization_of;
+use crate::routes::iam::record;
+use crate::state::AppState;
+
+// ---------------------------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------------------------
+
+/// The `?organization_id=` every list and detail accepts, for platform accounts.
+#[derive(Debug, Default, Deserialize)]
+pub struct OrganizationParam {
+    /// Which organization to act on; a tenant account may not name another.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// The item list's query string.
+#[derive(Debug, Default, Deserialize)]
+pub struct ItemListParams {
+    /// Free text over SKU, name and barcode.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// One category.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// `true` for live only, `false` for inactive only.
+    #[serde(default)]
+    pub active: Option<bool>,
+    /// Include archived items.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+    /// `true` for items that mirror a catalog product.
+    #[serde(default)]
+    pub linked_to_catalog: Option<bool>,
+    /// Sort key.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// `asc` or `desc`.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// Page size.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The previous page's cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+impl From<ItemListParams> for ItemQuery {
+    fn from(params: ItemListParams) -> Self {
+        Self {
+            search: params.search,
+            category: params.category,
+            active: params.active,
+            include_archived: params.include_archived,
+            linked_to_catalog: params.linked_to_catalog,
+            sort: params.sort,
+            direction: params.direction,
+            limit: params.limit,
+            cursor: params.cursor,
+        }
+    }
+}
+
+/// The stock list's query string.
+#[derive(Debug, Default, Deserialize)]
+pub struct StockListParams {
+    /// Free text over SKU and name.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// One warehouse.
+    #[serde(default)]
+    pub warehouse_id: Option<Uuid>,
+    /// One location.
+    #[serde(default)]
+    pub location_id: Option<Uuid>,
+    /// One item.
+    #[serde(default)]
+    pub item_id: Option<Uuid>,
+    /// One category.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// `ok` / `low` / `critical` / `negative` / `below_threshold`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Rows with no movement for this many days.
+    #[serde(default)]
+    pub idle_days: Option<i32>,
+    /// Page size.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The previous page's cursor.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+impl From<StockListParams> for StockQuery {
+    fn from(params: StockListParams) -> Self {
+        Self {
+            search: params.search,
+            warehouse_id: params.warehouse_id,
+            location_id: params.location_id,
+            item_id: params.item_id,
+            category: params.category,
+            status: params.status,
+            idle_days: params.idle_days,
+            limit: params.limit,
+            cursor: params.cursor,
+        }
+    }
+}
+
+/// The ledger's query string.
+#[derive(Debug, Default, Deserialize)]
+pub struct MovementListParams {
+    /// Free text over SKU, name and note.
+    #[serde(default)]
+    pub search: Option<String>,
+    /// One item.
+    #[serde(default)]
+    pub item_id: Option<Uuid>,
+    /// One location.
+    #[serde(default)]
+    pub location_id: Option<Uuid>,
+    /// One or more kinds, repeated or comma-separated.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// One reason.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Who recorded it.
+    #[serde(default)]
+    pub actor_user_id: Option<Uuid>,
+    /// A document reference — a kind (`order`), a uuid, or a number typed off a document.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// The window's start, RFC 3339.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// The window's end, RFC 3339.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Page size.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The previous page's cursor (a movement id).
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+impl MovementListParams {
+    /// The kinds, split on commas so `?kind=receipt,issue` works as well as a repeated param.
+    fn kinds(&self) -> Vec<String> {
+        self.kind
+            .as_deref()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|piece| !piece.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The module's query, with the cursor parsed as the ledger's `bigint` id.
+    fn into_query(self) -> Result<MovementQuery, InventoryError> {
+        let cursor = self
+            .cursor
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|_| {
+                InventoryError::invalid("movement", "cursor", "the cursor is a movement id")
+            })?;
+        // `kinds()` is read **before** the fields are moved, because `self.kinds()` borrows
+        // `self.kind` and moving `self.search` first would make that borrow a move-after-partial.
+        let kinds = self.kinds();
+        Ok(MovementQuery {
+            search: self.search,
+            item_id: self.item_id,
+            location_id: self.location_id,
+            kinds,
+            reason: self.reason,
+            actor_user_id: self.actor_user_id,
+            source: self.source,
+            from: self.from,
+            to: self.to,
+            limit: self.limit,
+            cursor,
+        })
+    }
+}
+
+/// The barcode/sku lookup the scanner box calls.
+#[derive(Debug, Deserialize)]
+pub struct LookupParams {
+    /// The scanned code, separators and all.
+    pub code: String,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// The item detail's history length.
+#[derive(Debug, Deserialize)]
+pub struct HistoryParams {
+    /// How many movements; the module clamps it to 500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// The body of a movement the caller posts.
+///
+/// **The kind and the permission are the caller's business, not the form's**: `kind` is optional
+/// and the module infers it from the reason, and `mode` is a drawer concept that the module
+/// resolves into either a delta or an absolute count before the arithmetic happens.
+#[derive(Debug, Deserialize)]
+pub struct RecordMovementBody {
+    /// The item that moves.
+    pub item_id: Uuid,
+    /// The location it moves at.
+    pub location_id: Uuid,
+    /// What it does, when the caller knows and does not want it inferred.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The quantity, as text: a delta, or — with `mode: "counted"` — the counted total.
+    pub quantity: String,
+    /// `delta` (the default) or `counted`.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Why it happened.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// A note.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// What caused it (`order`, `transfer`, `stocktake`, `manual`).
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    /// That document's id.
+    #[serde(default)]
+    pub source_id: Option<Uuid>,
+    /// Organization to act on.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+impl RecordMovementBody {
+    /// Turn the drawer's two modes into the module's one.
+    ///
+    /// **`counted` is turned into a delta here, not in the module**, and the reason is that the
+    /// current on-hand is a property of the database, not of the request: a client that sent an
+    /// absolute count would be asking the server to trust the number it is about to check the
+    /// server's number against. Reading the row first is also what lets the refusal name the
+    /// quantity that is actually available.
+    async fn into_movement(
+        self,
+        pool: &sqlx::PgPool,
+        organization_id: Uuid,
+        may_go_negative: bool,
+    ) -> Result<NewMovement, InventoryError> {
+        let mode = self.mode.as_deref().unwrap_or("delta");
+        let quantity = match mode {
+            "delta" => self.quantity,
+            "counted" => {
+                let current = ledger::stock_level(pool, organization_id, self.item_id, self.location_id)
+                    .await?;
+                let counted = store::parse_quantity("movement", "quantity", &self.quantity)?;
+                let delta = counted
+                    .checked_sub(current.on_hand)
+                    .ok_or_else(|| {
+                        InventoryError::invalid("movement", "quantity", "that number is too large")
+                    })?;
+                if delta.is_zero() {
+                    return Err(InventoryError::invalid(
+                        "movement",
+                        "quantity",
+                        format!(
+                            "the count is already {} — there is nothing to adjust",
+                            current.on_hand
+                        ),
+                    ));
+                }
+                delta.to_text()
+            }
+            other => {
+                return Err(InventoryError::invalid(
+                    "movement",
+                    "mode",
+                    format!("{other} is not a mode — use `delta` or `counted`"),
+                ));
+            }
+        };
+        Ok(NewMovement {
+            item_id: self.item_id,
+            location_id: self.location_id,
+            kind: self.kind,
+            quantity,
+            reason: self.reason,
+            note: self.note,
+            source_kind: self.source_kind,
+            source_id: self.source_id,
+            may_go_negative,
+        })
+    }
+}
+
+/// The body of the "what would this do?" preview the drawer calls before it commits.
+#[derive(Debug, Deserialize)]
+pub struct PreviewBody {
+    /// The item.
+    pub item_id: Uuid,
+    /// The location.
+    pub location_id: Uuid,
+    /// The quantity, as text.
+    pub quantity: String,
+    /// The mode, as in [`RecordMovementBody`].
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// The reason, which decides the direction when no kind is named.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The kind, when the caller names one.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Organization to read.
+    #[serde(default)]
+    pub organization_id: Option<Uuid>,
+}
+
+/// What the preview answers.
+#[derive(Debug, serde::Serialize)]
+pub struct Preview {
+    /// The quantity before.
+    pub on_hand_before: String,
+    /// The quantity the row would hold.
+    pub on_hand_after: String,
+    /// How much of it is held for orders, before and after.
+    pub reserved_before: String,
+    /// The reserved total after.
+    pub reserved_after: String,
+    /// What a person may draw after.
+    pub available_after: String,
+    /// The kind the module inferred, so the drawer can print it.
+    pub kind: String,
+    /// The reason that was applied.
+    pub reason: String,
+    /// The badge the row would wear.
+    pub status: String,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit and events
+// ---------------------------------------------------------------------------------------------
+
+/// Record an event without letting a webhook problem fail the caller's request.
+///
+/// A stock movement that happened but whose event was lost is a stock movement that a REQ-003
+/// automation never saw; refusing the *request* would be far worse, because the ledger row would
+/// roll back with it and the person would retry a movement that had in fact not happened.
+async fn emit(state: &AppState, event: NewEvent) {
+    if let Err(error) = bus::emit(state.db().pool(), event).await {
+        tracing::warn!(error = %error, "the inventory event could not be recorded");
+    }
+}
+
+/// Which item fields a write actually changed.
+///
+/// Typed rather than "serialise both rows and diff the JSON": a diff over two serialised views
+/// would also report the `updated_at` this same write moved, and an audit row that says a row
+/// changed when nothing the person can see did is an audit row nobody trusts.
+fn item_changes(before: &ItemView, after: &ItemView) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    let (before_item, after_item) = (&before.item, &after.item);
+    if before_item.name != after_item.name {
+        changed.push("name".to_owned());
+    }
+    if before_item.category != after_item.category {
+        changed.push("category".to_owned());
+    }
+    if before_item.unit != after_item.unit {
+        changed.push("unit".to_owned());
+    }
+    if before_item.barcode != after_item.barcode {
+        changed.push("barcode".to_owned());
+    }
+    if before_item.min_threshold != after_item.min_threshold {
+        changed.push("min_threshold".to_owned());
+    }
+    if before_item.reorder_point != after_item.reorder_point {
+        changed.push("reorder_point".to_owned());
+    }
+    if before_item.reorder_qty != after_item.reorder_qty {
+        changed.push("reorder_qty".to_owned());
+    }
+    if before_item.cost != after_item.cost {
+        changed.push("cost".to_owned());
+    }
+    if before_item.product_id != after_item.product_id {
+        changed.push("product_id".to_owned());
+    }
+    if before_item.notes != after_item.notes {
+        changed.push("notes".to_owned());
+    }
+    if before_item.active != after_item.active {
+        changed.push("active".to_owned());
+    }
+    changed
+}
+
+// ---------------------------------------------------------------------------------------------
+// Overview
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory` — the overview's figures.
+pub async fn overview(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<Overview>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        store::overview(state.db().pool(), organization_id).await?,
+    ))
+}
+
+/// `GET /api/v1/inventory/vocabulary` — the words the item form and the filters offer.
+///
+/// Categories, units and the reason codes in one call, because the item form draws three selects
+/// and a screen that fetches them one at a time is a form that appears empty three times.
+#[derive(Debug, serde::Serialize)]
+pub struct Vocabulary {
+    /// The categories the organization has written.
+    pub categories: Vec<String>,
+    /// The units the organization has written.
+    pub units: Vec<String>,
+    /// The reason codes, with the two negatives flagged so the drawer can say which one needs a
+    /// permission.
+    pub reasons: Vec<Value>,
+    /// The location kinds the location editor offers.
+    pub location_kinds: Vec<String>,
+}
+
+/// `GET /api/v1/inventory/vocabulary` — categories, units, reasons and location kinds.
+pub async fn vocabulary(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<Vocabulary>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let categories = store::list_categories(pool, organization_id).await?;
+    let mut units = store::list_units(pool, organization_id).await?;
+    // The organization's default is offered even before anybody has written an item, because the
+    // first item of a new tenant is exactly the case where the list is empty.
+    let default_unit = store::default_unit(pool, organization_id).await?;
+    if !units.iter().any(|unit| unit == &default_unit) {
+        units.insert(0, default_unit);
+    }
+    let reasons = omnion_module_inventory::model::ReasonCode::ALL
+        .iter()
+        .map(|reason| {
+            json!({
+                "value": reason.as_str(),
+                "may_go_negative": reason.may_go_negative(),
+            })
+        })
+        .collect();
+    Ok(Json(Vocabulary {
+        categories,
+        units,
+        reasons,
+        location_kinds: omnion_module_inventory::model::LocationKind::ALL
+            .iter()
+            .map(|kind| kind.as_str().to_owned())
+            .collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Items
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/items` — one page of items.
+pub async fn list_items(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<ItemListParams>,
+) -> Result<Json<Page<ItemView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = ItemQuery::from(params);
+    Ok(Json(
+        store::list_items(state.db().pool(), organization_id, &query).await?,
+    ))
+}
+
+/// `GET /api/v1/inventory/items/{id}` — one item, with its stock at every location.
+///
+/// The detail is **one call**, not "the item, then its positions": a screen that has to join two
+/// responses can draw a header from one and a table from the other that disagree about the same
+/// item, and the stock list is a rollup of the same numbers either way.
+pub async fn get_item(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Json<ItemDetail>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let position = store::item_position(pool, organization_id, item_id).await?;
+    let history = ledger::item_history(pool, organization_id, item_id, 200).await?;
+    Ok(Json(ItemDetail { position, history }))
+}
+
+/// The item detail: the position plus the movement history the screen's second tab draws.
+///
+/// **Not `#[serde(flatten)]`ed**, unlike the item inside the position. A flatten serializes as a
+/// map, and every field of `StockPosition` would land at the top level beside `history` — which
+/// reads well until two of them collide and one silently wins. A named `position` key is one line
+/// longer in the JSON and cannot collide.
+#[derive(Debug, serde::Serialize)]
+pub struct ItemDetail {
+    /// The item, its per-location rows and the totals.
+    pub position: StockPosition,
+    /// Its movements, newest first.
+    pub history: Vec<Movement>,
+}
+
+/// `POST /api/v1/inventory/items` — create an item.
+pub async fn create_item(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<NewItem>,
+) -> Result<(StatusCode, Json<ItemView>), ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let created = store::create_item(state.db().pool(), organization_id, &body.0).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.item.created")
+            .organization(organization_id)
+            .target("inventory_item", created.id.to_string())
+            .metadata(json!({ "request_id": created.id, "after": created.reference() }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.item.created")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(created.reference()),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `PATCH /api/v1/inventory/items/{id}` — update an item.
+pub async fn update_item(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(item_id): Path<Uuid>,
+    body: Json<ItemPatch>,
+) -> Result<Json<ItemView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let before = store::get_item(pool, organization_id, item_id).await?;
+    let after = store::patch_item(pool, organization_id, item_id, &body.0).await?;
+
+    let changed = item_changes(&before, &after);
+    if !changed.is_empty() {
+        record(
+            &state,
+            NewAuditEntry::by_user(current.user.id, "inventory.item.updated")
+                .organization(organization_id)
+                .target("inventory_item", after.id.to_string())
+                .metadata(json!({
+                    "request_id": after.id,
+                    "changed": changed,
+                    "before": before.reference(),
+                    "after": after.reference(),
+                }))
+                .ip_address(address.as_text()),
+        )
+        .await?;
+
+        emit(
+            &state,
+            NewEvent::new("inventory.item.updated")
+                .organization(organization_id)
+                .actor(current.user.id)
+                .payload(json!({ "item_id": after.id, "changed": changed })),
+        )
+        .await;
+    }
+
+    Ok(Json(after))
+}
+
+/// `DELETE /api/v1/inventory/items/{id}` — archive an item.
+pub async fn archive_item(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(item_id): Path<Uuid>,
+) -> Result<Json<ItemView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let before = store::get_item(pool, organization_id, item_id).await?;
+    let after = store::archive_item(pool, organization_id, item_id).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.item.archived")
+            .organization(organization_id)
+            .target("inventory_item", after.id.to_string())
+            .metadata(json!({
+                "request_id": after.id,
+                "before": before.reference(),
+                "after": after.reference(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.item.archived")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(after.reference()),
+    )
+    .await;
+
+    Ok(Json(after))
+}
+
+/// `GET /api/v1/inventory/items/lookup?code=…` — the scanner box's one call.
+///
+/// A miss is a `404` and not an empty list: a scanner that resolves nothing has to say so, and a
+/// `200` with zero rows is a response a scanner box renders as "found an item called nothing".
+pub async fn lookup_item(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<LookupParams>,
+) -> Result<Json<ItemView>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let found = store::lookup_item(state.db().pool(), organization_id, &params.code)
+        .await?
+        .ok_or(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "inventory_item_not_found",
+            "no item carries that barcode or SKU",
+        ))?;
+    Ok(Json(found))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stock
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/stock` — one page of the stock list.
+pub async fn list_stock(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<StockListParams>,
+) -> Result<Json<Page<StockLevel>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = StockQuery::from(params);
+    Ok(Json(
+        store::list_stock(state.db().pool(), organization_id, &query).await?,
+    ))
+}
+
+/// `GET /api/v1/inventory/reconciliation` — the rollup against a replay of the ledger.
+///
+/// **A list of disagreements, not a count.** The endpoint exists so somebody can go and look at a
+/// row, and a number cannot be looked at.
+pub async fn reconciliation(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<store::StocktakeSnapshot>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        store::reconciliation_report(state.db().pool(), organization_id).await?,
+    ))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The ledger
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/movements` — one page of the ledger, newest first.
+pub async fn list_movements(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(params): Query<MovementListParams>,
+) -> Result<Json<Page<Movement>>, ApiError> {
+    let organization_id = organization_of(&state, &current, params.organization_id).await?;
+    let query = params.into_query()?;
+    Ok(Json(
+        ledger::list_movements(state.db().pool(), organization_id, &query).await?,
+    ))
+}
+
+/// `GET /api/v1/inventory/movements/{id}` — one movement, with the numbers it produced.
+pub async fn get_movement(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    Path(movement_id): Path<i64>,
+) -> Result<Json<Movement>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let movement = ledger::get_movement(state.db().pool(), movement_id).await?;
+    // A movement of another organization is a 404, checked here rather than in the module: the
+    // ledger's id is a global sequence, so `get_movement` alone would happily return a row from a
+    // competitor and the id is guessable by counting.
+    if movement.organization_id != organization_id {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "inventory_movement_not_found",
+            "no such movement in this organization",
+        ));
+    }
+    Ok(Json(movement))
+}
+
+/// `POST /api/v1/inventory/movements` — record a movement.
+///
+/// The audit row carries the **before and after quantities**, not just the movement: the question
+/// an auditor asks about a stock adjustment is "what was there before and what is there now",
+/// and an audit row that only names the delta makes them reconstruct it from the ledger.
+pub async fn record_movement(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<RecordMovementBody>,
+) -> Result<(StatusCode, Json<Recorded>), ApiError> {
+    let organization_id = organization_of(&state, &current, body.0.organization_id.or(organization.organization_id)).await?;
+    let pool = state.db().pool();
+
+    // The negative-stock permission, asked once here and passed down as a boolean. This is the
+    // only place in the stack that can answer it: the module has no session, and the schema
+    // cannot ask.
+    let may_go_negative = holds_permission(&state, &current, organization_id, "inventory.negative.manage")
+        .await?;
+
+    let before = ledger::stock_level(pool, organization_id, body.0.item_id, body.0.location_id).await?;
+    let new = body.0.into_movement(pool, organization_id, may_go_negative).await?;
+    let recorded = ledger::record_movement(pool, organization_id, &new, Some(current.user.id)).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.movement.recorded")
+            .organization(organization_id)
+            .target("inventory_movement", recorded.movement.id.to_string())
+            .metadata(json!({
+                "movement_id": recorded.movement.id,
+                "item_id": recorded.movement.item_id,
+                "location_id": recorded.movement.location_id,
+                "kind": recorded.movement.kind.as_str(),
+                "reason": recorded.movement.reason.as_str(),
+                "quantity": recorded.movement.quantity.to_text(),
+                "on_hand_before": before.on_hand.to_text(),
+                "on_hand_after": recorded.movement.on_hand_after.to_text(),
+                "reserved_before": before.reserved.to_text(),
+                "reserved_after": recorded.movement.reserved_after.to_text(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.movement.recorded")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(recorded.movement.reference()),
+    )
+    .await;
+
+    // A crossing of the reorder point is its own event, because it is the one a REQ-003
+    // automation subscribes to ("when stock runs low, raise a purchase request"). It is emitted
+    // from the transition, not from the badge, so a movement that does not cross anything is
+    // silent — the rule is edge-triggered, exactly as the spec demands, or a busy warehouse
+    // floods the automation log.
+    if crossed_downward(&before, &recorded.position) {
+        emit(
+            &state,
+            NewEvent::new("inventory.stock.low")
+                .organization(organization_id)
+                .actor(current.user.id)
+                .payload(json!({
+                    "item_id": recorded.movement.item_id,
+                    "sku": recorded.movement.sku,
+                    "location_id": recorded.movement.location_id,
+                    "available": recorded.position.available.to_text(),
+                    "reorder_point": recorded.position.reorder_point.to_text(),
+                })),
+        )
+        .await;
+    }
+
+    Ok((StatusCode::CREATED, Json(recorded)))
+}
+
+/// Whether this write took the row from above its reorder point to at or below it.
+fn crossed_downward(before: &StockLevel, after: &StockLevel) -> bool {
+    before.available.milli() > before.reorder_point.milli()
+        && after.available.milli() <= after.reorder_point.milli()
+}
+
+/// `POST /api/v1/inventory/movements/preview` — what this adjustment would do, before it happens.
+///
+/// The drawer calls it on every keystroke so the operator sees the resulting quantity rather than
+/// finding out after a round trip. It is a **read** of the current row plus the module's own
+/// arithmetic, so the number previewed and the number written come from one implementation: a
+/// second implementation in the browser is the one that drifts.
+pub async fn preview_movement(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<PreviewBody>,
+) -> Result<Json<Preview>, ApiError> {
+    let organization_id = organization_of(&state, &current, body.0.organization_id.or(organization.organization_id)).await?;
+    let pool = state.db().pool();
+    let current_level = ledger::stock_level(pool, organization_id, body.0.item_id, body.0.location_id).await?;
+    let may_go_negative = holds_permission(&state, &current, organization_id, "inventory.negative.manage")
+        .await?;
+
+    let typed = store::parse_quantity("movement", "quantity", &body.0.quantity)?;
+    let quantity = match body.0.mode.as_deref().unwrap_or("delta") {
+        "delta" => typed,
+        "counted" => typed
+            .checked_sub(current_level.on_hand)
+            .ok_or_else(|| {
+                ApiError::bad_request("invalid_inventory_movement", "that number is too large")
+            })?,
+        other => {
+            return Err(ApiError::bad_request(
+                "invalid_inventory_movement",
+                format!("{other} is not a mode — use `delta` or `counted`"),
+            ));
+        }
+    };
+    let reason = omnion_module_inventory::items::default_reason(body.0.reason.as_deref())?;
+    let kind = preview_kind(body.0.kind.as_deref(), reason, quantity)?;
+
+    // The preview answers even when the write would be refused, because **the refusal is the
+    // preview**: "this would leave −3, here is what is available" is the sentence the drawer
+    // needs more than a 409 three fields later.
+    let (on_hand_after, reserved_after) =
+        match omnion_module_inventory::apply_movement(
+            current_level.on_hand,
+            current_level.reserved,
+            kind,
+            quantity,
+            reason,
+            may_go_negative,
+        ) {
+            Ok(after) => after,
+            Err(error) => {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "inventory_movement_refused",
+                    error.to_string(),
+                ));
+            }
+        };
+    let available_after = on_hand_after.checked_sub(reserved_after).unwrap_or(Quantity::ZERO);
+    let status = omnion_module_inventory::StockStatus::of(
+        available_after,
+        current_level.min_threshold,
+        current_level.reorder_point,
+    );
+
+    Ok(Json(Preview {
+        on_hand_before: current_level.on_hand.to_text(),
+        on_hand_after: on_hand_after.to_text(),
+        reserved_before: current_level.reserved.to_text(),
+        reserved_after: reserved_after.to_text(),
+        available_after: available_after.to_text(),
+        kind: kind.as_str().to_owned(),
+        reason: reason.as_str().to_owned(),
+        status: status.as_str().to_owned(),
+    }))
+}
+
+/// The kind a preview would apply — the same inference the module makes, exposed so the drawer
+/// can print the kind it is about to write.
+fn preview_kind(
+    named: Option<&str>,
+    reason: omnion_module_inventory::ReasonCode,
+    quantity: Quantity,
+) -> Result<omnion_module_inventory::MovementKind, ApiError> {
+    // Built by asking the module's own rule through a throwaway `NewMovement`, so the preview and
+    // the write cannot pick different kinds. A named kind short-circuits.
+    if let Some(raw) = named.map(str::trim).filter(|raw| !raw.is_empty()) {
+        let kind = omnion_module_inventory::MovementKind::parse(raw).ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_inventory_movement",
+                format!("{raw} is not a movement kind"),
+            )
+        })?;
+        if !kind.is_recordable_by_hand() {
+            return Err(ApiError::bad_request(
+                "invalid_inventory_movement",
+                "a reservation is made by confirming an order, not by recording a movement by hand",
+            ));
+        }
+        return Ok(kind);
+    }
+    Ok(match reason {
+        omnion_module_inventory::ReasonCode::PurchaseReceipt
+        | omnion_module_inventory::ReasonCode::CustomerReturn => {
+            omnion_module_inventory::MovementKind::Receipt
+        }
+        omnion_module_inventory::ReasonCode::SaleShipment
+        | omnion_module_inventory::ReasonCode::SupplierReturn => {
+            omnion_module_inventory::MovementKind::Issue
+        }
+        omnion_module_inventory::ReasonCode::Transfer => {
+            if quantity.is_negative() {
+                omnion_module_inventory::MovementKind::TransferOut
+            } else {
+                omnion_module_inventory::MovementKind::TransferIn
+            }
+        }
+        _ => omnion_module_inventory::MovementKind::Adjustment,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Warehouses and locations
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/warehouses` — the tree, with each node's totals.
+pub async fn list_warehouses(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<Vec<WarehouseView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        store::list_warehouses(state.db().pool(), organization_id).await?,
+    ))
+}
+
+/// `POST /api/v1/inventory/warehouses` — create a warehouse.
+pub async fn create_warehouse(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<NewWarehouse>,
+) -> Result<(StatusCode, Json<WarehouseView>), ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let created = store::create_warehouse(state.db().pool(), organization_id, &body.0).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.warehouse.created")
+            .organization(organization_id)
+            .target("inventory_warehouse", created.id.to_string())
+            .metadata(json!({ "request_id": created.id, "after": created.reference() }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.location.changed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(created.reference()),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `PATCH /api/v1/inventory/warehouses/{id}` — rename or deactivate a warehouse.
+pub async fn update_warehouse(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(warehouse_id): Path<Uuid>,
+    body: Json<WarehousePatch>,
+) -> Result<Json<WarehouseView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let before = store::get_warehouse(pool, organization_id, warehouse_id).await?;
+    let after = store::patch_warehouse(pool, organization_id, warehouse_id, &body.0).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.warehouse.updated")
+            .organization(organization_id)
+            .target("inventory_warehouse", after.id.to_string())
+            .metadata(json!({
+                "request_id": after.id,
+                "before": before.reference(),
+                "after": after.reference(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.location.changed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(after.reference()),
+    )
+    .await;
+
+    Ok(Json(after))
+}
+
+/// `GET /api/v1/inventory/locations` — every location, ordered by warehouse then code.
+pub async fn list_locations(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<Vec<LocationView>>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        store::list_locations(state.db().pool(), organization_id).await?,
+    ))
+}
+
+/// `POST /api/v1/inventory/locations` — create a location under a warehouse.
+pub async fn create_location(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<NewLocation>,
+) -> Result<(StatusCode, Json<LocationView>), ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let created = store::create_location(state.db().pool(), organization_id, &body.0).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.location.created")
+            .organization(organization_id)
+            .target("inventory_location", created.id.to_string())
+            .metadata(json!({ "request_id": created.id, "after": created.reference() }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.location.changed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(created.reference()),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// `PATCH /api/v1/inventory/locations/{id}` — rename, re-kind or deactivate a location.
+pub async fn update_location(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    Path(location_id): Path<Uuid>,
+    body: Json<LocationPatch>,
+) -> Result<Json<LocationView>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let before = store::get_location(pool, organization_id, location_id).await?;
+    let after = store::patch_location(pool, organization_id, location_id, &body.0).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.location.updated")
+            .organization(organization_id)
+            .target("inventory_location", after.id.to_string())
+            .metadata(json!({
+                "request_id": after.id,
+                "before": before.reference(),
+                "after": after.reference(),
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    emit(
+        &state,
+        NewEvent::new("inventory.location.changed")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(after.reference()),
+    )
+    .await;
+
+    Ok(Json(after))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/inventory/settings` — the thresholds the drawer reads before it writes.
+pub async fn get_settings(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(organization): Query<OrganizationParam>,
+) -> Result<Json<omnion_module_inventory::Settings>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    Ok(Json(
+        store::get_settings(state.db().pool(), organization_id).await?,
+    ))
+}
+
+/// `PUT /api/v1/inventory/settings` — write the thresholds.
+pub async fn update_settings(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Query(organization): Query<OrganizationParam>,
+    body: Json<SettingsPatch>,
+) -> Result<Json<omnion_module_inventory::Settings>, ApiError> {
+    let organization_id = organization_of(&state, &current, organization.organization_id).await?;
+    let pool = state.db().pool();
+    let before = store::get_settings(pool, organization_id).await?;
+    let after = store::update_settings(pool, organization_id, &body.0).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "inventory.settings.updated")
+            .organization(organization_id)
+            .target("inventory_settings", organization_id.to_string())
+            .metadata(json!({ "before": before, "after": after }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+
+    Ok(Json(after))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the caller holds a permission in this organization, resolved once per write.
+///
+/// The negative-stock rule needs an answer the module cannot produce for itself, and getting it
+/// **wrong in the permissive direction** would let any warehouse operator drive stock below zero,
+/// so a failure to read the role store is treated as "does not hold it" rather than propagated:
+/// the write is refused and the audit trail shows the refusal, which is the safe direction for
+/// both of them.
+async fn holds_permission(
+    state: &AppState,
+    current: &CurrentSession,
+    organization_id: Uuid,
+    key: &str,
+) -> Result<bool, ApiError> {
+    // `omnion_permissions::authorize` is the **same** resolution the route guard uses — role
+    // bindings first, then the organization's ABAC policies — so the negative-stock rule and the
+    // permission on the route cannot disagree about who may drive stock below zero. Reading the
+    // role graph anywhere else would be a second implementation of one decision.
+    let scope = omnion_permissions::model::Scope::Organization { organization_id };
+    match omnion_permissions::evaluate::authorize(state.db().pool(), current.user.id, scope, key).await {
+        Ok(decision) => Ok(decision.is_allowed()),
+        Err(error) => {
+            tracing::warn!(error = %error, %key, "the role store could not be read; refusing");
+            Ok(false)
+        }
+    }
+}
+
+/// `true` when the database refused to answer, rather than refusing the statement.
+///
+/// A `503` for this and a `500` for everything else: the two have opposite recoveries, and a
+/// client that cannot tell them apart retries the one that will never succeed.
+fn database_unavailable(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------------------------
+
+impl From<InventoryError> for ApiError {
+    /// The inventory module's refusals, mapped the way every other module's are: a validation
+    /// failure is a `400` naming the field the form renders it under, a missing or
+    /// out-of-organization record is a `404`, a taken SKU or code is a `409`, and **a write the
+    /// numbers refuse is a `422`** — nothing the caller typed is malformed, the request is
+    /// well-formed and the warehouse does not have the stock, which is a different thing and
+    /// deserves a different status.
+    fn from(error: InventoryError) -> Self {
+        match error {
+            InventoryError::Invalid {
+                entity,
+                field,
+                message,
+            } => Self::bad_request("invalid_inventory_record", message)
+                .with_details(json!({ "entity": entity, "field": field })),
+            InventoryError::InvalidQuery(message) => {
+                Self::bad_request("invalid_inventory_query", message)
+            }
+            InventoryError::NotFound(kind) => Self::new(
+                StatusCode::NOT_FOUND,
+                match kind {
+                    "item" => "inventory_item_not_found",
+                    "location" => "inventory_location_not_found",
+                    "warehouse" => "inventory_warehouse_not_found",
+                    "movement" => "inventory_movement_not_found",
+                    _ => "inventory_record_not_found",
+                },
+                format!("no such {kind} in this organization"),
+            ),
+            InventoryError::CodeTaken { entity, code } => Self::new(
+                StatusCode::CONFLICT,
+                "inventory_code_taken",
+                format!("another {entity} of this organization is already called {code}"),
+            ),
+            // The number is in the **sentence** as well as in `details`, and that duplication is
+            // deliberate. `details` is what a form renders beside the quantity input; the sentence
+            // is what a person reads in a log, in an email and on a terminal. The first version
+            // put the available quantity only in `details`, and the walk's assertion — which
+            // checks the sentence, because a human reads the sentence — failed on a message that
+            // said "this would leave −3.000" without ever saying what *was* there.
+            InventoryError::WouldGoNegative {
+                message,
+                available,
+            } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "inventory_insufficient_stock",
+                format!("{message} (available {available})"),
+            )
+            .with_details(json!({ "available": available })),
+            InventoryError::InvalidStatusChange(message) => {
+                Self::new(StatusCode::CONFLICT, "inventory_status_conflict", message)
+            }
+            InventoryError::ApprovalNotGranted(message) => Self::new(
+                StatusCode::CONFLICT,
+                "inventory_approval_required",
+                message,
+            ),
+            InventoryError::InvalidNumber {
+                entity,
+                field,
+                source,
+            } => Self::bad_request("invalid_inventory_record", source.to_string())
+                .with_details(json!({ "entity": entity, "field": field })),
+            InventoryError::MissingPermission(key) => Self::new(
+                StatusCode::FORBIDDEN,
+                "inventory_permission_required",
+                format!("this write needs {key}"),
+            ),
+            InventoryError::ForeignKey { kind, id } => Self::new(
+                StatusCode::BAD_REQUEST,
+                "inventory_foreign_key",
+                format!("{kind} {id} is not in this organization"),
+            ),
+            // The same split the sales module makes, for the same reason: a pool that timed out is
+            // a **503 the caller retries**, and a statement the database refused is a `500` that
+            // retrying will reproduce. Reporting both as one code teaches a client to retry a
+            // unique violation forever.
+            InventoryError::Database(error) if database_unavailable(&error) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "database is unavailable",
+            ),
+            InventoryError::Database(error) => {
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", error.to_string())
+            }
+        }
+    }
+}

@@ -663,6 +663,44 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "sales",
         description: "Read the sales reports and export them as CSV",
     },
+
+    // Inventory (docs/requests/REQ-053). The family is split by **what a mistake costs**, not by
+    // screen, and three of the five exist for a reason a reader would otherwise have to infer:
+    //
+    // * `inventory.movements.record` is not implied by `inventory.items.manage`. Fixing a
+    //   threshold and altering a balance are different acts, and the second one is the one the
+    //   ledger is there to record.
+    // * `inventory.negative.manage` **guards no route at all.** The schema cannot ask who is
+    //   calling, so the rule is a service check inside the write: it is the only permission on
+    //   this platform whose entire meaning is "the refusal this module would otherwise make is
+    //   permitted for you", and giving it a route would be giving it a second meaning.
+    // * `inventory.locations.manage` is separate from the movement key because closing a location
+    //   makes stock unreachable, which is a structural change rather than a day's work.
+    PermissionDef {
+        key: "inventory.items.read",
+        category: "inventory",
+        description: "Read items, stock levels, the movement ledger and the warehouse tree",
+    },
+    PermissionDef {
+        key: "inventory.items.manage",
+        category: "inventory",
+        description: "Create, edit and archive inventory items",
+    },
+    PermissionDef {
+        key: "inventory.movements.record",
+        category: "inventory",
+        description: "Record stock movements (receipts, issues, adjustments, transfers)",
+    },
+    PermissionDef {
+        key: "inventory.locations.manage",
+        category: "inventory",
+        description: "Create, rename and deactivate warehouses, locations and the thresholds",
+    },
+    PermissionDef {
+        key: "inventory.negative.manage",
+        category: "inventory",
+        description: "Allow a correction to take stock below zero (needed with reason `correction`)",
+    },
 ];
 
 /// Look a permission up by key.
@@ -886,6 +924,28 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("crm"),
                 "{key} belongs to the crm category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_inventory_family_is_catalogued_and_one_key_guards_no_route() {
+        // REQ-053. Four keys guard routes and the fifth does not — `inventory.negative.manage`
+        // is a service rule the schema cannot check, so it exists only to unlock one refusal.
+        // A catalogue entry for it is what lets a role **hold** it; nothing in `routes/inventory.rs`
+        // may `require()` it, and this test cannot see that, so the comment in the route file is
+        // the second half of the guarantee and the assertion here is the first.
+        for key in [
+            "inventory.items.read",
+            "inventory.items.manage",
+            "inventory.movements.record",
+            "inventory.locations.manage",
+            "inventory.negative.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("inventory"),
+                "{key} belongs to the inventory category"
             );
         }
     }

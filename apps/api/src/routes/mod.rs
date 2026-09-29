@@ -94,6 +94,7 @@ pub mod crm_leads;
 pub mod crm_views;
 pub mod health;
 pub mod iam;
+pub mod inventory;
 pub mod iam_approvals;
 pub mod iam_policy;
 pub mod iam_providers;
@@ -1350,6 +1351,71 @@ pub fn router(state: AppState) -> Router {
         .merge(sales_quotes_send)
         .merge(sales_quotes_public);
 
+    // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
+    // stock rollup and the append-only ledger.
+    //
+    // The keys are **not** one per screen. They follow what a mistake costs, and three of them
+    // exist for reasons a reader would otherwise have to infer:
+    //
+    // * `inventory.movements.record` is separate from `inventory.items.manage` because **reading
+    //   a balance and moving stock are different powers**: a picking clerk needs the first for
+    //   every order of the day and the second once.
+    // * `inventory.negative.manage` is a key of its own and **is not on any route**. The schema
+    //   cannot ask who is calling, so the rule is checked inside the write (see
+    //   `inventory::record_movement`); a role that holds it can do nothing else with it, which is
+    //   exactly what a "you may take the stock below zero" permission should look like.
+    // * `inventory.locations.manage` is separate from `inventory.movements.record` because
+    //   closing a location is a structural change — it makes stock unreachable — and a person who
+    //   ships goods all day is not automatically the person who may close a bin.
+    let inventory_items_read = Router::new()
+        .route("/inventory", get(inventory::overview))
+        .route("/inventory/vocabulary", get(inventory::vocabulary))
+        .route("/inventory/items", get(inventory::list_items))
+        .route("/inventory/items/lookup", get(inventory::lookup_item))
+        .route("/inventory/items/{id}", get(inventory::get_item))
+        .route("/inventory/stock", get(inventory::list_stock))
+        .route("/inventory/reconciliation", get(inventory::reconciliation))
+        .route("/inventory/warehouses", get(inventory::list_warehouses))
+        .route("/inventory/locations", get(inventory::list_locations))
+        .route("/inventory/movements", get(inventory::list_movements))
+        .route("/inventory/movements/{id}", get(inventory::get_movement))
+        // The preview and the settings row are reads that sit on a read key: the drawer asks
+        // "what would this do?" on every keystroke, and putting that behind a write key would make
+        // the drawer broken for every role that may not yet be trusted with the write.
+        .route("/inventory/movements/preview", post(inventory::preview_movement))
+        .route("/inventory/settings", get(inventory::get_settings))
+        .route_layer(guards::require(&state, "inventory.items.read"));
+
+    let inventory_items_manage = Router::new()
+        .route("/inventory/items", post(inventory::create_item))
+        .route("/inventory/items/{id}", patch(inventory::update_item))
+        .route("/inventory/items/{id}", delete(inventory::archive_item))
+        .route_layer(guards::require(&state, "inventory.items.manage"));
+
+    let inventory_locations_manage = Router::new()
+        .route("/inventory/warehouses", post(inventory::create_warehouse))
+        .route("/inventory/warehouses/{id}", patch(inventory::update_warehouse))
+        .route("/inventory/locations", post(inventory::create_location))
+        .route("/inventory/locations/{id}", patch(inventory::update_location))
+        .route("/inventory/settings", put(inventory::update_settings))
+        .route_layer(guards::require(&state, "inventory.locations.manage"));
+
+    // The ledger's write. **`inventory.movements.record` is the key that moves numbers**, and it
+    // is deliberately not implied by `inventory.items.manage`: being able to fix a threshold is
+    // not being able to alter the balance.
+    let inventory_movements_record = Router::new()
+        .route("/inventory/movements", post(inventory::record_movement))
+        .route_layer(guards::require(&state, "inventory.movements.record"));
+
+    // **There is no `PATCH` or `DELETE` on `/inventory/movements/{id}` and there is never going to
+    // be one.** The criterion asks for a 405 and axum answers that for a path it does not
+    // implement, which is the only answer that cannot be undone by a later handler that decides to
+    // be helpful. The way to fix a mistake is another movement.
+    let inventory = inventory_items_read
+        .merge(inventory_items_manage)
+        .merge(inventory_locations_manage)
+        .merge(inventory_movements_record);
+
     let v1 = Router::new()
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
@@ -1426,6 +1492,7 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_collect)
         .merge(crm)
         .merge(sales)
+        .merge(inventory)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),

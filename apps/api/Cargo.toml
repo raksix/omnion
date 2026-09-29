@@ -40,6 +40,7 @@ omnion-module-analytics = { path = "../../modules/analytics" }
 omnion-module-crm = { path = "../../modules/crm" }
 omnion-module-sales = { path = "../../modules/sales" }
 omnion-onboarding = { path = "../../crates/onboarding" }
+omnion-module-inventory = { path = "../../modules/inventory" }
 omnion-permissions = { path = "../../crates/permissions" }
 omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
