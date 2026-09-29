@@ -6245,3 +6245,198 @@ export function saveBackupSettings(input: {
     body: JSON.stringify(input),
   });
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 — the platform-wide rate limiter (slice 1)
+//
+// Every function here talks to `/api/v1/reliability/rate-limits/*`, which is a DIFFERENT surface
+// from `/api/v1/security/rate-limits`: the security one is the gateway's per-route document
+// (REQ-040) and the reliability one is the platform-wide budgets (user / organization / IP /
+// route). Both can refuse the same caller, so both exist, and every refusal the reliability
+// layer writes names which of the two answered.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * One policy, in resolution order, with the ceiling already added.
+ *
+ * `enforced_here` is the field that stops a stored-but-unspent row from reading as protection:
+ * a `route`-scoped policy is stored and listed, but the platform limiter runs before the router
+ * publishes a matched route and has no template to match on, so the panel says so on the row
+ * rather than leaving the operator to find out from a caller that was never refused.
+ */
+export interface ReliabilityPolicy {
+  id: string | null;
+  name: string;
+  scope: string;
+  target_id: string | null;
+  route_pattern: string | null;
+  limit_count: number;
+  window_seconds: number;
+  burst: number;
+  /** `limit_count + burst`, computed by the API so a table never makes the reader add it up. */
+  ceiling: number;
+  priority: number;
+  is_default: boolean;
+  enabled: boolean;
+  enforced_here: boolean;
+}
+
+/** The policy list: the rows, the scope vocabulary and this deployment's failure mode. */
+export interface ReliabilityPolicies {
+  policies: ReliabilityPolicy[];
+  vocabulary: string[];
+  limiter: string;
+  /** Whether an unreadable counter fails open (availability) or closed (protection). */
+  fail_mode: string;
+}
+
+/** A write. The API owns every range; the client sends numbers and shows what came back. */
+export interface ReliabilityPolicyInput {
+  name: string;
+  scope: string;
+  target_id?: string | null;
+  route_pattern?: string | null;
+  limit_count: number;
+  window_seconds: number;
+  burst?: number;
+  priority?: number;
+  enabled?: boolean;
+}
+
+/** The dry-run's input: the same four facts the middleware reads off a request. */
+export interface ReliabilityEvaluateInput {
+  scope?: string | null;
+  user_id?: string | null;
+  ip?: string | null;
+  route?: string | null;
+  /** The counter to assume, for explaining a refusal a caller is already seeing. */
+  count?: number | null;
+}
+
+/**
+ * The dry-run's verdict, as the API's `Verdict` enum actually serialises: an externally tagged
+ * enum, so the variant is the KEY and its fields are the value.
+ *
+ * It is an enum rather than a flat answer because the four shapes are genuinely different and a
+ * client-side "allowed + remaining" collapses the two that matter:
+ *
+ * - `Unlimited` — no policy applies. The request proceeds and there is **no budget number at
+ *   all**; rendering it as "0 remaining" sends an operator hunting for a policy that does not
+ *   exist.
+ * - `Uncounted` — a policy applies, the counter was unreadable, the deployment fails **open**.
+ *   The request proceeds and nothing was counted, so `remaining` is absent on purpose: a number
+ *   here would be a measurement nobody took.
+ * - `RefusedUncounted` — the same outage with the deployment failing **closed**. Refused, with
+ *   no `retry_after`, because a wait the platform cannot compute is not a promise.
+ * - `Allowed` / `Limited` — the two answers that carry a real measurement, and the only two the
+ *   middleware is allowed to write `X-RateLimit-*` headers for.
+ */
+export type ReliabilityVerdict =
+  | { Allowed: { policy_id: string | null; scope: string; remaining: number; limit: number } }
+  | { Limited: { policy_id: string | null; scope: string; retry_after: number; limit: number; ceiling: number } }
+  | { Unlimited: Record<string, never> }
+  | { Uncounted: { scope: string } }
+  | { RefusedUncounted: { scope: string } };
+
+/** The variant name, which is what the screen renders and what a test asserts on. */
+export function reliabilityVerdictKind(verdict: ReliabilityVerdict): string {
+  const [kind] = Object.keys(verdict);
+  return kind ?? "Unknown";
+}
+
+export interface ReliabilityEvaluated {
+  policy: ReliabilityPolicy | null;
+  verdict: ReliabilityVerdict;
+  counted: { count: number; authoritative: boolean };
+  window_start: string | null;
+  counter_key: string | null;
+  fail_mode: string;
+}
+
+/** One refusal rollup: a scope, a route and one window. */
+export interface ReliabilityRefusal {
+  scope: string;
+  target_id: string | null;
+  route: string;
+  window_start: string;
+  refusals: number;
+  last_refusal_at: string;
+}
+
+export interface ReliabilityRefusals {
+  refusals: ReliabilityRefusal[];
+  last_24_hours: number;
+}
+
+/**
+ * The policies, in the order the resolver walks them.
+ *
+ * `no-store`: a cached table is a screen that says "600 per minute" while the platform enforces
+ * something else, and the whole value of the screen is that the two agree.
+ */
+export function fetchReliabilityPolicies(): Promise<ReliabilityPolicies> {
+  return request<ReliabilityPolicies>("/api/v1/reliability/rate-limits", { cache: "no-store" });
+}
+
+/** Create a policy. The body never carries an id — the route decides which row it writes. */
+export function createReliabilityPolicy(
+  input: ReliabilityPolicyInput,
+): Promise<ReliabilityPolicy> {
+  return request<ReliabilityPolicy>("/api/v1/reliability/rate-limits", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Edit a policy. A default row is edited in place; deleting one disables it instead. */
+export function updateReliabilityPolicy(
+  id: string,
+  input: ReliabilityPolicyInput,
+): Promise<ReliabilityPolicy> {
+  return request<ReliabilityPolicy>(`/api/v1/reliability/rate-limits/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Remove a custom policy.
+ *
+ * A default row is **disabled, not removed** — the shipped budgets are the document that
+ * protects a deployment nobody has configured yet, and a delete that dropped them would turn an
+ * install with no configuration into one with no protection. The API reports which it did.
+ */
+export function deleteReliabilityPolicy(
+  id: string,
+): Promise<{ id: string; disabled: boolean; message: string }> {
+  return request<{ id: string; disabled: boolean; message: string }>(
+    `/api/v1/reliability/rate-limits/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/**
+ * Dry-run one request through the limiter.
+ *
+ * A **server** call on purpose: the acceptance criterion is that the tool names the same policy
+ * the middleware resolves, and only the server holds that resolver. A client-side reimplementation
+ * agrees on the day it is written and drifts the first time somebody tunes a limit — which is
+ * the day somebody is relying on it. It also does not spend the budget it measures.
+ */
+export function evaluateReliabilityLimit(
+  input: ReliabilityEvaluateInput,
+): Promise<ReliabilityEvaluated> {
+  return request<ReliabilityEvaluated>("/api/v1/reliability/rate-limits/evaluate", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** The refusal rollups — one row per scope, route and window, never one per request. */
+export function fetchReliabilityRefusals(limit = 50): Promise<ReliabilityRefusals> {
+  return request<ReliabilityRefusals>(
+    `/api/v1/reliability/rate-limits/refusals?limit=${encodeURIComponent(String(limit))}`,
+    { cache: "no-store" },
+  );
+}
