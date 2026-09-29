@@ -216,6 +216,20 @@ All events ride the existing signed webhook bus; org/site-scoped events deliver 
   screen and adds the two no unit test can make: every filter control is present in the DOM (a filter that exists in the copy and not on the screen is a dead control), and the section does not overflow its
   card at 390px.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
+  *Partly proved, and the gap is stated rather than hidden.* The **QA walkthrough** ran on the private
+  stack this tick — `QA_STACK=w7` on 18086/3106/3206, artifacts `qa-artifacts/20260929-022729` — and
+  REQ-098's own scope is clean: **zero high findings** on `/ai/models`, `/ai/routing`, `/ai/logs` or the
+  provider health/usage panels, and the vision review of `page-ai` returned **0 issues**. Slice 5's figure
+  is in the report as `usage-cost=—`, which is the honest render for a window where nothing could be
+  priced, and it is read as text because a screenshot cannot tell an em dash from a zero.
+  The pass reported 138 findings overall (high 132), and **every one of them is REQ-010's**:
+  `/media/settings` answering 422 and one broken thumbnail on `/media/settings`. A concurrent writer
+  (w4) has that open and documented; none of it is this request's, and calling it "green" without
+  naming that would be the dishonest summary.
+  **Not yet proved:** `cargo test --workspace` (this tick ran the five AI suites — 52 walks plus 161
+  crate tests — rather than the whole workspace, which on this box is not cheap while nine other
+  writers build) and `pnpm build` (the admin **typecheck** is clean; the production build belongs to the
+  same gate). Both are the next tick's first command.*
 
 ### QA plan
 
