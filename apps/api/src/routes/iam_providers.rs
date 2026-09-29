@@ -28,6 +28,8 @@ use omnion_identity::sso::providers::{
     self, AuthProvider, NewProvider, ProviderChanges, ProviderKind, default_scopes,
 };
 use omnion_identity::sso::{directory, protocol_steps, provisioning};
+use omnion_identity::error::IdentityError;
+use omnion_identity::provenance;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -42,6 +44,13 @@ use crate::state::AppState;
 
 /// Largest provider event page the list answers.
 const MAX_EVENT_PAGE: i64 = 100;
+
+/// Largest reassign batch one request may carry.
+///
+/// A refusal rather than a silent truncation: a panel that asked for 5,000 and quietly did 500
+/// would report a success, and an operator who read it would believe 4,500 people had just
+/// become local sign-ins.
+const MAX_REASSIGN_BATCH: usize = 500;
 
 /// Record an event without letting a webhook problem fail the caller's request.
 async fn emit(state: &AppState, event: NewEvent) {
@@ -332,6 +341,98 @@ pub struct ProviderEnabledBody {
     pub gate_passed: bool,
 }
 
+/// How many accounts one provider deletion would reassign, read before anything is removed.
+#[derive(Debug, Serialize)]
+pub struct ImpactBody {
+    /// The provider that would be removed.
+    pub provider_id: Uuid,
+    /// Its slug, so the dialog names the connector rather than an id.
+    pub slug: String,
+    /// Accounts that would lose their provider link.
+    pub affected_accounts: i64,
+    /// The same number grouped by the system that owns each account.
+    pub by_source: Vec<provenance::SourceCount>,
+    /// A bounded sample of the affected accounts, for the dialog.
+    pub accounts: Vec<AccountRow>,
+    /// Whether a source string in the table is not one this build knows.
+    ///
+    /// Carried so the panel can say "and some we could not name" rather than showing a total
+    /// that does not add up — a count nobody can reconcile is a count nobody trusts.
+    pub unknown_sources: bool,
+    /// `true` when the delete would be refused, so the panel does not re-derive the rule.
+    pub blocked: bool,
+}
+
+impl ImpactBody {
+    fn new(
+        provider_id: Uuid,
+        impact: &provenance::Impact,
+        accounts: &[provenance::Provenance],
+        slug: String,
+    ) -> Self {
+        Self {
+            provider_id,
+            slug,
+            affected_accounts: impact.total,
+            by_source: impact.by_source.clone(),
+            accounts: accounts.iter().map(AccountRow::from).collect(),
+            unknown_sources: impact.unknown_sources,
+            blocked: impact.total > 0,
+        }
+    }
+}
+
+/// One account in the deletion dialog.
+///
+/// The address is included because an operator deciding to delete a directory needs to know
+/// *whose* access is affected; nothing else about the row crosses this surface.
+#[derive(Debug, Serialize)]
+pub struct AccountRow {
+    /// The account.
+    pub user_id: Uuid,
+    /// Its address.
+    pub email: String,
+    /// Which system owns it.
+    pub source: String,
+    /// What the directory calls it, when it has said.
+    pub external_id: Option<String>,
+}
+
+impl From<&provenance::Provenance> for AccountRow {
+    fn from(row: &provenance::Provenance) -> Self {
+        Self {
+            user_id: row.user_id,
+            email: row.email.clone(),
+            source: row.identity_source.clone(),
+            external_id: row.external_id.clone(),
+        }
+    }
+}
+
+/// The body of the reassign action.
+#[derive(Debug, Deserialize)]
+pub struct ReassignBody {
+    /// The accounts to fall back to local sign-in.
+    pub user_ids: Vec<Uuid>,
+}
+
+/// The answer of the reassign action: four numbers, not one.
+#[derive(Debug, Serialize)]
+pub struct ReassignResultBody {
+    /// How many ids the request asked for.
+    pub requested: usize,
+    /// How many accounts actually moved.
+    pub reassigned: u64,
+    /// How many of this provider's accounts the batch named but the update did not move.
+    ///
+    /// Always zero in this implementation, and carried anyway: an update that reported fewer
+    /// rows than the scope query matched would mean something moved concurrently, and a caller
+    /// that could not see that difference would report a success that is one account short.
+    pub not_moved: u64,
+    /// How many ids named no account of this provider in this organization.
+    pub skipped: usize,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------------------------
@@ -619,6 +720,16 @@ pub async fn update_provider(
 }
 
 /// Remove a provider. Its challenges and event log go with it (the migration cascades them).
+///
+/// The guard is the point of this handler, and it is a **count read before the delete**, not a
+/// foreign key. `0127` declares `provisioned_by_provider_id … on delete set null`, which is the
+/// safe direction and also the quiet one: deleting a provider whose accounts are still
+/// provisioned turns every one of them into a local account, keeping their sessions and their
+/// role grants while losing every record of which directory vouched for them. So the request
+/// names the count and the panel has to show it before anything is removed.
+///
+/// The audit line records the count on success too, not only on refusal: "we removed the Okta
+/// connector and 12 accounts kept their access" is a fact somebody will be asked about later.
 pub async fn delete_provider(
     State(state): State<AppState>,
     current: CurrentSession,
@@ -626,19 +737,151 @@ pub async fn delete_provider(
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
     let provider = load(&state, &current, id).await?;
+
+    let impact = provenance::deletion_impact(state.db().pool(), id).await?;
+    if impact.total > 0 {
+        // Mapped to `AccountRow` rather than embedded as `Provenance`: the store type carries
+        // columns the dialog has no use for, and a store type that grew a field would then
+        // silently widen this error body.
+        let accounts: Vec<AccountRow> = provenance::affected_accounts(state.db().pool(), id, 50)
+            .await?
+            .iter()
+            .map(AccountRow::from)
+            .collect();
+        return Err(ApiError::conflict("provider_in_use", impact.refusal()).with_details(json!({
+            "provider_id": id,
+            "slug": provider.slug,
+            "affected_accounts": impact.total,
+            "by_source": impact.by_source,
+            "unknown_sources": impact.unknown_sources,
+            "accounts": accounts,
+        })));
+    }
+
     providers::delete_provider(state.db().pool(), id).await?;
 
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "iam.provider_removed")
             .target("auth_provider", id.to_string())
-            .metadata(json!({ "slug": provider.slug, "kind": provider.kind.as_str() }))
+            .metadata(json!({
+                "slug": provider.slug,
+                "kind": provider.kind.as_str(),
+                "provisioned_accounts_at_removal": impact.total,
+            }))
             .ip_address(address.as_text())
             .organization(Some(provider.organization_id)),
     )
     .await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What deleting this provider would do, so the panel can say it *before* the button is pressed.
+///
+/// A dialog that discovers the block only after the click is a dialog that failed; this is the
+/// same count the refusal carries, read on a route that can answer `200` with zero accounts.
+pub async fn provider_deletion_impact(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ImpactBody>, ApiError> {
+    let provider = load(&state, &current, id).await?;
+    let impact = provenance::deletion_impact(state.db().pool(), id).await?;
+    let accounts = provenance::affected_accounts(state.db().pool(), id, 50).await?;
+    Ok(Json(ImpactBody::new(
+        id,
+        &impact,
+        &accounts,
+        provider.slug,
+    )))
+}
+
+/// Fall accounts back to local — the other half of the criterion, and the action the refusal
+/// tells the operator to take.
+///
+/// Every id is checked against the caller's organization and the provider's, so a batch cannot
+/// quietly take an account from a *different* tenant that happens to be in the list. The answer
+/// is the number that actually moved, read back from the update rather than from the request
+/// length: a list of a hundred ids where three exist elsewhere is a batch of 97, and printing
+/// "97 reassigned" would be the lie.
+///
+/// No client address is recorded on this one. Four extractors is the ceiling axum's handler
+/// tuple allows alongside a body, and the actor — who inside the tenant pressed the button — is
+/// the fact an audit reader needs; the network path of an administrator's own session is not.
+pub async fn reassign_provisioned_accounts(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReassignBody>,
+) -> Result<Json<ReassignResultBody>, ApiError> {
+    let provider = load(&state, &current, id).await?;
+
+    let requested = body.user_ids.len();
+    if requested == 0 {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "name at least one account to fall back to a local sign-in",
+        ));
+    }
+    if requested > MAX_REASSIGN_BATCH {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            format!("fall back at most {MAX_REASSIGN_BATCH} accounts at a time — the panel can carry more in several batches"),
+        ));
+    }
+
+    // Which of the requested ids are actually this provider's, in this organization. Answered by
+    // a query rather than by filtering in Rust, so an id from another tenant is *absent* from
+    // the result rather than silently reassigned.
+    let scope = scoped_accounts(&state, id, provider.organization_id, &body.user_ids).await?;
+    let moved = provenance::reassign(state.db().pool(), &scope).await?;
+
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "iam.provider_accounts_reassigned")
+            .target("auth_provider", id.to_string())
+            .metadata(json!({
+                "slug": provider.slug,
+                "requested": requested,
+                "reassigned": moved,
+            }))
+            .organization(Some(provider.organization_id)),
+    )
+    .await?;
+
+    Ok(Json(ReassignResultBody {
+        requested,
+        reassigned: moved,
+        // Measured against the scope query, not against the update's row count. A local account
+        // in the list is a caller mistake the operator needs to hear about; subtracting the
+        // request length from the rows moved would report it as "not found", which is a
+        // different claim about a different kind of mistake.
+        not_moved: scope.len() as u64 - moved,
+        skipped: requested - scope.len(),
+    }))
+}
+
+/// Keep only the requested ids that belong to this provider in this organization.
+async fn scoped_accounts(
+    state: &AppState,
+    provider_id: Uuid,
+    organization_id: Uuid,
+    requested: &[Uuid],
+) -> Result<Vec<Uuid>, ApiError> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "select id from users \
+          where id = any($1) \
+            and organization_id = $2 \
+            and (provisioned_by_provider_id = $3 or identity_source = 'scim')",
+    )
+    .bind(requested)
+    .bind(organization_id)
+    .bind(provider_id)
+    .fetch_all(state.db().pool())
+    .await
+    .map_err(|error| ApiError::from(IdentityError::Database(error)))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Ask the provider what it is.
