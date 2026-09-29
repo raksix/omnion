@@ -1219,6 +1219,16 @@ pub fn router(state: AppState) -> Router {
         // Assignment is its own key, not a wing of `crm.leads.manage`: what a lead *says* and
         // who is answerable for it are different decisions, and the person who most often needs
         // to hand a lead over is usually the one who may edit it.
+        // The duplicate verdict is reversed through a named endpoint, not a PATCH on the
+        // lead: only the store knows which contact the dedupe matched, so an endpoint that
+        // took a `contact_id` from the panel would either make the panel guess or accept an
+        // id for a row it has not matched. `crm.leads.manage` — the same power as rejecting
+        // a lead, because it changes what a lead is.
+        .route(
+            "/crm/leads/{id}/duplicate-decision",
+            post(crm_intake::duplicate_decision)
+                .layer(guards::require(&state, "crm.leads.manage")),
+        )
         .route(
             "/crm/leads/{id}/assign",
             post(crm_intake::assign).layer(guards::require(&state, "crm.leads.assign")),

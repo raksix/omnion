@@ -39,7 +39,8 @@ pub const LEAD_COLUMNS: &str = "id, organization_id, site_id, source_id, status,
      company_id, deal_id, quote_id, owner_user_id, first_name, last_name, email, phone, \
      company_name, job_title, product_interest, message, consent_text, consent_given, \
      utm_source, utm_medium, utm_campaign, utm_term, utm_content, click_id, referrer_host, \
-     landing_path, source_path, payload, payload_bytes, dedupe_key, duplicate_of, decision, \
+     landing_path, source_path, payload, payload_bytes, dedupe_key, duplicate_of, \
+     dedupe_contact_id, dedupe_score, decision, \
      assignment_rule_id, assignment_reason, sla_policy_id, first_response_due_at, \
      first_response_at, escalated_at, spam_score, rejection_reason, received_at, \
      converted_at, created_at, updated_at";
@@ -632,7 +633,20 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
             "duplicate",
             Some("duplicate"),
             None,
-            Some(found.contact_id),
+            // **The pointer is the LEAD this repeats, and this is where that used to go wrong.**
+            // `duplicate_of` is a foreign key to `crm_leads`; the obvious thing to put here is
+            // the contact that matched, and for fourteen ticks that is exactly what the code
+            // did — in an `update` *after* the insert, so the failure was a 23503 raised by a
+            // statement whose only job was bookkeeping. On any installation with the CRM, a
+            // `reject_duplicate` source therefore answered `500` to every visitor, and no test
+            // here could see it: `crm_contacts` is absent on this branch, so the dedupe pass
+            // never returns a candidate and the arm is dead code in every test.
+            //
+            // The matched contact is recorded in `dedupe_contact_id` (see below) and
+            // `duplicate_of` stays null here. When a *lead* pointer is genuinely available — a
+            // previous submission from the same visitor — that is the column's one writer, so
+            // it keeps a single meaning.
+            None,
             Some(format!(
                 "duplicate of an existing contact (matched on {})",
                 found.key.as_str()
@@ -665,6 +679,19 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
         ),
     };
 
+    // The contact the verdict matched and the confidence it reached, taken **once** from the
+    // verdict rather than from the match arm above. Two sources for this number is how the
+    // queue and the timeline end up disagreeing about a row, and the score is the only thing
+    // that makes a `duplicate` claim checkable rather than asserted.
+    let (matched_contact, matched_score) = match &verdict {
+        Verdict::Matched(found) => (Some(found.contact_id), Some(found.score)),
+        Verdict::Ambiguous(found) => match found.first() {
+            Some(first) => (Some(first.contact_id), Some(first.score)),
+            None => (None, None),
+        },
+        Verdict::Unique => (None, None),
+    };
+
     let lead = insert_lead(
         pool,
         submission,
@@ -677,6 +704,8 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
             decision: decision.map(str::to_string),
             contact_id,
             duplicate_of,
+            dedupe_contact_id: matched_contact,
+            dedupe_score: matched_score,
             dedupe_key: key,
             rejection_reason: reason,
             consent_given,
@@ -685,24 +714,17 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
     )
     .await?;
 
-    // A duplicate row points at the *contact* it matched, and the queue is built from the
-    // lead's own decision — so it is written here rather than derived later, because a
-    // duplicate queue that has to re-run the dedupe to be displayed is a queue that shows
-    // different answers tomorrow.
-    if decision == Some("duplicate") && contact_id.is_none() && duplicate_of.is_none() {
-        let best = match &verdict {
-            Verdict::Matched(found) => Some(found),
-            Verdict::Ambiguous(found) => found.first(),
-            Verdict::Unique => None,
-        };
-        if let Some(first) = best {
-            sqlx::query("update crm_leads set duplicate_of = $2 where id = $1")
-                .bind(lead.id)
-                .bind(first.contact_id)
-                .execute(pool)
-                .await?;
-        }
-    }
+    // A duplicate row used to get its contact pointer from a second statement here, and that
+    // statement wrote a `crm_contacts` id into `crm_leads.duplicate_of` — a foreign key to
+    // `crm_leads`. On an installation with the CRM it raised 23503 and failed a submission
+    // whose lead row had already been written correctly; on an installation without the CRM it
+    // never ran at all. The pointer and the score are written by the insert now, and there is
+    // deliberately no second statement: a lead row is written once, and bookkeeping cannot fail
+    // a capture.
+    debug_assert!(
+        !lead.duplicate_of.eq(&lead.dedupe_contact_id) || lead.dedupe_contact_id.is_none(),
+        "the matched contact must be stored in dedupe_contact_id, never in duplicate_of"
+    );
 
     record_source_outcome(pool, source.id, true, None).await?;
     Ok(Captured {
@@ -757,8 +779,18 @@ struct LeadWrite {
     decision: Option<String>,
     /// Contact it was linked to.
     contact_id: Option<Uuid>,
-    /// Contact it duplicates.
+    /// The earlier **lead** it repeats, when one is known.
+    ///
+    /// Never a contact: `crm_leads.duplicate_of` is a foreign key to `crm_leads`, and the
+    /// matched contact belongs in `dedupe_contact_id`. The two being one column is the defect
+    /// migration `0144` exists to separate.
     duplicate_of: Option<Uuid>,
+    /// The contact the dedupe verdict matched.
+    ///
+    /// Written by the insert rather than by a second statement, so a lead row is written once.
+    dedupe_contact_id: Option<Uuid>,
+    /// The score, as a column the database bounds rather than a number the code promises.
+    dedupe_score: Option<f64>,
     /// The normalized dedupe key.
     dedupe_key: Option<String>,
     /// Why it was rejected or duplicated.
@@ -788,9 +820,10 @@ async fn insert_lead(
           last_name, email, phone, company_name, job_title, product_interest, message, \
           consent_text, consent_given, utm_source, utm_medium, utm_campaign, utm_term, \
           utm_content, click_id, referrer_host, landing_path, source_path, payload, \
-          payload_bytes, dedupe_key, decision, spam_score, rejection_reason, received_at) \
+          payload_bytes, dedupe_key, dedupe_contact_id, dedupe_score, decision, spam_score, \
+          rejection_reason, received_at) \
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,\
-         $23,$24,$25,$26,$27,$28,$29,$30,$31,$32) returning {LEAD_COLUMNS}"
+         $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34) returning {LEAD_COLUMNS}"
     );
     let lead = sqlx::query_as::<_, Lead>(&query)
         .bind(submission.organization_id)
@@ -821,6 +854,8 @@ async fn insert_lead(
         .bind(payload)
         .bind(payload_bytes)
         .bind(write.dedupe_key.as_deref())
+        .bind(write.dedupe_contact_id)
+        .bind(write.dedupe_score)
         .bind(write.decision.as_deref())
         .bind(write.spam_score)
         .bind(write.rejection_reason.as_deref())
@@ -1309,7 +1344,11 @@ impl BulkAssignReport {
             .map(|(text, count)| format!("{count} x {text}"))
             .collect::<Vec<_>>()
             .join("; ");
-        format!("{} of {} leads were assigned. {detail}", self.applied(), self.results.len())
+        format!(
+            "{} of {} leads were assigned. {detail}",
+            self.applied(),
+            self.results.len()
+        )
     }
 }
 
@@ -1352,28 +1391,27 @@ pub async fn bulk_assign_owner(
 
     let mut report = BulkAssignReport::default();
     for id in ids {
-        let outcome = match assign_owner(pool, organization_id, *id, owner, reason, actor_user_id)
-            .await
-        {
-            Ok(Some(_)) => BulkAssignOutcome {
-                id: *id,
-                done: true,
-                reason: None,
-            },
-            // A lead of another organization is not a row, and the batch says so rather than
-            // pretending the caller asked for something that does not exist — `404` for one
-            // id in a list of twenty is not an error the operator can act on.
-            Ok(None) => BulkAssignOutcome {
-                id: *id,
-                done: false,
-                reason: Some("no such lead in this organization".to_string()),
-            },
-            Err(error) => BulkAssignOutcome {
-                id: *id,
-                done: false,
-                reason: Some(error.to_string()),
-            },
-        };
+        let outcome =
+            match assign_owner(pool, organization_id, *id, owner, reason, actor_user_id).await {
+                Ok(Some(_)) => BulkAssignOutcome {
+                    id: *id,
+                    done: true,
+                    reason: None,
+                },
+                // A lead of another organization is not a row, and the batch says so rather than
+                // pretending the caller asked for something that does not exist — `404` for one
+                // id in a list of twenty is not an error the operator can act on.
+                Ok(None) => BulkAssignOutcome {
+                    id: *id,
+                    done: false,
+                    reason: Some("no such lead in this organization".to_string()),
+                },
+                Err(error) => BulkAssignOutcome {
+                    id: *id,
+                    done: false,
+                    reason: Some(error.to_string()),
+                },
+            };
         report.results.push(outcome);
     }
     Ok(report)
@@ -1782,6 +1820,194 @@ pub async fn record_response(
         .await?;
     }
     Ok(updated)
+}
+
+/// What an operator decided about a filed duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateDecision {
+    /// Attach the lead to the contact its own dedupe pass recorded.
+    Link,
+    /// File it as a lead in its own right: the match was wrong, or it is a second enquiry.
+    KeepSeparate,
+}
+
+impl DuplicateDecision {
+    /// Parse the wire name.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "link" => Some(Self::Link),
+            "keep_separate" => Some(Self::KeepSeparate),
+            _ => None,
+        }
+    }
+}
+
+/// The answer a duplicate decision produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateResolution {
+    /// The lead after the decision.
+    pub lead: Lead,
+    /// The contact it was attached to, when the decision was `Link`.
+    pub contact_id: Option<Uuid>,
+    /// Why the decision could not be carried out, when it could not.
+    pub refused: Option<String>,
+}
+
+/// Reverse a filed duplicate verdict.
+///
+/// **This lives in the store and not in the panel, because only the store knows the matched
+/// contact.** The queue's `Link` button used to send `PATCH { status: "assigned" }`; `patch_lead`
+/// takes `contact_id` from the patch or else from the existing row, and a duplicate row has
+/// none — so the row left the queue, the panel announced "linked to the contact it matched", and
+/// no contact had been touched. The panel cannot even *name* the right contact, so an endpoint
+/// that required it would have pushed the bug somewhere less visible rather than fixing it.
+///
+/// Two refusals, both of them about a row the operator is misreading:
+///
+/// * **A lead with no recorded match cannot be linked.** `duplicate_of` (a lead pointer) is not a
+///   fallback for `dedupe_contact_id`; one is an id of a lead and the other of a contact, and
+///   using one where the other belongs is the defect this file's header is about.
+/// * **A row that is not a duplicate claim is refused rather than silently restated.** Pressing
+///   `Keep separate` on a lead that was never filed as one would write a status change to a row
+///   nobody asked about; the answer names the status it actually has.
+pub async fn resolve_duplicate(
+    pool: &PgPool,
+    organization_id: Uuid,
+    lead_id: Uuid,
+    decision: DuplicateDecision,
+    actor_user_id: Option<Uuid>,
+) -> Result<Option<DuplicateResolution>> {
+    let Some(existing) = find_lead(pool, organization_id, lead_id).await? else {
+        // Another organization's lead answers the same `None` as a lead that is gone, on the
+        // same principle as every other read in this module: a panel that can tell those apart
+        // can enumerate ids.
+        return Ok(None);
+    };
+
+    let is_duplicate_claim = existing.status == "duplicate" || existing.duplicate_of.is_some();
+    let (previous_status, matched_contact) = (existing.status.clone(), existing.dedupe_contact_id);
+    if !is_duplicate_claim {
+        return Ok(Some(DuplicateResolution {
+            lead: existing,
+            contact_id: None,
+            refused: Some(format!(
+                "this lead is filed as \"{previous_status}\", not as a duplicate — there is no verdict to reverse"
+            )),
+        }));
+    }
+
+    // The outcome is a value of its own type rather than a `(status, label, refusal)` tuple: the
+    // first version returned a `decision_label` that was *sometimes* a refusal sentence and
+    // decided which by `label.len() > 8`, which is a string's length standing in for a type
+    // distinction. `linked` is six characters and `kept_separate` is thirteen, so the test was a
+    // "did somebody write a sentence" heuristic that the next label would silently defeat.
+    let outcome = match decision {
+        DuplicateDecision::Link => match matched_contact {
+            Some(contact) => Outcome::Attach(contact),
+            // The ambiguous case is worth its own sentence: several contacts matched and the
+            // queue shows every one of them, so "no match" here would read as a platform bug.
+            None => Outcome::Refused(
+                "this duplicate matched several contacts or none — open the lead and pick one"
+                    .to_string(),
+            ),
+        },
+        DuplicateDecision::KeepSeparate => Outcome::Separate,
+    };
+
+    if let Outcome::Attach(contact) = outcome {
+        let status = "assigned";
+        let decision_label = "linked";
+        let contact_id = Some(contact);
+        let query = format!(
+            "update crm_leads set status = $3, contact_id = $4, updated_at = now() \
+             where organization_id = $1 and id = $2 returning {LEAD_COLUMNS}"
+        );
+        let updated = sqlx::query_as::<_, Lead>(&query)
+            .bind(organization_id)
+            .bind(lead_id)
+            .bind(status)
+            .bind(contact_id)
+            .fetch_optional(pool)
+            .await?;
+        if let Some(lead) = &updated {
+            append_event(
+                pool,
+                lead.id,
+                "duplicate_decided",
+                actor_user_id,
+                serde_json::json!({
+                    "decision": decision_label,
+                    "previous_status": existing.status,
+                    "contact_id": contact_id.map(|id| id.to_string()),
+                    "dedupe_key": lead.dedupe_key,
+                    "dedupe_score": lead.dedupe_score,
+                }),
+            )
+            .await?;
+        }
+        return Ok(updated.map(|lead| DuplicateResolution {
+            lead,
+            contact_id,
+            refused: None,
+        }));
+    }
+
+    match outcome {
+        // Unreachable: the `Attach` arm above returns. Written out rather than `unreachable!()`
+        // so a future arm added to `Outcome` gets a compile error here instead of a panic in a
+        // request handler.
+        Outcome::Attach(_) => Ok(None),
+        Outcome::Separate => {
+            let query = format!(
+                "update crm_leads set status = 'new', updated_at = now() \
+                 where organization_id = $1 and id = $2 returning {LEAD_COLUMNS}"
+            );
+            let updated = sqlx::query_as::<_, Lead>(&query)
+                .bind(organization_id)
+                .bind(lead_id)
+                .fetch_optional(pool)
+                .await?;
+            if let Some(lead) = &updated {
+                append_event(
+                    pool,
+                    lead.id,
+                    "duplicate_decided",
+                    actor_user_id,
+                    serde_json::json!({
+                        "decision": "kept_separate",
+                        "previous_status": existing.status,
+                        "contact_id": serde_json::Value::Null,
+                        "dedupe_key": lead.dedupe_key,
+                        "dedupe_score": lead.dedupe_score,
+                    }),
+                )
+                .await?;
+            }
+            Ok(updated.map(|lead| DuplicateResolution {
+                lead,
+                contact_id: None,
+                refused: None,
+            }))
+        }
+        // A refusal writes nothing and says why — the same rule as the conversion path's
+        // `conversion_skipped`: a row is never left looking decided when nothing was decided.
+        Outcome::Refused(reason) => Ok(Some(DuplicateResolution {
+            lead: existing,
+            contact_id: None,
+            refused: Some(reason),
+        })),
+    }
+}
+
+/// What resolving a duplicate verdict produced, before anything is written.
+enum Outcome {
+    /// Attach the lead to this contact.
+    Attach(Uuid),
+    /// File it as a lead in its own right.
+    Separate,
+    /// Nothing may be written; this is why.
+    Refused(String),
 }
 
 /// The duplicate queue: rows kept separate because something already matched them.

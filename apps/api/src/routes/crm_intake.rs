@@ -430,6 +430,18 @@ pub struct LeadBody {
     pub decision: Option<String>,
     /// The key the verdict matched on.
     pub dedupe_key: Option<String>,
+    /// The contact the dedupe verdict matched.
+    ///
+    /// Separate from `duplicate_of` (a *lead*) since migration `0144`: one column holding both
+    /// meanings is what made a `reject_duplicate` source fail every submission on an
+    /// installation with the CRM, because a contact id cannot satisfy a foreign key to
+    /// `crm_leads`.
+    pub dedupe_contact_id: Option<Uuid>,
+    /// The confidence the verdict was made on, 0.0-1.0.
+    ///
+    /// Shown beside the key because "duplicate of somebody" is not a decision an operator can
+    /// check — "`ayse@company.com` already exists, matched on e-mail at 0.95" is.
+    pub dedupe_score: Option<f64>,
     /// The lead this one duplicates.
     pub duplicate_of: Option<Uuid>,
     /// The reason it was rejected or filed as spam.
@@ -482,6 +494,8 @@ impl From<Lead> for LeadBody {
             decision: value.decision,
             dedupe_key: value.dedupe_key,
             duplicate_of: value.duplicate_of,
+            dedupe_contact_id: value.dedupe_contact_id,
+            dedupe_score: value.dedupe_score,
             rejection_reason: value.rejection_reason,
             spam_score: value.spam_score,
             first_response_due_at: value.first_response_due_at.map(|at| at.to_string()),
@@ -928,6 +942,96 @@ pub async fn list_leads(
         metrics: page.metrics,
         leads: page.leads.into_iter().map(LeadBody::from).collect(),
     }))
+}
+
+/// `POST /api/v1/crm/leads/{id}/duplicate-decision` — reverse a filed duplicate verdict.
+///
+/// A named endpoint rather than a `PATCH` on the lead, because only the store knows which
+/// contact the verdict matched. The queue's `Link` button used to send `{ status: "assigned" }`
+/// and nothing else: `patch_lead` keeps the existing `contact_id` when the patch has none, a
+/// duplicate row has none, so the row left the queue and the panel said it was linked to a
+/// contact it had never touched.
+///
+/// `crm.leads.manage` — the same key as rejecting a lead, because it is the same power: both
+/// change what a lead *is*. A reader of the queue decides nothing.
+pub async fn duplicate_decision(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(id): Path<Uuid>,
+    Json(body): Json<DuplicateDecisionBody>,
+) -> Result<Json<DuplicateDecisionBodyOut>, ApiError> {
+    let Some(decision) = store::DuplicateDecision::parse(body.decision.trim()) else {
+        return Err(ApiError::bad_request(
+            "invalid_duplicate_decision",
+            format!(
+                "\"decision\" must be one of {}",
+                ["link", "keep_separate"].join(", ")
+            ),
+        ));
+    };
+    let organization_id = organization_of(&session)?;
+    let pool = state.db().pool();
+    let resolution =
+        store::resolve_duplicate(pool, organization_id, id, decision, Some(session.user.id))
+            .await
+            .map_err(map_store)?
+            // A lead of another organization answers the same 404 as a lead that is gone.
+            .ok_or_else(|| not_found("lead"))?;
+
+    if let Some(reason) = &resolution.refused {
+        // A refusal is a `409`, not an error page: the request was well-formed and the answer
+        // is "not this row" — the same shape as the conversion path's partial success.
+        return Ok(Json(DuplicateDecisionBodyOut {
+            lead: LeadBody::from(resolution.lead),
+            contact_id: None,
+            applied: false,
+            reason: Some(reason.clone()),
+        }));
+    }
+
+    audit(
+        pool,
+        session.user.id,
+        organization_id,
+        "crm.lead.duplicate_decided",
+        id,
+        json!({
+            "decision": body.decision,
+            "contact_id": resolution.contact_id.map(|value| value.to_string()),
+        }),
+    )
+    .await;
+
+    Ok(Json(DuplicateDecisionBodyOut {
+        lead: LeadBody::from(resolution.lead),
+        contact_id: resolution.contact_id,
+        applied: true,
+        reason: None,
+    }))
+}
+
+/// The body of a duplicate decision.
+#[derive(Debug, Deserialize)]
+pub struct DuplicateDecisionBody {
+    /// `link` or `keep_separate`.
+    pub decision: String,
+}
+
+/// What a duplicate decision produced.
+#[derive(Debug, Serialize)]
+pub struct DuplicateDecisionBodyOut {
+    /// The lead after the decision.
+    pub lead: LeadBody,
+    /// The contact it was attached to, when the decision was `link`.
+    pub contact_id: Option<Uuid>,
+    /// Whether the decision was carried out.
+    ///
+    /// A separate flag rather than inferring it: "the row is unchanged" is the same observable
+    /// state as a decision that was applied and happened to be a no-op, and the panel has to
+    /// be able to say which one happened.
+    pub applied: bool,
+    /// Why it was not, when it was not.
+    pub reason: Option<String>,
 }
 
 /// `GET /api/v1/crm/leads/duplicates` — the duplicate queue.
@@ -1432,7 +1536,7 @@ pub async fn bulk_assign(
     if reason.is_empty() {
         return Err(ApiError::bad_request(
             "reason_required",
-            "an assignment says why \u2014 twenty leads that moved hands with no explanation \
+            "an assignment says why — twenty leads that moved hands with no explanation \
              cannot be explained to twenty people who had them",
         ));
     }
