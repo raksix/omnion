@@ -5534,3 +5534,75 @@ one of them is the actual security fix:
 tick the screen boxes for slice 1. Then slice 2 (headers + CSRF) — which is where the CSP,
 referrer-policy and HSTS settings finally give the two `unknown` rows in the overview something
 real to report, which is why those two rows are the most useful thing this tick left behind.
+
+## 2026-09-29 · wave 4 · REQ-053 slice 2 — the approval path, the exports and three screens (`fdc04e4`, `e8328a5`)
+
+**What.** The over-threshold adjustment now waits for a decision. `0127_inventory_adjustment_approvals.sql`,
+`modules/inventory/src/approvals.rs` (the request, the inbox, the decision, the withdrawal), the module's
+CSV writer, six new routes plus the threshold check inside `POST /movements`, `apps/admin/lib/inventory.ts`,
+three screens (stock list, movement ledger, adjustment inbox), the shared drawer, the nav entry and a depth
+pass that drives all three.
+
+**The rule, stated because the shape follows from it.** An adjustment over the organization's threshold changes
+nothing until somebody who did not ask for it says yes.
+
+**The decision this tick actually had to make: what is the request?**
+
+The cheap design is a `pending` flag on `inventory_movements`, and it breaks the one property the module
+exists for. The ledger is append-only and replayable, and `replay` is the *proof* that the rollup is honest.
+A ledger row whose meaning depends on a second table is a row whose meaning can change after the fact — and
+the replay stops being a proof and becomes a puzzle. So the request **holds the whole un-applied write**: item,
+location, kind, mode, quantity, reason, note, source. Approving replays those exact values through
+`record_movement`, the module's single write path. Two routes into one write function, never two write
+functions, because two write paths for one business rule is how a module ends up with two answers.
+
+**Second decision: the amount is absolute, not a percentage.** A variance of two units out of ten thousand is
+not a smaller mistake than two out of ten. A percentage rule waves the first through and stops the second,
+which is exactly backwards, and the approver would be asked about numbers that do not describe the mistake.
+
+**Third: the threshold is a snapshot.** Lowering the threshold after three requests are pending must not
+retroactively justify them, so the row carries the line it was measured against and the inbox prints the
+row's number rather than today's setting.
+
+**Proof.**
+
+* `cargo test -p omnion-module-inventory --quiet` — **60 passed, 0 failed** (47 from slice 1, 13 new: the
+  amount function, the threshold comparison including a threshold of zero, and the CSV writer's cells).
+* `cargo build -p omnion-api --quiet` — clean.
+* `pnpm --filter @omnion/admin typecheck` — clean.
+* QA pass on the private stack (`QA_STACK=w4`, ports 18083/3103/3203, database `omnion_qa_w4`).
+
+**Two tests that fought each other, and what the fight was about.**
+
+The CSV writer guards a cell beginning with `=`, `+`, `-` or `@` so an item name cannot become a formula in
+the approver's spreadsheet. My first version guarded every leading `-`. That is the bug, and it is the worst
+kind: **a ledger export is mostly negative numbers**, so the guard turned the export into a column of text —
+worse than the injection it prevents, and invisible because the file still opens. The rule is that `-` starts
+a formula only when something *evaluable* follows it, so `-1.500` and `- 3 units` pass through and a bare `-`
+or `-cmd` is guarded. Two assertions failed before the function and the tests agreed, and the loser was the
+tests; the doc comment now states the rule the function implements, because "the rule" and "the function"
+disagreeing is how the next reader picks the wrong one.
+
+**A test that measured nothing.** The first filter assertion checked only that some negative row appeared,
+which passes on a filter wired to nothing. It is now a **conjunction**: after asking for negatives, either
+nothing matches or every row shown is negative.
+
+**The "no edits" affordance, measured.** The spec asks for "no pencil icon on rows". The depth pass counts
+every control a ledger row carries and **fails** the pass if any label reads edit, delete, remove or void — a
+promise the server keeps with a `405` deserves an assertion, not a reviewer's eye.
+
+**Not proved this tick, and said so rather than ticked.**
+
+The **transfer line cap** and the **low-stock alert** boxes stay unticked: they are slice 3. The mobile
+one-handed box stays unticked — the drawer is built as a full-screen sheet with `inputMode="decimal"`, but a
+build is not a measurement, and the box asks for 390×844 use. The stocktake box is slice 4.
+
+**Next.**
+
+Slice 3 — transfers (draft, dispatch, receive, cancel) and the low-stock alert sweep with REQ-021's
+notifications. The `in_transit` location kind, the `TransferOut`/`TransferIn` kinds and the `stocktake_variance`
+reason code already exist in slice 1 with **no route behind them**, which is the same shape of gap this slice
+just closed: the schema can be right and the feature absent.
+
+**Migrations.** `0127_inventory_adjustment_approvals.sql` — taken above the shared high-water, which now reads
+main 0123, wave3 0125, wave9 0125, wave2 0124. Mine are 0053, 0054, 0055, 0057, 0125, 0126 and now 0127.
