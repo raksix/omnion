@@ -5087,7 +5087,6 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
 
-<<<<<<< HEAD
 ## Wave 4b / w8 tick 17b — the fixture fix exposed the product bug it had been hiding
 
 With the pass able to build its own tenant (tick 17), the CRM screens rendered — 36–40 real
@@ -5591,7 +5590,7 @@ the CRM screens remain un-walked and no line in the REQ claims otherwise.
 (2) A full `scripts/qa/run.sh` on the private stack once the slot clears, now that the roll-up fix has landed and
 the routing chain is actually wired for it to observe. (3) Check `git status` first: `scripts/qa/run.sh` and
 `scripts/qa/cargo-slot{,-test}.sh` belong to a parallel session in this worktree — untouched, uncommitted.
-=======
+
 ## Tick 63 — REQ-010 slice 2's last open item: the serve path answers a window
 
 **What.** HTTP range requests, the one line REQ-010 has carried as "still open" since slice 2:
@@ -5882,4 +5881,3 @@ what might be there. (b) `objects/` grows one file per object, and the delete ro
 remove the directory as well as the run's own JSON — check that before the restore wizard
 exists, because an operator who deletes a backup and finds the files still there will assume
 the product lied.
->>>>>>> origin/main
