@@ -6396,3 +6396,70 @@ sweep tells the operator what is actually on the destination. (b) The `partial` 
 unticked — a run where one part fails ends as `partial` with the message visible in the UI
 needs a fault injected into the drawer, not a test.
 
+
+## Tick 68 — wave 5 (REQ-017 slices 3–4): the clone reached the *public* read, twice, in both directions
+
+**What.** Two isolation defects the staging clone created outside the panel, and one missing
+header the acceptance list had been carrying unticked since the request was written.
+
+**The `500` half was the one I expected.** Migration 0148 moved a page's identity from
+`(site_id, slug)` to `(site_id, environment_id, slug)`, and `pages::find_page_by_slug` still
+matched the first two. A staging environment holding a copy of a published slug made the public
+read match **two** rows, and `fetch_optional` over two rows is not "the first one" — it is a
+protocol error. `GET /api/v1/public/pages/{slug}` answered `500` for every address the clone had
+copied. The fix makes the environment a **required argument** of the function rather than a
+filter, so there is no version of it that can look at more than one environment, and the public
+renderer resolves the organization's production environment explicitly (a missing one answers the
+public `404`, never a `500` that would disclose an installation is missing its own invariant).
+
+**The leak half was the one the red run found first, and it is the worse of the two.** A page
+that exists **only** in staging matches exactly *one* row under the broken signature — so the read
+answered `200` and served an unpublished staging draft to every visitor of production. I had
+written the test expecting the `500`, and the very first red run came back `200` against an
+assertion of `404`. A test written to expect the crash would have gone **green against a handler
+that published staging**, because the crash is a loud failure and the leak is a silent one. The
+assertion that caught it is the last one in the walk, not the first. Recorded because the
+temptation on a green walk is always to move the "annoying" assertion to the top.
+
+**`noindex` is a layer, not a line.** The header was unticked for four ticks. It cannot be a
+handler line: "is this address staging" is a property of the **host**, not of the status the
+handler chose, so a handler that stamps its own return value covers the `200` and leaves the
+`404` unindexed — the first thing a crawler learns about that host is then inconsistent. The
+`noindex` middleware sits above the public route and stamps whatever leaves, and
+`find_staging_by_host` is the one read in the environment store deliberately **not** scoped by
+organization (a visitor has no organization yet; the answer is one row chosen by an exact indexed
+host match, and the only thing the caller may learn from it is whether the address is staging).
+The walk reads the header on a `200` and a `404`, proves the same host carries none before the
+environment exists and none after it is archived, and proves production is never marked — the
+last leg matters because a layer that stamps unconditionally is one line away from deindexing
+every site in the installation.
+
+**Proof.** `omnion-environment --lib` **51/0** · `omnion-content --lib` **15/0** · `omnion-api
+--lib` **263/0** · `pnpm typecheck` **2/2** · the two new walks green in isolation
+(`a_staging_copy_must_not_break_or_leak_into_the_public_read` 1/0 in 6.4s,
+`a_staging_host_answers_noindex_and_a_production_one_does_not` 1/0 in 7.0s), each preceded by a
+mutation run that is red **for the right reason** — the first by the `200`-instead-of-`404` leak,
+the second by `left: None, right: Some("noindex, nofollow")` with the layer unwired and the file
+restored byte-for-byte afterwards.
+
+**Blocker, fourth tick running, unchanged and not worked around.** The `omnion-api --test
+environments` **full** suite did not complete: it is 36 integration walks each building a scratch
+database, and the box could not give it connections. A first run reported **7 passed / 28 failed**
+and the next **14 / 21** — every failure `Database(PoolTimedOut)` at the shared IAM seed, with
+`pg_stat_activity` at 50–55 of 100 and seven writer suites live. A `--test-threads=2` run then
+**hung for ten minutes** with tests reporting "running for over 60 seconds" while the database
+showed *zero* blocked locks and the scratch connections `idle` on the seed statement — contention,
+not a deadlock and not a product fault. I killed it, dropped the two orphaned
+`omnion_env_*` scratch databases it left (a killed run's scratch DB is the residue the next run
+reclaims) and re-ran the two walks I had changed, in isolation, green. **The honest summary is
+that the other 34 walks have not been re-verified this tick**, which is why nothing here closes a
+REQ. The browser gate did not run either: the QA slot has been held by a live sibling for four
+ticks and `/mnt/apopic` sat at 100% (501M free) with load 13–16.
+
+**Next.** (a) The environment chip and the non-dismissible banner still owe the browser pass —
+`runEnvironmentsDepth` has nine claims that have never executed, and a screen nobody has opened is
+not a screen that works. (b) Slice 4's remaining item is **large-site batching**: the runner
+batches, but no walk crosses a batch boundary, so the ceiling and the progress reporting past it
+are unverified. (c) Large-host Postgres contention needs a per-writer connection budget rather
+than a shared 100 — a walk suite that opens a scratch database per test is a different shape of
+load from a crate's unit tests, and it competes with six sibling writers for the same pool.

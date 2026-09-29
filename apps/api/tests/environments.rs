@@ -47,6 +47,9 @@ struct TestResponse {
     status: StatusCode,
     /// Every `Set-Cookie`, so the CSRF cookie login issued is not lost.
     set_cookies: Vec<String>,
+    /// Every response header, so a walk can read a header the *middleware* set rather than the
+    /// handler — `X-Robots-Tag` is attached on the way out and never appears in a body.
+    headers: axum::http::HeaderMap,
     body: Value,
 }
 
@@ -60,6 +63,14 @@ impl TestResponse {
                 .map(|(_, value)| value.trim().to_owned())
         })
     }
+
+    /// A header as a plain string, for the walks that assert on a header by name.
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    }
 }
 
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
@@ -68,8 +79,8 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
-    let set_cookies: Vec<String> = response
-        .headers()
+    let headers = response.headers().clone();
+    let set_cookies: Vec<String> = headers
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
@@ -89,6 +100,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     TestResponse {
         status,
         set_cookies,
+        headers,
         body,
     }
 }
@@ -489,11 +501,24 @@ struct Fixture {
     caller_user_id: Uuid,
 }
 
-const ALL_PERMISSIONS: [&str; 4] = [
+/// The deployment keys this suite's administrator holds.
+///
+/// The content keys are here because the public-read walk below has to publish a page through
+/// the real route rather than setting `status = 'published'` by hand: a page with no published
+/// revision answers `404` on the public surface, so a hand-set status would test a fixture the
+/// platform never produces. Granting them on this one account does not weaken the permission
+/// walks — those build their own accounts with deliberately narrower key sets.
+const ALL_PERMISSIONS: [&str; 10] = [
     "deployment.read",
     "deployment.preview",
     "deployment.deploy",
     "deployment.rollback",
+    "content.pages.read",
+    "content.pages.create",
+    "content.pages.update",
+    "content.pages.delete",
+    "content.pages.publish",
+    "content.pages.schedule",
 ];
 
 impl Fixture {
@@ -527,6 +552,16 @@ impl Fixture {
 
     /// Create a staging environment through the API and return its id.
     async fn create_staging(&self, name: &str, key: &str) -> Value {
+        self.create_staging_inner(name, key, Value::Null).await
+    }
+
+    /// The same create, with a staging host — the only difference that matters to a walk that
+    /// reads a response by the host it arrived on.
+    async fn create_staging_with_host(&self, name: &str, key: &str, host: &str) -> Value {
+        self.create_staging_inner(name, key, json!(host)).await
+    }
+
+    async fn create_staging_inner(&self, name: &str, key: &str, host: Value) -> Value {
         let response = call(
             &self.state,
             request(
@@ -536,6 +571,7 @@ impl Fixture {
                 Some(json!({
                     "name": name,
                     "key": key,
+                    "staging_host": host,
                     "areas": ["pages", "translations", "workflows", "site_settings"],
                     "exclude_archived": false,
                 })),
@@ -698,6 +734,297 @@ async fn the_list_carries_real_per_area_counts_after_the_clone_finishes() {
     assert_eq!(staging["clone"]["status"], "done");
     assert_eq!(staging["clone"]["percent"], 100);
     assert_eq!(staging["clone"]["cancellable"], false);
+}
+
+/// Publish one production page through the real route, the way an editor does.
+///
+/// Used by the public-read walk below: a page that is `published` in the column but has no
+/// published revision answers `404` on the public surface, so the walk has to go through the
+/// publish route rather than setting a status by hand.
+async fn publish_page_via_api(state: &AppState, caller: &Caller, site_id: Uuid, slug: &str) -> Uuid {
+    let created = call(
+        state,
+        request(
+            Method::POST,
+            "/api/v1/pages",
+            Some(caller),
+            Some(json!({ "site_id": site_id, "slug": slug, "title": "Shared", "body": "body" })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "create: {}", created.body);
+    let page_id = Uuid::parse_str(created.body["id"].as_str().unwrap()).unwrap();
+
+    let published = call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/pages/{page_id}/publish"),
+            Some(caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(published.status, StatusCode::OK, "publish: {}", published.body);
+    page_id
+}
+
+/// The public read of one address, anonymously, addressed by site key.
+async fn public_read(state: &AppState, site_key: &str, slug: &str) -> TestResponse {
+    let response = call(
+        state,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/public/pages/{slug}?site={site_key}"))
+            .body(Body::empty())
+            .expect("request must build"),
+    )
+    .await;
+    response
+}
+
+/// Migration 0148 made `(site_id, environment_id, slug)` the identity of a page, but
+/// `pages::find_page_by_slug` still matched `(site_id, slug)`. The clone copies production into
+/// staging, so a slug that exists in both environments matched **two** rows — and
+/// `fetch_optional` over two rows is not "the first one", it is a protocol error, so
+/// `GET /api/v1/public/pages/{slug}` answered `500` for every address the clone had copied.
+///
+/// The leak is the same defect read from the other side, and the red run proved it *first*:
+/// a page that exists **only** in staging matched exactly one row, so the read answered `200`
+/// and served an unpublished draft to every visitor of production. A test written to expect
+/// `500` would have gone green against a handler that published staging — the failure this walk
+/// was written for is the *silent* one, and the assertion that caught it is the last one in the
+/// walk, not the first.
+///
+/// That is the shape this walk keeps closed: creating a staging environment must not take the
+/// public site down, and staging content must be reachable *only* through the staging address.
+#[tokio::test]
+async fn a_staging_copy_must_not_break_or_leak_into_the_public_read() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site_key: String =
+        sqlx::query_scalar("select key from sites where id = $1")
+            .bind(fixture.site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the site carries a key");
+
+    let page = publish_page_via_api(&fixture.state, &fixture.caller, fixture.site, "shared").await;
+
+    let before = public_read(&fixture.state, &site_key, "shared").await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "before any staging copy the public read answers: {}",
+        before.body
+    );
+    assert_eq!(before.body["revision"]["title"], "Shared");
+
+    // Clone it. The clone is the thing that creates the second row.
+    let created = fixture.create_staging("Staging", "staging-leak").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    let copies: i64 = sqlx::query_scalar(
+        "select count(*) from pages where site_id = $1 and slug = 'shared'",
+    )
+    .bind(fixture.site)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        copies, 2,
+        "this walk is only meaningful while the site really holds two environments' copies"
+    );
+
+    // The half that was broken: the public read must still answer.
+    let after = public_read(&fixture.state, &site_key, "shared").await;
+    assert_eq!(
+        after.status,
+        StatusCode::OK,
+        "a staging copy must not take the public read down: {}",
+        after.body
+    );
+
+    // And the staging copy must not have become the answer. A staging page is a different row
+    // with its own revision; if the read ever widens to "any row with this slug", a visitor reads
+    // a draft nobody published.
+    let staging_page: Uuid =
+        sqlx::query_scalar("select id from pages where environment_id = $1 and slug = 'shared'")
+            .bind(environment_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    sqlx::query("update page_revisions set title = 'Staging only' where page_id = $1")
+        .bind(staging_page)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    let after_edit = public_read(&fixture.state, &site_key, "shared").await;
+    assert_eq!(after_edit.status, StatusCode::OK, "body: {}", after_edit.body);
+    assert_ne!(
+        after_edit.body["revision"]["title"], "Staging only",
+        "the public read must serve the production revision, never the staging copy"
+    );
+
+    // A page that exists only in staging is not a page a visitor can reach.
+    let staging_only: Uuid = sqlx::query_scalar(
+        "insert into pages (site_id, slug, status, environment_id) \
+         values ($1, 'drafts-only', 'published', $2) returning id",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into page_revisions (page_id, revision_no, state, title, body) \
+         values ($1, 1, 'published', 'Drafts only', 'body')",
+    )
+    .bind(staging_only)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    let leaked = public_read(&fixture.state, &site_key, "drafts-only").await;
+    assert_eq!(
+        leaked.status,
+        StatusCode::NOT_FOUND,
+        "a page that exists only in staging is not published content: {}",
+        leaked.body
+    );
+
+    // The production row is still the one the panel edits; the staging edit changed nothing.
+    let production_slug: String = sqlx::query_scalar("select slug from pages where id = $1")
+        .bind(page)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(production_slug, "shared");
+}
+
+/// The public read addressed by a `Host` header, as a browser or a crawler arrives.
+async fn public_read_at_host(
+    state: &AppState,
+    site_key: &str,
+    host: &str,
+    slug: &str,
+) -> TestResponse {
+    call(
+        state,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/public/pages/{slug}?site={site_key}"))
+            .header("host", host)
+            .body(Body::empty())
+            .expect("request must build"),
+    )
+    .await
+}
+
+/// A staging host answers `X-Robots-Tag: noindex`; a production host does not.
+///
+/// The criterion is one clause of REQ-017's acceptance list and it was unticked for four ticks
+/// while the environment screens were being finished, because "the panel says staging is not
+/// public" is not the same claim as "a crawler is told". The one that matters is the header, and
+/// the only place it can be said is the response — a staging host serves a *published* page, so
+/// nothing else about the response says otherwise.
+///
+/// Three things are pinned deliberately:
+///
+///   * the marker is on a **404** as well as a 200. A handler that stamps its own return value
+///     covers the happy path and leaves the not-found path indexable, which is how a host ends
+///     up unindexed at one path and indexed at another — the walk asks for an address that
+///     exists only in staging, so the `404` *is* the interesting response here;
+///   * production is **not** marked. A layer that stamps unconditionally is a one-line change
+///     away from telling every site in the installation not to be indexed, and the walk reads
+///     the same header on a production address to prove it is absent rather than assumed;
+///   * the marker follows the **host**, not the site: the same page on the same site is
+///     indexable on one address and not on the other, which is the whole point of a staging host.
+#[tokio::test]
+async fn a_staging_host_answers_noindex_and_a_production_one_does_not() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site_key: String =
+        sqlx::query_scalar("select key from sites where id = $1")
+            .bind(fixture.site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the site carries a key");
+
+    publish_page_via_api(&fixture.state, &fixture.caller, fixture.site, "indexed").await;
+
+    // Before any staging host exists, the same address is indexable. Without this leg the
+    // walk would pass on a response that carries the header unconditionally.
+    let staging_host = format!("staging-{}.omnion.test", Uuid::new_v4().simple());
+    let before = public_read_at_host(&fixture.state, &site_key, &staging_host, "indexed").await;
+    assert_eq!(before.status, StatusCode::OK, "body: {}", before.body);
+    assert_eq!(
+        before.header("x-robots-tag"),
+        None,
+        "a host no staging environment owns must be indexable"
+    );
+
+    let created = fixture
+        .create_staging_with_host("Staging", "noindex-walk", &staging_host)
+        .await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // The published page, on the staging host.
+    let marked = public_read_at_host(&fixture.state, &site_key, &staging_host, "indexed").await;
+    assert_eq!(marked.status, StatusCode::OK, "body: {}", marked.body);
+    assert_eq!(
+        marked.header("x-robots-tag").as_deref(),
+        Some("noindex, nofollow"),
+        "a staging host must refuse indexing on a page it serves: {:?}",
+        marked.headers
+    );
+
+    // The 404 leg: an address nobody published, on the same staging host. The mark is a property
+    // of the address, so it holds here too.
+    let missing = public_read_at_host(&fixture.state, &site_key, &staging_host, "never-published")
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "body: {}", missing.body);
+    assert_eq!(
+        missing.header("x-robots-tag").as_deref(),
+        Some("noindex, nofollow"),
+        "a staging host must refuse indexing even where it has nothing to serve: {:?}",
+        missing.headers
+    );
+
+    // Production, again, by the site's own key address: unchanged.
+    let production = public_read(&fixture.state, &site_key, "indexed").await;
+    assert_eq!(production.status, StatusCode::OK, "body: {}", production.body);
+    assert_eq!(
+        production.header("x-robots-tag"),
+        None,
+        "creating a staging environment must not deindex the live site"
+    );
+
+    // Archiving releases the host, and a released host is an ordinary address again.
+    let archived = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/environments/{environment_id}"),
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(archived.status, StatusCode::OK, "archive: {}", archived.body);
+
+    let after_archive = public_read_at_host(&fixture.state, &site_key, &staging_host, "indexed").await;
+    assert_eq!(after_archive.status, StatusCode::OK, "body: {}", after_archive.body);
+    assert_eq!(
+        after_archive.header("x-robots-tag"),
+        None,
+        "an archived environment no longer holds the host, so the host is not staging any more"
+    );
 }
 
 #[tokio::test]

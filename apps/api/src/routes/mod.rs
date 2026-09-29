@@ -834,7 +834,17 @@ pub fn router(state: AppState) -> Router {
 
     // Public: the unauthenticated read surface of the site renderer. It serves published
     // content only, so it carries no permission guard — and no mutation can be reached here.
-    let public_pages = get(public::get_published_page);
+    //
+    // The `noindex` layer sits *above* the handler rather than inside it, because "is this
+    // address staging" is a fact about the host and not about the status the handler chose
+    // (REQ-017 slice 4). A handler marks its own `200` and forgets the `404`; a layer marks
+    // whatever leaves, so a staging host is never indexable at one path and indexable at
+    // another.
+    let public_pages = get(public::get_published_page)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            public::noindex_staging_hosts,
+        ));
 
     // A published page points at its own assets, so the library's read side is public too.
     let public_media = get(media::public_media);

@@ -17,7 +17,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use omnion_content::{ContentError, pages};
 use omnion_environment::store as environment_store;
@@ -216,6 +216,52 @@ pub async fn get_published_page(
         },
         &headers,
     ))
+}
+
+/// The `X-Robots-Tag` a staging address answers with, and nothing else.
+pub const STAGING_ROBOTS_TAG: &str = "noindex, nofollow";
+
+/// Stamp `noindex` on every response that left through a staging host.
+///
+/// REQ-017 slice 4 puts staging behind `noindex`, and the header is the only place it can be
+/// said: a staging host serves a *published* page, so every other signal — the response code,
+/// the content, the absence of a `sitemap` link — says "indexable", and the one fact that makes
+/// the page a mistake is one the renderer cannot see.
+///
+/// It is a **layer, not a line in the handler**, and that placement is the decision. A handler
+/// marks the `200` it returns and nothing else, so a staging address that answers `404` for an
+/// address nobody published would go out unmarked — and the first thing a crawler learns about
+/// that host is then inconsistent: an unindexed page here, an indexed one there, whichever it
+/// happened to reach. The mark belongs where the response *leaves*, because "is this address
+/// staging" is a property of the address and not of the status code.
+///
+/// The cost is one indexed equality probe on `staging_host` for the host the request arrived on
+/// — paid by production requests too. That is the trade the request names: a staging address
+/// cannot be indexed by forgetting to configure something.
+pub async fn noindex_staging_hosts(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers().clone();
+    let host = request_host(&headers);
+    let staging = match host {
+        Some(host) => environment_store::find_staging_by_host(state.db().pool(), &host)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+        None => false,
+    };
+
+    let mut response = next.run(request).await;
+    if staging {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-robots-tag"),
+            HeaderValue::from_static(STAGING_ROBOTS_TAG),
+        );
+    }
+    response
 }
 
 /// The query string a cache rule may key on: everything except the site hint.

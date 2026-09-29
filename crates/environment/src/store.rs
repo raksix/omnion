@@ -698,6 +698,39 @@ pub async fn cancel_job(
     Ok(row)
 }
 
+/// Read the environment a **staging host** addresses, across organizations.
+///
+/// This is the one read in this module that is deliberately *not* scoped by organization, and
+/// it is scoped by something else instead: the host. A visitor reaches staging by typing its
+/// address, long before they have a session or an organization, so the public read surface has
+/// nothing to scope by — and pretending otherwise would be a different lie, because the answer
+/// is a single row (or none) chosen by an exact host match, and it is a host the installation
+/// itself published. The header this produces is the *only* thing the caller may learn from it:
+/// whether this address is staging at all, so a search engine is told not to index it. The
+/// environment's own name, key, counts and clone history never travel with it.
+///
+/// The lookup answers `Ok(None)` for an unknown host rather than an error, because "no staging
+/// environment owns this address" is the ordinary case for every production request.
+pub async fn find_staging_by_host(
+    pool: &PgPool,
+    host: &str,
+) -> Result<Option<EnvironmentRow>, EnvironmentError> {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return Ok(None);
+    }
+    let sql = format!(
+        "select {ENVIRONMENT_COLUMNS} from environments \
+         where staging_host = $1 and status <> 'archived' limit 1"
+    );
+    let row = sqlx::query_as::<_, EnvironmentRow>(&sql)
+        .bind(&host)
+        .fetch_optional(pool)
+        .await
+        .map_err(store_error)?;
+    Ok(row)
+}
+
 /// Set an environment's status outside a transaction.
 async fn set_status_standalone(
     pool: &PgPool,

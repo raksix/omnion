@@ -6,9 +6,16 @@
 > staging environment could be created empty through the browser. `Area::copies()`/`Area::note()`
 > now declare the truth in the crate, the API carries `copies` + `note` on every option, the
 > shared areas are listed unticked and explained rather than hidden, and a unit test reads the
-> runner off disk so the two halves cannot drift again (`5c10e54`). **Still owed: the browser
-> gate** — the four `runEnvironmentsDepth` claims plus the five new ones for the clone areas have
-> never executed, and the box was at load 75–181 with `/dev/shm` at 100% for this tick
+> runner off disk so the two halves cannot drift again (`5c10e54`). Tick 68 closed the two isolation defects the clone created in
+ > the **public** read — a staging copy used to match two rows and answer `500`, and a page that
+ > existed only in staging used to answer `200` and publish an unpublished draft to every visitor
+ > of production; `pages::find_page_by_slug` now takes the environment as a *required* argument so
+ > the unsafe form cannot be written, and the public renderer resolves the organization's
+ > production environment explicitly. The same tick added the `noindex` layer, so a staging host
+ > answers `X-Robots-Tag: noindex, nofollow` on every status including the `404`. **Still owed:
+ > the browser gate** — the four `runEnvironmentsDepth` claims plus the five new ones for the
+ > clone areas have never executed, and for the fourth tick running the box has had no room
+ > (QA slot held by a live sibling; `/mnt/apopic` at 100%, load 13–16)
 > · **Captured:** 2026-09-25 ·
 > **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
@@ -153,6 +160,11 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
   counts.
 - [ ] Clone copies pages, revisions, translations, menus, site settings, theme selection and workflow definitions, and copies **no** media blobs (verified by storage object count before
   and after).
+  *(tick 67 is the reason this reads oddly: three of the six areas — theme selection, workflow
+  definitions and site settings — were being **labelled and priced** in the wizard while copying
+  **nothing**, and `Area::copies()` now declares the truth in the crate. The unticked box is
+  still honest: the criterion asks for a storage-object count across a clone, and no walk
+  measures one.)*
 - [x] Clone is idempotent: re-cloning an unchanged environment produces the same counts and no duplicate rows (natural keys are unique per environment).
 - [x] Staging nesting is refused with `staging_nesting_refused` for a staging source.
 - [x] Editing a page in staging leaves the production row byte-identical (asserted by comparing `updated_at` and revision hashes).
@@ -169,6 +181,7 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
   *(walk `promotion_history_detail_and_the_gates`: `GET /environments/{id}/promotions` returns the history newest-first with the set's own counts, `GET /promotions/{id}` returns the frozen items, and 403/404 are each proven separately. **The tab is built** (`61c8d1c`): open promotions sort above finished ones, each row carries the frozen counts and a conflict count in the attention tone, and the expand reads the record's own step log. It has not been through the browser pass yet — see the slice note below.)*
 - [ ] `promotion.*` events arrive at an endpoint subscribed to `promotion.*` within the delivery window.
 - [ ] The environment chip appears in the panel header while staging is active, the staging banner cannot be dismissed, and staging hosts answer with `X-Robots-Tag: noindex`.
+  *(the `noindex` half is done and walked: `a_staging_host_answers_noindex_and_a_production_one_does_not` reads the header on a staging host's `200` **and** its `404`, proves the same host carries no header before the environment exists and none after it is archived, and proves production is never marked. The mark is a **middleware layer**, not a line in the handler, because "is this address staging" is a fact about the host rather than the status — a handler marks its own `200` and forgets the `404`. The chip and the non-dismissible banner still owe the browser pass.)
 - [x] All new routes answer `403` without their permission and `404` for another organization's environment — `the_change_set_is_404_for_another_organization_and_403_without_the_key` proves both on the new route; the existing walks cover the other six.
 - [x] Archive releases the staging host and leaves the content readable in the archived state.
   *(integration walk `archiving_releases_the_host_and_keeps_the_content`; the browser half is
@@ -207,7 +220,15 @@ approved, applied atomically, visible in history, and emitted to a subscribed en
      and the row is written; the delivery half is REQ-016's runner, and is not yet proven against a
      real endpoint from here.
 4. **Hardening.** Clone cancel/retry, `noindex` on staging hosts, large-site batching, conflict refresh, error states and the archive path. *Done line:* a cancelled clone leaves no
-partial environment marked active, and a conflicted promotion is refused with item-level detail.
+   partial environment marked active, and a conflicted promotion is refused with item-level detail.
+   **Two of this slice's four items closed in tick 68** — the `noindex` layer (walk above) and
+   the archive path — `archiving_releases_the_host_and_keeps_the_content` for the release, and the
+   last leg of the `noindex` walk for the consequence: a released host stops being staging by
+   *ceasing* to answer as one, not by being told to. Clone cancel was already covered by
+   `cancelling_a_clone_leaves_the_environment_out_of_active`; **large-site batching remains**
+   unproven — the runner batches, but no walk crosses the batch boundary, so the ceiling and the
+   progress reporting past it are unverified. The slice stays open, and with it the REQ: a
+   REQ closes on its last slice, not on the one that is easiest to prove.
 
 ### Risks / notes
 
