@@ -39,6 +39,14 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
+# A CSRF secret for this disposable stack only, so the panel can save anything.
+#
+# The API's CSRF layer refuses rather than skips when no secret is configured — correct in
+# production, where a silent skip would be invisible — but that refusal is unconditional, so
+# every panel mutation answers `403 csrf_unavailable` on a stack that simply forgot to set one.
+# A walkthrough that creates a rule and watches it fail on that is measuring the harness, not the
+# product. This is a throwaway credential for a throwaway database on localhost.
+export OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-stack-csrf-secret-not-a-credential}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -112,12 +120,13 @@ if [ ! -x target/debug/omnion-api ] \
   cargo build -p omnion-api
 fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  pm2 restart "$API_NAME" >/dev/null
+  pm2 restart "$API_NAME" --update-env >/dev/null
 else
   OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
+  OMNION_CSRF_SECRET="$OMNION_CSRF_SECRET" \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }

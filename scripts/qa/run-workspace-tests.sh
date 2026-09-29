@@ -75,6 +75,15 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -v ON_ERROR_STOP=1 -tAc 
 export OMNION_DATABASE_URL="postgres://${PGUSER}@${PGHOST}:${PGPORT}/${DB}"
 export OMNION_REDIS_URL="${QA_REDIS_URL:-redis://127.0.0.1:6380}"
 export OMNION_ENV="${OMNION_ENV:-development}"
+# A CSRF secret for the GATE ONLY, so the cookie-authenticated suites can write.
+#
+# main's CSRF layer (`headers_middleware`) refuses rather than skips when no secret is
+# configured, which is the right production behaviour: a platform that silently drops CSRF
+# protection is worse than one that visibly refuses writes. But the refusal is unconditional,
+# so every suite that signs in with a cookie and then POSTs dies on
+# `403 csrf_unavailable ... (set OMNION_CSRF_SECRET)` — not on anything the code under test did.
+# A test secret is the whole point of a disposable stack; it is not a credential for anything.
+export OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-gate-csrf-secret-not-a-credential}"
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_INCREMENTAL=0
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
