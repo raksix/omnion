@@ -4273,8 +4273,13 @@ async function runMenusDepth(page, report) {
       // for going deeper is "Add a child under <row>", so the pass drives THAT — and then reads
       // the depth back from the store rather than counting the rows it drew, because three
       // visible labels is a two-level tree (a nested row renders inside its parent).
+      // The child's own label, read from the child's own row. Asking the PARENT row for a
+      // descendant label answers with the parent's text — a nested row is rendered inside its
+      // parent, so `… span:first-child` lands on the parent's button — and the button then named
+      // "Add a child under QA second" was pressed while the tree was already rooted there. The
+      // row carries the child's id, so that is what identifies it.
       const nestedLabel = await page
-        .locator(`[data-menu-item="${nestedChildId}"] [data-menu-item-row] span:first-child`)
+        .locator(`[data-menu-item-row="${nestedChildId}"] [data-menu-item-label] span:first-child`)
         .first()
         .innerText()
         .catch(() => null);
