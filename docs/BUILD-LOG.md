@@ -4703,3 +4703,60 @@ written (`runFormsDepth`, 58 required steps) and has never run, so every browser
 this slice is currently untested — including the three that only exist in the screen: the builder's
 local refusals, the preview running the live rules, and the spam tab explaining a counter whose
 rows were never stored. Then the full `run.sh` to close slice 1's acceptance 4 and criterion 13.
+
+## Tick 58 — REQ-012 slice 2, the header policy and the CSRF token
+
+**What.** `crates/security/src/headers.rs` (the policy, its rendering and every reason it is
+refused), `csrf.rs` (the derived double-submit token), `header_store.rs` (the singleton row, a
+compare-and-swap save, and the history), `0135_security_headers.sql`, `CsrfSecret` in
+`crates/core/src/config.rs`, the two middlewares in `apps/api/src/headers_middleware.rs`, and
+`GET`/`PUT /security/headers` behind `security.read` / `security.manage`.
+
+**The decisions that are the slice, not its furniture.**
+
+* **One rendering, three consumers.** `HeaderPolicy::render` produces the header lines that go
+  on the wire, the `rendered` column the panel previews, and what the posture checks read. A
+  policy summarised in one place and assembled in another is how an operator ends up with
+  "I configured it and nothing changed".
+* **Report-only sends the report header and nothing else.** Sending both would apply a policy
+  while the screen says it is only reporting it. The test asserts neither mode emits the other
+  mode's name.
+* **The installed layer holds a shared cell, not a snapshot.** The first draft snapshotted the
+  policy when the router was built, which meant a save changed the database and no response
+  until the next restart. `RwLock<Arc<Policy>>` — one pointer clone per request, and `reload`
+  after a successful save.
+* **Refuse, never skip, when the secret is missing.** A deployment with no `OMNION_CSRF_SECRET`
+  boots and then refuses cookie-authenticated mutations. Failing open would turn a missing key
+  into a silent loss of a control, which is the worst outcome a control has.
+* **Header policy is a singleton, not per-tenant.** One process serves every response, so a
+  per-tenant CSP would let one tenant weaken the policy everybody's requests are answered with.
+* **The audit row and the setting are one transaction.** The first draft ran them as two
+  queries — the update commits, the insert fails on a dropped connection, and the edit happened
+  with nothing recording it.
+
+**Two defects from tick 57, found because this tick finally ran `--lib`.**
+
+* `cargo test -p omnion-api --lib` had been **red since slice 1** and only `cargo build` had
+  ever been run against it. A test called `to_string()` on `ApiError`, which implements no
+  `Display`. It does now — the code and the message, never the `details` blob.
+* A test fixture had a **credential mask written into the source** instead of a secret: the
+  file literally held the redaction placeholder where an `sk-` value was meant, so the
+  credential detector was being asserted against a Unicode marker and passing for the wrong
+  reason. Fixed at byte level; `git diff --stat` is the check that catches that class of edit.
+
+**Proof, added.**
+
+- `cargo test -p omnion-security --lib` → **100 passed** (51 + 46 for headers and CSRF, + 3 store)
+- `cargo test -p omnion-api --lib` → **208 passed** (was 0 compiling)
+- `cargo test -p omnion-core --lib` → **37 passed** (34 + 3 for the secret)
+- `cargo build -p omnion-api` → clean
+- Commits: `163a4f8`, `b9e2ae2`, `f2f8007`, `1ad077e`, `6e7b920`, `4747b9f`
+
+**Still open, and named rather than written off.** The `/security/headers` **screen** does not
+exist yet, and neither slice 1 nor slice 2 has a browser pass: the single QA slot was held by a
+live w10 pass for this whole tick (holder 2521941, cwd `/mnt/apopic/omnion-w10`). A pass that
+starts while this tree is half-written would build half of it, so the pass was deliberately
+stopped and the slice committed instead. **Next tick:** if the slot is free, run
+`bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
+then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
+visited and clicked.

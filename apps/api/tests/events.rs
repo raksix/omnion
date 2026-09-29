@@ -417,12 +417,7 @@ fn runner_config() -> RunnerConfig {
 /// A helper rather than four lines repeated in every walk, because a walk that reaches for the
 /// endpoints by hand tends to publish as the platform owner, and the delivery then belongs to
 /// no organization — which makes a tenant-scoped assertion silently vacuous.
-async fn publish_page(
-    harness: &Harness,
-    token: &str,
-    site: Uuid,
-    slug: &str,
-) -> StatusCode {
+async fn publish_page(harness: &Harness, token: &str, site: Uuid, slug: &str) -> StatusCode {
     let page = harness
         .call(post(
             "/api/v1/pages",
@@ -881,13 +876,24 @@ async fn the_bus_records_events_and_delivers_signed_webhooks() {
         );
     }
     assert_eq!(
-        names.iter().filter(|name| **name == "page.published").count(),
+        names
+            .iter()
+            .filter(|name| **name == "page.published")
+            .count(),
         3,
         "three publications were recorded: {:?}",
         feed.body
     );
-    assert_eq!(events[0]["name"], json!("webhook.delivery.failed"), "newest first");
-    assert_eq!(names.last(), Some(&"webhook.endpoint.created"), "oldest last");
+    assert_eq!(
+        events[0]["name"],
+        json!("webhook.delivery.failed"),
+        "newest first"
+    );
+    assert_eq!(
+        names.last(),
+        Some(&"webhook.endpoint.created"),
+        "oldest last"
+    );
 
     let audit = harness
         .call(get("/api/v1/iam/audit", Some(&owner_token)))
@@ -1531,8 +1537,7 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
     // Five facts to narrow: three page events on one site, one on another, and one that
     // belongs to a different organization entirely. The last one is the row a tenancy filter
     // that quietly stopped working would leak, so it is seeded deliberately.
-    let other_organization =
-        create_organization_row(&harness.db, "other", "Someone Else").await;
+    let other_organization = create_organization_row(&harness.db, "other", "Someone Else").await;
     for (name, site_id, owner) in [
         ("page.created", site, organization),
         ("page.updated", site, organization),
@@ -1540,15 +1545,17 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         ("page.created", other_site, organization),
         ("user.updated", site, other_organization),
     ] {
-        sqlx::query("insert into events (name, organization_id, site_id, actor_user_id, payload) \
-                     values ($1, $2, $3, $4, '{}'::jsonb)")
-            .bind(name)
-            .bind(owner)
-            .bind(site_id)
-            .bind(actor_id)
-            .execute(harness.db.pool())
-            .await
-            .expect("the seeded event must be inserted");
+        sqlx::query(
+            "insert into events (name, organization_id, site_id, actor_user_id, payload) \
+                     values ($1, $2, $3, $4, '{}'::jsonb)",
+        )
+        .bind(name)
+        .bind(owner)
+        .bind(site_id)
+        .bind(actor_id)
+        .execute(harness.db.pool())
+        .await
+        .expect("the seeded event must be inserted");
     }
 
     // ---- Scoping: an organization account sees its own and nothing else -------------------------
@@ -1643,7 +1650,10 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         .await;
     assert_eq!(windowed.status, StatusCode::OK, "{:?}", windowed.body);
     assert!(
-        windowed.body["events"].as_array().expect("events").is_empty(),
+        windowed.body["events"]
+            .as_array()
+            .expect("events")
+            .is_empty(),
         "a future window is honoured, not ignored: {:?}",
         windowed.body
     );
@@ -1663,7 +1673,10 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         "{:?}",
         bad_window.body
     );
-    assert_eq!(bad_window.body["error"]["code"], json!("invalid_event_window"));
+    assert_eq!(
+        bad_window.body["error"]["code"],
+        json!("invalid_event_window")
+    );
     assert!(
         bad_window.body["error"]["message"]
             .as_str()
@@ -1684,7 +1697,12 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
             Some(&reader_token),
         ))
         .await;
-    assert_eq!(bad_name.status, StatusCode::BAD_REQUEST, "{:?}", bad_name.body);
+    assert_eq!(
+        bad_name.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        bad_name.body
+    );
 
     // ---- Keyset pagination -----------------------------------------------------------------------
     let first = harness
@@ -1736,7 +1754,10 @@ async fn the_feed_filters_pages_and_refuses_what_it_cannot_serve() {
         "and carries no cursor to follow"
     );
 
-    let overlap: Vec<&i64> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    let overlap: Vec<&i64> = first_ids
+        .iter()
+        .filter(|id| second_ids.contains(id))
+        .collect();
     assert!(
         overlap.is_empty(),
         "no row is served twice across the page boundary: {first_ids:?} then {second_ids:?}"
@@ -1808,7 +1829,13 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             !entry["area"].as_str().unwrap_or_default().is_empty(),
             "{name} belongs to no area"
         );
-        assert!(!entry["payload_fields"].as_array().expect("fields").is_empty(), "{name}");
+        assert!(
+            !entry["payload_fields"]
+                .as_array()
+                .expect("fields")
+                .is_empty(),
+            "{name}"
+        );
 
         // The group is the part a receiver can subscribe to as a whole, and it must agree
         // with the name: a `group` that does not prefix the `name` is a picker that would
@@ -1834,14 +1861,19 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
             .iter()
             .find(|field| field["name"] == required)
             .unwrap_or_else(|| panic!("page.published must declare {required}"));
-        assert_eq!(field["required"], true, "{required} is promised as required");
+        assert_eq!(
+            field["required"], true,
+            "{required} is promised as required"
+        );
     }
 
     // The counts agree with the list, and the ceiling the panel enforces is published with
     // it so the form does not hardcode a number that can drift from the validator.
     assert_eq!(
         catalogue.body["live_count"].as_u64().expect("live_count") as usize
-            + catalogue.body["reserved_count"].as_u64().expect("reserved_count") as usize,
+            + catalogue.body["reserved_count"]
+                .as_u64()
+                .expect("reserved_count") as usize,
         entries.len(),
         "live + reserved is the whole list"
     );
@@ -1851,7 +1883,10 @@ async fn the_catalogue_is_readable_and_a_group_subscription_expands() {
         "the panel's ceiling is the validator's ceiling"
     );
     assert!(
-        !catalogue.body["areas"].as_array().expect("areas").is_empty(),
+        !catalogue.body["areas"]
+            .as_array()
+            .expect("areas")
+            .is_empty(),
         "the picker groups by area"
     );
 
@@ -2101,7 +2136,10 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
     // screen that renders `undefined` in a latency column has no way to say "not yet run",
     // and an operator reads that as zero.
     assert_eq!(first["status"], "delivered");
-    assert_eq!(first["trigger"], "test", "a button press is a test, not traffic");
+    assert_eq!(
+        first["trigger"], "test",
+        "a button press is a test, not traffic"
+    );
     assert_eq!(first["redeliver_count"], json!(0));
     assert!(
         first["duration_ms"].is_number(),
@@ -2125,14 +2163,22 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
     // the platform delivered nothing, and a rate the operator can raise by pressing a button
     // is not a measurement of the receiver.
     assert_eq!(stats.body["total"], json!(1), "the row is in the history");
-    assert_eq!(stats.body["tests"], json!(1), "and it is reported as a test");
+    assert_eq!(
+        stats.body["tests"],
+        json!(1),
+        "and it is reported as a test"
+    );
     assert_eq!(
         stats.body["delivered"],
         json!(0),
         "but it is not counted as delivered traffic"
     );
     assert_eq!(stats.body["failed"], json!(0));
-    assert_eq!(stats.body["window_hours"], json!(24), "the default is a day");
+    assert_eq!(
+        stats.body["window_hours"],
+        json!(24),
+        "the default is a day"
+    );
     assert_eq!(
         stats.body["success_rate"],
         json!(null),
@@ -2150,8 +2196,16 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
             Some(&editor_token),
         ))
         .await;
-    assert_eq!(with_traffic.body["delivered"], json!(1), "the publication arrived");
-    assert_eq!(with_traffic.body["tests"], json!(1), "and the test is still counted apart");
+    assert_eq!(
+        with_traffic.body["delivered"],
+        json!(1),
+        "the publication arrived"
+    );
+    assert_eq!(
+        with_traffic.body["tests"],
+        json!(1),
+        "and the test is still counted apart"
+    );
     assert_eq!(with_traffic.body["total"], json!(2));
     assert_eq!(with_traffic.body["success_rate"], json!(1.0));
     assert!(
@@ -2219,8 +2273,7 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
         .expect("the forced row is still there")
         .clone();
     assert_eq!(
-        replayed["trigger"],
-        "replay",
+        replayed["trigger"], "replay",
         "a forced row is a replay, which is why the trigger column exists"
     );
     assert_eq!(
@@ -2229,7 +2282,11 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
         "and the row still exists exactly once: {}",
         after.body["deliveries"].as_array().expect("d").len()
     );
-    assert_eq!(replayed["attempts"], json!(0), "a new round starts from zero");
+    assert_eq!(
+        replayed["attempts"],
+        json!(0),
+        "a new round starts from zero"
+    );
 
     tick(&harness).await;
     assert!(
@@ -2286,8 +2343,7 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
         pending.body
     );
     assert_eq!(
-        pending.body["error"]["code"],
-        "delivery_already_pending",
+        pending.body["error"]["code"], "delivery_already_pending",
         "the three refusals must not share one code — the operator's next step differs"
     );
 
@@ -2295,7 +2351,10 @@ async fn a_delivery_can_be_sent_again_and_the_platform_says_why_it_will_not() {
     // the caller may manage it, so the answer is about the delivery, not about the endpoint.
     let unknown = harness
         .call(post(
-            &format!("/api/v1/webhooks/{endpoint_id}/deliveries/{}/redeliver", Uuid::new_v4()),
+            &format!(
+                "/api/v1/webhooks/{endpoint_id}/deliveries/{}/redeliver",
+                Uuid::new_v4()
+            ),
             json!({}),
             Some(&editor_token),
         ))
@@ -2446,7 +2505,10 @@ async fn rotating_a_secret_shows_it_once_and_breaks_the_old_signature() {
         .await;
     assert_eq!(rotated.status, StatusCode::OK, "{:?}", rotated.body);
     let new_secret = rotated.body["secret"].as_str().expect("a new secret");
-    assert_ne!(new_secret, first_secret, "the platform issues a different value");
+    assert_ne!(
+        new_secret, first_secret,
+        "the platform issues a different value"
+    );
     assert!(
         !new_secret.contains(first_secret),
         "the new secret is generated, not derived from the old one"
@@ -2602,21 +2664,35 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
     // `page.published`, and this endpoint subscribes to both. Writing "seven" here was the
     // walk being wrong about the platform rather than the platform being wrong about itself.
     let all = harness.call(get(&base, Some(&editor_token))).await;
-    assert_eq!(all.body["total"], json!(8), "six probes and two page events");
+    assert_eq!(
+        all.body["total"],
+        json!(8),
+        "six probes and two page events"
+    );
     assert_eq!(all.body["has_more"], json!(false));
 
     let delivered = harness
-        .call(get(&format!("{base}?status=delivered"), Some(&editor_token)))
+        .call(get(
+            &format!("{base}?status=delivered"),
+            Some(&editor_token),
+        ))
         .await;
     assert_eq!(delivered.body["total"], json!(8), "all eight were accepted");
 
     // Several statuses mean "any of these", which is the question an operator chasing a
     // broken receiver actually asks.
     let broken = harness
-        .call(get(&format!("{base}?status=failed&status=pending"), Some(&editor_token)))
+        .call(get(
+            &format!("{base}?status=failed&status=pending"),
+            Some(&editor_token),
+        ))
         .await;
     assert_eq!(broken.status, StatusCode::OK);
-    assert_eq!(broken.body["total"], json!(0), "nothing failed and nothing waits");
+    assert_eq!(
+        broken.body["total"],
+        json!(0),
+        "nothing failed and nothing waits"
+    );
 
     // One `?status=` must not be a plain-text 400: the parser is by hand for the same reason
     // the feed's is, and this is the assertion that keeps it that way.
@@ -2626,7 +2702,10 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
     // are `webhook.test`, and a filter that returned them for `name=page.published` would be
     // filtering on nothing.
     let by_name = harness
-        .call(get(&format!("{base}?name=page.published"), Some(&editor_token)))
+        .call(get(
+            &format!("{base}?name=page.published"),
+            Some(&editor_token),
+        ))
         .await;
     assert_eq!(
         by_name.body["total"],
@@ -2634,17 +2713,26 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
         "only the publication matches, not its creation: {:?}",
         by_name.body
     );
-    assert_eq!(by_name.body["deliveries"][0]["event_name"], "page.published");
     assert_eq!(
-        by_name.body["deliveries"][0]["trigger"],
-        "event",
+        by_name.body["deliveries"][0]["event_name"],
+        "page.published"
+    );
+    assert_eq!(
+        by_name.body["deliveries"][0]["trigger"], "event",
         "and it is traffic, not a probe"
     );
 
     let by_tests = harness
-        .call(get(&format!("{base}?name=webhook.test"), Some(&editor_token)))
+        .call(get(
+            &format!("{base}?name=webhook.test"),
+            Some(&editor_token),
+        ))
         .await;
-    assert_eq!(by_tests.body["total"], json!(6), "the probes are still there");
+    assert_eq!(
+        by_tests.body["total"],
+        json!(6),
+        "the probes are still there"
+    );
 
     // The free-text search reaches the event name as well as the id.
     let by_text = harness
@@ -2685,12 +2773,20 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
         .call(get(&format!("{base}?limit=lots"), Some(&editor_token)))
         .await;
     assert_eq!(bad_limit.status, StatusCode::BAD_REQUEST);
-    assert!(bad_limit.body["error"]["message"].as_str().unwrap_or_default().contains("limit"));
+    assert!(
+        bad_limit.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("limit")
+    );
 
     // A cursor needs both halves: `cursor_at` without `cursor_id` would be a row comparison
     // against a null id, which Postgres refuses — a 500 on a request the panel builds itself.
     let half_cursor = harness
-        .call(get(&format!("{base}?cursor_at=2026-01-01T00:00:00Z"), Some(&editor_token)))
+        .call(get(
+            &format!("{base}?cursor_at=2026-01-01T00:00:00Z"),
+            Some(&editor_token),
+        ))
         .await;
     assert_eq!(half_cursor.status, StatusCode::BAD_REQUEST);
     assert!(
@@ -2713,23 +2809,29 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
         .call(get(&format!("{base}?limit=4"), Some(&editor_token)))
         .await;
     assert_eq!(first.body["deliveries"].as_array().expect("d").len(), 4);
-    assert_eq!(first.body["total"], json!(8), "the header still knows the whole set");
+    assert_eq!(
+        first.body["total"],
+        json!(8),
+        "the header still knows the whole set"
+    );
     assert_eq!(first.body["has_more"], json!(true));
     let cursor = first.body["next_cursor"].as_object().expect("a cursor");
     let cursor_at = cursor["at"].as_str().expect("at").to_owned();
     let cursor_id = cursor["id"].as_str().expect("id").to_owned();
 
     let second = harness
-        .call(
-            get(
-                &format!("{base}?limit=4&cursor_at={cursor_at}&cursor_id={cursor_id}"),
-                Some(&editor_token),
-            ),
-        )
+        .call(get(
+            &format!("{base}?limit=4&cursor_at={cursor_at}&cursor_id={cursor_id}"),
+            Some(&editor_token),
+        ))
         .await;
     assert_eq!(second.status, StatusCode::OK, "{:?}", second.body);
     let second_rows = second.body["deliveries"].as_array().expect("d");
-    assert_eq!(second_rows.len(), 4, "the rest of the set is on the second page");
+    assert_eq!(
+        second_rows.len(),
+        4,
+        "the rest of the set is on the second page"
+    );
     assert_eq!(second.body["has_more"], json!(false));
 
     let first_ids: Vec<String> = first.body["deliveries"]
@@ -2742,7 +2844,10 @@ async fn the_delivery_history_filters_pages_and_names_its_bad_parameters() {
         .iter()
         .map(|row| row["id"].as_str().expect("id").to_owned())
         .collect();
-    let overlap: Vec<&String> = first_ids.iter().filter(|id| second_ids.contains(id)).collect();
+    let overlap: Vec<&String> = first_ids
+        .iter()
+        .filter(|id| second_ids.contains(id))
+        .collect();
     assert!(
         overlap.is_empty(),
         "the (created_at, id) cursor repeats no row: {first_ids:?} then {second_ids:?}"
@@ -2807,7 +2912,8 @@ async fn a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did() {
     assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
     let endpoint_id = created.body["id"].as_str().expect("id").to_owned();
     assert_eq!(
-        created.body["enabled"], json!(true),
+        created.body["enabled"],
+        json!(true),
         "a new endpoint is on until somebody says otherwise"
     );
 
@@ -2896,7 +3002,11 @@ async fn a_disabled_endpoint_goes_quiet_and_still_answers_what_it_did() {
         .iter()
         .find(|row| row["id"] == endpoint_id.as_str())
         .expect("the endpoint is still listed");
-    assert_eq!(mine["enabled"], json!(false), "the status dot has something to draw");
+    assert_eq!(
+        mine["enabled"],
+        json!(false),
+        "the status dot has something to draw"
+    );
 
     // ---- 4. Switching back on resumes the stream, without a re-subscribe -------------------------
     let resumed = harness

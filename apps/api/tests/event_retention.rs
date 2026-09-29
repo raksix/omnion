@@ -132,10 +132,12 @@ impl Harness {
     async fn dispose(self) {
         self.db.pool().close().await;
         let database = self.database;
-        sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
-            .execute(self.maintenance.pool())
-            .await
-            .expect("the temporary database must be removed");
+        sqlx::query(&format!(
+            "drop database if exists \"{database}\" with (force)"
+        ))
+        .execute(self.maintenance.pool())
+        .await
+        .expect("the temporary database must be removed");
     }
 }
 
@@ -311,13 +313,7 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
     let other = create_organization_row(&harness.db, "other", "Other Tenant").await;
 
     let (operator_id, operator_token) = account(&harness, Some(organization)).await;
-    grant(
-        &harness,
-        operator_id,
-        organization,
-        &OPERATOR_PERMISSIONS,
-    )
-    .await;
+    grant(&harness, operator_id, organization, &OPERATOR_PERMISSIONS).await;
 
     // --- The default window is a number, and it is the documented one ------------------------
 
@@ -326,17 +322,25 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(
-        body["window_days"], json!(30),
+        body["window_days"],
+        json!(30),
         "an organization that has never opened the screen gets the documented default, \
          not a guess and not `null`: {body:?}"
     );
     assert_eq!(body["min_days"], json!(1));
     assert_eq!(body["max_days"], json!(3650));
-    assert_eq!(body["last_run"], Value::Null, "nothing has run yet: {body:?}");
+    assert_eq!(
+        body["last_run"],
+        Value::Null,
+        "nothing has run yet: {body:?}"
+    );
 
     // --- A window outside the range is refused by name, not clamped --------------------------
 
-    for (days, why) in [(0, "keep nothing"), (4000, "ten years of an unreadable bus")] {
+    for (days, why) in [
+        (0, "keep nothing"),
+        (4000, "ten years of an unreadable bus"),
+    ] {
         let (status, body) = harness
             .call(patch(
                 "/api/v1/events/retention",
@@ -350,7 +354,8 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
             "a window of {days} ({why}) is refused: {body:?}"
         );
         assert_eq!(
-            body["error"]["code"], json!("invalid_retention_window"),
+            body["error"]["code"],
+            json!("invalid_retention_window"),
             "the refusal names the field: {body:?}"
         );
     }
@@ -360,7 +365,8 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .call(get("/api/v1/events/retention", &operator_token))
         .await;
     assert_eq!(
-        body["window_days"], json!(30),
+        body["window_days"],
+        json!(30),
         "a refused write must not change anything: {body:?}"
     );
 
@@ -379,7 +385,10 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
     // The change is on the bus with the window *before* and *after*, because "the window is 1
     // day" is not a record of anything — an audit needs the transition.
     let (_, feed) = harness
-        .call(get("/api/v1/events?name=webhook.retention.changed", &operator_token))
+        .call(get(
+            "/api/v1/events?name=webhook.retention.changed",
+            &operator_token,
+        ))
         .await;
     let changed = feed["events"]
         .as_array()
@@ -450,9 +459,14 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
     let (_, before) = harness
         .call(get("/api/v1/events/retention", &operator_token))
         .await;
-    assert_eq!(before["events"], json!(3), "the bus holds every event: {before:?}");
     assert_eq!(
-        before["due"], json!(1),
+        before["events"],
+        json!(3),
+        "the bus holds every event: {before:?}"
+    );
+    assert_eq!(
+        before["due"],
+        json!(1),
         "the pinned event is counted as history and not as due, and the retention \
          audit event itself is not past the window: {before:?}"
     );
@@ -462,22 +476,23 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .await;
     assert_eq!(status, StatusCode::OK, "{swept:?}");
     assert_eq!(
-        swept["events_deleted"], json!(1),
+        swept["events_deleted"],
+        json!(1),
         "the free event goes and the pinned one stays: {swept:?}"
     );
     assert_eq!(
-        swept["deliveries_deleted"], json!(0),
+        swept["deliveries_deleted"],
+        json!(0),
         "the pinned delivery is the reason its event stayed, so no delivery may be counted: \
          {swept:?}"
     );
 
     // The row, not the response: the event a receiver is still owed must still be there.
-    let still_owed: i64 =
-        sqlx::query_scalar("select count(*) from events where id = $1")
-            .bind(owed.event.id)
-            .fetch_one(harness.db.pool())
-            .await
-            .expect("the owed event must be readable");
+    let still_owed: i64 = sqlx::query_scalar("select count(*) from events where id = $1")
+        .bind(owed.event.id)
+        .fetch_one(harness.db.pool())
+        .await
+        .expect("the owed event must be readable");
     assert_eq!(
         still_owed, 1,
         "an event whose delivery is still pending must not be swept — the cascade would have \
@@ -527,11 +542,13 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .call(post("/api/v1/events/retention/sweep", &operator_token))
         .await;
     assert_eq!(
-        swept["events_deleted"], json!(1),
+        swept["events_deleted"],
+        json!(1),
         "a settled delivery does not pin its event: {swept:?}"
     );
     assert_eq!(
-        swept["deliveries_deleted"], json!(1),
+        swept["deliveries_deleted"],
+        json!(1),
         "and its delivery is counted separately, because the operator's history lost a row: \
          {swept:?}"
     );
@@ -567,7 +584,8 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .call(post("/api/v1/events/retention/sweep", &operator_token))
         .await;
     assert_eq!(
-        swept["events_deleted"], json!(0),
+        swept["events_deleted"],
+        json!(0),
         "a two-tenant sweep must not reach into the tenant that did not ask for it: {swept:?}"
     );
 
@@ -591,10 +609,7 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         "the last sweep is on screen even though it removed nothing: {body:?}"
     );
     assert_eq!(body["last_run"]["events_deleted"], json!(0));
-    let history = body["recent_runs"]
-        .as_array()
-        .expect("recent_runs")
-        .len();
+    let history = body["recent_runs"].as_array().expect("recent_runs").len();
     assert_eq!(
         history, 3,
         "every sweep is a row, including the empty ones: {body:?}"
@@ -624,7 +639,8 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .call(get("/api/v1/events/retention", &reader_token))
         .await;
     assert_eq!(
-        status, StatusCode::OK,
+        status,
+        StatusCode::OK,
         "reading how much history is kept is reading the bus: {body:?}"
     );
 
@@ -637,11 +653,15 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
                 json!({ "window_days": 400 }),
             ),
         ),
-        ("a sweep", post("/api/v1/events/retention/sweep", &reader_token)),
+        (
+            "a sweep",
+            post("/api/v1/events/retention/sweep", &reader_token),
+        ),
     ] {
         let (status, body) = harness.call(request).await;
         assert_eq!(
-            status, StatusCode::FORBIDDEN,
+            status,
+            StatusCode::FORBIDDEN,
             "a read-only auditor must not be able to trigger {label} — it destroys history: \
              {body:?}"
         );
@@ -660,7 +680,10 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         .iter()
         .find(|(id, _)| *id == Some(organization))
         .expect("this organization has events and must be in the work list");
-    assert_eq!(mine.1, 1, "the work list carries the window the operator set");
+    assert_eq!(
+        mine.1, 1,
+        "the work list carries the window the operator set"
+    );
     assert!(
         queue.iter().any(|(id, _)| *id == Some(other)),
         "a tenant with events is in the work list whoever swept last"
@@ -680,7 +703,8 @@ async fn the_sweeper_keeps_what_a_receiver_is_still_owed_and_logs_the_rest() {
         ))
         .await;
     assert_eq!(
-        status, StatusCode::BAD_REQUEST,
+        status,
+        StatusCode::BAD_REQUEST,
         "a platform account has no window to set, and saying so is better than a 200 that \
          changed nothing: {body:?}"
     );

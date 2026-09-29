@@ -471,24 +471,32 @@ fn parse_events_query(raw: Option<&str>) -> Result<EventsQuery, ApiError> {
             "from" => query.from = Some(value),
             "to" => query.to = Some(value),
             "site_id" => {
-                query.site_id = Some(value.parse().map_err(|_| {
-                    invalid_query("site_id", "it is not a uuid")
-                })?)
+                query.site_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("site_id", "it is not a uuid"))?,
+                )
             }
             "actor_user_id" => {
-                query.actor_user_id = Some(value.parse().map_err(|_| {
-                    invalid_query("actor_user_id", "it is not a uuid")
-                })?)
+                query.actor_user_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("actor_user_id", "it is not a uuid"))?,
+                )
             }
             "cursor" => {
-                query.cursor = Some(value.parse().map_err(|_| {
-                    invalid_query("cursor", "it is not a row id")
-                })?)
+                query.cursor = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("cursor", "it is not a row id"))?,
+                )
             }
             "limit" => {
-                query.limit = Some(value.parse().map_err(|_| {
-                    invalid_query("limit", "it is not a whole number")
-                })?)
+                query.limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_query("limit", "it is not a whole number"))?,
+                )
             }
             _ => {}
         }
@@ -691,10 +699,11 @@ pub async fn list_catalogue(
     // tenant's endpoints, and a platform-wide count would tell one organization how much
     // traffic another one receives.
     let since = OffsetDateTime::now_utc() - time::Duration::hours(24);
-    let counts = store::delivery_counts_since(state.db().pool(), current.user.organization_id, since)
-        .await?
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>();
+    let counts =
+        store::delivery_counts_since(state.db().pool(), current.user.organization_id, since)
+            .await?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
 
     Ok(Json(CatalogueResponse {
         areas: omnion_events::catalogue::areas(),
@@ -1007,12 +1016,14 @@ pub async fn list_deliveries(
 
     // The cursor is the last row's own `(created_at, id)`, exclusive, so the next page cannot
     // re-serve the row the cursor names.
-    let next_cursor = page.has_more.then(|| page.deliveries.last()).flatten().map(|row| {
-        DeliveryCursorBody {
+    let next_cursor = page
+        .has_more
+        .then(|| page.deliveries.last())
+        .flatten()
+        .map(|row| DeliveryCursorBody {
             at: row.created_at,
             id: row.id,
-        }
-    });
+        });
 
     Ok(Json(DeliveryPageBody {
         deliveries: page.deliveries.iter().map(DeliveryBody::build).collect(),
@@ -1048,14 +1059,18 @@ fn parse_delivery_query(raw: Option<&str>) -> Result<DeliveryQuery, ApiError> {
             "q" => query.q = Some(value),
             "cursor_at" => query.cursor_at = Some(value),
             "cursor_id" => {
-                query.cursor_id = Some(value.parse().map_err(|_| {
-                    invalid_delivery_query("cursor_id", "it is not a uuid")
-                })?)
+                query.cursor_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_delivery_query("cursor_id", "it is not a uuid"))?,
+                )
             }
             "limit" => {
-                query.limit = Some(value.parse().map_err(|_| {
-                    invalid_delivery_query("limit", "it is not a whole number")
-                })?)
+                query.limit = Some(
+                    value
+                        .parse()
+                        .map_err(|_| invalid_delivery_query("limit", "it is not a whole number"))?,
+                )
             }
             _ => {}
         }
@@ -1193,7 +1208,8 @@ pub async fn redeliver_many(
         ));
     }
 
-    let outcomes = store::redeliver_many(state.db().pool(), endpoint.id, &body.delivery_ids).await?;
+    let outcomes =
+        store::redeliver_many(state.db().pool(), endpoint.id, &body.delivery_ids).await?;
 
     let mut queued = 0;
     let mut skipped = Vec::new();
@@ -1239,7 +1255,10 @@ pub async fn endpoint_stats(
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<EndpointStatsBody>, ApiError> {
     let endpoint = endpoint_in_scope(&state, &current, endpoint_id).await?;
-    let window_hours = query.window_hours.unwrap_or(DEFAULT_STATS_WINDOW_HOURS).clamp(1, 24 * 365);
+    let window_hours = query
+        .window_hours
+        .unwrap_or(DEFAULT_STATS_WINDOW_HOURS)
+        .clamp(1, 24 * 365);
 
     let stats = store::endpoint_stats(
         state.db().pool(),
@@ -1402,7 +1421,10 @@ pub async fn list_events(
 /// The error names the parameter rather than the value: `from` and `to` arrive as strings
 /// because `Query` will not do the parse for us, and a `400` that says "unparsable" without
 /// saying *which* field leaves the caller guessing between two boxes on the screen.
-fn parse_instant(raw: Option<&str>, field: &'static str) -> Result<Option<OffsetDateTime>, ApiError> {
+fn parse_instant(
+    raw: Option<&str>,
+    field: &'static str,
+) -> Result<Option<OffsetDateTime>, ApiError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -1436,8 +1458,9 @@ pub async fn retention_status(
 ) -> Result<Json<RetentionStatusBody>, ApiError> {
     let organization_id = current.user.organization_id;
     let status = store::retention_status(state.db().pool(), organization_id).await?;
-    let recent_runs = store::list_retention_runs(state.db().pool(), organization_id, RETENTION_RUN_HISTORY)
-        .await?;
+    let recent_runs =
+        store::list_retention_runs(state.db().pool(), organization_id, RETENTION_RUN_HISTORY)
+            .await?;
 
     Ok(Json(RetentionStatusBody {
         organization_id,
@@ -1503,9 +1526,12 @@ pub async fn set_retention(
     .await;
 
     let status = store::retention_status(state.db().pool(), Some(organization_id)).await?;
-    let recent_runs =
-        store::list_retention_runs(state.db().pool(), Some(organization_id), RETENTION_RUN_HISTORY)
-            .await?;
+    let recent_runs = store::list_retention_runs(
+        state.db().pool(),
+        Some(organization_id),
+        RETENTION_RUN_HISTORY,
+    )
+    .await?;
 
     Ok(Json(RetentionStatusBody {
         organization_id: Some(organization_id),
