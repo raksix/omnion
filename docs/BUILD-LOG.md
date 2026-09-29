@@ -5891,3 +5891,57 @@ plus a `kill -0` on each **holder** pid. If it is free, run the pass and read th
 dependency order the last three ticks agreed on. If the box is still at load 40+ with 0 free RAM,
 `cargo test -p <crate> --lib` and `bun x tsc --noEmit` are the tick's honest debt: a note read off a
 swapping machine is worse than a note deferred.
+
+### Wave 3 / tick 27 — a rule is built by being incomplete, so a save may not refuse the work (2026-09-29)
+**What.** The builder could not be used to build a rule. `replace_graph` projected the graph
+inside the write and carried the projection error out with `?`, so the author's **first save** —
+a trigger and a card that are not connected yet — was refused `400 graph_invalid`. A rule is
+born `[trigger, end]` and is edited one card at a time; the state that refuses the write is the
+state every rule passes through on its way to being a rule. The guard moved from "you may not
+save" to "you may not run", which was always the true statement and is the place the projection
+already failed (`91bcbda`).
+**Three halves, and the trade is only safe because all three landed in one commit.** The save
+writes the graph and **records** the reason in `workflows.validation_error`; it leaves the step
+list **alone** on a graph that does not project (`steps = coalesce($3, steps)`); `start_run`
+reads the reason through `admit_to_run` and refuses with `workflow_not_runnable`. Drop any one
+and the feature is worse than before: without the record the rule silently stops firing, without
+the `coalesce` a blank list is handed to an engine that settles a zero-step run as `completed`,
+and without the guard the rule runs work the author can no longer see on their canvas.
+**THE BLANKING IS THE SUBTLE HALF, AND THE TEST PROVES IT IN BOTH DIRECTIONS.** "Not yet
+runnable" and "has never run" are different sentences on the list screen and the same database
+row, which is the same conflation the trace panel was fixed for. A body-only test cannot see it:
+a server that saved an **empty** list answers "the save worked" *and* "the run reported
+success" while doing nothing. So the integration test reads stored rows — previous `steps`
+survive, reason recorded and non-blank, `workflow_executions` holds **zero** rows after the
+refusal — and then wires the graph for real and requires the reason to clear *and* the run to
+succeed, because a guard that never re-opens is a rule that stopped working forever.
+**A BLANK REASON IS NOT A VERDICT.** `admit_to_run("")` admits. Reading a blank as a refusal
+makes a rule permanently unrunnable over a column nothing wrote, which is the silent direction:
+it simply never fires and no screen says why. Asserted, with a whitespace-only reason beside it.
+**A FINDING LIST AND ITS ERROR COUNT MUST NOT BE ONE EXPRESSION.** `GraphBody::build` shipped
+`filter(is_error)` as `findings` and `findings.len()` as `error_count` — so the two could never
+disagree, which made the panel's own `severity !== "error"` branch **unreachable**: a graph with
+a real warning and no error reached the author as "No problems". The body now carries the whole
+list and counts errors separately. **The test for it is the shape worth keeping:** the fixture
+must produce *exactly one warning and zero errors*, which took two corrections to get right — a
+`note` node is inert and produces no finding at all (so the test would have passed its own guard
+on an empty list), and `starter_graph(None)` is a `trigger.event` with no event name, which is a
+**`missing_parameter` error**. A fixture whose cleanliness is assumed is a fixture whose defects
+are the test's, so the starting graph is now asserted clean *before* the one warning is added.
+**Proof.** `omnion-workflows --lib` 143 ok · `omnion-api --lib` 241 ok · `omnion-automation
+--lib` 115 ok · `apps/admin` `tsc --noEmit` exit 0 · `cargo fmt --check` clean on every file
+this tick touched (the crate has pre-existing drift in ~120 sibling files, left alone).
+**Two compile errors were inherited from the in-flight WIP, and the second was not cosmetic.**
+`filter(graph::Finding::is_error)` does not typecheck — `Iterator::filter` hands the predicate
+`&&Finding` — and it was paired with a fixture naming a type that does not exist
+(`graph::GraphNode` with a `kind` field; the real one is `graph::Node` with `node_type`, a
+required `label` and a `Position` that is not optional). A test written against a struct that
+was never there is a test that was never run: `--lib` had been **red**, not green-and-unmeasured.
+**Not ticked beyond the box above, and why.** The pass is queued behind a live w8 holder
+(`/tmp/omnion-qa-slot/1490013-…`, `kill -0` on the holder true, `cwd=/mnt/apopic/omnion-w8`) —
+a *real* queue this time, not the leak tick 26 fixed. The six REQ-004 notes are still
+unmeasured and the boxes that depend on them stay unticked.
+**Next.** Read the pass in the order the last four ticks agreed on: `workflow-table` (was `422`),
+then `validate-classes`, `cmd-s-writes-once`, `two-tab-conflict`, `run-from-here`,
+`step-trace`. A note that still reads empty after that is a **product** defect, because the
+instrument behind all six is now fixed and committed.
