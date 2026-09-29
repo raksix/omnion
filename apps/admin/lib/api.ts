@@ -17,6 +17,8 @@ import type {
   EventCatalogue,
   EventFilters,
   EventPage,
+  RetentionStatus,
+  SweepResult,
   NewMediaGrant,
   Media,
   MediaBulkResult,
@@ -5458,4 +5460,38 @@ export function fetchWebhookStats(id: string, windowHours?: number): Promise<Web
  */
 export function fetchEventCatalogue(): Promise<EventCatalogue> {
   return request<EventCatalogue>("/api/v1/events/catalogue");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The bus's own retention (REQ-016, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * How much history this organization keeps, and the last sweeps that ran.
+ *
+ * The read carries the bounds the API enforces (`min_days`, `max_days`) rather than the screen
+ * inventing its own: a range written in two places is a range that will disagree, and the input
+ * that disagrees with the server's rule is the one that gets a `400` nobody can act on.
+ */
+export function fetchRetention(): Promise<RetentionStatus> {
+  return request<RetentionStatus>("/api/v1/events/retention");
+}
+
+/**
+ * Set the window, in days.
+ *
+ * The refusal is passed through rather than caught: a window of `0` or `4000` is refused by
+ * name, and a screen that clamped it would answer `200` with a number the operator did not
+ * choose.
+ */
+export function setRetentionWindow(windowDays: number): Promise<RetentionStatus> {
+  return request<RetentionStatus>("/api/v1/events/retention", {
+    method: "PATCH",
+    body: JSON.stringify({ window_days: windowDays }),
+  });
+}
+
+/** Run one sweep now, and answer with what it actually removed. */
+export function sweepRetention(): Promise<SweepResult> {
+  return request<SweepResult>("/api/v1/events/retention/sweep", { method: "POST" });
 }

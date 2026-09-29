@@ -4210,32 +4210,56 @@ written, so a green run closes the slice rather than starting it. After that, sl
 operator needs first when a delivery is missing.
 
 ## 2026-09-29 — REQ-004 slice 3 · "Run from here" needs a sixth step state, and the three queries that read step status were already shaped for one
-
+---
 **What.** Slice 3's first criterion. The whole thing turned out to be gated on a one-word
 hole rather than on missing code, and the hole was only visible once the criterion was read
 as a sentence: a run's steps are all `pending` when it is created and the engine claims them
 strictly in `step_no` order, so there was no way to say "these two did not run". Not
 "skipped with a flag" — a *state*, because every consumer of a step's status would otherwise
 have to learn a second question ("is this pending, or pending-and-skipped?").
-
+## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
 **The finding worth keeping: `skipped` cost no engine change at all.** Three queries read
 step status, and each was already shaped so that one more terminal state would be free:
-
+**What.** The event bus grew on every mutation and nothing ever forgot anything: `/events`
+shows the last page, the API keeps a keyset cursor over every row, the automation matcher
+replays from its own cursor. Slice 3 gives the bus a window, a sweeper, a run log, and a
+`/events` **Retention** tab — the third tab beside Feed and Catalogue, answering a different
+question (what will be forgotten and when) rather than a fourth card inside the Feed.
 ```sql
 claim_due_step:   s.status in ('pending', 'waiting')                       -- never claimed
 settle_execution: count(*) filter (where status in ('pending','running','waiting'))  -- closed
                   count(*) filter (where status = 'failed' and not ignored) -- not a failure
 retry_step_from:  ... and status in ('failed','cancelled','pending','waiting')       -- stays skipped
 ```
-
+Migration `0123_event_retention.sql` puts the window on the **organization**
+(`organizations.event_retention_days`, `between 1 and 3650`, never null, default 30). Three
+decisions carry it, and each is a place the obvious shortcut is wrong:
 Read them in that order and the feature is a constraint change. A state that had to be
 threaded through them would have been the tell that the schema was not ready — which is a
 cheaper test than writing the state and finding out.
-
+* **A `pending` delivery pins its event.** The obvious sweep — "delete events older than N
+  and let `on delete cascade` take the deliveries" — deletes a fact a receiver is still owed.
+  The receiver's only symptom is a delivery that never arrives with nothing in the platform
+  saying why. The store's predicate selects events with **no delivery at all** or with **only
+  settled** ones; a `pending` row pins its event for ever. An event nobody was ever queued
+  for is the bulk of the bus, which is exactly the part worth deleting.
+* **The window is a column on the organization, not on the event.** "30 days" is a policy an
+  operator sets once and then changes; storing it per event would mean a sweeper that has to
+  *compare* the two to decide what is old. The cutoff is computed per organization inside the
+  same statement, and an organization that has never set one falls back to the platform
+  default rather than to `null` — because `null` would mean "keep for ever", which is a
+  decision nobody made deliberately.
+* **A run that deletes nothing is still written to the log.** "The last sweep was at 03:00 and
+  it found nothing" is the sentence an operator needs on the day they ask why a March event is
+  still in the feed, and a table that only records activity cannot answer it on the day
+  nothing happened.
 **The plan is made against a walk, not the step list**, and that was the second real design
 decision. The two disagree in three places and *each one decides whether a node is startable
 at all*:
-
+**A window on the organization is also a permission split.** Reading the window, the counts and
+the last sweep rides `events.read` — describing what will be removed is reading the bus.
+**Changing** the window and running a sweep are `webhooks.manage`, because shortening a window
+destroys an audit trail and a read-only auditor must not be able to trigger that from a link.
 | node | in the step list | in the walk | what "start here" means |
 |---|---|---|---|
 | trigger | absent | present, holds no position | re-run the whole rule — a real thing an operator wants |
@@ -4279,8 +4303,22 @@ validator refuses to let anything leave ("exports no port"). So an inert node is
 leaf and can never sit mid-graph. The test now asserts the shape that does exist (a note is
 inert, has no outputs, takes no step number) rather than the one I imagined. Unimplemented
 special-casing is code nobody re-reads.
+**`retention` is declared before `/events/{id}`.** Same reason `/events/catalogue` is: a
+literal segment registered after a parameterised sibling is read as an event id, and a request
+that is perfectly valid answers `404 no such event`.
 
-**Proof.**
+**A count that ignores pending deliveries is a number the screen lies with.** The `due` figure
+comes from the *same predicate the `delete` uses* — an event pinned by a pending delivery is
+in `events` and never in `due`. A panel that said "412 due" on the morning a sweep removes 0
+would be quoting a number nobody can reconcile with the run log.
+
+**The panel refuses the range before the server does, because the bounds are the server's.**
+`min_days`/`max_days` arrive in the read rather than being written into the component, because
+a range written in two places is a range that will disagree, and the input that disagrees with
+the server is the one that gets a `400` nobody can act on. Out of range *disables* Save rather
+than offering a failure. And when the server does refuse, its own sentence is shown — it names
+the field and the range, and replacing that with "invalid value" throws away the only sentence
+that says which bound was crossed.
 - `cargo test -p omnion-workflows --lib` → **95** (84 before, 11 new)
 - `cargo test -p omnion-api --test workflows` → **14/14** against a real Postgres, including
   `run_from_here_starts_at_the_node_and_marks_the_prefix_skipped`: the test reads the **stored
@@ -4290,29 +4328,22 @@ special-casing is code nobody re-reads.
   never claimed it. Both refusals proven too.
 - `node --test` on the builder suites → **61** (53 before, 8 new)
 - `tsc --noEmit` in `apps/admin` → exit 0 · `cargo check -p omnion-api --all-targets` → 0 errors
-
 **Not proved: the browser pass.** The slot was held by w10 (pid 2643862, cwd
 `/mnt/apopic/omnion-w10`) for the whole tick — a live pass, not a leak. The criterion is
 unticked until the pass reads `run-from-here` with `skipped > 0`, `reasonNamesNode: true` and
 `firstRunnableNo === firstSkippedNo + 1`. The probe reads the run back through the API after
 the press, because a toast that says "Run started" proves the button was pressed and nothing
 else.
-
 **Queue note.** `df` was the constraint this tick: `/mnt/apopic` 93% → 94%, `/dev/shm`
 94–100%, `/` at 99%, RAM 29/32, load 43. Seven writers, seven tmpfs targets.
-
 **Next.** Criterion 2 (node status pills on the canvas) and criterion 3 (*Retry this node* —
 where `store::retry_step_from`'s own comment is the spec and it says the opposite of what the
 criterion wants: it is deliberately a **tail** re-run, so a single-node retry is a different
 write and must not be built by narrowing it).
-
-
 ## 2026-09-29 — REQ-004 slice 3 · criterion 2 (node status pills) — built, blocked at the DB gate
-
 **What.** The pill half of *"after a run each node shows its status pill"*. The mapping is a
 pure function (`node-status.ts`) with 10 tests; the pill is on the node card; the QA probe
 now reads the canvas instead of the API.
-
 **The finding worth keeping: the criterion was unprovable, not unmet.** The engine had been
 writing `workflow_steps.node_id` and `skip_reason` since `0122`, and the run has recorded
 `started_from_node` since it was created — for two ticks. `StepBody` carried a step's
@@ -4320,9 +4351,7 @@ writing `workflow_steps.node_id` and `skip_reason` since `0122`, and the run has
 all. So the probe had been reading `null` for every field it asked about, on a run that was
 behaving perfectly. Writing a row and reading it back are two different things, and only one
 of them was ever built.
-
 **Three rules in the mapping, each of which fails *visibly*:**
-
 1. **A node with no step paints nothing.** Not "pending", not a grey dot. A pill on a node
    the run never reached is a claim about work the engine never did, and there is nothing on
    screen that distinguishes it from a real one.
@@ -4333,18 +4362,20 @@ of them was ever built.
 3. **Steps with no `node_id` are dropped, not bucketed under an empty key.** A rule whose
    definition predates the builder has no node behind its steps; attributing them by index
    paints the first card on the canvas with a status that belongs to no node at all.
-
 **The probe reads the canvas, and that is the point.** Re-reading the run's rows from the
 API would pass even if every card rendered nothing — the same trap as a handler that
 returns a plan-shaped body while writing no run. It now compares the *painted node set*
 against the run's, which is the assertion that catches rule 1 being broken.
-
-**Proof.**
+- `cargo test -p omnion-events --lib` → **47** (45 + 2)
+- `cargo test -p omnion-api --test event_retention` → **1/1** against real PostgreSQL, on a
+  one-day window set through the same `PATCH` an operator uses
+- `cargo test -p omnion-api --test events` → **9/9** (the sweep must not disturb the existing
+  delivery history)
 - `node-status` → **10/10**; builder suites → **71/71** (61 before)
 - `cargo test -p omnion-workflows --lib` → **95/95**
 - `cargo check -p omnion-api --all-targets` → exit 0
-- `tsc --noEmit` in `apps/admin` → exit 0
-
+- Commits: `f47f35f` (migration, store, worker, routes, walk), `14862ce` (the tab and
+  `runRetentionDepth`)
 **Not proved: the DB integration test, and it is not my change.**
 `cargo test -p omnion-api --test workflows run_from_here` fails at migration
 `VersionMissing(19)`. The branch is missing **`0019` and `0022` entirely** — the sequence
@@ -4358,7 +4389,17 @@ not mine to do** — every branch picks the next free number from its own tail, 
 numbers are in use on branches this worktree does not own. Resetting the database does not
 help: the gap is in the *repository*, so a fresh DB hits it too. This needs the owner to
 land the two migrations, or a reconciliation pass across branches.
-
+**Two defects the walk found, both of the same shape as slice 2's.** The first is a **function
+PostgreSQL 16 does not have in the form the argument was written in**: `make_interval(days =>
+$2)` bound to an `i64` fails with *"function make_interval(days => bigint) does not exist"* —
+a named argument has to land on `int`, and the error names a function that plainly exists, so
+it reads like a migration fault rather than an argument type. The second is an **assertion
+written in the same breath as the code that broke it**: the walk set the window through a
+`PATCH`, that `PATCH` recorded `webhook.retention.changed` on the same bus, and the count
+assertion still said "two aged events" while the bus honestly held three. It had passed for
+the wrong reason only because nobody had run it since the audit event was added. Counting is
+not "count the rows I set up" — a number an operator reads is a number the platform has to be
+able to explain, including the parts nobody staged.
 **Queue note.** `/mnt/apopic` hit **100%** mid-tick — `git commit` returned *"unable to
 write loose object file: No space left on device"* with all three files staged and intact.
 Reclaimed 5.4G of **my own** `/dev/shm/w3-target` cache (never another writer's); another
@@ -4370,16 +4411,17 @@ threshold should check `df` before writing, not after.
 output — which is the inspector's question rather than the canvas's, and needs the run's
 step `params`/`output` to be reachable from a node id (the mapping already carries
 `stepNos` for exactly that). Then criterion 3, *Retry this node*.
-
-
+**Not done, and not claimed. No browser pass.** The QA slot is held by a sibling writer for the
+whole window (its holder pids 3654283/3654312, its pass on ports 3103/3108/3109 — none of them
+mine), and the box is at load 20-27. `runRetentionDepth` and `runWebhooksDepth` are written and
+**unrun**, so every acceptance box naming a screen stays unticked with the reason written into
+the box. All 17 `data-retention-*` hooks the depth pass selects are present in the component —
+a probe that selects a hook the screen does not carry is a probe that cannot fail.
 ## 2026-09-29 — REQ-004 slice 3, criterion 2's second half (the click) · what a step did, on the node that did it
-
 feat(api): send a step's inputs · feat(builder): the trace panel · test(qa): click a painted node
-
 The pill said what a node's status *was*. Nothing said what the step *did*, so the
 criterion was half a feature: "clicking the node opens that step's inputs and output"
 had an output and no inputs.
-
 **The gap was on the wire, not in the client.** `StepBody` carried `output` and not
 `params` — the same class of defect as the `node_id` one this criterion already paid for
 once, and the reason it keeps recurring is that writing a row and reading it back are two
@@ -4387,10 +4429,8 @@ different things. A stored `params` is *not* the node's authored `params` on the
 a run from a node, a retry, or an edit that was never saved leave the two different, and
 the one an operator debugging a run needs is the stored one. Reusing `node.params` in the
 panel would have compiled, rendered, and quietly been the wrong number.
-
 **`step-detail.ts` is a pure function, and its three rules are what a
 `steps.find(s => s.node_id === id)` throws away:**
-
 * a node with two branches opens **both** steps. Showing the branch that ran and hiding
   the one that did not is the exact information the `diverged` pill exists to advertise.
 * `null` (no run read) is not `[]` (a run with no steps). A rule whose first run is still
@@ -4400,12 +4440,10 @@ panel would have compiled, rendered, and quietly been the wrong number.
   a step that never produced anything. The server now sends `{}` rather than omitting the
   key, precisely so `describePayload` can tell them apart, and a Rust test asserts the
   empty object *is* sent.
-
 **Payloads are classified before they are rendered, never stringified.** `JSON.stringify`
 on a cyclic value throws, and it throws during render, which takes the whole panel with
 it. A deep value renders as one summary line however deep it goes, because expanding a
 payload until it ends is a page that never finishes loading.
-
 **The probe reads the PANEL, not the run.** Fetching the run and printing `step.output`
 would pass against a trace that rendered nothing — the same trap the pill probe fell into
 last tick, so it is now the pattern rather than a lesson. The node clicked is read off a
@@ -4414,14 +4452,11 @@ never reached is the `node-absent` state and would prove the empty-state message
 of the panel. One assertion reads the API instead (`stepsWithParams` / `stepsTotal`): a
 panel that renders "no inputs" on every step is a correct-looking panel built on a field
 nobody sends, and nothing on screen says so.
-
-**Proof.**
 - `apps/admin` builder suites → **85/85** (71 before; 14 new)
 - `cargo test -p omnion-api --lib` → **206/206** (203 before; 3 new)
 - `cargo test -p omnion-workflows --lib` → **95/95**
 - `cargo check -p omnion-api --all-targets` → exit 0
 - `tsc --noEmit` in `apps/admin` → exit 0
-
 **Not ticked: the criterion, and the browser pass.** The pass is queued behind w9's
 holder, and the same migration gap as last tick still stands — `0019` and `0022` are
 absent from this branch and from `origin/main` (`0019_cms_blocks.sql` on
@@ -4431,22 +4466,17 @@ absent from this branch and from `origin/main` (`0019_cms_blocks.sql` on
 a loud failure for a duplicate that kills every suite at once, so it stays the owner's
 call. **The `node-status` boxes stay unticked too** — the probe for them exists and is
 correct, but a criterion is not ticked on a probe that has not run.
-
 **Merged.** `origin/main` (3 commits, REQ-016 slice 2) merged at `a44d730`; the one
 conflict was both sides adding a nav item to `app-shell.tsx`, so both were kept — the
 alternative, taking one side's import line, silently deletes a nav entry from the other
 writer's wave.
-
 **Next.** The QA pass, and then criterion 3 — *Retry this node*. `store::retry_step_from`
 is deliberately a **tail** re-run, so a single-node retry is a different write and must
 not be built by narrowing it.
-
 ## 2026-09-29 · wave3 tick 17 · REQ-004 slice 3, criterion 3 — *Retry this node*
-
 **What.** Criterion 3 of REQ-004: *"Retry this node" re-runs only that node without
 duplicating earlier side effects (proven with the mail sink).* Server, store, endpoint and
 inspector control, in one commit (`633b620`).
-
 **The trap the criterion names, taken seriously.** `store::retry_step_from` is a **tail**
 re-run — it re-opens `step_no >= N` — because a run whose middle failed must not be allowed
 to march on to completion with a hole in the middle. Building the node control by narrowing
@@ -4454,7 +4484,6 @@ that write would re-send the earlier e-mail, which is the one outcome the criter
 So it is a **different write**: `store::retry_single_step`, one `step_no`, and the walk
 asserts the returned row count so a later widening of the `WHERE` clause fails the walk
 rather than quietly repeating a side effect.
-
 **Why the proof is a mail count and not a status comparison.** A run whose first step
 re-runs is *indistinguishable* from one that did not on any status column — the difference
 is a message that left the process. The criterion names the instrument, and it is the right
@@ -4462,9 +4491,7 @@ one: the walk spins a small SMTP sink, drives the engine with a **real** action 
 (not `NoActionHandler`, which would fail the mail step for a reason that has nothing to do
 with retrying and make the count zero before the retry ever happened), and asserts the
 count is still 1 afterwards.
-
 **Two decisions the walk overturned, which is the part worth keeping.**
-
 1. **A plain `run` never stamped `node_id` at all.** The per-node status layer was empty for
    the *most common* way to start a run: no pills, no click target, and a retry answering
    *"took no part in this run"* on **every card**. The walk was written for retry and found a
@@ -4473,7 +4500,6 @@ count is still 1 afterwards.
    fail a run that has already started; a rule whose graph does not project is left
    *unattributed* rather than half-attributed, because a half-painted canvas reads as "those
    nodes were skipped", which is a claim about work the engine did.
-
 2. **The attempt counter had to be reset, and my first design was wrong.** The reasoning was
    "re-running one node is not a new budget", so the write left `attempts` alone — and
    PostgreSQL refused it. `workflow_steps_attempts_shape` caps `attempts` at `max_attempts`
@@ -4484,21 +4510,17 @@ count is still 1 afterwards.
    the reasoning is recorded in the store's own doc comment so the next reader does not
    re-derive the wrong answer. **A database constraint, not a test, is what corrected the
    design here** — the walk found it because it drove the real engine.
-
 **`plan_retry_node` is a pure function** because a branching node is **two rows** (a
 `success` and an `error` step), and a `find` would report "nothing to retry" on the very node
 the canvas is painting *diverged* red. Four refusals with four distinct codes, because only
 two of them are about the run: a node that succeeded, a node the run never reached, a live
 run, a cancelled run. The two run-level refusals deliberately do **not** name the node — that
 would point the operator at the card they clicked instead of the run that was closed.
-
-**Proof.**
 - `cargo test -p omnion-workflows --lib` → **109/109** (95 before; 14 new)
 - `cargo test -p omnion-api --test workflows retry_this_node` → **1/1**, against a
   **freshly created** database (`omnion_w3_fresh`)
 - `apps/admin` builder suites → **96/96** (85 before; 11 new)
 - `tsc --noEmit` in `apps/admin` → clean
-
 **The migration-gap blocker, re-tested and narrowed.** Two ticks this branch reported that
 *no* `OMNION_REQUIRE_DB=1` suite can run because migrations `0019` and `0022` are absent
 and every suite dies at `VersionMissing(19)`. That is true of a **polluted** database and
@@ -4510,7 +4532,10 @@ branch's migration list*, not a block on testing this branch. `scripts/qa/run-me
 already encodes the right shape (a disposable database per suite); the general answer is a
 disposable database per suite for the DB-bound walks, and the shared development database
 should be treated as unusable by anything that migrates.
-
 **Next.** The browser pass on the private stack, which is what criterion 2's *click* half and
 criterion 3's control both need — a criterion is not ticked on a probe that has not run.
 Then criterion 5 (the real-event listener) and criterion 8 (Table-mode parity).
+**Next.** On arrival, check the slot: if it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with **no `QA_STACK` override**. If green, tick the screen boxes for
+slices 1, 2 and 3 together and close REQ-016. Then the first not-done REQ in wave-1 order
+(REQ-012/013/014 — the security, backup and system-health centres).

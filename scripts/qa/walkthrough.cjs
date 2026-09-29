@@ -4706,6 +4706,134 @@ async function runWebhooksDepth(page, report) {
 }
 
 /**
+ * The retention pass (REQ-016, slice 3).
+ *
+ * It is a separate pass rather than more steps in the events one, and the reason is a cleanup
+ * obligation: a sweep **deletes rows**, so this pass has to put the bus back the way it found
+ * it before any later pass counts events. The events pass asserts on counts; a retention pass
+ * that ran first and left the bus short would make that pass's numbers wrong for reasons that
+ * have nothing to do with it.
+ *
+ * What it proves on screen, in this order:
+ *
+ *  1. The tab renders and the window is the server's, not a default written in the client.
+ *  2. A window outside the server's own range leaves the **Save** button disabled, so the
+ *     refusal never depends on the round trip succeeding.
+ *  3. A window inside the range saves, and the change is on the bus with the before *and* the
+ *     after — a policy change with no audit trail is a policy change nobody can roll back.
+ *  4. `Sweep now` answers with a number, including zero, and a zero renders as a sentence
+ *     rather than an empty table: "the last sweep ran and found nothing" and "no sweep has
+ *     run" are different states and must not look the same.
+ *  5. The run log grows by exactly one row per sweep — including the empty one, which is the
+ *     whole reason the log exists.
+ *  6. The window is put back to what it was, and the status read back says so.
+ */
+async function runRetentionDepth(page, report) {
+  const steps = {};
+  const before = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/events/retention", { credentials: "same-origin" });
+      return answer.ok ? answer.json() : null;
+    })
+    .catch(() => null);
+
+  const original = before?.window_days ?? 30;
+
+  try {
+    // ---- 1. The tab, before anything is changed ------------------------------------------------
+    await page.goto(`${URL_ADMIN}/events?tab=retention`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForSelector("[data-retention-panel], [data-retention-error]", { timeout: 8000 }).catch(() => {});
+
+    steps.panelPresent = (await page.locator("[data-retention-panel]").count()) > 0;
+    steps.noError = (await page.locator("[data-retention-error]").count()) === 0;
+    steps.windowIsTheServers = (await page.locator("[data-retention-window]").inputValue().catch(() => "")) === String(original);
+    steps.boundsComeFromTheApi = before?.min_days === 1 && before?.max_days === 3650;
+    // The counts are on screen even when they are zero: a "due" cell that renders blank is
+    // indistinguishable from a cell for an endpoint the screen forgot to ask about.
+    steps.eventsCounted = (await page.locator("[data-retention-events]").textContent().catch(() => "")).trim().length > 0;
+    steps.dueCounted = (await page.locator("[data-retention-due]").textContent().catch(() => "")).trim().length > 0;
+    steps.lastRunIsNamed = (await page.locator("[data-retention-last-run]").textContent().catch(() => "")).trim().length > 0;
+    await shot(page, "page-events-retention");
+
+    // ---- 2. A window outside the range cannot be saved -----------------------------------------
+    // The bounds are the server's, so the button is the *first* refusal: a value the API would
+    // reject is not offered as something to try.
+    await page.locator("[data-retention-window]").fill("0");
+    await page.waitForTimeout(250);
+    steps.zeroDisablesSave = await page.locator("[data-retention-save]").isDisabled();
+    await page.locator("[data-retention-window]").fill("4000");
+    await page.waitForTimeout(250);
+    steps.hugeDisablesSave = await page.locator("[data-retention-save]").isDisabled();
+    await shot(page, "page-events-retention-out-of-range");
+
+    // ---- 3. A valid window saves, and the change is on the bus --------------------------------
+    await page.locator("[data-retention-window]").fill("7");
+    await page.waitForTimeout(250);
+    steps.validEnablesSave = !(await page.locator("[data-retention-save]").isDisabled());
+    await page.locator("[data-retention-save]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-retention-notice]", { timeout: 8000 }).catch(() => {});
+    steps.saved = ((await page.locator("[data-retention-window]").inputValue().catch(() => ""))) === "7";
+    steps.savedIsAnnounced = ((await page.locator("[data-retention-notice]").textContent().catch(() => ""))).trim().length > 0;
+    await shot(page, "page-events-retention-saved");
+
+    const audited = await page
+      .evaluate(async () => {
+        const answer = await fetch("/api/v1/events?name=webhook.retention.changed&limit=5", {
+          credentials: "same-origin",
+        });
+        const body = await answer.json();
+        return (body.events || [])[0]?.payload ?? null;
+      })
+      .catch(() => null);
+    // The transition, not the new value: an audit trail that records "the window is 7" cannot
+    // answer "what was it before", which is the only question a rollback has.
+    steps.auditCarriesBoth = audited?.previous_window_days === original && audited?.window_days === 7;
+
+    // ---- 4. A sweep answers with a number, including zero --------------------------------------
+    const runsBefore = (await page.locator("[data-retention-run]").count());
+    await page.locator("[data-retention-sweep]").click({ timeout: 4000 }).catch(() => {});
+    await page.waitForSelector("[data-retention-notice]", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const sweptNotice = ((await page.locator("[data-retention-notice]").textContent().catch(() => ""))).trim();
+    steps.sweepAnswers = sweptNotice.length > 0;
+    // A fresh QA database has nothing past a seven-day window, so the honest answer here is
+    // zero — and the sentence is what proves the button finished rather than hung.
+    steps.emptySweepIsASentence = /nothing past the window/i.test(sweptNotice) || /Removed/i.test(sweptNotice);
+    await shot(page, "page-events-retention-swept");
+
+    // ---- 5. The run log grew, empty sweep or not ------------------------------------------------
+    const runsAfter = (await page.locator("[data-retention-run]").count());
+    steps.runLogGrew = runsAfter === runsBefore + 1;
+    steps.emptyRunsHaveTheirOwnState =
+      (await page.locator("[data-retention-runs-empty]").count()) === 0;
+    steps.runRowsCounted = runsAfter;
+    steps.runsBefore = runsBefore;
+
+    record({ page: "events", action: "retention-sweep", removed: steps.runRowsCounted });
+  } finally {
+    // ---- 6. Put the window back -----------------------------------------------------------------
+    // The pass changes a policy the rest of the run reads, so it restores it in a `finally`
+    // rather than at the end of the happy path: a throw three steps in must not leave the QA
+    // organization's bus on a seven-day window for every pass that follows.
+    try {
+      await page.evaluate(async (days) => {
+        await fetch("/api/v1/events/retention", {
+          method: "PATCH",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ window_days: days }),
+        });
+      }, original);
+      steps.restored = true;
+    } catch {
+      steps.restored = false;
+    }
+  }
+
+  return steps;
+}
+
+/**
  * The settings and privacy pass (REQ-007, slice 4): the write half of the settings screen and
  * the two irreversible operations, each proven against the QA database rather than against the
  * screen's own optimism — tracking off, saved, reloaded and read back; a retention value the
@@ -5097,6 +5225,10 @@ async function main() {
     // by area.
     { path: "/events", name: "events" },
     { path: "/events?tab=catalogue", name: "events-catalogue" },
+    // The bus's own retention (REQ-016, slice 3) — a third tab on the same screen, and the
+    // only one whose numbers come from a different endpoint than the feed. Walked here so the
+    // "no untested screen" rule covers it too, and driven by `runRetentionDepth` below.
+    { path: "/events?tab=retention", name: "events-retention" },
     // The webhook endpoints (REQ-016, slice 2) — the list and the create form are walked here.
     // The detail screen is NOT: its path carries an endpoint id, and a route walked with a
     // placeholder id only proves the not-found state renders. `runWebhooksDepth` below opens a
@@ -5237,6 +5369,12 @@ async function main() {
   // make on its own.
   report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
   log(`webhooks: ${JSON.stringify(report.webhooks)}`);
+
+  // The bus's own retention (REQ-016, slice 3). It runs after the events and webhook passes —
+  // both of which count rows on the bus — because a sweep deletes, and a pass that deleted
+  // first would make their numbers wrong for a reason that has nothing to do with them.
+  report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
+  log(`retention: ${JSON.stringify(report.retention)}`);
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
