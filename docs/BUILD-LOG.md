@@ -4121,7 +4121,7 @@ and fewer than ~20 Chrome processes.
 close slice 2 and start slice 3 — the six trigger events mapped through the rule set into one
 enqueued purge, gated by the `auto_purge` toggles the settings screen already stores.
 
-## Tick 18 — REQ-011 slice 3: automatic invalidation (partial; browser gate still deferred)
+## Tick 18 — REQ-011 slice 3: automatic invalidation (built and green; browser gate still deferred)
 
 **Pre-flight said no again, so this tick spent its budget on product instead.** `MemAvailable`
 **4G** against a `> 8G` precondition, load 14.4 (peaking 31.6 while six other writers built),
@@ -4163,19 +4163,53 @@ gets a successful purge that invalidated nothing.
 
 **Proof.**
 - `cargo test -p omnion-cdn --quiet` -> **110 passed / 0 failed** (94 before, 16 new).
-- `apps/api/tests/cdn_invalidation.rs` — nine walks, written against the **real** bus: they call
-  `bus::emit` and then `invalidation::drain`, so the row that appears is one the platform wrote.
-  Includes the exactly-once walk (drain three times, one purge), the disabled-toggle walk, the
-  tag-less fallback walk, and one that takes the queued row all the way to `succeeded` through
-  the *worker's* `claim_due` / `apply_outcome` / `settle`.
+- `apps/api/tests/cdn_invalidation.rs` -> **10 passed / 0 failed** (3.15s). Written against the
+  **real** bus: they call `bus::emit` and then `invalidation::drain`, so the row that appears is
+  one the platform wrote. The publish walk, exactly-once across three drains, the disabled
+  toggle, the no-address event, an event from another area, a replaced file, a theme activation,
+  the tag fallback, and one that takes the queued row to `succeeded` through the *worker's*
+  `claim_due` / `apply_outcome` / `settle`.
+- Regression on the suites this branch already owned: `cdn` **15**, `cdn_headers` **16**,
+  `cdn_purge` **17** — all green, 0 failures. `pnpm typecheck` -> **0 errors**.
 - `GET /api/v1/cdn/purges/{id}` answers a `source` object; `/cdn/purges`' drawer renders
   "automatic · page.published · event 412" against a platform-raised purge and "requested by an
   operator" against a manual one.
-- **Pending at the time of writing**: the API build and the nine walks were still compiling when
-  this entry was written. The crate is green; the API half is not yet claimed as verified.
 
-**Commits.** `3603060` (crate, migration, catalog drift test).
+**Four of the ten walks failed on the first run, and three of the four were the test being
+wrong** — which is the more useful half of the result, because each one was a belief the walk
+was carrying that the product did not share.
 
-**Next.** Finish the API compile and run the nine walks; then merge `origin/main` (four known
-conflicts: `app-shell.tsx`, `lib/api.ts`, `lib/types.ts`, `BUILD-LOG.md`, `walkthrough.cjs`) and
-run the browser gate on the first tick that finds a quiet box.
+* **`origin` reports `tags: true` on purpose.** With no external edge a tag resolves to the URL
+  it stands for, and the origin answers honestly. Two walks asserted `kind == "url"` and were
+  corrected, not the adapter.
+* **Every shipped adapter reports tag support**, so the tag-less branch of the planner is
+  unreachable in production today. The obvious move — point a site at `generic_http` and assert
+  a URL purge — would have produced a green walk for the wrong reason: the adapter still says
+  `tags: true`, and the row would be a tag purge wearing a URL assertion. The branch is instead
+  driven through the planner, and the walk states the condition under which it should be
+  promoted to a database walk (the day an adapter ships that cannot hold a tag).
+* **A trigger turned on after the fact does not retroactively purge what it missed.** The
+  walk assumed it would. It should not: the cursor has passed, and replaying a month of backlog
+  for a trigger that was off is a stampede at a provider for content republished many times
+  since. The operator's tool for "purge everything now" is the console, which says so.
+* **One real defect, in the test rather than the product**: `on conflict (site_id)` has no
+  arbiter to match, because per-site uniqueness is a *partial* index. The product's own
+  `put_settings` already spells it `on conflict (site_id) where site_id is not null`.
+
+**One environment finding worth the space it takes.** The first API build was killed twice
+mid-link, once with `No space left on device` and once with `failed to open … No such file or
+directory` on the linker's own output. The second was not the disk filling up: the shared
+`omnion-disk-guard` cron (every 30 min, its last-resort loop frees until 10G is available) had
+**deleted this worktree's `target/` underneath the running linker**, twice, because six other
+writers' targets were larger. A cold `target/` is the guard's stated, accepted cost — it says
+so in its own header — but a target deleted *between* rustc's writes is a build that fails in
+a way that looks like a compiler bug. `CARGO_TARGET_DIR=/root/w5-build` moves this writer's
+artifacts off the guarded path entirely, and the same build then completed.
+
+**Commits.** `3603060` (crate, migration, catalogue drift test), `0e7ac6b` (docs),
+`a2b188b` (admin + the `source` field), `3df6432` (the pass and the walks).
+
+**Next.** Merge `origin/main` (four known conflicts: `app-shell.tsx`, `lib/api.ts`,
+`lib/types.ts`, `walkthrough.cjs` — and `lib/types.ts` is a file this branch also touched, so the
+union must keep BOTH sides), then run the browser gate on the first tick that finds a quiet box.
+Two slices now stand un-gated behind it, and that is the honest state of the branch.

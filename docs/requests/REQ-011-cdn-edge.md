@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slices 1–3 built — `807e307`, `69ba2c7`, `3603060`; browser gate still pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; browser gate still pending) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -134,18 +134,28 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   a durable-cursor walk over `events` that writes the plans. The pure half is deliberate — the
   mapping is where every real choice lives, and a mapping testable only by emitting an event and
   reading a table is a mapping nobody writes a second test for. Sixteen such tests cost 0.02s;
-  nine integration walks against the real bus cost 155s and are the ones that would catch a
-  statement PostgreSQL refuses. The drain runs **before** the drain that claims due items, so a
+  nine integration walks against the real bus — 10 of them, 3.15s — are the ones that would catch a
+ statement PostgreSQL refuses. The drain runs **before** the drain that claims due items, so a
   publication is queued and claimed in the same worker tick rather than the next one.
   Trigger toggles are honoured per name and default to **off**: a settings row created before a
   trigger existed must not start purging a site because someone added an event name, and the
   operator has a switch for every name precisely so the answer is theirs to give.
-  Proved by `apps/api/tests/cdn_invalidation.rs` — the publish walk (a purge row, one item, the
-  page's own address, `requested_by = null`, and a `cdn_purge_sources` row naming the event),
-  the exactly-once walk (drain three times → one purge), the disabled-toggle walk, the
-  no-address walk, the foreign-event walk, the media-address walk, the tag-less fallback walk,
-  and one that carries the queued row to `succeeded` through the worker's own
-  `claim_due` / `apply_outcome` / `settle`._
+  Proved by `apps/api/tests/cdn_invalidation.rs` — **10/10** — the publish walk (a purge row,
+  one item, the page's own address, `requested_by = null`, and a `cdn_purge_sources` row naming
+  the event), the exactly-once walk (drain three times → one purge), the disabled-toggle walk,
+  the no-address walk, the foreign-event walk, the media-address walk, the theme walk, the
+  tag-fallback walk, and one that carries the queued row to `succeeded` through the worker's own
+  `claim_due` / `apply_outcome` / `settle`.
+
+  Two of those walks exist because they were **wrong first**, and the corrections are the
+  argument. Every shipped adapter reports tag support — `origin` because a tag resolves to its
+  URL when there is no edge at all — so the planner's tag-less branch is unreachable in
+  production today; rather than fake a tag-less provider and bank a green walk for the wrong
+  reason, that branch is driven through the planner and the walk names the condition under which
+  it should be promoted. And a trigger turned on after the fact does **not** retroactively purge
+  what it missed: the cursor has passed, and replaying a month of backlog is a stampede at a
+  provider for content that has been republished many times since. The console is the tool for
+  "purge everything now", and it says so._
 - [x] A provider error marks the purge `failed`, records the provider message and leaves items retryable.
   _`a_provider_refusal_lands_in_the_drawer_with_its_message_and_is_retryable` points the site
   at an adapter with an unreachable endpoint and drains it three times against a budget of
