@@ -5269,3 +5269,60 @@ not a margin to start a Chromium in. The CRM screens remain un-walked. Slice 3's
 **Next.** Try the pass the moment the slot frees; it is the only thing standing between this
 branch and a walkthrough. Then the inbox's live breached-count badge, which the worker has just
 made meaningful for the first time.
+
+## omnion-w8 · tick 20 · REQ-117 slice 3, the binding health check
+
+**What.** `store::capture` now runs the intake binding health check on the submission that
+proves it, and `modules/crm-intake/src/binding_health.rs` supplies the form's key list and
+turns the pure `mapping::health` verdict into one of three states. `mapping::health` and
+`store::set_broken_mappings` had shipped several slices earlier and had **no production
+caller** — the sources table's "broken mapping" badge was a branch no state could reach.
+
+**Proof.**
+- `scripts/qa/run-crm-binding-health.sh` **5/5** (own database `omnion_qa_w8_binding`).
+- **Proven to fail**: removing the one call from `capture` → `left: [] right: ["job"]`, while
+  the 9 unit tests in the module stay green.
+- `cargo test -p omnion-module-crm-intake --lib` **159 passed / 0 failed** (was 150).
+- Sibling gates unchanged: `run-crm-intake` PASS, `run-crm-dedupe` 10, `run-crm-claims` 7,
+  `run-crm-convert` 6.
+- 0 clippy warnings in the files touched; `apps/admin` `tsc --noEmit` clean.
+- Commits: `a15411b` (the answer), `d7912dd` (the caller + the gate), `0b40c98` (payload-first
+  key list), `b303e6d` (clippy).
+
+**The lesson worth keeping.** This is the **fourth** time this module has shipped a function
+that computes the right answer, is unit-tested, has a column, a model predicate and a screen —
+and has no caller. Round-robin cursor, autoresponder reservation, SLA reminder, this. The
+cheapest possible audit found it: `grep -rn '<fn>'` over the module and `apps/`, counting
+references that are not the definition. A unit test is evidence about a function; it is *not*
+evidence about a feature. **The test that measures a feature has to go through its caller.**
+
+**A detector that lies is worse than no detector.** The first dead-code scan reported
+`submissions_this_hour` as having no production caller, when it is called 30 lines below its own
+definition in the same file. It had stripped `#[cfg(test)]` modules and counted refs in a way
+that missed them. Rebuilding it on `grep` with a known-positive control (that function) is what
+made it usable — a detector needs a control before its negatives mean anything.
+
+**A wrong test premise is the most expensive thing a gate can cost you.** Four of six tests
+failed on the first run, and every one was the test's fault, not the code's:
+- the fixture built an `endpoint` source, which has no `form_key` and is therefore *correctly*
+  `Unknown` — a keyed endpoint has no form whose fields can be renamed, so calling it broken
+  would be the bug;
+- the idempotence test asserted on `updated_at`, which `record_source_outcome` moves on every
+  submission by design;
+- the "unreadable binding" fixture needed an empty payload, which turns out to be unreachable.
+
+Diagnosing which side is wrong is the whole skill. The rule that worked: **read the code that
+is being blamed before editing it**, and treat every failing assertion as a claim about the
+product until proved otherwise.
+
+**Found, not mine, and left for its own slice.** `capture`'s `rejected` branch writes a lead with
+neither e-mail nor phone; `crm_leads_contactable_check` refuses it with a `23514`. REQ-117
+acceptance 5 says that row is written with a readable reason, and `crm_autoresponder.rs` works
+around the same path rather than testing it. It also makes the health check's `Unknown` state
+unreachable through `capture` on this branch, which is why that half is asserted on
+`keys_to_store()` in a unit test and named in the gate header instead of being faked at the
+HTTP level. The fix is a migration that relaxes the check for `status = 'rejected'`.
+
+**Next.** Slice 3's remaining depth: the REQ-064 form-editor card is the last screen, and the
+`rejected`-row constraint above is a real defect worth its own commit. A browser pass is still
+blocked — the QA slot is held by another writer's live pass and free RAM is ~200 MB of 32 G.
