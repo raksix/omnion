@@ -48,8 +48,8 @@ pub mod transfers;
 pub use error::{InventoryError, Result};
 pub use items::Item;
 pub use ledger::{
-    Movement, MovementQuery, NewMovement, Recorded, apply_movement, record_resolved, replay,
-    record_movement,
+    Movement, MovementQuery, NewMovement, Recorded, ReplayedPosition, apply_movement,
+    record_resolved, replay, record_movement,
 };
 pub use reservations::{
     ReservationAction, ReservationOutcome, UnheldLine, reserve_for_order,

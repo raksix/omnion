@@ -431,6 +431,7 @@ pub async fn record_movement(
         new.source_kind.as_deref(),
         new.source_id,
         &note,
+        None,
         new.may_go_negative,
         actor,
     )
@@ -459,6 +460,11 @@ pub async fn record_resolved(
     source_kind: Option<&str>,
     source_id: Option<Uuid>,
     note: &str,
+    // The sales order line this movement belongs to (migration `0146`) — a nullable **pointer**,
+    // never a copy of the quantity: the amount lives on the row itself, so a wrong pointer can
+    // only make the reservation guard conservative (hold again) rather than destructive, which is
+    // the direction to be wrong in. A hand-written movement passes `None`.
+    order_line_id: Option<Uuid>,
     may_go_negative: bool,
     actor: Option<Uuid>,
 ) -> Result<Recorded> {
@@ -503,8 +509,9 @@ pub async fn record_resolved(
     // The ledger row first, carrying the numbers that were computed from the locked read.
     let movement_id: i64 = sqlx::query_scalar(
         "insert into inventory_movements (organization_id, item_id, location_id, kind, quantity, \
-             reason, source_kind, source_id, note, on_hand_after, reserved_after, actor_user_id) \
-         values ($1, $2, $3, $4, $5::numeric, $6, $7, $8, $9, $10::numeric, $11::numeric, $12) \
+             reason, source_kind, source_id, note, on_hand_after, reserved_after, actor_user_id, \
+             order_line_id) \
+         values ($1, $2, $3, $4, $5::numeric, $6, $7, $8, $9, $10::numeric, $11::numeric, $12, $13) \
          returning id",
     )
     .bind(organization_id)
@@ -519,6 +526,7 @@ pub async fn record_resolved(
     .bind(next_on_hand.to_text())
     .bind(next_reserved.to_text())
     .bind(actor)
+    .bind(order_line_id)
     .fetch_one(&mut *transaction)
     .await
     .map_err(|error| {
@@ -877,17 +885,38 @@ pub async fn item_history(
     .map(|page| page.items)
 }
 
-/// Recompute every item × location's `on_hand` from the ledger alone.
+/// What the ledger alone says a stock row should be: both numbers, not one.
+///
+/// `on_hand` and `reserved` are separate columns with separate rules, and folding them into one
+/// number is how a reservation becomes invisible. The bug this shape hides is specific: a reserve
+/// has `signed() == 0` ("it does not move on_hand"), and the arm that used to catch `0` was a
+/// plain addition — so a hold of 4 replayed as `on_hand = 14` against a rollup saying `10`. The
+/// reconciliation report would have reported a permanent, impossible disagreement on every
+/// reserved row, which is the fastest way to teach a team to ignore the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplayedPosition {
+    /// What the movements add up to on the shelf.
+    pub on_hand: Quantity,
+    /// What the holds add up to against it.
+    pub reserved: Quantity,
+}
+
+/// Recompute every item × location's `on_hand` and `reserved` from the ledger alone.
 ///
 /// This is the check the acceptance criteria demand, and it is deliberately written as a
 /// **replay from the movements** rather than a comparison of the last row's `on_hand_after`: the
 /// last row only proves the final number, whereas a replay proves the whole sequence adds up.
 /// A ledger whose middle was corrupted still ends at the right number if the last row was honest.
 ///
-/// Rows the ledger never mentions are **absent from the map**, and that absence is meaningful:
-/// `reconciliation_report` compares it against a rollup row and finds the disagreement, which is
-/// the one a spot check never finds because nothing in the ledger mentions it.
-pub async fn replay(pool: &PgPool, organization_id: Uuid) -> Result<std::collections::HashMap<Uuid, Quantity>> {
+/// Rows the ledger never mentions are **present with zeroes** rather than absent, because
+/// `reconciliation_report` compares them against a rollup row and the row it most needs to catch
+/// is the one nothing in the ledger mentions. (Before slice 5 the absence was meaningful only
+/// because a missing row always meant a zero rollup; now that a row can be created by a hold, the
+/// rule has to be stated rather than inherited.)
+pub async fn replay(
+    pool: &PgPool,
+    organization_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, ReplayedPosition>> {
     let rows = sqlx::query(
         "select s.id, m.kind, m.quantity::text as quantity from inventory_stock s \
          left join inventory_movements m \
@@ -899,26 +928,45 @@ pub async fn replay(pool: &PgPool, organization_id: Uuid) -> Result<std::collect
     .fetch_all(pool)
     .await?;
 
-    let mut totals: std::collections::HashMap<Uuid, Quantity> = Default::default();
+    let mut totals: std::collections::HashMap<Uuid, ReplayedPosition> = Default::default();
     for row in rows {
         let id: Uuid = row.get("id");
         let kind: Option<String> = row.get("kind");
-        let Some(kind_raw) = kind else {
-            // No movement has ever touched this row. A rollup that is not zero here is a
-            // disagreement the replay has to be able to *see*, so the row is seeded at zero
-            // rather than skipped.
-            totals.entry(id).or_insert(Quantity::ZERO);
-            continue;
-        };
+        // Seeded, not skipped: a rollup row the ledger never mentions is a disagreement this
+        // replay has to be able to see.
+        let entry = totals.entry(id).or_default();
+        let Some(kind_raw) = kind else { continue };
         let kind = MovementKind::parse(&kind_raw).ok_or_else(|| {
             InventoryError::invalid("movement", "kind", format!("{kind_raw} is not a movement kind"))
         })?;
         let quantity = store::quantity_from_text(row.get::<&str, _>("quantity"))?;
-        let entry = totals.entry(id).or_insert(Quantity::ZERO);
-        *entry = match kind.signed() {
-            1 => entry.checked_add(quantity).unwrap_or(*entry),
-            -1 => entry.checked_sub(quantity).unwrap_or(*entry),
-            _ => entry.checked_add(quantity).unwrap_or(*entry),
+
+        // The two columns are decided by **which one the kind moves**, not by a signed multiplier
+        // that happens to be zero for both reservation kinds. The three cases are spelled out so
+        // that adding a kind later forces a decision here instead of falling into the arithmetic
+        // that made a hold look like a receipt.
+        if kind.touches_reserved() {
+            let released = matches!(kind, MovementKind::Release);
+            let next = if released {
+                entry.reserved.checked_sub(quantity)
+            } else {
+                entry.reserved.checked_add(quantity)
+            };
+            entry.reserved = next.unwrap_or(entry.reserved);
+            continue;
+        }
+        entry.on_hand = match kind {
+            // An adjustment carries its own sign, so it is a plain addition of a possibly
+            // negative number — the same as a receipt, and deliberately not re-derived here.
+            MovementKind::Adjustment | MovementKind::Receipt | MovementKind::TransferIn => {
+                entry.on_hand.checked_add(quantity).unwrap_or(entry.on_hand)
+            }
+            MovementKind::Issue | MovementKind::TransferOut => {
+                entry.on_hand.checked_sub(quantity).unwrap_or(entry.on_hand)
+            }
+            // `Reserve` and `Release` are handled above; naming them here keeps a future kind
+            // from silently becoming an addition to the shelf.
+            MovementKind::Reserve | MovementKind::Release => entry.on_hand,
         };
     }
     Ok(totals)
@@ -1023,6 +1071,58 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("zero"), "{error}");
+    }
+
+    /// A hold must not move `on_hand` in the replay either.
+    ///
+    /// This is the assertion the old replay could not make. `signed()` is `0` for both
+    /// reservation kinds, and the arm that used to catch `0` was a plain **addition** — so a hold
+    /// of 4 replayed as `on_hand = 14` while the rollup said `10`, and the reconciliation report
+    /// would have reported a permanent disagreement on every reserved row. The bug was invisible
+    /// only because no write moved `reserved`; the day the first hold existed, the module's own
+    /// proof of itself would have started crying wolf on every order.
+    #[test]
+    fn a_replay_reads_a_hold_as_a_hold_and_not_as_a_receipt() {
+        let kinds = [
+            MovementKind::Receipt,
+            MovementKind::Reserve,
+            MovementKind::Issue,
+            MovementKind::Release,
+        ];
+        // 10 in, 4 held, 3 out, 4 given back. The shelf ends where it started; the hold ends at
+        // zero. A replay that added the reservation would end at 15, and one that treated the
+        // release as an issue would end at 3 — the two failure modes, both wrong, both quiet.
+        let expect_on_hand = ["10.000", "10.000", "7.000", "7.000"];
+        let expect_reserved = ["0.000", "4.000", "4.000", "0.000"];
+        let quantities = ["10.000", "4.000", "3.000", "4.000"];
+
+        let mut position = ReplayedPosition::default();
+        for ((kind, quantity), (want_on_hand, want_reserved)) in kinds
+            .iter()
+            .zip(quantities)
+            .zip(expect_on_hand.iter().zip(expect_reserved))
+        {
+            let quantity = store::quantity_from_text(quantity).expect("quantity");
+            // The same two cases the replay itself makes, so the test cannot agree with a
+            // different rule than the code runs.
+            if kind.touches_reserved() {
+                let next = if matches!(kind, MovementKind::Release) {
+                    position.reserved.checked_sub(quantity)
+                } else {
+                    position.reserved.checked_add(quantity)
+                };
+                position.reserved = next.unwrap_or(position.reserved);
+            } else {
+                position.on_hand = match kind {
+                    MovementKind::Issue | MovementKind::TransferOut => {
+                        position.on_hand.checked_sub(quantity).unwrap_or(position.on_hand)
+                    }
+                    _ => position.on_hand.checked_add(quantity).unwrap_or(position.on_hand),
+                };
+            }
+            assert_eq!(position.on_hand.to_text(), *want_on_hand, "after a {kind:?}");
+            assert_eq!(position.reserved.to_text(), *want_reserved, "after a {kind:?}");
+        }
     }
 
     #[test]

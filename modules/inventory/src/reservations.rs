@@ -175,7 +175,7 @@ pub async fn reserve_for_order(
     let (number, _status) = order.ok_or(InventoryError::NotFound("order"))?;
 
     let lines: Vec<OrderLine> = sqlx::query_as(
-        "select l.id,
+        "select l.id as line_id,
                 l.product_id,
                 l.description,
                 l.quantity::text as quantity,
@@ -208,6 +208,23 @@ pub async fn reserve_for_order(
             ));
         }
 
+        // **A second confirm must not hold the same stock twice.** The sales module's unique
+        // index on `(order_id, line_id)` makes the *sales* row idempotent, so a double-click or a
+        // retried request writes no second hold there — and every screen that reads the order then
+        // looks perfectly correct while the shelf has been drained twice. This is the second time
+        // in this module that a unique index in one table has hidden a write in another: the
+        // guard asks the **ledger** what this order still holds on this line, which is the only
+        // place the answer can come from, because the rollup is the organization's total.
+        let outstanding = if action == ReservationAction::Reserve {
+            let already = held_for_line(pool, organization_id, order_id, line.line_id).await?;
+            quantity.checked_sub(already).unwrap_or(Quantity::ZERO)
+        } else {
+            quantity
+        };
+        if !outstanding.is_positive() {
+            continue;
+        }
+
         let Some(item_id) = item_for_line(pool, organization_id, line).await? else {
             // The honest `partial`. A free-text line and a line whose product has never been made
             // an inventory item are the same fact from the warehouse's side: there is no shelf.
@@ -232,7 +249,7 @@ pub async fn reserve_for_order(
         // satisfy the hold takes as little of it as possible. `on_hand - reserved` is the number a
         // promise may be built on; sorting by the *available* figure (and not by the id) is what
         // makes the spread deterministic across two calls that see the same data.
-        let locations = available_locations(pool, organization_id, item_id, quantity).await?;
+        let locations = available_locations(pool, organization_id, item_id, outstanding).await?;
         if locations.is_empty() {
             let available = total_available(pool, organization_id, item_id).await?;
             outcome.unheld_lines.push(UnheldLine {
@@ -241,7 +258,7 @@ pub async fn reserve_for_order(
                 product_id: line.product_id,
                 sku: line.sku.clone(),
                 reason: format!(
-                    "this item can be promised {available} and the order asks for {quantity}"
+                    "this item can be promised {available} and the order asks for {outstanding}"
                 ),
             });
             continue;
@@ -252,7 +269,7 @@ pub async fn reserve_for_order(
             // own `reserved` for this source is what makes a cancel of a partly-issued order
             // return the remainder rather than a fresh spread of the original number.
             let take = match action {
-                ReservationAction::Reserve => room.min(quantity),
+                ReservationAction::Reserve => room.min(outstanding),
                 ReservationAction::Release => {
                     let held = held_for_source(
                         pool,
@@ -265,7 +282,7 @@ pub async fn reserve_for_order(
                     // `min`, because a warehouse that already issued part of the goods has
                     // released the rest itself; releasing more than is held would take `reserved`
                     // below zero and the ledger refuses that for the right reason.
-                    held.min(quantity.min(room.max(Quantity::ZERO)))
+                    held.min(outstanding.min(room.max(Quantity::ZERO)))
                 }
             };
             if !take.is_positive() {
@@ -292,6 +309,7 @@ pub async fn reserve_for_order(
                 Some(action.source_kind()),
                 Some(order_id),
                 &note,
+                Some(line.line_id),
                 // A reservation can never go negative: it moves `reserved` only, and
                 // `apply_movement` refuses `reserved > on_hand` unconditionally. Passing `false`
                 // is the honest statement — this write is not asking for the exception.
@@ -316,14 +334,14 @@ pub async fn reserve_for_order(
         {
             held_here = held_here.checked_add(position.reserved).unwrap_or(held_here);
         }
-        if held_here < quantity && action == ReservationAction::Reserve {
+        if held_here < outstanding && action == ReservationAction::Reserve {
             outcome.unheld_lines.push(UnheldLine {
                 line_id: line.line_id,
                 description: line.description.clone(),
                 product_id: line.product_id,
                 sku: line.sku.clone(),
                 reason: format!(
-                    "only {held_here} of {quantity} is on a shelf to promise"
+                    "only {held_here} of {outstanding} is on a shelf to promise"
                 ),
             });
         }
@@ -421,6 +439,43 @@ async fn total_available(
     room.map(|raw| crate::store::quantity_from_text(&raw))
         .transpose()
         .map(|value| value.unwrap_or(Quantity::ZERO))
+}
+
+/// What one order line is still holding, summed over every location.
+///
+/// Read from the ledger's own `order_line_id` pointer (migration `0146`), so this is an equality on
+/// a uuid. The first version of this function matched on the **note** — `like '%· line "<id>"%'`
+/// — which is a string filter on a column that exists to be read by a person, and it would have
+/// broken the first time somebody renamed a line. The pointer is the same question asked in the
+/// shape the data can answer it.
+async fn held_for_line(
+    pool: &PgPool,
+    organization_id: Uuid,
+    order_id: Uuid,
+    line_id: Uuid,
+) -> Result<Quantity> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "select kind, quantity::text from inventory_movements
+          where organization_id = $1 and source_kind = 'order' and source_id = $2
+            and order_line_id = $3
+          order by id",
+    )
+    .bind(organization_id)
+    .bind(order_id)
+    .bind(line_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut held = Quantity::ZERO;
+    for (kind, quantity) in rows {
+        let parsed = crate::store::quantity_from_text(&quantity)?;
+        held = if kind == MovementKind::Reserve.as_str() {
+            held.checked_add(parsed).unwrap_or(held)
+        } else {
+            held.checked_sub(parsed).unwrap_or(held)
+        };
+    }
+    Ok(held)
 }
 
 /// What this order is still holding of one item at one location.

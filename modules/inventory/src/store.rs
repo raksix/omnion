@@ -1682,15 +1682,23 @@ pub async fn reconciliation_report(
         // A row that exists only in the rollup is a disagreement too, and the one a spot check
         // never finds: nothing in the ledger mentions it, so "sum the movements" says nothing is
         // wrong.
-        let expected = replayed.get(&id).copied().unwrap_or(Quantity::ZERO);
-        if expected.milli() != rollup_on_hand.milli() {
+        let expected = replayed.get(&id).copied().unwrap_or_default();
+        // **Both** numbers, and the conjunction is the point. This used to compare `on_hand` only
+        // and then report `replay`ed `reserved` as the rollup's own figure — a column that agreed
+        // with itself by construction and therefore could never fail. That was harmless while no
+        // write moved `reserved`; slice 5 made holds real, and a bridge that corrupted the
+        // reservation column would have been reported as clean. A check that cannot fail is worse
+        // than no check, because the report is what everybody trusts.
+        if expected.on_hand.milli() != rollup_on_hand.milli()
+            || expected.reserved.milli() != rollup_reserved.milli()
+        {
             mismatches.push(StockMismatch {
                 item_id: row.get("item_id"),
                 location_id: row.get("location_id"),
                 rollup_on_hand: rollup_on_hand.to_text(),
-                replayed_on_hand: expected.to_text(),
+                replayed_on_hand: expected.on_hand.to_text(),
                 rollup_reserved: rollup_reserved.to_text(),
-                replayed_reserved: rollup_reserved.to_text(),
+                replayed_reserved: expected.reserved.to_text(),
             });
         }
     }

@@ -21,6 +21,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
+use omnion_module_inventory::reservations::{self, ReservationAction};
 use omnion_module_sales::orders::{
     self, CancelOrder, NewOrder, OrderQuery, OrderView,
 };
@@ -186,6 +187,21 @@ pub async fn confirm_order(
     let detail =
         orders::confirm_order(state.db().pool(), organization_id, order_id, current.user.id).await?;
 
+    // The hold, on the shelf. This is deliberately **not** a subscriber to the event below: the
+    // event is what a webhook or an automation rule reads, and both of those may be off, may be
+    // slow, and may fail. A promise made in an order that no shelf knows about is the exact gap
+    // this line closes, and it is the same argument the events section of REQ-053 makes about
+    // `sales.order.confirmed` — consumed, but consumed *here*, where the document is committed
+    // and a failure can still be reported to the person who pressed the button.
+    let holds = reservations::reserve_for_order(
+        state.db().pool(),
+        organization_id,
+        order_id,
+        ReservationAction::Reserve,
+        Some(current.user.id),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "sales.order.confirm")
@@ -197,6 +213,8 @@ pub async fn confirm_order(
                 "reservation_state": detail.order.reservation_state.as_str(),
                 "currency": detail.order.currency,
                 "grand_total": detail.order.grand_total,
+                "held": holds.movements.len(),
+                "unheld_lines": holds.unheld_lines,
             })),
     )
     .await?;
@@ -213,7 +231,12 @@ pub async fn confirm_order(
                 "grand_total": detail.order.grand_total,
                 "reservation_state": detail.order.reservation_state.as_str(),
                 // The reserved quantities, per the spec's payload list: a warehouse subscriber
-                // needs the numbers, not the fact that something happened to them.
+                // needs the numbers, not the fact that something happened to them. These are the
+                // numbers **actually written to the shelf**, which is what makes this payload worth
+                // subscribing to — before the bridge, a subscriber that trusted them would be
+                // reading a promise rather than a movement.
+                "held_movements": holds.movements.len(),
+                "unheld_lines": holds.unheld_lines,
                 "lines": detail
                     .lines
                     .iter()
@@ -249,6 +272,19 @@ pub async fn cancel_order(
     )
     .await?;
 
+    // The stock goes back, through the same bridge that took it. Symmetry is the whole argument
+    // for doing it here rather than leaving it to a subscriber: a release that is written by a
+    // different code path from the reserve is a release that can drift, and "the cancel button
+    // gave the stock back" is a promise made to a warehouse.
+    let released = reservations::reserve_for_order(
+        state.db().pool(),
+        organization_id,
+        order_id,
+        ReservationAction::Release,
+        Some(current.user.id),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "sales.order.cancel")
@@ -259,6 +295,7 @@ pub async fn cancel_order(
                 "status": detail.order.status.as_str(),
                 "reason": input.reason,
                 "reservation_state": detail.order.reservation_state.as_str(),
+                "released_movements": released.movements.len(),
             })),
     )
     .await?;
