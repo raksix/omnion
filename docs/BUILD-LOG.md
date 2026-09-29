@@ -91,7 +91,7 @@ written without validation is a palette entry that fails when somebody places it
 replaces it with the SDK, the validating install, and a removal that can name what it breaks.
 
 **What shipped.** `crates/workflows/src/node_package.rs` (the manifest, the validator, the
-canonical checksum, `pack`, `scaffold`, `removal_plan`); `0055_workflow_node_package_nodes.sql`
+canonical checksum, `pack`, `scaffold`, `removal_plan`); `0142_workflow_node_package_nodes.sql`
 — `node_keys` on the ledger row; `apps/api/src/routes/node_packages.rs`; `tools/cli/src/node.rs`
 — `omnion node scaffold|validate|pack`; and `/modules/installed` with a walkthrough depth pass.
 

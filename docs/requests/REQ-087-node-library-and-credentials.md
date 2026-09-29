@@ -1,6 +1,6 @@
 # REQ-087 — Node Library & Credential Catalog
 
-> **Status:** in-progress (slices 1–4, `c3ec2d0`…`0e88f27`; slice 4 browser-proven, credentials org scoping open) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
+> **Status:** in-progress (slices 1–4 + the credentials org-scoping fix, `c3ec2d0`…`d11b778`; slice 4 and the credential screens browser-proven) · **Captured:** 2026-09-26 · **Layer:** `crates/workflows` + plugins
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -232,7 +232,9 @@ back to untested), `workflows.graph.saved` (usage refresh).
       them; the expired-credential amber state is computed (`effective_health`), not read from
       the column, so a token that expired while nothing was running still shows it; and the
       walkthrough sweeps a fixture secret across the DOM, the list and every API read. The
-      credential screens are in the routes list and driven by the pass.*
+      credential screens are in the routes list and driven by the pass. **The filters now also
+      carry the organization** (`d11b778`) — without it a platform account's list was a refusal,
+      and a filter that cannot read its own list cannot be said to narrow it.*
 - [ ] The credential access audit (REQ-125) records reads and tests with actor and time, and the detail link resolves.
 - [ ] Library and credentials screens are keyboard navigable end to end and readable at 390 px.
 
@@ -270,6 +272,21 @@ match the tested state, usage data is real.
    REQ-125's encrypted store — which returns `secret_store_unavailable` by design rather than
    inventing a scheme — and the referenced-delete refusal, which needs a fixture graph and
    arrives with the canvas.*
+
+   **Closed after the slice shipped (`d11b778`): the whole surface was unreachable for the
+   account that needs it.** Every one of the nine routes resolved its organization with
+   `resolve_organization(&current, None)`, so an account *without* a primary organization was
+   refused `organization_required` before it read anything — a superuser administering a
+   tenant's credentials, and the QA owner the pass signs in as, which is why the credential
+   screens showed an empty list and the API answered `400` 66 times over a pass. The
+   organization now travels where the request already has a place for it: the list query, the
+   create and update bodies, the delete and secret-replace bodies, and a shared `ScopeQuery`
+   for the read routes with no body. Every field is optional, so a tenant's own call is
+   unchanged — `every_credential_request_can_name_the_organization_it_works_on` and
+   `a_body_that_names_an_organization_wins_over_the_query_string` say both halves out loud.
+   On the panel the picker is `useOrganizationScope` rather than a fourth hand-copied block: a
+   tenant never sees a control it cannot use, and the create form disables its save button and
+   says why instead of letting the reader fill in a form the API will refuse.
 3. **OAuth and health** — start/callback, single-flight refresh, reauth state, canvas integration. Done: a fixture provider round-trips tokens and a forced refresh failure degrades correctly.
    *Shipped (`7edd4fa`, `f2a4b97`, `e2a7e17`, `faeb737`, `3e91777`, `7317cfb`, `77c60fb`): the
    flow's algebra, its persistence, the transport seam, the refresh caller, the four endpoints
@@ -282,7 +299,7 @@ match the tested state, usage data is real.
    compile-time test), and `RefreshLock` — single-flight per credential, because a refresh
    invalidates the old refresh token on most providers, so six concurrent nodes must produce
    one exchange. `LocalBox` seals the PKCE verifier for the length of one flow.
-   `0054_workflow_oauth_flows.sql` + `oauth_store.rs` — the flow table with **no token column
+   `0141_workflow_oauth_flows.sql` + `oauth_store.rs` — the flow table with **no token column
    and no foreign key to the credential**, `state_hash` rather than the state (a state is a
    bearer value), and `claim_flow` as one `update … where status = 'pending'` so the database
    decides who spent it rather than the application's timing. `release_flow` exists so a
@@ -311,6 +328,11 @@ match the tested state, usage data is real.
    `cargo test -p omnion-workflows --lib` 110 → **132**; `cargo test -p omnion-api --lib`
    **225 passed**; `pnpm typecheck` 0 errors.
 
+   **Scoped after the slice shipped (`d11b778`):** the three session-carrying OAuth routes
+   carried the same defect — `start` takes the organization in its body, and `disconnect` and
+   the forced refresh (neither of which has a body) take a `ScopeQuery`. A platform account
+   connecting a tenant's credential was refused `organization_required` before the flow began.
+
    **Still open on this slice:** storing the token set (REQ-125 — the callback reports that
    refusal as a *failure* rather than as a connection), and `needs_reauth` reaching the canvas
    (REQ-086 slice 2 — the event carries `credential_key`, and the canvas has nowhere to
@@ -338,18 +360,16 @@ match the tested state, usage data is real.
       prove an install, and every step after it ran against a row that was never there. The
       parameter now matches the shape the SDK's own scaffold writes.
 
-   **Still open on this slice:** the palette reading the ledger is REQ-086 slice 2's job, and
-   the credentials screens carry the *same* org-scoping defect the ledger had — 8 routes in
-   `credentials.rs` and 3 in `credential_oauth.rs` still resolve with no requested value, which
-   is why the pass's credential depth reads an empty list and the API answers `400` 66 times.
-   Same fix, same reason; it is the next slice and it is not started.*
+   **Still open on this slice:** the palette reading the ledger is REQ-086 slice 2's job. The
+   second half of that note — the credentials screens carrying the *same* org-scoping defect
+   the ledger had — is **closed** by `d11b778`; see slice 2 above.*
    `crates/workflows/src/node_package.rs` — the manifest, the validator, the canonical
    checksum, `pack`, `scaffold` and `removal_plan`. The validator lints each definition with
    the **bundled registry's own** `lint_node`/`lint_credential` on the same object it installs,
    so a package cannot satisfy a weaker contract than a bundled node; it adds the rules that
    only make sense for third parties (namespaced keys, `sandbox: required` only, declared ==
    implied permissions, no self-installing as `bundled`), and refuses on *any* finding.
-   `0055_workflow_node_package_nodes.sql` — `node_keys` on the ledger row, with the shape
+   `0142_workflow_node_package_nodes.sql` — `node_keys` on the ledger row, with the shape
    check in an `IMMUTABLE` function because a CHECK cannot contain a subquery.
    `apps/api/src/routes/node_packages.rs` — the validating install (manifest in, server-side
    checksum out, equal-or-newer enforced against the live row), the toggle and the removal
