@@ -26,6 +26,7 @@ import { useRouter } from "next/navigation";
 import {
   Ban,
   Copy,
+  Download,
   ExternalLink,
   Link2,
   Loader2,
@@ -38,6 +39,7 @@ import { ErrorState, toScreenError, type ScreenErrorValue } from "@/components/e
 import { LoadingTable } from "@/components/loading-table";
 
 import { formatMoney } from "@/lib/sales";
+import { documentNotice, downloadQuotePdf } from "@/lib/sales-documents";
 import {
   cancelSalesQuote,
   duplicateSalesQuote,
@@ -100,6 +102,33 @@ export function QuoteDetailView({ quoteId }: { quoteId: string }) {
     },
     [],
   );
+
+  /**
+   * The PDF download, deliberately **not** routed through `act`.
+   *
+   * `act` reloads the detail after the action, because every other button here changes the
+   * document. A download changes nothing, and reloading would make the screen flicker and throw
+   * away the scroll position of somebody who is reading the quote they just printed. It also has
+   * its own failure message: a download that fails is a download that did not happen, which is
+   * not the same sentence as "that action could not be completed".
+   */
+  const onDownload = useCallback(async () => {
+    setBusy("pdf");
+    setActionError(null);
+    setNotice(null);
+    try {
+      const document = await downloadQuotePdf(quoteId);
+      setNotice(documentNotice(document) ?? `Downloaded ${document.filename}.`);
+    } catch (problem) {
+      setActionError(
+        problem instanceof Error
+          ? problem.message
+          : "The PDF could not be prepared, so nothing was saved.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }, [quoteId]);
 
   if (error) {
     return <ErrorState error={error} onRetry={() => setReloadToken((token) => token + 1)} />;
@@ -175,6 +204,20 @@ export function QuoteDetailView({ quoteId }: { quoteId: string }) {
               Send
             </button>
           ) : null}
+          <button
+            type="button"
+            onClick={() => void onDownload()}
+            disabled={busy !== null}
+            data-qa-sales-detail-pdf
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] disabled:opacity-60"
+          >
+            {busy === "pdf" ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+            ) : (
+              <Download className="h-3.5 w-3.5" aria-hidden />
+            )}
+            PDF
+          </button>
           <button
             type="button"
             onClick={() =>

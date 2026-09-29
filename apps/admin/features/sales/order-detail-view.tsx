@@ -27,6 +27,7 @@ import {
   ArrowLeft,
   Ban,
   CheckCircle2,
+  Download,
   FileText,
   Loader2,
   PackageCheck,
@@ -37,6 +38,7 @@ import { ErrorState, toScreenError, type ScreenErrorValue } from "@/components/e
 
 import { formatTimestamp } from "@/lib/format";
 import { formatMoney } from "@/lib/sales";
+import { documentNotice, downloadOrderPdf } from "@/lib/sales-documents";
 import {
   SALES_ORDER_STATUSES,
   cancelSalesOrder,
@@ -127,6 +129,29 @@ export function OrderDetailView() {
     [orderId, organizationId, reason],
   );
 
+  /**
+   * The PDF download, separate from `run` for the same reason the quote's is: `run` re-reads the
+   * order after every action, and a download changes nothing — reloading would throw away the
+   * scroll position of somebody reading the order they just printed.
+   */
+  const onDownload = useCallback(async () => {
+    setBusy("pdf");
+    setActionError(null);
+    setNotice(null);
+    try {
+      const document = await downloadOrderPdf(orderId);
+      setNotice(documentNotice(document) ?? `Downloaded ${document.filename}.`);
+    } catch (problem) {
+      setActionError(
+        problem instanceof Error
+          ? problem.message
+          : "The PDF could not be prepared, so nothing was saved.",
+      );
+    } finally {
+      setBusy(null);
+    }
+  }, [orderId]);
+
   if (error) {
     return <ErrorState error={error} onRetry={load} />;
   }
@@ -197,6 +222,20 @@ export function OrderDetailView() {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void onDownload()}
+            disabled={busy !== null}
+            data-qa-sales-order-pdf
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-2.5 py-1.5 text-[12.5px] disabled:opacity-60"
+          >
+            {busy === "pdf" ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+            ) : (
+              <Download className="h-3.5 w-3.5" aria-hidden />
+            )}
+            PDF
+          </button>
           {canConfirm ? (
             <button
               type="button"
