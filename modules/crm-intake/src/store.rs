@@ -13,8 +13,8 @@
 //! * **A refusal is still a row.** [`capture`] writes the spam and rejected rows *through the
 //!   same insert* as an accepted one, so the inbox can show what was discarded.
 
-use sqlx::PgPool;
 use sqlx::postgres::PgQueryResult;
+use sqlx::PgPool;
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
@@ -23,10 +23,10 @@ use crate::error::{CrmIntakeError, Result};
 use crate::keys;
 use crate::mapping::{self, MappedValues, MappingEntry};
 use crate::model::{
-    Attribution, IntakeSource, Lead, LeadEvent, LeadMetrics, NewIntakeSource, SpamVerdict,
-    contactable,
+    contactable, Attribution, IntakeSource, Lead, LeadEvent, LeadMetrics, NewIntakeSource,
+    SpamVerdict,
 };
-use crate::vocabulary::{MAX_PAGE, MAX_PAYLOAD_BYTES, is_status};
+use crate::vocabulary::{is_status, MAX_PAGE, MAX_PAYLOAD_BYTES};
 
 pub const SOURCE_COLUMNS: &str = "id, organization_id, site_id, name, kind, form_key, \
      endpoint_key_hash, endpoint_key_hint, mapping, required_targets, consent_required, \
@@ -1559,7 +1559,11 @@ pub async fn assign_owner(
     append_event_on(
         &mut *tx,
         id,
-        if previous_owner.is_some() { "reassigned" } else { "assigned" },
+        if previous_owner.is_some() {
+            "reassigned"
+        } else {
+            "assigned"
+        },
         actor_user_id,
         serde_json::json!({
             "owner_user_id": owner.map(|o| o.to_string()),

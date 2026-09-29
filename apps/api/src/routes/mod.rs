@@ -130,10 +130,16 @@ use crate::state::AppState;
 /// declared once, here, and cannot be quietly merged into one permission by a later edit.
 fn crm_assignment_surface(state: &AppState) -> Router<AppState> {
     let assignment = Router::new()
-        .route("/crm/assignment/rules", get(crm_assignment::list_rules).merge(post(crm_assignment::create_rule)))
+        .route(
+            "/crm/assignment/rules",
+            get(crm_assignment::list_rules).merge(post(crm_assignment::create_rule)),
+        )
         // `/order` is static and must be declared before `/rules/{id}` so axum ranks it
         // ahead of the parameter route — "order" read as a rule id is a 400, not a reorder.
-        .route("/crm/assignment/rules/order", put(crm_assignment::reorder_rules))
+        .route(
+            "/crm/assignment/rules/order",
+            put(crm_assignment::reorder_rules),
+        )
         .route(
             "/crm/assignment/rules/{id}",
             get(crm_assignment::get_rule)
@@ -143,7 +149,10 @@ fn crm_assignment_surface(state: &AppState) -> Router<AppState> {
         .route("/crm/assignment/targets", get(crm_assignment::list_targets))
         .route_layer(guards::require(state, "crm.intake.manage"));
     let sla = Router::new()
-        .route("/crm/sla/policies", get(crm_assignment::list_policies).merge(post(crm_assignment::create_policy)))
+        .route(
+            "/crm/sla/policies",
+            get(crm_assignment::list_policies).merge(post(crm_assignment::create_policy)),
+        )
         .route(
             "/crm/sla/policies/{id}",
             get(crm_assignment::get_policy)

@@ -90,10 +90,15 @@ async fn one_lead(pool: &PgPool, org: Uuid, email: &str) -> Uuid {
     .await
     .expect("a captured lead");
     assert_eq!(
-        captured.lead.status, "new",
+        captured.lead.status,
+        "new",
         "the fixture was refused ({}): {}",
         captured.lead.status,
-        captured.lead.rejection_reason.as_deref().unwrap_or("no reason")
+        captured
+            .lead
+            .rejection_reason
+            .as_deref()
+            .unwrap_or("no reason")
     );
     captured.lead.id
 }
@@ -132,12 +137,7 @@ async fn trail(pool: &PgPool, lead: Uuid) -> Vec<(String, Option<String>, Option
     .expect("the lead's trail")
     .into_iter()
     .map(|(kind, detail)| {
-        let text = |key: &str| {
-            detail
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        };
+        let text = |key: &str| detail.get(key).and_then(|v| v.as_str()).map(str::to_string);
         (
             kind,
             text("previous_owner_user_id"),
@@ -176,8 +176,14 @@ async fn a_hand_owns_the_lead_and_the_trail_names_both_hands() {
     assert_eq!(after_second.status, "assigned");
 
     let lines = trail(&pool, lead).await;
-    let assigned: Vec<_> = lines.iter().filter(|(k, _, _, _)| k == "assigned").collect();
-    let reassigned: Vec<_> = lines.iter().filter(|(k, _, _, _)| k == "reassigned").collect();
+    let assigned: Vec<_> = lines
+        .iter()
+        .filter(|(k, _, _, _)| k == "assigned")
+        .collect();
+    let reassigned: Vec<_> = lines
+        .iter()
+        .filter(|(k, _, _, _)| k == "reassigned")
+        .collect();
     assert_eq!(assigned.len(), 1, "exactly one first hand: {lines:?}");
     assert_eq!(reassigned.len(), 1, "exactly one re-hand: {lines:?}");
     assert_eq!(assigned[0].1, None, "nothing was there before: {lines:?}");
@@ -228,7 +234,11 @@ async fn putting_a_lead_back_in_the_queue_is_a_hand_not_a_cleared_field() {
         .filter(|(k, _, _, _)| k == "assigned" || k == "reassigned")
         .collect();
     assert_eq!(hands.len(), 2, "both hands are recorded: {lines:?}");
-    assert_eq!(hands[0].2, Some(owner.to_string()), "the first hand took it");
+    assert_eq!(
+        hands[0].2,
+        Some(owner.to_string()),
+        "the first hand took it"
+    );
     assert_eq!(hands[1].1, Some(owner.to_string()));
     assert_eq!(hands[1].2, None, "the queue is the new owner");
     assert_eq!(hands[1].3, "back to the pool");
@@ -246,10 +256,15 @@ async fn a_verdict_is_refused_and_the_refusal_names_the_status() {
         .await
         .expect("the lead can be marked spam");
     let refused = store::assign_owner(
-        &pool, org, lead, Some(one_user(&pool, org, "Would-be owner").await), "give it away", None,
+        &pool,
+        org,
+        lead,
+        Some(one_user(&pool, org, "Would-be owner").await),
+        "give it away",
+        None,
     )
-        .await
-        .expect_err("a verdict is not work");
+    .await
+    .expect_err("a verdict is not work");
     let message = refused.to_string();
     assert!(
         message.contains("spam"),
@@ -284,10 +299,15 @@ async fn a_lead_of_another_organization_is_a_none_not_a_row() {
     let lead = one_lead(&pool, theirs, "theirs@example.test").await;
 
     let result = store::assign_owner(
-        &pool, mine, lead, Some(one_user(&pool, mine, "Trespasser").await), "mine now", None,
+        &pool,
+        mine,
+        lead,
+        Some(one_user(&pool, mine, "Trespasser").await),
+        "mine now",
+        None,
     )
-        .await
-        .expect("the call itself succeeds");
+    .await
+    .expect("the call itself succeeds");
     assert!(
         result.is_none(),
         "another organization's lead answers None, not a row: a 403 at this layer is an \
@@ -333,11 +353,16 @@ async fn the_sla_deadline_survives_a_change_of_hands() {
         .expect("a deadline");
 
     let after = store::assign_owner(
-        &pool, org, lead, Some(one_user(&pool, org, "Wrong region").await), "wrong region", None,
+        &pool,
+        org,
+        lead,
+        Some(one_user(&pool, org, "Wrong region").await),
+        "wrong region",
+        None,
     )
-        .await
-        .expect("assign")
-        .expect("the lead");
+    .await
+    .expect("assign")
+    .expect("the lead");
     let reread = store::find_lead(&pool, org, lead)
         .await
         .expect("read")
@@ -350,7 +375,9 @@ async fn the_sla_deadline_survives_a_change_of_hands() {
     // nanosecond digits. Comparing to the `due` I bound would fail on precision alone, which
     // is the wrong reason — so the re-read value is stamped with the same round trip and the
     // assertion is about *identity*, not about a type's resolution.
-    let due_as_stored = reread.first_response_due_at.expect("the deadline is still there");
+    let due_as_stored = reread
+        .first_response_due_at
+        .expect("the deadline is still there");
     assert_eq!(
         due_as_stored.nanosecond() / 1_000,
         due.nanosecond() / 1_000,

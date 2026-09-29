@@ -31,17 +31,17 @@
 //!   see; `received_at`, `payload` and `spam_score` are not in it, because a verdict that
 //!   its own subject can edit is not a verdict.
 
-use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use omnion_audit::{ActorType, NewAuditEntry};
-use omnion_events::{NewEvent, bus};
+use omnion_events::{bus, NewEvent};
 use omnion_module_crm_intake::autoresponder::Delivery;
 use omnion_module_crm_intake::autoresponder_store;
 use omnion_module_crm_intake::model::{IntakeSource, Lead, LeadEvent};
@@ -51,8 +51,8 @@ use omnion_module_crm_intake::{CrmIntakeError, LeadMetrics, MappingEntry, NewInt
 use crate::auth::CurrentSession;
 use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
-use crate::workflow_runner;
 use crate::state::AppState;
+use crate::workflow_runner;
 
 // ---------------------------------------------------------------------------------------------
 // Bodies
@@ -800,8 +800,13 @@ pub async fn capture(
 fn spawn_autoresponder(state: AppState, lead: Lead, source: IntakeSource) {
     tokio::spawn(async move {
         let pool = state.db().pool().clone();
-        let outcome = match autoresponder_store::prepare(&pool, &lead, &source, OffsetDateTime::now_utc())
-            .await
+        let outcome = match autoresponder_store::prepare(
+            &pool,
+            &lead,
+            &source,
+            OffsetDateTime::now_utc(),
+        )
+        .await
         {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -842,7 +847,9 @@ fn spawn_autoresponder(state: AppState, lead: Lead, source: IntakeSource) {
             Ok(()) => {
                 // The claim was taken *before* the send, so a crash in between leaves a
                 // pending line that the detail page reads as "reserved", not "sent".
-                if let Err(error) = autoresponder_store::mark_sent(&pool, lead.id, OffsetDateTime::now_utc()).await {
+                if let Err(error) =
+                    autoresponder_store::mark_sent(&pool, lead.id, OffsetDateTime::now_utc()).await
+                {
                     tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder went out but was not recorded as sent");
                 }
             }
@@ -850,7 +857,9 @@ fn spawn_autoresponder(state: AppState, lead: Lead, source: IntakeSource) {
                 tracing::warn!(lead_id = %lead.id, error = %error, "the autoresponder could not be sent");
                 // Release the claim so the next worker tick may answer this lead: a mailer
                 // that refused must not leave a lead that is permanently "already sent".
-                if let Err(release) = autoresponder_store::release_claim(&pool, lead.id, &message.to).await {
+                if let Err(release) =
+                    autoresponder_store::release_claim(&pool, lead.id, &message.to).await
+                {
                     tracing::warn!(lead_id = %lead.id, error = %release, "the autoresponder's claim could not be released");
                 }
             }
@@ -1820,7 +1829,8 @@ pub async fn autoresponder_templates(
             .iter()
             .map(|(token, renders)| PlaceholderBody { token, renders })
             .collect(),
-        max_delay_minutes: omnion_module_crm_intake::autoresponder::Autoresponder::MAX_DELAY_MINUTES,
+        max_delay_minutes:
+            omnion_module_crm_intake::autoresponder::Autoresponder::MAX_DELAY_MINUTES,
     }))
 }
 
@@ -2167,11 +2177,9 @@ mod tests {
             );
             assert!(error.contains(field), "{error}");
         }
-        assert!(
-            parse_instant(Some("2026-01-31T09:00:00Z"), "since")
-                .unwrap()
-                .is_some()
-        );
+        assert!(parse_instant(Some("2026-01-31T09:00:00Z"), "since")
+            .unwrap()
+            .is_some());
         assert!(parse_instant(Some("  "), "since").unwrap().is_none());
     }
 
@@ -2235,7 +2243,7 @@ mod tests {
         assert_eq!(idempotency_key(&headers).map(|key| key.len()), Some(128));
     }
 
-// -----------------------------------------------------------------------------------------
+    // -----------------------------------------------------------------------------------------
     // The autoresponder editor's answers
     // -----------------------------------------------------------------------------------------
 
@@ -2255,11 +2263,7 @@ mod tests {
             accepted: true,
             reason: "preview",
         };
-        let delivery = autoresponder.deliver(
-            &recipient,
-            time::OffsetDateTime::now_utc(),
-            false,
-        );
+        let delivery = autoresponder.deliver(&recipient, time::OffsetDateTime::now_utc(), false);
         let (subject, body, delayed, due_at) = match &delivery {
             Delivery::Ready(message) => (
                 Some(message.subject.clone()),
@@ -2301,17 +2305,32 @@ mod tests {
         assert_eq!(answer.reason, "sent");
         // The point of the endpoint: the greeting is the *server's* render, not the client's.
         // A client-side substitution would agree on `{{name}}` and disagree on the aliases.
-        assert!(answer.body.as_deref().unwrap().contains("Hello Ada's message"));
-        assert!(answer.body.as_deref().unwrap().contains("Analytical Engines"));
+        assert!(answer
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("Hello Ada's message"));
+        assert!(answer
+            .body
+            .as_deref()
+            .unwrap()
+            .contains("Analytical Engines"));
         assert!(answer.unfilled.is_empty(), "{:?}", answer.unfilled);
     }
 
     #[test]
     fn a_delayed_autoresponder_previews_as_held_with_a_due_time() {
-        let answer = preview_of(configured(30, "we have your message"), "Ada", Some("ada@x.com"));
+        let answer = preview_of(
+            configured(30, "we have your message"),
+            "Ada",
+            Some("ada@x.com"),
+        );
         assert_eq!(answer.verdict, "ready", "{answer:?}");
         assert!(answer.delayed, "a delay has to read as held, not as sent");
-        assert!(answer.due_at.is_some(), "a held message answers when it goes out");
+        assert!(
+            answer.due_at.is_some(),
+            "a held message answers when it goes out"
+        );
     }
 
     #[test]
@@ -2325,7 +2344,10 @@ mod tests {
         );
         assert_eq!(answer.verdict, "invalid_template", "{answer:?}");
         assert_eq!(answer.reason, "invalid_template");
-        assert!(answer.subject.is_none(), "an unusable template renders no message");
+        assert!(
+            answer.subject.is_none(),
+            "an unusable template renders no message"
+        );
     }
 
     #[test]
@@ -2349,7 +2371,10 @@ mod tests {
         // The failure this reports is invisible in a rendered message: `{{salutation}}` becomes
         // an empty space, so the visitor reads "Dear ," and nobody knows the template is wrong.
         let answer = preview_of(
-            configured(0, "Dear {{salutation}}, {{name}} — from {{source}} and {{company}}."),
+            configured(
+                0,
+                "Dear {{salutation}}, {{name}} — from {{source}} and {{company}}.",
+            ),
             "Ada",
             Some("ada@x.com"),
         );
@@ -2376,7 +2401,10 @@ mod tests {
         ] {
             let body = format!("x {token} y");
             let answer = preview_of(configured(0, &body), "Ada", Some("ada@x.com"));
-            assert!(answer.unfilled.is_empty(), "{token} was reported as unknown: {answer:?}");
+            assert!(
+                answer.unfilled.is_empty(),
+                "{token} was reported as unknown: {answer:?}"
+            );
         }
     }
 
@@ -2392,7 +2420,10 @@ mod tests {
                 "Ada",
                 Some("ada@example.com"),
             );
-            assert_eq!(answer.verdict, "ready", "template {name} offered but unrenderable");
+            assert_eq!(
+                answer.verdict, "ready",
+                "template {name} offered but unrenderable"
+            );
         }
     }
 
