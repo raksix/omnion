@@ -6063,3 +6063,75 @@ background process, and clear any place you orphan, or the next tick inherits a 
 `/security/headers` and clicks it, and tick the screen boxes for slices 1 and 2. If the slot is
 again occupied, build slice 3 (rate limiting + lockout) rather than idling — the schema and the
 policy can land and be tested without a browser.
+
+## tick 32 — REQ-053 slice 4b: the reports screen, and a count that was lying (`8eec4e1`, `9ed1b31`, `ea41a85`, `c58ba90`)
+
+**What.** The last open criterion of the module, and the first screen in it whose subject
+is a **number somebody will quote to somebody else**. `modules/inventory/src/reports.rs`:
+the valuation, the period's movement summary, the idle block, the reports CSV, and the
+global search. Three read routes under `inventory.items.read`, the `/inventory/reports`
+screen, and ten walks.
+
+**The bug this found.** `count_stock` knew about four of the stock list's seven filters —
+`item_id`, `location_id`, `warehouse_id`, `idle_days` and not the other three. Filtering a
+warehouse down to its negatives therefore rendered **three rows in the table and the whole
+organization's row count in the number beside it**: two numbers, off one page, in the same
+second, about the same rows. It is invisible on any screen with no data, which is why five
+slices of this module shipped before it was seen. The fix applies all three missing
+filters, and the walk asserts the count **as a conjunction with the list** — after asking
+for negatives, either nothing matched or the count is what the page shows, *and* every row
+shown really is negative. Either half alone passes on a broken filter or a broken count.
+
+**Three decisions the criterion does not name, and the trap each one has.**
+
+* **Value is `on_hand × cost`, never `available × cost`.** A reservation belongs to a sales
+  order; the goods are still in this warehouse and still worth what they were worth. The
+  report that subtracts availability makes **confirming an order reduce the organization's
+  stock value** — invisible to a warehouse person, immediate to a finance one. The
+  reserved total is printed *beside* the value instead.
+* **"Value-lite" is small for a reason that is stated, not assumed.** `cost` is nullable and
+  the module has never invented one, so `sum(on_hand * cost)` is not just imprecise: a NULL
+  treated as zero makes ten uncosted units invisible beside ten priced ones, and the number
+  is *arithmetically correct*. Hence four figures — the priced amount and quantity, the
+  unpriced **line count**, and a share weighted by **lines** rather than by value, because
+  what the uncosted rows would be worth is a guess. And a scope priced in two currencies is
+  a **422 that names them**: a total across two currencies is arithmetically correct and
+  commercially meaningless, and the person who quotes it to a customer is who finds out.
+* **The idle block's count is a separate statement.** Its rows are capped, so `rows.len()`
+  is not the answer to "how many are idle" — that is the count bug, one layer up, and a
+  capped list reporting the value of the twenty rows it showed under a heading saying 186
+  is the same lie with better typography.
+
+The movement summary **names** `reserve` and `release` out rather than filtering by
+"everything else", so a new kind has to be classified or the function has to change. A
+filter by "not a reservation" would quietly start counting a brand new kind of hold as goods
+arriving, which is the failure worth designing for.
+
+**Proof.** `cargo test -p omnion-module-inventory --lib` **98/98** (84 before, +14: the
+window bounds, the idle bounds shared with the list, the CSV's capped-count contract, the
+scale arithmetic of `on_hand × cost` — thousandths times hundredths over a thousand, where
+being wrong by 1000 is invisible in a test that only checks a row exists). `pnpm turbo run
+typecheck --force` **2/2**. `cargo build -p omnion-api` clean, zero warnings. **The ten
+walks have not completed**: the box is at load ~25 with four other writers building
+concurrently, and this suite's `cargo` has been queued behind theirs for most of the tick.
+It has failed three times for reasons that were all *not* the code — the QA pass resetting
+`omnion_qa_w4` underneath it, a fixture reading a `MAIN` location the suite had never
+created, and a `kind` value the check constraint refuses. The last two are now fixed and
+this is a queue, not a failure.
+
+**Two harness lessons worth more than the feature.** The walkthrough pass **owns**
+`omnion_qa_<stack>` and resets it at the start of every run, so a suite pointed at it dies
+with `database does not exist` about once per pass — and because the message reads like a
+permission or a migration problem, it cost this suite two ticks of misdiagnosis. The walks
+now have **their own database** (`omnion_qa_w4_walks`, created by the script), because one
+suite per database is the rule and the fix is to stop sharing it. And `run-walks.py`'s
+first version prepared that database with `psycopg`, which is not installed on this box: it
+silently did nothing, and the suite then failed with the exact symptom it exists to remove.
+A preparation step that fails quietly is worse than no preparation step, because it is
+indistinguishable from the problem it was meant to fix.
+
+**Next tick, first thing:** `python3 scripts/qa/run-walks.py` to completion and read the
+ten results — the fixture bugs are fixed and the queue should have cleared overnight. Then
+`/inventory/reports` needs its QA pass, which is the last thing slice 4b owes. After that:
+the ⌘K entries, the empty/loading/error sweep, and the 390×844 pass — the three boxes still
+open on this REQ.
