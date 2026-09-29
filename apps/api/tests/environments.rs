@@ -202,6 +202,31 @@ async fn open_harness() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
+
+    // The limiter, at a limit a test suite can live with.
+    //
+    // `ensure_installed` falls back to the *shipped* defaults for harnesses that build a router
+    // without a `main.rs`, and `sign_in` is one of them: 10 requests per 300 seconds. This suite
+    // creates a distinct account per walk, so 25 walks cannot fit in that budget, and the counter
+    // is in Redis — shared with every other writer's suite on the box, so a suite that trips it
+    // also breaks theirs. Both failure modes arrive as `login body: … rate_limited` on a test
+    // whose subject is cloning, which is a lie about where the problem is.
+    //
+    // So the suite installs its own policy before building the router. It raises `sign_in` rather
+    // than disabling it: the limiter stays real, and the suite still exercises the layer on the
+    // way through — it simply is not measured by the production policy. `ensure_installed` keeps
+    // whatever is already installed, so installing first is what wins.
+    let _ = omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
+        &state,
+        vec![
+            omnion_security::RatePolicy::new("global", 60, 600, 100, true).expect("a valid row"),
+            omnion_security::RatePolicy::new("sign_in", 300, 100_000, 0, true).expect("a valid row"),
+            omnion_security::RatePolicy::new("public_api", 60, 100_000, 0, true).expect("a valid row"),
+            omnion_security::RatePolicy::new("authenticated_api", 60, 100_000, 0, true)
+                .expect("a valid row"),
+        ],
+    ));
+
     Some((state, db))
 }
 
