@@ -4300,6 +4300,39 @@ async function runEventsDepth(page, report) {
     steps.payloadText = (
       await page.locator(`[data-event-payload="${rowId}"]`).innerText().catch(() => "")
     ).slice(0, 200);
+
+    // 4b. The key tree, and the path it copies. The claim under test is that the button hands
+    //     over the path a *receiver* would write, so the assertion reads the clipboard the
+    //     browser actually filled rather than trusting the button's presence: a copy button
+    //     that copies the key's display name passes a click test and fails the reader.
+    const pathBlock = page.locator(`[data-event-paths="${rowId}"]`);
+    steps.hasPathTree = (await pathBlock.count()) > 0;
+    if (steps.hasPathTree) {
+      const firstPathButton = pathBlock.locator("[data-event-copy-path]").first();
+      steps.pathCount = await pathBlock.locator("[data-event-copy-path]").count();
+      const pathHint = await firstPathButton.getAttribute("title").catch(() => null);
+      steps.pathButtonNamesItsPath = !!pathHint && pathHint.startsWith("Copy the path ");
+      steps.pathIsRootedAtPayload = !!pathHint && pathHint.includes("payload");
+      await shot(page, "page-events-paths");
+
+      await page
+        .context()
+        .grantPermissions(["clipboard-read", "clipboard-write"])
+        .catch(() => {});
+      await firstPathButton.click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(350);
+      const clip = await page
+        .evaluate(() => navigator.clipboard.readText().catch(() => ""))
+        .catch(() => "");
+      steps.clipboardPath = clip;
+      // The copied text must BE the path, and must be the one the button advertised. A
+      // mismatch here is the exact failure the acceptance box is about.
+      steps.clipboardMatchesHint = !!pathHint && clip === pathHint.replace("Copy the path ", "");
+      steps.noticeNamesTheCopy = (
+        await page.locator("[data-event-notice], [role=status]").first().innerText().catch(() => "")
+      ).includes("Copied");
+    }
+
     await shot(page, "page-events-payload");
     // The keyboard path: `j` walks the cursor and `Enter` opens, so the shortcuts are real.
     await page.locator("[data-event-table] tbody").focus().catch(() => {});
