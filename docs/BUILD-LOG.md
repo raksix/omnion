@@ -4687,3 +4687,63 @@ per owner, with a CSV containing the same rows), global search over quotes and o
 PDF export. `sales_order` rows now exist, so the won/lost and conversion figures have something
 to count. `MIGRATIONS`: 0053/0054/0055/0057 are mine; the shared high-water is 0056 (wave8) —
 re-read `git ls-tree origin/<branch> database/migrations/` for every sibling at commit time.
+
+## Tick 24 — the report, the CSV, and the guard that existed for one case
+
+**What.** REQ-052 slice 4b. The chain was finished and the question it never answered was the one
+a sales desk is judged on. `modules/sales/src/reports.rs` classifies every quote in **one** `case`
+expression and hands it to four readers — the counts, the per-owner breakdown, the table and the
+CSV — so a headline cannot disagree with the sum of its own rows. `GET /api/v1/sales/search` is one
+ranked statement over quotes *and* orders, matching number, customer and title. The screen is
+`/sales/reports`: four stat cards, both conversion rates, the mean deal, the per-owner table, the
+rows, and an export that is **fetched** rather than navigated to.
+
+**The five rules, each with the easy wrong version it replaced.**
+
+1. **Conversion is won ÷ (won + lost)**, never ÷ every quote — a denominator holding drafts and
+   quotes still with a customer falls every time a seller writes a new one. The spec's
+   "quote-to-order conversion" is a *different* number and both are printed.
+2. **An accepted quote with no order is `pending`**, not a win. The customer said yes; nobody has
+   written the order. The order join lives *outside* the `case` for the count and *inside* it for
+   the rows, and the first version had it inside both, which reported 0% for a desk that converts
+   almost everything it sends.
+3. **A cancelled quote is neither a win nor a loss.** The organization withdrew it; folding that
+   into "lost" makes a seller who tidied up their pipeline look beaten. It is a fifth column, and
+   the screen prints `won + lost + pending + cancelled = N` so a reader can check the arithmetic
+   instead of trusting it.
+4. **The average is over won deals only**, in exact decimal (`Money`, hundredths as `i128`) — never
+   `f64`. The board reads this figure twice, once on the screen and once in the CSV, and a float
+   rounding is a two-file argument.
+5. **`null` prints as an em dash, never `0%`.** "Nobody decided yet" and "nobody won anything" are
+   different facts and only one of them is a zero.
+
+**Two defects the walks and the SQL found, neither visible to a typecheck.**
+
+- **`q.decided_at` does not exist.** The schema has `accepted_at`, `declined_at` and
+  `cancelled_at` — three columns, no single "decided" — and the summary answered `500` with the
+  column name, which is the cheapest possible way to find out. The day a quote is counted by is now
+  `coalesce(accepted_at, declined_at, cancelled_at, created_at)`. The walk pins it down by
+  rewinding one quote's `created_at` 200 days and asserting that a report over its **written** day
+  comes back **empty** while today's contains it; without the rewind the two expressions are
+  indistinguishable.
+- **The "any of" guard never tried its own first permission.** `new_any` peels the first name into
+  `permission` and leaves the rest in `alternatives` — and the loop iterated `alternatives` alone.
+  So the guard written *precisely* so a quotes-only reader could search was the one case it refused,
+  and the quotes-only walk caught it as a 403 naming both keys it had just been asked about. The
+  lesson: a "primary plus alternatives" shape is a bug whenever the loop forgets the primary, and
+  the type system cannot see it because both halves are the same `&'static str`.
+
+**Gates.** `cargo test -p omnion-module-sales --lib` **147/147** (+19) ·
+`cargo test -p omnion-api --lib` **244/244** · report walks **10/10** ·
+`apps/admin` `tsc --noEmit` clean · `node --check scripts/qa/walkthrough.cjs` clean.
+**No migration** — the report reads the tables `0053` already created, which is the first slice of
+this module that needed none.
+
+**Next.** The browser pass for slice 4b is queued (`/tmp/w4-qa-4b.log`) and this is **not** a
+close tick, so the REQ stays `in-progress` regardless of what it says. After it lands: the **PDF**,
+the last unticked item on this REQ and the only thing the nav still does not link to. REQ-029 owns
+the rendering engine, which is not built, so the question this slice has to answer is whether the
+module can emit a document by itself or must wait — and that question is worth a paragraph in the
+REQ rather than a placeholder button. `MIGRATIONS`: 0053/0054/0055/0057 are mine and 4b added
+none; the shared high-water moves constantly — re-read `git ls-tree origin/<branch>
+database/migrations/` for every sibling at commit time, never from memory.
