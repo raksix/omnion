@@ -492,8 +492,14 @@ pub async fn totals(
     pool: &PgPool,
     organization_id: Option<Uuid>,
 ) -> Result<(i64, Option<OffsetDateTime>, Option<Uuid>)> {
+    // `sum()` over a `bigint` column returns `numeric`, which sqlx will not decode into an
+    // `i64` — the first version of this query answered `500` on every call with "mismatched
+    // types; Rust type Option<i64> is not compatible with SQL type NUMERIC", which took the
+    // whole status card down over a column width. The cast is `::bigint` and deliberately NOT
+    // `::int`: a total that wraps at 2 GiB reports a plausible small number, and a plausible
+    // small number is worse than an error somebody can see.
     let row: (Option<i64>, Option<OffsetDateTime>, Option<Uuid>) = sqlx::query_as(
-        "select sum(size_bytes), max(finished_at) filter (where status = 'succeeded'), \
+        "select sum(size_bytes)::bigint, max(finished_at) filter (where status = 'succeeded'), \
                 (array_agg(id order by finished_at desc) filter \
                    (where status = 'succeeded'))[1] \
          from backups where organization_id is not distinct from $1",
