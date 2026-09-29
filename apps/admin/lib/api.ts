@@ -29,6 +29,13 @@ import type {
 
   CreatedMediaShare,
   Form,
+  PageSeo,
+  PageSeoBody,
+  SeoBrokenLink,
+  SeoOverview,
+  SeoRedirect,
+  SeoRedirectTest,
+  SeoSettings,
   FormDetail,
   Inbox,
   Submission,
@@ -5126,5 +5133,129 @@ export function importSecurityReport(
   return request<SecurityImportReport>("/api/v1/security/findings/import", {
     method: "POST",
     body: JSON.stringify({ report, source }),
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// SEO toolkit (REQ-064, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The whole SEO screen in one read.
+ *
+ * One endpoint rather than six: the screen is a set of panels over ONE site, and a panel that
+ * fetches its own slice is a screen with five loading states and five ways to show a number
+ * from a different moment than its neighbour.
+ */
+export function fetchSeoOverview(siteId: string): Promise<SeoOverview> {
+  return request<SeoOverview>(`/api/v1/seo/settings?site_id=${encodeURIComponent(siteId)}`);
+}
+
+/** A page's SEO fields and the tags they produce. */
+export function fetchPageSeo(pageId: string): Promise<PageSeoBody> {
+  return request<PageSeoBody>(`/api/v1/pages/${encodeURIComponent(pageId)}/seo`);
+}
+
+/**
+ * Save a page's SEO fields and get the tags back from the same call.
+ *
+ * The response carries the generated tag set so the SERP preview and the JSON-LD view update
+ * from the call that saved them. A panel that re-derives the preview itself has two
+ * implementations of "what a crawler sees", and they drift on the first edge case.
+ */
+export function savePageSeo(pageId: string, seo: PageSeo): Promise<PageSeoBody> {
+  return request<PageSeoBody>(`/api/v1/pages/${encodeURIComponent(pageId)}/seo`, {
+    method: "PUT",
+    body: JSON.stringify(seo),
+  });
+}
+
+export function createSeoRedirect(input: {
+  site_id: string;
+  from_path: string;
+  to_path: string;
+  status_code?: number;
+  pattern?: string;
+  enabled?: boolean;
+}): Promise<SeoRedirect> {
+  return request<SeoRedirect>("/api/v1/seo/redirects", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateSeoRedirect(
+  ruleId: string,
+  input: {
+    from_path: string;
+    to_path: string;
+    status_code?: number;
+    pattern?: string;
+    enabled?: boolean;
+  },
+): Promise<SeoRedirect> {
+  return request<SeoRedirect>(`/api/v1/seo/redirects/${encodeURIComponent(ruleId)}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteSeoRedirect(ruleId: string): Promise<void> {
+  return request<void>(`/api/v1/seo/redirects/${encodeURIComponent(ruleId)}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * Ask what would answer a path — and what else would.
+ *
+ * This does not count a hit, which is the whole reason it is a separate entry point from the
+ * public resolver: an owner trying three candidate rules must not leave three hits in the column
+ * they are reading to decide whether any of the rules is needed.
+ */
+export function testSeoRedirect(ruleId: string, path: string): Promise<SeoRedirectTest> {
+  return request<SeoRedirectTest>(
+    `/api/v1/seo/redirects/${encodeURIComponent(ruleId)}/test`,
+    { method: "POST", body: JSON.stringify({ path }) },
+  );
+}
+
+/** Save a site's sitemap settings and robots.txt. */
+export function saveSeoSettings(
+  siteId: string,
+  input: {
+    sitemap_types: string[];
+    default_priority: number;
+    default_change_frequency: string;
+    robots_txt: string;
+  },
+): Promise<SeoSettings> {
+  return request<SeoSettings>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/seo/settings`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/** Rebuild the sitemap and store it. */
+export function regenerateSitemap(siteId: string): Promise<SeoSettings> {
+  return request<SeoSettings>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/seo/sitemap/regenerate`,
+    { method: "POST" },
+  );
+}
+
+/** Run the internal-link crawl now. */
+export function scanBrokenLinks(siteId: string): Promise<SeoBrokenLink[]> {
+  return request<SeoBrokenLink[]>("/api/v1/seo/broken-links", {
+    method: "POST",
+    body: JSON.stringify({ site_id: siteId }),
+  });
+}
+
+/** Dismiss a broken link, or bring a dismissed one back. */
+export function setBrokenLinkIgnored(linkId: string, ignored: boolean): Promise<void> {
+  return request<void>(`/api/v1/seo/broken-links/${encodeURIComponent(linkId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ ignored }),
   });
 }

@@ -57,6 +57,9 @@ const NAV = [
   // content surfaces rather than settings, so they sit next to Pages rather than under it.
   { href: "/menus", label: "Menus", icon: ListTree },
   { href: "/publishing/queue", label: "Publishing queue", icon: CalendarClock },
+  // The SEO toolkit (REQ-064, slice 3). It sits beside Publishing queue because both answer
+  // "what does the outside world see about this site" — one about when, one about how.
+  { href: "/seo", label: "SEO", icon: Globe },
   { href: "/media", label: "Media", icon: Images },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/notifications", label: "Notifications", icon: Bell },

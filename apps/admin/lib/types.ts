@@ -1799,3 +1799,111 @@ export type SecurityImportReport = {
   refreshed: number;
   rejected: string[];
 };
+
+// ---------------------------------------------------------------------------------------------
+// SEO toolkit (REQ-064, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/** The editable SEO fields of one page. */
+export type PageSeo = {
+  seo_title: string | null;
+  seo_description: string | null;
+  canonical_url: string | null;
+  og_title: string | null;
+  og_description: string | null;
+  og_image_media_id: string | null;
+  twitter_card: string;
+  robots: string;
+  structured_data_type: string | null;
+  structured_data: Record<string, unknown>;
+};
+
+/** The `<meta>` set a crawler reads, built by the server's own generator. */
+export type SeoTags = {
+  title: string;
+  description: string | null;
+  canonical: string | null;
+  og_title: string;
+  og_description: string | null;
+  og_image: string | null;
+  og_type: string;
+  twitter_card: string;
+  robots: string;
+  json_ld: string | null;
+  /** Schema fields the chosen type wants and this page cannot supply. */
+  missing_fields: string[];
+};
+
+/** A page's fields plus the tags they produce. */
+export type PageSeoBody = {
+  seo: PageSeo;
+  tags: SeoTags;
+};
+
+/** One redirect rule. */
+export type SeoRedirect = {
+  id: string;
+  from_path: string;
+  to_path: string;
+  status_code: number;
+  pattern: string;
+  enabled: boolean;
+  hits: number;
+  last_hit_at: string | null;
+};
+
+/** What `Test a path` found, including the rules that also answer it. */
+export type SeoRedirectTest = {
+  path: string;
+  matched: SeoRedirect | null;
+  also_matched: SeoRedirect[];
+};
+
+/** One broken internal link. */
+export type SeoBrokenLink = {
+  id: string;
+  source_page_id: string | null;
+  source_slug: string | null;
+  target_url: string;
+  anchor_text: string | null;
+  status: number | null;
+  ignored: boolean;
+};
+
+/** A site's stored settings, with the sitemap the panel previews. */
+export type SeoSettings = {
+  sitemap_types: string[];
+  default_priority: number;
+  default_change_frequency: string;
+  sitemap_xml: string | null;
+  sitemap_last_generated_at: string | null;
+  /** How many URLs the stored sitemap holds, so an empty preview can explain itself. */
+  sitemap_url_count: number;
+  robots_txt: string;
+};
+
+/**
+ * The closed vocabularies the editor offers.
+ *
+ * Served rather than hard-coded: a picker that offers a schema type the server then refuses is a
+ * picker whose rejection arrives as an unexplained 400.
+ */
+export type SeoVocabulary = {
+  structured_data_types: string[];
+  twitter_cards: string[];
+  redirect_patterns: string[];
+  redirect_status_codes: number[];
+  change_frequencies: string[];
+  /** This site's own page types, for the sitemap's inclusion list. */
+  page_types: string[];
+};
+
+/** Everything the SEO screen draws, in one read. */
+export type SeoOverview = {
+  site: { id: string; key: string; name: string; host: string | null };
+  vocabulary: SeoVocabulary;
+  settings: SeoSettings;
+  redirects: SeoRedirect[];
+  broken_links: SeoBrokenLink[];
+  robots_warnings: string[];
+};
