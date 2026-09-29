@@ -38,15 +38,18 @@ import {
   SLA_STATE_TONE,
   contactLabel,
   countdown,
+  ownerLabel,
   relativeInstant,
   slaState,
 } from "@/lib/crm-intake";
 import {
   fetchIntakeSources,
   fetchLeads,
+  fetchLeadOwners,
   type IntakeSource,
   type Lead,
   type LeadInbox,
+  type LeadOwner,
 } from "@/lib/crm-intake-api";
 
 const PAGE = 25;
@@ -72,6 +75,9 @@ export function LeadInbox() {
 
   const [inbox, setInbox] = useState<LeadInbox | null>(null);
   const [sources, setSources] = useState<IntakeSource[]>([]);
+  // The roster behind the owner column. Read once, and its absence is invisible to the table:
+  // a lead whose owner cannot be named still has to appear, with the short id the trail uses.
+  const [owners, setOwners] = useState<LeadOwner[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,6 +128,22 @@ export function LeadInbox() {
     };
   }, []);
 
+  // The same rule for the roster. A lead that cannot say who owns it is still a lead, so a
+  // roster failure must not empty the table — it falls back to the short id.
+  useEffect(() => {
+    let cancelled = false;
+    fetchLeadOwners()
+      .then((rows) => {
+        if (!cancelled) setOwners(rows);
+      })
+      .catch(() => {
+        /* the owner column degrades to the id, which is still true */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const setParam = (key: string, value: string) => {
     const next = new URLSearchParams(params?.toString() ?? "");
     if (value) next.set(key, value);
@@ -142,6 +164,7 @@ export function LeadInbox() {
     router.replace(query ? `/crm/leads?${query}` : "/crm/leads");
   };
 
+  const ownersById = new Map(owners.map((owner) => [owner.id, owner.label]));
   const leads = inbox?.leads ?? [];
   const metrics = inbox?.metrics ?? null;
   const activeFilters =
@@ -204,6 +227,10 @@ export function LeadInbox() {
 
           <label className="flex flex-col gap-1 text-[11.5px] text-muted">
             <span className="font-medium">Owner</span>
+            {/* "Me" and "Unassigned" are the two an operator uses daily; the roster is the
+                third, which is "everything one colleague is answerable for" — and it was
+                impossible to ask before, because the only way to name a colleague was to
+                paste their uuid. */}
             <select
               id="lead-owner"
               value={filters.owner}
@@ -213,6 +240,11 @@ export function LeadInbox() {
               <option value="">Anyone</option>
               <option value="me">Owned by me</option>
               <option value="unassigned">Unassigned</option>
+              {owners.map((owner) => (
+                <option key={owner.id} value={owner.id} data-owner-filter={owner.id}>
+                  {owner.label} · {owner.open_leads} open
+                </option>
+              ))}
             </select>
           </label>
 
@@ -336,7 +368,7 @@ export function LeadInbox() {
             />
           )
         ) : (
-          <LeadTable leads={leads} />
+          <LeadTable leads={leads} ownersById={ownersById} />
         )}
       </div>
 
@@ -397,7 +429,13 @@ function Counter({
  * grid — a lead inbox is read on a phone, and a 7-column table on a 390px screen is a table
  * nobody reads.
  */
-function LeadTable({ leads }: { leads: Lead[] }) {
+function LeadTable({
+  leads,
+  ownersById,
+}: {
+  leads: Lead[];
+  ownersById: Map<string, string>;
+}) {
   return (
     <div className="overflow-x-auto">
       <table data-lead-table className="w-full border-collapse text-left text-[13px]">
@@ -439,9 +477,14 @@ function LeadTable({ leads }: { leads: Lead[] }) {
                 <td className="px-3 py-2.5 text-muted">
                   <span className="block max-w-32 truncate">{lead.product_interest ?? "—"}</span>
                 </td>
-                <td className="px-3 py-2.5">
+                {/* The column reads a *name*. "Assigned" answered "is there somebody?" and
+                    not "who?" — which is the only question this column exists to answer, and
+                    the reason the inbox's owner filter was unusable without a second tab. */}
+                <td className="px-3 py-2.5" data-lead-owner-cell>
                   {lead.owner_user_id ? (
-                    <span className="text-muted">Assigned</span>
+                    <span className="block max-w-40 truncate text-muted" title={lead.owner_user_id}>
+                      {ownerLabel(ownersById, lead.owner_user_id)}
+                    </span>
                   ) : (
                     <span className="rounded-full bg-caution-soft px-1.5 py-0.5 text-[11px] text-caution">
                       Unassigned

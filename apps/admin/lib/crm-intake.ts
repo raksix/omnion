@@ -252,13 +252,39 @@ export const MAPPING_TARGETS = Object.keys(MAPPING_TARGET_LABEL);
 /** The transforms the panel offers, in the order they are applied. */
 export const MAPPING_TRANSFORMS = Object.keys(MAPPING_TRANSFORM_LABEL);
 
-/** A lead's trail, rendered as one line. Unknown kinds keep their raw name. */
+/**
+ * A lead's trail, rendered as one line. Unknown kinds keep their raw name.
+ *
+ * `assigned` and `reassigned` are two kinds on purpose — the store reads the choice off the
+ * row's previous owner rather than off whether the id changed — so the words are two as well,
+ * and a panel that rendered both as "Assigned" would throw away the distinction the trail was
+ * built to keep.
+ */
 export const LEAD_EVENT_LABEL: Record<string, string> = {
   received: "Received",
   status_changed: "Status changed",
   edited: "Edited",
   responded: "First response recorded",
+  assigned: "Assigned",
+  reassigned: "Owner changed",
+  converted: "Converted",
+  conversion_skipped: "Conversion skipped",
+  autoresponder_sent: "Autoresponder",
 };
+
+/**
+ * How an owner reads in a row: their name when the roster knows them, and a short id when it
+ * does not.
+ *
+ * The fallback is deliberate rather than a dash. A deleted or platform account still owns a
+ * lead until somebody reassigns it, and a screen that renders nothing for it reads as "nobody
+ * owns this" — which is the one thing an audit screen must never be wrong about. A short id is
+ * findable; a blank is not.
+ */
+export function ownerLabel(owners: Map<string, string>, userId: string | null): string {
+  if (!userId) return "Unassigned";
+  return owners.get(userId) ?? `Former member ${userId.slice(0, 8)}`;
+}
 
 /** The words a dedupe decision is read as. */
 export const DECISION_LABEL: Record<string, string> = {

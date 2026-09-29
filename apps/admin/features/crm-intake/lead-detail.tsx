@@ -51,6 +51,7 @@ import {
   SLA_STATE_TONE,
   contactLabel,
   countdown,
+  ownerLabel,
   slaState,
 } from "@/lib/crm-intake";
 import {
@@ -66,6 +67,8 @@ import {
   type LeadDetail as LeadDetailBody,
   type LeadStep,
   assignLead,
+  fetchLeadOwners,
+  type LeadOwner,
 } from "@/lib/crm-intake-api";
 
 type Draft = {
@@ -112,6 +115,11 @@ export function LeadDetail() {
   const [assigning, setAssigning] = useState(false);
   const [assignOwner, setAssignOwner] = useState("");
   const [assignReason, setAssignReason] = useState("");
+  // The roster is fetched once per detail read, not per panel open, and a failure is
+  // *degraded* rather than fatal: the panel still works with a typed id, it just says why the
+  // list is empty. A roster that fails to load must not take the lead page down with it.
+  const [owners, setOwners] = useState<LeadOwner[] | null>(null);
+  const [ownersError, setOwnersError] = useState<string | null>(null);
   // What the last `Convert` actually produced, kept apart from `notice` because the
   // interesting half is the `deal_skipped` sentence — "the CRM module is not installed" is
   // information the operator needs after the toast has gone.
@@ -121,6 +129,17 @@ export function LeadDetail() {
     if (!id) return;
     setLoading(true);
     setError(null);
+    // The roster is a separate call that must not decide whether the lead renders: it is
+    // beside the answer, not part of it.
+    void fetchLeadOwners()
+      .then((rows) => {
+        setOwners(rows);
+        setOwnersError(null);
+      })
+      .catch(() => {
+        setOwners([]);
+        setOwnersError("The list of owners could not be read, so the picker is showing nothing.");
+      });
     try {
       const answer = await fetchLead(id);
       setDetail(answer);
@@ -254,6 +273,10 @@ export function LeadDetail() {
 
   const lead = detail.lead;
   const state = slaState(lead);
+  // Ids to names, built once per roster. The header chip, the trail and the picker all read
+  // this one map, which is the only way the three can be guaranteed to agree — three separate
+  // lookups is three chances for the header to say one thing and the timeline another.
+  const ownersById = new Map((owners ?? []).map((owner) => [owner.id, owner.label]));
   const remaining = countdown(lead.first_response_due_at);
   const payloadEntries = Object.entries(detail.payload ?? {});
 
@@ -289,6 +312,20 @@ export function LeadDetail() {
           >
             {SLA_STATE_LABEL[state]}
             {remaining && state !== "none" && state !== "met" ? ` · ${remaining}` : ""}
+          </span>
+          {/* The owner reads as a name or a badge, never as a boolean. "Assigned" was the
+              truth and useless: the whole question on this screen is *who*, and an answer
+              that contains no name makes the header a place to look and find nothing. */}
+          <span
+            data-lead-owner-chip
+            className={
+              lead.owner_user_id
+                ? "inline-flex items-center gap-1.5 rounded-full border border-line bg-surface px-2.5 py-1 text-[11.5px] text-muted"
+                : "inline-flex items-center gap-1.5 rounded-full bg-caution-soft px-2.5 py-1 text-[11.5px] text-caution"
+            }
+          >
+            <UserRoundCheck className="size-3.5" aria-hidden />
+            {ownerLabel(ownersById, lead.owner_user_id)}
           </span>
         </div>
       </header>
@@ -573,16 +610,43 @@ export function LeadDetail() {
                   data-lead-assign
                   className="flex flex-col gap-2 rounded-lg border border-line bg-canvas p-2.5"
                 >
+                  {/* A picker, not a uuid box. The store wants an id; an operator knows a
+                      colleague's name, and the roster is the only place in the panel where the
+                      two meet. The load is on the same row because handing the tenth lead to
+                      somebody who already has nine is a decision somebody has to *see* they
+                      are making. */}
                   <label className="flex flex-col gap-1 text-[11.5px] text-muted">
                     <span className="font-medium">Owner</span>
-                    <input
+                    <select
                       data-lead-assign-owner
                       className="rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] text-ink"
-                      placeholder="Unassigned queue (leave empty)"
                       value={assignOwner}
-                      onChange={(event) => setAssignOwner(event.target.value.trim())}
-                    />
+                      onChange={(event) => setAssignOwner(event.target.value)}
+                    >
+                      <option value="">Unassigned queue</option>
+                      {(owners ?? []).map((owner) => (
+                        <option
+                          key={owner.id}
+                          value={owner.id}
+                          data-owner-option={owner.id}
+                        >
+                          {owner.label} · {owner.open_leads} open
+                          {owner.status === "disabled" ? " · disabled" : ""}
+                        </option>
+                      ))}
+                    </select>
                   </label>
+                  {owners && owners.length === 0 && ownersError ? (
+                    <p className="text-[11.5px] text-caution" data-lead-assign-roster-error>
+                      {ownersError}
+                    </p>
+                  ) : null}
+                  {owners && owners.length === 0 && !ownersError ? (
+                    <p className="text-[11.5px] text-muted" data-lead-assign-roster-empty>
+                      Nobody else is in this organization yet, so this lead can only sit in the
+                      unassigned queue. Invite people under Settings → IAM to share the queue.
+                    </p>
+                  ) : null}
                   <label className="flex flex-col gap-1 text-[11.5px] text-muted">
                     <span className="font-medium">Why</span>
                     <input
@@ -594,9 +658,9 @@ export function LeadDetail() {
                     />
                   </label>
                   <p className="text-[11.5px] text-muted">
-                    Empty means the unassigned queue, and the reason is recorded either way. The
-                    first-response deadline does not move: handing a lead to the right person is
-                    not a new promise to the person who wrote in.
+                    The unassigned queue is a choice, not an absence, and the reason is recorded
+                    either way. The first-response deadline does not move: handing a lead to the
+                    right person is not a new promise to the person who wrote in.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <button
@@ -819,6 +883,19 @@ export function LeadDetail() {
                       {new Date(event.created_at).toLocaleString()}
                       {event.actor_user_id ? " · by an operator" : ""}
                     </span>
+                    {/* A hand-over line names both people it moved between. Rendering only the
+                        new one leaves "Owner changed" answering no question, and rendering
+                        neither leaves the trail unable to explain a lead that reached the
+                        wrong desk. */}
+                    {typeof event.detail?.owner_user_id === "string" ? (
+                      <span className="text-[11.5px] text-muted" data-lead-trail-owner>
+                        {"→ "}
+                        {ownerLabel(ownersById, String(event.detail.owner_user_id))}
+                        {typeof event.detail.previous_owner_user_id === "string"
+                          ? ` from ${ownerLabel(ownersById, String(event.detail.previous_owner_user_id))}`
+                          : " from the unassigned queue"}
+                      </span>
+                    ) : null}
                     {typeof event.detail?.reason === "string" ? (
                       <span className="text-[11.5px] text-muted">{event.detail.reason}</span>
                     ) : null}

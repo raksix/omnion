@@ -64,8 +64,8 @@ pub use error::{CrmIntakeError, Result};
 pub use keys::{hash_key, hint_for, issue_key, verify_key};
 pub use mapping::{MappedValues, MappingEntry, apply, health, validate_required_targets};
 pub use model::{
-    Attribution, CaptureOutcome, IntakeSource, Lead, LeadEvent, LeadMetrics, NewIntakeSource,
-    SpamVerdict, contactable,
+    Attribution, CaptureOutcome, IntakeSource, Lead, LeadEvent, LeadMetrics, LeadOwner,
+    NewIntakeSource, SpamVerdict, contactable,
 };
 pub use vocabulary::{
     ASSIGNMENT_TARGETS, DECISIONS, DEDUPE_POLICIES, MAX_BULK_IDS, MAX_PAGE, MAX_PAYLOAD_BYTES,

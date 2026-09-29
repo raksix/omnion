@@ -1236,6 +1236,13 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/flow",
             get(crm_intake::flow).layer(guards::require(&state, "crm.leads.read")),
         )
+        // The hand-over roster. `crm.leads.read`, not `crm.leads.assign`: the inbox already
+        // shows who owns what, and a screen that shows an owner column while hiding the list
+        // of owners teaches the reader that the column is an id.
+        .route(
+            "/crm/leads/owners",
+            get(crm_intake::owners).layer(guards::require(&state, "crm.leads.read")),
+        )
         .route(
             "/crm/leads/retention/sweep",
             post(crm_intake::retention_sweep).layer(guards::require(&state, "crm.leads.manage")),

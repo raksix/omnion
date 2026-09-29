@@ -303,6 +303,28 @@ export function convertLead(id: string): Promise<LeadConversion> {
   });
 }
 
+/** One person a lead can be handed to, with the load they already hold. */
+export type LeadOwner = {
+  id: string;
+  label: string;
+  email: string;
+  open_leads: number;
+  status: string;
+};
+
+/**
+ * The hand-over roster.
+ *
+ * The hand-over screen used to take a uuid in a free-text box, which made the documented
+ * "a person can decide whose work it is" something only somebody with the IAM screen open in
+ * another tab could actually do. `open_leads` is on the same row for the same reason: handing
+ * the tenth lead to somebody who already has nine is a decision somebody has to be able to
+ * *see* they are making.
+ */
+export function fetchLeadOwners(): Promise<LeadOwner[]> {
+  return request<LeadOwner[]>("/api/v1/crm/leads/owners");
+}
+
 /** What this deployment can do with the documented flow, so the stepper can say so. */
 export function fetchLeadFlow(): Promise<LeadFlow> {
   return request<LeadFlow>("/api/v1/crm/leads/flow");

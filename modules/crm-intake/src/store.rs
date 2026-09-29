@@ -23,8 +23,8 @@ use crate::error::{CrmIntakeError, Result};
 use crate::keys;
 use crate::mapping::{self, MappedValues, MappingEntry};
 use crate::model::{
-    contactable, Attribution, IntakeSource, Lead, LeadEvent, LeadMetrics, NewIntakeSource,
-    SpamVerdict,
+    contactable, Attribution, IntakeSource, Lead, LeadEvent, LeadMetrics, LeadOwner,
+    NewIntakeSource, SpamVerdict,
 };
 use crate::vocabulary::{is_status, MAX_PAGE, MAX_PAYLOAD_BYTES};
 
@@ -1210,6 +1210,46 @@ async fn count_unassigned(pool: &PgPool, organization_id: Uuid) -> Result<i64> {
     .fetch_one(pool)
     .await?;
     Ok(row.0)
+}
+
+/// The people a lead can be handed to, with the open load each one already holds.
+///
+/// Three decisions here are load-bearing, and none of them is visible in the query.
+///
+/// * **The account has to belong to the organization.** `users.organization_id` is
+///   nullable, so a *platform* account (an owner who belongs to no organization) matches no
+///   filter and is simply absent — which is correct: this roster is who the tenant's own
+///   leads can be routed to, and a platform operator's personal queue is not one of them.
+/// * **The load is a correlated subquery, not a second pass.** The picker shows twelve people
+///   and twelve counts; a second query to annotate them would be a second chance for the list
+///   and the numbers to disagree, and this screen exists precisely to stop the inbox and the
+///   roster telling different stories.
+/// * **A disabled account is returned, not hidden.** Filtering it out would make the owner of
+///   an existing lead vanish from the screen that explains who owns what, and the trail line
+///   would render a raw uuid for a colleague who plainly exists. The picker marks it instead.
+pub async fn list_owners(pool: &PgPool, organization_id: Uuid) -> Result<Vec<LeadOwner>> {
+    let rows: Vec<(Uuid, String, String, String, i64)> = sqlx::query_as(
+        "select u.id, u.display_name, u.email, u.status, \
+                (select count(*) from crm_leads l where l.organization_id = $1 \
+                   and l.owner_user_id = u.id and l.status in ('new','assigned','contacted','qualified')) \
+         from users u \
+         where u.organization_id = $1 \
+         order by lower(coalesce(nullif(btrim(u.display_name), ''), u.email)), u.email",
+    )
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, display_name, email, status, open_leads)| LeadOwner {
+            id,
+            label: LeadOwner::label_of(&display_name, &email),
+            email,
+            open_leads,
+            status,
+        })
+        .collect())
 }
 
 /// One lead of an organization, or `None`.

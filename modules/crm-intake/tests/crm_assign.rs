@@ -392,3 +392,179 @@ async fn the_sla_deadline_survives_a_change_of_hands() {
 
     drop_org(&pool, org).await;
 }
+
+
+/// The roster is what makes a hand-over possible without the IAM screen open in another tab,
+/// and there are three ways it can be subtly wrong. All three are only visible against a
+/// database: each is a *row* claim, not a computation.
+///
+/// * **A colleague's load must be theirs, and only open work counts.** A count that includes
+///   converted and discarded leads tells an operator to avoid somebody who is in fact free,
+///   which is the one thing a load number must never do.
+/// * **A colleague of another organization must not appear.** The `users` table is global and
+///   `organization_id` is nullable, so a roster that joins loosely lists every account on the
+///   box — which is a tenant leak wearing a select element.
+/// * **A disabled colleague still appears.** Filtering them out would make the owner of an
+///   existing lead render as nobody, on the very screen whose job is to say who owns what.
+#[tokio::test]
+async fn the_roster_names_the_people_and_counts_only_their_open_work() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "roster-basic").await;
+
+    let ada = one_user(&pool, org, "Ada Lovelace").await;
+    let grace = one_user(&pool, org, "Grace Hopper").await;
+    // A lead nobody has answered, owned by Ada.
+    let ada_lead = one_lead(&pool, org, "roster-ada@example.test").await;
+    store::assign_owner(&pool, org, ada_lead, Some(ada), "first", None)
+        .await
+        .expect("assign")
+        .expect("the lead");
+
+    let roster = store::list_owners(&pool, org)
+        .await
+        .expect("the roster");
+
+    let ada_row = roster.iter().find(|row| row.id == ada).expect("Ada is in it");
+    assert_eq!(ada_row.label, "Ada Lovelace", "a person is a name, not an id");
+    assert!(ada_row.email.contains("@example.invalid"));
+    assert_eq!(ada_row.open_leads, 1, "her one open lead is counted");
+    assert_eq!(ada_row.status, "active");
+
+    let grace_row = roster
+        .iter()
+        .find(|row| row.id == grace)
+        .expect("Grace is in it too");
+    assert_eq!(
+        grace_row.open_leads, 0,
+        "and somebody with nothing on them reads as zero, not absent"
+    );
+
+    // A converted lead is not work: it must stop counting the moment it is closed.
+    sqlx::query("update crm_leads set status = 'converted' where id = $1")
+        .bind(ada_lead)
+        .execute(&pool)
+        .await
+        .expect("close the lead");
+    let after = store::list_owners(&pool, org).await.expect("the roster");
+    assert_eq!(
+        after.iter().find(|row| row.id == ada).expect("Ada").open_leads,
+        0,
+        "a converted lead is a customer, not a task"
+    );
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn the_roster_is_this_organizations_and_nobody_elses() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "roster-tenancy").await;
+    let theirs = fresh_org(&pool, "roster-other").await;
+
+    let mine = one_user(&pool, org, "Mine").await;
+    let other = one_user(&pool, theirs, "Theirs").await;
+
+    // A platform account: no organization at all. It is a real row in `users` and it must not
+    // show up as a destination in any tenant's hand-over panel.
+    let platform = Uuid::new_v4();
+    sqlx::query("insert into users (id, email, password_hash, display_name) values ($1, $2, 'x', $3)")
+        .bind(platform)
+        .bind(format!("platform-{}@example.invalid", platform.simple()))
+        .bind("Platform Operator")
+        .execute(&pool)
+        .await
+        .expect("a platform account");
+
+    let roster = store::list_owners(&pool, org).await.expect("the roster");
+    assert!(
+        roster.iter().any(|row| row.id == mine),
+        "the tenant's own people are offered"
+    );
+    assert!(
+        !roster.iter().any(|row| row.id == other),
+        "another organization's account is not a destination — that is a tenant leak"
+    );
+    assert!(
+        !roster.iter().any(|row| row.id == platform),
+        "and a platform account belongs to no tenant's queue"
+    );
+
+    // The empty organization is an empty list, not an error and not a fallback to the
+    // caller's own organization — the read is scoped by the argument, full stop.
+    let empty = fresh_org(&pool, "roster-empty").await;
+    assert!(
+        store::list_owners(&pool, empty)
+            .await
+            .expect("an empty roster")
+            .is_empty(),
+        "an organization with nobody in it has nobody to hand leads to"
+    );
+
+    drop_org(&pool, org).await;
+    drop_org(&pool, theirs).await;
+    drop_org(&pool, empty).await;
+    sqlx::query("delete from users where id = $1")
+        .bind(platform)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn a_disabled_colleague_is_listed_and_marked_rather_than_hidden() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "roster-disabled").await;
+    let person = one_user(&pool, org, "Retired Owner").await;
+
+    // They still own a lead. Hiding them would make that lead read as unowned.
+    let lead = one_lead(&pool, org, "roster-disabled@example.test").await;
+    store::assign_owner(&pool, org, lead, Some(person), "before they left", None)
+        .await
+        .expect("assign")
+        .expect("the lead");
+    sqlx::query("update users set status = 'disabled' where id = $1")
+        .bind(person)
+        .execute(&pool)
+        .await
+        .expect("disable");
+
+    let roster = store::list_owners(&pool, org).await.expect("the roster");
+    let row = roster
+        .iter()
+        .find(|row| row.id == person)
+        .expect("a colleague who owns a lead is still somebody");
+    assert_eq!(row.status, "disabled", "and the panel can mark the row with it");
+    assert_eq!(row.label, "Retired Owner", "the name still renders");
+    assert_eq!(row.open_leads, 1, "the load they cannot take is still visible");
+
+    drop_org(&pool, org).await;
+}
+
+#[tokio::test]
+async fn an_account_with_no_display_name_is_read_as_its_address() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "roster-noname").await;
+
+    // An invited account with a blank display name. An empty `<option>` in the picker is
+    // indistinguishable from the "unassigned queue" row above it, so the store resolves it.
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "insert into users (id, organization_id, email, password_hash, display_name) \
+         values ($1, $2, $3, 'x', '')",
+    )
+    .bind(id)
+    .bind(org)
+    .bind("no-name@example.invalid")
+    .execute(&pool)
+    .await
+    .expect("a nameless account");
+
+    let roster = store::list_owners(&pool, org).await.expect("the roster");
+    let row = roster.iter().find(|row| row.id == id).expect("in the roster");
+    assert_eq!(
+        row.label, "no-name@example.invalid",
+        "an invitation flow leaves blank names, and a blank option is not a choice"
+    );
+
+    drop_org(&pool, org).await;
+}

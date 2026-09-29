@@ -44,7 +44,7 @@ use omnion_audit::{ActorType, NewAuditEntry};
 use omnion_events::{bus, NewEvent};
 use omnion_module_crm_intake::autoresponder::Delivery;
 use omnion_module_crm_intake::autoresponder_store;
-use omnion_module_crm_intake::model::{IntakeSource, Lead, LeadEvent};
+use omnion_module_crm_intake::model::{IntakeSource, Lead, LeadEvent, LeadOwner};
 use omnion_module_crm_intake::store::{self, LeadQuery, SourcePatch};
 use omnion_module_crm_intake::{CrmIntakeError, LeadMetrics, MappingEntry, NewIntakeSource};
 
@@ -1272,6 +1272,36 @@ pub struct ConversionBody {
     pub deal_skipped: Option<String>,
 }
 
+/// One person a lead can be handed to.
+///
+/// The wire shape is the store's row with the label already resolved, because the panel has
+/// no way to resolve it itself: it holds ids, not the `users` table.
+#[derive(Debug, Serialize)]
+pub struct LeadOwnerBody {
+    /// The account id.
+    pub id: Uuid,
+    /// Their name, or their address when they have no display name.
+    pub label: String,
+    /// Their e-mail.
+    pub email: String,
+    /// Open leads they hold right now.
+    pub open_leads: i64,
+    /// Their account status.
+    pub status: String,
+}
+
+impl From<LeadOwner> for LeadOwnerBody {
+    fn from(owner: LeadOwner) -> Self {
+        Self {
+            id: owner.id,
+            label: owner.label,
+            email: owner.email,
+            open_leads: owner.open_leads,
+            status: owner.status,
+        }
+    }
+}
+
 /// Which of the documented flow's modules this deployment actually has.
 ///
 /// The stepper asks this rather than asserting what it can do. The answer is read from the
@@ -1363,6 +1393,27 @@ pub async fn convert(
         deal_id: report.deal_id,
         deal_skipped: report.deal_skipped,
     }))
+}
+
+/// `GET /api/v1/crm/leads/owners` — who a lead can be handed to, and what they already hold.
+///
+/// The hand-over screen used to ask for a uuid in a free-text box. That is the identifier of
+/// an *account*, not of a colleague, and it made the documented hand-over ("an operator who
+/// works the queue can decide whose work it is") something only an operator who had the IAM
+/// screen open in another tab could actually perform.
+///
+/// Read permission, not `crm.leads.assign`: seeing the roster is part of reading the inbox —
+/// the inbox already shows who owns what — and gating it on the assignment power would hide
+/// the owner column's meaning from the majority of the people who use it.
+pub async fn owners(
+    State(state): State<AppState>,
+    session: CurrentSession,
+) -> Result<Json<Vec<LeadOwnerBody>>, ApiError> {
+    let organization_id = organization_of(&session)?;
+    let rows = store::list_owners(state.db().pool(), organization_id)
+        .await
+        .map_err(map_store)?;
+    Ok(Json(rows.into_iter().map(LeadOwnerBody::from).collect()))
 }
 
 /// `GET /api/v1/crm/leads/flow` — which steps of the documented flow this deployment can run.

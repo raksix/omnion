@@ -498,6 +498,45 @@ impl LeadEvent {
     }
 }
 
+/// A person a lead can be handed to, with the load they already carry.
+///
+/// The hand-over screen used to ask for a UUID. That is the identifier of an *account*, not
+/// of a colleague: an operator who works the queue all day cannot be expected to know which
+/// of a hundred rows is their own, and a picker that only lists names is the difference
+/// between a hand-over and a guess. The count is on the same row for the same reason — a
+/// picker showing twelve names with no workload tells the operator nothing about whether they
+/// are about to dump the tenth lead on somebody who already has nine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeadOwner {
+    /// The account id — what `assign` stores.
+    pub id: Uuid,
+    /// Their name, or their address when the account has no display name.
+    pub label: String,
+    /// Their e-mail, the stable thing a colleague is actually recognised by.
+    pub email: String,
+    /// Open leads they hold right now.
+    pub open_leads: i64,
+    /// Their account status, so a disabled colleague is not offered as a destination.
+    pub status: String,
+}
+
+impl LeadOwner {
+    /// What the label says, when the display name is blank.
+    ///
+    /// An account created by an invitation flow with no display name renders as an empty
+    /// `<option>`, which is indistinguishable from the unassigned row in the list above it —
+    /// so the address is the fallback rather than a blank.
+    #[must_use]
+    pub fn label_of(display_name: &str, email: &str) -> String {
+        let name = display_name.trim();
+        if !name.is_empty() {
+            name.to_string()
+        } else {
+            email.trim().to_string()
+        }
+    }
+}
+
 /// What one capture call produced.
 ///
 /// `accepted` and `lead_id` are the only two things a *public* caller is told: the intake
