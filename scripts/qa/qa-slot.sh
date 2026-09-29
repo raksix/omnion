@@ -75,6 +75,12 @@ while :; do
     echo "[qa-slot] place taken ($(( count + 1 ))/$MAX)" >&2
     exit 0
   fi
+  # **The reaper has to run in the loop, not only on entry.** It is called once above, which
+  # reclaims a place whose holder was already gone when *this* script started — and misses the
+  # case that actually costs a pass its whole tick: the holder dies while this script is already
+  # waiting. A pass that crashed two minutes ago keeps its place until the next pass starts, and
+  # on a nine-writer box that is every other waiting pass.
+  reap
   if [ "$(date +%s)" -ge "$deadline" ]; then
     echo "[qa-slot] no place after ${WAIT}s, proceeding without one" >&2
     exit 0
