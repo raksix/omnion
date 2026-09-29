@@ -4039,6 +4039,71 @@ async function runCrmIntakeDepth(page, report) {
   steps.respondIsIdempotent = firstResponse === secondResponse;
   steps.respondTimelineHasTwoLines = await page.locator("[data-event=responded]").count();
 
+  // `Convert`, and the stepper's answer. Two claims are measured here, both of which the
+  // previous build could not make at all:
+  //
+  //   1. The stepper's states come from the server and reflect the row — the opportunity
+  //      becomes `done` and the button disables itself, so a conversion that reported success
+  //      while the panel still showed "not built yet" is caught.
+  //   2. A blocked step says *which module* is missing. This branch has no sales module, so
+  //      the quotation must read as blocked and name it — a step stuck on "pending" forever
+  //      is indistinguishable from a broken one.
+  const stepsBefore = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-conversion-stepper] li")).map((li) => [
+      li.getAttribute("data-step"),
+      li.getAttribute("data-state"),
+    ]),
+  );
+  steps.stepperBefore = stepsBefore;
+  steps.stepperHasStates = stepsBefore.every(([, state]) =>
+    ["done", "current", "pending", "blocked"].includes(String(state)),
+  );
+  steps.quotationBlockedAndNamed = await page.evaluate(() => {
+    const step = document.querySelector('[data-conversion-stepper] [data-step=quotation]');
+    return {
+      state: step?.getAttribute("data-state") ?? "missing",
+      note: step?.textContent ?? "",
+    };
+  });
+  await page.locator("[data-lead-convert]").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.convertResult = (await page.locator("[data-conversion-result]").innerText().catch(() => "")).trim();
+  steps.convertTimeline = await page.locator("[data-event=converted]").count();
+  const stepsAfter = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("[data-conversion-stepper] li")).map((li) => [
+      li.getAttribute("data-step"),
+      li.getAttribute("data-state"),
+    ]),
+  );
+  steps.stepperAfter = stepsAfter;
+  // Either the opportunity completed (CRM installed) or it stayed `current` with the
+  // module's absence spelled out. Both are honest; a stepper that shows `pending` for a
+  // module that is not installed and does not say so is the defect this asserts against.
+  const opportunityState = String(stepsAfter.find(([key]) => key === "opportunity")?.[1] ?? "");
+  steps.convertOutcomeHonest =
+    opportunityState === "done" ||
+    (opportunityState === "current" && /not installed|no sales pipeline/i.test(steps.convertResult));
+
+  // The flow probe, which is what makes the stepper's `blocked` state truthful: it answers
+  // from the database whether the CRM, sales and commerce tables are there, and the
+  // stepper's note must agree with it. A stepper that says "not installed" over an
+  // installed module (or the reverse) is a panel telling the operator something false.
+  const flow = await page.evaluate(() =>
+    fetch("/api/v1/crm/leads/flow", { credentials: "same-origin" })
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null),
+  );
+  steps.flow = flow;
+  steps.stepperAgreesWithFlow = await page.evaluate((crm) => {
+    const opportunity = document.querySelector(
+      '[data-conversion-stepper] [data-step=opportunity]',
+    );
+    const note = opportunity?.textContent ?? "";
+    // With the CRM absent the opportunity cannot complete, and the stepper must not claim it
+    // did; with it present the conversion produces a deal and the step reads `done`.
+    return crm ? true : !/Deal created/.test(note);
+  }, Boolean(flow?.crm));
+
   // 6. The duplicate queue. A second source with the `reject_duplicate` policy files the row
   //    instead of linking it, which is the only way a row reaches this screen.
   const dupeSource = await page.evaluate(async (tag) => {
