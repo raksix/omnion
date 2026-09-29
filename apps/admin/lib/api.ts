@@ -4779,6 +4779,66 @@ export function fetchMetricCatalog(): Promise<MetricCatalogResponse> {
 }
 
 /**
+ * `GET /api/v1/observability/overview` — the landing screen (docs/requests/REQ-126).
+ *
+ * Every headline is `number | null` and the difference is load-bearing: `null` means "this
+ * family has no samples in the window", which on a fresh install is every one of them, and `0`
+ * means "the counter is genuinely at zero". The screen renders the first as "—" with an
+ * explanation and the second as a number, because a panel of zeroes on an instance that has
+ * served nothing is indistinguishable from a healthy flat line.
+ *
+ * `unavailable` names the sources that could not be read. It exists because the screen is
+ * assembled defensively server-side: a tile whose source is unreadable degrades to `null` and
+ * adds its name here rather than failing the whole read, since the operator opening this page
+ * during an incident must not get an error page.
+ */
+export interface ObservabilityOverview {
+  window_minutes: number;
+  requests_total: number | null;
+  error_ratio: number | null;
+  p95_latency_seconds: number | null;
+  queue_depth: number | null;
+  ai_cost_micros_today: number | null;
+  exporters: OverviewExporter[];
+  alerts: OverviewAlerts | null;
+  unavailable: string[];
+  no_traffic: boolean;
+}
+
+/** One exporter's chip and the drop count that says whether to trust it. */
+export interface OverviewExporter {
+  name: string;
+  health: string;
+  dropped_total: number;
+  buffered: number;
+}
+
+/** The alert surface in one count per state, plus the newest firing incident. */
+export interface OverviewAlerts {
+  firing: number;
+  pending: number;
+  latest_firing: OverviewIncident | null;
+}
+
+/**
+ * The newest firing incident.
+ *
+ * `rule` is nullable because the event stores a rule id and the rule may since have been
+ * deleted; the incident stays linkable by `rule_id` either way.
+ */
+export interface OverviewIncident {
+  id: string;
+  rule_id: string;
+  rule: string | null;
+  started_at: string;
+}
+
+/** `GET /api/v1/observability/overview`. */
+export function fetchObservabilityOverview(): Promise<ObservabilityOverview> {
+  return request<ObservabilityOverview>("/api/v1/observability/overview");
+}
+
+/**
  * `GET /api/v1/observability/metrics/query` — a bounded chart for one family.
  *
  * `metric` is required: the API refuses an unknown family with `unknown_metric` rather than

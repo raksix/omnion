@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, HardDriveDownload, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, BellRing, Bot, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Radio, Route, Scale, ScrollText, ShieldCheck, HardDriveDownload, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -36,6 +36,19 @@ const NAV = [
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
+  // The observability centre (REQ-126) and its six areas. It sits beside Events rather than
+  // under Settings: Events answers "what does the platform think happened", this answers "what
+  // is it doing right now and what did it drop" — and both are read during the same incident.
+  // The parent links to the overview rather than to any one area, because the landing screen is
+  // the one that knows which area holds the answer; deep-linking an operator into the log
+  // explorer when they asked "is anything wrong" is the wrong default.
+  { href: "/observability", label: "Observability", icon: Gauge },
+  { href: "/observability/logs", label: "Observability logs", icon: ScrollText },
+  { href: "/observability/traces", label: "Traces", icon: Route },
+  { href: "/observability/metrics", label: "Metric catalogue", icon: BarChart3 },
+  { href: "/observability/exporters", label: "Exporters", icon: Radio },
+  { href: "/observability/alerts", label: "Alert rules", icon: BellRing },
+  { href: "/observability/settings", label: "Observability settings", icon: SlidersHorizontal },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },

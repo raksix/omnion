@@ -98,6 +98,7 @@ pub mod media_usage;
 pub mod media_versions;
 pub mod observability;
 pub mod observability_alerts;
+pub mod observability_overview;
 pub mod observability_traces;
 pub mod notifications;
 pub mod notifications_admin;
@@ -1257,6 +1258,14 @@ pub fn router(state: AppState) -> Router {
         // The metric catalogue and the chart behind it (REQ-126, slice 2). Both are reads of
         // telemetry, so both are `observability.read`; a caller who may see what happened may see
         // what the instance counts.
+        // The landing screen (REQ-126). It is a read of the same sources the tiles below read,
+        // so it is `observability.read` — a caller who may see what happened may see the summary
+        // of it. It writes nothing, so it records no audit entry: a screen that leaves a row
+        // behind on every page view is an audit trail of navigation.
+        .route(
+            "/observability/overview",
+            get(observability_overview::read_overview),
+        )
         .route(
             "/observability/metrics/catalog",
             get(observability::read_catalog),

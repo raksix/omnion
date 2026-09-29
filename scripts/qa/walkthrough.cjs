@@ -5626,6 +5626,12 @@ async function main() {
     // pass below acknowledges a flag, filters by a request id and greps the exported feed for the
     // fixture value it must never contain.
     { path: "/secrets/audit", name: "secrets-audit" },
+    // The centre's landing screen (REQ-126) — walked here and driven by the depth pass below.
+    // It is listed before its six areas deliberately: it is the route the parent nav entry
+    // points at, so an operator who clicks "Observability" and lands somewhere other than here
+    // has been deep-linked past the answer to their question, and that is only visible if the
+    // walk visits the parent.
+    { path: "/observability", name: "observability-overview" },
     // The metric catalogue and its chart (REQ-126, slice 2) — walked here and driven by the
     // depth pass below, which selects a second family, changes the range, copies the PromQL and
     // asserts the cap is shown as a cap rather than as a number with no meaning.
@@ -5786,6 +5792,7 @@ async function main() {
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
   // bytes are pending rather than reclaimed.
   report.observabilityTraces = await runDepthPass("observability-traces", () =>
+    runObservabilityOverviewDepth(page),
     runObservabilityTracesDepth(page, report),
   );
   report.observabilityLogs = await runDepthPass("observability-logs", () =>
@@ -6221,6 +6228,128 @@ async function main() {
  * @param {import("playwright-core").Page} page
  * @param {object} report the shared report the full pass fills in
  */
+/**
+ * The observability landing screen (REQ-126) — the one screen of this request that had no
+ * walkthrough at all, because it had not been built.
+ *
+ * What this pass asserts is the STATE, not the layout, because the layout is the easy half and
+ * the states are where this screen can mislead:
+ *
+ * 1. Every tile rendered. A screen that answered `200` and drew three of six tiles is a partial
+ *    read, and the operator cannot tell it from an instance that has nothing to report.
+ * 2. An absent reading is a dash, never a zero. On a stack the harness has just reset the
+ *    registry is empty, so `null` is the honest answer for all five tiles — and the pass
+ *    asserts the screen said so in words rather than drawing a clean row of zeroes, because a
+ *    flat zero line on an idle instance reads as a healthy one.
+ * 3. The alert tile is present even though the alert store may be unreadable, and says
+ *    "unknown" rather than zero in that case. "No alerts" and "we cannot see the alerts" are
+ *    opposites during an outage.
+ * 4. The six doors are real links with real hrefs, and the exporter section renders whether or
+ *    not an exporter is configured — an instance with none is the normal state of a fresh
+ *    install, and an empty section that renders nothing at all reads as a broken one.
+ *
+ * @param {import("playwright-core").Page} page
+ */
+async function runObservabilityOverviewDepth(page) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "observability-overview-depth", action: "observability", ...step });
+  };
+  // An assertion is recorded, not thrown: the roll-up counts steps whose `ok` is false, so a
+  // pass that finds a defect still writes its artifacts and its report instead of dying on the
+  // first one. (This is the harness convention — the sibling depth passes record and return.)
+  const expect = (check, ok, detail) => note({ check, ok, detail });
+
+  await page
+    .goto(`${URL_ADMIN}/observability`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="observability-overview"]', { timeout: 20000 })
+    .catch(() => {});
+
+  const root = page.locator('[data-view="observability-overview"]');
+  await root.waitFor({ state: "visible", timeout: 20000 }).catch(() => {});
+  await page.waitForTimeout(600);
+
+  // (1) The screen mounted at all — the route and the API call both answered.
+  const mounted = (await root.count()) > 0;
+  expect("screen-mounted", mounted, "/observability rendered nothing");
+  if (!mounted) return steps;
+
+  // (2) Every tile is present. Six is the number the request asks for: requests, error ratio,
+  //     p95, queue depth, AI spend and alerts.
+  const slots = ["requests", "error-ratio", "p95", "queue", "spend", "alerts"];
+  const missing = [];
+  for (const slot of slots) {
+    if ((await root.locator(`[data-tile="${slot}"]`).count()) === 0) missing.push(slot);
+  }
+  expect(
+    "every-tile-present",
+    missing.length === 0,
+    missing.length > 0 ? `missing tiles: ${missing.join(", ")}` : `${slots.length} tiles`,
+  );
+
+  // (3) An idle instance must say so. The registry is empty right after the harness reset the
+  //     database, so every headline is `null`; the screen's job is to render that as a dash and
+  //     to SAY it, not to draw zeroes.
+  const idleTexts = await Promise.all(
+    slots.slice(0, 5).map(async (slot) => ({
+      slot,
+      text: await root.locator(`[data-tile="${slot}"]`).innerText().catch(() => ""),
+    })),
+  );
+  const drewZero = idleTexts.filter((tile) => /(^|\s)0(\s|$)/.test(tile.text)).map((t) => t.slot);
+  const saysNoData = (await root.getByText(/has not served a request in the window/i).count()) > 0;
+  expect(
+    "idle-instance-is-not-zero",
+    drewZero.length === 0,
+    drewZero.length > 0
+      ? `drew 0 for ${drewZero.join(", ")} on an instance with no samples`
+      : "no headline claims zero without a sample",
+  );
+  expect(
+    "idle-instance-explains-itself",
+    saysNoData,
+    saysNoData ? "" : "the screen does not say the dashes are an absence of data",
+  );
+
+  // (4) The alert tile never silently reads zero when the store was unreadable.
+  const alertText = await root.locator('[data-tile="alerts"]').innerText().catch(() => "");
+  expect("alert-tile-present", alertText.length > 0, alertText.split("\n")[0]);
+
+  // (5) The six doors are links, not buttons that go nowhere.
+  const doors = await root.locator('a[href^="/observability/"]').evaluateAll((links) =>
+    links.map((link) => link.getAttribute("href")),
+  );
+  const expectedDoors = [
+    "/observability/logs",
+    "/observability/traces",
+    "/observability/metrics",
+    "/observability/exporters",
+    "/observability/alerts",
+    "/observability/settings",
+  ];
+  const deadDoors = expectedDoors.filter((href) => !doors.includes(href));
+  expect(
+    "six-doors-present",
+    deadDoors.length === 0,
+    deadDoors.length > 0 ? `no link to ${deadDoors.join(", ")}` : `${doors.length} doors`,
+  );
+
+  // (6) The exporter section renders in both states. A fresh stack has none, and an empty
+  //     section that collapses to nothing reads as a broken one rather than an unconfigured one.
+  const exporterSection = await root.getByText(/No exporter is configured/i).count();
+  const exporterChips = await root.locator("li").filter({ hasText: /dropped/ }).count();
+  expect(
+    "exporter-section-renders",
+    exporterSection > 0 || exporterChips > 0,
+    exporterSection > 0 ? "empty state" : `${exporterChips} chip(s)`,
+  );
+
+  return steps;
+}
+
 async function runObservabilityMetricsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -7097,6 +7226,7 @@ async function runObservabilitySettingsDepth(page, report) {
 
 module.exports = {
   runSecretsAuditDepth,
+  runObservabilityOverviewDepth,
   runObservabilityMetricsDepth,
   runObservabilityTracesDepth,
   runObservabilityExportersDepth,
