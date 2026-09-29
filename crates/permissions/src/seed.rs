@@ -119,6 +119,12 @@ const BASE_ROLES: &[BaseRole] = &[
             "notifications.read",
             "notifications.send",
             "notifications.manage",
+            // The outbox reads *everybody's* delivery state, so this one is a manager's on
+            // purpose and not an inherited consequence of `notifications.manage` — a content
+            // manager who can change their own channels has no reason to see who else was
+            // emailed, and granting it "because they are a manager" is the kind of quiet
+            // widening that is impossible to audit later.
+            "notifications.admin",
         ]),
     },
     BaseRole {
@@ -563,6 +569,10 @@ mod tests {
         assert!(
             !keys.contains(&"notifications.send"),
             "notifying other people is not a member's power"
+        );
+        assert!(
+            !keys.contains(&"notifications.admin"),
+            "reading everybody's delivery log is not a member's power"
         );
 
         let editor = BASE_ROLES

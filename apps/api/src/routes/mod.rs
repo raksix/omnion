@@ -97,6 +97,7 @@ pub mod media_transform;
 pub mod media_usage;
 pub mod media_versions;
 pub mod notifications;
+pub mod notifications_admin;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -795,6 +796,68 @@ pub fn router(state: AppState) -> Router {
         .merge(delete(notifications::delete).layer(guards::require(&state, "notifications.read")));
     let notifications_read =
         post(notifications::set_read).layer(guards::require(&state, "notifications.read"));
+    // Slice 2's own surface: the reader's own channel configuration, which is a *different*
+    // power from reading one's own inbox. `notifications.read` is granted to every role
+    // because it grants nothing about anybody else; `notifications.manage` changes what the
+    // organization will send this person and how, so it is deliberately absent from the base
+    // role and belongs to a person who has been given it on purpose.
+    let notifications_preferences = get(notifications::get_preferences)
+        .layer(guards::require(&state, "notifications.manage"))
+        .merge(
+            put(notifications::put_preferences)
+                .layer(guards::require(&state, "notifications.manage")),
+        );
+
+    // Slice 3 splits by *scope* rather than by action, and the split is the whole point of the
+    // slice:
+    //
+    // * a person's own devices are `notifications.manage` — the same key as their preferences,
+    //   because registering a phone is the browser half of "tell me how to reach me";
+    // * channel readiness is `notifications.manage` too, for the same reason: it is about the
+    //   reader's own matrix;
+    // * the outbox and the router's rules are `notifications.admin`, the one key that reads
+    //   *anybody's* activity. The outbox shows who was told what and whether it arrived, so
+    //   granting it "because somebody can manage notifications" would be the quiet widening
+    //   this platform cannot audit later.
+    //
+    // The static segments are declared before `/notifications/{id}` so axum ranks them ahead of
+    // the parameter route — the same reason `/media/settings` is spelled as a literal.
+    let notifications_push = Router::new()
+        .route(
+            "/notifications/push-subscriptions",
+            post(notifications_admin::register_push).merge(get(notifications_admin::list_push)),
+        )
+        .route(
+            "/notifications/push-subscriptions/{id}",
+            delete(notifications_admin::remove_push),
+        )
+        .route_layer(guards::require(&state, "notifications.manage"));
+    let notifications_channels =
+        get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
+    let notifications_outbox = Router::new()
+        .route(
+            "/notifications/outbox",
+            get(notifications_admin::list_outbox),
+        )
+        .route(
+            "/notifications/outbox/{id}/retry",
+            post(notifications_admin::retry_outbox),
+        )
+        .route_layer(guards::require(&state, "notifications.admin"));
+    let notifications_routes = Router::new()
+        .route(
+            "/notifications/routes",
+            get(notifications_admin::list_routes).merge(post(notifications_admin::create_route)),
+        )
+        .route(
+            "/notifications/routes/{id}",
+            delete(notifications_admin::delete_route),
+        )
+        // Running one event through the router is an administrator's *proof*, not a feature:
+        // the claim of slice 3 is that a bus fact becomes a notification with no direct call
+        // between the two modules, and this is the only way to show that from a browser.
+        .route("/notifications/route", post(notifications_admin::run_route))
+        .route_layer(guards::require(&state, "notifications.admin"));
 
     // Analytics (docs/requests/REQ-007): reading a site's tracking settings and its snippet is
     // `analytics.read`, changing them is the separate `analytics.settings.manage`, and both
@@ -913,6 +976,19 @@ pub fn router(state: AppState) -> Router {
         .route("/notifications/bulk", notifications_bulk)
         .route("/notifications/mark-all-read", notifications_mark_all)
         .route("/notifications/emit", notifications_emit)
+        // Slice 2. `preferences` is a *literal* segment and is declared before the `{id}`
+        // routes for exactly the reason `summary` is above: axum ranks a static segment ahead
+        // of a parameter one, and `PUT /notifications/preferences` would otherwise be parsed
+        // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
+        // as "the settings screen is broken".
+        .route("/notifications/preferences", notifications_preferences)
+        // Slice 3's four sub-routers, merged rather than spelled out route by route. Each is a
+        // `Router` with its own `route_layer`, so the guard travels with the group and a future
+        // fifth endpoint joins the right one by being added inside its block.
+        .merge(notifications_push)
+        .route("/notifications/channels", notifications_channels)
+        .merge(notifications_outbox)
+        .merge(notifications_routes)
         .route("/notifications/{id}", notifications_entry)
         .route("/notifications/{id}/read", notifications_read)
         // CRM intake (REQ-117, slice 1). The public capture endpoint carries no guard: it

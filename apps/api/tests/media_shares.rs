@@ -416,7 +416,12 @@ async fn a_link_serves_until_it_is_revoked_and_counts_only_real_downloads() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let share_id = created.body["share"]["id"]
         .as_str()
         .expect("the create response names the share")
@@ -427,7 +432,10 @@ async fn a_link_serves_until_it_is_revoked_and_counts_only_real_downloads() {
         .to_owned();
     assert_eq!(bearer.len(), 64, "32 random bytes, hex encoded");
     assert!(
-        created.body["url"].as_str().unwrap_or_default().ends_with(&bearer),
+        created.body["url"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(&bearer),
         "the URL ends in the token: {:?}",
         created.body["url"]
     );
@@ -499,25 +507,18 @@ async fn a_link_serves_until_it_is_revoked_and_counts_only_real_downloads() {
     );
 
     // The counter moved, because bytes went out.
-    let counted: i32 = sqlx::query_scalar(
-        "select download_count from media_shares where id = $1",
-    )
-    .bind(Uuid::parse_str(&share_id).expect("uuid"))
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the counter must read");
+    let counted: i32 = sqlx::query_scalar("select download_count from media_shares where id = $1")
+        .bind(Uuid::parse_str(&share_id).expect("uuid"))
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the counter must read");
     assert_eq!(counted, 1, "one download that produced bytes");
 
     // A wrong token is refused, and answered as "gone" rather than 404 — the same answer as a
     // revoked link, so a caller cannot enumerate tokens by watching for a difference.
     let unknown = call(
         &fixture.state,
-        request(
-            Method::GET,
-            &public_uri(&"f".repeat(64)),
-            None,
-            None,
-        ),
+        request(Method::GET, &public_uri(&"f".repeat(64)), None, None),
     )
     .await;
     assert_eq!(unknown.status, StatusCode::GONE, "body: {}", unknown.body);
@@ -534,7 +535,12 @@ async fn a_link_serves_until_it_is_revoked_and_counts_only_real_downloads() {
         ),
     )
     .await;
-    assert_eq!(revoked.status, StatusCode::NO_CONTENT, "body: {}", revoked.body);
+    assert_eq!(
+        revoked.status,
+        StatusCode::NO_CONTENT,
+        "body: {}",
+        revoked.body
+    );
 
     // Immediate: the very next request is refused, with no worker and no reaper in between.
     let after = call(
@@ -577,7 +583,10 @@ async fn a_link_serves_until_it_is_revoked_and_counts_only_real_downloads() {
     let audited: i64 = sqlx::query_scalar(
         "select count(*) from audit_log where action = any($1) and target_id = $2",
     )
-    .bind(vec!["media.share_created".to_owned(), "media.share_revoked".to_owned()])
+    .bind(vec![
+        "media.share_created".to_owned(),
+        "media.share_revoked".to_owned(),
+    ])
     .bind(media_id.to_string())
     .fetch_one(fixture.db.pool())
     .await
@@ -609,7 +618,12 @@ async fn a_password_protected_link_checks_the_password_and_stores_its_hash() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let share_id = created.body["share"]["id"].as_str().expect("id").to_owned();
     let bearer = created.body["token"].as_str().expect("token").to_owned();
     assert_eq!(created.body["share"]["has_password"], json!(true));
@@ -720,7 +734,12 @@ async fn an_expiry_is_enforced_and_its_field_is_named_when_it_is_not() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let share_id = created.body["share"]["id"].as_str().expect("id").to_owned();
     let bearer = created.body["token"].as_str().expect("token").to_owned();
 
@@ -780,7 +799,12 @@ async fn a_link_stops_serving_when_its_file_stops_being_servable() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let bearer = created.body["token"].as_str().expect("token").to_owned();
 
     let live = call(
@@ -804,7 +828,12 @@ async fn a_link_stops_serving_when_its_file_stops_being_servable() {
         request(Method::GET, &public_uri(&bearer), None, None),
     )
     .await;
-    assert_eq!(flagged.status, StatusCode::FORBIDDEN, "body: {}", flagged.body);
+    assert_eq!(
+        flagged.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        flagged.body
+    );
     assert_eq!(flagged.body["error"]["code"], json!("file_unavailable"));
 
     // And the same for the trash.
@@ -818,7 +847,12 @@ async fn a_link_stops_serving_when_its_file_stops_being_servable() {
         request(Method::GET, &public_uri(&bearer), None, None),
     )
     .await;
-    assert_eq!(trashed.status, StatusCode::FORBIDDEN, "body: {}", trashed.body);
+    assert_eq!(
+        trashed.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        trashed.body
+    );
     assert_eq!(trashed.body["error"]["code"], json!("file_unavailable"));
 
     // A link over a file that is *already* in the trash is refused at creation, rather than
@@ -833,7 +867,12 @@ async fn a_link_stops_serving_when_its_file_stops_being_servable() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::CONFLICT,
+        "body: {}",
+        refused.body
+    );
     assert_eq!(refused.body["error"]["code"], json!("file_in_trash"));
 
     fixture.cleanup().await;
@@ -876,7 +915,12 @@ async fn the_share_routes_are_permission_gated_and_tenant_scoped() {
         ),
     )
     .await;
-    assert_eq!(create.status, StatusCode::FORBIDDEN, "body: {}", create.body);
+    assert_eq!(
+        create.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        create.body
+    );
 
     let created = call(
         &fixture.state,
@@ -888,7 +932,12 @@ async fn the_share_routes_are_permission_gated_and_tenant_scoped() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let share_id = created.body["share"]["id"].as_str().expect("id").to_owned();
 
     let revoke = call(
@@ -901,7 +950,12 @@ async fn the_share_routes_are_permission_gated_and_tenant_scoped() {
         ),
     )
     .await;
-    assert_eq!(revoke.status, StatusCode::FORBIDDEN, "body: {}", revoke.body);
+    assert_eq!(
+        revoke.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        revoke.body
+    );
 
     // An anonymous caller may not list, and may not create.
     for (method, uri) in [
@@ -930,7 +984,12 @@ async fn the_share_routes_are_permission_gated_and_tenant_scoped() {
         ),
     )
     .await;
-    assert_eq!(crossed.status, StatusCode::NOT_FOUND, "body: {}", crossed.body);
+    assert_eq!(
+        crossed.status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        crossed.body
+    );
     assert_eq!(crossed.body["error"]["code"], json!("share_not_found"));
 
     // A share of a file that does not exist at all is the same 404, and the token route is
