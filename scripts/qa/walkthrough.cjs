@@ -7114,6 +7114,138 @@ async function runWorkflowBuilderDepth(page, report) {
     namesNode: (broken.body?.findings ?? []).some((finding) => finding.node_id === "trigger-2"),
   });
 
+  // ---- Each error class, one at a time, and the node it blames -------------------------------
+  // The criterion names five classes (cycle, two triggers, orphan, missing input, duplicate
+  // edge) and asks each one to name the node involved. Proving them in a single "broken"
+  // graph does not answer that: the five overlap, one class can mask another, and a panel
+  // that renders only the first finding would report the same codes as one that renders
+  // them all. So each class gets its own graph, and each is checked for the two things the
+  // criterion actually asks — the code appears, and the message names a real node.
+  //
+  // Each case starts from a *valid* seed and breaks exactly one thing, so a code that comes
+  // back is attributable to the break and not to collateral damage.
+  const validationClasses = await page.evaluate(async (id) => {
+    const base = await (await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })).json();
+
+    // A minimal valid spine: event trigger → action → end. Every case below is this plus
+    // one defect, and the first case is this on its own as the control.
+    //
+    // The port keys are the registry's, not guesses: a trigger exports `out`, an action
+    // exports `success`/`error`. A probe that wires `next` into both would be measuring
+    // `unknown_source_port` on every case at once — the codes the criterion asks about would
+    // never appear, and the table would report the validation as broken rather than the
+    // probe as wrong.
+    const trigger = (nid) => ({
+      id: nid,
+      type: "trigger.event",
+      label: `Event ${nid}`,
+      params: { event: "qa.validate.probe" },
+      position: { x: 40, y: 40 },
+    });
+    const act = (nid) => ({
+      id: nid,
+      type: "action",
+      label: `Act ${nid}`,
+      params: { action: "log", parameters: "{}" },
+      position: { x: 320, y: 40 },
+    });
+    const finish = (nid) => ({
+      id: nid,
+      type: "end",
+      label: `End ${nid}`,
+      params: {},
+      position: { x: 600, y: 40 },
+    });
+    const edge = (from, to, port) => ({ source: from, source_port: port, target: to });
+    const spine = () => [edge("t1", "a1", "out"), edge("a1", "e1", "success")];
+
+    const cases = {
+      clean: {
+        nodes: [trigger("t1"), act("a1"), finish("e1")],
+        edges: spine(),
+      },
+      // A loop: a1 → t1 closes a ring back to the trigger.
+      cycle: {
+        nodes: [trigger("t1"), act("a1"), finish("e1")],
+        edges: [...spine(), edge("a1", "t1", "success")],
+      },
+      multiple_triggers: {
+        nodes: [trigger("t1"), trigger("t2"), act("a1"), finish("e1")],
+        edges: spine(),
+      },
+      // Reachable from nothing: a floating action the trigger never reaches.
+      orphan_node: {
+        nodes: [trigger("t1"), act("a1"), finish("e1"), act("stray")],
+        edges: spine(),
+      },
+      // A required parameter left empty — the registry names the field and the node.
+      missing_input: {
+        nodes: [{ ...trigger("t1"), params: { event: "" } }, act("a1"), finish("e1")],
+        edges: spine(),
+      },
+      duplicate_edge: {
+        nodes: [trigger("t1"), act("a1"), finish("e1")],
+        edges: [edge("t1", "a1", "out"), edge("t1", "a1", "out"), edge("a1", "e1", "success")],
+      },
+    };
+
+    const out = {};
+    for (const [name, graph] of Object.entries(cases)) {
+      const response = await fetch(`/api/v1/workflows/${id}/validate`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ graph, graph_version: base.graph_version }),
+      });
+      const body = await response.json().catch(() => null);
+      const findings = body?.findings ?? [];
+      out[name] = {
+        status: response.status,
+        valid: body?.valid ?? null,
+        codes: findings.map((f) => f.code),
+        // "Names the node involved" — the finding carries a node id the graph really has,
+        // or the message quotes a label. A finding with neither is a class the panel shows
+        // as a bare sentence the author has to decode.
+        named: findings
+          .filter((f) => f.severity === "error")
+          .every((f) => f.node_id || /[A-Z][a-z]+/.test(f.message ?? "")),
+        firstMessage: (findings[0]?.message ?? "").slice(0, 160),
+      };
+    }
+    return out;
+  }, workflowId);
+
+  // The control first: if the clean spine is not clean, every other row in the table is
+  // measuring the seed rather than the defect.
+  note({
+    step: "validate-classes",
+    clean: {
+      valid: validationClasses.clean?.valid,
+      codes: validationClasses.clean?.codes ?? [],
+    },
+    cycle: {
+      found: validationClasses.cycle?.codes?.includes("graph_cycle"),
+      names: validationClasses.cycle?.firstMessage ?? "",
+    },
+    twoTriggers: {
+      found: validationClasses.multiple_triggers?.codes?.includes("multiple_triggers"),
+      names: validationClasses.multiple_triggers?.firstMessage ?? "",
+    },
+    orphan: {
+      found: validationClasses.orphan_node?.codes?.includes("orphan_node"),
+      names: validationClasses.orphan_node?.firstMessage ?? "",
+    },
+    missingInput: {
+      found: validationClasses.missing_input?.codes?.includes("missing_parameter"),
+      codes: validationClasses.missing_input?.codes ?? [],
+      names: validationClasses.missing_input?.firstMessage ?? "",
+    },
+    duplicateEdge: {
+      found: validationClasses.duplicate_edge?.codes?.includes("duplicate_edge"),
+      names: validationClasses.duplicate_edge?.firstMessage ?? "",
+    },
+  });
+
   // ---- The toolbar's Validate, and the problems panel it fills -----------------------------
   await page.locator("[data-testid='builder-validate']").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(1500);
