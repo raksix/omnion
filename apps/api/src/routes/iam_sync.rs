@@ -415,6 +415,10 @@ pub fn next_run_at(interval_minutes: i32, last: Option<OffsetDateTime>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the test module builds a `SyncCounts` by hand, so the import lives here rather than
+    // at the top: a top-level import that the binary does not need is a warning, and this file
+    // compiles in two configurations where that warning is not hypothetical.
+    use omnion_identity::sso::sync_runs::SyncCounts;
 
     fn a_run(status: RunStatus, started: OffsetDateTime, finished: Option<OffsetDateTime>) -> SyncRun {
         SyncRun {
