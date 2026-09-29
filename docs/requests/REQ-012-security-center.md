@@ -1,6 +1,17 @@
 # REQ-012 — Security Center
 
 > **Status:** in-progress — **slices 1 and 2 are code-complete; neither has a browser pass.** `crates/security` (posture registry, findings store, lifecycle), migration `0054_security_posture.sql`, the `/security` + `/security/findings` screens and the API behind three separate powers (`security.read` / `security.scan` / `security.manage`). Unit tests: 39 crate + 62 permissions. **The browser pass has not run** — `runSecurityDepth` is written and wired into `scripts/qa/walkthrough.cjs` but unrun, so the boxes that name a screen stay unticked. · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+>
+> **The migration gap is not what is blocking the pass.** Earlier revisions of this file and of
+> `docs/BUILD-LOG.md` recorded that `main`'s `0018 → 0021` gap makes `migrate()` fail on any
+> fresh database and therefore stops `scripts/qa/run.sh` at step 1. That is wrong, and
+> `apps/api/tests/migration_gap.rs` proves it on 2026-09-29: sqlx's
+> `validate_applied_migrations` only rejects an *applied* version the binary cannot see, and a
+> fresh database has no applied rows, so a clean install migrates fine. The gap's real victim is
+> a **restore from a branch that had a 0019** — that row is applied and invisible here, so the
+> runner refuses, which is the correct behaviour and is now the second test. A fresh QA database
+> is not a restore, so the pass is unblocked. What is actually holding passes right now is the
+> one-pass-per-box slot, which two sibling waves have legitimately occupied.
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -124,7 +135,7 @@ Webhook relevance: `security.finding.opened` (critical/high) and `security.locko
 - [x] CSV export of findings and security events matches the current filter. *(the findings half shipped: `GET /security/findings.csv` reads the same parser as the list, ignores the page size on purpose, and its 50k cap's refusal names the count. The security-events half is slice 4, with the events screen.)*
 - [ ] `/security/events` shows real sign-in, lockout, denial and settings-change entries.
 - [ ] Secret inventory lists names and rotation age only; no value appears in HTML, JSON or export.
-- [x] CSRF protection rejects a cookie-authenticated mutation without a token. *(derived HMAC over the session id, no table to rotate; `403 csrf_failed` rather than `401` because the caller is authenticated and it is the request that is refused; a bearer machine key is exempt because it is not ambient authority; a deployment with no `OMNION_CSRF_SECRET` refuses rather than skipping)*
+- [x] CSRF protection rejects a cookie-authenticated mutation without a token. *(derived HMAC over the session id, no table to rotate; `403 csrf_failed` rather than `401` because the caller is authenticated and it is the request that is refused; a bearer machine key is exempt because it is not ambient authority; a deployment with no `OMNION_CSRF_SECRET` refuses rather than skipping)* **The guard existed with nothing to guard against: the token was never issued and the client never sent one, so every panel save answered `403 csrf_failed`. Fixed 2026-09-29** — `cookies::csrf_cookie_for` mints it in all four sign-in paths, sign-out clears both cookies, and `apps/admin/lib/api.ts` echoes it from one place in `request()`. `apps/api/tests/csrf.rs` drives the whole round trip over HTTP, and the "with the token it is **accepted**" half is the assertion the original slice never had: a guard that refuses everything passes the refusal half.*
 - [ ] Every endpoint enforces its catalogue key; a forbidden call returns `403 permission_denied`. *(the four keys are in the catalogue and every route is behind a guard; the 403 itself is unproven until a pass calls an endpoint without the key)*
 - [ ] Walkthrough passes with zero high findings.
 
@@ -135,7 +146,7 @@ The walkthrough must visit `/security` and each sub-tab, click "Run checks", ope
 ### Slices
 
 1. **Posture + findings** — schema, check registry, `/security` overview, findings list/detail and status transitions, audit entries. Done: the overview shows real states and a finding can be acknowledged, ignored with a reason and exported. **SLICE 1 COMPLETE 2026-09-29, awaiting the browser pass** (`0054_security_posture.sql`, `crates/security`, `apps/api/src/routes/security.rs`, `features/security/`, `runSecurityDepth`). The CSV export shipped with it: `crates/security/src/csv.rs` renders the filter unpaged, caps at 50k rows with a refusal that names the count, and prefixes a cell starting with `= + - @` with a tab — a findings title can be a hostile package name and a findings export is exactly the document somebody opens in a spreadsheet. 51 crate tests.
-2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. **Backend complete 2026-09-29** (`crates/security/src/headers.rs`, `csrf.rs`, `header_store.rs`, `0135_security_headers.sql`, `apps/api/src/headers_middleware.rs`, `routes/security_headers.rs`, `GET/PUT /security/headers`). 46 new crate tests + 5 API tests; `cargo test -p omnion-api --lib` 208 passed. Still open: the `/security/headers` **screen** and the walkthrough entry — the browser pass has not run, so no box that names a screen is ticked.
+2. **Headers + CSRF** — header policy model, middleware application, CSP preview, CSRF token for cookie-authenticated mutations, `/security/headers`. **Backend complete 2026-09-29** (`crates/security/src/headers.rs`, `csrf.rs`, `header_store.rs`, `0135_security_headers.sql`, `apps/api/src/headers_middleware.rs`, `routes/security_headers.rs`, `GET/PUT /security/headers`). The CSRF half was **not** complete on that date: the layer was on the router, but nothing issued the token and nothing sent it, so every cookie-authenticated mutation was refused. Closed 2026-09-29 by `2274768` + `5210388` + `6a08bd4`. Still open: the `/security/headers` **screen** and the walkthrough entry — the browser pass has not run, so no box that names a screen is ticked.
 3. **Rate limiting + lockout** — Redis-backed limiter, scope table, tester, failed-attempt counting, lockout and unlock, `/security/sign-in-protection` and `/security/rate-limits`. Done: a scripted burst gets `429`, and five failed sign-ins lock the account until it is unlocked.
 4. **IP access + events + inventory** — allow/deny evaluation, rules UI, security-event view, secret inventory projection, `security.finding.opened` webhook. Done: a denied CIDR cannot reach the API, the events screen shows the attempt, and the inventory shows rotation age without values.
 

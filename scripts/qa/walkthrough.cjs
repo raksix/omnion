@@ -6526,6 +6526,158 @@ async function runSecurityDepth(page, report) {
     note({ step: "cleanup-failed", reason: String(error.message || error) });
   }
 
+  // ---- The header policy screen (REQ-012, slice 2) ---------------------------------------------
+  //
+  // This half exists because slice 2's backend shipped with no screen: the API could store a
+  // policy and nothing in the panel could edit one. The three claims worth a browser are
+  // therefore the three a JSON response cannot make — the draft preview tracks the form, a
+  // refusal names the row that caused it, and a save reaches the *response headers* rather
+  // than only the settings row.
+  await page.goto(`${URL_ADMIN}/security/headers`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-header-policy], [data-header-error]", { timeout: 15000 }).catch(() => {});
+  const headersRendered = (await page.locator("[data-header-policy]").count()) > 0;
+  note({ step: "headers-loaded", rendered: headersRendered });
+  if (headersRendered) {
+    // The tab strip must mark the open screen, and must not offer a tab that leads nowhere.
+    const tabs = await page.locator("[data-security-tab]").count();
+    const currentTab = await page.locator('[data-security-tab][aria-current="page"]').count();
+    note({ step: "security-tabs", tabs, currentTab });
+    if (currentTab !== 1) {
+      note({ step: "security-tab-not-marked", currentTab, reason: "the open tab is not marked" });
+    }
+
+    // The rendered column is the server's, and it must contain the real header names rather
+    // than a summary. A preview of a summary is the bug the whole column exists to prevent.
+    const savedLines = await page.$$eval("[data-header-line]", (nodes) =>
+      nodes.map((node) => ({
+        name: node.getAttribute("data-header-line"),
+        off: node.getAttribute("data-header-off") === "true",
+        text: node.textContent.trim(),
+      })),
+    );
+    note({ step: "header-lines", lines: savedLines.length });
+    const cspLine = savedLines.find((line) => /Content-Security-Policy/.test(line.name || ""));
+    if (!cspLine) {
+      note({ step: "no-csp-line", reason: "the preview carries no CSP header" });
+    } else if (cspLine.off) {
+      note({ step: "csp-off", reason: "the baseline sends no CSP at all" });
+    }
+    // Report-only and enforce are mutually exclusive on the wire. Both names appearing at once
+    // means the screen is showing a policy the middleware would never send.
+    const bothModes = savedLines.filter((line) =>
+      /Content-Security-Policy(-Report-Only)?$/.test(line.name || ""),
+    );
+    if (bothModes.length > 1) {
+      note({ step: "both-csp-modes", lines: bothModes.map((line) => line.name) });
+    }
+
+    // A directive row with no name cannot be saved, and the control must be disabled while it
+    // is there — a live button that always fails teaches the operator the form is broken.
+    await page.locator("[data-header-add-directive]").click().catch(() => {});
+    await page.waitForTimeout(400);
+    const emptyNameShown = (await page.locator("[data-header-empty-name]").count()) > 0;
+    const saveBlocked = await page.locator("[data-header-save]").isDisabled().catch(() => null);
+    note({ step: "empty-directive-blocks-save", warned: emptyNameShown, saveDisabled: saveBlocked });
+    if (emptyNameShown && saveBlocked === false) {
+      note({ step: "empty-directive-savable", reason: "an unnamed directive can be saved" });
+    }
+    await shot(page, "security-headers-empty-directive");
+
+    // Filling it in makes the form dirty, and the preview must switch to a *draft* — a preview
+    // that keeps showing the saved policy beside an edited form is exactly the confusion this
+    // screen exists to remove.
+    await page.locator("[data-header-directive-name='0']").fill("img-src");
+    await page.locator("[data-header-directive-values='0']").fill("'self' data:");
+    await page.waitForTimeout(400);
+    const dirtyShown = (await page.locator("[data-header-dirty]").count()) > 0;
+    const draftPreview = (await page.locator('[data-header-preview="draft"]').count()) > 0;
+    const draftDrafted = (await page.locator("[data-header-preview-draft]").count()) > 0;
+    note({ step: "draft-preview", dirtyShown, draftPreview, labelled: draftDrafted });
+    if (!draftPreview) {
+      note({ step: "preview-not-a-draft", reason: "an edited form still shows the saved policy" });
+    }
+    if (draftPreview && !draftDrafted) {
+      note({ step: "draft-unlabelled", reason: "the draft preview is not labelled as one" });
+    }
+    await shot(page, "security-headers-draft");
+
+    // The mode radios are exclusive, and switching must move the header name in the preview
+    // from the report-only name to the enforcing one.
+    await page.locator('[data-header-mode="enforce"]').check().catch(() => {});
+    await page.waitForTimeout(400);
+    const enforcedLine = await page
+      .locator('[data-header-line="Content-Security-Policy"]')
+      .count();
+    const reportLine = await page
+      .locator('[data-header-line="Content-Security-Policy-Report-Only"]')
+      .count();
+    note({ step: "enforce-switches-name", enforcing: enforcedLine, reportOnly: reportLine });
+    if (enforcedLine !== 1 || reportLine !== 0) {
+      note({
+        step: "csp-mode-does-not-move",
+        reason: "enforce mode did not replace the report-only header name",
+      });
+    }
+    await shot(page, "security-headers-enforce");
+
+    // A `max-age` a browser would ignore is a warning on the field, not a silent save.
+    await page.locator("[data-header-hsts-max-age]").fill("3600");
+    await page.waitForTimeout(400);
+    const hstsWarned = (await page.locator("[data-header-hsts-warning]").count()) > 0;
+    note({ step: "hsts-too-short-warned", warned: hstsWarned });
+    await shot(page, "security-headers-hsts-warning");
+    await page.locator("[data-header-hsts-max-age]").fill("31536000");
+    await page.waitForTimeout(300);
+
+    // ---- Save, and read it back off the wire ---------------------------------------------------
+    // The assertion is the response headers, not the settings row: a policy that stores but
+    // does not reach the middleware is the failure mode this whole screen is about.
+    await page.locator("[data-header-save]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-header-save-error]", { timeout: 12000 }).catch(() => {});
+    const saveError = (await page.locator("[data-header-save-error]").textContent().catch(() => "")) || null;
+    note({ step: "headers-saved", error: saveError ? saveError.trim().slice(0, 160) : null });
+    if (saveError) {
+      note({ step: "headers-save-failed", reason: "the policy did not save" });
+    } else {
+      await page.waitForTimeout(600);
+      const onTheWire = await page.evaluate(async () => {
+        const answer = await fetch("/api/v1/security/headers", { credentials: "same-origin" });
+        const body = await answer.json().catch(() => null);
+        return body?.rendered ?? null;
+      });
+      const wireNames = (onTheWire || []).map((line) => line.name);
+      const wireEnforcing = wireNames.includes("Content-Security-Policy");
+      const wireReportOnly = wireNames.includes("Content-Security-Policy-Report-Only");
+      note({ step: "wire-csp-mode", enforcing: wireEnforcing, reportOnly: wireReportOnly });
+      if (!wireEnforcing || wireReportOnly) {
+        note({
+          step: "wire-mode-mismatch",
+          reason: "the saved mode did not reach the stored rendering",
+        });
+      }
+      const hasImgSrc = (onTheWire || []).some(
+        (line) => (line.value || "").includes("img-src 'self' data:"),
+      );
+      note({ step: "wire-has-directive", hasImgSrc });
+      if (!hasImgSrc) {
+        note({ step: "directive-not-stored", reason: "the edited directive did not reach the store" });
+      }
+      // An off header is a visible row, not a missing one.
+      const hasOffRow = (onTheWire || []).some((line) => line.value === null);
+      note({ step: "wire-lists-off-headers", hasOffRow });
+    }
+    await shot(page, "security-headers-saved");
+
+    // Put the mode back to report-only so a pass cannot leave the QA deployment enforcing a
+    // policy that a sibling's browser pass would then be running under.
+    await page.locator('[data-header-mode="report_only"]').check().catch(() => {});
+    await page.waitForTimeout(300);
+    await page.locator("[data-header-save]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    note({ step: "headers-restored" });
+    await shot(page, "security-headers-restored");
+  }
+
   return { ok: true, steps };
 }
 

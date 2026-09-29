@@ -303,6 +303,7 @@ pub async fn create_owner(
 
     let secure = !state.config().env.is_development();
     let cookie = cookies::session_cookie(&token, SESSION_TTL_SECONDS, secure);
+    let csrf = cookies::csrf_cookie_for(&session.id, state.config().csrf.as_bytes(), secure);
 
     let onboarding = onboarding_state::status(state.db().pool()).await?;
     let mut response = (
@@ -317,6 +318,12 @@ pub async fn create_owner(
         SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("session cookie is valid header text"),
     );
+    if let Some(csrf) = csrf {
+        response.headers_mut().append(
+            SET_COOKIE,
+            HeaderValue::from_str(&csrf).expect("CSRF cookie is valid header text"),
+        );
+    }
     Ok(response)
 }
 
