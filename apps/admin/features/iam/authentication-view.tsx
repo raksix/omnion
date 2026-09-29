@@ -38,6 +38,7 @@ import {
 
 import { useSession } from "@/lib/session";
 import { AttributeMapEditor } from "@/features/iam/attribute-map-editor";
+import { RoleRulesEditor } from "@/features/iam/role-rules-editor";
 import {
   ApiError,
   createIamProvider,
@@ -1142,6 +1143,16 @@ export function AuthenticationView() {
             {draft.id ? (
               <div className="border-t border-line pt-3">
                 <AttributeMapEditor providerId={draft.id} />
+              </div>
+            ) : null}
+
+            {/* The role rules are the next step of the same job, and for the same reason they sit
+                in the same drawer rather than on a screen of their own: the wizard asks Basics ->
+                Connection -> Attribute mapping -> Role mapping -> Enable, and splitting the fourth
+                step onto a separate route would make the wizard's own order a lie. */}
+            {draft.id ? (
+              <div className="border-t border-line pt-3">
+                <RoleRulesEditor providerId={draft.id} />
               </div>
             ) : null}
 

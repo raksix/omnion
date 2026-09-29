@@ -3853,6 +3853,95 @@ export function previewIamAttributeMap(
   });
 }
 
+/** One rule, as the editor reads it. */
+export type IamRoleRule = {
+  id: string | null;
+  position: number;
+  when_kind: string;
+  needs_key: boolean;
+  when_key: string;
+  when_operator: string;
+  when_value: string;
+  role_id: string;
+  scope_type: string;
+  site_id: string | null;
+  stop: boolean;
+  enabled: boolean;
+};
+
+/** A picker option the server sent, so the client never hard-codes a vocabulary. */
+export type IamRuleOption = { name: string; hint: string; needs_key?: boolean; needs_site?: boolean };
+
+/** The provider's role rules, with the kind/operator/scope catalogues. */
+export type IamRoleRules = {
+  provider_id: string;
+  rules: IamRoleRule[];
+  when_kinds: IamRuleOption[];
+  when_operators: IamRuleOption[];
+  scope_types: IamRuleOption[];
+  default_role_id: string | null;
+  problems: IamTestProblem[];
+};
+
+/**
+ * The result of walking the rules against a sample.
+ *
+ * `trace` is the reason this is worth showing rather than just the role: a rule that did not fire
+ * carries the values it read, so "matched nothing" and "read nothing" — different bugs with
+ * different fixes — are visibly different.
+ */
+export type IamRoleRuleDryRun = {
+  provider_id: string;
+  role_id: string | null;
+  reason: string;
+  matched_rule_index: number | null;
+  sample_email: string;
+  sample_groups: string[];
+  trace: {
+    index: number;
+    label: string;
+    when_kind: string;
+    when_key: string;
+    when_operator: string;
+    when_value: string;
+    role_id: string;
+    scope_type: string;
+    read: string[];
+    matched: boolean;
+    verdict: "matched" | "no_match" | "not_reached" | "disabled";
+  }[];
+  problems: IamTestProblem[];
+};
+
+export function fetchIamRoleRules(id: string): Promise<IamRoleRules> {
+  return request(`/api/v1/iam/providers/${id}/role-rules`);
+}
+
+/**
+ * Replace the whole rule set in one PUT. The order is the semantics, so a save that applies rows
+ * one at a time would let a sign-in land between the delete and the insert and see an empty set.
+ */
+export function saveIamRoleRules(
+  id: string,
+  rules: IamRoleRule[],
+): Promise<IamRoleRules> {
+  return request(`/api/v1/iam/providers/${id}/role-rules`, {
+    method: "PUT",
+    body: JSON.stringify({ rules }),
+  });
+}
+
+/** Dry-run a pasted identity against the *stored* rules. Writes nothing. */
+export function dryRunIamRoleRules(
+  id: string,
+  sample: unknown,
+): Promise<IamRoleRuleDryRun> {
+  return request(`/api/v1/iam/providers/${id}/role-rules/preview`, {
+    method: "POST",
+    body: JSON.stringify({ sample }),
+  });
+}
+
 /** The providers a person may sign in with — the public list the sign-in screen renders. */
 export function fetchSsoProviders(): Promise<{
   organization_id: string;
