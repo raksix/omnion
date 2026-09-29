@@ -14,6 +14,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
+use omnion_events::NewEvent;
 use omnion_permissions::model::{NewSubjectBinding, ResourceContext, Scope, Subject};
 use omnion_permissions::{
     PermissionsError, bindings, groups as group_store, service_accounts, simulate as simulator,
@@ -544,6 +545,25 @@ pub async fn update_user(
     .fetch_one(pool)
     .await
     .map_err(PermissionsError::Database)?;
+
+    // An account's details, status, organization or MFA requirement changing is a fact a
+    // receiver acts on \u2014 a provisioning system mirrors it, a session bus drops the account
+    // when it is disabled. The catalogue listed `user.updated` as live; until this call the
+    // only place it existed was the table.
+    omnion_events::bus::emit(
+        pool,
+        NewEvent::new("user.updated")
+            .organization(updated.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "user_id": updated.id,
+                "email": updated.email,
+                "display_name": updated.display_name,
+                "status": updated.status,
+                "mfa_enforced": updated.mfa_enforced,
+            })),
+    )
+    .await?;
 
     record(
         &state,

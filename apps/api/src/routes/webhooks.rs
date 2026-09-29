@@ -191,6 +191,12 @@ pub struct EventBody {
 pub struct EventsResponse {
     /// The events, newest first.
     pub events: Vec<EventBody>,
+    /// Cursor for the next page: the id of the last row above, or `None` at the end.
+    pub next_cursor: Option<i64>,
+    /// Whether a further page exists. The panel needs it to decide whether "Load more" is a
+    /// real button or decoration, and it is read from the row *past* the page rather than from
+    /// a second count that could disagree with what is on screen.
+    pub has_more: bool,
 }
 
 /// One payload field of one event, as the catalogue describes it.
@@ -219,6 +225,13 @@ pub struct CatalogueEntryBody {
     pub status: &'static str,
     /// The fields the payload carries.
     pub payload_fields: Vec<CatalogueFieldBody>,
+    /// Deliveries this name produced in the last 24 hours, for this organization.
+    ///
+    /// The number answers the question the status column cannot: a *live* name with a zero here
+    /// is a name the platform records but nobody is subscribed to, which is a fact an operator
+    /// wants before connecting an endpoint rather than after. It is `0` rather than absent for
+    /// a name with no deliveries so the column is always a number the screen can render.
+    pub deliveries_24h: i64,
 }
 
 /// The whole catalogue, grouped for the picker.
@@ -286,14 +299,109 @@ pub struct LimitQuery {
 }
 
 /// `?name=` on the event read.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct EventsQuery {
     /// How many rows to return.
     #[serde(default)]
     pub limit: Option<i64>,
-    /// Exact event name to filter by.
+    /// One exact event name; repeatable, and several names mean "any of these".
     #[serde(default)]
-    pub name: Option<String>,
+    pub name: Vec<String>,
+    /// Site the events happened on.
+    #[serde(default)]
+    pub site_id: Option<Uuid>,
+    /// Account that caused them.
+    #[serde(default)]
+    pub actor_user_id: Option<Uuid>,
+    /// Lower bound of the window, RFC 3339.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Upper bound of the window, RFC 3339.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Keyset cursor: the id of the previous page's last row.
+    #[serde(default)]
+    pub cursor: Option<i64>,
+}
+
+/// The event read's query string, parsed by hand.
+///
+/// The reason is one line long and it was found the hard way: `serde_urlencoded` — which is
+/// what `Query<T>` is built on — **rejects `?name=a` for a `Vec<String>` field outright**,
+/// with a `400` whose body is plain text rather than the API's own error envelope. One
+/// `?name=page.published` therefore did not filter, it *failed*, and the failure was invisible
+/// to any client that only checked the status of a happy-path request. The same parser shape
+/// already exists for the notification list (see `notifications::parse_list_params`), and its
+/// doc comment carries the three rules this one repeats: a repeated key accumulates, a single
+/// value is a one-element list, and a valueless key is a flag rather than a malformed pair.
+///
+/// Anything this build does not know is **ignored** rather than refused, so a panel that
+/// starts sending one filter earlier than the API does still gets its feed. The two values
+/// that cannot be guessed at are refused by name, because both are requests a reader would
+/// otherwise see silently ignored: a `limit` of "lots" and a `cursor` that is not a number.
+fn parse_events_query(raw: Option<&str>) -> Result<EventsQuery, ApiError> {
+    let mut query = EventsQuery::default();
+
+    let Some(raw) = raw else {
+        return Ok(query);
+    };
+
+    for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
+        // `split_once` yielding nothing is a valueless key (`?archived`), which is legal URI
+        // syntax and means "present" — not a malformed pair.
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = decode_query_token(key);
+        let value = decode_query_token(value);
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "name" => query.name.push(value),
+            "from" => query.from = Some(value),
+            "to" => query.to = Some(value),
+            "site_id" => {
+                query.site_id = Some(value.parse().map_err(|_| {
+                    invalid_query("site_id", "it is not a uuid")
+                })?)
+            }
+            "actor_user_id" => {
+                query.actor_user_id = Some(value.parse().map_err(|_| {
+                    invalid_query("actor_user_id", "it is not a uuid")
+                })?)
+            }
+            "cursor" => {
+                query.cursor = Some(value.parse().map_err(|_| {
+                    invalid_query("cursor", "it is not a row id")
+                })?)
+            }
+            "limit" => {
+                query.limit = Some(value.parse().map_err(|_| {
+                    invalid_query("limit", "it is not a whole number")
+                })?)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(query)
+}
+
+/// Percent-decode one query-string token, `+` meaning a space.
+fn decode_query_token(value: &str) -> String {
+    let bytes = value.replace('+', " ");
+    percent_encoding::percent_decode_str(&bytes)
+        .decode_utf8_lossy()
+        .to_string()
+}
+
+/// The one refusal this parser hands out, naming the parameter so the panel can put the
+/// message next to the right box instead of next to the whole filter bar.
+fn invalid_query(field: &str, because: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_event_query",
+        format!("`{field}` is not usable: {because}"),
+    )
 }
 
 /// What a test delivery queued.
@@ -320,13 +428,28 @@ pub struct TestDeliveryBody {
 /// The route is declared **before** `/events/{id}` would shadow it (a sibling of `/events`,
 /// not a child), and it is `events.read` like the feed: describing what an event means is
 /// reading the bus, not administering an endpoint.
-pub async fn list_catalogue(_current: CurrentSession) -> Result<Json<CatalogueResponse>, ApiError> {
+pub async fn list_catalogue(
+    state: State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<CatalogueResponse>, ApiError> {
     let entries = omnion_events::catalogue::all();
     let live_count = entries
         .iter()
         .filter(|entry| entry.status == omnion_events::catalogue::Status::Live)
         .count();
     let reserved_count = entries.len() - live_count;
+
+    // The registry itself needs no database — it is a fact about the *platform*, not about a
+    // tenant, and two organizations asking must get the same answer. The one row-derived
+    // number on this read is the 24-hour delivery count, and it is scoped to the caller's
+    // organization exactly like every other read: a count is an observation about this
+    // tenant's endpoints, and a platform-wide count would tell one organization how much
+    // traffic another one receives.
+    let since = OffsetDateTime::now_utc() - time::Duration::hours(24);
+    let counts = store::delivery_counts_since(state.db().pool(), current.user.organization_id, since)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
 
     Ok(Json(CatalogueResponse {
         areas: omnion_events::catalogue::areas(),
@@ -350,6 +473,7 @@ pub async fn list_catalogue(_current: CurrentSession) -> Result<Json<CatalogueRe
                         required: field.required,
                     })
                     .collect(),
+                deliveries_24h: counts.get(entry.name).copied().unwrap_or_default(),
             })
             .collect(),
     }))
@@ -411,6 +535,26 @@ pub async fn create_webhook(
             events: events.clone(),
             created_by: Some(current.user.id),
         },
+    )
+    .await?;
+
+    // The endpoint's own lifecycle belongs on the bus, not only in the audit trail. An
+    // organization that watches itself through a second receiver needs to know a consumer
+    // appeared \u2014 that is how a downstream system knows to start looking for a class of
+    // event it was not previously told about. The name is the endpoint's own, never its
+    // secret.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.created")
+            .organization(endpoint.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "endpoint_id": endpoint.id,
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "events": endpoint.events,
+                "enabled": endpoint.enabled,
+            })),
     )
     .await?;
 
@@ -487,6 +631,36 @@ pub async fn update_webhook(
         metadata["secret_rotated"] = json!(true);
     }
 
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.updated")
+            .organization(updated.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "endpoint_id": updated.id,
+                "name": updated.name,
+                "url": updated.url,
+                "events": updated.events,
+                "enabled": updated.enabled,
+                "secret_rotated": rotated,
+            })),
+    )
+    .await?;
+
+    // A rotation is its own fact, and it is the one a receiver most needs: the old signature
+    // stops verifying, and a receiver that does not hear this starts rejecting every delivery
+    // it was being sent. The secret itself is never in the payload \u2014 only that it changed.
+    if rotated {
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new("webhook.secret.rotated")
+                .organization(updated.organization_id)
+                .actor(current.user.id)
+                .payload(json!({ "endpoint_id": updated.id, "name": updated.name })),
+        )
+        .await?;
+    }
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "webhook.endpoint.updated")
@@ -512,6 +686,15 @@ pub async fn delete_webhook(
     if !store::delete_endpoint(state.db().pool(), endpoint.id).await? {
         return Err(endpoint_not_found());
     }
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.removed")
+            .organization(endpoint.organization_id)
+            .actor(current.user.id)
+            .payload(json!({ "endpoint_id": endpoint.id, "name": endpoint.name })),
+    )
+    .await?;
 
     record(
         &state,
@@ -570,6 +753,25 @@ pub async fn test_webhook(
     )
     .await?;
 
+    // The test delivery is addressed to one endpoint with `emit_to`, so recording it as an
+    // event as well would be pointless \u2014 it is aimed at the endpoint that was just tested
+    // and reaches nobody else. The catalogue carries `webhook.endpoint.tested` for the other
+    // direction: a second receiver watching the organization needs to know this endpoint was
+    // proven, which is a fact about the endpoint rather than about a delivery.
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("webhook.endpoint.tested")
+            .organization(endpoint.organization_id)
+            .actor(current.user.id)
+            .payload(json!({
+                "endpoint_id": endpoint.id,
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "deliveries": report.deliveries,
+            })),
+    )
+    .await?;
+
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "webhook.endpoint.tested")
@@ -596,24 +798,43 @@ pub async fn test_webhook(
 pub async fn list_events(
     State(state): State<AppState>,
     current: CurrentSession,
-    Query(query): Query<EventsQuery>,
+    query: axum::extract::RawQuery,
 ) -> Result<Json<EventsResponse>, ApiError> {
-    let name = match query.name.as_deref() {
-        Some(raw) => Some(validation::validate_event_name(raw)?),
-        None => None,
-    };
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    // The hand parser rather than `Query<EventsQuery>`: see `parse_events_query` — one
+    // `?name=` is enough to make the generic deserializer answer a plain-text 400.
+    let query = parse_events_query(query.0.as_deref())?;
 
-    let events = store::list_events(
-        state.db().pool(),
-        current.user.organization_id,
-        name.as_deref(),
-        limit,
-    )
-    .await?;
+    // Every name is validated, not just the first: a filter that silently ignored a typo
+    // would return "nothing happened" for a name that has happened a thousand times, and the
+    // operator would go looking for a broken module instead of a typo in their own filter.
+    let mut names = Vec::with_capacity(query.name.len());
+    for raw in &query.name {
+        names.push(validation::validate_event_name(raw)?);
+    }
+
+    let filter = store::EventFilter {
+        organization_id: current.user.organization_id,
+        names,
+        site_id: query.site_id,
+        actor_user_id: query.actor_user_id,
+        from: parse_instant(query.from.as_deref(), "from")?,
+        to: parse_instant(query.to.as_deref(), "to")?,
+        before: query.cursor.filter(|id| *id > 0),
+        limit: query.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE),
+    };
+
+    let page = store::list_events(state.db().pool(), &filter).await?;
+
+    // The cursor is the last row's own id, exclusive: the next page asks for `id < cursor` and
+    // therefore cannot re-serve the row the cursor names.
+    let next_cursor = page
+        .has_more
+        .then(|| page.events.last().map(|event| event.id))
+        .flatten();
 
     Ok(Json(EventsResponse {
-        events: events
+        events: page
+            .events
             .iter()
             .map(|event| EventBody {
                 id: event.id,
@@ -625,7 +846,29 @@ pub async fn list_events(
                 created_at: event.created_at,
             })
             .collect(),
+        next_cursor,
+        has_more: page.has_more,
     }))
+}
+
+/// Parse an RFC 3339 bound of the feed's window.
+///
+/// The error names the parameter rather than the value: `from` and `to` arrive as strings
+/// because `Query` will not do the parse for us, and a `400` that says "unparsable" without
+/// saying *which* field leaves the caller guessing between two boxes on the screen.
+fn parse_instant(raw: Option<&str>, field: &'static str) -> Result<Option<OffsetDateTime>, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .map(Some)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_event_window",
+                format!("`{field}` is not an RFC 3339 timestamp"),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------------------------
