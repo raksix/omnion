@@ -19,6 +19,8 @@ pub enum Command {
     Migrate,
     /// `omnion setup …`.
     Setup(Box<SetupOptions>),
+    /// `omnion node scaffold|validate|pack …`.
+    Node(Box<crate::node::NodeCommand>),
 }
 
 /// Everything `omnion setup` accepts on the command line.
@@ -99,6 +101,16 @@ impl Command {
                 let options = parse_setup(&mut cursor)?;
                 Ok(Self::Setup(Box::new(options)))
             }
+            "node" => {
+                // The node verbs take their own argv: `omnion node scaffold acme --out acme`
+                // reads nothing from the shared cursor, and routing them through it would
+                // mean a second parser for the same CLI. The cursor is checked for leftovers
+                // so `omnion node --loud` is a usage error rather than a silently ignored flag.
+                let rest: Vec<String> = cursor.remaining();
+                Ok(Self::Node(Box::new(crate::node::NodeCommand::parse(
+                    &rest,
+                )?)))
+            }
             other => Err(format!("unknown command {other:?}")),
         }
     }
@@ -155,6 +167,7 @@ COMMANDS
     setup      First-run setup: owner account, organization, first site, theme.
     doctor     Check the environment: configuration, database, migrations, redis, storage.
     migrate    Apply pending database migrations.
+    node       The node SDK: scaffold, validate or pack a node package.
     help       Show this text (also -h, --help).
     version    Show the version (also -V, --version).
 
@@ -176,8 +189,14 @@ ENVIRONMENT
     The connection comes from the same variables the API reads
     (OMNION_DATABASE_URL, OMNION_REDIS_URL, …). See docs/02-ARCHITECTURE.md.
 
+NODE OPTIONS
+    omnion node scaffold <key> [--out <dir>]   Write a package that installs.
+    omnion node validate <manifest.json>       What an install would say.
+    omnion node pack <manifest.json> [-o <f>]  Validate, then write the packed file.
+
 EXAMPLES
     omnion doctor
+    omnion node scaffold acme-tools --out acme-tools
     omnion setup --non-interactive --name 'Ada Lovelace' --email ada@example.com \\
         --password-stdin --organization 'Acme' --site 'Acme' --domain acme.example.com
 
@@ -217,6 +236,13 @@ impl<'a> Cursor<'a> {
             Some((flag, value)) if flag.starts_with("--") => Some((flag, Some(value))),
             _ => Some((arg.as_str(), None)),
         }
+    }
+
+    /// Everything not yet consumed, as owned strings.
+    fn remaining(&mut self) -> Vec<String> {
+        let rest: Vec<String> = self.argv[self.index..].to_vec();
+        self.index = self.argv.len();
+        rest
     }
 
     /// The value of a flag: inline, or the next argument (which must not be another flag).
