@@ -87,12 +87,48 @@ async function call(url, init) {
 }
 
 async function main() {
+  // `GET /onboarding` is the one endpoint here that needs no session: a client has to be able to
+  // ask "is this installation set up?" before it can sign in, and the answer holds no secret
+  // (step booleans and static labels). Asking it FIRST is what makes the fresh-database case
+  // legible instead of looking like a broken sign-in.
+  //
+  // The previous version signed in first and reported `401 invalid_credentials` on every fresh
+  // reset, which is the one state this step exists for. run.sh resets the database, so the owner
+  // does not exist yet: there is nobody to sign in as, and the walkthrough's wizard — which runs
+  // immediately after this step — is what creates the account, the organization and the site. So
+  // the step was not merely failing, it was guaranteed to fail on every pass and print
+  // "rule screens will report empty" over a stack that was about to be seeded correctly.
+  const status = await call(`${URL_ADMIN}/api/v1/onboarding`, { method: "GET" });
+  const steps = status.body?.steps;
+  if (status.status !== 200 || !steps || typeof steps.owner !== "boolean") {
+    console.error(
+      `[qa] onboarding status unreadable (${status.status}): ${JSON.stringify(status.body).slice(0, 200)}`,
+    );
+    process.exit(1);
+  }
+
+  // No account yet is NOT a failure: the wizard is mid-flight and owns this state end to end.
+  // Claiming the pass is broken here is how a working pass gets reported as a broken product.
+  if (!steps.owner) {
+    console.log("[qa] no account yet — the first-run wizard seeds the owner, organization and site");
+    return;
+  }
+
+  // An account without a tenant is the one state this step really repairs: a resumed or partial
+  // first run leaves exactly that, and every rule belongs to a tenant.
+  if (steps.organization) {
+    console.log("[qa] organization already present (onboarding reports it)");
+    return;
+  }
+
   const login = await call(`${URL_ADMIN}/api/v1/auth/login`, {
     method: "POST",
     body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
   });
   if (login.status !== 200) {
-    console.error(`[qa] sign-in failed (${login.status}): ${JSON.stringify(login.body).slice(0, 200)}`);
+    console.error(
+      `[qa] an account exists but sign-in failed (${login.status}): ${JSON.stringify(login.body).slice(0, 200)}`,
+    );
     process.exit(1);
   }
 
