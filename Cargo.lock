@@ -1652,6 +1652,8 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "hmac",
+ "omnion-core",
+ "redis",
  "serde",
  "serde_json",
  "sha2",
