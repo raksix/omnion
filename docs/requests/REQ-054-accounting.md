@@ -1,6 +1,6 @@
 # REQ-054 — Accounting
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/accounting`)
+> **Status:** in-progress (slice 1 — the data model and the journal invariant: `4fd84f8`) · **Captured:** 2026-09-26 · **Layer:** module (`modules/accounting`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -177,7 +177,7 @@ Visual check: invoice list shows status badges with text and the red/amber due-d
 
 ### Slices
 
-1. **Chart of accounts, tax rates, journal + data core.** Migration, seeds, accounts/tax-rate screens, journal with the balance invariant, permission keys, audit, tests. Done when a manual balanced entry posts and an unbalanced one is refused with a visible message.
+1. **Chart of accounts, tax rates, journal + data core.** Migration, seeds, accounts/tax-rate screens, journal with the balance invariant, permission keys, audit, tests. Done when a manual balanced entry posts and an unbalanced one is refused with a visible message. **The migration and its invariants are in (`4fd84f8`, `0167_accounting.sql`); the screens, the posting route and the `accounting.*` keys are not.** Everything below the data model is untouched, so nothing in the slice is ticked yet.
 2. **Invoices + sales handoff + PDF.** Invoice list/detail/form, order → draft invoice, send, void, PDF, overdue sweep, events. Done when the QA walkthrough issues, sends and overdue-flags an invoice and the PDF opens with matching totals.
 3. **Payments + allocation + cashflow.** Record payment with allocation (auto/manual), partial and full states, reversal, journal side effects, payments screen, cashflow report. Done when partial → paid works end to end and the cashflow sums match the payments.
 4. **Expenses + approvals + remaining reports.** Expense CRUD with receipts, submit/approve/reject/reimburse, categories, income/expense + aging + tax reports, CSV/PDF exports. Done when a receipt-backed expense is approved through the approvals inbox and every report exports row-for-row.
