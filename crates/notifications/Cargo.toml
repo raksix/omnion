@@ -14,3 +14,8 @@ thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# The router resolves a `permission:` recipient rule through the *same* resolution the route
+# guard uses, so a rule can never reach somebody who lost the key and can never miss somebody
+# who holds it through role inheritance. One direction only: permissions must not know about
+# notifications, or a permission check would start emitting.
+omnion-permissions = { path = "../permissions" }

@@ -1378,6 +1378,7 @@ dependencies = [
  "omnion-storage",
  "omnion-workflows",
  "p256",
+ "percent-encoding",
  "rand 0.8.8",
  "reqwest",
  "rsa",
@@ -1541,6 +1542,7 @@ dependencies = [
 name = "omnion-notifications"
 version = "0.1.0"
 dependencies = [
+ "omnion-permissions",
  "serde",
  "serde_json",
  "sqlx",

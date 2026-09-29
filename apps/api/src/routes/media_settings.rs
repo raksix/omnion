@@ -22,8 +22,8 @@ use axum::extract::{Query, State};
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use omnion_media::{
-    ConnectionProbe, NewSiteStorage, describe_public_base, describe_target,
-    read_storage_settings, write_storage_settings,
+    ConnectionProbe, NewSiteStorage, describe_public_base, describe_target, read_storage_settings,
+    write_storage_settings,
 };
 use omnion_storage::{Storage, StorageConfig, StorageDriver};
 use serde::{Deserialize, Serialize};
@@ -272,10 +272,7 @@ pub async fn write(
         .await?;
     }
 
-    Ok(Json(SettingsBody::build(
-        &saved,
-        before.created_at,
-    )))
+    Ok(Json(SettingsBody::build(&saved, before.created_at)))
 }
 
 /// Prove that a configuration reaches a bucket.
@@ -322,9 +319,12 @@ pub async fn test_connection(
                             "the probe object was written but could not be removed — this \
                              credential may not have delete permission",
                         ),
-                        Ok(true) => {
-                            ConnectionProbe::wrote(&candidate.driver, &target, &public_base, elapsed)
-                        }
+                        Ok(true) => ConnectionProbe::wrote(
+                            &candidate.driver,
+                            &target,
+                            &public_base,
+                            elapsed,
+                        ),
                         Err(reason) => ConnectionProbe::read_only(
                             &candidate.driver,
                             &target,

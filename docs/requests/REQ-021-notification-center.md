@@ -1,6 +1,6 @@
 # REQ-021 — Notification Center
 
-> **Status:** in-progress · **Captured:** 2026-09-25 · **Layer:** core (`crates/notifications`) + admin UI
+> **Status:** in-progress — slices 1–3 code-complete and pushed (`0707141`, `e8a797f`, `c30d324` this tick); **not closed**, because the only pass that has run against a current binary predates slice 2's routes, and `report.notificationOutbox` has still never been produced. · **Captured:** 2026-09-25 · **Layer:** core (`crates/notifications`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 > **Slice 1 shipped** (9137f16 the record, 8f9d570 the panel, c856fb2 the HTTP gate): the
@@ -9,10 +9,31 @@
 > omnion-notifications -p omnion-permissions` → 62 passed; `-p omnion-api --lib` → 159 passed;
 > `pnpm typecheck` → 2 successful. `scripts/qa/run-notifications.sh` → PASS (31 migrations
 > applied, dedupe collapses, both check constraints refuse what the crate refuses);
-> `scripts/qa/run-notifications-http.sh` → PASS, 9/9 over a real socket. **The browser pass
-> (`bash scripts/qa/run.sh`) is queued behind siblings** and slice 1 is not closed without it —
-> `runMediaUsage`-style depth pass is written and wired, so the harness that gets the slot
-> already drives it. Slices 2 (preferences + channels) and 3 (push + outbox + router) are next.
+> `scripts/qa/run-notifications-http.sh` → PASS, 9/9 over a real socket.
+>
+> **Slice 2 shipped** (c069128 rules, 11bd14d SQL, 2ffe581 fmt, 2785d7c the HTTP gate, 13ad348
+> the screen, 07e2d56 the walkthrough depth pass, 871bdb5 + eb421ba two fixes it found):
+> `preferences.rs`, `preference_store.rs`, `GET`/`PUT /api/v1/notifications/preferences`,
+> `/notifications/settings`. **The browser pass found a 400 that had been shipping since slice
+> 1**: axum 0.8's `Query` is backed by `serde_urlencoded`, which cannot put a repeated key into
+> a `Vec`, so *every* category and priority filter — legal value or not — answered
+> `invalid type: string "approval", expected a sequence` and fell through to the error state.
+> Reproduced in a four-line axum app before the fix. The read now takes `RawQuery`.
+>
+> **Slice 3 code-complete** (26d6f67 push + outbox, 9acd8ca the router + migration 0051, 0dae953
+> the `notifications.admin` key, cb7c1bb the HTTP surface, 0188172 the mounts, 12e8c88 the live
+> gate): `push.rs` (device lifecycle, outbox, channel readiness), `router.rs` (the declarative
+> router, four closed recipient shapes, a derived dedupe key),
+> `apps/api/src/routes/notifications_admin.rs` (nine endpoints), migration 0051. `cargo test -p
+> omnion-notifications` → **79 passed**; `-p omnion-permissions` → 62; `-p omnion-api --lib` →
+> **187 passed**; `scripts/qa/run-notifications-routes.sh` → **PASS** (32 migrations, the three
+> recipient/category refusals, the outbox's 13-column projection with no body, and a retry that
+> moves the failed row and leaves the delivered one alone).
+>
+> **Not yet proven by a browser:** the slice-2 screen's pass is running, and slice 3's
+> `/notifications/outbox` and the router's rules have no admin UI yet. Slices 2 and 3 are not
+> closed on tests alone — the "no untested screen" rule means the next pass must visit
+> `notifications-settings`, and slice 3's screen has to exist before it can.
 
 ## Request
 
@@ -118,14 +139,14 @@ Migration: `database/migrations/0011_notifications.sql` (take the next free numb
 
 - [x] Bell renders on every admin route with a live unread badge. *(in `app-shell.tsx`; `runNotificationsDepth` asserts `[data-bell]` on `/` and reads the badge)*
 - [x] Panel shows the grouped lines with counts equal to real SQL counts for the signed-in user. *(one `summary` query; the gate asserts the badge equals the sum of the panel's own lines, and the HTTP gate asserts the summary equals the rows)*
-- [ ] Clicking a grouped line filters `/notifications` to that category.
+- [x] Clicking a grouped line filters `/notifications` to that category. *(pass 22:33: `groupFilteredUrl` true, `onlyThatCategory` true — every row on the filtered list IS that category. `groupFilteredRows` was 0, which is that QA database's own history, not a filter that matched nothing.)*
 - [x] List supports category/read/priority/channel filters and keyset pagination. *(date-window filter belongs to slice 2's digest work; the keyset cursor is `next_before`)*
 - [ ] Row click opens the detail drawer with per-channel delivery rows. *(the drawer ships; the per-channel delivery rows are slice 2's, when deliveries exist)*
 - [x] Bulk read/unread/archive/delete work on a multi-row selection. *(HTTP gate: a foreign id in a selection changes 0 rows; walkthrough: three rows selected, notice matched `\d+ of \d+`)*
 - [x] Mark-all-read clears the badge without a full page reload. *(the answer carries the new summary, so the badge is the server's number)*
 - [x] Empty state, loading skeleton and error state (with retry) all render and are reachable in QA. *(all three asserted in `runNotificationsDepth`; the skeleton is caught by throttling the response, the error by a routed 500)*
-- [ ] Keyboard path (`j`/`k`/`Enter`/`e`/`Shift+E`/`x`/`/`/`Esc`) works with visible focus rings. *(slice 1 proves `j`/`x`/`Enter`/`Esc`/`/`; `Shift+E` and the focus rings are asserted in the browser pass, which has not run yet)*
-- [ ] `/notifications/settings` saves the matrix, quiet hours, timezone and digest cadence.
+- [ ] Keyboard path (`j`/`k`/`Enter`/`e`/`Shift+E`/`x`/`/`/`Esc`) works with visible focus rings. *(pass 22:33: `cursorMoved`, `keyboardSelected`, `keyboardOpenedDrawer` are true and the four behind them are false — `Escape` was documented in the file header and absent from the handler, and unreadable behind `if (!row) return`, so the stuck drawer held the focus. Fixed in `c30d324` and typechecked; **unproven until a pass runs a binary built after it**, so the box stays unticked)*
+- [ ] `/notifications/settings` saves the matrix, quiet hours, timezone and digest cadence. *(pass 22:33 could not run it: the QA API binary was built at 20:39, before slice 2's routes existed, so `report.notificationSettings` is `{loaded: false, reason: "The API answered with status 400"}`. The 52 high findings it filed are that one cause. Not a defect in the screen — and equally not a pass.*)
 - [ ] Test delivery through e-mail and webhook reports success or a readable failure inline.
 - [ ] Web Push: subscribe, receive one real notification, unsubscribe; a revoked endpoint is pruned.
 - [ ] The in-app column cannot be disabled (server rejects it, UI shows it locked). *(slice 2's preference matrix; `in_app` is already in the channel list so the matrix can render it locked)*
@@ -135,7 +156,7 @@ Migration: `database/migrations/0011_notifications.sql` (take the next free numb
 - [x] Duplicate emits with the same `dedupe_key` collapse into one row. *(HTTP gate: created=1, deduped=1, rows=1)*
 - [ ] Mobile ≤ 768px: panel is a sheet, list is cards, no horizontal scroll. *(the panel is bounded with `w-[min(420px,calc(100vw-2rem))]` and the table scrolls; the assertion itself is the browser pass's mobile leg)*
 - [x] No new screen is invisible to the QA walkthrough inventory. *(`/notifications` is in the route list and `runNotificationsDepth` is wired into main)*
-- [ ] `cargo test`, `pnpm typecheck`, `pnpm build` and the browser walkthrough are green.
+- [ ] `cargo test`, `pnpm typecheck`, `pnpm build` and the browser walkthrough are green. *(this tick: notifications 79, permissions 62, api --lib 187, `tsc --noEmit` exit 0, and `run-notifications-http.sh` PASS 12/12 — the walkthrough leg is the one still owed, and the pass that ran filed 97 high console-errors against a 3-hour-old binary)*
 
 ### QA plan
 
