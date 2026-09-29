@@ -24,9 +24,21 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchGraph, fetchNodeTypes, saveGraph, validateGraph } from "@/lib/api";
+import {
+  fetchGraph,
+  fetchNodeTypes,
+  previewExpressions,
+  saveGraph,
+  validateGraph,
+} from "@/lib/api";
 import { ApiError } from "@/lib/api";
-import type { GraphDocument, GraphIssue, NodeParam, NodeType } from "@/lib/types";
+import type {
+  ExpressionPreview,
+  GraphDocument,
+  GraphIssue,
+  NodeParam,
+  NodeType,
+} from "@/lib/types";
 
 import {
   MAX_ZOOM,
@@ -114,6 +126,35 @@ function writeRecents(keys: string[]): void {
 
 /** How long after the last edit the autosave fires. The REQ's number. */
 const AUTOSAVE_MS = 2000;
+
+/**
+ * How long the canvas waits after a keystroke before asking for a preview. Longer than the
+ * autosave debounce on purpose: a save is worth doing promptly because it is a write the
+ * person may walk away from, whereas a preview is only worth doing once they stop typing.
+ */
+const PREVIEW_DEBOUNCE_MS = 400;
+
+/**
+ * The sample an expression is evaluated against until somebody changes it.
+ *
+ * It is real, shaped data rather than a stub, and the inspector exposes it as editable — an
+ * expression previewed against `{}` tells the reader nothing, and a preview whose sample they
+ * cannot see is a preview they cannot reason about. The server never supplies this itself:
+ * a preview that could reach live data would read rows the person editing may not be allowed
+ * to see, and would answer differently on every call.
+ */
+const DEFAULT_SAMPLE: Record<string, unknown> = {
+  node: {
+    items: [
+      { title: "First order", total: 42 },
+      { title: "Second order", total: 17 },
+    ],
+    count: 2,
+    author: { name: "Ada Lovelace", email: "ada@example.com" },
+    summary: null,
+  },
+  vars: { site: "example.com", currency: "EUR" },
+};
 
 /** Below this width the canvas is read-only, which the REQ names at 900 px. */
 const MOBILE_BREAKPOINT = 900;
@@ -383,6 +424,74 @@ export function WorkflowCanvas({ workflowId }: { workflowId: string }) {
     },
     [revision, workflowId],
   );
+
+  // --- expression preview ------------------------------------------------------------------
+
+  // The sample an expression is evaluated against. It is **pinned** rather than fetched, and
+  // that is not a placeholder: a preview answered from live data would show a different number
+  // on every keystroke, so the value beside a field would not be the value the step gets. The
+  // server refuses a request with no namespaces rather than inventing some, so this map is the
+  // whole contract — a person can edit it, and an expression naming a namespace that is not
+  // here is refused with a sentence that lists the ones that are.
+  const [sample, setSample] = useState<Record<string, unknown>>(DEFAULT_SAMPLE);
+  const [preview, setPreview] = useState<{
+    nodeKey: string | null;
+    fields: Record<string, ExpressionPreview>;
+    error: string | null;
+    loading: boolean;
+  }>({ nodeKey: null, fields: {}, error: null, loading: false });
+
+  const previewing = useRef(false);
+
+  const [sampleText, setSampleText] = useState(() => JSON.stringify(DEFAULT_SAMPLE, null, 2));
+  const [sampleError, setSampleError] = useState<string | null>(null);
+
+  const onSample = useCallback((text: string) => {
+    setSampleText(text);
+    try {
+      const parsed: unknown = JSON.parse(text);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        setSampleError("The sample must be a JSON object keyed by namespace.");
+        return;
+      }
+      setSampleError(null);
+      setSample(parsed as Record<string, unknown>);
+    } catch (error) {
+      // The previous sample stays in force. Refusing to evaluate against nothing is the safe
+      // direction, and the message says which of the two things is wrong.
+      setSampleError(
+        error instanceof Error ? `Not valid JSON: ${error.message}` : "Not valid JSON.",
+      );
+    }
+  }, []);
+
+  const runPreview = useCallback(
+    async (nodeKey: string, params: Record<string, unknown>) => {
+      // One in flight at a time, for the same reason validation has one: two answers arriving
+      // out of order would put the *older* evaluation next to the text that caused the newer
+      // one, which is a preview that lies rather than one that lags.
+      if (previewing.current) return;
+      previewing.current = true;
+      setPreview((current) => ({ ...current, nodeKey, loading: true, error: null }));
+      try {
+        const answer = await previewExpressions(workflowId, params, sample);
+        const fields: Record<string, ExpressionPreview> = {};
+        for (const entry of answer.previews) fields[entry.field] = entry;
+        setPreview({ nodeKey, fields, error: null, loading: false });
+      } catch (error) {
+        // The refusal is a sentence about a named field, and the inspector's whole job is to
+        // show it on that row. Dropping it into a banner at the top of the canvas is how a
+        // person ends up looking in the wrong place.
+        const message =
+          error instanceof ApiError ? error.message : "the preview could not be reached";
+        setPreview({ nodeKey, fields: {}, error: message, loading: false });
+      } finally {
+        previewing.current = false;
+      }
+    },
+    [sample, workflowId],
+  );
+
 
   // --- operations -------------------------------------------------------------------------
 
@@ -829,6 +938,26 @@ export function WorkflowCanvas({ workflowId }: { workflowId: string }) {
 
   const inspecting = state.document.nodes.find((node) => node.key === state.inspecting) ?? null;
   const inspectingType = inspecting ? definition(inspecting.type) : undefined;
+
+  // Re-run for the node being inspected whenever one of its parameters carries an expression.
+  // The effect lives HERE rather than beside `runPreview` because `inspecting` is derived below
+  // from `state`: an effect placed above it reads a binding that does not exist yet, which is
+  // a temporal dead zone the type checker reports and the browser turns into a ReferenceError.
+  useEffect(() => {
+    if (!inspecting) return;
+    const params = inspecting.params;
+    const carriesExpression = Object.values(params).some(
+      (value) => typeof value === "string" && value.includes("{{"),
+    );
+    if (!carriesExpression) {
+      setPreview({ nodeKey: null, fields: {}, error: null, loading: false });
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void runPreview(inspecting.key, params);
+    }, PREVIEW_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [inspecting, runPreview]);
   const readOnly = narrow;
 
   // --- render -----------------------------------------------------------------------------
@@ -1512,6 +1641,10 @@ export function WorkflowCanvas({ workflowId }: { workflowId: string }) {
                 type={inspectingType}
                 issues={issuesByNode.get(inspecting.key) ?? []}
                 readOnly={readOnly}
+                preview={preview.nodeKey === inspecting.key ? preview : null}
+                sampleText={sampleText}
+                sampleError={sampleError}
+                onSample={onSample}
                 onParam={(name, value) => {
                   const next = {
                     ...state.document,
@@ -1732,6 +1865,10 @@ function NodeInspector({
   type,
   issues,
   readOnly,
+  preview,
+  sampleText,
+  sampleError,
+  onSample,
   onParam,
   onToggleDisabled,
   onRename,
@@ -1743,6 +1880,15 @@ function NodeInspector({
   type: NodeType | undefined;
   issues: GraphIssue[];
   readOnly: boolean;
+  /** The node's evaluated fields, or null when the node carries no expression. */
+  preview: {
+    fields: Record<string, ExpressionPreview>;
+    error: string | null;
+    loading: boolean;
+  } | null;
+  sampleText: string;
+  sampleError: string | null;
+  onSample: (text: string) => void;
   onParam: (name: string, value: unknown) => void;
   onToggleDisabled: () => void;
   onRename: (label: string) => void;
@@ -1809,13 +1955,92 @@ function NodeInspector({
               field={field}
               value={params[field.name]}
               readOnly={readOnly}
+              preview={preview?.fields[field.name] ?? null}
+              previewLoading={preview?.loading ?? false}
               onChange={(value) => onParam(field.name, value)}
             />
           ))}
         </div>
       )}
+
+      {preview?.error ? (
+        <p className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 p-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+          {preview.error}
+        </p>
+      ) : null}
+
+      <h3 className="mt-4 text-[12px] font-medium">Preview sample</h3>
+      <p className="mt-0.5 text-[10px] text-muted">
+        Expressions are evaluated against this, on the server. The server never fetches it for
+        you, so what you see here is exactly what a preview can read.
+      </p>
+      <textarea
+        aria-label="Preview sample"
+        readOnly={readOnly}
+        value={sampleText}
+        onChange={(event) => onSample(event.target.value)}
+        spellCheck={false}
+        className="mt-1 h-40 w-full rounded border border-line bg-background px-2 py-1 font-mono text-[10px]"
+      />
+      {sampleError ? (
+        <p className="mt-0.5 text-[10px] text-red-500">{sampleError}</p>
+      ) : (
+        <p className="mt-0.5 text-[10px] text-muted">
+          {namespaceCount(sampleText)} namespace
+          {namespaceCount(sampleText) === 1 ? "" : "s"}:{" "}
+          {namespaceList(sampleText).join(", ") || "none"}
+        </p>
+      )}
     </div>
   );
+}
+
+/**
+ * What a previewed value IS, shown beside it when it is not a string.
+ *
+ * The point is the difference between `2` and `"2"`: a field that will send a number and a
+ * field that will send its text look identical in a preview that renders everything as text,
+ * and the whole reason the server keeps a lone expression's type is so the person editing
+ * can be told which one they have.
+ */
+function typeName(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "list";
+  switch (typeof value) {
+    case "number":
+      return "number";
+    case "boolean":
+      return "true/false";
+    case "object":
+      return "object";
+    default:
+      return "text";
+  }
+}
+
+/**
+ * The namespaces a sample edit declares, read from the TEXT rather than from the parsed
+ * object. The parsed object only exists when the text is valid, and this line is exactly the
+ * one that is rendered when it is not — so reading it from the object would be reading the
+ * last good value and describing it as the current one.
+ */
+function namespaceList(text: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    return Object.keys(parsed as Record<string, unknown>);
+  } catch {
+    return [];
+  }
+}
+
+function namespaceCount(text: string): number {
+  return namespaceList(text).length;
+}
+
+/** Whether a parameter value carries an expression at all. */
+function carriesExpression(value: unknown): boolean {
+  return typeof value === "string" && value.includes("{{");
 }
 
 /** One parameter row, rendered from the registry's declared `ui`. */
@@ -1823,14 +2048,20 @@ function ParamField({
   field,
   value,
   readOnly,
+  preview,
   onChange,
 }: {
   field: NodeParam;
   value: unknown;
   readOnly: boolean;
+  preview: ExpressionPreview | null;
+  previewLoading: boolean;
   onChange: (value: unknown) => void;
 }) {
   const id = `param-${field.name}`;
+  // Loading is shown only for a field that is actually carrying an expression, so a node with
+  // no expressions at all does not show a spinner next to every one of its parameters.
+  const previewLoading = !preview && carriesExpression(value);
   const current = value === undefined || value === null ? "" : String(value);
   const missing = field.required && current.trim() === "";
 
@@ -1900,6 +2131,21 @@ function ParamField({
       {field.secret_field ? (
         <p className="mt-0.5 text-[10px] text-muted">
           This field names a credential, never its secret.
+        </p>
+      ) : null}
+
+      {previewLoading ? (
+        <p className="mt-1 text-[10px] text-muted">evaluating…</p>
+      ) : preview ? (
+        <p
+          data-preview-for={field.name}
+          className="mt-1 rounded border border-line bg-muted/40 px-1.5 py-1 font-mono text-[10px] break-all"
+        >
+          <span className="text-muted">→ </span>
+          {preview.rendered}
+          {preview.typed && typeof preview.value !== "string" ? (
+            <span className="ml-1 text-muted">({typeName(preview.value)})</span>
+          ) : null}
         </p>
       ) : null}
     </div>

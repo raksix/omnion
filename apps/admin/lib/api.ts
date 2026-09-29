@@ -40,6 +40,7 @@ import type {
   GraphRead,
   GraphSaved,
   GraphValidated,
+  ExpressionPreviewed,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -4939,6 +4940,31 @@ export function validateGraph(
   return request<GraphValidated>(
     `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/validate`,
     { method: "POST", body: JSON.stringify({ graph, revision }) },
+  );
+}
+
+/**
+ * Evaluate one node's parameters against pinned sample data, storing nothing.
+ *
+ * A **server** call, and the REQ is explicit that it has to be: a client that reimplemented
+ * the expression rules would agree with the server on the day it was written and drift the
+ * first time a rule changed — which is the day somebody is relying on the preview to decide
+ * whether a step will do what they meant. The sample travels in the body rather than being
+ * fetched for the same reason: a preview that could reach live data would answer differently
+ * on every keystroke, and could read a row the person editing has no permission to see.
+ *
+ * A field whose expression cannot be resolved is a `422` whose message names the field, and
+ * this function does not swallow it — the inspector needs that sentence on the row, not a
+ * rejected promise with nothing on it.
+ */
+export function previewExpressions(
+  workflowId: string,
+  params: Record<string, unknown>,
+  namespaces: Record<string, unknown>,
+): Promise<ExpressionPreviewed> {
+  return request<ExpressionPreviewed>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/expressions/preview`,
+    { method: "POST", body: JSON.stringify({ params, namespaces }) },
   );
 }
 

@@ -2049,3 +2049,23 @@ export type GraphValidated = {
   issue_count: number;
   step_count?: number;
 };
+/**
+ * One field's evaluated value. `typed` distinguishes a lone expression — whose `value` keeps
+ * its own JSON shape, so a count stays a number — from a field that mixes text, whose `value`
+ * is the string it will actually be.
+ */
+export type ExpressionPreview = {
+  field: string;
+  value: unknown;
+  expression: string;
+  rendered: string;
+  typed: boolean;
+};
+/** `POST /workflows/{id}/graph/expressions/preview` — the server's answer for one node. */
+export type ExpressionPreviewed = {
+  workflow_id: string;
+  previews: ExpressionPreview[];
+  preview_count: number;
+  /** The namespaces that were available, for autocomplete. */
+  namespaces: string[];
+};
