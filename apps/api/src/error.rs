@@ -277,6 +277,15 @@ impl From<IdentityError> for ApiError {
             IdentityError::InvalidOrganization(message)
             | IdentityError::InvalidSite(message)
             | IdentityError::InvalidHost(message) => Self::bad_request("invalid_request", message),
+            // A provisioning refusal is the *caller's* mistake: a token name that is too long, a
+            // lifetime outside the range, an attempt to rotate something already dead. Until this
+            // arm existed it fell through to the catch-all and answered `500 internal_error` —
+            // a status code that tells the operator the platform is broken when in fact they
+            // typed a zero, and (as the JIT-password defect in the same REQ showed) a
+            // distinguishable status on a credential path is a small tell worth closing.
+            IdentityError::InvalidProvisioning(message) => {
+                Self::bad_request("invalid_provisioning", message)
+            }
             // Security policy, second factors and stored secrets (REQ-006, slice 3). A policy
             // refused by a range check names the control the reader has to fix, so the panel can
             // point at the field instead of printing a sentence.
