@@ -6020,6 +6020,19 @@ async function runEventsDepth(page, report) {
  *  6. **Archiving keeps the content** and releases the host, so the row stays in the archived
  *     filter rather than disappearing and taking the pages with it.
  *
+ * Since slice 3 there are four more claims, and they are the ones a promotion screen can fake
+ * most easily because the interesting part happens *after* the click:
+ *
+ *  7. **The selection names its own scope.** The button reads `Promote selection (1)` after one
+ *     checkbox, not `Promote all N`. A bulk action that quietly widened the operator's selection
+ *     is the most dangerous button on the screen, and the label is the only place it is visible.
+ *  8. **The dialog leads with a count, not a warning.** The frozen summary is read from the live
+ *     change set the operator is looking at, so what they confirm is what they saw.
+ *  9. **Requesting writes a row.** The pass reads `promotions` in the database, because a
+ *     timeline that renders from local state and writes nothing is a dialog that lies.
+ * 10. **The Promotions tab shows the record, not the screen state.** It is re-read after a full
+ *     navigation, so a tab built from the same in-memory state would pass a check it should fail.
+ *
  * Everything it creates is removed in the `finally`, because the QA database is shared with the
  * next writer's pass and a leftover staging environment is a row their clone count will read.
  */
@@ -6205,6 +6218,137 @@ async function runEnvironmentsDepth(page, report) {
       record({ page: "environments", action: "cancel-offered-on-finished-job" });
     }
 
+    // ---- The promotion path (REQ-017, slice 3) ---------------------------------------------
+    // This runs *before* the archive step, because archiving releases the host and an archived
+    // environment is not something you promote. The order here is the order a person would do
+    // it: look at the change set, freeze it, decide, and only then throw the copy away.
+    //
+    // The change set is populated first, through SQL rather than through the content screen —
+    // the point of this pass is the promotion UI, and seeding a page through the editor would
+    // make a failure ambiguous between "the editor broke" and "the promotion broke".
+    const productionEnv = qaSql(
+      `select id from environments where organization_id = (select organization_id from environments where id = '${environmentId}') and type = 'production' limit 1`,
+    );
+    if (productionEnv) {
+      const seedSlug = `qa-promote-${stamp}`;
+      // A page's title lives on its revision, not on `pages` — a seed that writes a `title`
+      // column does not exist fails at the first insert and the whole pass reports "the promotion
+      // screen is broken" for a reason that is entirely in the fixture. The revision is created
+      // as a draft, which is the state the change set reads its title from.
+      const seeded = qaSql(
+        `insert into pages (id, site_id, environment_id, slug, status, created_by, created_at, updated_at) ` +
+          `select gen_random_uuid(), p.site_id, '${environmentId}', '${seedSlug}', 'draft', p.created_by, now(), now() ` +
+          `from pages p ` +
+          `where p.environment_id = '${productionEnv}' and p.site_id is not null limit 1 ` +
+          `returning id`,
+      );
+      if (seeded) {
+        qaSql(
+          `insert into page_revisions (page_id, revision_no, state, title, body, created_by) ` +
+            `values ('${seeded}', 1, 'draft', 'QA promote row', 'Seeded by the environment pass.', null)`,
+        );
+      }
+    }
+
+    await page.goto(
+      `${URL_ADMIN}/environments/${environmentId}?tab=changes`,
+      { waitUntil: "domcontentloaded" },
+    ).catch(() => {});
+    await page.waitForTimeout(1500);
+    const changeRows = await page.locator("[data-change-row]").count();
+    const counts = await page.locator("[data-changes-counts]").innerText().catch(() => "");
+    steps.changes = { rows: changeRows, counts, namedTheRow: /QA promote row/.test(await page.locator("[data-changes-tab]").innerText().catch(() => "")) };
+    await shot(page, "environments-changes-tab");
+
+    // The selection is the bulk action, so it has to actually select. Selecting one row and
+    // reading the button's own count is the check: a button that says "Promote all 3" while three
+    // rows are checked is a scope the operator never chose.
+    await page.locator("[data-change-select]").first().check().catch(() => {});
+    await page.waitForTimeout(300);
+    const promoteLabel = await page
+      .locator("[data-changes-promote]")
+      .innerText()
+      .catch(() => "");
+    steps.selection = { label: promoteLabel, reflectsSelection: /Promote selection \(1\)/.test(promoteLabel) };
+    if (!steps.selection.reflectsSelection) {
+      record({ page: "environments", action: "promote-button-does-not-name-the-selection" });
+    }
+
+    await page.click("[data-changes-promote]").catch(() => {});
+    await page.waitForTimeout(800);
+    const promotionDialog = (await page.locator("[data-promotion-dialog]").count()) > 0;
+    const summary = await page
+      .locator("[data-promotion-counts]")
+      .innerText()
+      .catch(() => "");
+    const permissionNote = await page
+      .locator("[data-promotion-permission-note]")
+      .innerText()
+      .catch(() => "");
+    steps.promotionDialog = {
+      shown: promotionDialog,
+      summary,
+      namesAnItemCount: /\d+ item/.test(summary),
+      permissionNote,
+    };
+    await shot(page, "environments-promotion-dialog");
+
+    if (promotionDialog) {
+      await page.click("[data-promotion-request]").catch(() => {});
+      await page.waitForTimeout(2000);
+      const timeline = (await page.locator("[data-promotion-timeline]").count()) > 0;
+      const approveRendered = (await page.locator("[data-promotion-approve]").count()) > 0;
+      const approveDisabled = await page
+        .locator("[data-promotion-approve]")
+        .isDisabled()
+        .catch(() => false);
+      steps.promotionFrozen = { timeline, approveRendered, approveDisabled };
+      await shot(page, "environments-promotion-timeline");
+
+      // The record must exist in the database, not just on screen. A timeline that renders from
+      // local state and writes nothing is a dialog that lies, and the integration walks cover
+      // the API half while this covers "the button that calls it".
+      const promotions = Number(
+        qaSql(
+          `select count(*) from promotions where environment_id = '${environmentId}'`,
+        ),
+      );
+      steps.promotionRowWritten = promotions;
+      if (promotions === 0) {
+        record({ page: "environments", action: "promotion-dialog-wrote-no-record" });
+      }
+
+      if (approveRendered && !approveDisabled) {
+        await page.click("[data-promotion-approve]").catch(() => {});
+        await page.waitForTimeout(3000);
+        const done = qaSql(
+          `select status from promotions where environment_id = '${environmentId}' order by created_at desc limit 1`,
+        );
+        steps.promotionApplied = done;
+        await shot(page, "environments-promotion-applied");
+      }
+      await page.click("[data-promotion-cancel-dialog]").catch(() => {});
+      await page.waitForTimeout(500);
+    }
+
+    // ---- The Promotions tab, read back from the record ---------------------------------------
+    await page.goto(
+      `${URL_ADMIN}/environments/${environmentId}?tab=promotions`,
+      { waitUntil: "domcontentloaded" },
+    ).catch(() => {});
+    await page.waitForTimeout(1500);
+    const promotionRows = await page.locator("[data-promotion-row]").count();
+    steps.promotionsTab = { rows: promotionRows, rendered: (await page.locator("[data-promotions-tab]").count()) > 0 };
+    await shot(page, "environments-promotions-tab");
+
+    if (promotionRows > 0) {
+      await page.locator("[data-promotion-expand]").first().click().catch(() => {});
+      await page.waitForTimeout(1200);
+      const frozenItems = await page.locator("[data-promotion-expanded-items] li").count();
+      steps.promotionExpanded = { frozenItems };
+      await shot(page, "environments-promotions-expanded");
+    }
+
     // ---- Archive keeps the content ----------------------------------------------------------
     await page.click("[data-env-detail-archive]").catch(() => {});
     await page.waitForTimeout(500);
@@ -6232,12 +6376,30 @@ async function runEnvironmentsDepth(page, report) {
       steps.clone?.cloneCopied === true &&
       steps.detail?.rendered === true &&
       steps.recloneDialog?.dialogShown === true &&
+      steps.promotionDialog?.shown === true &&
+      steps.promotionDialog?.namesAnItemCount === true &&
+      steps.promotionRowWritten > 0 &&
+      steps.promotionsTab?.rendered === true &&
       steps.archive?.keptContent === true;
     return { ok, steps };
   } finally {
     // Cleanup is not optional. The QA database is shared with every other writer's pass, and a
     // leftover staging environment with copied pages is a row their own clone counts will read.
+    // The promotion rows go first because they reference the environment, and the seeded
+    // revision before its page because `page_revisions.page_id` cascades — but the explicit
+    // delete is what makes the intent readable, and `delete from pages` is what the other
+    // writers' passes already rely on.
     if (environmentId) {
+      // `promotions` only exists once migration 0161 has been applied to this database. A pass
+      // that starts against a reset database would otherwise abort in the *cleanup*, which
+      // throws away the steps it already collected and reports a red pass for a missing table
+      // rather than for anything the screen did.
+      try {
+        qaSql(`delete from promotions where environment_id = '${environmentId}'`);
+      } catch {
+        // No promotion table here: this run had nothing to clean up.
+      }
+      qaSql(`delete from page_revisions where page_id in (select id from pages where environment_id = '${environmentId}')`);
       qaSql(`delete from pages where environment_id = '${environmentId}'`);
       qaSql(`delete from environments where id = '${environmentId}'`);
     }
