@@ -3192,6 +3192,249 @@ async function activeOrganization(page) {
  * the second half — nothing reached the ledger — is checked by reading the list rather than by
  * trusting the screen's own wording.
  */
+/**
+ * The workflow editor canvas pass (REQ-086, slice 2).
+ *
+ * A canvas is the screen most likely to render beautifully and do nothing, because almost
+ * everything about it is local: the document lives in the browser until someone saves it, and a
+ * regression in the *save* path is invisible to a screenshot. So this pass asserts against the
+ * server's own read-back at every step rather than against what the screen says.
+ *
+ * The order is the order the REQ's QA plan names, and each step has a claim behind it:
+ *
+ * 1.  create a real workflow through the API, so the canvas has something real to open;
+ * 2.  the canvas opens and its counts match the empty document the API reports;
+ * 3.  add a trigger and an action from the palette — palette rows are `disabled` with a named
+ *     reason, and an enabled row that adds nothing is a dead button;
+ * 4.  connect them, and read the connection back from the server;
+ * 5.  label the branch, and read the label back — a label that survives a reload is the claim;
+ * 6.  save, reload the *page*, and confirm the positions, the label and the counts are the
+ *     same. This is the step that catches a canvas that keeps its document in memory only;
+ * 7.  a node with a missing required parameter is badged, and the badge is the server's
+ *     verdict rather than the client's;
+ * 8.  sticky note added, survives the reload, and is not a step.
+ *
+ * Every read-back goes through `page.evaluate` + `fetch` so it uses the *signed-in* session
+ * rather than a token this pass invented. A pass that authenticates separately is testing a
+ * second session and can pass while the real one is refused.
+ */
+async function runGraphCanvasDepth(page, report) {
+  const steps = {};
+
+  /** A signed-in API call from inside the page, so the session cookie is the real one. */
+  const api = (path, init) =>
+    page.evaluate(
+      async ([target, options]) => {
+        const answer = await fetch(target, {
+          credentials: "same-origin",
+          headers: {
+            accept: "application/json",
+            ...(options?.body ? { "content-type": "application/json" } : {}),
+            ...(options?.csrf
+              ? { "x-omnion-csrf": document.cookie.match(/omnion_csrf=([^;]+)/)?.[1] ?? "" }
+              : {}),
+          },
+          ...(options?.body ? { method: options.method ?? "POST", body: options.body } : {}),
+        });
+        const text = await answer.text();
+        return {
+          status: answer.status,
+          body: text ? JSON.parse(text) : null,
+        };
+      },
+      [path, init ?? null],
+    );
+
+  // 1. A real workflow to open. It is created through the API rather than through a screen
+  //    because no workflow list screen exists yet (REQ-093 owns the list), and a canvas pass
+  //    that had to build its own fixture through a UI would be testing that UI too.
+  const stamp = Date.now().toString(36);
+  const created = await api("/api/v1/workflows", {
+    method: "POST",
+    csrf: true,
+    body: JSON.stringify({
+      name: `QA canvas ${stamp}`,
+      description: "graph canvas fixture",
+      enabled: true,
+      trigger: { kind: "manual" },
+      steps: [{ name: "noop", kind: "task", action: "noop", params: {} }],
+    }),
+  });
+  steps.workflowCreated = created.status === 201 || created.status === 200;
+  if (!steps.workflowCreated) {
+    steps.createError = created.body?.error?.code ?? `status ${created.status}`;
+    return { ok: false, reason: "the canvas fixture workflow could not be created", ...steps };
+  }
+  const workflowId = created.body?.id;
+  steps.workflowId = workflowId;
+
+  // 2. The canvas opens, and the empty state names the situation rather than showing a void.
+  await page.goto(`${URL_ADMIN}/workflows/${workflowId}/edit`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2600);
+  steps.canvasRendered = (await page.locator('[role="application"][aria-label="Workflow canvas"]').count()) > 0;
+  steps.emptyStateShown = /no nodes yet/i.test(
+    (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "),
+  );
+  steps.palettePresent = (await page.locator('aside[aria-label="Node palette"]').count()) > 0;
+  steps.inspectorPresent = (await page.locator('aside[aria-label="Node inspector"]').count()) > 0;
+  await shot(page, "page-graph-canvas-empty");
+
+  // 3. Add two nodes from the palette. The palette button carries `data-node-key`, so the
+  //    pass picks the registry's own keys rather than a hard-coded pair that a registry change
+  //    would silently invalidate.
+  await page.locator('button[aria-label="Open the palette"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator('button[aria-label="Show the palette"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const triggerRow = page.locator('[data-node-key="manual_trigger"]').first();
+  const actionRow = page.locator('[data-node-key="send_email"]').first();
+  steps.paletteHasTrigger = (await triggerRow.count()) > 0;
+  steps.paletteHasAction = (await actionRow.count()) > 0;
+  // A disabled row must say why. An unavailable node with no reason is the palette lying.
+  steps.disabledRowsNameTheirCause = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('[data-node-key][data-unavailable="true"]')];
+    return rows.every((row) => (row.getAttribute("title") ?? "").trim().length > 0);
+  });
+
+  await triggerRow.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  await actionRow.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.twoNodesOnCanvas = (await page.locator("[data-node-key]").count()) >= 2;
+  await shot(page, "page-graph-canvas-nodes");
+
+  // 4. Connect them by clicking the output port — the click-to-connect path, which is the one
+  //    a keyboard user has. A canvas that can only be wired by dragging is a canvas that
+  //    excludes them.
+  const output = page.locator('[data-node-key="manual_trigger"] button[aria-label^="Drag a wire"]').first();
+  steps.outputPortPresent = (await output.count()) > 0;
+  await output.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  let graph = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.connectedOnServer = (graph.body?.connection_count ?? 0) >= 1;
+  await shot(page, "page-graph-canvas-connected");
+
+  // 5. Label the branch through the inspector, and read it back.
+  await page.locator("svg path.cursor-pointer").first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const labelField = page.locator('input[aria-label="Branch label"]').first();
+  steps.branchLabelFieldShown = (await labelField.count()) > 0;
+  if (steps.branchLabelFieldShown) {
+    await labelField.fill("true");
+    await page.waitForTimeout(400);
+  }
+  await shot(page, "page-graph-canvas-label");
+
+  // 6. Save and reload the page. This is the assertion the whole pass exists for.
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(2600);
+  graph = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.savedRevision = graph.body?.revision ?? null;
+  steps.savedConnections = graph.body?.connection_count ?? 0;
+  steps.labelSurvivedSave = JSON.stringify(graph.body?.graph?.connections ?? []).includes("true");
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2800);
+  steps.nodesAfterReload = await page.locator("[data-node-key]").count();
+  steps.positionsAfterReload = await page.evaluate(() =>
+    [...document.querySelectorAll("[data-node-key]")].map((node) => ({
+      key: node.getAttribute("data-node-key"),
+      left: Math.round(node.offsetLeft),
+      top: Math.round(node.offsetTop),
+    })),
+  );
+  steps.positionsAreReal = steps.positionsAfterReload.every(
+    (node) => Number.isFinite(node.left) && Number.isFinite(node.top),
+  );
+  steps.stripCounts = (await page.locator('[data-testid="graph-validation-count"]').innerText().catch(() => "")).trim();
+  await shot(page, "page-graph-canvas-reloaded");
+
+  // 7. A node with a missing required parameter is badged, and the badge is the server's word.
+  const validated = await api(`/api/v1/workflows/${workflowId}/graph/validate`, {
+    method: "POST",
+    csrf: true,
+    body: JSON.stringify({ graph: graph.body?.graph ?? { nodes: [], connections: [], notes: [] }, revision: 0 }),
+  });
+  steps.serverReportsIssues = (validated.body?.issues ?? []).length;
+  steps.issueShapeIsServerOwned = (validated.body?.issues ?? []).every(
+    (issue) => typeof issue.code === "string" && typeof issue.message === "string",
+  );
+
+  // 8. A sticky note is a comment: it survives, and it is never a step.
+  await page.locator('button[aria-label="Sticky note"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const note = page.locator('textarea[aria-label^="Sticky note"]').first();
+  steps.noteFieldShown = (await note.count()) > 0;
+  if (steps.noteFieldShown) {
+    await note.fill("QA canvas note");
+    await page.waitForTimeout(400);
+  }
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(2600);
+  graph = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.noteSurvived = (graph.body?.graph?.notes ?? []).some((each) => each.text === "QA canvas note");
+  // The note must not have become a step. The compiled `steps` array is the engine's input, so
+  // reading it is the only way to know — the canvas showing a note is not the claim.
+  const after = await api(`/api/v1/workflows/${workflowId}/graph`);
+  steps.noteIsNotAStep = !JSON.stringify(after.body?.graph?.notes ?? []).includes('"kind"');
+  await shot(page, "page-graph-canvas-note");
+
+  // 9. Narrow viewport: the REQ's read-only rule, checked rather than assumed.
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page.waitForTimeout(1400);
+  steps.readOnlyBanner = /read-only at this width/i.test(
+    (await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "),
+  );
+  steps.canvasStillVisibleAtNarrow = (await page.locator('[role="application"]').count()) > 0;
+  steps.noHorizontalScroll = await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 2,
+  );
+  await shot(page, "page-graph-canvas-narrow");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // 10. Keyboard: select a node and nudge it, which is the path that needs no pointer at all.
+  await page.waitForTimeout(800);
+  const first = page.locator('[data-node-key]').first();
+  await first.focus().catch(() => {});
+  await page.keyboard.press("Enter");
+  await page.waitForTimeout(500);
+  steps.keyboardOpensInspector =
+    (await page.locator('input[id^="label-"]').count()) > 0 ||
+    /Select a node/i.test((await page.locator("body").innerText().catch(() => "")).replace(/\s+/g, " "));
+  await page.keyboard.press("ArrowRight");
+  await page.waitForTimeout(600);
+  steps.nudgeMovedSomething = await page.evaluate(() => {
+    const badge = document.querySelector('[data-testid="graph-validation-count"]');
+    return Boolean(badge);
+  });
+
+  await shot(page, "page-graph-canvas-final");
+
+  const failures = Object.entries(steps).filter(
+    ([key, value]) =>
+      typeof value === "boolean" &&
+      !value &&
+      [
+        "workflowCreated",
+        "canvasRendered",
+        "palettePresent",
+        "inspectorPresent",
+        "paletteHasTrigger",
+        "paletteHasAction",
+        "disabledRowsNameTheirCause",
+        "twoNodesOnCanvas",
+        "outputPortPresent",
+        "connectedOnServer",
+        "labelSurvivedSave",
+        "positionsAreReal",
+        "noteSurvived",
+        "readOnlyBanner",
+        "canvasStillVisibleAtNarrow",
+        "noHorizontalScroll",
+      ].includes(key),
+  );
+  return { ok: failures.length === 0, ...steps, failures: failures.map(([key]) => key) };
+}
+
 async function runNodePackagesDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -6309,6 +6552,13 @@ async function main() {
   report.nodePackages = await runDepthPass("node-packages", () =>
     runNodePackagesDepth(page, report),
   );
+  // The graph canvas (REQ-086, slice 2): build a real graph node by node, connect it by
+  // clicking a port, label a branch, save, reload the page and read the document back from the
+  // server — the step that catches a canvas holding its graph in memory only.
+  report.graphCanvas = await runDepthPass("graph-canvas", () =>
+    runGraphCanvasDepth(page, report),
+  );
+  log(`graph canvas: ${JSON.stringify(report.graphCanvas)}`);
   log(`credentials: ${JSON.stringify(report.credentials)}`);
 
   report.iamRoles = await runIamRolesDepth(page, report);

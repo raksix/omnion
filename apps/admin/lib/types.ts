@@ -1837,3 +1837,82 @@ export const REFERRER_POLICIES = [
  * the browser silently drops", and an operator setting 3600 deserves to be told before saving.
  */
 export const MIN_HSTS_MAX_AGE = 15_768_000;
+
+/* ------------------------------------------------------------------ *
+ * The visual graph (REQ-086)
+ *
+ * These mirror `crates/workflows/src/graph.rs` field for field, and the server's structs are
+ * `deny_unknown_fields`. That is not pedantry: a canvas that sends a `notes` field a node does
+ * not have gets a `400` on every save, and the failure reads as "the graph is broken" rather
+ * than as "the client and the server disagree about the shape". A field that is not in the
+ * Rust struct does not belong here either.
+ * ------------------------------------------------------------------ */
+
+/** Where a node sits on the canvas. Canvas units; the editor scales them by the zoom. */
+export type GraphPosition = { x: number; y: number };
+/** One node on the canvas. `key` is the stable editor string every connection names. */
+export type GraphNode = {
+  key: string;
+  type: string;
+  label: string;
+  position: GraphPosition;
+  params: Record<string, unknown>;
+  /** A switched-off node compiles to nothing at all — the engine has no "skip" state. */
+  disabled: boolean;
+};
+/** One wire. `label` is the branch name the run overlay shows. */
+export type GraphConnection = {
+  from: string;
+  from_port: string;
+  to: string;
+  to_port: string;
+  label?: string;
+};
+/** A sticky note: a comment on the canvas that never compiles and never executes. */
+export type GraphNote = {
+  id: string;
+  position: GraphPosition;
+  color: string;
+  width: number;
+  height: number;
+  text: string;
+};
+/** The document the canvas authors and the server stores. */
+export type GraphDocument = {
+  nodes: GraphNode[];
+  connections: GraphConnection[];
+  notes: GraphNote[];
+};
+/**
+ * One problem with a graph.
+ *
+ * `node_key` and `connection_index` are both optional on the wire, and the difference is
+ * meaningful: a node problem can be badged and jumped to, a connection problem can only be
+ * listed, because an edge has no element to select.
+ */
+export type GraphIssue = {
+  code: string;
+  node_key?: string;
+  connection_index?: number;
+  message: string;
+};
+/** `GET /workflows/{id}/graph` — the document plus the revision it was read at. */
+export type GraphRead = {
+  workflow_id: string;
+  graph: GraphDocument;
+  revision: number;
+  node_count: number;
+  connection_count: number;
+  note_count: number;
+  updated_at: string | null;
+  updated_by: string | null;
+};
+/** `PUT /workflows/{id}/graph` — what a successful save reports back. */
+export type GraphSaved = { revision: number; step_count: number; node_order: string[] };
+/** `POST /workflows/{id}/graph/validate` — every problem, in a stable order. */
+export type GraphValidated = {
+  valid: boolean;
+  issues: GraphIssue[];
+  issue_count: number;
+  step_count?: number;
+};

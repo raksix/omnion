@@ -25,6 +25,10 @@ import type {
   WebhookTestReport,
   CreatedMediaShare,
   EventCatalogue,
+  GraphDocument,
+  GraphRead,
+  GraphSaved,
+  GraphValidated,
   EventFilters,
   EventPage,
   RetentionStatus,
@@ -4873,4 +4877,56 @@ export function saveHeaderPolicy(save: HeaderPolicySave): Promise<HeaderPolicySa
     method: "PUT",
     body: JSON.stringify(save),
   });
+}
+
+/* ------------------------------------------------------------------ *
+ * The visual graph (REQ-086)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read a workflow's graph, with the revision it was read at.
+ *
+ * The revision is not metadata: the canvas holds it for the life of the session and sends it
+ * back on every save, and a save carrying a revision the server does not have is a `409` rather
+ * than an overwrite. A read that dropped the number would make the editor's conflict path
+ * unreachable.
+ */
+export function fetchGraph(workflowId: string): Promise<GraphRead> {
+  return request<GraphRead>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Save the whole graph. The compiled steps are written with it, in one request.
+ *
+ * `revision` is the one the editor loaded. On a `409` the thrown `ApiError` carries
+ * `details.current_revision`, which is what the compare-and-reload prompt shows; this function
+ * does not retry, because a silent retry is an overwrite wearing a retry's name.
+ */
+export function saveGraph(
+  workflowId: string,
+  graph: GraphDocument,
+  revision: number,
+): Promise<GraphSaved> {
+  return request<GraphSaved>(`/api/v1/workflows/${encodeURIComponent(workflowId)}/graph`, {
+    method: "PUT",
+    body: JSON.stringify({ graph, revision }),
+  });
+}
+
+/**
+ * Compile and report without saving, so a person typing a node parameter can be told it is wrong
+ * before anything is stored. The server owns every rule; the canvas never pre-validates.
+ */
+export function validateGraph(
+  workflowId: string,
+  graph: GraphDocument,
+  revision: number,
+): Promise<GraphValidated> {
+  return request<GraphValidated>(
+    `/api/v1/workflows/${encodeURIComponent(workflowId)}/graph/validate`,
+    { method: "POST", body: JSON.stringify({ graph, revision }) },
+  );
 }
