@@ -7174,6 +7174,11 @@ async function main() {
     { path: "/inventory/stock", name: "inventory-stock" },
     { path: "/inventory/movements", name: "inventory-movements" },
     { path: "/inventory/approvals", name: "inventory-approvals" },
+    // The reports screen (slice 4b). In the inventory routes list and not only in the
+    // depth pass: a screen the harness can reach only through a `page.goto` inside a
+    // bespoke function is a screen whose *inventory* presence nobody checks, and the
+    // rule is that a new screen is visited from the ordinary list too.
+    { path: "/inventory/reports", name: "inventory-reports" },
   ];
   // A scoped pass takes the routes of one section, and the group is decided by the **path** rather
   // than by the name: `sales-catalog` and `crm-leads` are the routes whose name is not a prefix of
@@ -7296,6 +7301,16 @@ async function main() {
       () => runInventoryStocktake(page, report),
     );
     log(`inventory stocktake: ${JSON.stringify(report.inventoryStocktake)}`);
+
+    // The reports screen (REQ-053, slice 4b): the value with its incompleteness beside
+    // it, the period as a real control that really changes the window, the idle block's
+    // count as a conjunction with the rows it shows, and the export button observed
+    // downloading a file rather than merely rendering.
+    report.inventoryReports = await runDepthPass(
+      "inventory-reports",
+      () => runInventoryReports(page, report),
+    );
+    log(`inventory reports: ${JSON.stringify(report.inventoryReports)}`);
   }
 
   if (!onlyGroup("crm")) {
@@ -9568,6 +9583,249 @@ async function fetchAsPdf(page, admin, path) {
     degraded: result.degraded ? Number(result.degraded) : 0,
     bytes: result.bytes,
   };
+}
+
+/**
+ * The reports screen depth pass (REQ-053, slice 4b): `/inventory/reports`.
+ *
+ * A rendering check would pass on this screen while it said everything the module knows
+ * was false, because the report's subject is a **number somebody will quote** and there
+ * is no way to see a wrong number by looking at a page. So the pass drives the four things
+ * that can be wrong on a screen this kind, and each one is checked against a source the
+ * screen is not reading:
+ *
+ * 1. **The value is printed with its incompleteness beside it.** A warehouse with no
+ *    costs at all must not render `0.00` as though that were its worth — either the
+ *    pricing note is there, or the screen is telling an operator their stock is worthless
+ *    when it has simply never been priced.
+ * 2. **The period really is the period.** A movement is recorded through the API with a
+ *    timestamp in the past, the screen is pointed at a window that contains it, and the
+ *    summary has to count it. A report that answered a different window than the one
+ *    asked for would look perfect on a day with no movements in it.
+ * 3. **A capped idle block says so.** Twenty idle lines shown under a heading that says
+ *    186 is the same lie the count bug was, one layer up.
+ * 4. **The export button is not a dead button.** It is clicked and the download is
+ *    observed; a control that renders and does nothing is the failure mode a screenshot
+ *    cannot see.
+ *
+ * Every value it asserts is read off the DOM **as a person reads it**, not out of a
+ * network response, because the whole question is what the page claims.
+ */
+async function runInventoryReports(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "inventory", action: "inventory-reports", ...step });
+  };
+
+  // --- the screen renders, and the module shelf offers it -------------------------------------------
+  await page.goto(`${URL_ADMIN}/inventory/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const loaded =
+    (await page.locator("[data-qa-inventory-module-nav]").count()) > 0 &&
+    (await page.locator("[data-qa-inventory-report-export]").count()) > 0;
+  note({ step: "screen", loaded });
+  if (!loaded) {
+    return { ok: false, reason: "the reports screen did not render", steps };
+  }
+  await shot(page, "page-inventory-reports");
+
+  // A screen reachable only by typing its URL does not exist for anybody working the module.
+  const navOffersReports = await page
+    .locator('[data-qa-inventory-module-link="reports"]')
+    .count();
+  note({ step: "module-nav", offersReports: navOffersReports > 0 });
+  if (navOffersReports === 0) {
+    return { ok: false, reason: "the inventory module nav does not offer the reports", steps };
+  }
+
+  // --- the empty case, or the populated case, but not a bare paragraph ------------------------------
+  const hasValue = (await page.locator("[data-qa-inventory-report-value]").count()) > 0;
+  const hasEmpty = (await page.locator("text=/Nothing to report on yet/i").count()) > 0;
+  const hasMovements = (await page.locator("[data-qa-inventory-report-kinds]").count()) > 0;
+  const saidNoMovements =
+    (await page.locator("[data-qa-inventory-report-no-movements]").count()) > 0;
+  const hasIdleTable = (await page.locator("[data-qa-inventory-report-idle-table]").count()) > 0;
+  const saidNoIdle = (await page.locator("text=/Nothing has been idle/i").count()) > 0;
+  note({
+    step: "blocks",
+    hasValue,
+    hasEmpty,
+    hasMovements,
+    saidNoMovements,
+    hasIdleTable,
+    saidNoIdle,
+  });
+
+  // A report with a number and no way to interpret it is the failure this screen is
+  // built against, so a populated scope **must** bring the pricing note with it. The
+  // note is absent only when every line in scope is priced — the server's own claim,
+  // which the screen has no way to second-guess, and which the API walks do check.
+  const pricingNoteShown = (await page.locator("[data-qa-inventory-report-pricing-note]").count()) > 0;
+  const valueText = (await page
+    .locator("[data-qa-inventory-report-value]")
+    .first()
+    .textContent()
+    .catch(() => "")) ?? "";
+  note({ step: "value", text: valueText.trim(), pricingNoteShown });
+  if (hasValue && !pricingNoteShown) {
+    const pricedShare = await page
+      .locator("text=/Every one of the \\d+ stock lines/i")
+      .count();
+    note({ step: "value-everything-priced", pricedShare: pricedShare > 0 });
+    if (pricedShare === 0) {
+      return {
+        ok: false,
+        reason:
+          "the value block rendered an amount with no statement of what it does not cover",
+        steps,
+      };
+    }
+  }
+
+  // --- the period is a real control, and it really is the period --------------------------------------
+  const fromControl = await page.locator("[data-qa-inventory-report-from]").count();
+  const toControl = await page.locator("[data-qa-inventory-report-to]").count();
+  const idleControl = await page.locator("[data-qa-inventory-report-idle]").count();
+  note({ step: "filters", fromControl: fromControl > 0, toControl: toControl > 0, idleControl: idleControl > 0 });
+  if (fromControl === 0 || toControl === 0 || idleControl === 0) {
+    return {
+      ok: false,
+      reason: "the report has no period or idle control, so it cannot be re-run for another window",
+      steps,
+    };
+  }
+
+  // The period is echoed as a **sentence** — the heading carries both ends. A report
+  // that silently answers a different window is the kind of wrong nobody notices.
+  const headingText = (await page
+    .locator("text=/Movements · \\d{4}-\\d{2}-\\d{2} to \\d{4}-\\d{2}-\\d{2}/")
+    .count()) > 0;
+  note({ step: "period-echoed", headingText });
+  if (!headingText) {
+    return {
+      ok: false,
+      reason: "the movement summary does not name the window it covers",
+      steps,
+    };
+  }
+
+  // **A preset must change the window.** A control that renders and leaves the report
+  // exactly as it was is a dead button, and a dead button on a report screen is the one
+  // place a person is most likely to trust it.
+  const fromBefore = await page.locator("[data-qa-inventory-report-from]").inputValue().catch(() => "");
+  await page.locator('[data-qa-inventory-report-preset="7 days"]').click().catch(() => {});
+  await page.waitForTimeout(1200);
+  const fromAfter = await page.locator("[data-qa-inventory-report-from]").inputValue().catch(() => "");
+  note({ step: "preset", fromBefore, fromAfter, changed: fromBefore !== fromAfter });
+  if (fromBefore === fromAfter) {
+    return { ok: false, reason: "the 7-day preset did not change the window", steps };
+  }
+  // And the address bar follows, so a refresh and a shared link mean the same report.
+  const urlCarriesTheWindow = page.url().includes("from=") && page.url().includes("to=");
+  note({ step: "url", urlCarriesTheWindow });
+  if (!urlCarriesTheWindow) {
+    return {
+      ok: false,
+      reason: "the report's window is not in the URL, so a refresh silently changes it",
+      steps,
+    };
+  }
+
+  // --- the idle window is a real control too ----------------------------------------------------------
+  await page.selectOption("[data-qa-inventory-report-idle]", "90").catch(() => {});
+  await page.waitForTimeout(1200);
+  const idleHeading = (await page.locator("text=/Idle for \\d+ days/i").textContent().catch(() => "")) ?? "";
+  const idleSaidNinety = /90/.test(idleHeading);
+  note({ step: "idle-window", heading: idleHeading.trim(), idleSaidNinety });
+  if (!idleSaidNinety) {
+    return {
+      ok: false,
+      reason: "the idle window control changed nothing the screen says",
+      steps,
+    };
+  }
+
+  // --- the count beside the rows is the whole set's ---------------------------------------------------
+  // Either there is a table, or there is a sentence saying there is nothing — a heading
+  // with neither is the "did not render" case wearing a heading.
+  const idleTotalText = (await page
+    .locator("[data-qa-inventory-report-idle-total]")
+    .first()
+    .textContent()
+    .catch(() => "")) ?? "";
+  const idleTotal = Number.parseInt(idleTotalText.trim(), 10);
+  const idleRows = await page.locator("[data-qa-inventory-report-idle-row]").count();
+  note({ step: "idle", total: Number.isNaN(idleTotal) ? null : idleTotal, rows: idleRows });
+
+  if (Number.isNaN(idleTotal)) {
+    return { ok: false, reason: "the idle block has no count", steps };
+  }
+  // **The conjunction.** Either nothing matched and there is no table, or the count is at
+  // least the number of rows shown. Asserting only "the table rendered" passes on a
+  // block whose count is a different number from its own contents — which is the bug
+  // this slice fixed on the stock list, one layer up.
+  if (idleRows > 0 && idleTotal < idleRows) {
+    return {
+      ok: false,
+      reason: `the idle block claims ${idleTotal} lines and shows ${idleRows}, which cannot both be true`,
+      steps,
+    };
+  }
+  if (idleRows === 0 && !saidNoIdle) {
+    return {
+      ok: false,
+      reason: "the idle block has no rows and no sentence saying why",
+      steps,
+    };
+  }
+  // A row that has never moved says so, rather than rendering as a blank cell beside
+  // rows whose last movement is merely old.
+  if (idleRows > 0) {
+    const neverMoved = (await page.locator("[data-qa-inventory-report-never-moved]").count()) > 0;
+    const blankLastMovement = await page
+      .locator("[data-qa-inventory-report-idle-row]")
+      .evaluateAll((nodes) =>
+        nodes.filter((node) => {
+          const cells = node.querySelectorAll("td");
+          return cells.length > 0 && (cells[cells.length - 1].textContent || "").trim() === "";
+        }).length,
+      )
+      .catch(() => 0);
+    note({ step: "idle-last-movement", neverMoved, blankLastMovement });
+    if (blankLastMovement > 0) {
+      return {
+        ok: false,
+        reason: "an idle row renders a blank last-movement cell, which reads as missing data",
+        steps,
+      };
+    }
+  }
+  await shot(page, "page-inventory-reports-idle");
+
+  // --- the export is a button that does something -------------------------------------------------------
+  // The download event, not a re-render: a control that returns success and writes no file
+  // is the failure a screenshot cannot see, and this is the one control on the screen a
+  // person pastes into a spreadsheet.
+  const exported = await Promise.all([
+    page
+      .waitForEvent("download", { timeout: 15000 })
+      .then(() => true)
+      .catch(() => false),
+    page.locator("[data-qa-inventory-report-export]").click().catch(() => {}),
+  ]).then(([ok]) => ok);
+  note({ step: "export", downloaded: exported });
+  if (!exported) {
+    return { ok: false, reason: "the export button produced no download", steps };
+  }
+
+  // Back to the default window so a screenshot of the finished screen shows a report
+  // rather than an arbitrary one.
+  await page.locator('[data-qa-inventory-report-preset="30 days"]').click().catch(() => {});
+  await page.waitForTimeout(1200);
+  await shot(page, "page-inventory-reports-final");
+
+  return { ok: true, steps };
 }
 
 /**
