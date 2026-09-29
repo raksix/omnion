@@ -6,7 +6,7 @@
 //!
 //! **The lists are compile-time, and the duplication in SQL is a test.** SQL cannot import a
 //! Rust constant, so the status, decision, kind and dedupe-policy lists are written twice —
-//! once here, once in `database/migrations/0051_crm_lead_intake.sql` — and
+//! once here, once in `database/migrations/0055_crm_lead_intake.sql` — and
 //! `the_migration_agrees_with_the_lists` reads the migration file itself. Both directions
 //! fail quietly without it: a status added to Rust and not to SQL passes every unit test in
 //! the crate and is then refused by the database, and a status added to SQL and not to Rust is
@@ -155,10 +155,10 @@ mod tests {
     fn the_migration_agrees_with_the_lists() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../database/migrations/0051_crm_lead_intake.sql"
+            "/../../database/migrations/0055_crm_lead_intake.sql"
         );
         let sql = std::fs::read_to_string(path).unwrap_or_else(|error| {
-            panic!("cannot read 0051_crm_lead_intake.sql ({error}); the closed lists are duplicated in it")
+            panic!("cannot read 0055_crm_lead_intake.sql ({error}); the closed lists are duplicated in it")
         });
 
         for (constraint, list) in [
