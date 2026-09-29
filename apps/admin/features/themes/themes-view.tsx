@@ -25,8 +25,9 @@
  *    installer, and until it does there is no delete to offer, so the action is not rendered
  *    rather than rendered disabled.
  */
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Check, Loader2, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, History, Loader2, RefreshCw, RotateCcw, SlidersHorizontal, Trash2 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -339,6 +340,29 @@ function ThemeCardView({
             <Trash2 className="h-4 w-4" aria-hidden />
           </button>
         ) : null}
+        {/* Customise and History are per-SITE resources, not per-theme ones: the settings
+            routes are `/sites/{site_id}/theme-settings`, and a card links to them with the
+            theme key in the path because that is the URL the operator remembers. The editor
+            re-reads the site's active theme and shows it, so a link from an inactive card
+            lands on the site's own settings rather than pretending to edit another theme. */}
+        <Link
+          href={`/themes/${encodeURIComponent(theme.key)}/customize`}
+          className="btn btn-ghost"
+          data-theme-customize-link={theme.key}
+          title="Colours, type, layout and branding"
+        >
+          <SlidersHorizontal className="h-4 w-4" aria-hidden />
+          Customize
+        </Link>
+        <Link
+          href={`/themes/${encodeURIComponent(theme.key)}/history`}
+          className="btn btn-ghost"
+          data-theme-history-link={theme.key}
+          title="Every saved revision, with diffs and a restore"
+        >
+          <History className="h-4 w-4" aria-hidden />
+          History
+        </Link>
       </div>
     </li>
   );

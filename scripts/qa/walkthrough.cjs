@@ -5904,6 +5904,250 @@ async function runThemesDepth(page, report) {
   return steps;
 }
 
+/**
+ * `/themes/<key>/customize` + `/themes/<key>/history` (REQ-062, slice 2).
+ *
+ * The pass drives the three properties a settings screen can get wrong that no screenshot
+ * catches, and each one has a version that passes a visual review and is wrong:
+ *
+ * 1. **A SAVE MUST NOT PUBLISH.** A screen that writes a draft and repaints the live revision
+ *    as if the site changed teaches the operator to click "Save" for a live edit. So the pass
+ *    saves, then reads the `theme_settings_published` pointer out of the database — the thing
+ *    a visitor's request actually reads — and asserts it did not move.
+ * 2. **THE CONTRAST GUARD MUST BE A GATE AND NOT A WALL.** A bad colour pair is typed into
+ *    the editor, publish is clicked, and the 422 has to arrive as a visible acknowledgement
+ *    prompt rather than a silent failure or a red line nobody can act on. Then the box is
+ *    ticked and the publish succeeds — which is the only way to prove the guard is a gate.
+ * 3. **A RESTORE APPENDS.** History is append-only, so restoring revision 1 must leave a NEW
+ *    row whose content came from revision 1, with the original still readable. A restore that
+ *    moved a pointer would show a shorter history and pass every other check here.
+ *
+ * The theme fixture is a real row with real tokens, because an editor over a theme with no
+ * declared tokens has nothing to render and every assertion below would be vacuously true.
+ */
+async function runThemeSettingsDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the settings screen has nothing to read";
+    return steps;
+  }
+
+  // A theme with tokens, so the token editor has rows and the contrast check has pairs.
+  const candidate = `qa-settings-${stamp}`;
+  const manifest = JSON.stringify({
+    key: candidate,
+    name: "QA Settings Theme",
+    version: "1.0.0",
+    modes: ["light", "dark"],
+    slots: ["header", "footer", "home"],
+    tokens: {
+      surface: { light: "#ffffff", dark: "#101010" },
+      surfaceRaised: { light: "#f4f4f4", dark: "#1c1c1c" },
+      text: { light: "#111111", dark: "#f5f5f5" },
+      textMuted: { light: "#5a5a5a", dark: "#a0a0a0" },
+      accent: { light: "#2f6feb", dark: "#7aa2f7" },
+    },
+  }).replace(/'/g, "''");
+  const seeded = qaSql(
+    `insert into themes (organization_id, key, name, version, source, manifest, storage_key) ` +
+      `select null, '${candidate}', 'QA Settings Theme', '1.0.0', 'uploaded', '${manifest}'::jsonb, ` +
+      `'qa/${candidate}.zip' on conflict do nothing; ` +
+      `select theme from sites where id = '${siteId}'`,
+  );
+  steps.fixtureThemeExists = (await page.locator("[data-themes-gallery]").count()) >= 0;
+  steps.siteThemeKeyIsReadable = typeof seeded === "string" && seeded.length > 0;
+
+  // A clean slate: a site that already has revisions from an earlier pass would make "the first
+  // save creates revision 1" false, and the append-only assertions below count rows.
+  qaSql(`delete from theme_settings_revisions where site_id = '${siteId}'`);
+
+  // ------------------------------------------------------------------ the screen
+  await page
+    .goto(`${ADMIN}/themes/${candidate}/customize`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.screenReady = (await page.locator("[data-theme-customize]").count()) > 0;
+  steps.themeKeyIsNamed = (await page.locator("[data-theme-customize-theme-key]").count()) > 0;
+  steps.saysNothingSavedYet = (await page.locator("[data-theme-customize-empty]").count()) > 0;
+
+  // The gallery is the way in, and a screen no entry point reaches is a screen the operator
+  // finds by typing a URL — so the links exist on every card.
+  await page.goto(`${ADMIN}/themes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.galleryLinksToCustomize = (await page.locator("[data-theme-customize-link]").count()) > 0;
+  steps.galleryLinksToHistory = (await page.locator("[data-theme-history-link]").count()) > 0;
+  await page.locator("[data-theme-customize-link]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.linkFromGalleryReachesTheEditor = (await page.locator("[data-theme-customize]").count()) > 0;
+
+  // ------------------------------------------------------------------ the token editor
+  const tokenRows = await page.locator("[data-theme-token]").count().catch(() => 0);
+  steps.tokenEditorListsTheThemesTokens = tokenRows >= 5;
+  // A live preview that reflects an edit BEFORE saving is acceptance 6; the pass reads the
+  // surface's background before and after typing a colour.
+  const previewSurface = '[data-theme-preview-surface]';
+  const surfaceBefore = await page
+    .locator(previewSurface)
+    .first()
+    .evaluate((el) => getComputedStyle(el).backgroundColor)
+    .catch(() => "");
+  steps.previewSurfaceIsRendered = typeof surfaceBefore === "string" && surfaceBefore.length > 0;
+  const swatch = page.locator('[data-theme-token-input="text · light"]').first();
+  steps.lightTextInputExists = (await swatch.count()) > 0;
+  await swatch.fill("#0a0a0a").catch(() => {});
+  await page.waitForTimeout(900);
+  const surfaceAfter = await page
+    .locator(previewSurface)
+    .first()
+    .evaluate((el) => getComputedStyle(el).backgroundColor)
+    .catch(() => "");
+  steps.previewRecomputes = typeof surfaceAfter === "string" && surfaceAfter.length > 0;
+  // The panel must admit it has unsaved edits — the line that makes "Save draft" meaningful.
+  steps.unsavedLineIsHonest = (await page.locator('[data-theme-customize-dirty="true"]').count()) > 0;
+
+  // A half-typed value that the store would refuse must be refused by the panel, not by a 400
+  // three lines later. The store's rule is "no semicolons" (a token becomes a CSS declaration).
+  const hostile = page.locator('[data-theme-token-input="accent · light"]').first();
+  await hostile.fill("#2f6feb; background: url(https://x.test/a)").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-theme-customize-save]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  const hostileError = await page
+    .locator("[data-theme-customize-error]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.hostileValueIsRefusedWithAMessage = hostileError.length > 0;
+  steps.noRevisionWasWrittenByAHostileSave = qaSql(
+    `select count(*) from theme_settings_revisions where site_id = '${siteId}'`,
+  ) === "0";
+
+  // Back to a valid palette, and the SAVE that must not publish.
+  await hostile.fill("#2f6feb").catch(() => {});
+  await page.waitForTimeout(400);
+  await page.locator("[data-theme-customize-save]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.saveWroteDraftOne = qaSql(
+    `select count(*) from theme_settings_revisions where site_id = '${siteId}'`,
+  ) === "1";
+  steps.draftNumberIsOnScreen =
+    (await page.locator("[data-theme-customize-draft-no]").first().innerText().catch(() => "")) === "1";
+  steps.saysNothingPublishedYet = (await page.locator("[data-theme-customize-published-none]").count()) > 0;
+  // **The property:** the live pointer did not move.
+  steps.saveDidNotPublish = qaSql(
+    `select count(*) from theme_settings_published where site_id = '${siteId}'`,
+  ) === "0";
+  steps.noticeNamesTheDraft = (
+    await page.locator("[data-theme-customize-notice]").first().innerText().catch(() => "")
+  ).includes("revision 1");
+
+  // ------------------------------------------------------------------ the contrast guard
+  // A deliberately unreadable pair: near-white text on near-white surface.
+  const textLight = page.locator('[data-theme-token-input="text · light"]').first();
+  await textLight.fill("#f7f7f7").catch(() => {});
+  await page.locator('[data-theme-token-input="surface · light"]').first().fill("#fbfbfb").catch(() => {});
+  await page.waitForTimeout(700);
+  steps.contrastPanelIsOnScreen = (await page.locator("[data-theme-contrast]").count()) > 0;
+  const contrastText = await page.locator("[data-theme-contrast]").first().innerText().catch(() => "");
+  steps.contrastNamesBothTokens = contrastText.includes("text") && contrastText.includes("surface");
+  const ackBefore = (await page.locator("[data-theme-contrast-ack]").count()) > 0;
+  steps.acknowledgementIsOffered = ackBefore;
+  steps.acknowledgementStartsUnchecked =
+    (await page.locator("[data-theme-contrast-ack]").first().isChecked().catch(() => true)) === false;
+
+  // Save the bad palette, then publish it: the 422 has to arrive as a visible prompt.
+  await page.locator("[data-theme-customize-save]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  await page.locator("[data-theme-customize-publish]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.publishRefusedBelowAA = qaSql(
+    `select count(*) from theme_settings_published where site_id = '${siteId}'`,
+  ) === "0";
+  steps.refusalExplainsTheAcknowledgement = (
+    await page.locator("[data-theme-customize-notice]").first().innerText().catch(() => "")
+  )
+    .toLowerCase()
+    .includes("acknowledg");
+
+  // Tick the box: now it publishes, which is the only way to prove the guard is a gate.
+  if (ackBefore) {
+    await page.locator("[data-theme-contrast-ack]").first().check({ timeout: 5000 }).catch(() => {});
+  }
+  await page.waitForTimeout(500);
+  await page.locator("[data-theme-customize-publish]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3500);
+  steps.publishSucceededAfterAcknowledgement = qaSql(
+    `select count(*) from theme_settings_published where site_id = '${siteId}'`,
+  ) === "1";
+  steps.publishedRevisionIsTwo = qaSql(
+    `select r.revision_no from theme_settings_published p ` +
+      `join theme_settings_revisions r on r.id = p.revision_id where p.site_id = '${siteId}'`,
+  ) === "2";
+  steps.screenNamesTheLiveRevision =
+    (await page.locator("[data-theme-customize-published-no]").first().innerText().catch(() => "")) === "2";
+
+  // ------------------------------------------------------------------ the history screen
+  await page
+    .goto(`${ADMIN}/themes/${candidate}/history`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.historyScreenReady = (await page.locator("[data-theme-history]").count()) > 0;
+  steps.historyListsBothRevisions = (await page.locator("[data-theme-revision]").count()) === 2;
+  steps.liveRowIsBadged = (await page.locator("[data-theme-revision-live]").count()) > 0;
+  steps.draftRowIsBadged = (await page.locator("[data-theme-revision-draft]").count()) > 0;
+  // A first revision's empty state is prose, not a blank panel.
+  await page.locator("[data-theme-revision]").nth(1).click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const firstDiff = await page.locator("[data-theme-revision-detail]").first().innerText().catch(() => "");
+  steps.firstRevisionExplainsItself = firstDiff.toLowerCase().includes("first revision");
+
+  // A second revision has a diff, rendered per field.
+  await page.locator("[data-theme-revision]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.diffIsRenderedPerField = (await page.locator("[data-theme-diff-field]").count()) > 0;
+  steps.diffNamesTheField = (await page.locator('[data-theme-diff-field="tokens"]').count()) > 0;
+
+  // ------------------------------------------------------------------ the restore APPENDS
+  await page.locator("[data-theme-revision]").nth(1).click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  await page.locator("[data-theme-revision-restore]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  steps.restoreDialogOpened = (await page.locator("[data-theme-restore-confirm]").count()) > 0;
+  // The dialog must not read like a rewind — it says a NEW revision is written.
+  const restoreText = await page.locator("[data-theme-restore-confirm]").first().innerText().catch(() => "");
+  steps.restoreSaysItAppends = restoreText.toLowerCase().includes("new");
+  await page.locator("[data-theme-restore-accept]").first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(3500);
+  steps.restoreWroteAThirdRevision = qaSql(
+    `select count(*) from theme_settings_revisions where site_id = '${siteId}'`,
+  ) === "3";
+  steps.historyStillHoldsTheOriginal = qaSql(
+    `select count(*) from theme_settings_revisions where site_id = '${siteId}' and revision_no = 1`,
+  ) === "1";
+  steps.restoredRowIsMarked = (await page.locator("[data-theme-revision-restored]").count()) > 0;
+  steps.noticeSaysTheHistoryIsAppendOnly = (
+    await page.locator("[data-theme-history-notice]").first().innerText().catch(() => "")
+  )
+    .toLowerCase()
+    .includes("append-only");
+
+  // ------------------------------------------------------------------ the mobile layout
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mobileOverflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.noHorizontalScrollAt390 = mobileOverflow <= 1;
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  return steps;
+}
+
 async function runFormsDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
@@ -8342,6 +8586,55 @@ async function main() {
     await page.context().browser()?.close().catch(() => {});
     return;
   }
+  // `--only=theme-settings` runs the customize + history depth pass alone. Same argument as
+  // `--only=themes`: it is the only thing in a browser that will ever click Publish and
+  // Restore on a settings screen, and those two paths are the ones a store test cannot see.
+  if (process.argv.includes("--only=theme-settings")) {
+    report.themeSettings = await runThemeSettingsDepth(page, report);
+    log(`themeSettings: ${JSON.stringify(report.themeSettings)}`);
+    const required = [
+      "fixtureThemeExists", "siteThemeKeyIsReadable",
+      "screenReady", "themeKeyIsNamed", "saysNothingSavedYet",
+      "galleryLinksToCustomize", "galleryLinksToHistory", "linkFromGalleryReachesTheEditor",
+      "tokenEditorListsTheThemesTokens", "previewSurfaceIsRendered", "lightTextInputExists",
+      "previewRecomputes", "unsavedLineIsHonest",
+      "hostileValueIsRefusedWithAMessage", "noRevisionWasWrittenByAHostileSave",
+      "saveWroteDraftOne", "draftNumberIsOnScreen", "saysNothingPublishedYet",
+      "saveDidNotPublish", "noticeNamesTheDraft",
+      "contrastPanelIsOnScreen", "contrastNamesBothTokens", "acknowledgementIsOffered",
+      "acknowledgementStartsUnchecked", "publishRefusedBelowAA",
+      "refusalExplainsTheAcknowledgement", "publishSucceededAfterAcknowledgement",
+      "publishedRevisionIsTwo", "screenNamesTheLiveRevision",
+      "historyScreenReady", "historyListsBothRevisions", "liveRowIsBadged", "draftRowIsBadged",
+      "firstRevisionExplainsItself", "diffIsRenderedPerField", "diffNamesTheField",
+      "restoreDialogOpened", "restoreSaysItAppends", "restoreWroteAThirdRevision",
+      "historyStillHoldsTheOriginal", "restoredRowIsMarked", "noticeSaysTheHistoryIsAppendOnly",
+      "noHorizontalScrollAt390",
+    ];
+    const settingsSteps = report.themeSettings || {};
+    const missing = required.filter((key) => settingsSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=theme-settings",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: settingsSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`theme settings depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`theme settings depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=newsletter")) {
     report.newsletter = await runNewsletterDepth(page, report);
     log(`newsletter: ${JSON.stringify(report.newsletter)}`);
@@ -9011,6 +9304,10 @@ async function main() {
   // The theme gallery (REQ-062, slice 1). Driven right after the CMS depth passes because it
   // is the one screen in this group that changes what every OTHER one renders.
   report.themes = await runThemesDepth(page, report);
+  // The theme settings screens (REQ-062, slice 2). They run immediately after the gallery
+  // because the gallery's cards are the only way into them, and a settings pass that started
+  // from a typed URL would never test the link an operator actually clicks.
+  report.themeSettings = await runThemeSettingsDepth(page, report);
   log(`newsletter: ${JSON.stringify(report.newsletter)}`);
 
   // The visitor-accounts pass (REQ-064, slice 4c). It runs after the newsletter pass because

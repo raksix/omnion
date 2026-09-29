@@ -6329,3 +6329,133 @@ export async function rollbackTheme(siteId: string): Promise<ActivationResult> {
     { method: "POST" },
   );
 }
+
+/**
+ * Theme settings (REQ-062 slice 2) — the customize screen's client.
+ *
+ * Three types and not one, because the store returns three answers and collapsing them into a
+ * single "current settings" object is how a panel ends up showing a draft as if it were live:
+ * `draft` is what the editor holds, `published` is what a visitor gets, and a site that has
+ * never published has `published: null` — which is a different message ("nothing is published
+ * yet, the theme's own defaults are live") rather than an absent field.
+ */
+export type ThemeSettingsRevision = {
+  id: string;
+  siteId: string;
+  revisionNo: number;
+  themeKey: string;
+  tokens: Record<string, unknown>;
+  typography: Record<string, unknown>;
+  layout: Record<string, unknown>;
+  branding: Record<string, unknown>;
+  headerFooter: Record<string, unknown>;
+  defaultMode: string;
+  createdBy: string | null;
+  createdAt: string;
+  publishedAt: string | null;
+  restoredFromId: string | null;
+};
+
+export type ThemeRevisionSummary = {
+  id: string;
+  revisionNo: number;
+  themeKey: string;
+  createdAt: string;
+  createdBy: string | null;
+  createdByName: string | null;
+  isPublished: boolean;
+  isDraft: boolean;
+  restoredFromNo: number | null;
+};
+
+/** One contrast finding, measured by the server — never re-measured in the browser. */
+export type ThemeContrastFinding = {
+  foreground: string;
+  background: string;
+  mode: string;
+  ratio: number;
+  required: number;
+  message: string;
+};
+
+export type ThemeSettingsView = {
+  siteId: string;
+  themeKey: string;
+  draft: ThemeSettingsRevision | null;
+  published: ThemeSettingsRevision | null;
+  revisions: ThemeRevisionSummary[];
+  contrast: ThemeContrastFinding[];
+  defaultTokens: Record<string, unknown>;
+};
+
+/** What `PUT` accepts. Every section defaults, so a partial edit is a legal save. */
+export type ThemeSettingsInput = {
+  themeKey: string;
+  tokens: Record<string, unknown>;
+  typography: Record<string, unknown>;
+  layout: Record<string, unknown>;
+  branding: Record<string, unknown>;
+  headerFooter: Record<string, unknown>;
+  defaultMode: string;
+};
+
+export type ThemeRevisionDetail = {
+  revision: ThemeSettingsRevision;
+  /** Per-field changes against the previous revision. Empty for revision 1. */
+  diff: { field: string; from: unknown; to: unknown }[];
+};
+
+export async function fetchThemeSettings(siteId: string): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings`,
+  );
+}
+
+/** Save a draft. A save is never a publish — the site does not change. */
+export async function saveThemeSettings(
+  siteId: string,
+  input: ThemeSettingsInput,
+): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Publish the draft.
+ *
+ * `acknowledgeContrast` is a real argument and not a convenience: the server refuses a publish
+ * whose tokens are below AA with a 422 unless the caller says it has seen the findings, and a
+ * client that always sent `true` would make the guard unsatisfiable in the same way a missing
+ * field makes it unsatisfiable. The panel sends it only after showing the badge.
+ */
+export async function publishThemeSettings(
+  siteId: string,
+  acknowledgeContrast: boolean,
+): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/publish`,
+    { method: "POST", body: JSON.stringify({ acknowledge_contrast: acknowledgeContrast }) },
+  );
+}
+
+export async function fetchThemeRevision(
+  siteId: string,
+  revisionNo: number,
+): Promise<ThemeRevisionDetail> {
+  return request<ThemeRevisionDetail>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/revisions/${revisionNo}`,
+  );
+}
+
+/** Restore an earlier revision. The server writes a NEW revision; history is append-only. */
+export async function restoreThemeRevision(
+  siteId: string,
+  revisionNo: number,
+): Promise<ThemeSettingsView> {
+  return request<ThemeSettingsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-settings/revisions/${revisionNo}/restore`,
+    { method: "POST" },
+  );
+}
