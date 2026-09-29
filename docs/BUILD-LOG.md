@@ -4209,7 +4209,37 @@ artifacts off the guarded path entirely, and the same build then completed.
 **Commits.** `3603060` (crate, migration, catalogue drift test), `0e7ac6b` (docs),
 `a2b188b` (admin + the `source` field), `3df6432` (the pass and the walks).
 
-**Next.** Merge `origin/main` (four known conflicts: `app-shell.tsx`, `lib/api.ts`,
-`lib/types.ts`, `walkthrough.cjs` — and `lib/types.ts` is a file this branch also touched, so the
-union must keep BOTH sides), then run the browser gate on the first tick that finds a quiet box.
-Two slices now stand un-gated behind it, and that is the honest state of the branch.
+**The browser gate ran — and found a harness bug before it found anything about the product.**
+Six ticks of deferral ended mid-tick, when Chrome fell from 40 to 10 and the load from 30 to 13.
+The pass printed four `[qa]` lines and died with no error, which reads as a product failure on the
+step after the last message and is not one: `pm2 describe <name>` exits non-zero for a process that
+does not exist, and under `set -euo pipefail` a failing command inside `$( )` aborts the script.
+`RUNNING_BIN` was therefore a trapdoor on precisely the moment it was written for — nothing
+registered yet, which is what a brand-new QA stack looks like. Fixed with `|| true` (`54d409a`),
+and the observation worth keeping is that **this branch had never run a pass at all**, so the bug
+was sitting in the harness of a stack that had never been exercised on it.
+
+With that fixed the pass ran for real: database reset, API on :18084, admin :3104, renderer :3204,
+and the walkthrough drove the route list — overview, pages, media, media-duplicates, media-trash,
+media-settings, sites, ai, search, search-settings, iam-overview, iam-users, iam-groups,
+iam-service-accounts, iam-simulator, iam-policies, the analytics group, and then **the three CDN
+pages**, where the tab died:
+
+```
+[walk] page cdn-overview failed: page.waitForTimeout: Target page, context or browser has been closed
+[walk] page cdn-rules   failed: (same)
+[walk] page cdn-settings failed: (same)
+```
+
+Five other writers had started passes while this one ran; load 30, Chrome 30, `MemAvailable` 8G
+down to under 4G at the failure. The artifact's `summary.json` is `{"fatal": …}` with no per-page
+results at all, so this is a **dead run, not a red one** — and it is the contention signature this
+loop has recorded before, not a finding about this change. It is not being written up as a pass,
+and the gate remains owed. What the run *did* establish is that the harness works up to the CDN
+routes once the `set -e` trapdoor is gone, which is the first evidence this branch has that.
+
+**Next.** Re-run the browser gate — it is now known to work up to the CDN routes, and it died on
+memory contention rather than on anything in this change, so the recipe is unchanged. Then merge
+`origin/main` (four known conflicts: `app-shell.tsx`, `lib/api.ts`, `lib/types.ts`,
+`walkthrough.cjs` — and `lib/types.ts` is a file this branch also touched, so the union must keep
+BOTH sides). Two slices stand un-gated behind that pass, which is the honest state of the branch.
