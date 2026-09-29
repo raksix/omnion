@@ -5160,3 +5160,43 @@ the *ninth* time — but the deferral now has a fix behind it rather than a pre-
 merge that arrived with it is repaired and green. With the scope honest, a
 `QA_ONLY=cdn,events,webhooks` pass is roughly a fifth of a full pass, and that is affordable here.
 REQ-011 and REQ-005 both wait on that one green run.
+
+
+## 2026-09-29 · tick 26 — the 170 high findings were a fixture, not a product
+
+**What.** Merged `origin/main` (2 conflicts), then ran the scoped browser pass for the first time
+in ten ticks and read the result instead of deferring it. The pass returned `179 findings (high 170)`.
+Every one of them traced to a single cause: the QA database had an OWNER account and **no
+organization and no site**.
+
+**Root cause, measured.** `run.sh` seeds `OMNION_ADMIN_EMAIL` on every boot, and that seed creates
+one user and nothing else. The walkthrough's wizard asks the API whether setup is needed, and
+`omnion_onboarding::state` answers `needs_setup: !has_users` — a user exists, so the wizard is
+skipped. The database is then permanently in a state the wizard will never re-enter and no
+site-scoped screen can render. The pass filed 68 × `400 /api/v1/cdn/rules?site_id=` (a real
+product defect, below) plus the cascade that follows from walking every site-scoped screen with
+no site.
+
+**Two product/harness defects, both now fixed.**
+
+1. `feat`/`fix(cdn)` — `cdn-overview-view.tsx:83` read `fetchCdnRules(siteId ?? "")` **before** the
+   `if (!siteId)` empty-state guard. A null site was coerced to `""`, and `?site_id=` is a 400 on
+   every render of an unconfigured installation. This is mine, it was 68 of the 170 highs, and it
+   would have hit a real user who has not created a site yet.
+2. `qa` — the same missing site, seen from the harness side. `qaSql` returns `""` when a scalar
+   read matches nothing; the seven call sites that interpolate that value into a later statement
+   built `where site_id = ''`, a uuid type error that aborted the seed while pointing at the
+   *update* rather than at the empty read. `run.sh` now seeds the organization and the site and
+   fails the pass outright when no site keyed `main` exists, and the two depth passes that used to
+   report `"no QA site to purge for"` no longer skip quietly.
+
+**Proof.** `cargo test -p omnion-api --lib` → **255 passed, 0 failed** · `pnpm typecheck` →
+**2/2 tasks, 0 errors** · `node --check scripts/qa/walkthrough.cjs` → clean · the merge audit
+(`Counter(origin/main) - Counter(merge-base)` compared against disk) → **0 lines main introduced
+were lost** · scoped pass, first run → `179 findings (high 170)`, all traced to the fixture above.
+
+**Commits.** `fd480a3` merge of `origin/main` · `799929b` `fix(cdn)` empty site id + `qaScalar` ·
+`f2f26cc` `qa` tenant/site fixture.
+
+**Next.** Re-run the scoped pass against the seeded fixture. If `/cdn` and the two CDN depth
+passes go green, REQ-011 slice 2 closes and REQ-005's browser gate unblocks with it.
