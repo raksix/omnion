@@ -5106,28 +5106,47 @@ spellings, and mine was the one already reasoned about in `6280a2a` — a redact
 union, verified by **multiset** (0 lines missing from either side, 79 headings, 0 duplicates) and
 not by a line count.
 
-Then the real work. Ticks 13–22 have all deferred the browser pass on box pressure, and tick 20
+**Then the merge turned out to be the tick's real work.** Resolving four conflicts left a
+file list that *looked* complete, and it was not. `notifications.rs` had been recorded as an
+"empty-side union" — ours between the markers genuinely was empty — and that reasoning was then
+applied to files with no markers at all, where a file-level loss leaves the conflict list
+untouched. Three files main had **added** never landed on disk: `security/headers/page.tsx`,
+`header-policy.tsx` (696 lines) and `security-tabs.tsx`. The whole REQ-012 slice 2 screen was
+gone, both security screens had lost their `<SecurityTabs>`, `lib/api.ts` had lost the client and
+`lib/types.ts` the types — and the panel did not compile. The compiler is what finally named it;
+`parse_list_params` and `decode` were referenced by main's notification tests and defined nowhere.
+
+Every file main touched is now compared against the merge base, and by line **multiset**, not
+count: `lib/types.ts` had 36 lines missing that a count would have hidden inside a reflow. A
+resolution audit that reads the marker list can only ever verify the files that had markers.
+
+`notifications.rs` is main's file wholesale — its `with_read` is an `Option<bool>` where mine was
+a `bool`, so "the client said nothing" and "the client said no" had become the same question. Main
+distinguishes all three states and tests them.
+
+Then the harness. Ticks 13–22 have all deferred the browser pass on box pressure, and tick 20
 said plainly that a gate which cannot be afforded is a gate that will not run. The fix belongs in
 the harness, so it went there — and the harness was still broken. `runDepthPass` checks `QA_ONLY`
 and turns a throw into a recorded finding, and fifteen call sites used it. **Sixteen more were
 invoked with a bare `await`** and ran regardless. Fifteen of those sixteen are precisely the
 passes a scoped run exists to reach: `runCdnRulesDepth`, `runCdnPurgeDepth` and all six
 `runOrganization*` passes. So every scoped artifact this branch has produced carried the label
-`cdn,events,webhooks` while holding the whole product's evidence — and, worse, a pass meant to
-reach `/cdn/purges` spent its budget in `search-depth` and never got there. That is the tick-21
-reading, and no amount of re-reading it would have found it: the scope was a *description*, not a
-control.
+`cdn,events,webhooks` while holding the whole product's evidence — and a pass meant to reach
+`/cdn/purges` spent its budget in `search-depth` and never got there. That is the tick-21 reading,
+and no amount of re-reading it would have found it: the scope was a *description*, not a control.
 
 **Proof.**
-- `git merge origin/main` → `92ee69a`; BUILD-LOG multiset: 0 missing from ours, 0 from theirs,
-  79 headings, 0 duplicate headings.
+- `git merge origin/main` → `92ee69a`; merge-repair → `91cdf0c`.
+- Every main-touched file compared against the merge base by line multiset: 3 missing files and
+  36 missing lines restored, 0 remaining.
+- `cargo test -p omnion-api --lib` **255/255** (was 224 and red) · `cargo test -p omnion-cdn`
+  **110/110** · `pnpm typecheck` 2/2 tasks, 0 errors · `bun build` parses `walkthrough.cjs` clean.
 - Scope predicate **re-executed**, not read (the tick-20 rule): `QA_ONLY=cdn` keeps **2 of 17**
   passes (`cdnRules`, `cdnPurges`); `QA_ONLY=organization` keeps exactly the six tenant passes; the
   core-route leak check returns `[]` for both.
-- `bun build` parses `walkthrough.cjs` clean (306 KB bundle, 1 module).
 - `grep`-level audit: **0** bare top-level pass calls remain; the two hits left
-  (`runTenantDepthFromDetail` at 3028, `organizationDepth` at 7025) are both *inside* the tenant
-  pass, whose call site is now scoped.
+  (`runTenantDepthFromDetail`, `organizationDepth`) are both *inside* the tenant pass, whose call
+  site is now scoped.
 
 **The trap inside the fix.** The five passes after `organizationDepth` drive the organization that
 pass *opens*, so scoping the parent alone leaves them reading `undefined.organizationId`. The
@@ -5137,6 +5156,7 @@ never have, because a missing summary reads like a crash and hides every finding
 missing tenant is recorded as a finding naming the reason, and the pass is skipped.
 
 **Next.** The box is still at load 20 / MemAvailable 4G / 40 Chrome, so the pass is deferred for
-the *ninth* time — but the deferral now has a fix behind it rather than a pre-flight. With the
-scope honest, a `QA_ONLY=cdn,events,webhooks` pass is roughly a fifth of a full pass, and that is
-affordable on this box. REQ-011 and REQ-005 both wait on this one green run.
+the *ninth* time — but the deferral now has a fix behind it rather than a pre-flight, and the
+merge that arrived with it is repaired and green. With the scope honest, a
+`QA_ONLY=cdn,events,webhooks` pass is roughly a fifth of a full pass, and that is affordable here.
+REQ-011 and REQ-005 both wait on that one green run.
