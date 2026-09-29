@@ -164,7 +164,11 @@ fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
+# `QA_ONLY` narrows the pass to the routes and depth passes whose name contains one of the
+# comma-separated words. It is a narrowing, not a weaker gate: what it walks is walked, clicked
+# and measured as usual, and both the summary and the report are stamped with the scope. Set it
+# when the box cannot afford a full pass — seven writers on one 32 GB host cannot each run one.
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" ${QA_ONLY:+--only "$QA_ONLY"}
 
 step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"

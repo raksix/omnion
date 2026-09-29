@@ -51,6 +51,23 @@ const STEP_MS = Number(arg("step-ms", "380"));
 const QA_PG_CONTAINER = arg("db-container", process.env.QA_PG_CONTAINER || "omnion-postgres");
 const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
 
+/**
+ * A scoped pass: walk only the routes and depth passes whose name matches.
+ *
+ * A full pass on a contended box costs eight to ten minutes of wall clock and a browser that
+ * several sibling passes are already fighting over; the pass that survives that is a pass whose
+ * tab dies halfway and whose `summary.json` carries only a `fatal` key. Seven writers on one
+ * 32 GB box cannot each afford a full pass every close tick, and "we could not run it" is what
+ * seven ticks of deferral produces — which is how an untested screen gets closed.
+ *
+ * The scope is a *narrowing*, never a weakening: the routes it keeps are walked, clicked and
+ * measured exactly as a full pass walks them, the depth passes it keeps drive their real
+ * fixtures, and the summary is stamped with the scope so a scoped artifact can never be read as
+ * a whole-repository pass. A scoped run that covers nothing is a mistake and says so loudly.
+ */
+const ONLY = (arg("only", process.env.QA_ONLY || "") || "").trim();
+const inScope = (name) => !ONLY || name.split(",").some((w) => w.trim() && name.includes(w.trim()));
+
 const CREDS = {
   name: "QA Owner",
   email: "qa-owner@omnion.test",
@@ -1061,6 +1078,10 @@ async function uploadMediaSample(page, source) {
  * never written. The error is recorded under the pass's own name so it is counted, not hidden.
  */
 async function runDepthPass(name, pass) {
+  if (!inScope(name)) {
+    log(`depth pass ${name} skipped (out of scope)`);
+    return { ok: true, steps: 0, skipped: true, reason: "out of scope" };
+  }
   try {
     return await pass();
   } catch (cause) {
@@ -6405,6 +6426,7 @@ async function main() {
   // were skipped and no report was written at all. A page that dies is a finding about that
   // page; the pages after it still have to be looked at.
   for (const route of routes) {
+    if (!inScope(route.name)) continue;
     log(`page: ${route.name}`);
     try {
       await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -6905,11 +6927,21 @@ async function main() {
     }
   }
 
+  // A scope that matched nothing is a typo, not a green pass: the run has walked no screen at
+  // all and its zero findings would sit in `summary.json` looking exactly like a clean one. Say
+  // so here, where the next reader of the artifact will see it — and *before* the severity tally,
+  // so the finding is counted rather than sitting in the list unnumbered.
+  if (ONLY && report.pages.length === 0) {
+    pushFindings("high", "qa-scope", `the scope "${ONLY}" matched no route — this pass walked nothing`);
+  }
+
   const bySeverity = { high: 0, medium: 0, low: 0 };
   for (const f of findings) bySeverity[f.severity] += 1;
 
   const summary = {
     ...report,
+    // Stamped on every artifact, so a scoped run can never be filed as a whole-repository pass.
+    scope: ONLY || "full",
     counts: {
       pages: report.pages.length,
       clicks: clicks.length,
@@ -6934,6 +6966,7 @@ async function main() {
 
   const md = [];
   md.push(`# Omnion QA walkthrough — ${report.startedAt}`);
+  if (ONLY) md.push(`> **Scoped pass** — only "${ONLY}". NOT a whole-repository result.`);
   md.push("");
   md.push(`- Admin: ${URL_ADMIN} · Web: ${URL_WEB}`);
   md.push(`- Pages walked: ${report.pages.length} · interactions: ${clicks.length} clicks, ${summary.counts.filled} fills, ${summary.counts.forms} form submissions`);
