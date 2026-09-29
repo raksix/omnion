@@ -2526,10 +2526,17 @@ fn every_emitted_name_is_in_the_catalogue() {
         .to_path_buf();
 
     let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut opaque: Vec<String> = Vec::new();
     let mut files = 0_usize;
 
     for area in ["apps", "crates", "modules"] {
-        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+        walk_rust(
+            &workspace.join(area),
+            &workspace,
+            &mut emitted,
+            &mut opaque,
+            &mut files,
+        );
     }
 
     assert!(
@@ -2540,6 +2547,17 @@ fn every_emitted_name_is_in_the_catalogue() {
         emitted.len() > 30,
         "the walk found {} emissions; the emitters are not where this test looks",
         emitted.len()
+    );
+
+    // A name the walk could not read is a name nobody has checked. Four of the platform's own
+    // events were in this position and had been for several slices: the bus recorded them, the
+    // picker never offered them, and an operator could not have subscribed even if they tried.
+    assert!(
+        opaque.is_empty(),
+        "{} computed `NewEvent::new(…)` name(s) are invisible to this test — spell the name \
+         out as a literal, or register both branches in crates/events/src/catalogue.rs:\n{}",
+        opaque.len(),
+        opaque.join("\n"),
     );
 
     let mut unlisted: Vec<String> = Vec::new();
@@ -2559,10 +2577,14 @@ fn every_emitted_name_is_in_the_catalogue() {
 }
 
 /// Collect `NewEvent::new("…")` out of every `.rs` file below `root`.
+///
+/// `opaque` collects the call sites whose name this walk could not read, so the caller can fail
+/// on them rather than pass over them in silence.
 fn walk_rust(
     root: &std::path::Path,
     workspace: &std::path::Path,
     found: &mut Vec<(String, String)>,
+    opaque: &mut Vec<String>,
     files: &mut usize,
 ) {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -2579,7 +2601,7 @@ fn walk_rust(
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name == "target" || name == "node_modules");
             if !skip {
-                walk_rust(&path, workspace, found, files);
+                walk_rust(&path, workspace, found, opaque, files);
             }
             continue;
         }
@@ -2593,6 +2615,57 @@ fn walk_rust(
         };
 
         for (index, line) in text.lines().enumerate() {
+            // The detector reads its own source, so its prose mentions `NewEvent::new(` too. A
+            // line that is a comment, or one that is a *quoted* marker rather than a call, is
+            // this test describing the rule rather than breaking it. Skipping comments is not
+            // a loophole: a computed name in a comment records nothing either, so there is
+            // nothing for the catalogue to carry.
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+
+            if let Some(rest) = line.split("NewEvent::new(").nth(1) {
+                let argument = rest.trim_start();
+
+                // A **computed** name is this walk's own blind spot, and it cost the platform
+                // six events. `NewEvent::new(if outcome.passed() { "…_passed" } else { "…_failed" })`
+                // is the most natural way to write a two-outcome fact, and a grep for
+                // `NewEvent::new("` cannot see either branch: the names it records are checked
+                // by nobody, and the picker never offers them, so an operator subscribes to
+                // nothing and no delivery is ever possible. The bus validated them happily — a
+                // name only has to be *shaped* to be recorded — which is exactly why this went
+                // unnoticed until the source test ran.
+                //
+                // The remedy is **not** "never compute a name". It is: every branch of a
+                // computed name has to be in the catalogue like any other. So the walk reads
+                // the literals the call spans and checks them exactly as it checks a direct
+                // one — which lets `media_retention.rs` keep its two-outcome emission while a
+                // branch that invents a name nobody can subscribe to still fails the gate.
+                if !argument.starts_with('"') {
+                    let names = call_names(&text, index);
+                    // A computed call with no readable name in it is still blind — the window
+                    // is deliberately small, and a future refactor that moves the branches to
+                    // their own lines would slip past a test that only checks the ones it can
+                    // see. So "I found no name here" is reported rather than treated as fine.
+                    if names.is_empty() && !path.ends_with("tests/events.rs") {
+                        opaque.push(format!(
+                            "{}:{}",
+                            path.strip_prefix(workspace).unwrap_or(&path).display(),
+                            index + 1
+                        ));
+                    }
+                    for name in names {
+                        let relative = path.strip_prefix(workspace).unwrap_or(&path);
+                        found.push((
+                            name,
+                            format!("{}:{} (computed)", relative.display(), index + 1),
+                        ));
+                    }
+                    continue;
+                }
+            }
+
             let Some(rest) = line.split("NewEvent::new(\"").nth(1) else {
                 continue;
             };
@@ -2615,6 +2688,73 @@ fn walk_rust(
             ));
         }
     }
+}
+
+/// The event names inside a call whose argument is computed rather than written out.
+///
+/// A two-outcome emission reads `NewEvent::new(if cond { "a.passed" } else { "a.failed" })`, and
+/// both literals belong to the call. The window is the call itself: from the opening parenthesis
+/// forward until parentheses balance, which is the only honest way to read a multi-line
+/// expression. A fixed line count would either truncate a formatted branch — which is how
+/// `media_retention.rs` hid `media.hold_released` from the first version of this — or read into
+/// the next call and invent a name that is not this one's.
+///
+/// The filter is the shape an event name actually has, so a string literal that is not a name
+/// (a reason, a path, a message) is dropped rather than reported.
+fn call_names(text: &str, line_index: usize) -> Vec<String> {
+    let mut lines = text.lines().skip(line_index);
+    let Some(first) = lines.next() else {
+        return Vec::new();
+    };
+    let Some(start) = first.find("NewEvent::new(") else {
+        return Vec::new();
+    };
+
+    let mut window = String::from(&first[start + "NewEvent::new(".len()..]);
+    let mut depth = 1_i32;
+    // Parentheses inside a string literal do not change the balance, and a `"("` in a detail
+    // message would otherwise unbalance the scan. Counting while ignoring quoted spans is the
+    // difference between "reads the call" and "reads something".
+    for line in lines {
+        let mut quoted = false;
+        for character in line.chars() {
+            match character {
+                '"' => quoted = !quoted,
+                '(' | '{' | '[' if !quoted => depth += 1,
+                ')' | '}' | ']' if !quoted => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return names_in(&window);
+                    }
+                }
+                _ => {}
+            }
+        }
+        window.push('\n');
+        window.push_str(line);
+    }
+    names_in(&window)
+}
+
+/// The dotted lower-case names among a call's string literals.
+fn names_in(window: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = window;
+    while let Some(open) = rest.find('"') {
+        let Some(close) = rest[open + 1..].find('"') else {
+            break;
+        };
+        let candidate = &rest[open + 1..open + 1 + close];
+        if candidate.contains('.')
+            && candidate
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
+        {
+            names.push(candidate.to_owned());
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    names
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2653,9 +2793,16 @@ fn every_live_name_has_an_emitter() {
         .to_path_buf();
 
     let mut emitted: Vec<(String, String)> = Vec::new();
+    let mut opaque: Vec<String> = Vec::new();
     let mut files = 0_usize;
     for area in ["apps", "crates", "modules"] {
-        walk_rust(&workspace.join(area), &workspace, &mut emitted, &mut files);
+        walk_rust(
+            &workspace.join(area),
+            &workspace,
+            &mut emitted,
+            &mut opaque,
+            &mut files,
+        );
     }
 
     let mut unbacked: Vec<String> = Vec::new();

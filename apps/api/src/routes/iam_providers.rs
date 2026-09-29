@@ -681,18 +681,30 @@ pub async fn test_provider(
 
         emit(
             &state,
-            NewEvent::new(if outcome.passed() {
-                "iam.provider_test_passed"
+            // Spelled as two literal branches, not one computed name. A `NewEvent::new(if …)`
+            // is invisible to the catalogue drift test, and these two events were unlisted for
+            // that reason: the bus recorded them and the picker never offered them, so nobody
+            // could subscribe to a provider test failure. Two names also let a subscriber take
+            // only the failures instead of every test it then has to filter.
+            if outcome.passed() {
+                NewEvent::new("iam.provider_test_passed")
+                    .organization(Some(provider.organization_id))
+                    .actor(Some(current.user.id))
+                    .payload(json!({
+                        "provider_id": provider.id,
+                        "kind": provider.kind.as_str(),
+                        "step": outcome.failing_step().map(|step| step.as_str()),
+                    }))
             } else {
-                "iam.provider_test_failed"
-            })
-            .organization(Some(provider.organization_id))
-            .actor(Some(current.user.id))
-            .payload(json!({
-                "provider_id": provider.id,
-                "kind": provider.kind.as_str(),
-                "step": outcome.failing_step().map(|step| step.as_str()),
-            })),
+                NewEvent::new("iam.provider_test_failed")
+                    .organization(Some(provider.organization_id))
+                    .actor(Some(current.user.id))
+                    .payload(json!({
+                        "provider_id": provider.id,
+                        "kind": provider.kind.as_str(),
+                        "step": outcome.failing_step().map(|step| step.as_str()),
+                    }))
+            },
         )
         .await;
 
@@ -740,18 +752,28 @@ pub async fn test_provider(
 
     emit(
         &state,
-        NewEvent::new(if outcome.passed() {
-            "iam.provider_test_passed"
+        // Two literal branches for the same reason as the directory ladder above: a computed
+        // name is invisible to the catalogue drift test, and these are the *only* two events a
+        // protocol provider produces.
+        if outcome.passed() {
+            NewEvent::new("iam.provider_test_passed")
+                .organization(Some(provider.organization_id))
+                .actor(Some(current.user.id))
+                .payload(json!({
+                    "provider_id": provider.id,
+                    "kind": provider.kind.as_str(),
+                    "step": failing_step,
+                }))
         } else {
-            "iam.provider_test_failed"
-        })
-        .organization(Some(provider.organization_id))
-        .actor(Some(current.user.id))
-        .payload(json!({
-            "provider_id": provider.id,
-            "kind": provider.kind.as_str(),
-            "step": failing_step,
-        })),
+            NewEvent::new("iam.provider_test_failed")
+                .organization(Some(provider.organization_id))
+                .actor(Some(current.user.id))
+                .payload(json!({
+                    "provider_id": provider.id,
+                    "kind": provider.kind.as_str(),
+                    "step": failing_step,
+                }))
+        },
     )
     .await;
 
