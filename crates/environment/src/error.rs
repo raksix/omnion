@@ -61,6 +61,17 @@ pub enum EnvironmentError {
         /// The status the promotion is actually in.
         status: String,
     },
+    /// Another promotion is already applying to this environment.
+    ///
+    /// The request's own rule ("concurrent promotions on one environment are serialized: a
+    /// second request while one is `running` is refused with a named error") needs a name, and it
+    /// cannot be `PromotionNotPending` — that names the status of *this* promotion, which is
+    /// perfectly `pending_approval` in exactly the case that matters: a second approval arriving
+    /// while the first one is writing to production.
+    PromotionAlreadyRunning {
+        /// The environment that is busy, so the panel can link to the promotion holding it.
+        environment_key: String,
+    },
     /// The store itself failed.
     ///
     /// Its own variant rather than a `Box<dyn Error>` because a store failure and a refusal
@@ -120,6 +131,11 @@ impl fmt::Display for EnvironmentError {
                 f,
                 "This promotion is “{status}” and no longer waits for approval."
             ),
+            Self::PromotionAlreadyRunning { environment_key } => write!(
+                f,
+                "Another promotion is already applying to “{environment_key}”. Wait for it to \
+                 finish, then try again."
+            ),
             Self::Store { message } => write!(f, "The environment store failed: {message}"),
         }
     }
@@ -142,6 +158,7 @@ impl EnvironmentError {
             Self::PromotionConflict { .. } => "promotion_conflict",
             Self::SelfApprovalRefused => "self_approval_refused",
             Self::PromotionNotPending { .. } => "promotion_not_pending",
+            Self::PromotionAlreadyRunning { .. } => "promotion_in_flight",
             Self::Store { .. } => "environment_store_failed",
         }
     }
