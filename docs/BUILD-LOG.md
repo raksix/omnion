@@ -345,6 +345,7 @@ removes exactly the eligible rows and a purge names the resources holding a file
   quarantine and release, retention policies with the daily worker, and the reference-based purge
   refusal — and with them the Usage and Activity tabs, which finally have rows to read.
 
+
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
 - **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
@@ -3102,6 +3103,7 @@ data source does.
 on purpose: each emitter is a `bus::emit` beside the write it already does, and the drift test
 turns "did I remember?" into a red line with a file and a line number.
 
+
 ---
 
 ## 2026-09-29 — REQ-016 slice 1 (emission half) · the gate that walked one direction
@@ -3256,128 +3258,6 @@ written, so a green run closes the slice rather than starting it. After that, sl
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
 
-### 2026-09-29 · omnion-w7 · REQ-098 closed, REQ-099 slice 1 opened
-
-**REQ-098 (Model Registry & Router) → `done`.** The two gates its closing box named as unproved
-both ran this tick: `pnpm build` exited 0 (route table listed, `ƒ Proxy (Middleware)` emitted) and
-`pnpm typecheck` is clean. The workspace suite is **70 suites, 1347 passed, 0 failed**
-(`EXIT=0`), against a **private** database — and that choice is the result, not a detail.
-
-**The first workspace run reported 13 failures and every one of them was the database.**
-`apps/api/tests/analytics.rs` panicked 13/13 at line 184, which is
-`db.migrate().await.expect("migrations must apply")`: the shared dev database is parked at
-migration **38** and cannot apply anything nine other writers have numbered since. Re-run
-byte-for-byte unchanged on a private database, the same 13 tests pass in 0.05s. Nothing in this
-request touched analytics, and the honest reading is the one the ledger has said for six ticks —
-a workspace suite on a shared database is not a verdict, it is a report on the database.
-
-**The five AI suites, individually:** `ai_hub` 14 · `ai_catalog` 11 · `ai_routing` 11 ·
-`ai_decisions` 11 · `ai_live_path` 5 — 52 walks, zero failures. The crate is at **197** unit
-tests (was 161) once REQ-099's step machine landed underneath it.
-
-**REQ-099 slice 1, first commit `0fc9fe4`.** `crates/ai-hub/src/agent.rs` — the **pure** half of
-the slice: `RunLimits` and its clamping, `StepMachine`, `AgentEvent`, `ToolCall`, the three
-vocabularies, `should_stop` and `delimit_untrusted`. Every stop condition has a failing-path test
-that fires it with values the test wrote itself, because a rule that cannot stop without a
-network, a clock or a row is a rule nobody can prove stops anything. The I/O half — provider
-call, tool execution, persistence, the SSE endpoint and the screens — is the rest of slice 1.
-**36 new tests; the crate is at 197.**
-
-**The order `should_stop` checks in is the contract.** Cancellation, loop detection, deadline,
-token budget, step cap. A run that both ran out of steps and blew its deadline on the last one
-must record one stable word, and the person who pressed stop must never be answered
-`max_steps`. `StopReason::is_failure` deliberately excludes `Cancelled` and `MaxSteps` for the
-same reason a success rate must not be gameable: a person who stopped the run stopped it.
-
-**Next.** The rest of REQ-099 slice 1 — the run store, the loop's I/O, `POST /ai/agents/{id}/runs`
-with its SSE stream, the run list and the trace screen. `ai_agents`/`ai_runs`/`ai_run_steps` want
-migrations **past** main's high-water (0051 at last fetch, re-read at commit time), not the tight
-next number.
-
-### 2026-09-29 · omnion-w7 · REQ-099 slice 1, the run store and a duplicate migration caught
-
-**The merge came first, and it was not clean.** `git merge origin/main` produced two conflicts,
-both in files a previous tick had resolved by taking "ours" wholesale. The BUILD-LOG had 22
-sections against main's 55: **30 entries belonging to other writers (REQ-006, REQ-007, REQ-010,
-REQ-021, REQ-032) had been silently dropped from this branch** and never restored. Rebuilt as
-main's file plus my `###` sections, verified by a multiset check — every main section present,
-every one of mine present, zero lines lost either way. `scripts/qa/walkthrough.cjs` had the same
-shape; the one hunk was main's event-console pass, kept.
-
-**A duplicate migration version, caught by reading `git ls-tree` instead of guessing.** main
-shipped `0052_webhook_delivery_ops.sql` while this branch already had
-`0052_ai_route_decisions.sql`. Two files claiming one version is the sqlx `VersionMismatch` that
-kills a whole suite before a single assertion runs. Renumbered this branch's four AI migrations to
-`0058`–`0061` and updated the REQ-098 prose naming them.
-
-**The gate URL in the state file was missing its password, and nobody noticed for a tick.**
-`OMNION_DATABASE_URL=postgres://omnion@127.0.0.1:5433/…` fails authentication, so every DB test
-in this branch had been *skipping* while reporting `ok`. The correct form is
-`postgres://omnion:omnion@127.0.0.1:5433/…`. Thirteen tests that read `13 passed` were twelve
-silences.
-
-**A test that fails for the wrong reason is worse than no test.** The migration checker asserted
-"this INSERT errored" and two cases were green on a *missing foreign key* rather than on the rule
-under test. Rewritten to assert on the constraint name postgres names. Then one case it was
-supposed to catch did not fire at all: a `running` run could carry `stop_reason = max_steps`,
-claiming an ending that has not happened. Added `ai_runs_reason_implies_finished`.
-
-**Two cost bugs the tests caught and the compiler could not.** The run's `cost_micros` was both
-incremented per step *and* recomputed by `finish_run` — a three-step run reported 13 599 micros
-for 3 600 of work. And `finish_run` never wrote the cost at all, so the column was always zero
-until something else touched it. The increment is gone; the cost is recomputed from the steps,
-which also makes closing a run twice idempotent.
-
-**A `Drop` impl cannot await, and a detached teardown races the binary's exit.** The first
-version of the integration harness created a throwaway database per test and never removed it,
-on the theory that a panicking test should leave evidence. Thirteen tests leaked 133 databases;
-the shared PostgreSQL went into recovery, and *other writers'* suites began skipping with
-"pool timed out". `dispose` is now explicit and awaited, and one clean run leaves zero behind.
-
-**sqlx and PostgreSQL disagree about types in four places, each found by running the code.** A
-raw `insert` sends placeholders untyped, so every nullable uuid needs `::uuid` and `temperature`
-needs `::numeric` — and putting a cast on the wrong slot fails with "cannot cast double precision
-to uuid". `numeric` does not decode into `f64`. `jsonb` does not decode into `Vec<String>` and
-has no cast to `text[]`, so it is expanded through `jsonb_array_elements_text` — with a
-`coalesce`, because `array_agg` over zero rows is NULL and every agent without tools would have
-failed to load. And `sum()` returns `bigint`, so the totals need `::int`.
-
-**Proof this tick.** `cargo test --workspace`: the only failing target is
-`-p omnion-api --test automation`, 3 tests, all `evaluated: 2, right: 1`. **Proved pre-existing
-on `origin/main`** by checking out main and re-running with none of this branch's code: identical
-3 failures. It is w3's wave, not this one. `omnion-ai-hub` 197 unit tests green.
-`apps/api/tests/ai_agent_runs.rs` 13/13, zero skips, zero leaked databases.
-`scripts/qa/agent-migration-checks.py` 27/27 rules, each asserted by constraint name.
-
-**Next.** The rest of REQ-099 slice 1: the provider call and tool execution, the runner's
-claim/heartbeat/requeue, `POST /ai/agents/{id}/runs` with SSE, the run list and the trace screen.
-
-## w7 · REQ-099 slice 1, the loop · 2026-09-29
-
-**What** — `crates/ai-hub/src/tools.rs` (the tool boundary) and `crates/ai-hub/src/loop_engine.rs`
-(the loop, behind a `Model` trait and the tool registry). `424284b`.
-
-**Proof**
-- `cargo test -p omnion-ai-hub --quiet` → **217 passed, 0 failed, 0 skipped** (197 before this
-  commit, +20). The skip count is measured, not assumed:
-  `-- --nocapture 2>&1 | grep -c skipping` reads 0.
-- `pnpm typecheck` → 2/2 packages, exit 0.
-- The run is 0.02 s. Before the fix three tests were still running at 60 s, which is how the
-  missing terminal frame was found.
-
-**Two product bugs the tests found, both fixed here**
-- The provider-failure, loop-detected and parked paths returned an `Outcome` directly and never
-  published a terminal frame. An SSE consumer that stops on `Done` held its connection open
-  until the browser gave up, then `EventSource` reconnected — the run looked like it restarted
-  itself. Every terminal path now goes through `finish()`.
-- A run that hit a cap with no answer was written `completed`, because the status came from
-  `is_failure()` alone, which deliberately excludes `Cancelled`. A parked run is its own status,
-  not a cancellation.
-
-**Next** — slice 1's remaining half: the `Model` adapter over `omnion_ai_hub::client`, the
-store-backed runner (claim with `skip locked`, heartbeat, requeue), `POST /ai/agents/{id}/runs`
-with SSE, the run list and the trace screen, then extend `scripts/qa/walkthrough.cjs`. Do **not**
-close the REQ: the QA browser pass has not run and eight acceptance boxes are still open.
 ---
 
 ## 2026-09-29 · REQ-016 slice 3 — the bus's own retention (tick 55)
@@ -3662,177 +3542,6 @@ stopped and the slice committed instead. **Next tick:** if the slot is free, run
 then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
 visited and clicked.
 
-## Tick 17 — REQ-099 slice 1, fourth commit: the real model (`9f3747f`) + main merge (`1fd72c1`)
-
-**What landed.** The loop drives a `Model` trait so a test can script answers and the route can
-dial a vendor; `provider_model.rs` is the other side of that seam. It streams a provider turn,
-reassembles the text from deltas, collects tool-call fragments and turns them into one
-`ModelAnswer`, counts usage, and maps a refusal onto a stable code. Underneath it the three
-protocol adapters learned the tool protocol end to end: declare tools, read calls out of a
-streamed answer, pair a result with the assistant turn that asked, and refuse to grow a
-call's arguments without bound. `Tool::schema()` exists because a declaration with empty
-properties tells the model to call the tool with `{}` and it then invents a value the tool never
-receives — the "empty declaration" default was silently wrong, not merely incomplete.
-
-**Two product bugs found and fixed while proving it.**
-
-- *A tool-only turn has no text and often no finish reason.* Read as "the provider sent
-  nothing", it ended the run on step one, before the first tool had run.
-- *The pairing handle has to survive the loop.* A result quoting a call id the provider never
-  issued is a `400`, not a missing fact; `RequestedCall.id` now travels with the call from the
-  provider's own handle, and a scripted call with none gets a generated one.
-
-**Proof.**
-
-- `cargo test -p omnion-ai-hub` → **240 passed, 0 failed** (was 217; +23)
-- `cargo test -p omnion-api --test ai_agent_runs` → **13 passed**
-- `cargo test -p omnion-core` → **39 passed**; `cargo build -p omnion-api` → clean
-- `pnpm typecheck` → 2/2 successful
-- Commits: `9f3747f`, `1fd72c1`
-
-**The merge, and a disk that lied.** `origin/main` had moved 18 commits and conflicted in
-`crates/core/src/config.rs`, where this branch's `AiHubConfig` and main's `CsrfSecret` were
-inserted at the same point — two *whole items*, so the resolution is both in full (verified:
-all 15 structs present, `git diff --stat` = +112 / −0 against main).
-
-Mid-resolution, `/mnt/apopic` hit **100%** and `config.rs` was truncated from 1451 to 865
-lines — a silent write that looked like a merge mistake. Recovery that worked: `git merge-file`
-into `/tmp`, then slice by *line index* (the earlier attempt dropped the 585 lines before the
-conflict and still "looked" plausible), install byte-for-byte, and let `cargo build` be the
-authority — it named the real defect, that the single shared `}` after the marker closes one
-impl where both insertions need one.
-
-**Next.** The store-backed runner (claim with `for update skip locked`, heartbeat, requeue past
-120 s, `OMNION_AI_RUNNER=false`), then `POST /ai/agents/{id}/runs` as SSE, then the run list
-and trace screens and `scripts/qa/walkthrough.cjs`. **Do not close REQ-099** — no browser pass
-has run on any of it and ten acceptance boxes are open.
-
-
-## Tick 18 — REQ-099 slice 1, commits five to seven: the runner and the surface (`2e0a30d`, `011654d`, `30eefc9`, `cf2368d`)
-
-**What landed.** The background worker and everything that talks to it. `run_store` grows the
-five queries a queue needs — `claim_next_run` (`for update skip locked`, the status change in
-the same transaction), `claim_run` by id, `heartbeat`, `requeue_stale`, `park_run`.
-`apps/api/src/ai_agent_runner.rs` is the worker: a 250 ms tick claims at most one run per free
-slot up to `OMNION_AI_RUNNER_CONCURRENCY`, a 60 s sweep hands dead workers' runs back, and
-`main.rs` spawns it beside the workflow runner on its **own** switch, because it is the one
-background task that spends money. `apps/api/src/routes/ai_agents.rs` is the surface: the agents
-CRUD, the run history, `POST /ai/agents/{id}/runs` as a live event stream, the SSE re-attach,
-cancel and resume — plus three new permission keys, and the walkthrough now visits `/ai/agents`
-and `/ai/runs`.
-
-**Three product bugs, all found by the tests rather than by reading.**
-
-- *A single-statement CTE claim does not run.* `with candidate as (...) update ai_runs ... from
-  candidate` puts two relations in scope, so every bare column in the returning list resolves
-  against both and PostgreSQL answers `column reference "id" is ambiguous` **before the
-  statement starts**. The fix is not cosmetic: the `for update skip locked` half is exactly the
-  part that must not be a separate transaction, so the selection was split out and closed in the
-  *same* transaction as the update.
-- *An empty queue is not a failed claim.* `fetch_one` over `limit 1` is `RowNotFound` when there
-  is nothing to take, and a caller reading that has to decide whether it is a database problem.
-  `fetch_optional` makes "there was no work" an ordinary answer — a runner whose poll logs an
-  error every time it is idle is a runner that trains the operator to ignore its log.
-- *The unique index, not the handler, is what stops a double Run.* A walk that needed two runs
-  for one agent was quietly relying on the opposite of the guarantee; the migration's partial
-  index refused it, and the test now asserts *that* instead of working around it.
-
-**Proof.**
-
-- `cargo build -p omnion-api` → clean (zero errors, zero warnings from the new files)
-- `cargo test -p omnion-ai-hub` → **240 passed**
-- `cargo test -p omnion-core` → **40 passed** (39 + the runner's own switch and concurrency)
-- `cargo test -p omnion-permissions` → **62 passed**
-- `cargo test -p omnion-api --test ai_agent_runs` → **18 passed** (was 13; +5 for the claim, the
-  by-id claim, the reaper, the park-and-resume and the one-active-run index)
-- `pnpm typecheck` → 2/2 successful
-- Commits: `2e0a30d`, `f605397`, `8b1db92`, `011654d`, `30eefc9`, `cf2368d`, `6161b37`
-
-**Still open, and named rather than written off.** The run list and trace **screens** do not
-exist; the walkthrough visits the two list routes, which exist, and no screen has had a browser
-pass. Two acceptance boxes were ticked because their proof is a command rather than a screen —
-the resume refusals and the interrupted-run requeue — and the rest stay open. **Do not close
-REQ-099.**
-
-**Next.** The `/ai/agents` and `/ai/runs` screens in the panel (list, detail, create/edit/delete,
-empty and populated states, the run sheet, the step accordion with arguments behind a tap), then
-`/ai/agents/[id]` and `/ai/runs/[id]`, then a QA pass over both with the walkthrough clicking the
-rows it walks.
-
-
-## Tick 19 — REQ-099 slice 1, commits eight and nine: the panel (`91bf56e`, `490c7c4`)
-
-**What landed.** The five screens the HTTP surface was missing, plus the walkthrough pass that
-drives them. `lib/api.ts` gains the agent runtime's client (fourteen calls and two stream
-readers); `features/ai/ai-agents-list.tsx`, `agent-form.tsx`, `ai-runs-list.tsx`,
-`ai-run-detail.tsx` and the shared `run-sheet.tsx`; five routes under `app/ai/`; and two sidebar
-entries. The routes land beside `/ai` in the shell rather than inside it, because the two
-screens answer two different questions and an operator reads them in that order: *what may I let
-this do* (the configuration) and *what did it already do, and what did that cost* (the history).
-
-**Four decisions the panel forced that the route did not have to make.**
-
-- *A duplicate is born disabled.* The copy button writes a real row — same prompt, same tools,
-  same limits, `-copy` suffixed key with a counter for the collision — and `enabled: false`. A
-  copy that can spend money the moment it is created is a second thing nobody has decided about
-  yet, and "Duplicate" is the button people press fastest.
-- *The model picker drops models that cannot call tools once the tool list is non-empty.* The
-  runtime refuses that pairing (`agent.approval_not_allowed` has the same shape of problem), and
-  an agent with tools pinned to a tool-less model is an agent whose every run ends in a provider
-  error. The select's own hint says why the list shrank, so the missing models read as a rule
-  rather than as a bug.
-- *The key box is disabled after create, not hidden, and the reason is printed above it.* The
-  key appears in URLs and in workflow node configuration, so it cannot change; a missing field
-  reads as a bug, a read-only one with the reason stated reads as a decision.
-- *A 409 is an answer, not an error.* The API hands back the **existing** run's id because the
-  one-active-run partial unique index is the guarantee; a double-pressed Run is the normal case,
-  not the exceptional one. The sheet therefore offers "watch that run" rather than a red banner
-  at somebody who did nothing wrong.
-
-**The trace's redaction is the store's, not a second rule.** The arguments behind a step are
-whatever `run_store::redact_arguments` wrote before the row existed. A client-side copy of the
-rule is a second answer to "which keys are secret" that can disagree with the first, and the
-person reading the trace is not the agent's author — so the panel shows the redaction and does
-not re-derive it.
-
-**And the re-attach is a replay, which is what makes the acceptance box measurable.**
-`/ai/runs/[id]` tails `GET /runs/{id}/events` while the run is going, and that endpoint reads
-the *step rows*. The same rows produce the live stream and the reloaded trace, so "replay matches
-SSE" is a comparison rather than a promise.
-
-**Proof.**
-
-- `pnpm typecheck` (`apps/admin` `tsc --noEmit`) → clean, 0 errors
-- `node --check scripts/qa/walkthrough.cjs` → clean
-- `cargo test -p omnion-ai-hub --lib` → **240 passed**
-- `cargo test -p omnion-api --test ai_agent_runs` → **18 passed**
-- Commits: `91bf56e`, `490c7c4`
-
-**The walkthrough, and why its assertions are about position.** A route walked by path proves
-its empty state renders and nothing else, so `runAiAgentsDepth` asks the questions instead: is
-the key refusal **in its field** (position, not existence — a banner at the top is where a reader
-fixes the wrong input), does the tool column actually say "approvals: 1", is the 409 offered as
-a link, are the trace's arguments behind a tap and do they open when tapped, and is the key box
-disabled after create. The two refusals it provokes are registered with
-`expectRefusal`, so a 500 inside their windows is still a finding — a form filled with
-placeholders should be rejected, not crash the API.
-
-**Not done, and named rather than written off.** The **Skills tab, the Runs tab and the Workspace
-tab** are absent on purpose: the workspace needs `ai_agent_files` and the object storage it
-indexes, which is slice 2's migration, and a tab that lists nothing is a tab that lies. The
-loop-level deadline / token-budget / cancellation tests, the output-verification helper, the
-guardrail bus events and the SDK example are all still open. **Do not close REQ-099** — nine
-acceptance boxes are unticked and no browser pass has run over the new screens yet.
-
-**The QA pass did not run this tick, and the reason is worth recording.** The box was at load
-average **25.5** with 4 GB available and 25 GB of swap already spent, one browser pass holding the
-single QA slot and ten Chromium processes alive. That is precisely the condition the resource
-guard was installed for after the 2026-09-28 death spiral, and a second pass would have turned a
-slow tick into a crashed one. The pass is the *next* tick's first step, and the code it will
-exercise is committed, typed and `node --check`-ed — so nothing is left half-written for it.
-
-**Next.** The QA pass over the new screens (the private `w7` stack), then the loop-level stop
-tests with the `ScriptedModel::slow` seam, then slice 2's migration and the workspace.
 ---
 
 ## Tick 59 — the CSRF layer was guarding a platform that could not save
@@ -3906,6 +3615,7 @@ exist, and neither slice 1 nor slice 2 has a browser pass — the QA slot has be
 sibling passes for three consecutive ticks. **Next tick:** build the `/security/headers` screen and
 extend `scripts/qa/walkthrough.cjs` so it is visited and clicked; then run the pass and tick the
 screen boxes for both slices.
+
 # Tick 60 — the blocker was a story, not a fact
 
 Two ticks of this loop wrote into `docs/BUILD-LOG.md` and into the REQ-012 status line that
@@ -4124,7 +3834,6 @@ slot's holder was alive at load 14 with 4 GB free, so it waits rather than forci
 
 **Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
 middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.
-
 ## Tick 21 — REQ-099 slice 2 closed out: the run's named inputs, the SDK, and two defects that only ran now
 
 Three atomic commits: `4ae90e7` (the SDK), `acd2683` (two defects), `a9919e5` (the run inputs).
@@ -4213,3 +3922,95 @@ agent aggregate. The QA pass is deferred: at tick time the box was at load 117 w
 processes and three sibling passes holding the single slot, so a fourth pass was not the way
 to spend it. `runAiSkillsDepth` is written and registered and has **not yet run**; the API
 answers 404 for its selectors until it does.
+## Tick 63 — REQ-010 slice 2's last open item: the serve path answers a window
+
+**What.** HTTP range requests, the one line REQ-010 has carried as "still open" since slice 2:
+a media player could not seek, because every read path answered the whole object whatever the
+client asked for. `crates/media/src/ranges.rs` decides the window; `get_range` on both storage
+drivers does the windowing; `read_window` on the serve paths wires it up.
+
+**Proof.**
+
+- `cargo test -p omnion-media --lib` → **199** (was 179; 20 new — 19 for the planner, 1 for the
+  total-not-the-window assertion the walk forced).
+- `cargo test -p omnion-storage --lib` → **28** (was 22; 6 new).
+- `cargo test -p omnion-security --lib` → **137**, `-p omnion-api --lib` → **220** — both unchanged
+  and green against the storage error variant and the API error mapping.
+- `cargo test -p omnion-api --test media` → **15** walks, **0 failures**, over the real router and
+  the real object store. One new walk; the other thirteen were unreachable before this tick.
+- `--test media_transform`, `media_shares`, `media_scan`, `media_duplicates`, `media_grants`,
+  `media_retention`, `media_settings`, `media_usage` — green against the serve paths this touches.
+- `apps/admin` `tsc --noEmit` — clean.
+
+**The defect only the walk could find.** The first `Content-Range` derived its *total* from the
+bytes that arrived, so a fifty-byte window out of a three-hundred-byte object answered
+`bytes 100-149/50` — a header whose total is smaller than its own end offset, which a player reads
+as "this file is fifty bytes long" and stops. Nineteen unit tests accepted it, because a unit test
+can only see the number it handed in. Only a walk that uploads 300 bytes and asks for 50 can see
+that the two halves come from different facts, so `RangePlan::Partial` now carries the total beside
+the window.
+
+**Two pre-existing red gates, both from the security ticks, were in the way.** A suite that cannot
+reach its first assertion proves nothing, so both are fixed here.
+
+1. **CSRF.** Sign-in made the session cookie *ambient* authority, so every cookie-authenticated
+   write needs a token. The media suite's login took `.split(';').next()` — correct for one cookie
+   and silently dropping every cookie after it — so all fifteen walks died on `csrf_unavailable`,
+   a message that names the server's configuration rather than the suite's own loss of the token.
+   The harness now keeps every `Set-Cookie`, and a write echoes the token in `x-omnion-csrf` the
+   way a browser does. That last part is not decoration: the middleware reads the header first, so
+   a suite that set only the cookie was testing the *fallback* while believing it tested the normal
+   path.
+2. **The rate limiter.** It is a process-wide cell filled from the *stored* document, and the
+   stored `sign_in` scope is ten requests per five minutes. The suite signs in three accounts per
+   walk and runs fifteen walks, so the eleventh sign-in was refused and every walk after it died on
+   a line that has nothing to do with media. The suite now installs a budget of its own — only the
+   `sign_in` scope is raised, because the limiter suite asserts its own numbers and the other
+   ceilings are the ones a deployment ships.
+
+**Two more worth keeping.** The disk was at **100 %** (11 MB free) when this tick started, which is
+a hard blocker: `write_file` returns success with a zero-byte file and `git commit` reports "No
+space left on device" while `git status` looks fine. The repo's own `scripts/qa/disk-guard.sh`
+freed 1.7 GB and, importantly, did it *without* deleting a target a live build was writing into —
+which is the reason that script reads `CARGO_TARGET_DIR` out of each process's own environment
+rather than guessing from a directory name. And the toolchain linter runs a bare `rustc` with no
+edition, so every `async fn` in the crate reads as an error; `cargo` is the only authority, and a
+linter error is not a build failure.
+
+**Next.** (a) The **browser pass is still queued** — `qa-slot.sh` caps the box at one concurrent
+pass and the holder is alive at load 64 with ~2 GB free, which is the 2026-09-28 OOM state. It waits
+rather than forcing. `runMediaRetention` and `runSecurityDepth` are written and wired into
+`scripts/qa/walkthrough.cjs`; both are unrun, which is the only reason REQ-010 and REQ-012 stay
+open. (b) REQ-010's remaining open line is the *replace* audit entry, which lands with slice 3's
+CDN purge hook. (c) REQ-012's other half: the sign-in route still does not call
+`evaluate_lockout`, so nothing has ever locked an account.
+
+**Commits:** `569fa99` the range planner · `b52f6c7` the crate export · `eecb42e` the storage window
+· `42090c7` the serve paths · `224dd5a` the walk and the two unblocked gates. Pushed.
+
+### Blocker found and left in place — the CSRF/rate-limit gate is repo-wide, not media's
+
+Running the eight sibling media suites after this tick's change showed **all eight red**: 28 walks
+on `rate_limited` and 15 on `csrf_unavailable`. The cause is the same two gates fixed in
+`--test media` above, and the fix belongs to the security work, not to this slice:
+
+- **20 suites** carry an identical `login()` helper that takes `.split(';').next()` and therefore
+  discards the CSRF cookie sign-in now issues. Every cookie-authenticated write in every one of
+  them is refused. `apps/api/tests/csrf.rs` shows the working pattern (set `config.csrf` from the
+  fixture, keep every `Set-Cookie`, echo the token in `x-omnion-csrf`).
+- The same twenty suites share one process-wide limiter cell fed from the stored `sign_in` scope
+  of ten per five minutes, which a multi-walk suite exhausts on its own sign-ins.
+
+**Proved pre-existing, not a regression from this tick:** on committed `main` (`224dd5a`, this
+tick's own work already pushed), `cargo test -p omnion-api --test media_shares` fails `0 passed;
+5 failed` with the same `csrf_unavailable` / `rate_limited` pair — and `media_shares` is a file this
+tick did not touch. A suite in another wave's scope is left as it was found.
+
+**What this tick can and cannot claim.** The range slice is proved by the gates that do run:
+`--test media` at **15 walks, 0 failures**, `omnion-media --lib` **199**, `omnion-storage --lib`
+**28**, `omnion-security --lib` **137**, `omnion-api --lib` **220**, and `apps/admin` typecheck
+clean. The eight sibling suites could not be used as a regression check, because they were already
+red before this tick and are red for a reason that has nothing to do with ranges. That is a weaker
+claim than "the whole media surface is green", and it is the honest one: the serve paths this tick
+touched are covered by the walk in `--test media`, which exercises them through the real router
+and the real object store.
