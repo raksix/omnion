@@ -390,19 +390,22 @@ async fn copy_area(
             .await
             .map_err(store_err)?;
 
+            // `update … set … from` puts the target in scope for the WHERE clause but not for
+            // the join conditions of the FROM list, so the staging page is reached by its own
+            // filter and the join to production happens on the *other* side. The revision link
+            // is by `(page, revision_no)` because both revisions got fresh ids.
             sqlx::query(
                 "update pages dst set published_revision_id = rev.id \
                  from page_revisions rev \
-                 join pages src on src.site_id = dst.site_id \
-                             and src.environment_id = $2 \
-                             and src.slug = dst.slug \
-                 join page_revisions srev on srev.page_id = src.id \
-                 where rev.page_id = dst.id and rev.revision_no = srev.revision_no \
-                   and src.published_revision_id = srev.id \
-                   and dst.environment_id = $2",
+                 join page_revisions srev on srev.revision_no = rev.revision_no \
+                 join pages src on src.id = srev.page_id and src.environment_id = $2 \
+                 where rev.page_id = dst.id \
+                   and dst.environment_id = $1 \
+                   and dst.site_id = src.site_id and dst.slug = src.slug \
+                   and src.published_revision_id = srev.id",
             )
-            .bind(source)
             .bind(target)
+            .bind(source)
             .execute(&mut *tx)
             .await
             .map_err(store_err)?;

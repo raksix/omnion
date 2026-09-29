@@ -276,6 +276,40 @@ async fn login(state: &AppState, email: &str) -> Caller {
     Caller { session, csrf }
 }
 
+/// Run *this* environment's pending clone job to completion.
+///
+/// The tempting version is a loop over the worker's own `claim_next_job`, and it is wrong in a
+/// way only a shared database shows: the claim is global, so with two walks running the walk
+/// whose job is not oldest claims somebody else's, and either runs it (a cross-tenant side
+/// effect from a test) or puts it back and spins forever against a peer that keeps creating new
+/// pending jobs. Both happened here.
+///
+/// So the walk claims *its own* job by id — the same row the create returned, which is the
+/// artifact the walk is actually about — and hands it to the same runner the worker uses. The
+/// runner is still exercised; only the global queue is bypassed, and that is a property of the
+/// harness, not of the code under test.
+async fn drain_clone_for(db: &Db, environment_id: Uuid) {
+    let job: Option<omnion_environment::store::CloneJobRow> = sqlx::query_as(
+        "select j.id, j.environment_id, j.status, j.areas, j.items_total, j.items_done, \
+                j.area_counts, j.exclude_archived, j.error, j.started_at, j.finished_at, \
+                j.created_by, j.created_at \
+         from environment_clone_jobs j \
+         where j.environment_id = $1 and j.status in ('pending','running') \
+         order by j.created_at desc limit 1",
+    )
+    .bind(environment_id)
+    .fetch_optional(db.pool())
+    .await
+    .expect("reading this environment's job must not fail");
+
+    let Some(job) = job else {
+        panic!("{environment_id} has no open clone job to run");
+    };
+    omnion_environment::runner::run_job(db.pool(), &job)
+        .await
+        .expect("the clone runner must not fail");
+}
+
 struct Fixture {
     state: AppState,
     db: Db,
@@ -460,17 +494,7 @@ async fn the_list_carries_real_per_area_counts_after_the_clone_finishes() {
     let created = fixture.create_staging("Staging", "staging-2").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
 
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
 
     let response = call(
         &fixture.state,
@@ -512,34 +536,45 @@ async fn a_clone_copies_content_and_leaves_production_byte_identical() {
 
     let created = fixture.create_staging("Staging", "staging-2").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
 
-    // The staging copy exists...
-    let staging_copy: i64 =
-        sqlx::query_scalar("select count(*) from pages where id = $1 and environment_id = $2")
-            .bind(page)
+    // The staging copy exists, and it is a *different row*: migration 0148 gave the page's
+    // natural key an environment, so the copy has its own id. Asserting that the production id
+    // survived into staging would be asserting the design this migration removed.
+    let staging_copy: i64 = sqlx::query_scalar(
+        "select count(*) from pages where site_id = $1 and slug = 'shared' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(staging_copy, 1, "the page was copied into staging");
+
+    let staging_id: Uuid =
+        sqlx::query_scalar("select id from pages where environment_id = $1 and slug = 'shared'")
             .bind(environment_id)
             .fetch_one(fixture.db.pool())
             .await
             .unwrap();
-    assert_eq!(staging_copy, 1, "the page was copied into staging");
+    assert_ne!(
+        staging_id, page,
+        "a staging page is its own row, not a second environment id on the production one"
+    );
+    // Its revision came with it, re-linked to the copy rather than to the source.
+    let revisions: i64 = sqlx::query_scalar(
+        "select count(*) from page_revisions where page_id = $1",
+    )
+    .bind(staging_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(revisions, 1, "the copy carries its own revision history");
 
-    // ...and editing it does not touch production. `updated_at` is compared rather than a
-    // content hash because it is the column the Changes diff reads, so this is the same
-    // comparison the promotion path will make.
-    sqlx::query("update pages set slug = 'shared-edited', updated_at = now() where id = $1 and environment_id = $2")
-        .bind(page)
-        .bind(environment_id)
+    // ...and editing it does not touch production. The production row is found by its own id,
+    // which the copy no longer shares.
+    sqlx::query("update pages set slug = 'shared-edited', updated_at = now() where id = $1")
+        .bind(staging_id)
         .execute(fixture.db.pool())
         .await
         .unwrap();
@@ -568,17 +603,7 @@ async fn a_clone_is_idempotent() {
     let created = fixture.create_staging("Staging", "staging-2").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
 
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
     let after_first: i64 =
         sqlx::query_scalar("select count(*) from pages where environment_id = $1")
             .bind(environment_id)
@@ -600,17 +625,7 @@ async fn a_clone_is_idempotent() {
     .await;
     assert_eq!(reclone.status, StatusCode::ACCEPTED, "body: {}", reclone.body);
 
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
 
     let after_second: i64 =
         sqlx::query_scalar("select count(*) from pages where environment_id = $1")
@@ -620,7 +635,8 @@ async fn a_clone_is_idempotent() {
             .unwrap();
     assert_eq!(
         after_second, after_first,
-        "re-cloning must not duplicate rows"
+        "re-cloning must not duplicate rows -- the second run empties the environment first, \
+         and the natural key refuses a second copy of the same slug"
     );
 }
 
@@ -631,17 +647,7 @@ async fn a_reclone_refuses_until_the_operator_confirms_what_is_discarded() {
     };
     let created = fixture.create_staging("Staging", "staging-2").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
     // Put a row in staging that production does not have: that is the work at risk.
     sqlx::query(
         "insert into pages (site_id, slug, environment_id) values ($1, 'staging-only', $2)",
@@ -774,17 +780,7 @@ async fn archiving_releases_the_host_and_keeps_the_content() {
     let host = created.body["staging_host"].as_str().unwrap().to_string();
     assert!(!host.is_empty());
 
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
 
     let archived = call(
         &fixture.state,
@@ -817,8 +813,6 @@ async fn a_second_open_clone_is_refused_with_the_running_job_named() {
     };
     let created = fixture.create_staging("Staging", "staging-2").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
-    let first_job = created["clone"]["id"].as_str().unwrap().to_string();
-
     // The first job is still pending, so the second request must be refused — by the database's
     // partial unique index, which is the only version that survives two requests at once.
     let second = call(
@@ -1078,17 +1072,7 @@ async fn the_detail_screen_carries_the_history_and_the_estimate() {
     let created = fixture.create_staging("Staging", "staging-2").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
 
-    for _ in 0..20 {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            break;
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap();
-    }
+    drain_clone_for(&fixture.db, environment_id).await;
 
     let response = call(
         &fixture.state,
@@ -1209,7 +1193,7 @@ async fn the_audit_trail_records_the_create_the_clone_and_the_archive() {
     assert_eq!(archived.status, StatusCode::OK);
 
     let actions: Vec<String> = sqlx::query_scalar(
-        "select action from audit_entries where target_id = $1 order by created_at asc",
+        "select action from audit_log where target_id = $1 order by created_at asc",
     )
     .bind(environment_id.to_string())
     .fetch_all(fixture.db.pool())
@@ -1259,18 +1243,20 @@ async fn a_session_survives_a_clone_that_copies_nothing() {
     let created = fixture.create_staging("Empty", "empty").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
 
-    let outcome = {
-        let Some(job) = omnion_environment::store::claim_next_job(fixture.db.pool())
-            .await
-            .unwrap()
-        else {
-            panic!("the create must have opened a job");
-        };
-        omnion_environment::runner::run_job(fixture.db.pool(), &job)
-            .await
-            .unwrap()
-    };
-    assert_eq!(outcome.status, CloneStatus::Done, "{}", outcome.summary());
+    drain_clone_for(&fixture.db, environment_id).await;
+    let outcome_status: String = sqlx::query_scalar(
+        "select status from environment_clone_jobs where environment_id = $1 \
+         order by created_at desc limit 1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the job row must be there");
+    assert_eq!(
+        omnion_environment::model::CloneStatus::parse(&outcome_status),
+        Some(omnion_environment::model::CloneStatus::Done),
+        "a clone with nothing to copy still finishes"
+    );
 
     let after = call(
         &fixture.state,
@@ -1283,8 +1269,12 @@ async fn a_session_survives_a_clone_that_copies_nothing() {
     )
     .await;
     assert_eq!(after.status, StatusCode::OK);
+    // A clone that copied nothing is still a *finished* clone: the environment is usable and
+    // says so. A status that stayed `cloning` would leave the operator with no way to tell
+    // "still working" from "finished, nothing to copy".
     assert_eq!(after.body["environment"]["status"], "active");
     assert_eq!(after.body["environment"]["content"]["total"], 0);
+    assert_eq!(after.body["jobs"][0]["status"], "done");
 }
 
 #[tokio::test]
@@ -1303,9 +1293,30 @@ async fn the_session_belongs_to_the_caller_not_to_the_environment() {
     )
     .await;
     assert_eq!(me.status, StatusCode::OK);
-    assert_eq!(
-        me.body["organization_id"],
-        fixture.organization.to_string(),
-        "the same organization as before"
-    );
+    // The same session still answers, and it still sees its own organization -- proved through
+    // the environment list rather than a field on `/me`, because the list is what a staging
+    // environment could have leaked out of.
+    let list = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            "/api/v1/environments",
+            Some(&fixture.caller),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK, "body: {}", list.body);
+    let rows = list.body["environments"].as_array().expect("an array");
+    // Production and the staging copy this walk created — both of the caller's own organization
+    // and nothing else. The count is a side effect of the walk, not the point: the point is
+    // that every row carries the caller's organization and no other tenant's.
+    assert_eq!(rows.len(), 2, "production plus the staging environment");
+    for row in rows {
+        assert_eq!(
+            row["organization_id"],
+            fixture.organization.to_string(),
+            "a staging environment must not carry another tenant's rows"
+        );
+    }
 }
