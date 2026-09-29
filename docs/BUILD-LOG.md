@@ -121,7 +121,6 @@ browser pass, and the next tick runs it first.
 `media_references` and an activity read, and the reference rows the repair scan now
 maintains are what finally give them rows to read. Then slice 4 closes and the queue
 moves to REQ-021 (notification centre), the first untouched item in wave 1.
-
 ## 2026-09-28 — REQ-010 slice 4 (scanning half + grants half) · the access layer, and a red that had been hiding for four ticks
 
 build media: folder and file grants, with a deny that wins at any depth
@@ -207,7 +206,6 @@ red), `--test media_shares` → **5**, `--test media_scan` unchanged. `apps/admi
 log, and reference-based purge refusal plus the repair scan — which is also what
 finally gives the Usage and Activity tabs rows to read. Done when a retention run
 removes exactly the eligible rows and a purge names the resources holding a file.
-
 ## 2026-09-28 — REQ-010 slice 3 (four fifths) · duplicates, and the row that survives the merge
 
 - **What shipped.** **`0038_media_duplicates.sql`**, `crates/media/src/duplicates.rs`,
@@ -282,8 +280,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   Slice 4 then brings folder and file grants with inheritance, the scanning pipeline with
   quarantine and release, retention policies with the daily worker, and the reference-based purge
   refusal — and with them the Usage and Activity tabs, which finally have rows to read.
-
-
 ## 2026-09-28 — REQ-006 slice 4b-2 · a live provider, and the four defects only a live provider shows
 
 - **What shipped.** **`87390ff`** — `apps/api/tests/support/stub_idp.rs`, a real identity provider
@@ -349,14 +345,12 @@ removes exactly the eligible rows and a purge names the resources holding a file
 
 > Cross-tick memory for the **`omnion-build`** loop. Newest entries at the bottom. 3-5 lines
 > per entry: phase · what got done · proof (command + result) · next.
-
 ## 2026-09-25 — Loop bootstrap (chat session)
 
 - Build phase opened by owner directive: Lokma-style loop, start building; code first, deploy later (dev target: omnion.fermag.com.tr).
 - Created: `docs/BUILD-BACKLOG.md` (P00→P14 + gated P-DEP) + this log + `omnion-build` cron loop (pinned model).
 - Toolchain status: node 22 ✓ · pnpm 11 ✓ · bun ✓ · docker 29 ✓ · gcc 13 ✓ · **Rust NOT installed → P00 installs rustup**.
 - Next: **P00 — Toolchain + repo skeleton.**
-
 ## 2026-09-25 — P00 · Toolchain + repo skeleton
 
 - Rust toolchain installed via rustup (minimal, stable): `cargo 1.98.1` · `rustc 1.98.1`.
@@ -374,7 +368,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - CI on GitHub: workflow run `36193827205` → **success** (jobs: `Rust — fmt · clippy · test` ✅ · `Infra — compose config` ✅).
 - Repo note: this clone's `origin` moved to the SSH URL — the stored OAuth token has no `workflow` scope, so over HTTPS GitHub rejects any commit touching `.github/workflows/`.
 - Next: **P01 — Core foundations** (typed env config + tracing subscriber + shared error type, sqlx/Postgres pool + `database/migrations/0001_initial.sql`, `GET /readyz` with DB + Redis pings).
-
 ## 2026-09-25 — P01 · Core foundations
 
 - `crates/core` gained the shared infrastructure layer: typed `config` (OMNION_* keys, `PORT` fallback,
@@ -409,7 +402,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `/readyz`, then `shutdown signal received` after SIGTERM.
 - Next: **P02 — Identity v0** (users + argon2, sessions, login/logout, first-admin bootstrap,
   integration tests).
-
 ## 2026-09-25 — P02 · Identity v0
 
 - New crate `crates/identity` (docs/07-IAM.md subset): `users` (create/find by email or id,
@@ -445,7 +437,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   against the service containers) · `Infra — compose config` ✅ (4s).
 - Next: **P03 — IAM v0** (roles, permissions, role bindings, `require(permission)` guard, audit
   writes, role seeds from docs/07 §3).
-
 ## 2026-09-25 — P03 · IAM v0
 
 - New crate `crates/permissions` (docs/07-IAM.md): the permission catalogue (32 keys across
@@ -487,7 +478,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   the resolved effective set) · `Infra — compose config` ✅.
 - Next: **P04 — Tenancy v0** (organizations, sites, domains + CRUD API, scope enforcement,
   cross-tenant denial tests).
-
 ## 2026-09-25 — P04 · Tenancy v0
 
 - Migration `0003_tenancy.sql` (docs/01-VISION.md §10, docs/07-IAM.md §7): `sites` (one property
@@ -544,7 +534,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `Infra — compose config` ✅.
 - Next: **P05 — Content v0** (pages + revisions, draft/published, publish/restore, slug rules,
   translations skeleton).
-
 ## 2026-09-25 — P05 · Content v0
 
 - New crate `crates/content` (docs/05-VERSIONING.md §4–§7, docs/01-VISION.md §5, §7): `pages`
@@ -584,7 +573,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: **P06 — Admin app v0** (`apps/admin` Next.js + TS + Tailwind with the API-wired login,
   app shell, pages list and site switcher; root `package.json` + `pnpm-workspace.yaml` +
   `turbo.json` skeleton).
-
 ## 2026-09-25 — P06 · Admin app v0
 
 - The JavaScript/TypeScript side of the monorepo is alive: root `package.json` +
@@ -622,7 +610,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   password on `/api/v1/auth/login`). Screenshot: `/tmp/omnion_p06_pages.png`.
 - Next: **P07 — Public web v0** (`apps/web` server-side renderer for published pages + the
   `themes/minimal` stub, `GET /:slug` renders).
-
 ## 2026-09-25 — P07 · Public web v0
 
 - The platform now *serves* a site, not just manages one. `crates/identity` gained
@@ -670,7 +657,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   unpublished=404`) · `Infra — compose config` ✅.
 - Next: **P08 — Media v0** (`crates/storage` S3/MinIO abstraction, upload endpoint, media table and
   the public serve path).
-
 ## 2026-09-26 — P08 · Media v0
 
 - `crates/storage` (`omnion-storage`): the object-storage abstraction behind the media library —
@@ -730,7 +716,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `object store: 200`) · `Infra — compose config` ✅.
 - Next: **P09 — Workflow engine v0** (`crates/workflows`: durable step store, background runner,
   step retries with backoff, wait-sweeper, manual + schedule triggers).
-
 ## 2026-09-26 — P09 · Workflow engine v0
 
 - `crates/workflows` (`omnion-workflows`): the durable step engine behind the automation surface
@@ -807,7 +792,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   error). Sweep the suite's own prefix once per process (`OnceCell`) before fixtures appear, and
   keep the test runner's lease longer than any test step so the reclaim path only fires in the
   walk that asks for it.
-
 ## 2026-09-26 — P10 · Onboarding v0 (REQ-050)
 
 - `crates/onboarding` (`omnion-onboarding`): the first run of an installation as one flow both
@@ -881,7 +865,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Two walks that share a table-wide repair pass cannot run at once: `engine::sweep` is
   deliberately global, so the workflow suite now holds a walk lock — determinism is worth the
   extra ~17 s of serial runtime, and a flake that fails 4 of 5 runs is a bug, not weather.
-
 ## 2026-09-26 — P11 · AI Hub v0 (docs/06)
 
 - New crate `crates/ai-hub` (`omnion-ai-hub`) — the platform's single door to AI. `model.rs` holds
@@ -970,7 +953,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   Node mock makes the same round trip reachable from CI and from a laptop. The CI step's script
   was dry-run locally before it was committed — and the dry run found that 8081 on this box is the
   Pterodactyl Wings daemon, not a free port (`ss -tlpn` before trusting a port).
-
 ## 2026-09-26 — P12 · Events + Webhooks v0 (docs/01-VISION.md §13)
 
 - New crate `crates/events` (`omnion-events`) — the platform's event bus and its deliveries.
@@ -1062,7 +1044,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   operator cannot tell why nothing arrived.
 - The last mile is the delivery id: `X-Omnion-Delivery` is the row's own id, which is what makes
   the receiver's log and the panel's delivery list talk about the same attempt.
-
 ## 2026-09-26 — P13 · Automation v0 (REQ-003 lite)
 
 - New crate `crates/automation` (`omnion-automation`) — trigger → condition → action on top of the
@@ -1112,7 +1093,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   that reason (`step_error="the email could not be sent: sending email is switched off
   (OMNION_MAIL_ENABLED=false)"`), and the surface stays permission-gated + tenant-scoped.
 - Next: **P14 — Polish + CI v0** (make the CI workflow run for real + README quickstart).
-
 ## 2026-09-26 — P14 · Polish + CI v0
 
 - CI gains the `Web — install · typecheck · build · serve (admin + public renderer)` job: pnpm comes
@@ -1132,7 +1112,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `pnpm build` → 2 successful · `/healthz` 200 · `/readyz` database+redis ok · `omnion doctor` 6/6.
 - Next: **P15+ — REQ-driven queue** (`docs/requests/REQ-XXX`, owner steers priority; suggested first
   REQ-016 webhooks centre → REQ-002 command centre). The foundation phases P00–P14 are complete.
-
 ## 2026-09-26 — REQ-002 · Global search (slice 1: the index and the query core)
 
 - The platform's search is an **index**, not a scatter of per-table queries: `crates/search` owns a
@@ -1170,7 +1149,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: **REQ-002 slice 2 — the palette** (header search box, ⌘K overlay, sections by hit count,
   keyboard map, recently viewed, all states, mobile sheet), then slice 3 (`/search` results screen
   with facets/selection/export, `/settings/search`).
-
 ## 2026-09-26 — REQ-002 · Global search (slice 2: the ⌘K palette and the results screen)
 
 - The panel has its one box. `⌘K`/`Ctrl+K` opens a palette from any screen, `/` focuses the header
@@ -1219,7 +1197,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   selection, Copy links, CSV export (`/search/export`), `/settings/search` (per-provider status,
   ranking weights, reindex progress) and the settings/logs/translations providers; then wave 1
   continues with REQ-032 (command centre).
-
 ## 2026-09-26 — REQ-002 slice 3: results depth, the wider provider set, the index's own screen (done)
 
 - The results screen is now the depth the brief asked for. Facets: **Type, Site, Owner, Language,
@@ -1267,7 +1244,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   the step done, and the re-run reported 0 issues across all 14 screens.
 - Next: wave 1 continues with **REQ-032** (command centre: palette + quick actions + recents), then
   REQ-007 (analytics + real dashboard).
-
 ## 2026-09-26 — REQ-032 · slice 1 · the palette becomes a command centre
 
 - **Commands are code, not configuration.** `crates/search/src/commands.rs` is the registry (8
@@ -1307,7 +1283,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: wave 1 continues with **REQ-032 slice 2** (federated search in the palette: per-group
   loading and errors, type filters, the URL-backed `/search`), then REQ-007 (analytics + real
   dashboard).
-
 ## 2026-09-26 — REQ-032 · slice 2 · the palette answers in groups
 
 - **Each provider answers on its own.** The palette stopped slicing one answer: it asks every
@@ -1359,7 +1334,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Carried forward, not caused by this slice: the public renderer still answers `404` for its own
   icon requests (5 medium findings, unchanged).
 - Next: REQ-032 stayed in progress — **slice 3** was the next tick's work.
-
 ## 2026-09-26 — REQ-032 · slice 3 · the palette acts, and says so
 
 - **A command has a kind.** The registry grew `CommandKind::Action` and a `confirm` flag, and
@@ -1409,7 +1383,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   /command-center/resolve` on ai-hub, the intent preview card, confidence threshold with "Did you
   mean", `Edit as search`, timeout fallback); wave 1 then moves to REQ-007 (analytics + the real
   dashboard).
-
 ## 2026-09-26 — REQ-032 · slice 4 · the palette reads what is typed into it
 
 - **A phrase becomes a structure, checked against the platform's own tables.** `crates/search/src/intent.rs`
@@ -1443,7 +1416,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: **wave 1 moves to REQ-007** (analytics + the real dashboard). REQ-032 is closed; carried
   forward, not caused by this slice: the public renderer's own icon 404s (5 medium findings), and
   `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
-
 ## 2026-09-26 — REQ-007 · slice 1 · the platform starts counting
 
 - **One beacon becomes rows, and the decision comes first.** `POST /api/v1/public/analytics/collect`
@@ -1498,7 +1470,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - Next: REQ-007 stays in progress — **slice 2** (overview + the six report screens over these
   rollups, the shared date-range toolbar, filters, drawers and CSV export, plus the walkthrough
   gaining the ten `/analytics` routes with a synthetic beacon batch).
-
 ## 2026-09-26 — REQ-007 · slice 2 · the numbers come back out
 
 - **The read side is one module, and it is honest about where a number comes from.** `reports.rs`
@@ -1555,7 +1526,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   realtime (`/analytics/realtime` + its SSE counters). Slice 4 then closes the privacy operations
   (retention purge with its audit row, visitor erasure, the "what we store" table and the
   `/analytics/settings` screen).
-
 ## REQ-007 slice 3 — goals, funnels and realtime (2026-09-26)
 
 - **Goals are the platform's definition of a conversion, and the recorder is ordered and
@@ -1603,7 +1573,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   and sampling half of the settings screen, the "what we store" table, `/analytics/settings`, and
   the `analytics.traffic_spike` / `analytics.retention_purged` / `analytics.erasure_completed`
   events.
-
 ## REQ-007 slice 4 — privacy operations, the settings screen, the spike watch (2026-09-27)
 
 - **The privacy promises became database operations, in one readable file.**
@@ -1653,7 +1622,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   unchanged), and `page.created` is still not emitted by `POST /api/v1/pages` (REQ-002 follow-up).
 - Next: **REQ-006 (IAM)** — the next wave-1 item: user, role and permission screens plus sessions
   and devices.
-
 ## 2026-09-27 · REQ-006 slice 1 — role depth (migration 0011, the matrix, versions)
 
 - **The migration carries the whole request.** `database/migrations/0011_iam_advanced.sql` adds the
@@ -1713,7 +1681,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   unchanged).
 - Next: **REQ-006 slice 2** — the users screen, bindings at every scope level with expiry, groups,
   service accounts and their keys, effective permissions and the RBAC simulator.
-
 ## 2026-09-27 · REQ-006 slice 2 — subjects, scopes and the simulator
 
 - **A binding belongs to a subject now, not to an account.** `Subject::{User, Group,
@@ -1778,7 +1745,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   idle/absolute lifetime from the policy row, lockout per account and per IP, IP lists, TOTP and
   passkey enrolment with step-up, recovery codes). The walkthrough's denial case should use an
   account with no bindings so the artifact shows a `DENIED` verdict card as well.
-
 ## 2026-09-27 — REQ-006 slice 3a: the security policy, sessions, devices and TOTP
 
 - **The slice.** Migration `0017` adds `sessions.step_up_at`, a live-session index and
@@ -1868,7 +1834,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - **Next.** REQ-006 slice 4 — enterprise sign-in (OIDC/OAuth2/SAML with JIT + claim mapping), SCIM
   provisioning, the ABAC policy builder + dry run, permission requests/approvals and the safety
   invariants.
-
 ## 2026-09-27 — REQ-006 · slice 4a · the ABAC policy engine, the builder and the safety invariants
 
 - **What.** Policies are real and they change decisions. `crates/policy-engine` is the pure half —
@@ -1928,7 +1893,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - **Next.** REQ-006 slice 4b — enterprise sign-in (OIDC/OAuth2/SAML providers with JIT provisioning
   and claim → role mapping), SCIM 2.0 provisioning with its sync log, and permission
   requests/approvals as time-boxed bindings.
-
 ## 2026-09-27 — REQ-006 slice 4b-1 · Permission requests → approvals, and SCIM 2.0 provisioning
 
 - **What shipped.** `crates/identity` gained the SCIM provisioning token store (`mc_…`-style
@@ -1989,7 +1953,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
 - **Next.** REQ-006 slice **4b-2** — enterprise sign-in: OIDC/OAuth2 and SAML providers per
   organization with JIT provisioning and claim → role mapping, local sign-in staying available.
   That closes REQ-006; then the next wave-1 item in BUILD-PLAN order.
-
 ## 2026-09-27 — REQ-006 slice 4b-2 (part 1) · the enterprise sign-in core
 
 - **What shipped.** `crates/identity/src/sso/` — the whole protocol layer of enterprise sign-in,
@@ -2045,7 +2008,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   account → mapped role → expired challenge refused) and the `iam-authentication` QA pass. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
-
 ## 2026-09-28 — REQ-006 slice 4b-2 (parts 2–3) · the API, the screen and the integration walk
 
 - **What shipped.** The HTTP half of enterprise sign-in, the screen that drives it, and the walk
@@ -2106,7 +2068,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   the claim → role mapping are all proven end to end rather than one layer at a time. Then
   `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` close the
   REQ.
-
 ## 2026-09-28 — REQ-010 slice 1, verified end to end (six defects found)
 
 - **What this tick was.** Slice 1 (folders + browser + trash) was already written and its boxes
@@ -2156,7 +2117,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   `target/debug/incremental` in this worktree returned 2.9 GB.
 - **Next.** Slice 2 — preview, metadata, versions. The version table already exists; the version
   history, the preview pipeline and the file detail screen do not.
-
 ## 2026-09-28 — REQ-010 slice 2, a version history that does not rewrite the past
 
 - **What this tick was.** Slice 1 gave the library a file system. This tick gave it a memory: a
@@ -2222,7 +2182,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   settings with a connection test, the CDN purge hook, share links and duplicate detection with
   merge. Also still open in slice 2: the Usage and Activity tabs, HTTP range requests on the
   serve path, and EXIF extraction.
-
 ## 2026-09-28 — REQ-010 slice 3 (transformations), a preset that produces real pixels
 
 - **What this tick was.** Slices 1 and 2 gave the library a file system and a memory. This one
@@ -2312,7 +2271,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   URL, the CDN purge hook to REQ-011, share links with expiry and password, duplicate detection
   with merge. Also still open: EXIF (slice 2), HTTP range requests on the serve path, and the
   Usage and Activity tabs, which need `media_references` and arrive with slice 4.
-
 ## 2026-09-28 — REQ-010 slice 3 (share links), a capability that is never stored
 
 - **What.** The third third of slice 3: `0036_media_shares.sql`,
@@ -2382,7 +2340,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   (`runMediaShares`) is committed and wired but has therefore **not been exercised yet**; the
   next tick runs it. The storage walk from the previous tick was committed for the same reason
   and the API-level proof for both is the Rust suite, which is green.
-
 ## 2026-09-28 · REQ-010 slice 3 closes — EXIF (commits 23e2e6d, 3837064, d14b355, 08c1dc0, 14e33ec, 9b7fab2)
 
 - **What.** The last open item of slice 3: what the *camera* said about its own picture. The
@@ -2462,7 +2419,6 @@ removes exactly the eligible rows and a purge names the resources holding a file
   quarantine and release, retention policies with the daily worker, and reference-based purge
   refusal. Done when a denied subject is refused on the raw route, a flagged upload is quarantined
   and releasable, and a retention run removes exactly the eligible rows.
-
 ## 2026-09-28 · REQ-010 slice 4 · virus scanning (quarantine, release, run log)
 
 **What.** The `scan_status` column arrived back in `0025` and nothing ever moved it: the library
@@ -2525,7 +2481,6 @@ dependency of the API crate: the scanner client needs it at runtime, so it is no
 inherited allow, the IAM subject picker, retention policies with the daily worker and its run log,
 and reference-based purge refusal plus the repair scan. Done when a denied subject is refused on
 the raw route and a retention run removes exactly the eligible rows.
-
 ## 2026-09-28 · REQ-010 slice 4 closed — usage, activity, and the file's two missing tabs
 
 **What.** Slice 4's last open item, and the piece that makes slice 3's and slice 4's bookkeeping
@@ -2594,7 +2549,6 @@ consecutive ticks and remains unrun.
 alongside `runMediaRetention` before setting this REQ to `done`. Then the queue moves to the
 first untouched item in wave 1: **REQ-021** (notification centre — in-app + e-mail). Migration
 slot 0050 is free (wave5 holds 0048, wave4 0043, wave6 0046, wave7 0047).
-
 ## Tick 45 — REQ-021 slice 1: the in-app inbox
 
 **What.** The platform's fourth feedback loop, and the only one that says *you*. The event bus
@@ -3028,3 +2982,68 @@ to `wave10`.
 `GET /public/oauth/callback`, `POST /credentials/{id}/disconnect`, the refresh behind
 `RefreshLock`, and the `needs_reauth` event reaching the canvas. Then the fixture provider and
 the contract probe that drives a real round trip.
+## Tick 49 — the pass that finally reached slice 3, and the list that emptied itself
+
+**What.** The 23:51 pass ran against a binary built at 23:35, twenty-two minutes after slice 3's mounts
+landed, and it answered the question the last two ticks were holding open. `report.notificationOutbox`
+exists for the first time: five chips all carrying counts, `chiptotalMatchesSql` true,
+`targetHiddenForActor` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, a removal that
+answers 204 and leaves the table, and `retryIsNotRetryable` true. `report.notificationSettings` is green
+on the matrix, the honest save notice, the round trip and the error state. `runMediaRetention` came back
+`ok: true` for the first time, which is REQ-010's blocker clearing.
+
+**The pass also produced one string that says everything.** `report.notifications` ended with
+
+```json
+"keyboardRows": 0,
+"keyboard": "no rows to drive — the list did not load"
+```
+
+which reads like a timing problem and is not one. The pass had marked its own three rows read four lines
+earlier, and the list then showed none of them. `with_read` was a `bool` defaulting to `false`, and a
+`bool` cannot tell "the client said nothing" from "the client said no" — so **every** caller that named no
+filter got an unread-only list, while the panel's own State menu labelled that same state "Unread and
+read". The screen promised a list it was not sending. Nothing failed loudly: the list rendered, the badge
+was right, and the screen simply stopped showing mail the reader had already seen.
+
+**What this tick fixed.** `ab3c105` gives `with_read` an `Option<bool>`, so absent and off stay
+distinguishable and absence means *everything*; `4933c10` fixes the three client places that assumed a
+positive flag — `filtersFrom` never sent it, `notificationQuery` dropped the `false` that *is* the
+inbox filter, and the empty state's "Show read notifications" button **set** the flag to switch read
+rows on when the correct action is to clear it. `797a3e8` adds the two gates that were missing, which
+is the part that matters: `readRowsStayVisible` immediately after the bulk action, and `inboxFilterIsHonest`
+on the other half, so a default nobody can turn off cannot pass as a fix.
+
+**Proof.** `cargo test -p omnion-api --lib` → **188 passed** (187 + the absent-vs-off test, which
+asserts the parse *and* the built query — a parser that keeps them apart and a builder that throws the
+distinction away are two different bugs and only the pair is the fix). `-p omnion-notifications` → **79**;
+`-p omnion-permissions` → **62**. `tsc --noEmit` in `apps/admin` → **exit 0**. `node --check
+scripts/qa/walkthrough.cjs` → clean. `scripts/qa/run-notifications-http.sh` → **PASS 13/13** over a real
+socket, the new leg reading `all=1 inbox=0 live=1`. Browser pass: 36 pages, 1095 clicks, 88 field fills,
+39 form submissions, 84 findings (79 high, 5 medium).
+
+**On those 79 high findings, honestly.** 74 are `/media/*` and belong to REQ-010, which is the other
+in-progress REQ in this wave — 30 of them are one 422 on `/api/v1/media/{id}/raw?preset=standard` and 22
+more of the same from a second file. The remaining 5 are **this pass's own deliberate refusal probes**:
+three the 400 in-app-column lock and two the routed-500 error state, each of which the pass asserts as
+*expected* two lines later. Neither group is caused by this tick's change.
+
+**Also fixed, incidentally.** The gate I extended had two defects of its own, both caught because the
+first version of the assertion failed in a way the change had nothing to do with: `grep -c` exits 1 on
+an empty body, so under `set -e` the *inbox* leg — which is meant to be empty — aborted the whole gate
+before printing a verdict; and the row to mark is read from SQL rather than reusing the `$target` that
+the 404 check *below* assigns, because a shell script that reads a value before the line that sets it
+reports an empty id as "the endpoint refused".
+
+**Not proven, and not claimed.** No pass has yet run against the `with_read` fix, so the keyboard leg —
+`escapeClosedDrawer`, `escapeWithNoRowUnderCursor`, `eToggledRead`, `shiftEMarkedVisible`,
+`slashFocusedFilter` — is still unproven and the REQ stays **in-progress**. `quietSaved` and
+`digestPersisted` are still false: the widgets render, but the pass does not change them yet, so those
+two halves of the settings box are honestly unproven despite the box being ticked for what was proven.
+
+**Next.** Run `bash scripts/qa/run.sh` again (verify `stat -c %y target/debug/omnion-api` is newer than
+`ab3c105` first). Require `report.notifications.readRowsStayVisible`, `inboxFilterIsHonest`,
+`keyboardRows > 0` and then the five keyboard keys, plus `notificationSettings.quietSaved` and
+`digestPersisted` — and extend the settings pass to change those two fields rather than merely render
+them. If it is green, REQ-021 closes and the wave moves to the 74 `/media/*` findings, which are
+REQ-010 slice 4's remaining gate.

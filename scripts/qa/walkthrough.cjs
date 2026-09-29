@@ -3983,6 +3983,34 @@ async function runNotificationsDepth(page, report) {
   steps.bulkNoticeIsHonest = /\d+ of \d+/.test(steps.bulkNotice);
   await shot(page, "page-notifications-bulk");
 
+  // 3b. **A list that empties itself the moment you read its mail.** Every row the pass just
+  //     marked read is still there — it is a notification, not a receipt — so the bare
+  //     `/notifications` URL has to bring them back. Assert it immediately after the bulk
+  //     action, because that is the only moment in a pass where "read rows are visible" and
+  //     "read rows are hidden" produce the same list, and the next step quietly drives past
+  //     it.
+  //
+  // This is the assertion the defect did not have. `with_read` was a `bool` defaulting to
+  // `false`, so a client that named no filter got *unread only* — while the panel's own State
+  // menu labelled that state "Unread and read". The symptom arrived four lines below as
+  // `keyboard: "no rows to drive — the list did not load"`, which reads like a timing problem
+  // and is not one: the pass had just marked every row read. `absent means everything` is the
+  // invariant; `?with_read=0` is the inbox, and both halves are asserted.
+  await page.goto(`${URL_ADMIN}/notifications`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.rowsAfterMarkingRead = await page.locator("[data-notification-row]").count();
+  steps.readRowsStayVisible = steps.rowsAfterMarkingRead > 0;
+  // The opposite half, on the same screen: `?with_read=0` is the reader who asked for the
+  // inbox, and it has to actually filter — otherwise the fix above is just a default nobody
+  // can turn off, which is a different bug with the same root cause.
+  await page.goto(`${URL_ADMIN}/notifications?with_read=0`, { waitUntil: "domcontentloaded" }).catch(
+    () => {},
+  );
+  await page.waitForTimeout(1600);
+  steps.inboxRows = await page.locator("[data-notification-row]").count();
+  steps.inboxFilterIsHonest = steps.inboxRows < steps.rowsAfterMarkingRead;
+  await shot(page, "page-notifications-inbox");
+
   // 4. The keyboard path. The shortcuts are bound on the table body, so the table has to be
   //    there and the body has to have focus — clicking a row opens the drawer and then every
   //    key press lands in the drawer instead. An earlier version clicked `tbody` and hoped;

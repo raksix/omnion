@@ -102,8 +102,20 @@ pub struct ListParams {
     #[serde(default)]
     pub archived: bool,
     /// Include the rows that have been read.
+    ///
+    /// **Defaults to on.** `bool` cannot tell "absent" from "false", so this used to be a
+    /// `bool` defaulting to `false` — and the list silently answered *unread only* to every
+    /// reader who asked for no filter at all. The panel's own State menu labels that state
+    /// "Unread and read", so the screen promised a list it was not sending, and a reader who
+    /// worked through their inbox came back to "You're all caught up" over three rows that
+    /// were right there. `with_read=0` / `=off` is the explicit way to hide them, and the walk
+    /// through the keyboard path caught this the only way it could be caught: it marked its
+    /// three rows read and then found nothing to drive `j` on.
+    ///
+    /// [`Option<bool>`] carries the third state: `parse_list_params` sets it only when the
+    /// client actually sent the parameter, so "absent" and "off" stay distinguishable.
     #[serde(default)]
-    pub with_read: bool,
+    pub with_read: Option<bool>,
     /// Page from this instant, exclusive (the keyset cursor).
     pub before: Option<String>,
     /// Page size.
@@ -158,7 +170,11 @@ fn parse_list_params(raw: Option<&str>) -> Result<ListParams, ApiError> {
             // client that adds a filter this build does not know still gets its list — and so
             // does a valueless key that is not a flag at all (`?category`, `?sort`).
             "archived" => params.archived = parse_flag(&value),
-            "with_read" => params.with_read = parse_flag(&value),
+            // `Some(parse_flag(..))` rather than a bare assignment: absent and off have to
+            // stay different, because absent is the honest "show me everything" and off is
+            // the reader who asked for the inbox. Collapsing them is what made the bare list
+            // unread-only.
+            "with_read" => params.with_read = Some(parse_flag(&value)),
             _ => {}
         }
     }
@@ -963,7 +979,10 @@ fn build_query(params: ListParams) -> Result<ListQuery, ApiError> {
         priorities: params.priority,
         channel: params.channel,
         include_archived: params.archived,
-        include_read: params.with_read,
+        // `unwrap_or(true)`: a client that named no `with_read` asked for the whole list.
+        // The panel's State menu says "Unread and read" for exactly this state, so anything
+        // else would be the server quietly filtering a list it is displaying in full.
+        include_read: params.with_read.unwrap_or(true),
         before,
         limit: params.limit.unwrap_or(50),
     })
@@ -1001,7 +1020,7 @@ mod tests {
             priority: vec!["high".to_owned()],
             channel: Some("email".to_owned()),
             archived: true,
-            with_read: true,
+            with_read: Some(true),
             before: None,
             limit: Some(25),
         })
@@ -1124,7 +1143,28 @@ mod tests {
         assert!(parse("archived").expect("valid").archived);
         assert!(!parse("archived=0").expect("valid").archived);
         assert!(!parse("archived=false").expect("valid").archived);
-        assert!(!parse("with_read=off").expect("valid").with_read);
+        // `Some(false)` and not `false`, because the parameter being *absent* has to survive
+        // as a third state. `with_read=off` is the reader who asked for the inbox; a client
+        // that never mentioned `with_read` asked for everything, and the two are not the same
+        // question.
+        assert_eq!(parse("with_read=off").expect("valid").with_read, Some(false));
+        assert_eq!(parse("with_read=1").expect("valid").with_read, Some(true));
+    }
+
+    #[test]
+    fn an_absent_with_read_and_an_explicit_off_are_different_questions() {
+        // This is the assertion the defect did not have. The bare list used to be unread-only
+        // because a `bool` defaulting to `false` cannot tell "the client said nothing" from
+        // "the client said no" — and the walkthrough found it by marking its own three rows
+        // read and then reporting an empty list to drive the keyboard on. Assert the parse
+        // AND the built query, because a parse that keeps the two apart and a builder that
+        // throws the distinction away are two different bugs and only the pair is the fix.
+        assert_eq!(parse("").expect("valid").with_read, None);
+        assert_eq!(parse("category=approval").expect("valid").with_read, None);
+        let bare = build_query(parse("").expect("valid")).expect("valid");
+        assert!(bare.include_read, "no filter must mean read and unread");
+        let inbox = build_query(parse("with_read=0").expect("valid")).expect("valid");
+        assert!(!inbox.include_read, "with_read=0 must mean unread only");
     }
 
     #[test]
