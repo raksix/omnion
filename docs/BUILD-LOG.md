@@ -3656,3 +3656,19 @@ screens, the badge tones, the overview counters, the walkthrough extension).
 / `page.deleted` / `media.replaced` / `theme.activated` / `site.domain.changed` mapped through
 the rule set into one enqueued purge, gated by the `auto_purge` toggles the settings screen
 already stores.
+
+**Browser gate, second update.** The pass ran ~21 minutes and never got the slot: w2's
+pass (pid 3727030) has held it since 01:20, and four other passes are queued behind mine.
+The slot file is *not* stale — the process that owns it is alive, which is the slot working
+exactly as designed on a box where six writers each want a browser. The pass stays queued
+and will produce its artifact on its own; **slice 2 is not closed and this tick does not
+claim otherwise.** The tick's own budget ran out waiting.
+
+This is the third pass in two ticks that has spent its whole wall clock in the queue, and it
+is the clearest argument yet for the fix already reported: `/etc/profile.d/omnion-qa-limits.sh`
+sets `QA_SLOTS=1` but only for a **login** shell, and a Hermes loop calling
+`bash scripts/qa/run.sh` gets a non-login, non-profile shell. So the guard that is supposed
+to make the passes take turns is simply not in effect for any of the six writers, and the
+box runs as many browsers at once as there are loops. The one-line fix belongs in `run.sh`
+itself — default `QA_SLOTS` inside the script — and `run.sh` is shared tooling, so it is
+reported here rather than edited from a writer branch.
