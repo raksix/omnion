@@ -19,10 +19,11 @@ select o.id, 'proof', 'Proof site' from organizations o where o.slug = 'env-proo
 insert into sites (organization_id, key, name)
 select o.id, 'proof', 'Proof site' from organizations o where o.slug = 'env-proof-b';
 
--- The production environments, as 0145's backfill created them.
-insert into environments (organization_id, key, name, type, status)
-select id, 'production', 'Production', 'production', 'active' from organizations
-on conflict (organization_id, key) do nothing;
+\echo '--- the trigger created a production environment for each new organization'
+select o.slug, e.key, e.type
+from organizations o join environments e on e.organization_id = o.id
+where o.slug like 'env-proof-%'
+order by o.slug;
 
 \echo '--- a page insert that names no environment lands in its own org production env'
 -- One page per organization, both naming no environment. `limit 1` would silently reduce this to
@@ -47,13 +48,25 @@ join environments e on e.id = p.environment_id
 group by o.slug, e.key
 order by o.slug, e.key;
 
-\echo '--- a site whose organization has no production environment is refused, not guessed'
-insert into organizations (name, slug) values ('Env proof C', 'env-proof-c');
-insert into sites (organization_id, key, name)
-select id, 'orphan', 'Orphan site' from organizations where slug = 'env-proof-c';
-\echo '--- the refusal below is expected (the trigger raises, then NOT NULL would too)'
+\echo '--- the corrupt case is now unreachable: a new organization cannot exist without one'
+-- The previous revision of this proof ended here, by creating an organization with no production
+-- environment and asserting that a page insert into it was refused. That case is no longer
+-- constructible -- the after-insert trigger gives every organization one -- so what is asserted
+-- now is the *reason* it is unreachable: a second production environment is still refused, which
+-- is the half of "exactly one" the partial unique index owns.
+-- A different key, so the refusal can only come from the partial unique index on
+-- `type = 'production'` and not from the `(organization_id, key)` unique constraint. Using the
+-- same key twice would let the second statement report success (`on conflict do nothing` on a
+-- *different* statement is an error, but a shared key makes the two causes indistinguishable).
+insert into environments (organization_id, key, name, type, status)
+select o.id, 'production-2', 'Second production', 'production', 'active'
+from organizations o where o.slug = 'env-proof-a';
+\echo '--- the refusal below is expected: the partial unique index owns "exactly one"'
 \set ON_ERROR_STOP off
-insert into pages (site_id, slug) values ((select id from sites where key = 'orphan'), 'orphan');
+insert into environments (organization_id, key, name, type, status)
+select o.id, 'production-2', 'Second production', 'production', 'active'
+from organizations o where o.slug = 'env-proof-a';
 \set ON_ERROR_STOP on
-\echo '--- and the refused row did not land'
-select count(*) as orphan_pages from pages where slug = 'orphan';
+select count(*) as production_rows
+from environments e join organizations o on o.id = e.organization_id
+where o.slug = 'env-proof-a' and e.type = 'production';

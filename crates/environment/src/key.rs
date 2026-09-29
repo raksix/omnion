@@ -129,11 +129,18 @@ pub fn derive_key(name: &str) -> String {
             out.pop();
         }
     }
+    // A reserved word is caught at save time, but a *derived* key that is reserved is a wizard
+    // dead end rather than a message: the operator types "Staging", the field fills itself with
+    // "staging", and submitting is refused for a word they never chose. So the derivation
+    // suffixes its way out of the reservation instead, and only after the reservation is
+    // actually hit — "staging" becomes "staging-2", while "qa" stays "qa".
     if out.is_empty() {
-        "staging".to_string()
-    } else {
-        out
+        out.push_str("staging");
     }
+    if RESERVED_KEYS.contains(&out.as_str()) {
+        out.push_str("-2");
+    }
+    out
 }
 
 /// A staging host name, checked.

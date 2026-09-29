@@ -78,6 +78,7 @@ pub mod cdn_cache;
 pub mod cdn_purge;
 pub mod commands;
 pub mod content;
+pub mod environments;
 pub mod health;
 pub mod iam;
 pub mod iam_approvals;
@@ -1003,6 +1004,34 @@ pub fn router(state: AppState) -> Router {
         post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
     let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
 
+    // Staging environments (REQ-017). Reading the list and one environment is `deployment.read`;
+    // creating one, re-cloning it and cancelling a clone is `deployment.preview`; archiving one
+    // is `deployment.rollback`. Three keys rather than one, because looking at a staging copy,
+    // filling it and throwing it away are three different amounts of trust.
+    let environments = get(environments::list_environments)
+        .layer(guards::require(&state, "deployment.read"))
+        .merge(
+            post(environments::create_environment)
+                .layer(guards::require(&state, "deployment.preview")),
+        );
+    let environment_one = get(environments::get_environment)
+        .layer(guards::require(&state, "deployment.read"))
+        .merge(
+            delete(environments::archive_environment)
+                .layer(guards::require(&state, "deployment.rollback")),
+        );
+    // Re-clone is its own path (the request's own API table puts it at `/clone`), so it gets a
+    // POST-only router rather than being merged onto `/environments/{id}`.
+    let environment_one_clone = post(environments::start_clone)
+        .layer(guards::require(&state, "deployment.preview"));
+    let environment_jobs = get(environments::list_clone_jobs)
+        .layer(guards::require(&state, "deployment.read"));
+    // Cancel is its own path rather than a merged `POST` on the job collection: it acts on one
+    // job and is destructive, and a collection-level POST that cancels "the current one" is a
+    // route whose meaning depends on state the caller cannot see.
+    let environment_job_cancel = post(environments::cancel_clone)
+        .layer(guards::require(&state, "deployment.preview"));
+
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
     // answer to the providers the caller's own read permissions cover; rebuilding the index
@@ -1600,6 +1629,14 @@ pub fn router(state: AppState) -> Router {
         .route("/cdn/settings", cdn_settings)
         .route("/cdn/settings/test", cdn_settings_test)
         .route("/cdn/adapters", cdn_adapters)
+        .route("/environments", environments)
+        .route("/environments/{id}", environment_one)
+        .route("/environments/{id}/clone", environment_one_clone)
+        .route("/environments/{id}/clone-jobs", environment_jobs)
+        .route(
+            "/environments/{id}/clone-jobs/{job_id}/cancel",
+            environment_job_cancel,
+        )
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)

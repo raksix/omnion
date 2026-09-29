@@ -61,6 +61,17 @@ pub enum EnvironmentError {
         /// The status the promotion is actually in.
         status: String,
     },
+    /// The store itself failed.
+    ///
+    /// Its own variant rather than a `Box<dyn Error>` because a store failure and a refusal
+    /// have to be told apart at the HTTP boundary: a refusal is a `4xx` naming what the caller
+    /// should change, and a store failure is a `5xx` naming what the operator should look at.
+    /// A single "any error" variant makes the API answer `500` to a duplicate key, which is a
+    /// refusal the caller *can* act on.
+    Store {
+        /// The driver's message, verbatim.
+        message: String,
+    },
 }
 
 impl fmt::Display for EnvironmentError {
@@ -109,6 +120,7 @@ impl fmt::Display for EnvironmentError {
                 f,
                 "This promotion is “{status}” and no longer waits for approval."
             ),
+            Self::Store { message } => write!(f, "The environment store failed: {message}"),
         }
     }
 }
@@ -130,6 +142,7 @@ impl EnvironmentError {
             Self::PromotionConflict { .. } => "promotion_conflict",
             Self::SelfApprovalRefused => "self_approval_refused",
             Self::PromotionNotPending { .. } => "promotion_not_pending",
+            Self::Store { .. } => "environment_store_failed",
         }
     }
 }

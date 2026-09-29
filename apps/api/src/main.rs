@@ -11,7 +11,8 @@ use omnion_api::audit_retention;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, cdn_purge_runner, event_retention_runner, event_runner,
+    analytics_runner, automation_runner, cdn_purge_runner, environment_clone_runner,
+    event_retention_runner, event_runner,
     retention_runner, search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
@@ -155,6 +156,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // still for minutes — and a second interval knob would be one more thing an operator
     // sets to zero by accident.
     let _purge_worker = cdn_purge_runner::spawn(state.clone());
+
+    // The staging clone worker (REQ-017): it is what makes "clone" mean something after the
+    // request returns. Unconditional, like the purge worker, because an environment that sits in
+    // `cloning` with nobody filling it is a state the list screen has to render and the operator
+    // has no way out of except a retry that also needs a worker.
+    let _clone_worker = environment_clone_runner::spawn(state.clone());
 
     // The audit retention sweep applies each tenant's own stored window, unattended
     // (REQ-005, slice 4): the number an operator typed into the Settings tab is enforced by
