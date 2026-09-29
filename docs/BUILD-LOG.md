@@ -6065,3 +6065,70 @@ index is written and `pending_objects_for_organization` says whose files a run m
 so `restore preview` can count what it can put back. (b) The prune sweep must use
 `remove_run_artifacts` too — it deletes the same directories by its own path today, which is
 the third half that could disagree with this one.
+
+---
+
+**What.** REQ-062 slice 1 left a gallery; this tick built the thing a gallery cannot answer, which
+is *what a site looks like while it has that theme*. The whole module hangs off one sentence:
+**a save is not a publish.**
+
+**Why that sentence is the design.** The obvious schema is one mutable `theme_settings` row with an
+`is_published` flag. It destroys two things at once: a save becomes the live site the moment somebody
+types, and there is no history to restore. So `theme_settings_revisions` only ever grows,
+`theme_settings_published` is the pointer a visitor renders from and `theme_settings_draft` is the one
+the panel edits. And a restore **writes** revision N+1 rather than moving the pointer back — that is
+what makes "restore revision 1" appear in the history as a numbered revision with an author and a
+time on it, and it is why restoring twice in a row does not delete the first restore.
+
+**The contrast check runs on the server, and one function feeds both halves.** `contrast_ratio` is
+the WCAG 2.1 formula, not an approximation: a "close enough" check passes pairs a real audit tool
+fails, and a badge that disagrees with the auditor is worse than no badge. A token that is not a hex
+colour produces **no finding** rather than a failure, because the customize screen runs this on every
+keystroke and a half-filled form is not an error. The save is allowed to be unreadable — a palette
+being compared against the theme is the normal state of the screen — and only the PUBLISH needs the
+acknowledgement, because that is the moment a signed-out visitor sees it.
+
+**Token values are refused if they carry a semicolon, a brace, an angle bracket, a backslash or a
+quote.** The renderer writes them into CSS custom properties, so this is a real stylesheet injection
+and a client-side validator is exactly the wrong place to catch it.
+
+**Three defects the walks found, all in code that compiled and looked right.**
+
+1. `restore_revision` built ONE upsert for both pointer tables out of a `[table, column]` pair. That
+   symmetry hid the fact that the two tables stamp different columns, so every restore answered 500
+   `column "updated_at" of relation "theme_settings_published" does not exist`. The two statements
+   are written out now, and the comment says why the loop was tempting.
+2. `PublishBody` read `acknowledge_contrast` off the wire, so a camelCase body always arrived as
+   `false` and **the contrast guard could never be satisfied** — a guard that is impossible to pass
+   is a guard that looks like a bug report forever. `rename_all = "camelCase"`.
+3. `diff` was `null` for a first revision. `[]` is the answer; `null` is a panel with a special case
+   for the one row where "nothing changed" is the whole answer.
+
+**Two of the three were not the product at all, and that is the more useful half.** `users.name` does
+not exist — the column is `display_name`, and a `query_as` struct does not check a column name at
+compile time, so the customize screen answered 500 on every load. And `cms_themes.rs`, the file slice
+1 shipped, no longer compiled: main had changed `NewSite` (`domain` → `theme`), `NewPage` (gained
+`body`/`summary`, returns a tuple) and `seed::seed_defaults` → `seed::ensure`. Both files are green.
+
+**The harness needed as much work as the product, and each of those is a trap worth naming.** A
+cookie-authenticated write needs a CSRF secret configured in-process or every walk measures a 403
+instead of the answer. `ensure_installed` seeds the process-wide limiter from the **shipped defaults**
+— a test harness builds the router without `main.rs` having read the store — so raising the `sign_in`
+policy in the database is a silent no-op until `reload_from_store` runs. And the public route
+addresses a site by a registered domain or an explicit `?site=`, not by `Host`, so a visitor walk
+against a site with no domain 404s with a message that explains it and is still a 404.
+
+**Proof.** `cms_theme_settings` **11 passed / 0 failed** (`--test-threads=1`, 86 s) ·
+`omnion-content --lib` **249 passed** (23 of them new) · `omnion-events --lib` 47 — the drift test
+scans the workspace for `NewEvent::new(…)` and accepts `themes.settings.published` · `omnion-permissions
+--lib` 63.
+
+**Blocker, unchanged and not worked around.** The browser pass did not run. The QA slot is held by a
+sibling (`omnion-w3`, live), the box peaked at load 21 with 1.6 GB available, and the volume hit
+**100% (492 MB free)** mid-tick — `scripts/qa/disk-guard.sh` freed 2.2 GB and got it back to 96%, but
+a pass started into a full volume is a pass that dies halfway and reports nothing. The pass is the
+gate for REQ-064 acceptance 18 and REQ-063's 17th criterion, and it still has to happen.
+
+**Next.** (a) The `/themes/<key>/customize` and `/themes/<key>/history` SCREENS — the layer they read
+is what this tick built, and the REQ's numbers 6-9 are about the screen, not the API. (b) When a slot
+holds, run `--only=featured-media` and `--only=members` to close the two open criteria.
