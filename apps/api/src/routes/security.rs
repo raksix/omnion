@@ -1086,9 +1086,11 @@ mod tests {
             json!({"results": []}),
         ] {
             let err = read_report(&bad, "dependency").expect_err("an unknown shape must be named");
+            // `ApiError` carries a code and a message and has no `Display`: the assertion is
+            // about the message, so it reads the message.
             assert!(
-                err.to_string().contains("findings"),
-                "the message should say what was expected: {err}"
+                err.message().contains("findings"),
+                "the message should say what was expected: {err:?}"
             );
         }
     }
