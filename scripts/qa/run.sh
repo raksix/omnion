@@ -114,46 +114,59 @@ if [ ! -x "$QA_API_BIN" ] \
   cargo clean -p omnion-core --target-dir ${CARGO_TARGET_DIR:-target} 2>/dev/null || true
   cargo build ${CARGO_TARGET_DIR:+--target-dir "$CARGO_TARGET_DIR"} -p omnion-api
 fi
-if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  pm2 restart "$API_NAME" >/dev/null
-else
-  # The binary pm2 starts must be `QA_API_BIN`, not the default path: a writer that built
-  # out of tree (a full worktree disk) passed a working `QA_API_BIN` through the staleness
-  # check and then had pm2 report `Script not found` for a path that was never built.
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
-  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
-  OMNION_PORT="$API_PORT" \
-  OMNION_ENV=development \
-  # The CSRF guard *refuses* a cookie-authenticated mutation when no secret is configured
-  # (REQ-012: refuse, never skip), which is right in production and useless in a QA stack —
-  # every create, install and delete in the walkthrough answers 403 and the pass reports a
-  # product defect that does not exist. The secret is a throwaway for a disposable database
-  # that is dropped on every pass; it is generated per pass so a half-finished run cannot
-  # leave a token that a later one still validates.
-  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-csrf-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}" \
-    pm2 start "$QA_API_BIN" --name "$API_NAME" --time >/dev/null
-fi
+# `delete` then `start`, never `restart`. That looks like a pointless extra second of
+# startup and it is the most expensive line in this file.
+#
+# `pm2 restart` **keeps the environment the process was first started with**. This script
+# drops and recreates the QA database a moment earlier, so a process left over from a pass
+# that used a different `QA_DB` still holds the *old* connection string — and after the drop,
+# "that database does not exist" comes back as a restart loop whose log reads `migration 19
+# was previously applied but is missing in the resolved migrations`. That sentence names a
+# migration, so it sends you auditing 41 SQL files that are all perfectly fine.
+#
+# It happened here for real: an earlier attempt left a process pointing at the main writer's
+# `omnion_qa` while every later pass reset `omnion_qa_w10`, and three consecutive passes
+# inherited it. The ports, the CSRF secret and the binary path are inherited the same way, and
+# each of those has changed between passes at least once.
+#
+# The binary pm2 starts must also be `QA_API_BIN`, not the default path: a writer that built
+# out of tree passed a working `QA_API_BIN` through the staleness check and then had pm2 report
+# `Script not found` for a path that was never built.
+#
+# The CSRF guard *refuses* a cookie-authenticated mutation when no secret is configured
+# (REQ-012: refuse, never skip), which is right in production and useless in a QA stack — every
+# create, install and delete in the walkthrough answers 403 and the pass reports a product
+# defect that does not exist. The secret is a throwaway for a disposable database that is
+# dropped on every pass, and it is generated per pass so a half-finished run cannot leave a
+# token a later one still validates.
+pm2 delete "$API_NAME" >/dev/null 2>&1 || true
+OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+OMNION_PORT="$API_PORT" \
+OMNION_ENV=development \
+OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-csrf-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')}" \
+  pm2 start "$QA_API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
 
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"
-if pm2 describe "$ADMIN_NAME" >/dev/null 2>&1; then
-  pm2 restart "$ADMIN_NAME" >/dev/null
-else
-  OMNION_API_URL="$API_URL" \
+# Same reasoning as the API: `restart` inherits the environment and the port of the
+# process that was there before, and both have moved between passes.
+pm2 delete "$ADMIN_NAME" >/dev/null 2>&1 || true
+OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_ADMIN" --name "$ADMIN_NAME" --cwd "$ROOT/apps/admin" --time -- dev --port "$ADMIN_PORT" --hostname 127.0.0.1 >/dev/null
-fi
+
 wait_http "http://127.0.0.1:$ADMIN_PORT/login" 150 || { echo "[qa] admin panel did not answer"; pm2 logs "$ADMIN_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "public renderer on :$WEB_PORT"
 NEXT_WEB="$ROOT/apps/web/node_modules/next/dist/bin/next"
-if pm2 describe "$WEB_NAME" >/dev/null 2>&1; then
-  pm2 restart "$WEB_NAME" >/dev/null
-else
-  OMNION_API_URL="$API_URL" \
+# Same reasoning as the API: `restart` inherits the environment and the port of the
+# process that was there before, and both have moved between passes.
+pm2 delete "$WEB_NAME" >/dev/null 2>&1 || true
+OMNION_API_URL="$API_URL" \
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
-fi
+
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
 step "browser walkthrough"
