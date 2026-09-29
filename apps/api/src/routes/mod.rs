@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod commands;
 pub mod content;
+pub mod credential_oauth;
 pub mod credentials;
 pub mod health;
 pub mod iam;
@@ -748,6 +749,23 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "workflows.credentials.manage")),
         );
 
+    // The OAuth flow (REQ-087 slice 3). Start and disconnect carry the credential manage
+    // power because both change what the credential can do; the forced refresh is the same
+    // power for the same reason — it spends a provider token.
+    //
+    // The callback is the one route on this surface with NO guard and NO session: the browser
+    // is at the provider and carries nothing back but `?code=…&state=…`. Its authentication is
+    // the signed `state`, which names the organization and the credential it was minted for,
+    // so a state cannot be replayed into another tenant or onto another credential. That is
+    // the whole reason the organization is inside the signature.
+    let credential_oauth_start = post(credential_oauth::start_oauth)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    let credential_oauth_refresh = post(credential_oauth::refresh_credential)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    let credential_disconnect = post(credential_oauth::disconnect)
+        .layer(guards::require(&state, "workflows.credentials.manage"));
+    let oauth_callback = get(credential_oauth::oauth_callback);
+
     // Onboarding: the first-run flow (REQ-050). No permission guard — the flow itself decides
     // who may act, and it must be reachable before any account, role or binding exists.
     let onboarding_owner = post(onboarding::create_owner);
@@ -1271,6 +1289,12 @@ pub fn router(state: AppState) -> Router {
         // credential. It is a *static* `shared` segment, so it never collides with the
         // `{id}` parameter above it.
         .route("/public/media/shared/{token}", public_media_shared)
+        // The OAuth callback (REQ-087 slice 3). Unauthenticated by necessity — a provider
+        // redirects a browser, not a session — and authenticated by the signed `state` it
+        // carries, which names the organization and the credential it was minted for. It is
+        // declared under `/public` with the other browser-facing entry points so the shape of
+        // the unauthenticated surface stays readable in one place.
+        .route("/public/oauth/callback", oauth_callback)
         .route("/workflows", workflows)
         .route("/workflows/{id}", workflow)
         .route("/workflows/{id}/run", workflow_run)
@@ -1298,6 +1322,13 @@ pub fn router(state: AppState) -> Router {
         .route("/credentials/{id}/usage", credential_usage)
         .route("/credentials/{id}/test", credential_test)
         .route("/credentials/{id}/secret", credential_secret)
+        // The OAuth sub-resources (REQ-087 slice 3), declared before `{id}` for the same
+        // reason. `refresh` and `disconnect` are separate verbs rather than one
+        // `POST /{id}/oauth` because the first spends a provider token and the second throws
+        // it away, and the panel wants to be able to say which one it pressed.
+        .route("/credentials/{id}/oauth/start", credential_oauth_start)
+        .route("/credentials/{id}/oauth/refresh", credential_oauth_refresh)
+        .route("/credentials/{id}/disconnect", credential_disconnect)
         .route("/credentials", credentials_list)
         .route("/credentials/{id}", credential_item)
         // The node-package ledger (REQ-087 slice 2/4). The static `installed` screen is a
