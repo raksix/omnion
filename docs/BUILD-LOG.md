@@ -3661,3 +3661,48 @@ stopped and the slice committed instead. **Next tick:** if the slot is free, run
 `bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
 then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
 visited and clicked.
+
+## Tick 17 — REQ-099 slice 1, fourth commit: the real model (`9f3747f`) + main merge (`1fd72c1`)
+
+**What landed.** The loop drives a `Model` trait so a test can script answers and the route can
+dial a vendor; `provider_model.rs` is the other side of that seam. It streams a provider turn,
+reassembles the text from deltas, collects tool-call fragments and turns them into one
+`ModelAnswer`, counts usage, and maps a refusal onto a stable code. Underneath it the three
+protocol adapters learned the tool protocol end to end: declare tools, read calls out of a
+streamed answer, pair a result with the assistant turn that asked, and refuse to grow a
+call's arguments without bound. `Tool::schema()` exists because a declaration with empty
+properties tells the model to call the tool with `{}` and it then invents a value the tool never
+receives — the "empty declaration" default was silently wrong, not merely incomplete.
+
+**Two product bugs found and fixed while proving it.**
+
+- *A tool-only turn has no text and often no finish reason.* Read as "the provider sent
+  nothing", it ended the run on step one, before the first tool had run.
+- *The pairing handle has to survive the loop.* A result quoting a call id the provider never
+  issued is a `400`, not a missing fact; `RequestedCall.id` now travels with the call from the
+  provider's own handle, and a scripted call with none gets a generated one.
+
+**Proof.**
+
+- `cargo test -p omnion-ai-hub` → **240 passed, 0 failed** (was 217; +23)
+- `cargo test -p omnion-api --test ai_agent_runs` → **13 passed**
+- `cargo test -p omnion-core` → **39 passed**; `cargo build -p omnion-api` → clean
+- `pnpm typecheck` → 2/2 successful
+- Commits: `9f3747f`, `1fd72c1`
+
+**The merge, and a disk that lied.** `origin/main` had moved 18 commits and conflicted in
+`crates/core/src/config.rs`, where this branch's `AiHubConfig` and main's `CsrfSecret` were
+inserted at the same point — two *whole items*, so the resolution is both in full (verified:
+all 15 structs present, `git diff --stat` = +112 / −0 against main).
+
+Mid-resolution, `/mnt/apopic` hit **100%** and `config.rs` was truncated from 1451 to 865
+lines — a silent write that looked like a merge mistake. Recovery that worked: `git merge-file`
+into `/tmp`, then slice by *line index* (the earlier attempt dropped the 585 lines before the
+conflict and still "looked" plausible), install byte-for-byte, and let `cargo build` be the
+authority — it named the real defect, that the single shared `}` after the marker closes one
+impl where both insertions need one.
+
+**Next.** The store-backed runner (claim with `for update skip locked`, heartbeat, requeue past
+120 s, `OMNION_AI_RUNNER=false`), then `POST /ai/agents/{id}/runs` as SSE, then the run list
+and trace screens and `scripts/qa/walkthrough.cjs`. **Do not close REQ-099** — no browser pass
+has run on any of it and ten acceptance boxes are open.

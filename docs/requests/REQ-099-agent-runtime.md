@@ -1,7 +1,8 @@
 # REQ-099 — Agent Runtime & Tool Loop
 
-> **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record and
-> the loop — `0fc9fe4`, `0e6b0fb`, `424284b`) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slice 1: the step machine, the run store, the idempotency record,
+> the loop and the real provider model — `0fc9fe4`, `0e6b0fb`, `424284b`, `9f3747f`) ·
+> **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 >
 > **Slice 1, first commit** (`0fc9fe4`): `crates/ai-hub/src/agent.rs` — `RunLimits` and its
@@ -37,6 +38,18 @@
 > provider call; a provider failure carries the bridge's code; a tool result reaches the model
 > inside the untrusted fence. Still open: the `Model` adapter over the real client, the store-
 > backed runner, `POST /ai/agents/{id}/runs` with SSE, and every screen.
+
+> **Slice 1, fourth commit** (`9f3747f`): `crates/ai-hub/src/provider_model.rs` — the `Model`
+> behind the loop, over the real client, and the tool protocol the three adapters were missing.
+> `ToolSpec`/`ChatToolCall` and `Tool::schema()` make a tool's arguments *declared* rather than
+> assumed; every adapter declares, requests, reads back and pairs tool calls; a tool-only turn
+> (no text, no finish reason) counts as a turn, because reading it as "the provider sent nothing"
+> ends the run on step one; and the provider's own call id travels with the call, because a result
+> quoting an id the provider never issued is a 400. The tests drive a mock provider over a real
+> socket and assert the **request bodies** — that a tool ran with the query the model meant, that
+> the second request is system/goal/call/result, and that an agent with no tools sends no `tools`
+> field at all. 23 new tests. Still open in slice 1: the store-backed runner, the SSE endpoint
+> and every screen.
 
 ## Request
 
@@ -145,7 +158,7 @@ All names are dotted lower-case and ride the signed webhook bus; run events carr
 
 ### Acceptance criteria
 
-- [ ] A run started from the panel streams steps into the detail view live, and the same run reloaded after completion shows an identical step list (replay matches SSE).
+- [ ] A run started from the panel streams steps into the detail view live, and the same run reloaded after completion shows an identical step list (replay matches SSE). *(the live half is proved with a real provider: a two-call run streams its text and its usage, and the run's steps land in the same trace the panel reads. Re-attach and the screens land with the route.)*
 - [x] `max_steps` stops a run that never reaches a final answer with `stop_reason = max_steps` and no further provider calls *(the loop's own test counts the stub's calls: a two-step cap makes exactly two calls, and the third would have been the third `page.search`; the run is written `failed`, not `completed`, because it produced no answer)*.
 - [ ] The deadline stops a run against a deliberately slow stub, the token budget stops an overshooting run, and cancellation stops at the next step boundary with a finished partial trace. *(the `ScriptedModel::slow` seam exists; the three stop conditions themselves are proved in `agent.rs` with a clock the test owns — the loop-level test lands with the runner)*
 - [x] Three identical tool calls in a row end the run with `loop_detected` and an `ai.run.loop_detected` event *(the run's `stop_reason` and its `error` event with code `loop_detected`; the third call is caught *before* execution, asserted by counting tool results = 2. The bus event is the route's job and lands with `POST /runs`)*.
