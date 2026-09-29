@@ -3793,3 +3793,79 @@ crashed pass stays alive forever (w2 left two), so a queue can stall on a place 
 using; and `target` on a `/dev/shm` symlink means a full tmpfs fails the build rather than
 the pass.
 
+
+## 2026-09-29 · REQ-004 slice 2 — the conflict had two exits and the client built one
+
+**1. The pass never ran, and the reason was a queue behaving correctly.** Last tick left the
+browser pass as the only outstanding job, so it was the first thing started. It sat behind the
+main writer's own pass for nine minutes, and the temptation — as on the previous tick — is to
+report the queue as broken. It is not: the slot holder is `run.sh` with its cwd in
+`/mnt/apopic/omnion` and a live `walkthrough.cjs` against :3100/:3200. One writer's pass, one
+place, everyone else queued. I checked the holder's cwd and its child before concluding
+anything about it, which took thirty seconds and prevented a "shared script is defective"
+finding that would have been wrong. **The rule: a queue is only a defect once you have read
+what the holder is actually doing.** The pass is queued with `QA_SLOT_WAIT=1500`, and the
+criterion stays unticked until it reports.
+
+**2. So the tick went to the next open criterion, and reading it turned up a dead end.** The
+`conflict` step in the walkthrough PUTs a stale version through a raw `fetch`. That proves the
+*server* refuses a stale save — and the server is right: `replace_graph` matches on
+`graph_version`, returns nothing, re-reads the row to tell a missing rule from a lost race,
+and answers with the version it now holds. The other half of the criterion is about the *UI* —
+"offers Reload while keeping the local copy visible instead of overwriting silently" — and a
+raw `fetch` never touches the toolbar, so the half that matters had never been measured. The
+probe was green and the feature was half-built.
+
+**3. What the UI actually did: it offered one of the two exits the server promised.** The
+server's message reads "reload to see their change, or keep editing to overwrite it". The
+toolbar rendered Reload. And after a 409 `versionRef` stayed at the value the tab had loaded,
+so every subsequent PUT quoted a version one behind and was refused *again* — the banner said
+"keep editing" and editing accomplished nothing, permanently. The only way to save was to
+throw the author's work away through the one button that worked. A conflict handler that looks
+correct in a screenshot and is a dead end for the user is the exact failure this request
+exists to prevent, and no test was watching it.
+
+`conflict.ts` now owns the two questions as pure functions:
+
+- `readVersionFrom(message)` — the version, read out of the one sentence `replace_graph`
+  writes, and **`null` when the sentence names none**. Null is the load-bearing case: a
+  plausible-looking default (0, or one more than we hold) turns an unknown into a confident
+  overwrite of a colleague's work, so an unnamed version falls back to reload alone.
+- `resolveConflict(conflict)` — the second exit. It quotes `conflict.version`, i.e. what the
+  *server* named. It takes no local version as a parameter, on purpose: a signature that
+  accepted one would eventually be handed `versionRef + 1`, and the test that forbids that is
+  the signature itself. Locally re-deriving the base is how an optimistic-concurrency guard
+  quietly becomes last-write-wins while still being called a guard.
+
+**4. The test that mattered was the one that failed.** `readVersionFrom` was
+`/at version (\d+)/`, which matches the integer prefix of `at version 7.5` and returns `7`. A
+client quoting 7 on malformed input is an overwrite the guard was supposed to refuse — the
+guard failing **open**, the one direction it must never fail in. The trailing boundary
+`(?!\.\d)` closes it. My own test caught this on its first run, which is the argument for
+writing the hostile cases before trusting the module.
+
+**Proof.**
+
+- `pnpm --filter @omnion/admin test` — **48/48** (41 previous + 7 new). `pnpm typecheck` clean.
+- `cargo test -p omnion-workflows` — **84/84** against merged main.
+- Both dangerous rules **reverted and re-run**: dropping the version boundary gives 6/7, and
+  letting an unnamed version fall through to the overwrite branch gives 6/7. A test that
+  cannot go red is a comment with assertions in it.
+- The walkthrough now drives a **real** two-tab conflict: a second page saves a rename, this
+  tab's own autosave loses, and the probe reads the save state, the Reload button, the
+  surviving local nodes, and then — `two-tab-keep-mine` — clicks the second exit and reads
+  `saved`. That last note is the one that would have caught the dead end, because a save
+  quoting a stale version comes back as a *second* conflict, not as a save. Tab two renames
+  rather than adds a node on purpose: `replace_graph` derives the step list in the same
+  statement, so a graph that does not validate is refused *before* the version check, and the
+  probe would be reading a different failure than the one it names.
+
+**Not proved: the browser pass.** It is queued behind the main writer's. Three acceptance
+boxes (selection gestures, edge delete, two-tab conflict) have their probes fixed and their
+product code committed, and **none is ticked** — a criterion is closed by a browser, not by a
+unit test.
+
+**Next.** Read the pass when it lands: `escape-clears.cleared`, `shift-click-multi.ok`,
+`edge-delete.removed`, `edge-delete-undo.restored`, `two-tab-conflict.refused` /
+`reloadOffered` / `localNodesKept`, and `two-tab-keep-mine.resolved`. Only then tick. After
+that: undo/redo depth, run-from-here, and Table mode.
