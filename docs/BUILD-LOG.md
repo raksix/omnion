@@ -4698,3 +4698,96 @@ stopped and the slice committed instead. **Next tick:** if the slot is free, run
 `bash scripts/qa/run.sh` with no `QA_STACK` override and tick the screen boxes for slice 1;
 then build the `/security/headers` screen and extend `scripts/qa/walkthrough.cjs` so it is
 visited and clicked.
+### 2026-09-29 — REQ-065 slice 4 part 10: the panel half of the deletion guard
+
+**What.** The panel half of the criterion from part 9. The backend already answered
+`GET /iam/providers/{id}/deletion-impact` and `POST /iam/providers/{id}/reassign`, and the
+admin had **no client for either** — the two actions the criterion is built on were
+unreachable from the browser. The row action was an inline `Remove / Remove for good` pair,
+and that pair has no way to know whether the delete will be refused until it presses: it
+discovers the block from a `409`, which reaches the operator as an error payload with no
+repair attached. "Cannot delete" is a dead end, and the route that would have prevented it
+existed the whole time.
+
+- `a54a573` — the two client functions and the shapes they answer.
+- `cb166b7` — `provider-deletion-dialog.tsx`, the screen itself.
+- `fc0a7af` — the row action becomes one button that opens it.
+- `ca40a43` — the walkthrough waits for the count and pins the unblocked case.
+
+**Why a dialog and not a second inline step.** The impact is a question, and a question needs
+a surface that is willing to show an answer of zero. Inline there is nowhere to put a
+breakdown and nowhere to put a repair, and the confirm pair has no way to become
+conditional on a number it has not read.
+
+**Three claims, decided in the component rather than the parent, because each is a claim
+about the impact and a claim has to be checkable.**
+
+The breakdown is shown **next to** the total and is **summed against it in the component**.
+"7 accounts" is a number to wave through; "7 accounts: 5 LDAP, 2 SCIM" says a directory sweep
+created these people. When the sum does not reconcile the dialog says so — `unknown_sources`
+is the API admitting it cannot name one of them, and `0127` deliberately leaves a SCIM row
+attributable to nothing, so a keyed-on-the-provider-id count is the lie this avoids.
+
+The repair is offered **only** when `blocked` is true. A provider that provisioned nobody has
+nothing to fall back, and a button that appears anyway eventually sends an empty batch and is
+told `no_subjects`. The walkthrough pins the *absence*, which is the half that matters.
+
+A failed read offers **no delete button at all**. That is the entire reason the dialog exists:
+a button that works without a count is the button this screen prevents.
+
+**Two staleness decisions that are not obvious.** The impact is re-read after a reassign
+rather than believed — announcing "now you can delete this" from a read that is one
+round-trip old is a lie the next button press contradicts. And a *refused* delete re-reads
+too: if somebody provisioned an account between the read and the click, the operator gets the
+new count and the repair rather than a raw `409` payload.
+
+**The account list is a bounded sample and the dialog says how many it is not showing.** An
+operator must not believe they are reading the whole set; a directory of 4000 people must not
+render 4000 rows either.
+
+**One defect the walkthrough would have shipped silently.** The three removals waited 400 ms
+between opening the confirm and pressing it. That was correct when the confirm rendered
+synchronously, and it became a race the moment the dialog had to read the impact first: on a
+slow response the confirm is not in the DOM, the click times out, and this pass swallows the
+error — a step that silently stops testing anything. Every site now waits on the count
+element itself, which is the condition the next action actually depends on.
+
+**Proof.**
+
+- `pnpm --filter @omnion/admin typecheck` → **clean**.
+- `node --check scripts/qa/walkthrough.cjs` → clean. (`bun build` only fails on
+  `playwright-core`, which is not installed in this worktree — a resolution error, not a
+  syntax error, and the module is present on the QA stack's own resolution path.)
+- `QA_STACK=w9 QA_API_PORT=18088 QA_ADMIN_PORT=3108 QA_WEB_PORT=3208 bash scripts/qa/run.sh`
+  → the private stack's first pass on this branch. Result recorded below.
+
+**Not claimed.** Criterion 15's screen boxes stay unticked until the pass reports zero high
+findings. The **blocked** half of the dialog — a provider that really has provisioned
+accounts, where the count is non-zero and the repair button appears — is not exercised by
+this pass, because the providers it creates have provisioned nobody. That case rests on the
+unit tests and `apps/api/tests/iam_provider_deletion.rs`; a pass that provisions an account
+through SCIM first would close it and is the obvious next step in the QA plan. The live OIDC
+round trip against the stub IdP with a SCIM-provisioned subject is also still open.
+
+**What the pass actually did, and what it did not.** The stack came up correctly and this
+branch's first pass proved the isolation while doing it: `QA_STACK=w9` resolved to
+`omnion_qa_w9` (the live API's `DATABASE_URL` was read back from `/proc/<pid>/environ` and ends
+in `/omnion_qa_w9`, and `auth_providers` exists there), the API answered on `:18088`, the admin
+on `:3108` and the renderer on `:3208`. The walkthrough then visited the page inventory and
+**died on `iam-authentication`** with `Target page, context or browser has been closed`.
+
+That is the multi-writer signature, not a finding. Three other writers were running passes at
+the same moment — `w6` on `:18085`, `w8` on `:18087`, `w10` on `:18089` — and `free -g` read
+25 used / 2 free with 6 available. The tab dying part-way down the route list is what a
+thirty-second memory shortage looks like from inside a browser, and it is the same error
+`scripts/qa/walkthrough.cjs` has hit on this box before. **The route is in the inventory and it
+was visited** — the failure is at `page.waitForTimeout` immediately after `page: iam-authentication`,
+which is the inventory click, not the deletion-dialog step. So the dialog's own assertions did
+not run, and they are **not** claimed.
+
+**A stale log line worth fixing rather than reading past.** `[qa] API on :18088 (database
+omnion_qa)` is a hardcoded string in `run.sh`; the line above it correctly reported
+`omnion_qa_w9 reset`. The value is right and the database is genuinely private — the log
+merely says the wrong thing, which is the kind of line that teaches the next reader that this
+stack is not isolated. Worth correcting in its own commit.
+
