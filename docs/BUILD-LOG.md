@@ -5291,3 +5291,235 @@ the API is done, the screens are not, and a REQ does not close on an API alone.
 **Gate still owed.** The scoped QA pass got the slot this tick and exited 3 at
 `could not sign in after wizard` — the API came up on :3104 but the walkthrough could not sign
 in. That is the harness, not this change, and it is the first thing to diagnose next tick.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Tick 60 — the blocker was a story, not a fact
+
+Two ticks of this loop wrote into `docs/BUILD-LOG.md` and into the REQ-012 status line that
+`main`'s migration-ledger gap `0018 → 0021` makes `migrate()` fail on **any fresh database**,
+and therefore stops `scripts/qa/run.sh` at step 1. One of those ticks used it to defer a browser
+pass, which is the expensive kind of wrong: not a broken build, but a screen that was finished
+and left unproven.
+
+The claim was never tested. It is about a third-party library's behaviour, and a claim about a
+library is a hypothesis until someone has run it. **This tick ran it.**
+
+`apps/api/tests/migration_gap.rs`, two walks against throwaway databases:
+
+```
+running 2 tests
+test fresh_database_migrates_despite_a_gap ... ok
+test restored_ledger_must_be_contiguous ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.58s
+```
+
+**The fresh install is fine.** sqlx's `validate_applied_migrations`
+(`sqlx-core-0.8.6/src/migrate/migrator.rs`) iterates the **applied** rows and rejects one whose
+version is not in the embedded set. A fresh database has no applied rows, so the loop has
+nothing to reject. The gap is inert on a clean install, and the QA pass — which always starts
+from a dropped database — was never blocked by it.
+
+**What the gap does break is a restore.** A database carried over from a branch that had a
+`0019` holds an applied row this binary cannot see, so the runner refuses. That is correct
+behaviour, not a bug, and it is the second test: the refusal must *name* the version rather
+than merely fail, because "migration failed" is not an actionable message and "migration 19 is
+not in this build" is. Both halves are now pinned, so the note can no longer drift in either
+direction, and the test asserts that `0019` is still absent so a future merge of a sibling's
+`0019` has to be a deliberate edit rather than a silent premise change.
+
+Each test creates and drops its own database and reads the server URL from the same environment
+the other suites use, so no credential appears in the test and a run can never touch the
+development database — a test that quietly did would pass for the wrong reason.
+
+**The pass is not blocked; it is queued.** The box allows one walkthrough at a time, and a
+sibling wave (w3) has held that slot since 10:36 and is genuinely progressing — its
+walkthrough is stepping through screens. This pass is waiting its turn behind it, which is the
+slot doing its job. Forcing a second Chrome onto a box that already shows load 11 and 6 GB free
+is how the 2026-09-28 crash happened, so the queue is the right answer, not an obstacle to route
+around.
+
+**A trap in the slot itself, worth the twenty minutes it cost.** A place file is named after
+the *taking* script's pid, and that script exits the moment it takes the place — so the pid in
+the filename is always dead within milliseconds of a perfectly healthy pass. Liveness is the
+**holder** pid, written to a sibling directory. I read the filename pid first, concluded both
+places were stale, and was one command away from stealing a live sibling's slot. `ps` on the
+holder showed a pass twelve minutes into a real walkthrough. `qa-slot.sh` documents this, and
+the lesson generalises: a lock whose name encodes the *waiter* is not a lock; check the thing
+that stays alive.
+
+**Second trap: `nohup … &` inside a backgrounded tool call still dies with its shell.** The
+first pass attempt left a place file and a dead holder behind — indistinguishable, from the
+outside, from a pass that had run. It had done nothing at all. Launch the command *as* the
+background process, and clear any place you orphan, or the next tick inherits a phantom.
+
+**Other gates, this tick:**
+
+- `cargo test -p omnion-security --quiet` → **100 passed**
+- `pnpm typecheck` (apps/admin) → clean
+- `cargo build -p omnion-api --test migration_gap` → clean
+
+**Next tick:** take the pass when the slot frees, confirm `runSecurityDepth` reaches
+`/security/headers` and clicks it, and tick the screen boxes for slices 1 and 2. If the slot is
+again occupied, build slice 3 (rate limiting + lockout) rather than idling — the schema and the
+policy can land and be tested without a browser.
+
+---
+
+## 2026-09-29 · tick 61 · REQ-012 slice 3 — the limiter, the lockout, and two screens
+
+**Picked up a tree that was already dirty.** The previous tick was cut off mid-slice: five
+modified files, six untracked ones, 2 545 lines of limiter and lockout code written but never
+committed. The instruction is to finish a slice rather than start one, so this tick's first job
+was to establish whether that half-written work was coherent, not to abandon it and start over.
+
+**It was coherent, and it was good.** 137 crate tests passed on the first run, the design notes
+explained *why* each choice was made rather than what it did, and `burst` was correctly defined as
+headroom inside a window rather than a second window. Discarding 2 545 lines of that to make a
+tidy tick would have been the wrong call.
+
+**The migration number was a collision waiting to happen.** The interrupted slice had written
+`0146_security_rate_limits.sql`. Four sibling writers share this PUBLIC repo, and both w4
+(`0146_inventory_order_line_ref`) and w10 (`0146_workflow_graph`) already held `0146`. This is
+the second time the shared namespace has bitten a wave, and the failure mode is nasty rather than
+loud: git merges two files with different content under the same name, and sqlx then refuses the
+database with a checksum error that names neither author. Renumbered to **0151**, taken from the
+high-water mark across *every* worktree rather than from this branch's own tail.
+
+**Proof, all real:**
+
+```
+cargo test -p omnion-security --quiet           → 137 passed; 0 failed
+cargo test -p omnion-api --lib --quiet          → 216 passed; 0 failed
+cargo test -p omnion-api --test migration_gap   →   4 passed; 0 failed  (--nocapture)
+pnpm typecheck (apps/admin)                     → clean
+```
+
+**The migration test is the one worth reading.** "The file applied" is a weak claim about three
+statements. What the new tests assert is that the file's *guarantees* survive a real install: a
+bare `insert into security_settings (id) values (1)` — the fixture, the seed, an operator at a
+psql prompt — still yields a readable document, and the locked-accounts index is **partial** on
+`locked_until is not null` rather than a plain index over a nullable timestamp, because the
+screen's query is "who is locked right now" and an unfiltered index turns that into a sequential
+read of every account on a platform with millions of them. Both shape constraints are violated
+on purpose, because a constraint test that only checks a *valid* row passes against a missing
+constraint just as happily.
+
+**A dead link, found by looking rather than by testing.** The posture registry has pointed
+`rate_limiting` at `/security/rate-limits` since it was written, and until this commit that link
+went nowhere — a check row on the overview pointing at a screen that did not exist. The tab
+strip's own comment ("lists the screens that exist, never the ones planned") is what made the gap
+visible: three tabs while the overview advertised a fourth destination. `/security/ip-access` is
+dead in exactly the same way and is slice 4's first defect, now written into the REQ.
+
+**I nearly shipped two dishonest ticks, and the fix is the lesson.** The two acceptance criteria
+about the limiter went in as `[x]` with notes reading, in my own words, "no real request has been
+refused" and "there is no middleware to match against yet". A ticked box whose note contradicts
+it is worse than an unticked one: the tick is what a later tick reads, and it would have recorded
+the enforcement as proven on the strength of a unit test. The tester's verdict matching the
+middleware is true *by construction* — both call the same `decide` — and a construction argument
+is not the criterion, which asks for a match. Both are unticked, with the gap named.
+
+**The screens.** `/security/rate-limits` shows the arithmetic rather than a word: "Allowed" over
+"would be allowed" hides "3 of 11 requests in the window", and that number is what tells an
+operator whether to raise the limit, wait for the window, or go looking for a client that is
+looping. The counter key is displayed so the claim is checkable against a Redis dump instead of
+merely believable, and the verdict region is `aria-live` and takes focus, because a verdict that
+only appears in a column is one a screen reader never reads. `/security/sign-in-protection` keeps
+the policy and the accounts it locked on one screen, because an operator tuning `attempts` has to
+see what the current setting has already caught. Its empty state is written as the good fact it
+is — a bare "no results" there reads as a broken lockout, which is the one conclusion an operator
+must not draw from it.
+
+**The pass is queued, not blocked.** A sibling wave still holds the one-pass-per-box slot
+(holder pid 1886095, alive and running `qa-slot.sh`). Load is 17 with 6 GB free, which is the
+state the 2026-09-28 OOM happened in, so this pass waits its turn. Nothing was forced.
+
+**Commits:** `0ceb384` domain · `64ac262` migration · `ec29551` API · `82c8edd` migration tests ·
+`5f41472` client+types · `d747b73` screens and tabs · `cd49644` this REQ's status. Pushed.
+
+**Next tick:** (a) layer the limiter middleware on the router so `enforce()` is actually on the
+request path, and prove a scripted burst returns `429` with `Retry-After` over HTTP; (b) call
+`evaluate_lockout` from the sign-in route so five failures actually lock an account. Both are the
+difference between "the policy exists" and "the platform refuses", and (a) is what un-ticks the
+first two boxes. Then take the browser pass the moment the slot frees.
+
+---
+
+## 2026-09-29 · tick 62 · REQ-012 slice 3 (b) — the limiter is on the request path
+
+**What.** `apps/api/src/rate_limit_middleware.rs` layers the limiter on the router as the
+outermost layer, and `apps/api/tests/rate_limit.rs` drives a real burst over HTTP. The two
+acceptance boxes that said "no request has ever been refused" are now proved and ticked.
+
+**Proof, all real:**
+
+```
+cargo test -p omnion-security --lib                  -> 137 passed; 0 failed
+cargo test -p omnion-api --lib                       -> 220 passed; 0 failed
+cargo test -p omnion-api --test rate_limit           ->   3 passed; 0 failed   (live PG + Redis)
+cargo test -p omnion-events --lib                    ->  47 passed; 0 failed
+cargo test -p omnion-api --test events every_emitted ->   1 passed            (was FAILED)
+pnpm typecheck (apps/admin)                          -> clean
+```
+
+**The order of the layers is the design, not an accident of where the line falls.** The limiter
+sits ahead of CSRF and ahead of every permission guard. Behind the guards it would cap only
+callers who already hold a permission, which leaves an anonymous spray against
+`POST /auth/login` uncapped — the one path an attacker reaches without an account. Ahead of CSRF
+because a cookie-less mutation is still a request somebody is sending and must spend budget
+either way. `/healthz` and `/readyz` are inside it too, deliberately: a probe every few seconds
+against a budget of 600 a minute cannot trip it, and a probe that reported the platform down would
+be its own outage.
+
+**The document is read once at boot into a process-wide cell**, the same shape as the header
+policy, so a request's cost never depends on the database — and `put_rate_limits` replaces the
+numbers in place, so the limiter decides by what the operator typed rather than by what was true
+before the last restart. Without that second half, the screen's own tester (which reads the store)
+would answer differently from the middleware that refuses the request, which is exactly the drift
+the criterion exists to catch.
+
+**Three things went wrong on the way, and each is a lesson rather than an apology.**
+
+The first is mine from last tick: four `security.*` events were emitted by slices 1–3 and absent
+from the event catalogue, so `every_emitted_name_is_in_the_catalogue` was **red on main** and my
+per-crate gates never ran it — it lives in a different test target. A green list of tests is not a
+green repo. `0e2caaa` lists the four, deliberately without policy values in the payloads: an event
+travels to every subscriber, and a rate limit published to the bus is published further than the
+panel ever shows it.
+
+The second is the one worth keeping. The suite's first run refused nothing. The cause was one line:
+`installed()` returned `None`, because the cell is filled when `router()` is built and the suite had
+not built one yet — so the reload went nowhere, the router installed the shipped defaults, and a
+six-request burst against a ceiling of 120 was never over the line. `Uuid::nil()` as the actor was
+refused by the foreign key a moment earlier too: `NULL` is how that column says *nobody*, and
+user-zero-is-not-present is a claim about a row that does not exist.
+
+**A method that returns `()` cannot report that it did nothing**, so the fix is `ensure_installed`
+plus an assertion that the live policy carries the test's own number. Without that assertion, "the
+reload was a no-op" and "the reload worked" are indistinguishable from the call site. The suite's
+own failure message ("the limiter is not on the request path") is what made it one run rather than
+an afternoon: a message that states the claim is worth more than a message that states the
+symptom.
+
+**Next.** (a) The sign-in route still does not call `evaluate_lockout` — nothing has ever locked an
+account, and `security.lockout.triggered` still has no emitter, so the name stays out of the
+catalogue rather than being listed as a fact the platform does not record. That is the other half
+of "the policy exists" versus "the platform refuses". (b) The browser pass is still queued; the
+slot's holder was alive at load 14 with 4 GB free, so it waits rather than forcing — that is how
+2026-09-28 OOMed.
+
+**Commits:** `0e2caaa` event catalogue · `005fed6` Retry-After on ApiError · `c86080a` the limiter
+middleware and its HTTP suite · `e2b9ceb` the panel's refusal region. Pushed.

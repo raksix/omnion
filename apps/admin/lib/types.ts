@@ -1963,3 +1963,107 @@ export type EnvironmentFilters = {
   search?: string;
   limit?: number;
 };
+
+export type RateLimitScope = {
+  scope: string;
+  window_seconds: number;
+  limit: number;
+  burst: number;
+  enabled: boolean;
+  /** `limit + burst`, computed by the server. */
+  ceiling: number;
+  /** Seconds until this window frees a place. */
+  window_remaining_seconds: number;
+};
+
+export type RateLimitsDocument = {
+  /** Always all five scopes: a missing row and an unconfigured row are different states. */
+  scopes: RateLimitScope[];
+  /** The scope names this build knows — the form's own vocabulary check. */
+  vocabulary: string[];
+  updated_by: string | null;
+  updated_at: string | null;
+  /** `false` means the baseline is showing because nobody has saved one. */
+  is_saved: boolean;
+};
+
+export type RateLimitsSave = {
+  scopes: Array<{
+    scope: string;
+    window_seconds: number;
+    limit: number;
+    burst: number;
+    enabled: boolean;
+  }>;
+  expected_scopes?: unknown;
+};
+
+export type RateLimitsSaved = RateLimitsDocument & { change_id: number | null };
+
+export type RateLimitTestRequest = {
+  method: string;
+  path: string;
+  client_ip?: string | null;
+  user_id?: string | null;
+  /** The counter to assume — what makes the tester usable during a real incident. */
+  count?: number | null;
+  machine_key?: boolean;
+};
+
+export type RateLimitTestResponse = {
+  scope: string;
+  verdict: {
+    limited: boolean;
+    scope: string;
+    reason: string;
+    count: number;
+    ceiling: number;
+    retry_after: number | null;
+  };
+  counter_identity: string;
+  counter_key: string;
+};
+
+export type LockoutPolicy = {
+  window_seconds: number;
+  attempts: number;
+  lockout_minutes: number;
+  progressive_delay: boolean;
+  base_delay_seconds: number;
+  reset_on_success: boolean;
+};
+
+export type LockoutBounds = {
+  window_seconds: [number, number];
+  attempts: [number, number];
+  lockout_minutes: [number, number];
+  base_delay_seconds: [number, number];
+  max_delay_seconds: number;
+};
+
+export type SignInProtectionDocument = {
+  policy: LockoutPolicy;
+  locked_accounts: number;
+  is_saved: boolean;
+  bounds: LockoutBounds;
+};
+
+export type SignInProtectionSave = {
+  policy: LockoutPolicy;
+  expected_policy?: unknown;
+};
+
+export type SignInProtectionSaved = SignInProtectionDocument & { change_id: number | null };
+
+export type LockedAccount = {
+  user_id: string;
+  email: string;
+  locked_until: string;
+  seconds_remaining: number;
+  failed_sign_in_count: number;
+};
+
+export type LockedAccountsPage = {
+  accounts: LockedAccount[];
+  total: number;
+};

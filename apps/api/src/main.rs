@@ -173,6 +173,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "the audit retention sweep is disabled (OMNION_AUDIT_RETENTION_SWEEP=false)"
         );
     }
+    // The rate-limit document is read here, once, and handed to the layer the router is about to
+    // install (REQ-012, slice 3). Reading it per request would make every request's cost depend on
+    // the database, which is how a settings screen turns into an outage; reading it here and
+    // failing open on the shipped defaults means a platform whose database is briefly unreachable
+    // still limits, instead of answering every caller in the world.
+    let limiter = omnion_api::rate_limit_middleware::RateLimiter::from_store(&state).await;
+    let _ = omnion_api::rate_limit_middleware::install(limiter);
+ origin/main
 
     let app = routes::router(state);
     axum::serve(
