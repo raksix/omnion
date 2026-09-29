@@ -3119,3 +3119,79 @@ slice 4 and REQ-021 remain blocked on the QA slot.
 and it is the last thing in slice 1. Re-check the QA slot on arrival; when it is free and the
 box is under load ~6, run `bash scripts/qa/run.sh` with no `QA_STACK` override and extend
 `scripts/qa/walkthrough.cjs` so the new route is visited and clicked.
+
+---
+
+## 2026-09-29 · REQ-016 slice 1, the screen half — `e7399d6`
+
+**What.** The `/events` screen, and the feed filters it needs to be a screen. The catalogue had
+a data source and nothing that rendered it; the feed had `?limit` and one `?name` and no way to
+page. Both halves are now closed, except the browser pass, which did not get a slot.
+
+**The finding: `?name=a` never filtered — it failed.** The first version of the query shape was
+a `Vec<String>` behind `Query<EventsQuery>`, which is the obvious way to write it and the wrong
+one. `serde_urlencoded` — the deserializer `Query` is built on — **rejects a single occurrence of
+a repeated key for a sequence field outright**, with a `400` whose body is plain text rather than
+the API's error envelope. So `GET /api/v1/events?name=page.published` returned `400`, not a
+filtered list. The existing test caught it on the first run and the fix is a hand parser, which
+is not a downgrade: the same three rules already live in `notifications::parse_list_params` and its
+doc comment explains why each one exists. The new one says the same three and adds the fourth the
+notification list learned the hard way — *ignore* a key this build does not know, so a panel that
+sends one filter earlier than the API still gets its feed.
+
+**A tenancy assertion that passed for the wrong reason.** The scoping assertion was first written
+against the platform owner, and it failed: five rows came back where four were expected. The
+owner's session carries `organization_id = None`, and the store's `($1::uuid is null or
+organization_id = $1)` reads that as *every* organization — which is correct for a superuser. The
+test was asserting the superuser sees everything, not that a tenant may not see another's. It now
+reads as an **organization** account, and the seeded foreign row has an *actor* from a third
+identity, so a broken actor filter and a broken organization filter are both caught.
+
+**`has_more` comes from the row past the page.** Not from a second `count`. A list and a count
+that disagree is a list that is lying, and the disagreement is invisible until somebody pages to
+the end and finds a row they have already seen. The store asks for `limit + 1` and truncates; the
+cursor is the last row's own id, exclusive, so the next page cannot re-serve the row the cursor
+names. Newest-first is asserted *across* the boundary, not per page, because "sorted within a page"
+is a property a single page satisfies by accident.
+
+**A live name nobody subscribes to is the useful number.** The catalogue now carries each name's
+24-hour delivery count, scoped to the caller's organization. It is the one question the `live`
+column cannot answer: the status says the platform records the name, the count says whether any of
+your endpoints ever heard it. It is `0` rather than absent so the column is always a number the
+screen can render, and the walk asserts *every* entry carries a number — a missing key would
+render as a blank cell indistinguishable from a name nobody has data for.
+
+**The window is relative in the URL and absolute in the request.** `?window=24h` is what the
+panel stores, and the `from` instant is computed at request time. Storing the instant would make a
+pasted link mean "the last two hours" for the sender and "nothing at all" for the reader, with no
+way to tell which happened. A `from` in the past *is* still accepted directly, because the API is
+a public surface and a relative filter is a panel convenience, not a protocol rule.
+
+**Proof.**
+
+- `cargo test -p omnion-events --lib` → **42** (unchanged; no new unit test was needed — the
+  store's filter is SQL and the walk exercises it against a real database, which is the only
+  place it can be exercised honestly)
+- `cargo test -p omnion-api --lib` → **188**
+- `cargo test -p omnion-api --test events` → **6/6** (5 before) against real Postgres
+- `tsc --noEmit` in `apps/admin` → exit 0
+- Two walkthrough routes added (`/events`, `/events?tab=catalogue`) and `runEventsDepth` written:
+  it publishes a page through the real route, filters by the first name on screen, reloads to
+  prove the URL carries the filter, expands a payload, drives `j`/`Enter`/`Escape`, forces a
+  routed `500` and checks the error banner, reads the catalogue back against the API and asserts
+  the totals match, narrows by area, expands an entry's payload fields and uses "Filter feed" to
+  cross to the other tab
+
+**Not done, and not claimed.** **No browser pass this tick.** The QA slot was held by a sibling
+writer for the whole window and the box was at load 26, so `runEventsDepth` is written and
+**unrun**, and the acceptance box that names the Catalogue *tab* stays unticked with the reason
+written into the box. The other two things the box wanted — the screen and the filters — are
+built, typechecked and API-tested. Slice 2 (endpoint management UI) and slice 3's delivery
+operations are untouched.
+
+**Next.** Re-check the QA slot on arrival; when it is free and the box is under load ~6, run
+`bash scripts/qa/run.sh` with no `QA_STACK` override. If it is green, tick the catalogue box and
+close slice 1; if the pass finds anything, fix it in the same tick — the depth pass is already
+written, so a green run closes the slice rather than starting it. After that, slice 2: the
+`/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
+operator needs first when a delivery is missing.
