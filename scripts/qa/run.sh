@@ -142,7 +142,7 @@ QA_ADMIN_EMAIL="${QA_ADMIN_EMAIL:-qa-owner@omnion.test}"
 QA_ADMIN_PASSWORD="${QA_ADMIN_PASSWORD:-OmnionQa-Passw0rd-2026!}"
 QA_ADMIN_NAME="${QA_ADMIN_NAME:-QA Owner}"
 pm2 delete "$API_NAME" >/dev/null 2>&1 || true
-OMNION_DATABASE_URL="postgres://omnion:***@127.0.0.1:5433/$QA_DB_NAME" \
+OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
 OMNION_REDIS_URL="redis://127.0.0.1:6380" \
 OMNION_PORT="$API_PORT" \
 OMNION_ENV=development \
