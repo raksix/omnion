@@ -83,6 +83,14 @@ import { readVersionFrom, resolveConflict } from "./conflict";
 import { arbitrateSave } from "./save-arbitration";
 import { startability, startMessage } from "@/features/workflows/run-from-here";
 import {
+  indexStepsByNode,
+  nodeRunStatus,
+  pillLabel,
+  pillText,
+  type NodeRunStatus,
+  type RunStep,
+} from "@/features/workflows/node-status";
+import {
   clearSelection,
   deleteTarget,
   EMPTY_SELECTION,
@@ -144,7 +152,12 @@ interface RunFromNodeBody {
   /** The steps it passed over, each with the reason the trace shows. */
   skipped?: Array<{ step_no: number; name: string; node_id: string; reason: string }>;
   /** The run itself, with every step including the skipped prefix. */
-  steps?: Array<{ step_no: number; status: string; skip_reason?: string | null }>;
+  steps?: Array<{
+    step_no: number;
+    status: string;
+    skip_reason?: string | null;
+    node_id?: string | null;
+  }>;
   /** The error shape every refused write answers with. */
   error?: { code?: string; message?: string };
 }
@@ -183,6 +196,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const [problemsOpen, setProblemsOpen] = useState(true);
   const [running, setRunning] = useState(false);
   const [runMessage, setRunMessage] = useState<string | null>(null);
+  // The most recent run's steps, keyed by the node each came from — this is what paints
+  // the status pills (REQ-004 slice 3, criterion 2). It is loaded once with the graph and
+  // refreshed by every run this screen starts, so a pill is never a guess about a run the
+  // engine has not reported yet.
+  const [runByNode, setRunByNode] = useState<Map<string, RunStep[]>>(
+    () => new Map<string, RunStep[]>(),
+  );
 
   const [dragging, setDragging] = useState<{
     id: string;
@@ -271,9 +291,52 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
     }
   }, [workflowId]);
 
+  /**
+   * Read the most recent run's steps, so the canvas can paint what the engine did.
+   *
+   * Two requests rather than one, because the list endpoint is a summary: it carries the
+   * run's id and its status but no steps, and the steps are the only thing that can say
+   * *which node* did what. A single call to the list would paint every node with the
+   * run's own status, which is a claim about work no individual node did.
+   *
+   * A rule that has never run answers with an empty list, which paints nothing — the
+   * honest reading, and the same one `node-status.ts` takes for a node with no step.
+   *
+   * Failures are swallowed on purpose. A run that cannot be read must not put the builder
+   * into its error state: the graph is fine, the rule is fine, and the only thing lost is
+   * the status layer. An author who cannot edit because a status lookup failed has been
+   * damaged by a decoration.
+   */
+  const loadLatestRun = useCallback(async () => {
+    try {
+      const response = await fetch(
+        `/api/v1/workflows/${workflowId}/executions?limit=1`,
+        { credentials: "same-origin", headers: { accept: "application/json" } },
+      );
+      if (!response.ok) return;
+      const body = (await response.json().catch(() => null)) as {
+        executions?: Array<{ id?: string }>;
+      } | null;
+      const latest = body?.executions?.[0];
+      if (!latest?.id) return;
+      const detail = await fetch(`/api/v1/workflow-executions/${latest.id}`, {
+        credentials: "same-origin",
+        headers: { accept: "application/json" },
+      });
+      if (!detail.ok) return;
+      const run = (await detail.json().catch(() => null)) as {
+        steps?: RunStep[];
+      } | null;
+      setRunByNode(indexStepsByNode(run?.steps ?? []));
+    } catch {
+      // See above: no status layer is better than no builder.
+    }
+  }, [workflowId]);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadLatestRun();
+  }, [load, loadLatestRun]);
 
   // ---- saving -----------------------------------------------------------------------------
 
@@ -1312,6 +1375,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         // autosave those are the same graph at two moments. Reporting the server's count
         // keeps the message true even in the tick between them.
         setRunMessage(startMessage(node.label, body?.skipped ?? []));
+        // The pills are read back from what the engine actually wrote, not from this
+        // screen's guess. The response already carries every step with its node, so
+        // re-reading the run is unnecessary — and re-reading it immediately would race
+        // the engine, which is still claiming the first step.
+        setRunByNode(indexStepsByNode(body?.steps ?? []));
       } catch (error) {
         setRunMessage(
           error instanceof Error ? error.message : "The run could not be started.",
@@ -1339,6 +1407,10 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         throw new Error(body?.error?.message ?? `Run failed with status ${response.status}.`);
       }
       setRunMessage("Run started. Its trace is on the rule's Runs tab.");
+      // A whole run paints the same pills a partial one does — the difference is which
+      // nodes are in the index, not how a status is drawn. Refreshing here is what makes
+      // the button's own press visible on the canvas instead of on another screen.
+      await loadLatestRun();
     } catch (error) {
       setRunMessage(error instanceof Error ? error.message : "The run could not be started.");
     } finally {
@@ -1753,6 +1825,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                   <div className="flex items-center gap-1.5 px-2.5 pt-2">
                     <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />
                     <span className="truncate text-[12.5px] font-medium">{node.label}</span>
+                    <NodeStatusPill status={nodeRunStatus(runByNode.get(node.id) ?? [])} />
                   </div>
                   <p className="truncate px-2.5 pb-2 pt-0.5 text-[11.5px] text-muted">
                     {nodeType?.summary ?? node.type}
@@ -2143,6 +2216,56 @@ function RunFromHereControl({
         </p>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The status pill on a node card.
+ *
+ * Criterion: *"After a run each node shows its status pill, and clicking the node opens that
+ * step's inputs and output."* This is the first half; the click is the inspector's job and
+ * the pill is what tells the author which step it will open.
+ *
+ * Two things it deliberately does not do. It does not render when there is no status —
+ * `nodeRunStatus` returns a null status for a node the run never reached, and a pill with
+ * an empty label is a dead control, so nothing is drawn at all rather than a neutral dot.
+ * And it does not colour by status name directly: the tones below are the design system's,
+ * so a status that later gains a colour cannot quietly invent a hue the palette does not
+ * have.
+ *
+ * The reason is a `title` rather than visible text because a skipped step's reason is a
+ * whole sentence naming a node, and a card 190px wide cannot hold it. Truncating it to an
+ * ellipsis would satisfy "the trace says why" with a word that says nothing.
+ */
+function NodeStatusPill({ status }: { status: NodeRunStatus }) {
+  const label = pillLabel(status);
+  if (!label) return null;
+  const text = pillText(status);
+
+  const tone =
+    status.status === "succeeded"
+      ? "border-[color:var(--color-positive)] text-[color:var(--color-positive)]"
+      : status.status === "failed"
+        ? "border-[color:var(--color-danger)] text-[color:var(--color-danger)]"
+        : status.status === "running"
+          ? "border-[color:var(--color-accent)] text-[color:var(--color-accent)]"
+          : status.status === "diverged"
+            ? "border-[color:var(--color-accent)] text-[color:var(--color-accent)]"
+            : "border-line text-muted";
+
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-1.5 py-0.5 text-[10.5px] font-medium ${tone}`}
+      title={text ?? label}
+      // A real marker, like `data-node-selected`: the QA pass reads this attribute rather
+      // than parsing a class string, because a class is a styling decision and a status is
+      // a fact about the engine.
+      data-node-status={status.status ?? undefined}
+      data-node-status-shape={status.shape}
+      data-node-step-nos={status.stepNos.join(",")}
+    >
+      {label}
+    </span>
   );
 }
 
