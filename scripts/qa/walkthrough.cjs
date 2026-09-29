@@ -4305,8 +4305,26 @@ async function runMenusDepth(page, report) {
   );
   const fourth = await page.evaluate(async (id) => {
     const detail = await fetch(`/api/v1/menus/${id}`, { credentials: "same-origin" }).then((r) => r.json());
-    // A fourth level under the deepest existing row, written through the store's own contract.
-    const deepest = detail.items.find((item) => item.label === "QA third") ?? detail.items[0];
+    // The parent of the fourth level has to BE the third level. Parented on the deepest row's OWN
+    // parent, a fourth-level row lands on a legal second level, the store accepts it, and the
+    // check reads false with a `200` beside it — a depth rule that was never exercised, wearing
+    // the costume of a store that does not enforce it. The chain is therefore built from the
+    // tree as it actually stands: the deepest existing row becomes the parent, and the new row is
+    // appended under it.
+    const depthOf = (item, byId) => {
+      let d = 1;
+      let cur = item;
+      while (cur?.parent_id && byId.has(cur.parent_id) && d < 12) {
+        cur = byId.get(cur.parent_id);
+        d += 1;
+      }
+      return d;
+    };
+    const byId = new Map(detail.items.map((item) => [item.id, item]));
+    let deepest = detail.items[0] ?? null;
+    for (const item of detail.items) {
+      if (!deepest || depthOf(item, byId) > depthOf(deepest, byId)) deepest = item;
+    }
     const items = detail.items.map((item) => ({
       id: item.id,
       parent_id: item.parent_id,
@@ -4324,7 +4342,7 @@ async function runMenusDepth(page, report) {
     }));
     items.push({
       id: crypto.randomUUID(),
-      parent_id: deepest ? deepest.parent_id : null,
+      parent_id: deepest ? deepest.id : null,
       position: 99,
       label: "QA fourth",
       item_type: "url",
@@ -4343,11 +4361,17 @@ async function runMenusDepth(page, report) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ items, locations: detail.locations }),
     });
-    return { status: response.status, body: await response.json().catch(() => ({})) };
+    return {
+      status: response.status,
+      body: await response.json().catch(() => ({})),
+      builtUnderDepth: deepest ? depthOf(deepest, byId) + 1 : 1,
+    };
   }, menuId);
   steps.fourthLevelStatus = fourth.status;
   steps.fourthLevelRefused = fourth.status === 400;
   steps.fourthLevelCode = fourth.body?.error?.code ?? null;
+  steps.fourthLevelBuiltUnder = fourth.builtUnderDepth;
+  steps.fourthLevelMessage = fourth.body?.error?.message ?? null;
   steps.refusalLeftTheTreeAlone =
     Number(qaSql(`select count(*) from cms_menu_items where menu_id = '${menuId}'`) || 0) ===
     Number(beforeRefusal);
@@ -4552,6 +4576,30 @@ async function runMenusDepth(page, report) {
       if (doneRow) {
         steps.doneRowHasNoActions = (await page.locator(`[data-queue-cancel="${doneRow}"]`).count()) === 0;
       }
+
+      // The queue's own retry, asked directly, because the button only exists on a failed row and
+      // this entry is not one. The claim is the REFUSAL: `retry` only moves a `failed` entry back
+      // to `pending`, so pressing it on a pending entry is the same mistake as pressing it twice —
+      // a duplicate publish scheduled for a second delivery. The store answers
+      // `publishing_entry_not_found` rather than an error shape, so the status is recorded beside
+      // the code: a `200` with the row still `pending` would be a second definition of "retried".
+      //
+      // This is written here, in the pass that owns the queue, rather than read off the
+      // notifications pass: that one drives a different screen with a different outbox and never
+      // runs in `--only=menus`, so demanding its key from this checklist was a check that could
+      // never be written — a permanently "missing" item that reads like a broken product.
+      const retry = await page.evaluate(async (id) => {
+        const response = await fetch(`/api/v1/publishing/queue/${id}/retry`, {
+          method: "POST",
+          credentials: "same-origin",
+        });
+        return { status: response.status, body: await response.json().catch(() => ({})) };
+      }, entry.body.id);
+      steps.retryRefusesAPendingRow = retry.status;
+      steps.retryRefusesASentRow = retry.status !== 200;
+      steps.retryRefusalCode = retry.body?.error?.code ?? null;
+      steps.retryLeftTheRowPending =
+        qaSql(`select status from cms_publishing_queue where id = '${entry.body.id}'`) === "pending";
 
       // Cancel it, and prove the row is really cancelled rather than merely off screen.
       await page.locator(`[data-queue-cancel="${entry.body.id}"]`).click({ timeout: 4000 }).catch(() => {});
@@ -5680,7 +5728,8 @@ async function main() {
       // the queue (same flat `steps` object — see below)
       "queueReady", "entryOnScreen", "rescheduleFormOpened", "rescheduleStored",
       "rescheduleIsLater", "rescheduleMoved", "cancelledInSql", "cancelButtonGone",
-      "retryRefusesASentRow", "scheduleStatus",
+      "retryRefusesASentRow", "retryRefusesAPendingRow", "retryRefusalCode",
+      "retryLeftTheRowPending", "scheduleStatus",
     ];
     // The queue half writes into the SAME flat `steps` object — there is no nested `queue`
     // key, and reading one into existence would have demanded eleven checks that can never be
