@@ -4192,6 +4192,22 @@ async function runSearchDepth(page, report) {
 
 // ---------------------------------------------------------------- analytics (REQ-007, slice 2)
 
+/**
+ * Read a single value out of the disposable QA database.
+ *
+ * A scalar read that matches nothing returns `""`, and a caller that interpolates that into a
+ * later statement builds `where site_id = ''` — a **type error** against a uuid column that then
+ * aborts the whole seeding step with a message about the *update*, pointing at the wrong line.
+ * Failing here, at the read that actually came back empty, names the real cause.
+ */
+function qaScalar(statement, what) {
+  const value = qaSql(statement);
+  if (!value) {
+    throw new Error(`qa fixture: ${what || statement} matched nothing in ${QA_DB}`);
+  }
+  return value;
+}
+
 /** Run one statement against the disposable QA database. */
 function qaSql(statement) {
   return execFileSync(
@@ -4304,7 +4320,7 @@ async function seedAnalytics(report) {
   // a third inside the last month, so 7-day and 30-day ranges both have a shape to draw.
   let spread = "skipped";
   try {
-    const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+    const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
     const shift = (table, column) => `
       update ${table} set ${column} = ${column} - (
         case when id % 3 = 1 then (1 + (id % 6)) else (7 + (id % 23)) end || ' days'
@@ -4485,7 +4501,7 @@ async function runGoalAndRealtimeDepth(page, report) {
   // realtime within five seconds — no rollup tick stands between the request and the counter.
   let latency = null;
   try {
-    const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+    const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
     const cookies = await page.context().cookies();
     const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
     const started = Date.now();
@@ -5277,7 +5293,7 @@ async function runNotificationOutboxDepth(page, report) {
 async function runCdnPurgeDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
-  const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
   if (!site) {
     steps.skipped = "no QA site to purge for";
     return steps;
@@ -5433,7 +5449,7 @@ async function runCdnPurgeDepth(page, report) {
 async function runCdnRulesDepth(page, report) {
   const steps = {};
   const stamp = Date.now();
-  const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
   if (!site) {
     steps.skipped = "no QA site to attach a rule to";
     return steps;
@@ -5666,7 +5682,7 @@ async function runCdnRulesDepth(page, report) {
  */
 async function runEventsDepth(page, report) {
   const steps = {};
-  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  const siteId = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
 
   // 1. Emit real facts through real routes. Publishing a page is the one an operator can
   //    always do, and it produces three names with three different payload shapes.
@@ -5896,7 +5912,7 @@ async function runEventsDepth(page, report) {
  */
 async function runWebhooksDepth(page, report) {
   const steps = {};
-  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  const siteId = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
 
   // ---- The receiver -----------------------------------------------------------------------------
   // Started here rather than by run.sh because only this pass needs it, and a process nothing
@@ -6652,7 +6668,7 @@ async function runRetentionDepth(page, report) {
  */
 async function runAnalyticsSettingsDepth(page, report) {
   const steps = {};
-  const site = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  const site = qaScalar(`select id from sites where key = '${CREDS.siteKey}' limit 1`, "the QA site (key '${CREDS.siteKey}')");
   const switchState = async (name) =>
     (await page
       .locator(`[data-analytics-settings-switch="${name}"]`)

@@ -78,9 +78,13 @@ export function CdnOverviewView() {
     // adapter is running (the installation default for a site with no row of its own),
     // and the rule list says whether anything is being cached through it. Reading only one
     // is how an overview ends up describing a provider that caches nothing.
+    // `siteId` is null until a site is chosen, and the guard below renders the empty state in
+    // that case. The reads run before that guard, so a null here must be *resolved*, never
+    // coerced to "" — `?site_id=` is a 400 from the server, and an overview that fetches on every
+    // render turns one missing site into a wall of failed requests.
     Promise.all([
       fetchCdnSettings(siteId),
-      fetchCdnRules(siteId ?? ""),
+      siteId === null ? Promise.resolve({ rules: [], unreadable: [] }) : fetchCdnRules(siteId),
       // The status call is a third read rather than a second because the purge counters
       // and the recent list come from the same query: fetching them separately would let
       // the table show a purge the counter has not counted, which reads as a bug and is.
