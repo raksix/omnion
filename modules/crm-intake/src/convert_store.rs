@@ -38,6 +38,48 @@ pub struct ConversionReport {
     pub deal_skipped: Option<String>,
 }
 
+/// `true` when a relation is in this database's catalog.
+///
+/// `to_regclass` rather than a query against the table: asking the catalog whether a name
+/// exists is one cheap lookup that cannot fail, where `select 1 from <table>` on a missing
+/// table is an error every caller has to pattern-match on `42P01` — and the *other* `42P01`,
+/// a missing column, gets confused with it.
+pub async fn table_present(pool: &PgPool, table: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("select to_regclass($1) is not null")
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+}
+
+/// Write the trail for a conversion that could not convert, and answer it.
+///
+/// The lead row is left exactly as it was — no status change, no pointers — because a
+/// conversion that did not happen must not leave the row looking like it did. The only
+/// thing written is the timeline line, which is what an operator reads to find out why the
+/// button did nothing.
+async fn record_skipped(
+    pool: &PgPool,
+    organization_id: Uuid,
+    lead_id: Uuid,
+    actor_user_id: Option<Uuid>,
+    report: ConversionReport,
+) -> Result<Option<ConversionReport>> {
+    let detail = serde_json::json!({
+        "contact_id": serde_json::Value::Null,
+        "contact_created": false,
+        "deal_id": serde_json::Value::Null,
+        "deal_skipped": report.deal_skipped,
+    });
+    store::append_event(pool, lead_id, "conversion_skipped", actor_user_id, detail).await?;
+
+    // Re-read so the answer is the row's state, and `None` if the lead went away.
+    if store::find_lead(pool, organization_id, lead_id).await?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(report))
+}
+
 /// The pipeline and stage a converted deal lands in.
 ///
 /// The source's own configuration wins, then the organization's default pipeline's first
@@ -91,14 +133,39 @@ pub async fn convert_lead(
         )));
     }
 
+    // **The CRM module's absence is decided once, here, and it decides both halves.**
+    //
+    // The first version created the contact *outside* this guard and only guarded the deal,
+    // because the two live in the same table. That was wrong in a way the gate caught on its
+    // first run: with no `crm_contacts` there is no table to insert a contact *into*, so the
+    // "create the contact, skip the deal" degradation could never run — the very installation
+    // it was written for got a 500. A contact is a CRM row, and without the CRM there is no
+    // contact; the honest answer is a lead that is still a lead, plus the reason.
+    let crm_present = table_present(pool, "crm_contacts").await;
+    if !crm_present {
+        tracing::warn!(
+            organization_id = %organization_id,
+            "crm_contacts is absent — the lead stays a lead and says why"
+        );
+        let report = ConversionReport {
+            contact_id: lead.contact_id.unwrap_or(Uuid::nil()),
+            contact_created: false,
+            deal_id: None,
+            deal_skipped: Some(
+                "the CRM module is not installed, so nothing was converted".to_string(),
+            ),
+        };
+        return record_skipped(pool, organization_id, lead_id, actor_user_id, report).await;
+    }
+
     let contact_id = match lead.contact_id {
         Some(existing) => existing,
         None => create_contact(pool, &lead).await?.contact_id,
     };
 
     let report = match default_pipeline(pool, organization_id, None, None).await {
-        // The CRM tables are absent: the contact is real, the opportunity cannot exist yet,
-        // and the lead is left `qualified` — the last working status before `converted`.
+        // The deals table is gone even though the contacts are (a partial installation). The
+        // contact is real in this case, so it stays and only the opportunity is skipped.
         Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P01") => {
             tracing::warn!(
                 organization_id = %organization_id,
@@ -109,7 +176,7 @@ pub async fn convert_lead(
                 contact_created: true,
                 deal_id: None,
                 deal_skipped: Some(
-                    "the CRM module is not installed, so no opportunity was created".to_string(),
+                    "the opportunities table is not installed, so no deal was created".to_string(),
                 ),
             }
         }
@@ -219,6 +286,11 @@ async fn create_contact(
         ));
     }
 
+    // `crm_contacts` has **no** `company_name` column — the company lives in its own table
+    // (REQ-051's `crm_companies`, reached by `company_id`). Naming a column that does not
+    // exist is a 42703 on the CRM-present path only, which is exactly the half that a
+    // CRM-less test run never exercises; the company name therefore goes into the note
+    // below rather than into a column the schema refuses.
     let row: (Uuid,) = sqlx::query_as(
         "insert into crm_contacts (organization_id, first_name, last_name, email, phone, \
              job_title, owner_user_id, status, notes) \
@@ -250,6 +322,17 @@ async fn create_contact(
 /// "asked for X on the website", not a JSON dump of a form submission.
 fn note_for(lead: &Lead) -> Option<String> {
     let mut note = String::from("From a website lead");
+    // The company name lands here because `crm_contacts` has no column for it: dropping it
+    // would lose the single most useful fact about who wrote in, and creating a company
+    // record is REQ-051's decision, not this module's.
+    if let Some(company) = lead
+        .company_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        note.push_str(&format!(" — {company}"));
+    }
     if let Some(interest) = lead
         .product_interest
         .as_deref()
@@ -383,14 +466,19 @@ pub async fn archive_expired_payloads(
     organization_id: Uuid,
     older_than_days: i32,
 ) -> Result<u64> {
+    // `make_interval(days => …)` takes an **integer**, and binding an i64 makes the whole
+    // statement fail with 42883 — which is what the gate caught on its first run. The cast
+    // is not a style preference: without it the retention sweep is a `500` in production and
+    // no unit test notices, because unit tests do not send SQL to a database.
+    let days = older_than_days.clamp(1, 3650);
     let result = sqlx::query(
         "update crm_leads set payload = '{}'::jsonb, payload_bytes = 0, message = null, \
              consent_text = null, updated_at = now() \
          where organization_id = $1 and payload_bytes > 0 \
-           and received_at < now() - make_interval(days => $2)",
+           and received_at < now() - make_interval(days => $2::int)",
     )
     .bind(organization_id)
-    .bind(i64::from(older_than_days.max(1)))
+    .bind(days)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -456,6 +544,8 @@ mod tests {
     fn the_contact_note_quotes_the_visitor_and_no_payload() {
         let note = note_for(&lead()).unwrap_or_default();
         assert!(note.contains("Website rewrite"), "{note}");
+        // The company has no column on a contact, so the note is where it survives.
+        assert!(note.contains("Acme"), "{note}");
         // The payload is the submitter's raw answers; the contact is read by people who
         // never consented to see it in a CRM column.
         assert!(!note.contains("hello"), "{note}");

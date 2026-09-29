@@ -877,7 +877,13 @@ pub async fn fetch_candidates(
     organization_id: Uuid,
     mapped: &MappedValues,
 ) -> Result<Vec<Candidate>> {
-    const CANDIDATE_COLUMNS: &str = "id, email, phone, company_name, first_name, last_name";
+    // **`crm_contacts` has no `company_name` column.** The company lives in `crm_companies`
+    // and is reached through `company_id`, so the name is an expression over a left join,
+    // not a column of the contact. Naming it as a column is a 42703 — and it is a 42703 only
+    // on an installation that *has* the CRM, which is precisely the half that a CRM-less
+    // test run never reaches. `scripts/qa/run-crm-convert.sh` found it on its first run.
+    const CANDIDATE_COLUMNS: &str = "crm_contacts.id, crm_contacts.email, crm_contacts.phone, \
+         c.name as company_name, crm_contacts.first_name, crm_contacts.last_name";
     let email = dedupe::normalize_email(mapped.get("email"));
     let phone = dedupe::normalize_phone(mapped.get("phone"));
     let company = mapped
@@ -891,13 +897,14 @@ pub async fn fetch_candidates(
 
     let query = format!(
         "select {CANDIDATE_COLUMNS} from crm_contacts \
-         where organization_id = $1 and archived_at is null and ( \
+         left join crm_companies c on c.id = crm_contacts.company_id \
+         where crm_contacts.organization_id = $1 and crm_contacts.archived_at is null and ( \
              ($2::text is not null and lower(email) = $2) \
           or ($3::text is not null and regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') = $3) \
           or ($4::text is not null and company_id is not null and exists ( \
-                select 1 from crm_companies c where c.id = crm_contacts.company_id \
-                  and c.organization_id = $1 and lower(c.name) like $4) ) ) \
-         order by updated_at desc limit 20"
+                select 1 from crm_companies c2 where c2.id = crm_contacts.company_id \
+                  and c2.organization_id = $1 and lower(c2.name) like $4) ) ) \
+         order by crm_contacts.updated_at desc limit 20"
     );
     let rows = sqlx::query_as::<_, Candidate>(&query)
         .bind(organization_id)
