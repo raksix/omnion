@@ -6384,6 +6384,14 @@ async function main() {
     { path: "/cdn", name: "cdn-overview" },
     { path: "/cdn/rules", name: "cdn-rules" },
     { path: "/cdn/settings", name: "cdn-settings" },
+    // The purge history and the purge console (REQ-011, slice 2). The REQ's own QA plan lists
+    // all six CDN screens, and these two were reachable only by a click from another screen —
+    // which is exactly the case the "no untested screen" rule exists for: a route nobody ever
+    // opens directly is a route whose *first paint* nobody has seen, and on the purge console
+    // that first paint is the form an operator lands on when a page is serving stale. The
+    // console's own form submit is driven by `runCdnPurgeDepth` below.
+    { path: "/cdn/purges", name: "cdn-purges" },
+    { path: "/cdn/purge", name: "cdn-purge-console" },
     // The preferences matrix (REQ-021, slice 2). Walked on its own route rather than reached
     // through the list, because "no untested screen" is about the *screen* and a settings
     // page that is only ever opened by a click is a screen whose first paint is never seen.
