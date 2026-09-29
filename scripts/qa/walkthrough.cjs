@@ -1427,6 +1427,52 @@ async function runProjectsDepth(page, report) {
   steps.memberRows = await page.locator("[data-project-member]").count();
   await shot(page, "page-project-detail");
 
+  // 2b \u00b7 the move dialog (REQ-133 slice 3). The screen only ships accepted if the harness opens
+  //      it, so this is part of the walkthrough rather than a separate script: a dialog nobody has
+  //      clicked is the exact thing the "no untested screen" rule exists to stop.
+  //
+  //      It asserts the three things the dialog claims. The workflow rows exist (or the empty
+  //      state does), a row offers "Move to project\u2026", and opening it names BOTH projects and
+  //      renders the unchecked list \u2014 that last one is the claim a reviewer would otherwise take
+  //      on faith, because nothing on screen would look wrong without it.
+  steps.workflowRows = await page.locator("[data-project-workflow]").count();
+  steps.workflowEmptyState = (await page.locator("[data-project-workflows-empty]").count()) > 0;
+  steps.workflowErrorStrip = (await page.locator("[data-project-workflows-error]").count()) > 0;
+  steps.moveButtons = await page.locator("[data-project-move-workflow]").count();
+
+  if (steps.moveButtons > 0) {
+    await page.locator("[data-project-move-workflow]").first().click();
+    await page.waitForTimeout(600);
+    steps.moveDialogOpen = (await page.locator("[data-move-dialog]").count()) > 0;
+    steps.moveTargetOptions = await page.locator("[data-move-target] option").count();
+
+    // Choose a destination that is not the project the workflow is already in. The first option
+    // is the empty prompt, so option index 1 is the first real one.
+    const options = await page.locator("[data-move-target] option").all();
+    if (options.length > 1) {
+      await page.locator("[data-move-target]").selectOption({ index: 1 });
+      await page.waitForTimeout(1200);
+      steps.moveReportRendered = (await page.locator("[data-move-route]").count()) > 0;
+      steps.moveUncheckedRendered = (await page.locator("[data-move-unchecked]").count()) > 0;
+      steps.moveRefusalRendered = (await page.locator("[data-move-refusal]").count()) > 0;
+      steps.moveConfirmDisabled =
+        (await page.locator("[data-move-confirm]").isDisabled().catch(() => false));
+      const uncheckedText = (await page.locator("[data-move-unchecked]").allInnerTexts()).join(" ");
+      // The sentence, not the ids: a panel claiming to check everything would omit this block
+      // entirely, and that is the defect the field was added for.
+      steps.moveUncheckedIsExplained = /not checked/i.test(uncheckedText);
+      await shot(page, "page-project-move-dialog");
+    } else {
+      // One project in the organization: the picker says so instead of offering a dead control.
+      steps.moveDialogOpen = steps.moveDialogOpen ?? false;
+      steps.moveNoDestination = (await page.locator("[data-move-target]").isDisabled().catch(() => false));
+    }
+
+    await page.locator("[data-move-close]").first().click();
+    await page.waitForTimeout(400);
+    steps.moveDialogClosed = (await page.locator("[data-move-dialog]").count()) === 0;
+  }
+
   // 3 · the roster is people, not ids. A row whose name and address are both a bare uuid is the
   //     id-shaped control this module's own header says not to build.
   const memberText = (await page.locator("[data-project-member]").allInnerTexts()).join(" | ");
