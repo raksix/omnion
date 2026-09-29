@@ -11,8 +11,8 @@ use omnion_api::audit_retention;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_runner, retention_runner, search_runner,
-    workflow_runner,
+    analytics_runner, automation_runner, cdn_purge_runner, event_runner, retention_runner,
+    search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -135,6 +135,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::info!("the analytics rollup worker is disabled (OMNION_ANALYTICS_RUNNER=false)");
     }
+
+    // The CDN purge worker drains the queue slice 2 added (REQ-011). It runs on the
+    // retention poll interval rather than a configuration of its own: a purge is an
+    // invalidation of something a visitor is about to see, so the queue must not sit
+    // still for minutes — and a second interval knob would be one more thing an operator
+    // sets to zero by accident.
+    let _purge_worker = cdn_purge_runner::spawn(state.clone());
 
     // The audit retention sweep applies each tenant's own stored window, unattended
     // (REQ-005, slice 4): the number an operator typed into the Settings tab is enforced by

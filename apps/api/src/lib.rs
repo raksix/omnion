@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cdn_purge_runner;
 pub mod analytics_runner;
 pub mod audit_retention;
 pub mod auth;
