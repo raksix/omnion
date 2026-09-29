@@ -6947,3 +6947,68 @@ index is written and `pending_objects_for_organization` says whose files a run m
 so `restore preview` can count what it can put back. (b) The prune sweep must use
 `remove_run_artifacts` too — it deletes the same directories by its own path today, which is
 the third half that could disagree with this one.
+
+## Tick 35 — the disk guard was deleting a live build, and calling it a compiler error
+
+**What.** The merge first: main had moved 4 commits, all in `crates/backup`, and the only
+conflict was `docs/BUILD-LOG.md`, which both sides only ever append to. It is merged by
+splicing both bodies and proving the result by **non-blank line multiset against both
+parents** — headings and line counts both survive a duplicated block, and "the totals add
+up" is not evidence that nothing was written twice. Verified: 5592 of HEAD's lines and 3746
+of MERGE_HEAD's lines, all present, 0 of either lost. (The script also had to be taught the
+two-way marker set: it was written for diff3 and died with `IndexError` on a hunk that has
+no `|||||||` base section. A lone `=======` then survived as an ordinary line, so `grep`
+counted one marker in a file that was in fact clean.)
+
+**The find.** `cargo build -p omnion-api` failed twice, mid-compile, with
+
+```
+error: could not write output to …/target/debug/deps/syn-….rcgu.o: No such file or directory
+error: couldn't create a temp dir: No such file or directory (os error 2)
+```
+
+`os error 2` is not a code fault. It is the output **directory** being gone, and `/mnt/apopic`
+was at 100% while it happened — so something on this box was reclaiming space, and the thing
+reclaiming it was `scripts/qa/disk-guard.sh`, whose whole purpose is to drop a worktree's
+`target/` when the disk gets tight. It dropped mine, twice, **while a `rustc` was writing
+into it**.
+
+The reason is one line of shell. The guard asks each process whether it holds
+`CARGO_TARGET_DIR=<dir>` and skips the target if one does. An ordinary `cargo build` never
+sets that variable: cargo takes the **default** target, `<cwd>/target`, from the process's own
+working directory. So the environment test is structurally blind to the most common build
+there is, and the one directory a plain `cargo build` writes into is the one directory the
+guard cannot see it in. Measured, not assumed — against a live build of this worktree
+`in_use` answers **NOT HELD** while `rustc` is in the target.
+
+Worse, the two reclaim paths disagreed about this. Step 4, the last-resort sweep, had the
+`in_use` check. Step 3, the ordinary per-worktree ceiling, had **no liveness check at all** —
+so the common case had no protection and the desperate case had a broken one. Fixing one call
+site would have left the same failure reachable through the other.
+
+**The fix.** `building_here` asks the question that actually decides it: is there a compiler
+process whose **cwd** is the worktree that owns this target? For a default-target build the
+environment is irrelevant and the cwd is the whole answer. Both reclaim steps now consult it;
+the ceiling drops a cache, never a running build. `scripts/qa/target-guard.sh` names the
+failure the way it is named above, because `os error 2` on an output path and `os error 28`
+on the same path are two different incidents and are routinely read as one.
+
+**Proof.**
+- `bash -n scripts/qa/disk-guard.sh` — clean.
+- `building_here` against a **live** `cargo build` of this worktree — detected.
+- `in_use` against that same live build — **NOT HELD**, which is the bug, reproduced.
+- After the fix, `cargo build -p omnion-api` from a 96M target — **exit 0 in 55 s** instead of
+  dying at ~8 minutes into a cold rebuild.
+- Merge committed `05306dd`; guard fix `a5bbe9b`.
+
+**Not proven, and not ticked.** No browser pass this tick, and none was attempted: the box
+sat between load 23 and load 187 with 24 GB of 32 GB swap in use, and the w4 QA stack was not
+up. Under those conditions a pass reports UI defects that do not exist — screenshots time out
+at 15 s and every locator after them fails. REQ-051's keyboard/mobile boxes and REQ-052's
+mobile box stay unticked, which is where they already were.
+
+**Next.** REQ-054 (accounting) — it is the module REQ-052's one unticked box is waiting on, and
+the migration namespace is at `0166` after a fresh scan of **all** worktrees, so the next
+number is `0167`. The two mobile boxes both need a pass, and both are worth a scoped
+`--only crm` / `--only sales` run: minutes, not hours, and the hour-long version is what loses
+its signed-in session.
