@@ -1090,6 +1090,23 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/{id}/respond",
             post(crm_intake::respond).layer(guards::require(&state, "crm.leads.manage")),
         )
+        // Conversion is its own key, not `crm.leads.manage`: turning a lead into a contact,
+        // an opportunity and eventually a customer is a promise to somebody outside the
+        // panel, and a support agent who may edit a lead row has no business making that
+        // promise. The flow read is `crm.leads.read` — a panel that cannot ask "what can
+        // this deployment do" renders a stepper nobody can act on.
+        .route(
+            "/crm/leads/{id}/convert",
+            post(crm_intake::convert).layer(guards::require(&state, "crm.leads.convert")),
+        )
+        .route(
+            "/crm/leads/flow",
+            get(crm_intake::flow).layer(guards::require(&state, "crm.leads.read")),
+        )
+        .route(
+            "/crm/leads/retention/sweep",
+            post(crm_intake::retention_sweep).layer(guards::require(&state, "crm.leads.manage")),
+        )
         .route(
             "/crm/leads/{id}/reject",
             post(crm_intake::reject).layer(guards::require(&state, "crm.leads.manage")),

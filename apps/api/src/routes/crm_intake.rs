@@ -552,6 +552,19 @@ pub struct LeadDetailBody {
     pub payload_bytes: i32,
     /// The history, newest first.
     pub timeline: Vec<EventBody>,
+    /// The four documented steps, computed from the row and what is installed.
+    pub steps: Vec<StepBody>,
+}
+
+/// One step as the panel renders it.
+#[derive(Debug, Serialize)]
+pub struct StepBody {
+    /// Which step.
+    pub key: &'static str,
+    /// `done` · `current` · `pending` · `blocked`.
+    pub state: &'static str,
+    /// What happened, or why it has not.
+    pub note: String,
 }
 
 impl From<Lead> for LeadDetailBody {
@@ -569,6 +582,7 @@ impl From<Lead> for LeadDetailBody {
         let lead = LeadBody::from(value);
         Self {
             lead,
+            steps: Vec::new(),
             payload,
             payload_bytes,
             timeline: Vec::new(),
@@ -850,8 +864,27 @@ pub async fn get_lead(
         .map(EventBody::from)
         .collect();
 
+    // The steps are computed here rather than in the view: the stepper's whole value is
+    // that it reflects the row and the installation, and a client that had to assemble that
+    // itself would be the second place the two can disagree. The plan is taken *before*
+    // `LeadDetailBody::from` consumes the row — a `From` impl that owns its input cannot
+    // lend it back, which is the same half-move trap its own body documents.
+    let availability = omnion_module_crm_intake::Availability {
+        sales: table_exists(pool, "sales_quotes").await,
+        commerce: table_exists(pool, "commerce_customers").await,
+    };
+    let steps = omnion_module_crm_intake::step_plan(&lead, availability)
+        .into_iter()
+        .map(|step| StepBody {
+            key: step.key,
+            state: step.state.as_str(),
+            note: step.note,
+        })
+        .collect();
+
     let mut detail = LeadDetailBody::from(lead);
     detail.timeline = timeline;
+    detail.steps = steps;
     Ok(Json(detail))
 }
 
@@ -1043,6 +1076,209 @@ pub async fn delete_lead(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a conversion produced, and what it could not.
+///
+/// `deal_skipped` is a field rather than an error because the module-absence case is a
+/// *partial success* and the panel has to render both halves: a screen that says "converted"
+/// over a lead whose opportunity was never created is a lie, and a screen that says "failed"
+/// over a contact that now exists throws away work that landed.
+#[derive(Debug, Serialize)]
+pub struct ConversionBody {
+    /// The lead after conversion.
+    pub lead: LeadBody,
+    /// The contact the lead belongs to.
+    pub contact_id: Uuid,
+    /// Whether that contact was created by this call.
+    pub contact_created: bool,
+    /// The opportunity, when one was made.
+    pub deal_id: Option<Uuid>,
+    /// Why no opportunity was made, in the operator's words.
+    pub deal_skipped: Option<String>,
+}
+
+/// Which of the documented flow's modules this deployment actually has.
+///
+/// The stepper asks this rather than asserting what it can do. The answer is read from the
+/// database — the CRM tables are REQ-051's and live on another branch, so "is the CRM
+/// installed" is a question about the installation, not a constant.
+#[derive(Debug, Serialize)]
+pub struct FlowAvailability {
+    /// Whether `crm_contacts` exists.
+    pub crm: bool,
+    /// Whether the sales module (REQ-052) exists.
+    pub sales: bool,
+    /// Whether the commerce module (REQ-008) exists.
+    pub commerce: bool,
+}
+
+impl FlowAvailability {
+    /// The module's own [`Availability`], for the pure step plan.
+    #[must_use]
+    pub fn to_module(self) -> omnion_module_crm_intake::Availability {
+        omnion_module_crm_intake::Availability {
+            sales: self.sales,
+            commerce: self.commerce,
+        }
+    }
+}
+
+/// `POST /api/v1/crm/leads/{id}/convert` — create or link the contact and open the
+/// opportunity.
+///
+/// The whole documented flow's third step, in one audited action, and deliberately **not**
+/// transactional across the CRM tables: a lead pointing at a contact nobody can see is a
+/// broken board, and the platform prefers the contact to exist with a late pointer.
+pub async fn convert(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ConversionBody>, ApiError> {
+    let organization_id = organization_of(&session)?;
+    let pool = state.db().pool();
+    let report = omnion_module_crm_intake::convert_store::convert_lead(
+        pool,
+        organization_id,
+        id,
+        Some(session.user.id),
+    )
+    .await
+    .map_err(map_store)?
+    .ok_or_else(|| not_found("lead"))?;
+
+    let lead = store::find_lead(pool, organization_id, id)
+        .await
+        .map_err(map_store)?
+        .ok_or_else(|| not_found("lead"))?;
+
+    audit(
+        pool,
+        session.user.id,
+        organization_id,
+        "crm.lead.converted",
+        id,
+        json!({
+            "contact_id": report.contact_id,
+            "contact_created": report.contact_created,
+            "deal_id": report.deal_id,
+            "deal_skipped": report.deal_skipped,
+        }),
+    )
+    .await;
+
+    if let Err(error) = bus::emit(
+        pool,
+        NewEvent::new("crm.lead.converted")
+            .organization(organization_id)
+            .payload(json!({
+                "lead_id": id,
+                "contact_id": report.contact_id,
+                "deal_id": report.deal_id,
+            })),
+    )
+    .await
+    {
+        tracing::warn!(error = %error, "crm.lead.converted could not be recorded");
+    }
+
+    Ok(Json(ConversionBody {
+        lead: LeadBody::from(lead),
+        contact_id: report.contact_id,
+        contact_created: report.contact_created,
+        deal_id: report.deal_id,
+        deal_skipped: report.deal_skipped,
+    }))
+}
+
+/// `GET /api/v1/crm/leads/flow` — which steps of the documented flow this deployment can run.
+///
+/// The stepper used to be four hard-coded strings saying the buttons do not exist, which is
+/// the "a disabled control without explanation" the QA plan forbids: the panel could not tell
+/// "not built yet" from "not installed here". This answers it from the database.
+pub async fn flow(
+    State(state): State<AppState>,
+    // The extractor is what makes the route authenticated — dropping it would turn a
+    // tenant-shape probe into a public endpoint. The session itself is not read: the
+    // answer is about the deployment, not about the caller.
+    _session: CurrentSession,
+) -> Result<Json<FlowAvailability>, ApiError> {
+    Ok(Json(FlowAvailability {
+        crm: table_exists(state.db().pool(), "crm_contacts").await,
+        sales: table_exists(state.db().pool(), "sales_quotes").await,
+        commerce: table_exists(state.db().pool(), "commerce_customers").await,
+    }))
+}
+
+/// `true` when a table is there.
+///
+/// `to_regclass` rather than a query against the table: asking the catalog whether a name
+/// exists is one cheap lookup that cannot fail, where a `select 1 from <table>` that does
+/// not exist is an error the caller has to pattern-match on `42P01` (and gets the *other*
+/// `42P01` — a missing column — confused with it).
+async fn table_exists(pool: &sqlx::PgPool, table: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("select to_regclass($1) is not null")
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false)
+}
+
+/// `POST /api/v1/crm/leads/retention/sweep` — archive payloads older than the window.
+///
+/// Reads as a maintenance action rather than something an operator presses per lead, because
+/// the promise it keeps is "the row is deletable and the body stops being stored after N
+/// days" — a policy, not a decision. The lead rows, their routing and their timelines stay.
+pub async fn retention_sweep(
+    State(state): State<AppState>,
+    session: CurrentSession,
+    Json(body): Json<SweepBody>,
+) -> Result<Json<SweepResult>, ApiError> {
+    let days = body.retention_days.unwrap_or(DEFAULT_RETENTION_DAYS);
+    if !(1..=3650).contains(&days) {
+        return Err(ApiError::bad_request(
+            "invalid_retention_days",
+            format!("retention_days must be between 1 and 3650, got {days}"),
+        ));
+    }
+    let archived = omnion_module_crm_intake::convert_store::archive_expired_payloads(
+        state.db().pool(),
+        organization_of(&session)?,
+        days,
+    )
+    .await
+    .map_err(map_store)?;
+
+    audit(
+        state.db().pool(),
+        session.user.id,
+        organization_of(&session)?,
+        "crm.lead.retention.swept",
+        Uuid::nil(),
+        json!({ "retention_days": days, "archived": archived }),
+    )
+    .await;
+
+    Ok(Json(SweepResult { archived, retention_days: days }))
+}
+
+/// The retention window an organization gets when it says nothing.
+const DEFAULT_RETENTION_DAYS: i32 = 730;
+
+/// The sweep's request body.
+#[derive(Debug, Deserialize)]
+pub struct SweepBody {
+    /// How old a payload must be before it is archived.
+    pub retention_days: Option<i32>,
+}
+
+/// What the sweep did.
+#[derive(Debug, Serialize)]
+pub struct SweepResult {
+    /// How many lead payloads were cleared.
+    pub archived: u64,
+    /// The window it ran with.
+    pub retention_days: i32,
 }
 
 // ---------------------------------------------------------------------------------------------

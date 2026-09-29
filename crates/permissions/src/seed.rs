@@ -152,8 +152,9 @@ const BASE_ROLES: &[BaseRole] = &[
             // requests, so it grants reading and working a lead. It does NOT grant
             // `crm.intake.manage` — editing a field mapping decides what the business stores
             // about every person who writes in, which is a different promise from working the
-            // leads that already arrived. Nor `crm.leads.convert`, which is slice 3's step into
-            // the sales pipeline.
+            // leads that already arrived. Nor `crm.leads.convert`, which is a promise to the
+            // person who wrote in: it turns them into a contact and an opportunity, and a
+            // moderator who works the queue is not the person who decides that.
             "crm.leads.read",
             "crm.leads.manage",
             // The bell is on every route, so every role that can open the panel needs to read
