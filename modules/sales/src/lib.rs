@@ -15,6 +15,8 @@
 //!   whose token is stored only as a hash.
 //! * [`approvals`] — the discount gate: ask a manager, decide the request, and let the quote be
 //!   sent afterwards.
+//! * [`orders`] — the other half of the chain: quote → order → confirm (which holds stock) →
+//!   invoice draft, with the status history that says how the document got where it is.
 //!
 //! The crate is a **module** (docs/04-MONOREPO.md): a feature the platform can carry behind the
 //! `sales.*` permission family, not infrastructure the core depends on. It talks to PostgreSQL
@@ -28,11 +30,12 @@ pub mod dates;
 pub mod error;
 pub mod model;
 pub mod money;
+pub mod orders;
 pub mod quotes;
 pub mod store;
 
 pub use error::{Result, SalesError};
-pub use model::{QuoteStatus, Settings, Unit};
+pub use model::{OrderReservationState, OrderStatus, QuoteStatus, Settings, Unit};
 pub use money::{LineTotals, QuoteTotals};
 pub use approvals::{
     ApprovalDecision, ApprovalQuery, ApprovalRequest, ApprovalRequired, ApprovalScope,
@@ -41,6 +44,10 @@ pub use approvals::{
 pub use quotes::{
     NewQuote, NewQuoteLine, PublicQuote, QuoteDetail, QuoteLineView, QuotePatch, QuoteQuery,
     QuoteTotalsView, QuoteView,
+};
+pub use orders::{
+    CancelOrder, HistoryEntry, InvoiceHandoffView, NewOrder, NewOrderLine, OrderDetail, OrderLineView,
+    OrderQuery, OrderView, ReservationView,
 };
 pub use store::{
     CatalogQuery, CatalogVocabulary, NewPriceList, NewPriceRow, NewProduct, Page, PriceListDetail,

@@ -167,6 +167,86 @@ impl OrderStatus {
     pub const fn holds_reservation(self) -> bool {
         matches!(self, Self::Confirmed | Self::Invoiced | Self::Delivered)
     }
+
+    /// The badge label the order list and the detail print.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "Draft",
+            Self::Confirmed => "Confirmed",
+            Self::Invoiced => "Invoiced",
+            Self::Delivered => "Delivered",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// True when the document is frozen and its lines may not change.
+    ///
+    /// Deliberately **not** the same question as a quote's `is_editable`: a confirmed order's grid
+    /// is read-only for a different reason than a sent quote's. A sent quote is frozen because
+    /// the *customer* read it; a confirmed order because the *warehouse* is holding stock
+    /// against it. The answer happens to coincide, the reason does not, and the reason is what
+    /// the order detail prints when it greys the grid out.
+    #[must_use]
+    pub const fn is_frozen(self) -> bool {
+        !matches!(self, Self::Draft)
+    }
+}
+
+/// Whether stock is held for an order, and whether all of it is.
+///
+/// A closed vocabulary rather than a `text` column a screen switches on: the order list draws a
+/// badge and the detail draws a note out of it, and a state the screen does not recognise is a
+/// screen that renders a blank cell. `None` is a **fact** — no holds at all — and not a synonym
+/// for "inventory is not installed": REQ-053 is a separate crate, so the module records the
+/// intent to hold and this state describes what it recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderReservationState {
+    /// Nothing is held: the order is a draft, or it was cancelled before it held anything.
+    None,
+    /// Some of the lines are held and some are not.
+    Partial,
+    /// Every line is held.
+    Total,
+    /// The holds were given back when the order was cancelled.
+    Released,
+}
+
+impl OrderReservationState {
+    /// The value stored in `sales_orders.reservation_state`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Partial => "partial",
+            Self::Total => "total",
+            Self::Released => "released",
+        }
+    }
+
+    /// Read a stored value, or `None` for one this build does not know.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "none" => Self::None,
+            "partial" => Self::Partial,
+            "total" => Self::Total,
+            "released" => Self::Released,
+            _ => return None,
+        })
+    }
+
+    /// The label the reservation column prints.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Partial => "Partial",
+            Self::Total => "Total",
+            Self::Released => "Released",
+        }
+    }
 }
 
 impl std::fmt::Display for OrderStatus {
