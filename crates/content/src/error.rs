@@ -125,6 +125,20 @@ pub enum ContentError {
     /// A schedule is not a usable instant (before now, or unparseable as a timestamp).
     #[error("invalid schedule: {0}")]
     InvalidSchedule(String),
+    /// A form definition is unusable (no fields, a duplicate or malformed key, a choice field
+    /// with no options, a submit behaviour with nothing to do).
+    #[error("invalid form: {0}")]
+    InvalidFormField(String),
+    /// No form carries this identifier (REQ-064 slice 2).
+    #[error("no such form")]
+    FormNotFound,
+    /// The site already has a form with this key. It is the form's public address, so two forms
+    /// cannot share it — a visitor has no way to choose between them.
+    #[error("this site already has a form with this key")]
+    FormKeyTaken(String),
+    /// No submission carries this identifier, or it belongs to another form.
+    #[error("no such submission in this form")]
+    SubmissionNotFound,
 }
 
 /// Result alias used across the content crate.
@@ -169,6 +183,10 @@ impl ContentError {
             Self::PublishingEntryNotFound => "publishing_entry_not_found",
             Self::InvalidPublishAction(_) => "invalid_publish_action",
             Self::InvalidSchedule(_) => "invalid_schedule",
+            Self::InvalidFormField(_) => "invalid_form",
+            Self::FormNotFound => "form_not_found",
+            Self::FormKeyTaken(_) => "form_key_taken",
+            Self::SubmissionNotFound => "submission_not_found",
         }
     }
 }

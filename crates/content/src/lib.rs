@@ -12,6 +12,7 @@ pub mod blockdiff;
 pub mod blocks;
 pub mod comments;
 pub mod error;
+pub mod forms;
 pub mod menus;
 pub mod model;
 pub mod pages;
@@ -38,6 +39,17 @@ pub use error::{ContentError, Result};
 // with the same meaning, and two public names for two different bounds is a call site that
 // guesses. A menu name and a pattern name are both 120 characters, so the value agrees — but
 // the modules keep their own constant so a bound may move without editing the other.
+pub use forms::{
+    FIELD_TYPES, FORM_STATUSES, Form, FormChanges, FormField, MAX_ANSWERS, MAX_FIELD_TEXT_LENGTH,
+    MAX_FORM_NAME_LENGTH, MAX_OPTIONS, NewFormField, NewSubmission, SUBMISSIONS_STATUSES,
+    SUBMIT_ACTIONS, Submission, SubmissionOutcome, SubmissionQuery, answers_summary,
+    bulk_submission_status,
+    consent_text, count_submissions, create_form, delete_form, delete_submission, find_form,
+    find_form_by_key, find_submission, list_fields, list_forms, list_submissions, matches_pattern,
+    option_labels, read_form, save_fields, set_form_status, set_submission_status, spam_score,
+    submissions_in_last_hour, submissions_to_csv, submit_public, update_form, validate_answer,
+    validate_submission,
+};
 pub use menus::{
     Audience, ITEM_TYPES, LOCATIONS, MAX_ITEMS, MAX_LABEL_LENGTH, Menu, MenuChanges, MenuItem,
     MenuSave, NewMenuItem, RenderedItem, RenderedMenu, VISIBILITIES, create_menu, delete_menu,
