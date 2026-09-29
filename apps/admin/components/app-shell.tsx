@@ -6,7 +6,10 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
+// Both sides added icons in the same import: wave4 brought Package/Users/Warehouse for the
+// business modules' nav entries, main brought HardDriveDownload for the backup centre. They are
+// additive, so the union keeps every entry the two features render.
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, HardDriveDownload, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -19,6 +22,10 @@ const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/pages", label: "Pages", icon: FileText },
   { href: "/media", label: "Media", icon: Images },
+  // Backups sit beside Media rather than under Settings: an operator asking "where are my
+  // files and can I get them back" is one question, and burying half of it under a
+  // settings sub-path is what makes somebody believe the platform has no restore point.
+  { href: "/backups", label: "Backups", icon: HardDriveDownload },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/crm/contacts", label: "CRM", icon: Users },
   { href: "/sales/catalog", label: "Sales", icon: Package },
