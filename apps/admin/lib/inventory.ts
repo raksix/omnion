@@ -679,6 +679,154 @@ export function exportApprovalsCsv(filters: { status?: string; item_id?: string 
   return download(`/api/v1/inventory/approvals/export${query(filters)}`, "adjustments.csv");
 }
 
+/** The reports screen's filters. Every one is optional and every default is the server's. */
+export type ReportFilters = {
+  from?: string;
+  to?: string;
+  warehouse_id?: string;
+  category?: string;
+  idle_days?: number;
+  limit?: number;
+};
+
+/**
+ * The valuation, with the incompleteness stated rather than hidden.
+ *
+ * `unpriced_lines` is a **count of lines the report could not value**, not a warning to
+ * be styled away: an amount printed on its own reads as the whole warehouse's worth, and
+ * the only thing that makes it honest is the sentence beside it.
+ */
+export type StockValue = {
+  currency: string;
+  valued_quantity: string;
+  valued_amount: string;
+  unpriced_lines: number;
+  scoped_lines: number;
+  /** `null` for an empty warehouse — "100% of nothing is priced" is not a fact. */
+  priced_share: string | null;
+  reserved_quantity: string;
+};
+
+/** One kind's contribution to the period. */
+export type MovementSummaryRow = {
+  kind: string;
+  count: number;
+  quantity: string;
+};
+
+/** The period's movement summary. Reservations are **not** in it — they move no stock. */
+export type MovementSummary = {
+  rows: number;
+  net_quantity: string;
+  by_kind: MovementSummaryRow[];
+};
+
+/** One stock row that has not moved. */
+export type IdleRow = {
+  id: string;
+  item_id: string;
+  sku: string;
+  name: string;
+  location_code: string;
+  on_hand: string;
+  unit: string;
+  /** `null` when the item has no cost — which is **not** the same as a value of zero. */
+  value: string | null;
+  /** `null` when the row has never moved at all, which is the most idle state there is. */
+  last_movement_at: string | null;
+};
+
+/** The idle block, with the count the returned rows are a subset of. */
+export type IdleStock = {
+  days: number;
+  total: number;
+  rows: IdleRow[];
+  truncated: boolean;
+  /** The total across **every** idle row, not just the ones returned. */
+  quantity: string;
+};
+
+/** The whole report. */
+export type InventoryReport = {
+  from: string;
+  to: string;
+  scoped_lines: number;
+  value: StockValue;
+  movements: MovementSummary;
+  idle: IdleStock;
+};
+
+/** One hit from the global search, from either surface. */
+export type SearchHit = {
+  id: string;
+  sku: string;
+  name: string;
+  category: string | null;
+  surface: "item" | "stock";
+  location_code?: string;
+  on_hand?: string;
+};
+
+export type GlobalSearchResults = {
+  query: string;
+  hits: SearchHit[];
+  truncated: boolean;
+};
+
+/** Load the report. The window and the idle days default server-side, so this may be called bare. */
+export function fetchReport(filters: ReportFilters = {}): Promise<InventoryReport> {
+  return inventoryRequest<InventoryReport>(`/api/v1/inventory/reports${query(filters)}`);
+}
+
+/** Download the report as a CSV — **the same report the screen rendered**, not a second query. */
+export function exportReportCsv(filters: ReportFilters = {}): Promise<void> {
+  return download(`/api/v1/inventory/reports/export${query(filters)}`, "report.csv");
+}
+
+/** Search items by SKU, barcode or name, across the item and the stock surface. */
+export function searchInventory(term: string, limit = 20): Promise<GlobalSearchResults> {
+  return inventoryRequest<GlobalSearchResults>(
+    `/api/v1/inventory/search${query({ q: term, limit })}`,
+  );
+}
+
+/**
+ * The sentence that makes the value honest, and an empty string when there is nothing to say.
+ *
+ * The rule the report is built on: an amount printed on its own reads as the whole
+ * warehouse's worth, so the incompleteness travels **with** it rather than in a tooltip
+ * somebody opens after they have already quoted the number.
+ */
+export function pricingNote(value: StockValue): string {
+  if (value.scoped_lines === 0) return "";
+  if (value.unpriced_lines === 0) {
+    return `Every one of the ${value.scoped_lines} stock lines in this scope has a cost.`;
+  }
+  const share = value.priced_share ? `${value.priced_share}% of lines` : "Some lines";
+  return (
+    `${value.unpriced_lines} of ${value.scoped_lines} stock lines have no cost set, so this ` +
+    `figure covers ${share} of the scope. Price the rest to value the whole warehouse.`
+  );
+}
+
+/** A kind's label as a person reads it, from the ledger's own vocabulary. */
+export function movementKindLabel(kind: string): string {
+  switch (kind) {
+    case "receipt":
+      return "Receipt";
+    case "issue":
+      return "Issue";
+    case "transfer_in":
+      return "Transfer in";
+    case "transfer_out":
+      return "Transfer out";
+    case "adjustment":
+      return "Adjustment";
+    default:
+      return kind;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Display
 // ---------------------------------------------------------------------------------------------

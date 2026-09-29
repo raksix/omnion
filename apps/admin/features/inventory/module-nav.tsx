@@ -19,7 +19,14 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { AlertTriangle, ArrowRightLeft, ClipboardCheck, ScrollText, Warehouse } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowRightLeft,
+  BarChart3,
+  ClipboardCheck,
+  ScrollText,
+  Warehouse,
+} from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: typeof Warehouse }[] = [
   { href: "/inventory/stock", label: "Stock", icon: Warehouse },
@@ -31,6 +38,10 @@ const LINKS: { href: string; label: string; icon: typeof Warehouse }[] = [
   { href: "/inventory/stocktake", label: "Stocktake", icon: ClipboardCheck },
   { href: "/inventory/alerts", label: "Low stock", icon: AlertTriangle },
   { href: "/inventory/approvals", label: "Adjustments", icon: ScrollText },
+  // Reports last, because it is the one screen somebody opens deliberately rather than
+  // the one they land on while working: a module shelf that puts a report between the
+  // operator and the stock list has made navigation worse to make a feature visible.
+  { href: "/inventory/reports", label: "Reports", icon: BarChart3 },
 ];
 
 export function InventoryModuleNav() {
