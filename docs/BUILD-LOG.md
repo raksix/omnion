@@ -4902,3 +4902,71 @@ close slice 1; if the pass finds anything, fix it in the same tick — the depth
 written, so a green run closes the slice rather than starting it. After that, slice 2: the
 `/webhooks` endpoint list, which is the larger of the two remaining halves and the one the
 operator needs first when a delivery is missing.
+
+
+## 2026-09-29 · wave 4 · REQ-052 slice 5 — the PDF documents (`2036485`)
+
+**What.** `GET /sales/quotes/{id}/pdf` and `GET /sales/orders/{id}/pdf`, a PDF 1.4 writer with no
+dependency (`modules/sales/src/pdf.rs`), the two layouts (`modules/sales/src/documents.rs`), the
+routes (`apps/api/src/routes/sales_documents.rs`), a **PDF** button on both detail screens, and a
+walkthrough step that reads the bytes. The box this closes is the last unticked item that was
+actually buildable; REQ-029 owns a general document engine and is not written.
+
+**The question the slice had to answer first.** "The module can emit a document itself, or must it
+wait?" — it can. A PDF 1.4 file is a cross-reference table and a content stream; the part a quote
+needs (header, line grid, totals block, page breaks) is about four hundred lines, and a
+font-embedding crate is megabytes of typeface on every build of a **public** repository. The writer
+lives beside the two documents that need it rather than in `crates/`, because moving it is a
+`git mv` and a `pub use` and a guess about infrastructure nobody has asked for twice.
+
+**Three defects, and none of them was a compile error.**
+
+1. **The content stream was a `String`.** WinAnsi is not UTF-8, so every byte above `0x7F` went
+   through `from_utf8_lossy` and reached the page as U+FFFD. A document printed "S?irket" for
+   "Şirket" — and **every test that read only ASCII passed**, because the corruption happened on
+   the way *into* the page rather than out of the encoder. The buffer is `Vec<u8>` end to end, and
+   `a_non_ascii_character_survives_into_the_stream_intact` asserts no replacement character is
+   present. This is the bug the tick is worth remembering for: the wrong buffer type for a binary
+   format is legal Rust and silent in every signature.
+2. **cp1252's `0x8A`/`0x9A` are `Š`/`ş` — the carons, not `Ş`/`ş`.** The cedillas are not in cp1252
+   at all. The first table put the cedillas on the caron's slots. It cost six rounds of failing
+   tests to find, because the two pairs are visually near-identical and *every* assertion that did
+   not name the exact byte kept passing. The four Turkish letters cp1252 genuinely lacks are now
+   aliased to a readable letter **and counted**: `g` for `ğ` reads as a correct name that is not
+   the right one, which is the more dangerous of the two failure modes, and the count reaches the
+   sender as an `x-omnion-document-degraded` header the screen shows. Everything about this was
+   settled with `bytes([0x8A]).decode("cp1252")`, never from memory.
+3. **The zero rule covered half the document.** A figure with no value prints a dash, never
+   `0.00` — but the rule was written for the totals block and the line grid printed `0.00` while
+   the total beneath it printed a dash. One document, two sentences, one of them wrong.
+
+**Proof.**
+
+```
+cargo test -p omnion-module-sales --lib            178 passed, 0 failed   (+38)
+cargo test -p omnion-api --lib                    249 passed, 0 failed
+apps/admin  tsc --noEmit -p tsconfig.json          clean
+node --check scripts/qa/walkthrough.cjs            clean
+```
+
+The walkthrough step asserts the `%PDF-` header, the `%%EOF` trailer and the grand total
+**printed in the document** — because Playwright cannot read a download it did not request, so a
+button that saved `{"error": …}` under a `.pdf` name passes every "did it download?" check there
+is. **The browser pass is queued behind the single QA slot and is NOT part of this tick's claim.**
+
+**What cost the tick, and is worth the next writer's time.** PostgreSQL was in **crash recovery
+for the first two hours of this tick** and every API call answered `dependency_unavailable`. The
+cause is not mysterious: `/mnt/apopic` had reached **100%** (363 MB free) and WAL recovery could
+not write. It recovered on its own once the build caches were pruned — `.tmp-target`'s stale test
+binaries, 0.9 GB of executables older than the last build. The second lesson is about the tests:
+**nine of the twenty failures were my own test expectations, written from a guess about the byte
+stream**, and each one cost a four-minute compile to disprove. `modules/sales/examples/pdf_probe.rs`
+now exists for exactly this — it prints what the writer really emits (bytes, operator lines, the
+xref table with line lengths) and it settled three rounds of guessing in one run of ninety seconds.
+Write the probe before the assertion, not after the fifth failure.
+
+**Next.** The **⌘K row** is the remaining half of the global-search box: `components/search-palette.tsx`
+is a shared component with its own provider registry, and a sales provider in it is the next slice,
+not a line in this module. Then REQ-052's `Order → invoice draft` box, which stays unticked **on
+purpose** — REQ-054 is not built, and the criterion is a hand-off to a module that does not exist.
+After that, REQ-053 inventory, the first of the nine untouched wave-4 requests.
