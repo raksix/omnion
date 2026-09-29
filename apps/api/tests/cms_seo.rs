@@ -229,12 +229,9 @@ async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], lab
 struct Fixture {
     state: AppState,
     db: Db,
-    org: Uuid,
     site: Uuid,
-    site_key: String,
     host: String,
     page: Uuid,
-    draft: Uuid,
     editor_email: String,
     reader_email: String,
     accounts: Vec<Uuid>,
@@ -298,12 +295,9 @@ impl Fixture {
         Some(Self {
             state,
             db,
-            org,
             site,
-            site_key,
             host,
             page,
-            draft,
             editor_email,
             reader_email,
             accounts: vec![editor_id, reader_id],
@@ -798,7 +792,8 @@ async fn a_robots_txt_that_blocks_the_whole_site_is_saved_with_the_warning_namin
                 "default_change_frequency": "daily",
                 "robots_txt": "User-agent: *\nDisallow: /\n"
             })),
-        )
+        ),
+    )
     .await;
     assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
     assert_eq!(saved.body["default_priority"], 0.7);

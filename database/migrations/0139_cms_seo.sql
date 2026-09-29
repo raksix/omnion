@@ -38,22 +38,36 @@ alter table pages
     add column twitter_card text not null default 'summary_large_image',
     add column robots text not null default 'index,follow',
     add column structured_data_type text,
-    add column structured_data jsonb not null default '{}'::jsonb,
-    constraint pages_twitter_card_check check (twitter_card in ('summary', 'summary_large_image')),
-    -- The same closed-vocabulary rule as above, in the column, so a hand-written INSERT cannot
-    -- slip a misspelling past the store's validation.
-    constraint pages_structured_data_type_check check (
+    add column structured_data jsonb not null default '{}'::jsonb;
+
+-- Every CHECK below is its own ALTER rather than a clause in the column block above, and the
+-- reason is specific: a `--` comment between two clauses makes PostgreSQL drop the REST OF THE
+-- LINE, which here is the entire remaining statement, and the migration dies at the first
+-- constraint with `syntax error at or near "constraint"` and a character offset into the middle
+-- of a comment. Comments belong BETWEEN statements.
+alter table pages
+    add constraint pages_twitter_card_check
+        check (twitter_card in ('summary', 'summary_large_image')),
+    add constraint pages_structured_data_type_check check (
         structured_data_type is null or structured_data_type in (
             'Article', 'Organization', 'FAQPage', 'Product', 'BreadcrumbList', 'WebSite'
         )
-    ),
-    -- A canonical URL is absolute; a site-relative one would be resolved against whatever host
-    -- the crawler happened to reach, which is exactly the ambiguity canonical exists to remove.
-    constraint pages_canonical_url_check check (
+    );
+
+-- A canonical URL is absolute: a site-relative one would be resolved against whatever host the
+-- crawler happened to reach, which is exactly the ambiguity canonical exists to remove.
+alter table pages
+    add constraint pages_canonical_url_check check (
         canonical_url is null or canonical_url ~ '^https?://[^/]+'
-    ),
-    constraint pages_seo_title_length check (seo_title is null or length(seo_title) <= 255),
-    constraint pages_seo_description_length check (seo_description is null or length(seo_description) <= 500);
+    );
+
+alter table pages
+    add constraint pages_seo_title_length
+        check (seo_title is null or length(seo_title) <= 255);
+
+alter table pages
+    add constraint pages_seo_description_length
+        check (seo_description is null or length(seo_description) <= 500);
 
 create index pages_sitemap_idx on pages (site_id, page_type, status) where status = 'published';
 
@@ -111,7 +125,7 @@ create table cms_seo_settings (
     default_change_frequency text not null default 'weekly',
     sitemap_xml text,
     sitemap_last_generated_at timestamptz,
-    robots_txt text not null default $robots$User-agent: *\nAllow: /$\robots$,
+    robots_txt text not null default E'User-agent: *\nAllow: /',
     updated_by uuid references users (id) on delete set null,
     updated_at timestamptz not null default now(),
     constraint cms_seo_settings_priority_range check (default_priority between 0.0 and 1.0),
