@@ -179,7 +179,9 @@ back to untested), `workflows.graph.saved` (usage refresh).
       *Proven: `POST /credentials/{id}/oauth/start` returns an authorization URL, a PKCE
       challenge and the redirect URI; the callback refuses a tampered state, a foreign state
       and an expired one with three *different* sentences under one code; the fixture provider
-      proves PKCE is derived `S256` and that a code is single-use. **The last clause is
+      proves PKCE is derived `S256` and that a code is single-use. `scripts/qa/oauth-contract.sh`
+      drives all of it over a real socket: **9 passed, 0 failed, 1 note** on the w10 stack
+      (`:18089`, database `omnion_qa_w10`, provider on `:18099`). **The last clause is
       blocked on REQ-125**, not on this slice: the provider issues a token and
       `write_token_payload` refuses with `secret_store_unavailable` rather than inventing a
       local scheme, so the "stores a token set" and "connected identity" halves cannot be

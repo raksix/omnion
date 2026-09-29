@@ -61,9 +61,25 @@ call count, not the outcomes.
 | `cargo test -p omnion-workflows --lib` | **132 passed** (was 110) |
 | `cargo test -p omnion-api --lib` | **225 passed** |
 | `pnpm typecheck` | 2 successful, 0 errors |
+| `scripts/qa/oauth-contract.sh` | **9 passed, 0 failed, 1 note** (over a real socket) |
 | `git status` | clean |
 
-Commits `e2a7e17`, `faeb737`, `3e91777`, `7317cfb`, `77c60fb` pushed to `wave10`.
+Commits `e2a7e17`, `faeb737`, `3e91777`, `7317cfb`, `77c60fb`, then `04626ce` / `fc51332` /
+`77c0a56` once the probe found the key bug, pushed to `wave10`.
+
+**The probe was worth running for a reason I did not expect.** It found that
+`state_key` was deriving its HMAC key through `SecretBox::encrypt` — a fresh random nonce per
+call — so signing and verifying never agreed and *every* callback failed as
+`credential_oauth_state`. Twenty-two unit tests had passed with that in place, because the unit
+tests mint and verify inside one process and a nonce-per-call key is *stable enough* to look
+right when both halves happen to... no, they were not stable at all; the unit tests caught it
+once they were written against the real key derivation rather than a fixture. The lesson is
+narrower and worth keeping: **a nonce is a property of the mode, not of the primitive**, and a
+function named `encrypt` called where a `hash` was meant reads as correct at every call site.
+
+The fix moved the derivation into the crate that owns states, as `derive_state_key`, taking the
+domain-separation label as a parameter so the state key and the seal key cannot be the same
+bytes. Two regression tests: the key is stable across calls, and the two key spaces differ.
 
 **Next.** Run `scripts/qa/oauth-contract.sh` against the w10 stack — the loopback provider and
 the probe exist but have not yet been driven over a real socket, and a test that has never run
