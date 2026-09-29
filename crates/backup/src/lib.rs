@@ -39,6 +39,7 @@ pub mod part;
 pub mod preview;
 pub mod purge;
 pub mod restore;
+pub mod restore_objects;
 pub mod store;
 pub mod sweep;
 
@@ -68,6 +69,11 @@ pub use purge::{
     run_directory,
 };
 pub use preview::{LiveComparison, MAX_MATCHED_KEYS, compare_database, compare_media};
+pub use restore_objects::{
+    ArchiveReader, Boxed, LibraryWriter, MediaRestoreReport, RestoreFailure, RowToucher,
+    MAX_REPORTED_FAILURES as MAX_REPORTED_RESTORE_FAILURES, archived_sites, index_objects, read_index,
+    restore_objects,
+};
 pub use restore::{
     LiveCounts, MAX_REPORTED_SITES, PartEvidence, RestoreMode, RestorePreview, RestoreWarning,
     RestoreWarningCode, STALE_AFTER_DAYS, WarningSeverity, build_preview, confirm_phrase,

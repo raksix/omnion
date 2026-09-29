@@ -289,7 +289,7 @@ pub fn build_plan(
     // Manifest order, not request order: a request that names `media, database` must restore
     // the schema before the objects that hang off it, and "the order the caller listed them
     // in" is a different answer each time somebody re-sorts a form.
-    let mut parts: Vec<String> = readable
+    let parts: Vec<String> = readable
         .iter()
         .filter(|name| request.parts.iter().any(|asked| asked == *name))
         .map(|name| (*name).to_owned())
