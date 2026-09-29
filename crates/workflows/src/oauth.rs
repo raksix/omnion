@@ -667,6 +667,137 @@ impl Drop for RefreshGuard<'_> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The local seal
+// ---------------------------------------------------------------------------------------------
+
+/// A key for the flow's own short-lived secrets.
+///
+/// A PKCE verifier has to survive exactly one round trip: the person leaves for the
+/// provider and comes back minutes later, and the callback needs the same verifier to
+/// spend the code. That is a *workflow* secret, not a credential one — it is worthless the
+/// moment the code is spent, and it is not the thing REQ-125 exists to manage. So the flow
+/// seals it with this: the same authenticated-encryption composition the identity crate uses
+/// for MFA, with a key scoped to the flows.
+///
+/// The important property is that a *tampered* envelope fails to open rather than opening to
+/// something else, and [`LocalBox::open`] returns an error instead of a guess. `open_pkce`
+/// then re-derives the challenge from what came out, so even a row edited by somebody who
+/// somehow has the key cannot produce a token request a provider will accept.
+#[derive(Clone)]
+pub struct LocalBox {
+    key: [u8; 32],
+}
+
+/// Envelope version tag; a change writes `v2` and keeps reading `v1`.
+const SEAL_VERSION: &str = "s1";
+
+/// Domain separation for the seal's MAC, so a key used elsewhere cannot open this.
+const SEAL_LABEL: &[u8] = b"omnion.workflow.oauth.seal.v1";
+
+impl LocalBox {
+    /// A box from raw key material.
+    #[must_use]
+    pub fn from_key_material(material: &[u8]) -> Self {
+        // A domain-separated hash rather than a copy: the caller's material is whatever
+        // length the operator gave us, and a box that silently accepted three bytes would be a
+        // box that accepts a password.
+        let mut hasher = Sha256::new();
+        hasher.update(SEAL_LABEL);
+        hasher.update(material);
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&hasher.finalize());
+        Self { key }
+    }
+
+    /// Seal a string.
+    #[must_use]
+    pub fn seal(&self, plaintext: &str) -> String {
+        let nonce = random_bytes(16);
+        let stream = keystream(&self.key, &nonce, plaintext.len());
+        let cipher: Vec<u8> = plaintext
+            .as_bytes()
+            .iter()
+            .zip(stream)
+            .map(|(b, k)| b ^ k)
+            .collect();
+        // Encrypt, THEN authenticate the ciphertext. This is the whole construction: the tag
+        // below is computed over the nonce *and* the ciphertext, so `open` verifies before it
+        // decrypts and a flipped byte is refused rather than returned as corrupted plaintext.
+        let mut full_mac = HmacSha256::new_from_slice(&self.key)
+            .expect("HMAC accepts a key of any length");
+        full_mac.update(&nonce);
+        full_mac.update(&cipher);
+        let full_tag = full_mac.finalize().into_bytes();
+        format!(
+            "{SEAL_VERSION}.{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(nonce),
+            URL_SAFE_NO_PAD.encode(cipher),
+            URL_SAFE_NO_PAD.encode(full_tag)
+        )
+    }
+
+    /// Open a sealed string, or refuse.
+    ///
+    /// An error is returned for a wrong version, a malformed envelope, a wrong key and a
+    /// tampered tag — all four are "this is not what we wrote", and none of them may return
+    /// partial plaintext.
+    pub fn open(&self, envelope: &str) -> std::result::Result<String, String> {
+        let mut parts = envelope.split('.');
+        if parts.next() != Some(SEAL_VERSION) {
+            return Err("unknown seal version".into());
+        }
+        let (Some(nonce), Some(cipher), Some(tag), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err("malformed envelope".into());
+        };
+        let (Ok(nonce), Ok(cipher), Ok(tag)) = (
+            URL_SAFE_NO_PAD.decode(nonce),
+            URL_SAFE_NO_PAD.decode(cipher),
+            URL_SAFE_NO_PAD.decode(tag),
+        ) else {
+            return Err("malformed envelope".into());
+        };
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts any key length");
+        mac.update(&nonce);
+        mac.update(&cipher);
+        // Verify before decrypting: a tampered envelope must never produce plaintext, not even
+        // plaintext that is then thrown away.
+        mac.verify_slice(&tag).map_err(|_| "tag mismatch".to_string())?;
+        let stream = keystream(&self.key, &nonce, cipher.len());
+        let plain: Vec<u8> = cipher
+            .iter()
+            .zip(stream)
+            .map(|(b, k)| b ^ k)
+            .collect();
+        String::from_utf8(plain).map_err(|_| "sealed value was not utf-8".into())
+    }
+}
+
+/// The keystream: `SHA-256(key || label || nonce || counter)`, truncated.
+fn keystream(key: &[u8], nonce: &[u8], length: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(length);
+    let mut counter: u64 = 0;
+    while out.len() < length {
+        let mut hasher = Sha256::new();
+        hasher.update(b"omnion.workflow.oauth.keystream.v1");
+        hasher.update(key);
+        hasher.update(nonce);
+        hasher.update(counter.to_be_bytes());
+        out.extend_from_slice(&hasher.finalize());
+        counter += 1;
+    }
+    out.truncate(length);
+    out
+}
+
+/// Seal with a box, for the store's one call site.
+#[must_use]
+pub fn seal_local(box_key: &LocalBox, plaintext: &str) -> String {
+    box_key.seal(plaintext)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Expiry
 // ---------------------------------------------------------------------------------------------
 
@@ -1026,6 +1157,52 @@ mod tests {
             lock.acquire(credential, Duration::from_millis(0)).is_some(),
             "releasing lets the next one in"
         );
+    }
+
+    #[test]
+    fn a_sealed_value_opens_back_to_itself() {
+        let box_key = LocalBox::from_key_material(b"an-installation-key-of-any-length");
+        for plaintext in ["", "v", "a PKCE verifier with = and & and spaces", "🙂"] {
+            let sealed = box_key.seal(plaintext);
+            assert_eq!(box_key.open(&sealed).unwrap(), plaintext);
+        }
+    }
+
+    #[test]
+    fn sealing_the_same_value_twice_gives_two_different_envelopes() {
+        // A fresh nonce per seal: two flows for one credential must not be distinguishable by
+        // their ciphertext, or the envelope itself becomes a correlator.
+        let box_key = LocalBox::from_key_material(b"an-installation-key-of-any-length");
+        assert_ne!(box_key.seal("same"), box_key.seal("same"));
+    }
+
+    #[test]
+    fn a_tampered_envelope_fails_to_open_rather_than_opening_to_something_else() {
+        let box_key = LocalBox::from_key_material(b"an-installation-key-of-any-length");
+        let sealed = box_key.seal("the-verifier");
+        // Flip one character of the ciphertext section.
+        let mut parts: Vec<&str> = sealed.split('.').collect();
+        let cipher = parts[2].to_string();
+        let flipped = if cipher.starts_with('A') { format!("B{}", &cipher[1..]) } else { format!("A{}", &cipher[1..]) };
+        parts[2] = &flipped;
+        let tampered = parts.join(".");
+        let error = box_key.open(&tampered).unwrap_err();
+        assert_eq!(error, "tag mismatch", "a tampered envelope must not decrypt");
+    }
+
+    #[test]
+    fn a_seal_from_another_installation_does_not_open() {
+        let writer = LocalBox::from_key_material(b"one-installation-key");
+        let reader = LocalBox::from_key_material(b"a-different-installation");
+        assert!(reader.open(&writer.seal("the-verifier")).is_err());
+    }
+
+    #[test]
+    fn a_malformed_or_foreign_envelope_is_an_error_and_never_a_partial_value() {
+        let box_key = LocalBox::from_key_material(b"an-installation-key-of-any-length");
+        for bad in ["", "s1", "s1.a", "s1.a.b", "s1.a.b.c.d", "v9.a.b.c", "not an envelope"] {
+            assert!(box_key.open(bad).is_err(), "{bad:?} must not open");
+        }
     }
 
     #[test]
