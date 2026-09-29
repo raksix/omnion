@@ -126,6 +126,21 @@ pub async fn clear_alert_state(pool: &sqlx::PgPool) {
     omnion_telemetry::metrics::clear_global_samples();
 }
 
+/// The database a connection string names, for a failure message.
+///
+/// Deliberately not a URL parser: a walk's database is the last path segment in every form this
+/// repository uses, and a wrong answer here costs a tick of guessing, so anything unparsable
+/// returns the raw string rather than `None`. **The password is never printed** — the panics this
+/// feeds are read aloud in CI logs, and a connection string is the one place a secret is most
+/// likely to be copied into a ticket.
+fn database_name(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    let last = after_scheme.rsplit('/').next()?;
+    let name = last.split('?').next().unwrap_or(last);
+    (!name.is_empty() && name.contains(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| name.to_owned())
+}
+
 /// Build the state for a walk, or fail.
 ///
 /// Panics on anything that is not "the environment is absent", and — unlike the six copies this
@@ -150,13 +165,25 @@ pub async fn state_or_fail() -> AppState {
     // claiming to be stale, and a walk that continued without it would assert against a database
     // that is not the one the code expects.
     if let Err(error) = db.migrate().await {
+        // Name the database. This message cost two ticks to diagnose: "migration 19 was
+        // previously applied but has been modified" is a **symptom of pointing at somebody
+        // else's database**, because a shared one records a DIFFERENT migration 19 (wave 2's
+        // `0019_cms_blocks` against this writer's `0019_secret_hierarchy`) and the checksum can
+        // never agree. Neither the file nor the commit named the target, so the reading was
+        // "someone edited an applied migration" and the fix was "rebuild the database", which
+        // is not it at all. One line of context turns a guess into a lookup.
+        let target = database_name(&config.database.url).unwrap_or_else(|| "<unparsable>".into());
         panic!(
-            "the migrations did not apply: {error}\n\
+            "the migrations did not apply to `{target}`: {error}\n\
              This is a repository defect, not a missing environment: the schema in \
              database/migrations/ is part of what these walks test.\n\
-             If an earlier edit changed a migration that had already been applied, the development \
-             database has to be rebuilt (DROP and CREATE), because sqlx records a checksum per \
-             version and refuses to re-apply a modified one."
+             Two causes, and which one this is depends on the database named above:\n\
+             - an applied migration was edited afterwards, so this database has to be rebuilt \
+               (DROP and CREATE) because sqlx records a checksum per version;\n\
+             - this is NOT the database the migrations in this tree describe. Every writer has \
+               their own (`omnion_w6_dev` here), and a shared one carries a different migration \
+               at the same number, which the checksum can never match. Check OMNION_DATABASE_URL \
+               before you rebuild anything."
         );
     }
 
