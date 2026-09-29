@@ -1345,6 +1345,33 @@ pub async fn save_observability_settings(
         .cloned()
         .collect();
 
+    // The ratio and the overrides are read BEFORE the write, not after. **They were read after,
+    // which made both events dead**: the `select` returned the value the UPDATE had just written,
+    // so `(previous - current)` was exactly zero, the `sampling.changed` branch was never taken,
+    // and the same held for every module in `level_changes`. A settings save that moved the ratio
+    // wrote the setting and told nobody — the fourth instance on this request of a fact that was
+    // implemented, unit-provable and unreachable, and the only one where the *route* was the
+    // defect rather than a missing caller. It survived a whole slice because every test that read
+    // the event asserted the route answered 200, and 200 is what a no-op save also answers.
+    // The reads are cheap and this is the only place the previous value exists.
+    let previous_ratio: f64 = sqlx::query_scalar(
+        "select sampling_ratio from obs_log_settings where id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(map_error)?;
+    // Compared against the RAW previous value, not against a re-resolved copy of it: this diff
+    // exists to say what the write changed, and re-resolving the previous row would drop an
+    // entry that is still there and report the removal as nothing. The expired entries the write
+    // dropped therefore show up here as `previous` with no `current` — which is what actually
+    // happened.
+    let before_overrides: serde_json::Value = sqlx::query_scalar(
+        "select log_level_overrides from obs_log_settings where id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(map_error)?;
+
     sqlx::query(
         "update obs_log_settings set \
              sampling_ratio = $1, logs_retention_days = $2, traces_retention_days = $3, \
@@ -1367,33 +1394,13 @@ pub async fn save_observability_settings(
     // The registry and the sampler are told immediately, not at the next restart: the request's
     // reason for the screen is "debugging does not need a redeploy", and a setting that only
     // takes effect on restart is a setting that fails at the one moment it is needed.
-    //
-    // The ratio is read BEFORE the write and after it, so the event says what MOVED rather than
-    // what is now. An event carrying only the new value cannot distinguish an operator raising
-    // the ratio from the panel saving a form that never changed it — and a `sampling.changed`
-    // per autosave would be the second.
-    let previous_ratio: f64 = sqlx::query_scalar(
-        "select sampling_ratio from obs_log_settings where id = 1",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(map_error)?;
-    let previous_overrides: serde_json::Value = sqlx::query_scalar(
-        "select log_level_overrides from obs_log_settings where id = 1",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(map_error)?;
-    // Compared against the RAW previous value, not against a re-resolved copy of it: this diff
-    // exists to say what the write changed, and re-resolving the previous row would drop an
-    // entry that is still there and report the removal as nothing. The expired entries the write
-    // dropped therefore show up here as `previous` with no `current` — which is what actually
-    // happened.
-    let before_overrides = previous_overrides;
-
     omnion_telemetry::metrics::global().set_global_budget(input.cardinality_budget as usize);
     omnion_telemetry::tracing_spine::set_sampling_ratio(input.sampling_ratio);
 
+    // The diff below compares `before_overrides` and `previous_ratio`, both captured BEFORE the
+    // write above, so each event says what MOVED rather than what is now. An event carrying only
+    // the new value cannot distinguish an operator raising the ratio from the panel saving a form
+    // that never changed it — and a `sampling.changed` per autosave would be the second.
     if (previous_ratio - input.sampling_ratio).abs() > f64::EPSILON {
         omnion_telemetry::events::try_emit(
             pool,
