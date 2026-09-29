@@ -35,6 +35,8 @@ use uuid::Uuid;
 struct Store {
     pool: PgPool,
     organization_id: Uuid,
+    /// The fixture agent's id, created at most once per store.
+    agent_id: tokio::sync::OnceCell<Uuid>,
     /// The throwaway database's name, kept so `dispose` can drop it.
     database: String,
     /// The connection to the maintenance database that created it.
@@ -102,9 +104,32 @@ impl Store {
         Some(Self {
             pool,
             organization_id,
+            agent_id: tokio::sync::OnceCell::new(),
             database,
             maintenance: Some(maintenance),
         })
+    }
+
+    /// The fixture agent's id, created at most once per store.
+    ///
+    /// A cell rather than a fresh row per call: `ai_agents` is unique on
+    /// `(organization_id, key)`, so a second `reporter` is a constraint violation. The walks that
+    /// need two runs share one agent, which is also what a real installation does.
+    ///
+    /// `tokio::sync::OnceCell` rather than `std::sync::OnceLock` because the initialiser is
+    /// `async` — a synchronous cell would have to block the runtime to await the insert, and a
+    /// blocking wait inside a `#[tokio::test]` is a deadlock the day the suite grows.
+    async fn agent_once(&self) -> Uuid {
+        *self
+            .agent_id
+            .get_or_init(|| async {
+                let new = NewAgent::with_defaults(self.organization_id, "reporter", "Reporter");
+                create_agent(&self.pool, &new)
+                    .await
+                    .expect("the fixture agent must be created")
+                    .id
+            })
+            .await
     }
 
     /// An agent to run, carrying the documented defaults.
@@ -643,5 +668,223 @@ async fn one_organization_cannot_read_another_organizations_runs() {
     );
     assert_eq!(list_runs(&store.pool, store.organization_id, None, 50).await.expect("read").len(), 1);
     assert_eq!(list_agents(&store.pool, other).await.expect("read").len(), 0);
+    store.dispose().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// The runner's claim, heartbeat and reaper (REQ-099 slice 1, fifth commit)
+// -------------------------------------------------------------------------------------------
+
+/// A run to be claimed, on the fixture agent.
+///
+/// One agent, many runs: the key on `ai_agents` is unique per organization, so a second
+/// `store.agent("reporter")` would be a duplicate key — and the walks below that need two runs
+/// are about two *runs*, not two agents.
+async fn queued_run(store: &Store, goal: &str) -> omnion_ai_hub::run_store::Run {
+    let agent = store.agent_once().await;
+    create_run(
+        &store.pool,
+        &NewRun {
+            organization_id: store.organization_id,
+            agent_id: agent,
+            trigger: "agent".to_owned(),
+            goal: goal.to_owned(),
+            ..NewRun::default_for(store.organization_id, agent)
+        },
+    )
+    .await
+    .expect("the run must be created")
+}
+
+#[tokio::test]
+async fn a_queued_run_is_claimed_exactly_once_and_never_by_a_second_claimer() {
+    let Some(store) = Store::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let run = queued_run(&store, "claim me").await;
+
+    let first = run_store::claim_next_run(&store.pool)
+        .await
+        .expect("the claim must read")
+        .expect("a queued run is claimable");
+    assert_eq!(first.id, run.id, "the oldest queued run is the one claimed");
+    assert_eq!(first.status, "running", "the claim moves the row in the same statement");
+    assert!(first.started_at.is_some(), "a claimed run has started");
+
+    // The second claim sees a queue with nothing in it, and must say so rather than hand back
+    // the run that is already running. This is the assertion that makes `for update skip locked`
+    // worth having: without the status change, two workers run the same two-tool agent.
+    let second = run_store::claim_next_run(&store.pool)
+        .await
+        .expect("the claim must read");
+    assert!(
+        second.is_none(),
+        "a run that is already running must not be claimed a second time: {second:?}"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_claimed_run_by_id_is_claimed_only_while_it_is_still_queued() {
+    let Some(store) = Store::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let run = queued_run(&store, "stream me").await;
+
+    // The streaming endpoint claims *its own* run by id, because it is holding the id it will
+    // show on screen; a queue-position claim would start a different run than the one the client
+    // is watching.
+    let claimed = run_store::claim_run(&store.pool, run.id)
+        .await
+        .expect("the claim must read")
+        .expect("a queued run is claimable by its own id");
+    assert_eq!(claimed.id, run.id);
+    assert_eq!(claimed.status, "running");
+
+    let again = run_store::claim_run(&store.pool, run.id).await.expect("the claim must read");
+    assert!(
+        again.is_none(),
+        "the second claimer finds the row already running and must not execute the loop twice"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_run_whose_worker_died_is_handed_back_and_the_one_that_is_alive_is_not() {
+    let Some(store) = Store::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    // Two runs on ONE agent is refused by `ai_runs_one_active_per_agent_uidx` — which is the
+    // point of that index and worth remembering while reading this test. The reaper's question is
+    // "which *running* run has a dead worker", so this needs two agents: one whose run was
+    // claimed and then aged, one whose run is being heartbeated.
+    let stale = queued_run(&store, "worker died").await;
+    let alive_agent = store.agent("reporter-two").await;
+    let alive = create_run(
+        &store.pool,
+        &NewRun {
+            organization_id: store.organization_id,
+            agent_id: alive_agent.id,
+            trigger: "agent".to_owned(),
+            goal: "still going".to_owned(),
+            ..NewRun::default_for(store.organization_id, alive_agent.id)
+        },
+    )
+    .await
+    .expect("the second run must be created");
+    run_store::claim_run(&store.pool, stale.id).await.expect("claim");
+    run_store::claim_run(&store.pool, alive.id).await.expect("claim");
+
+    // The alive run heartbeats now; the stale one does not. Nothing is stale yet, because
+    // `claim_run` wrote both heartbeats.
+    run_store::heartbeat(&store.pool, alive.id).await.expect("heartbeat");
+    assert_eq!(run_store::requeue_stale(&store.pool).await.expect("reap"), 0);
+
+    // Age the stale one past the threshold. This is a write rather than a sleep: the threshold
+    // is 120 seconds, and a test that waits for it is a test that takes two minutes.
+    sqlx::query(
+        "update ai_runs set heartbeat_at = now() - make_interval(secs => $1) where id = $2",
+    )
+    .bind(run_store::HEARTBEAT_STALE_SECONDS + 30)
+    .bind(stale.id)
+    .execute(&store.pool)
+    .await
+    .expect("the run must be aged");
+
+    assert_eq!(run_store::requeue_stale(&store.pool).await.expect("reap"), 1);
+    let requeued = get_run(&store.pool, store.organization_id, stale.id)
+        .await
+        .expect("read")
+        .expect("the run survives the requeue");
+    assert_eq!(requeued.status, "queued", "a dead worker's run goes back on the queue");
+    assert_eq!(requeued.resume_count, 1, "and the resume is counted");
+    assert!(requeued.heartbeat_at.is_none(), "the stale heartbeat is cleared, or the next reap takes it again");
+
+    let untouched = get_run(&store.pool, store.organization_id, alive.id)
+        .await
+        .expect("read")
+        .expect("the live run survives");
+    assert_eq!(
+        untouched.status, "running",
+        "a run whose worker heartbeats is never handed to a second worker"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_parked_run_keeps_no_stop_reason_and_a_resume_puts_it_back_on_the_queue() {
+    let Some(store) = Store::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let run = queued_run(&store, "needs a decision").await;
+    run_store::claim_run(&store.pool, run.id).await.expect("claim");
+    run_store::park_run(&store.pool, run.id, Some("waiting for a decision"))
+        .await
+        .expect("park");
+
+    let parked = get_run(&store.pool, store.organization_id, run.id)
+        .await
+        .expect("read")
+        .expect("the run exists");
+    assert_eq!(parked.status, "awaiting_approval");
+    assert!(
+        parked.stop_reason.is_none(),
+        "a run that is waiting for a person has not ended, and the migration refuses a reason \
+         without a terminal status"
+    );
+    assert!(parked.heartbeat_at.is_none(), "a parked run holds no worker");
+
+    // The approval inbox reads this state, so it must be findable in constant time: the partial
+    // index is the reason the row is cheap to find however long the history grows.
+    let found: i64 = sqlx::query_scalar(
+        "select count(*) from ai_runs where status = 'awaiting_approval'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .expect("read");
+    assert_eq!(found, 1);
+
+    assert!(run_store::requeue_run(&store.pool, run.id).await.expect("requeue"));
+    let resumed = get_run(&store.pool, store.organization_id, run.id)
+        .await
+        .expect("read")
+        .expect("the run exists");
+    assert_eq!(resumed.status, "queued");
+    assert_eq!(resumed.resume_count, 1, "the resume is counted when the run is re-queued, not when it answers");
+    assert!(resumed.error.is_none(), "a re-queued run does not keep the parking note as an error");
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_run_that_is_queued_and_going_at_once_is_refused_by_the_one_active_per_agent_index() {
+    let Some(store) = Store::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let first = queued_run(&store, "first").await;
+    let second = create_run(
+        &store.pool,
+        &NewRun {
+            organization_id: store.organization_id,
+            agent_id: first.agent_id.expect("the fixture agent"),
+            trigger: "agent".to_owned(),
+            goal: "second".to_owned(),
+            ..NewRun::default_for(store.organization_id, first.agent_id.expect("the fixture agent"))
+        },
+    )
+    .await;
+
+    // The index is the guarantee, not the route's read: a double-clicked Run button is two
+    // requests arriving together, and the second one must lose in the database rather than in
+    // whichever handler happened to read the queue first.
+    let refused = second.expect_err("a second active run for one agent is refused");
+    assert!(
+        matches!(refused, AiHubError::Database(_)),
+        "the refusal is the unique index, not a validation: {refused:?}"
+    );
     store.dispose().await;
 }
