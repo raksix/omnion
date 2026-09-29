@@ -26,7 +26,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { javascript } from "@codemirror/lang-javascript";
 import { json } from "@codemirror/lang-json";
 import { python } from "@codemirror/lang-python";
-import { EditorState, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, keymap, lineNumbers } from "@codemirror/view";
 import {
   HighlightStyle,
@@ -34,10 +34,15 @@ import {
   defaultHighlightStyle,
   syntaxHighlighting,
 } from "@codemirror/language";
-import { defaultKeymap, history, historyKeymap, searchKeymap } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
-import { search } from "@codemirror/search";
-import { linter, type Diagnostic } from "codemirror";
+import { search, searchKeymap } from "@codemirror/search";
+// `@codemirror/lint`, not `linter` — the package is named after the thing it does and the
+// export is named `linter`. Reading the diagnostics off the lint package rather than off the
+// `codemirror` barrel is deliberate too: the barrel re-exports the *basic setup* extension,
+// which brings its own keymap and history, and two histories in one editor is an undo that
+// silently does nothing.
+import { linter, type Diagnostic } from "@codemirror/lint";
 
 import { completeExpressions } from "@/lib/api";
 import { ApiError } from "@/lib/api";
@@ -154,6 +159,11 @@ export function CodeEditor({
 }) {
   const host = useRef<HTMLDivElement | null>(null);
   const view = useRef<EditorView | null>(null);
+  const editableRef = useRef<Compartment | null>(null);
+  // Shared with the mount-only effect through a ref, so a new `issues` array does not
+  // rebuild the extension. Declared here rather than inside the effect because the linter
+  // callback closes over it and the effect may not run again for the life of the field.
+  const diagnosticsRef = useRef<Diagnostic[]>([]);
   const change = useRef(onChange);
   change.current = onChange;
 
@@ -164,8 +174,12 @@ export function CodeEditor({
     // Declared BEFORE the linter that reads it. The order here is not style: a
     // `const` read on the previous line is a temporal-dead-zone error at runtime, and a
     // build that is green until the editor mounts is the worst possible time to find out.
-    const diagnosticsRef = { current: diagnosticsFor(issuesRef.current, fieldRef.current) };
+    diagnosticsRef.current = diagnosticsFor(issuesRef.current, fieldRef.current);
     const diagnostics = linter(() => diagnosticsRef.current, { delay: 200 });
+    // A compartment rather than re-creating the view: `readOnly` flips when the inspector
+    // opens a second editor of the same workflow, and re-creating would throw away the undo
+    // history of a field somebody is halfway through.
+    const editable = new Compartment();
     const created = new EditorView({
       state: EditorState.create({
         doc: valueRef.current,
@@ -175,13 +189,19 @@ export function CodeEditor({
           bracketMatching(),
           closeBrackets(),
           search({ top: true }),
-          keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap]),
+          keymap.of([
+            ...closeBracketsKeymap,
+            ...defaultKeymap,
+            ...historyKeymap,
+            ...searchKeymap,
+          ]),
           syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-          HighlightStyle.define([]),
           ...languageExtension(languageRef.current),
           EditorView.lineWrapping,
-          EditorState.readOnly.of(readOnlyRef.current),
-          EditorView.editable.of(!readOnlyRef.current),
+          editable.of([
+            EditorState.readOnly.of(readOnlyRef.current),
+            EditorView.editable.of(!readOnlyRef.current),
+          ]),
           diagnostics,
           THEME,
           EditorView.updateListener.of((update) => {
@@ -192,9 +212,11 @@ export function CodeEditor({
       parent: host.current,
     });
     view.current = created;
+    editableRef.current = editable;
     return () => {
       created.destroy();
       view.current = null;
+      editableRef.current = null;
     };
     // Intentionally mount-only: see the doc comment.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -229,14 +251,22 @@ export function CodeEditor({
 
   useEffect(() => {
     const current = view.current;
-    if (!current) return;
+    const editable = editableRef.current;
+    if (!current || !editable) return;
     current.dispatch({
-      effects: EditorState.reconfigure.of([
+      effects: editable.reconfigure([
         EditorState.readOnly.of(readOnly),
         EditorView.editable.of(!readOnly),
       ]),
     });
   }, [readOnly]);
+
+  // The diagnostics are pushed rather than re-created: `linter` closes over its callback, so
+  // rebuilding the extension on every validation round trip would reset the editor's
+  // diagnostic state mid-edit and make the gutter flicker between marks and no marks.
+  useEffect(() => {
+    diagnosticsRef.current = diagnosticsFor(issues, field);
+  }, [issues, field]);
 
   // The linter is fed through a ref so a new `issues` array does not rebuild the extension:
   // `linter()` closes over the callback, and re-creating it on every validation round trip
