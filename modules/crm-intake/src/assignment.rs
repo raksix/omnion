@@ -355,6 +355,20 @@ pub fn simulate(rules: &[AssignmentRule], input: &AssignmentInput) -> Assignment
     for rule in &ordered {
         if rule.matches(input) {
             let (owner, cursor_before, cursor_after) = match rule.target_kind.as_str() {
+                // A `user` rule whose person was deleted is treated the same way an emptied
+                // pool is: a skip, so the next rule gets its turn. The alternative — a match
+                // with no owner — is the one outcome an assignment chain must never produce,
+                // and it is reachable in production (delete the user, keep the rule) as
+                // surely as the pool case. The migration's check refuses to *save* such a
+                // rule; this arm is for the one that was already saved.
+                "user" if rule.target_user_id.is_none() => {
+                    skipped.push(SkippedRule {
+                        rule_id: rule.id,
+                        rule_name: rule.name.clone(),
+                        failed_on: "target (the person this rule names is gone)".into(),
+                    });
+                    continue;
+                }
                 "user" => (rule.target_user_id, None, None),
                 "pool" => {
                     let pool = rule.candidate_user_ids();
@@ -978,6 +992,28 @@ mod tests {
         assert_eq!(seen[0], seen[3], "the pool is a cycle, not a shuffle");
         assert_eq!(seen[0], seen[6]);
         assert_eq!(seen[1], seen[4]);
+    }
+
+    #[test]
+    fn a_user_rule_whose_person_was_deleted_falls_through_rather_than_matching_nobody() {
+        // A rule that matches every lead and hands it to nobody is the one outcome the
+        // chain must never produce. The migration's check refuses to *save* it; this is the
+        // path for the rule that was already saved and then lost its person.
+        let mut orphaned = rule(Uuid::from_u128(1), 0, json!({}), "user");
+        orphaned.target_user_id = None;
+        let catch_all = rule(Uuid::from_u128(2), 1, json!({}), "queue");
+        let outcome = simulate(&[orphaned, catch_all], &AssignmentInput::default());
+        assert_eq!(
+            outcome.rule_id,
+            Some(Uuid::from_u128(2)),
+            "the orphaned rule must be skipped, not honoured as an empty owner"
+        );
+        assert_eq!(outcome.owner_user_id, None, "the queue really is nobody");
+        assert!(
+            outcome.skipped[0].failed_on.contains("the person"),
+            "the skip names the reason: {}",
+            outcome.skipped[0].failed_on
+        );
     }
 
     #[test]

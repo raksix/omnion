@@ -21,8 +21,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::assignment::{
-    AssignmentInput, AssignmentOutcome, AssignmentRule, SlaPolicy, due_at, next_position, renumber,
-    simulate, validate_policy, validate_rule,
+    AssignmentInput, AssignmentOutcome, AssignmentRule, SlaPolicy, due_at, renumber, simulate,
+    validate_policy, validate_rule,
 };
 use crate::error::{CrmIntakeError, Result};
 use crate::vocabulary::MAX_PAGE;
@@ -165,7 +165,19 @@ pub async fn create_rule(
     rule: &NewRule,
 ) -> Result<AssignmentRule> {
     rule.check()?;
-    let position = next_position(&list_rules(pool, organization_id).await?);
+    // A new rule goes ABOVE the seeded catch-all, not at the bottom of the chain.
+    //
+    // `next_position` is max + 1, and the catch-all is seeded at 1000 — so the obvious
+    // implementation puts every operator-created rule *below* the one rule that matches
+    // everything. The rule is then saved, listed, and never fires: "I added a country rule
+    // and the lead still went to the queue" is the exact symptom, and it is invisible
+    // because every screen involved reports success.
+    //
+    // The insert therefore writes a placeholder position and the chain is renumbered
+    // immediately afterwards, through the same [`reorder_rules`] a drag uses. Reusing the
+    // drag's code rather than open-coding a shift is the point: there is one place where
+    // positions are made dense, so a create and a drag cannot disagree about what "second
+    // from the top" means.
     let query = format!(
         "insert into crm_assignment_rules \
              (organization_id, name, position, conditions, target_kind, target_user_id, \
@@ -176,7 +188,9 @@ pub async fn create_rule(
     let created = sqlx::query_as::<_, AssignmentRule>(&query)
         .bind(organization_id)
         .bind(rule.name.trim())
-        .bind(position)
+        // A placeholder well below the seeded catch-all: correct for the duration of this
+        // one statement, and overwritten by the renumber before the function returns.
+        .bind(i32::MAX / 2)
         .bind(&rule.conditions)
         .bind(&rule.target_kind)
         .bind(rule.target_user_id)
@@ -185,7 +199,12 @@ pub async fn create_rule(
         .fetch_one(pool)
         .await;
     match created {
-        Ok(row) => Ok(row),
+        Ok(row) => {
+            reorder_rules(pool, organization_id, &[row.id]).await?;
+            find_rule(pool, organization_id, row.id).await?.ok_or_else(|| {
+                CrmIntakeError::Invalid("the rule was saved but could not be read back".into())
+            })
+        }
         Err(error) => Err(map_unique(error, "a rule with that name already exists")),
     }
 }

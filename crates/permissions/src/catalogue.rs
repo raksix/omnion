@@ -463,6 +463,16 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Manage intake sources, their field mappings and their endpoint keys",
     },
+    // * `crm.sla.manage` is the first-response targets, and it is deliberately NOT a wing of
+    //   `crm.intake.manage`. "Who answers a lead" and "how fast they must answer" go to
+    //   different people in most organizations — a sales manager sets the routing, a team
+    //   lead sets the promise made to a submitter — and merging them would mean the second
+    //   of those people could not set a target without also being handed the routing.
+    PermissionDef {
+        key: "crm.sla.manage",
+        category: "crm",
+        description: "Manage first-response targets, business hours and escalation targets",
+    },
     // `notifications.admin` is the org-wide delivery log and the router's rules. It arrived with
     // slice 3, which is the first build where it has routes behind it — a permission with no
     // route is a role entry granting a promise the platform cannot keep, which is why it was

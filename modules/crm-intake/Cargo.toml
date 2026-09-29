@@ -17,3 +17,9 @@ tracing.workspace = true
 sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
+
+[dev-dependencies]
+# The slice-2 gate (scripts/qa/run-crm-assignment.sh) needs a real database, because the
+# claim's correctness is a property of the *transaction* and no unit test can prove one.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }

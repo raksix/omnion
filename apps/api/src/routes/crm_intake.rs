@@ -622,7 +622,7 @@ pub struct MappingPreviewBody {
 /// definition the platform refuses is the caller's `400`, a rate limit is a `429`, and a
 /// database that did not answer is a `500` — never a `400`, because a client that retries a
 /// `400` forever is a client the platform taught to do that.
-fn map_store(error: CrmIntakeError) -> ApiError {
+pub(super) fn map_store(error: CrmIntakeError) -> ApiError {
     use CrmIntakeError as E;
     match error {
         E::Invalid(message) => ApiError::bad_request("invalid_lead", message),
@@ -660,7 +660,7 @@ fn invalid_key() -> ApiError {
 
 /// `404` for a row that is not the caller's, and for a row that is gone. The two are the
 /// same answer on purpose — a panel that can tell those apart can enumerate ids.
-fn not_found(what: &'static str) -> ApiError {
+pub(super) fn not_found(what: &'static str) -> ApiError {
     ApiError::new(
         StatusCode::NOT_FOUND,
         "not_found",
@@ -1347,7 +1347,7 @@ pub async fn test_mapping(
 /// A signed-in account with no organization is not a platform operator on this surface: the
 /// inbox belongs to an organization, and there is no "every organization's inbox" view on
 /// this route, so the answer is `400` rather than a query that returns the wrong tenants.
-fn organization_of(session: &CurrentSession) -> Result<Uuid, ApiError> {
+pub(super) fn organization_of(session: &CurrentSession) -> Result<Uuid, ApiError> {
     session.user.organization_id.ok_or_else(|| {
         ApiError::bad_request(
             "no_organization",
@@ -1434,7 +1434,7 @@ fn lead_fingerprint(lead: &Lead) -> serde_json::Value {
 /// An action that succeeded but whose audit line could not be written is reported, not
 /// unwound: the business change is real, and pretending otherwise would make the panel show
 /// an error for work that actually happened.
-async fn audit(
+pub(super) async fn audit(
     pool: &sqlx::PgPool,
     actor_user_id: Uuid,
     organization_id: Uuid,

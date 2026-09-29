@@ -97,7 +97,15 @@ create table crm_sla_policies (
     constraint crm_sla_policies_reminder_check
         check (reminder_minutes is null
                or (reminder_minutes between 1 and 20160
-                   and reminder_minutes <> first_response_minutes))
+                   and reminder_minutes <> first_response_minutes)),
+    -- The uniqueness that makes `ensure_defaults`'s `on conflict do nothing` work. Without
+    -- it the runtime seed fails with 42P10 ("no unique or exclusion constraint matching the
+    -- ON CONFLICT specification") the first time any organization is read — and it fails on
+    -- *every* organization, because the seed is on the read path. This is the same trap as
+    -- the duplicate migration number: a constraint the code depends on, declared in a
+    -- different file from the one that names it, and invisible until the moment a panel
+    -- opens the screen.
+    constraint crm_sla_policies_organization_name_key unique (organization_id, name)
 );
 
 -- One catch-all per organization. It is the rule that explains the unassigned queue: a lead

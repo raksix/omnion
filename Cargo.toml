@@ -38,7 +38,7 @@ tower = { version = "0.5", features = ["util"] }
 # Identity primitives (crates/identity): typed ids and timestamps shared with SQLx, Argon2
 # password hashing, session-token generation and hashing.
 uuid = { version = "1", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["serde-well-known"] }
+time = { version = "0.3", features = ["serde-well-known", "formatting", "parsing", "macros"] }
 argon2 = "0.5"
 rand = "0.8"
 sha2 = "0.10"

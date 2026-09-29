@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod commands;
 pub mod content;
+pub mod crm_assignment;
 pub mod crm_intake;
 pub mod health;
 pub mod iam;
@@ -120,6 +121,40 @@ use crate::guards;
 use crate::state::AppState;
 
 /// Build the application router around the shared [`AppState`].
+/// The CRM assignment and SLA surface.
+///
+/// The rules and the policies carry `crm.intake.manage`; the simulator carries
+/// `crm.leads.read`. It is a function rather than an inline `Router` so the two layers are
+/// declared once, here, and cannot be quietly merged into one permission by a later edit.
+fn crm_assignment_surface(state: &AppState) -> Router<AppState> {
+    let assignment = Router::new()
+        .route("/crm/assignment/rules", get(crm_assignment::list_rules).merge(post(crm_assignment::create_rule)))
+        // `/order` is static and must be declared before `/rules/{id}` so axum ranks it
+        // ahead of the parameter route — "order" read as a rule id is a 400, not a reorder.
+        .route("/crm/assignment/rules/order", put(crm_assignment::reorder_rules))
+        .route(
+            "/crm/assignment/rules/{id}",
+            get(crm_assignment::get_rule)
+                .merge(patch(crm_assignment::update_rule))
+                .merge(delete(crm_assignment::delete_rule)),
+        )
+        .route("/crm/assignment/targets", get(crm_assignment::list_targets))
+        .route_layer(guards::require(state, "crm.intake.manage"));
+    let sla = Router::new()
+        .route("/crm/sla/policies", get(crm_assignment::list_policies).merge(post(crm_assignment::create_policy)))
+        .route(
+            "/crm/sla/policies/{id}",
+            get(crm_assignment::get_policy)
+                .merge(patch(crm_assignment::update_policy))
+                .merge(delete(crm_assignment::delete_policy)),
+        )
+        .route_layer(guards::require(state, "crm.sla.manage"));
+    let simulate = Router::new()
+        .route("/crm/assignment/simulate", post(crm_assignment::simulate))
+        .route_layer(guards::require(state, "crm.leads.read"));
+    assignment.merge(sla).merge(simulate)
+}
+
 pub fn router(state: AppState) -> Router {
     let roles = get(iam::list_roles)
         .layer(guards::require(&state, "iam.roles.read"))
@@ -1063,6 +1098,26 @@ pub fn router(state: AppState) -> Router {
             "/crm/leads/{id}/spam",
             post(crm_intake::mark_spam).layer(guards::require(&state, "crm.leads.manage")),
         )
+        // CRM assignment and SLA (docs/requests/REQ-117, slice 2). Three powers, split by
+        // what they are over rather than by which screen they live on:
+        //
+        // * `crm.intake.manage` — the assignment chain. Editing a rule decides, for every
+        //   lead from now on, which person answers it, so it is the same power as editing
+        //   the intake sources themselves and carries that key.
+        // * `crm.sla.manage` — the response targets. A policy is a promise to a submitter
+        //   about how fast somebody answers, and it is its own key because "who answers"
+        //   and "how fast" go to different people in most organizations: a team lead sets
+        //   the target, a sales manager sets the routing.
+        // * `crm.leads.read` — the simulator, and only the simulator. It reads the rules,
+        //   answers a hypothetical, writes nothing and advances no cursor, so it needs no
+        //   management power. That is what lets a support lead ask "who would get this"
+        //   without being able to change who gets it.
+        //
+        // The rules themselves are ONE router with two layers rather than two routers: the
+        // chain and the policies are different tables but the same screen, and splitting
+        // them into separate `.merge()`s would let a later edit give one of them the other's
+        // key without anybody noticing.
+        .merge(crm_assignment_surface(&state))
         .route(
             "/analytics/settings",
             analytics_settings_read.merge(analytics_settings_write),
