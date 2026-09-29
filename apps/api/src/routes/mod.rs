@@ -97,6 +97,7 @@ pub mod media_usage;
 pub mod media_versions;
 pub mod notifications;
 pub mod notifications_admin;
+pub mod security;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -925,6 +926,45 @@ pub fn router(state: AppState) -> Router {
     // an account that may walk away with the data are two different powers. The page series rides
     // with the read key: it is one page's numbers, nothing more than the table already shows.
     let analytics_reports = Router::new()
+        // Security centre (docs/requests/REQ-012, slice 1). The split is by *power*, not by
+        // verb: `security.read` sees the posture and the findings, `security.scan` re-runs the
+        // checks and ingests a report, and `security.manage` changes a finding's status.
+        //
+        // `security.scan` is a separate key from `security.manage` on purpose. Re-running the
+        // checks is read-only in effect — it changes no configuration — while acknowledging or
+        // ignoring a finding is a decision somebody will later be asked to justify, and a
+        // deployment that grants both lets an account that can only look also dismiss what it
+        // saw. The static segments come first so axum ranks them ahead of
+        // `/security/findings/{id}`.
+        .route(
+            "/security/overview",
+            get(security::overview).layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/checks/run",
+            post(security::run_checks).layer(guards::require(&state, "security.scan")),
+        )
+        .route(
+            "/security/findings/import",
+            post(security::import).layer(guards::require(&state, "security.scan")),
+        )
+        .route(
+            "/security/findings/bulk",
+            post(security::bulk).layer(guards::require(&state, "security.manage")),
+        )
+        .route(
+            "/security/findings",
+            get(security::list).layer(guards::require(&state, "security.read")),
+        )
+        .route(
+            "/security/findings/{id}",
+            get(security::get)
+                .layer(guards::require(&state, "security.read"))
+                .merge(
+                    patch(security::patch_status)
+                        .layer(guards::require(&state, "security.manage")),
+                ),
+        )
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))
         .route("/analytics/pages/series", get(analytics::page_series))

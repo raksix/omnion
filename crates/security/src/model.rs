@@ -382,7 +382,11 @@ pub struct FindingPage {
 }
 
 /// Open findings grouped by severity, for the overview's score ring.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` is part of the type rather than applied at the route: the bucket is part of the
+/// answer, and a route that has to borrow a *local* struct to serialise it is a route that
+/// will eventually forget and answer `null` for the whole legend.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SeverityCount {
     /// The severity.
     pub severity: String,
