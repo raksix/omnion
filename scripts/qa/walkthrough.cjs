@@ -10391,14 +10391,36 @@ async function runWorkflowBuilderDepth(page, report) {
       // invisible to validation and the rule would have been stored as valid. The `false`
       // branch below is the shape an author actually draws ("retry until it passes") and it
       // closes the same way.
+      //
+      // NOTE what this row actually measured for three ticks: it carries a SECOND defect.
+      // `spine()` already puts an edge on `a1`'s `success` port, so closing the ring from the
+      // same port leaves TWO edges on one walked port — which is `ambiguous_branch`, and it
+      // sorts first. The pass therefore read `cycle.found: true` off an `ambiguous_branch`
+      // message and reported "the cycle is found", which was true by accident. One defect per
+      // graph is the whole reason this table was split per class, and the row that violated it
+      // is the row nobody checked. The ring now closes from a SECOND action, so `a1` keeps
+      // its single `success` edge and the only thing wrong with the drawing is the cycle.
       cycle: {
-        nodes: [trigger("t1"), act("a1"), finish("e1")],
-        edges: [...spine(), edge("a1", "t1", "success")],
+        nodes: [trigger("t1"), act("a1"), act("a2"), finish("e1")],
+        edges: [
+          edge("t1", "a1", "out"),
+          edge("a1", "a2", "success"),
+          edge("a2", "e1", "success"),
+          edge("a2", "t1", "error"),
+        ],
       },
       // The same loop closing on the port the walk never takes — the one the server's own
       // traversal missed. A condition with a retry branch, which is the common shape.
+      //
+      // The type is `condition`, NOT `condition.if`. The registry key is `condition`
+      // (`graph.rs`, `key: "condition"`), and `find_node_type` is exact — so `condition.if`
+      // resolved to nothing and answered `unknown_node_type` on the first finding, which then
+      // became the `firstMessage` this row reports. The row read `found: true` off the *codes*
+      // (which did contain `graph_cycle`) while its `names` field showed a sentence about a
+      // node type the author had never typed. Same shape as the earlier `next`-on-a-trigger
+      // probe: a case built from a port or type name that the registry has never had.
       cycle_on_a_branch: {
-        nodes: [trigger("t1"), { ...act("c1"), type: "condition.if" }, act("a1"), finish("e1")],
+        nodes: [trigger("t1"), { ...act("c1"), type: "condition" }, act("a1"), finish("e1")],
         edges: [
           edge("t1", "c1", "out"),
           edge("c1", "a1", "true"),
@@ -10501,6 +10523,11 @@ async function runWorkflowBuilderDepth(page, report) {
     },
     cycle: {
       found: validationClasses.cycle?.codes?.includes("graph_cycle"),
+      // The codes matter as much as `found`. `found` was `true` for three ticks while the
+      // first finding was an `ambiguous_branch`, because this row carried two defects and the
+      // classes mask one another. Reading the whole list is what makes a second defect
+      // visible here instead of hiding behind the code the row was written to find.
+      codes: validationClasses.cycle?.codes ?? [],
       names: validationClasses.cycle?.firstMessage ?? "",
     },
     // The branch-closing ring. It is a separate row because it failed while the row above
