@@ -6013,3 +6013,24 @@ REQ-004 notes in the order four ticks have agreed: `workflow-table` (`create.sta
 **201** now, the 422 was fixed a day before the note was written), `validate-classes`,
 `cmd-s-writes-once`, `two-tab-conflict`, `run-from-here`, `step-trace`. An empty note after
 that is a **product** defect; the instrument behind all of them is committed.
+
+**THE PASS RAN AND THE TAB DIED — AND THE LOG SAYS WHERE, WHICH IS THE POINT.** It took the
+slot at 00:23 (w8's walkthrough finished, `pgrep -f omnion-w8/qa-artifacts` went quiet), reset
+the database, rebuilt the API and walked the static routes through `overview`, `pages`,
+`media` and `automations`. Then every route after that answered `Page crashed` /
+`Target crashed`, and the walkthrough died in `runPalette` (line 2274) with 124 records in
+`clicks.jsonl` — the last of them the `Backups` link on `/automations`. **The crash is
+memory, not the change**: `free` read 28/32 used with **0 free** and 20 Chrome processes
+live, w7 running its own pass at the same time on 6 shared cores. This is the documented
+"target page, context or browser has been closed" mode four ticks have now hit — a screen
+whose QA dies with the box is not evidence about the screen.
+**What it costs is specific and worth naming: the builder depth pass never ran at all**, so
+`shortcut-help` and the six REQ-004 notes are still unmeasured, and a pass that dies *after*
+`automations` is a pass that cannot report on the thing it was queued for. `run.sh` builds
+and boots correctly and the stack was healthy; the instrument failed on the box, at the point
+the box ran out.
+
+**Next.** The pass must be launched when `free` has room and no sibling holds a Chromium, and
+the first thing its log should show is the builder depth pass rather than sixty static routes.
+If the box is still at 0 free, the honest answer is that the queue is ahead of the RAM, and
+the ledger now says so where the next tick will read it.
