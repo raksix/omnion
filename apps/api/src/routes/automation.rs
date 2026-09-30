@@ -362,6 +362,31 @@ pub async fn create_automation(
             .await
             .map_err(ApiError::from)?;
 
+    // **Acceptance 6 at the create boundary.** `resolve_target` answers "which project does this
+    // land in" — a question a `viewer` passes, because the organization's default project is
+    // visible to every account in the tenant. Creating a rule inside a project is an *edit of
+    // that project*, so the capability is asked separately; without it the fourth role is
+    // decorative here while the workflows surface enforces it. One query per create, not per
+    // request.
+    let (allowed, role) = omnion_workflows::projects::permits(
+        state.db().pool(),
+        organization_id,
+        target.id,
+        caller,
+        omnion_workflows::projects::ProjectRole::can_edit,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not create automations here — \
+                 ask a project owner to change it, it applies immediately"
+            ),
+        ));
+    }
+
     let workflow = store::insert_workflow(
         state.db().pool(),
         NewWorkflow {
@@ -426,7 +451,14 @@ pub async fn update_automation(
     Path(automation_id): Path<Uuid>,
     Json(input): Json<AutomationInput>,
 ) -> Result<Json<AutomationBody>, ApiError> {
-    let existing = automation_in_scope(&state, &current, automation_id).await?;
+    let existing = automation_with_capability(
+        &state,
+        &current,
+        automation_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "replace an automation rule",
+    )
+    .await?;
     ensure_same_organization(
         &current,
         input.organization_id.or(Some(existing.organization_id)),
@@ -488,7 +520,14 @@ pub async fn delete_automation(
     Path(automation_id): Path<Uuid>,
     address: ClientAddress,
 ) -> Result<StatusCode, ApiError> {
-    let existing = automation_in_scope(&state, &current, automation_id).await?;
+    let existing = automation_with_capability(
+        &state,
+        &current,
+        automation_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "delete an automation rule",
+    )
+    .await?;
 
     if !store::delete_workflow(state.db().pool(), existing.id).await? {
         return Err(automation_not_found());
@@ -556,6 +595,55 @@ fn automation_not_found() -> ApiError {
         "automation_not_found",
         "no such automation",
     )
+}
+
+/// Load a rule the caller may see **and** hold `capability` in its project.
+///
+/// REQ-133 acceptance 6, same shape as `workflows::workflow_with_capability`, and for the same
+/// reason: `automation_in_scope` answers "does this row belong to this tenant", which a colleague
+/// in another project passes, so a `viewer` could rewrite or delete an event rule. The
+/// `404`-not-`403` rule above is about *reads*; this is a write, and a write names what is wrong.
+///
+/// A member of another project lands on the same refusal through `permits`: no membership row,
+/// `find_visible` fails, the role is `None`, and `None` may not do anything. That is the correct
+/// answer for a write about a project they cannot see — and it is a *side effect* of asking about
+/// the role rather than a second check, which is the reason to ask once.
+async fn automation_with_capability(
+    state: &AppState,
+    current: &CurrentSession,
+    automation_id: Uuid,
+    capability: fn(omnion_workflows::projects::ProjectRole) -> bool,
+    what: &str,
+) -> Result<omnion_workflows::Workflow, ApiError> {
+    let workflow = automation_in_scope(state, current, automation_id).await?;
+    let caller = omnion_workflows::projects::ProjectCaller {
+        user_id: current.user.id,
+        is_instance_admin: crate::routes::automation_projects::is_instance_admin(
+            state,
+            current,
+            workflow.organization_id,
+        )
+        .await,
+    };
+    let (allowed, role) = omnion_workflows::projects::permits(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.project_id,
+        caller,
+        capability,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not {what} — ask a project owner \
+                 to change it, it applies immediately"
+            ),
+        ));
+    }
+    Ok(workflow)
 }
 
 #[cfg(test)]

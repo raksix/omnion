@@ -436,7 +436,16 @@ pub async fn update_workflow(
     Path(workflow_id): Path<Uuid>,
     Json(input): Json<WorkflowInput>,
 ) -> Result<Json<WorkflowBody>, ApiError> {
-    let existing = workflow_in_scope(&state, &current, workflow_id).await?;
+    // `can_edit`, not "can see": replacing a definition is an edit of it, and a viewer or an
+    // operator in this project is refused with the role that refused (REQ-133 acceptance 6).
+    let existing = workflow_with_capability(
+        &state,
+        &current,
+        workflow_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "replace a workflow definition",
+    )
+    .await?;
 
     if let Some(site_id) = input.site_id {
         site_in_scope(&state, &current, site_id).await?;
@@ -498,7 +507,18 @@ pub async fn delete_workflow(
     address: ClientAddress,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let workflow = workflow_in_scope(&state, &current, workflow_id).await?;
+    // `can_edit` for a delete, and deliberately not a distinct capability: the matrix has four
+    // roles and six verbs, and inventing a sixth predicate for "remove" would be a permission
+    // that stops biting the moment somebody adds a role (the failure mode this file's doc comment
+    // names). An editor may rewrite the definition, so an editor may remove it.
+    let workflow = workflow_with_capability(
+        &state,
+        &current,
+        workflow_id,
+        omnion_workflows::projects::ProjectRole::can_edit,
+        "delete a workflow",
+    )
+    .await?;
 
     if !store::delete_workflow(state.db().pool(), workflow.id).await? {
         return Err(workflow_not_found());
@@ -526,7 +546,19 @@ pub async fn run_workflow(
     current: CurrentSession,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ExecutionDetail>), ApiError> {
-    let workflow = workflow_in_scope(&state, &current, workflow_id).await?;
+    // `can_run` and not `can_edit`: this is the one verb where the matrix earns its fourth role.
+    // An operator may start runs and an editor may too, but a **viewer may not** — and before this
+    // tick the route asked only "can you see the workflow", so a viewer could start a run of an
+    // automation somebody else wrote. Acceptance 6 is the sentence that says the very next request
+    // reflects the role, so the role is what this route reads.
+    let workflow = workflow_with_capability(
+        &state,
+        &current,
+        workflow_id,
+        omnion_workflows::projects::ProjectRole::can_run,
+        "start a run",
+    )
+    .await?;
 
     let execution = engine::start_run(
         state.db().pool(),
@@ -692,9 +724,37 @@ async fn resolve_project(
     project_id: Option<Uuid>,
 ) -> Result<omnion_workflows::projects::Project, ApiError> {
     let caller = caller_projects(state, current, organization_id).await;
-    projects::resolve_target(state.db().pool(), organization_id, project_id, caller)
-        .await
-        .map_err(ApiError::from)
+    let project =
+        projects::resolve_target(state.db().pool(), organization_id, project_id, caller).await?;
+
+    // Creating inside a project is an **edit of that project**, and `resolve_target` alone does
+    // not say so: it answers "which project does this land in", which a viewer passes happily. So
+    // the capability is asked here rather than at each of the two create routes — the same reason
+    // `caller_projects` exists, and the same reason a project-owner session must be refused here
+    // by the API rather than by a hidden button.
+    //
+    // One query more per create, not per request: the create path already writes a row, and this
+    // is the statement that makes acceptance 6 true for `POST /workflows` and `POST /automations`
+    // as well as for the three per-workflow routes.
+    let (allowed, role) = projects::permits(
+        state.db().pool(),
+        organization_id,
+        project.id,
+        caller,
+        omnion_workflows::projects::ProjectRole::can_edit,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not create automations here — \
+                 ask a project owner to change it, it applies immediately"
+            ),
+        ));
+    }
+    Ok(project)
 }
 
 /// Write an audit row; a privileged action is not reported as successful without one.
@@ -753,6 +813,55 @@ async fn workflow_in_scope(
     .map_err(ApiError::from)?
     {
         return Err(workflow_not_found());
+    }
+    Ok(workflow)
+}
+
+/// Load a workflow the caller may see **and** hold `capability` in its project.
+///
+/// **This function is the missing caller REQ-133 acceptance 6 is about.** Until this tick,
+/// `workflow_in_scope` was the *only* gate on `PUT /workflows/{id}`, `POST /workflows/{id}/run` and
+/// `DELETE /workflows/{id}`, and it answers exactly one question — "may this caller SEE the row" —
+/// which every member of a project may answer. So the role column, the capability matrix and the
+/// members screen all existed and none of them reached a write: a `viewer` could replace a
+/// definition and an `operator` could delete one. The matrix was correct, tested, and unreachable —
+/// the tenth instance on this branch of a rule that is right and has no caller.
+///
+/// Why the refusal is `403` and not the `404` above it, and the two must not be confused: the
+/// caller can already see the row (they just fetched it to ask), so `403` discloses nothing new and
+/// names the remedy — "ask an owner to change your role" is an action, not a fact about a
+/// resource that does not exist.
+///
+/// The role is read **per call** ([`projects::effective_role`]) rather than once per session:
+/// that is the sentence acceptance 6 makes, and a per-session memo would be the only thing that
+/// could make it false. There is no cache to invalidate because there is no cache — one indexed
+/// primary-key lookup on `automation_project_members`, re-run by construction.
+async fn workflow_with_capability(
+    state: &AppState,
+    current: &CurrentSession,
+    workflow_id: Uuid,
+    capability: fn(omnion_workflows::projects::ProjectRole) -> bool,
+    what: &str,
+) -> Result<Workflow, ApiError> {
+    let workflow = workflow_in_scope(state, current, workflow_id).await?;
+    let caller = caller_projects(state, current, workflow.organization_id).await;
+    let (allowed, role) = projects::permits(
+        state.db().pool(),
+        workflow.organization_id,
+        workflow.project_id,
+        caller,
+        capability,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "project_capability_required",
+            format!(
+                "your role in this project's team ({role:?}) may not {what} — ask a project \
+                 owner to change it, it applies immediately"
+            ),
+        ));
     }
     Ok(workflow)
 }
