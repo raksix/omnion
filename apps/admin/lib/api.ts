@@ -12,6 +12,11 @@ import type {
   SecurityFindingStatus,
   SecurityImportReport,
   SecurityOverview,
+  HealthOverview,
+  HealthServiceDetail,
+  HealthSamplePoint,
+  HealthSummary,
+  HealthPruneResult,
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
@@ -5067,4 +5072,67 @@ export function saveBackupSettings(input: {
     method: "PUT",
     body: JSON.stringify(input),
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The overview is fetched with `cache: "no-store"` and the POST carries the CSRF header
+// `request()` already adds, because both of those are the difference between this screen
+// showing the platform and showing a screenshot of it. A cached overview is a status
+// screen that answers "how were things when this tab was last opened", which is the one
+// question a health screen must never answer.
+// ---------------------------------------------------------------------------------------------
+
+/** Every service's state, the host's metrics and the banner, read live. */
+export function fetchHealthOverview(): Promise<HealthOverview> {
+  return request<HealthOverview>("/api/v1/health/overview", { cache: "no-store" });
+}
+
+/**
+ * Run every probe now and record the samples.
+ *
+ * The answer is a full overview rather than a run id, so the panel replaces what it has
+ * with what the server now believes. A client that merged the new states into the old rows
+ * would keep the last stored `healthy` for a service that has just gone down.
+ */
+export function runHealthChecks(): Promise<HealthOverview> {
+  return request<HealthOverview>("/api/v1/health/checks/run", {
+    method: "POST",
+    cache: "no-store",
+  });
+}
+
+/** One service, with the checks it ran and the metrics it has published. */
+export function fetchHealthService(key: string): Promise<HealthServiceDetail> {
+  return request<HealthServiceDetail>(`/api/v1/health/services/${encodeURIComponent(key)}`, {
+    cache: "no-store",
+  });
+}
+
+/** One metric's series, oldest first. `hours` is clamped server-side to 1 h … 7 d. */
+export function fetchHealthSamples(
+  service: string,
+  metric: string,
+  hours = 24,
+): Promise<HealthSamplePoint[]> {
+  const query = new URLSearchParams({ service, metric, hours: String(hours) });
+  return request<HealthSamplePoint[]>(`/api/v1/health/samples?${query.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/** The one-line summary the security overview and the operator dashboard embed. */
+export function fetchHealthSummary(): Promise<HealthSummary> {
+  return request<HealthSummary>("/api/v1/health/summary", { cache: "no-store" });
+}
+
+/** The host's raw kernel readings, including the notes for anything unreadable. */
+export function fetchHealthHost(): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>("/api/v1/health/host", { cache: "no-store" });
+}
+
+/** Drop raw samples past the retention window. Destructive, so it is a POST. */
+export function pruneHealthSamples(): Promise<HealthPruneResult> {
+  return request<HealthPruneResult>("/api/v1/health/maintenance/prune", { method: "POST" });
 }

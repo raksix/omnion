@@ -2178,3 +2178,96 @@ export interface BackupSchedule {
   /** What the screen says the frequency means, in one sentence. */
   cadence: string;
 }
+
+// -------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The four states are a closed set on the server and here, and the reason the client
+// repeats the list instead of typing `state: string` is the same one the server closes it
+// for: a colour map keyed by a string is a map that renders `undefined` in a class
+// attribute the first time a probe learns a fifth word. The badge, the label and the icon
+// all come out of one record, so a state can never have a colour and no label.
+// -------------------------------------------------------------------------------------------
+
+/** The four words a service state can be. `unknown` is NOT "fine". */
+export type HealthState = "healthy" | "degraded" | "down" | "unknown";
+
+/** One check inside a service row. */
+export type HealthCheck = {
+  check: string;
+  state: string;
+  message: string;
+  latency_ms: number;
+};
+
+/** One service row. Always present for every registered service, probed or not. */
+export type HealthService = {
+  service: string;
+  state: HealthState;
+  description: string;
+  latency_ms: number | null;
+  checked_at: string | null;
+  message: string;
+  detail: Record<string, unknown>;
+  checks: HealthCheck[];
+  href: string;
+};
+
+/** One host metric card. `threshold: null` means no opinion is configured. */
+export type HealthHostMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  state: string;
+  threshold: number | null;
+};
+
+/** The overview's verdict, as a word and as a sentence. */
+export type HealthBanner = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+};
+
+/** `GET /api/v1/health/overview`. */
+export type HealthOverview = {
+  services: HealthService[];
+  host: HealthHostMetric[];
+  banner: HealthBanner;
+  counts: Record<HealthState, number>;
+  last_checked_at: string | null;
+  registry: string[];
+  sample_count: number;
+};
+
+/** One metric of one service, with the newest value it published. */
+export type HealthServiceMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  sampled_at: string;
+};
+
+/** `GET /api/v1/health/services/{key}`. */
+export type HealthServiceDetail = HealthService & { metrics: HealthServiceMetric[] };
+
+/** `GET /api/v1/health/summary` — the one line other centres embed. */
+export type HealthSummary = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+  /** `true` only when every registered service is healthy. Never true while any is unprobed. */
+  operational: boolean;
+  counts: Record<HealthState, number>;
+};
+
+/** One point of a metric's series, oldest first. */
+export type HealthSamplePoint = {
+  value: number;
+  unit: string;
+  state: string;
+  sampled_at: string;
+};
+
+/** What the retention prune deleted. */
+export type HealthPruneResult = { deleted: number; retention_days: number };
