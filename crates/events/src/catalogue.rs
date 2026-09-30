@@ -413,6 +413,19 @@ catalogue! {
     "workflow.run.failed", "workflows", Reserved,
     "A workflow run stopped on a step that failed.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("error", String, opt)];
+    // ---- Automation projects (REQ-133) ------------------------------------------------------------
+    // The limit notices are the interesting pair: an operations team subscribes to them precisely
+    // because they are *once*. `period` and `current` travel with every one of them, so a consumer
+    // can tell "crossed again after midnight" from "the same crossing observed twice" without
+    // keeping state of its own.
+    "automation.project.limit.warning", "automation", Live,
+    "An automation project crossed a limit's warning threshold, once per period.",
+    [("project_id", Uuid, req), ("limit", String, req), ("current", Integer, req),
+     ("max", Integer, req), ("period", String, req), ("project_key", String, opt)];
+    "automation.project.limit.exceeded", "automation", Live,
+    "An automation project reached a hard limit; further runs are refused until the limit rises.",
+    [("project_id", Uuid, req), ("limit", String, req), ("current", Integer, req),
+     ("max", Integer, req), ("period", String, req), ("project_key", String, opt)];
 
     // ---- Webhooks ------------------------------------------------------------------------------
     "webhook.endpoint.created", "webhooks", Live,

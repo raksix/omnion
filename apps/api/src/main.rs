@@ -13,6 +13,7 @@ use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_sweep_runner, crm_autoresponder_runner,
     crm_sla_runner, event_retention_runner, event_runner, search_runner, workflow_runner,
+    project_limit_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -187,6 +188,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _sla = crm_sla_runner::spawn(state.clone());
     } else {
         tracing::info!("the crm sla worker is disabled (OMNION_CRM_SLA_RUNNER=false)");
+    }
+
+    // The project limit notice worker (REQ-133, slice 4) emits
+    // `automation.project.limit.warning` and `.limit_exceeded` exactly once per limit per period.
+    // Everything about the limits already worked -- the screen drew the amber bar and the engine
+    // refused the over-quota run by name -- but the REQ's two events were emitted by nothing, and
+    // the warning a client saw was computed per read, so reloading re-warned for ever. The
+    // once-ness is a claim row rather than a property of this process, so a second API node
+    // sweeping the same database cannot double-notify.
+    if state.config().project_limit.runner_enabled {
+        let _project_limit = project_limit_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the project limit worker is disabled (OMNION_PROJECT_LIMIT_RUNNER=false)");
     }
 
     // The rate-limit document is read here, once, and handed to the layer the router is about to
