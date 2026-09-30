@@ -10668,3 +10668,88 @@ still slice 3's one missing screen and REQ-064's forms module is on no branch.
 platform's own proxy the ceiling counts the *proxy's* address for every visitor. That is a
 deployment-dependent defect in the address's provenance, and the honest fix belongs with the
 `ClientAddress` type rather than in the CRM.
+
+---
+
+## Tick 51 — the key's boundary, promised in a comment and implemented nowhere
+
+**What.** `store::rotate_key`'s doc comment has said *"Refused for a source that has no key (a
+form-bound one)"* since the key surface shipped. The refusal was not implemented anywhere.
+`POST /api/v1/crm/intake/sources/{id}/rotate-key` found the row, issued a key and wrote it, so
+one call turned a form-bound intake source into a keyed endpoint.
+
+The direction is what makes it a finding rather than a nuisance. `create_source` deliberately
+issues a form source no key, because that source is authenticated by the *form's own submission
+validation* — and `find_source_by_key` matched the stored digest **regardless of `kind`**. So
+after one rotation the source answered at a public URL whose authentication is a 160-bit
+credential pasted into somebody's own site: a second, undeclared capture path onto a source that
+was never configured to have one, bypassing the form's validation. On the REQ's own words, "the
+public intake surface is the attack surface."
+
+**Where it came from.** `scripts/qa/dead-callers.py --roots modules/crm-intake` returned thirteen
+candidates, most of them builders called only by tests (`catch_all`, `with_transforms`,
+`verify_key`). One was a credential: `verify_key`, exported from `keys` with a comment promising
+*"comparison is constant-time"* that the body does not perform (it hashes first and then compares
+digests with `==`, which is a constant-time comparison of two computed values, so the promise
+holds — but no production caller exists, because the live path is a digest equality in
+`find_source_by_key`). Reading the *doc comment against the function* is what produced the real
+defect, and this is now the third time in three ticks that is where one came from (a field
+comment, a method comment, a doc comment).
+
+**Why nothing was green.** The panel is *correct* here — `source.kind === "endpoint"` gates the
+button — and every gate that touched rotation created an endpoint source and asserted only that
+the digest changed. **A test that asserts the happy path passes on an implementation with no
+guard at all.** This is also the boundary REQ-117 says the API must enforce rather than the UI
+hiding.
+
+**The fix, in two places, because one place does not close the class.**
+
+* `vocabulary::carries_endpoint_key` is the single rule, consulted by `create_source`,
+  `rotate_key` and `find_source_by_key`, so three sites cannot drift. It is a **closed** list:
+  an unknown kind is never key-bearing, which is what makes adding a fourth `SOURCE_KINDS`
+  member a decision rather than an accident.
+* `rotate_key` refuses before it writes. `Ok(None)` still means *only* "no such source in this
+  organization" — the handler maps it to `not_found("intake source")`, and a wrong reason for a
+  refusal sends an operator hunting for a source that is right there, so the refusal is an `Err`
+  whose message names the key.
+* `find_source_by_key` reads `kind` too, binding `KEY_BEARING_KIND` as a query parameter rather
+  than a literal. A digest is the *fact that a key was written*, not the boundary: a restored
+  dump, a hand-written insert, an import tool and a future kind's own migration all put one on a
+  row without asking `rotate_key`.
+
+**Proof.**
+
+- `bash scripts/qa/run-crm-key-lifecycle.sh` — schema check green, `crm_key_lifecycle` **7/7**.
+- **Proven to fail, twice and independently.** With the `rotate_key` guard removed: **4/7** — the
+  two refusal assertions red carrying the refusal's own message, all five controls green. With
+  the lookup's `and kind = $2` removed and nothing else changed: **6/7**, only the digest test
+  red. The second measurement is the load-bearing one: it shows the rotate guard alone leaves the
+  class open for any digest arriving by a route that never asks `rotate_key`.
+- `cargo test -p omnion-module-crm-intake --lib` **171 passed** (was 170; the new one is the
+  per-kind key-addressability assertion). `cargo build -p omnion-api` green. Admin
+  `tsc --noEmit` exit 0. Clippy **0** on the files this slice touched.
+- `scripts/qa/run-crm-intake.sh` and `run-crm-binding-health.sh` unchanged green — both drive
+  `create_source` and the public lookup, so they are the regression net for this change.
+
+**Two fixture defects of mine, and the second is the one worth keeping.** The first draft of the
+digest test demanded `None` and failed with `Some(<endpoint id>)`: both rows carry the same
+digest and `fetch_optional` returns the one that is legitimately addressable. The product was
+right and the assertion was wrong — and a test that names the wrong expected value sends the
+next reader to fix the product. Its control now deactivates the endpoint row and asks again, so
+the assertion cannot also pass on a build where the lookup answered `None` unconditionally. Also
+`organizations_slug_format` refused all six fixtures on the first run (spaces in the slug), which
+is the constraint working and is why a schema check is cheaper than reading "6 failed".
+
+**Not done, deliberately.** No browser pass — the QA slot is held by a live w3 pass, and no screen
+changed; the panel half was already correct, which is why the defect was invisible from the UI.
+REQ-117 stays open: the REQ-064 form-editor card is slice 3's one missing screen and REQ-064's
+forms module is on no branch.
+
+**Commits.** `45d01991` the store + the shared rule + the gate · `5fe0021f` the digest half on
+the public path · `a68db239` clippy.
+
+**Next.** `verify_key` is still exported with no production caller and a comment about
+constant-time comparison; the live path is a digest equality, so the function is either the
+thing the lookup should use (with a constant-time digest compare) or a comment that promises a
+property no code path has. Either way it is the next candidate in the same sweep, and it is the
+same shape: *a comment about a credential, and nothing behind it.*
