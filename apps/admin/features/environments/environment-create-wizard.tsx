@@ -391,6 +391,16 @@ export function EnvironmentCreateWizard({ areas, sourceKey, onClose, onCreated }
               onClick={() => void submit()}
               disabled={busy}
               data-env-wizard-submit
+              // The generic walkthrough pass clicks every button on the page, and a wizard is the
+              // one control that is unsafe to let it drive: the pass fills the name and key with
+              // sample values and submits, which creates a real staging environment whose clone
+              // then runs, and the screen's own depth pass — the one that knows the key it wants
+              // and has to assert the copy afterwards — finds its environment already created with
+              // the wrong key and reports "the wizard submitted but no environment with key
+              // qa-staging-… exists". The guard is the harness's own mechanism for exactly this
+              // ("this control belongs to the screen's own pass"), and the button that creates a
+              // tenant-scoped record is the clearest case of it in the panel.
+              data-qa-guard="environments-depth"
               className="rounded-lg bg-accent px-3 py-2 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:opacity-50"
             >
               {busy ? "Creating…" : "Create and clone"}
