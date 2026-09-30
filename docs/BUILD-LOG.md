@@ -6778,3 +6778,51 @@ next-run cell carries a date and the zone, and this tick explains why that cell 
 with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
 belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
 this tick looked at.
+
+## 2026-09-30 · tick 33 · REQ-046 slice 3 — five red tests, one of them a real bug
+
+**What.** The wire for the AI workflow console (976-line `apps/api/src/routes/ai_workflows.rs`,
+two catalogue events, the console + review screens, a 10-walk suite), plus the platform-wide
+tenancy fix the previous tick left uncommitted.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p omnion-api --tests` | exit 0 |
+| `ai_workflow_builder` | **10 passed / 0 failed** (52.6 s) — was 5/10 on arrival |
+| `omnion-module-ai --lib` | **41/0** |
+| `omnion-api --lib` | **241/0** (was 240/1 — a stale catalogue test, below) |
+| `omnion-workflows --lib` | **144/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+
+**The count was the least interesting number in the report.** Five of ten walks were red, and
+every failure was the fixture, and no two failures were the same fixture. Read as "the console is
+5/5 broken" it would have sent the next tick to rewrite a working route.
+
+**The one product bug, and it was in committed code.** The repair round-trip was unreachable.
+`generate.rs` cleared the opening user turn before spending the single repair, so the second
+provider call carried `[system, user(""), …]` and every OpenAI-compatible provider refused it
+with *"chat messages may not be empty"*. The draft then failed with a **provider** error instead
+of the second refusal — so the acceptance criterion the request leads with ("an unvalidatable
+answer triggers exactly one repair") could never pass, and it failed for a reason that has
+nothing to do with the answer being wrong. Found by the suite, fixed in `375da98c`, and the
+binding is now non-`mut` so the shape cannot regress silently.
+
+**Why the unit test beside it never caught it.** `a_repair_request_carries_the_failed_turns_before_the_new_instruction`
+calls `request_for(&plan, "second try", &transcript)` with an **explicit non-empty turn** — it
+tests the function, not the value the loop holds. A test that exercises a helper with its own
+fixture instead of the caller's state passes forever while the caller is broken. The replacement
+asserts the wire shape, and would be red if the clearing came back.
+
+**The five fixture bugs, since a fixture bug is a lesson about the product's shape.**
+`auditor` is not a seeded role (and no platform role can express "reads but may not spend" — a
+seed gap for wave 1's IAM surface, recorded in the REQ). The owner wizard is once per
+installation, so a second tenant cannot be made by calling it twice. A script that replays one
+answer gives two drafts the same title, which makes a *correct* filter count look wrong. `POST
+/workflows` normalises steps, so object equality is false on a correct answer. A store-made
+session carries no CSRF token, so it fails `csrf_failed` and proves the double-submit check
+instead of the permission.
+
+**Next.** Slice 4 — approve/reject/revise/test-run, workflow materialisation (which must pass
+`enabled: false` explicitly: the API arms a new rule by default), and the probe.

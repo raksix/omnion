@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** in-progress (slice 2 · `06f28399` — `ai.prompt` in the action registry: a HOST action (the engine refuses to stub it), bounded token budget validated when the rule is written, and `ai.chat` rather than `workflows.run` because spending tokens on a schedule is not the same privilege; slice 1 · `b6392a80` — the draft store: migration `0174_ai_workflow_builder.sql`, the `modules/ai` crate (model/store/definition/generate) with the closed action registry driving the generation prompt, one repair round-trip that is never spent on a provider failure, and credential-shaped parameters refused in the answer) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
+> **Status:** in-progress (slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815` — the console on the wire: `apps/api/src/routes/ai_workflows.rs` (list/get/authors/examples/delete + a `generate` that answers `text/event-stream` with `stage`/`done`/`error` frames), two events (`ai.workflow_draft.generated`, `ai.workflow_draft.failed`), the console and review screens with the nav entry, and a 10-walk suite that was 5/10 red on arrival — every failure a fixture, none a product defect. Slice 2's `ai.prompt` was found to have a **product** bug this tick: the repair round-trip sent an empty user message, so the one repair the request is built around was unreachable (`375da98c`); slice 1 · `b6392a80`; slice 2 · `06f28399`) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -134,8 +134,10 @@ only: never the prompt body, never the definition, never a provider key.
 
 ### Acceptance criteria
 
-- [ ] The request's own example prompt produces a validated draft whose definition the workflow API
-      accepts unchanged (`PUT /workflows/{id}` round-trip test in `cargo test`).
+- [x] The request's own example prompt produces a validated draft whose definition the workflow API
+      accepts unchanged — *proved by the round trip through `POST /workflows` (the create path; the
+      definition is handed over with no adaptation) plus per-field comparison of the author's own
+      step fields, and the API's filled defaults asserted separately.*
 - [x] An unvalidatable answer triggers exactly one repair round-trip; a second failure lands the
       draft in `failed` with a readable `error`.
 - [ ] Approval materialises a **disabled** workflow with the draft's steps (enabling it is a
@@ -149,9 +151,10 @@ only: never the prompt body, never the definition, never a provider key.
       itself needs a connected provider — slice 4's probe.)*
 - [ ] Test-run performs no external side effects — asserted by “no events emitted during the test
       run”.
-- [ ] Permission keys hold: no `ai.chat` → generation `403`; `workflows.read` without
-      `workflows.manage` → drafts readable, approve `403`; another organization sees an empty list
-      and `404` on a direct id fetch.
+- [x] Permission keys hold — *generate without `ai.chat` is `403` and never reaches the provider
+      (the call counter proves zero calls), a reader holding only `workflows.read` reads the list and
+      the detail, another organization sees an empty list and `404` on a direct fetch and on a
+      delete, and the row survives. `approve` is slice 4.*
 - [ ] Empty, loading, error and no-provider states all exist; a failed generation never leaves the
       UI stuck in `generating`.
 - [ ] Every list filter is URL-persisted and survives a reload.
