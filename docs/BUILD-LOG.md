@@ -7462,3 +7462,65 @@ begins, and the `backup.restored` audit entry. (b) The `partial` box is still un
 where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
 is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
 read the price, the warnings and the phrase, so when the slot frees there is something to run.
+
+
+---
+
+## Wave 4 · tick 37 · REQ-054 slice 2 — the invoice
+
+**What.** `modules/accounting/src/invoices.rs` (the document, the state machine, the arithmetic the
+server refuses to take from a client), `apps/api/src/routes/accounting_invoices.rs` (six routes),
+`accounting.invoices.read/.create/.send` in the catalogue, and sixteen integration walks.
+
+**The four rules, and why each is not the obvious implementation.**
+
+1. **The server owns the arithmetic.** `NewInvoice` has no `subtotal`, no `grand_total`, no
+   `tax_total` field at all — so a client that posts them has them dropped by deserialization, and
+   a free invoice is not reachable. This needed two new methods on `Amount`:
+   `multiply_qty` (thousandths) and `percent_of` (hundredths of a percent), each rounding **once,
+   half away from zero**, which is the direction PostgreSQL's `round(numeric)` goes — so the panel
+   and a SQL recompute agree to the cent, which is the REQ's own "the panel, the PDF and the
+   reports must print identical totals".
+2. **Only a draft is editable.** The refusal names the way out (void and duplicate) because "cannot
+   post" with no alternative sends a bookkeeper to a form that will also refuse.
+3. **Void keeps the number and demands a reason.** `INV-0007` was quoted on a purchase order and on
+   a customer's ledger; deleting the row leaves that reference dangling, voiding leaves it resolving
+   to "withdrawn, and here is why". A void with a blank reason is refused — the row is permanent.
+4. **The sweep is idempotent by construction.** The guard is `overdue_at is null` *inside* the same
+   `UPDATE` that flips the status, so two racing sweeps cannot both win, and the rows the UPDATE
+   returns are exactly the rows worth announcing. This is load-bearing, not tidy:
+   `accounting.invoice.overdue` drives the documented automation that sends an e-mail, and a sweep
+   that fired per scheduler tick would mail the customer every tick.
+
+**Proof, and the line under it.** `cargo build -p omnion-module-accounting` green;
+`cargo test -p omnion-module-accounting --lib` **32/32**; `cargo build -p omnion-api` green, which
+is what proves the six routes are wired rather than merely written. The sixteen walks in
+`apps/api/tests/accounting_invoices.rs` are **committed but have never run against PostgreSQL** — see
+below.
+
+**Two environment facts that cost the tick, both of them the known ones.**
+
+`target/` was deleted from this worktree **twice** in one tick, by a sibling reclaiming disk; the
+`target-guard.sh` script diagnosed it correctly both times and rebuilt, which is what it is for. The
+second deletion landed mid-`cargo test`, so the run died with `failed to write
+…/libsqlx_core.rmeta: No such file or directory (os error 2)` — **`os error 2` on a `.rmeta`/`.o`
+path is this, and never a code fault; `os error 28` is the real "disk full"**. Both were reported by
+`cargo test -p omnion-permissions` and `omnion-api --lib` at the same moment, which is the tell: a
+real fault in one crate never takes a dependency of an unrelated one with it.
+
+The root filesystem then reached **100% (12 MB free)**. The cause is not this worktree — it is 583 MB
+total, of which the source is most. `/dev/shm` was at 94% from siblings' `CARGO_TARGET_DIR`s. So the
+integration suite was committed unrun rather than run, and that is recorded in the REQ in the same
+words. A suite that has never executed is a hypothesis, and the slice-1 suite found four product
+defects and four test defects on its first real run, so this one will too.
+
+**Commits.** `707c4b1` the module and its money arithmetic, `34762df` the routes, the keys and the
+walks.
+
+**Next.** Run `apps/api/tests/accounting_invoices.rs` — one test at a time with `--test-threads=1`,
+because twelve walks serialise on a `tokio::sync::Mutex` and the whole suite as one invocation
+**hangs** rather than failing (every walk alone finishes in seconds). Fix what it finds. Then
+`accounting_invoice_lines`' `tax_amount` derivation is a SQL expression worth re-reading against the
+module's own `PricedLine.tax_amount`: the detail read recomputes it from `line_total` while the
+writer stored it, and those two have to be the same number — the PDF arrives in slice 3 or 4 and
+will be the first place anybody notices if they are not.
