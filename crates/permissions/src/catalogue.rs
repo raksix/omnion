@@ -638,6 +638,30 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "projects",
         description: "Instance-wide power over every project in the organization, including the ones you are not a member of",
     },
+    // `projects.limits.manage` and `projects.audit.read` (REQ-133, slice 6 and 9). They were
+    // deliberately left uncatalogued with the comment "no route behind it yet" — a promise the
+    // platform cannot keep, which was the right rule — and then BOTH ROUTES LANDED while the
+    // catalogue kept the old claim. The consequence is not a stale comment: `authorize` resolves
+    // a permission key through the catalogue, so these two routes were refused for EVERY
+    // account, including the instance owner. `PUT /projects/{id}/limits` and
+    // `GET /projects/{id}/audit` were screens that could never be written or read by anybody,
+    // and the only reason nothing noticed is that the panel hides both behind a project role
+    // check that fails first.
+    //
+    // Found by `scripts/qa/run-delegated-admin.sh`, which builds its fixture by granting a role
+    // real permissions and hit `projects.limits.manage is not in the catalogue` — the gate
+    // failing to SET UP a delegated administrator, which is the closest thing to a test that
+    // complains about a permission nobody can hold.
+    PermissionDef {
+        key: "projects.limits.manage",
+        category: "projects",
+        description: "Change a project's usage limits and thresholds",
+    },
+    PermissionDef {
+        key: "projects.audit.read",
+        category: "projects",
+        description: "Read a project's own audit stream",
+    },
     // Search (docs/requests/REQ-002). `search.read` is the box itself — every signed-in
     // account holds it, and the results are still narrowed by organization and by each
     // provider's own read permission; `search.manage` is index maintenance, not searching.
@@ -880,6 +904,8 @@ mod tests {
             "projects.manage",
             "projects.members.manage",
             "projects.admin",
+            "projects.limits.manage",
+            "projects.audit.read",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
@@ -887,11 +913,19 @@ mod tests {
                 "{key} belongs to the projects category"
             );
         }
-        // Slice 3 and slice 4's keys must NOT exist yet: cataloguing a key with no route
-        // behind it is a promise the platform cannot keep.
-        for key in ["projects.limits.manage", "projects.audit.read", "workflows.move"] {
-            assert!(get(key).is_none(), "{key} has no route yet and must stay uncatalogued");
-        }
+        // `workflows.move` still must NOT exist: it has no route. The move is deliberately guarded
+        // by `workflows.manage` (routes/mod.rs says why — inventing a fourth workflow permission
+        // would mean a role that can edit a workflow cannot move one, with no word saying why),
+        // so cataloguing it would be a grantable promise with nothing behind it.
+        //
+        // This assertion is the one that should have caught the two keys above. It was written as
+        // a tripwire ("when a route lands, this fails and you catalogue the key") and then the
+        // routes landed without it being read — a tripwire nobody fires is decoration, and the
+        // platform shipped two permanently-refused routes because of it.
+        assert!(
+            get("workflows.move").is_none(),
+            "workflows.move has no route and must stay uncatalogued"
+        );
     }
 
     #[test]
