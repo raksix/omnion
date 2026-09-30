@@ -25,8 +25,7 @@
 alter table accounting_expenses
     add column if not exists expense_number bigint,
     add column if not exists decided_by uuid,
-    add column if not exists rejection_comment text not null default '',
-    add column if not expenses_decided_by_idx;
+    add column if not exists rejection_comment text not null default '';
 
 comment on column accounting_expenses.expense_number is
   'Per-organization sequence number, allocated the same way as a journal entry (max + 1 for '
