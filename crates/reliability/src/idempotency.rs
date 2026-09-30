@@ -235,6 +235,16 @@ pub fn decide(existing: Option<&KeyRecord>, request_hash: &str, now: OffsetDateT
             retry_after: IN_PROGRESS_RETRY_AFTER,
         };
     }
+    // A FAILED key has no response to return. It fell through to `ReturnStored` before, which
+    // would replay `unwrap_or(200)` and a NULL body — a `200` with an empty body for a write that
+    // never succeeded. That is the worst possible answer: the client believes the write happened.
+    //
+    // `Proceed` is the correct verdict, and it is what makes the retry meaningful. The claim path
+    // takes a `failed` row over (the upsert's takeover predicate), so the retry owns the key and
+    // the row becomes the evidence rather than a permanent, silent refusal.
+    if record.state == crate::vocabulary::IDEMPOTENCY_FAILED {
+        return Replay::Proceed;
+    }
     Replay::ReturnStored {
         status: record.response_status.unwrap_or(200),
         body: record.response_body.clone(),

@@ -22,6 +22,20 @@ pub const IDEMPOTENCY_STATES: &[&str] = &["in_progress", "completed", "failed"];
 /// The state a key is written in before the handler has answered.
 pub const IDEMPOTENCY_IN_PROGRESS: &str = "in_progress";
 
+/// The state a key is written in once its attempt has answered, successfully or not.
+///
+/// Named here rather than in the store so the three states have ONE definition: a hand-written
+/// copy of `"completed"` in a query is a second place to change it, and the copy nobody changes is
+/// how a state rots into a value the `check` constraint rejects — at runtime, on one row.
+pub const IDEMPOTENCY_COMPLETED: &str = "completed";
+
+/// The state of a key whose attempt never finished, so the key can be retried.
+///
+/// Distinct from `completed` on purpose. A replay of a failed key must NOT return a stored
+/// response, because there is none; `decide` maps it to `Proceed` so the retry runs, and the row
+/// stays as the evidence of what happened.
+pub const IDEMPOTENCY_FAILED: &str = "failed";
+
 /// The subsystems that retry, and each one's shipped default ceiling.
 ///
 /// The order is the panel's display order and is deliberately the order of how expensive a
@@ -162,6 +176,33 @@ mod tests {
 
     /// Every list is a set: a duplicate in one of these is a second definition of the same word,
     /// and the panel's dropdown would show it twice while the resolver still matched one.
+    /// The three named states are the ones queries actually write.
+    ///
+    /// `IDEMPOTENCY_STATES` is a list and the states are constants, so nothing in the type system
+    /// stops a query writing a state the `check` constraint rejects — and that failure arrives at
+    /// runtime, on one row, in production. The constants exist to stop the string being typed
+    /// twice; this test is what stops the constant itself drifting away from the constraint.
+    ///
+    /// I first added the three constants to the `no_list_carries_a_duplicate` table, which
+    /// iterates `(name, list)` pairs — so the table refused to compile, correctly, because they
+    /// are not lists. A test's data table is a contract about what kind of thing goes in it.
+    #[test]
+    fn every_named_idempotency_state_is_one_the_schema_accepts() {
+        for state in [IDEMPOTENCY_IN_PROGRESS, IDEMPOTENCY_COMPLETED, IDEMPOTENCY_FAILED] {
+            assert!(
+                IDEMPOTENCY_STATES.contains(&state),
+                "{state} is written by a query but is not in IDEMPOTENCY_STATES, so the check \
+                 constraint would refuse it at runtime"
+            );
+        }
+        assert_eq!(
+            IDEMPOTENCY_STATES.len(),
+            3,
+            "a fourth state needs a constant and a decision about what a replay of it does, not \
+             just a row in this list"
+        );
+    }
+
     #[test]
     fn no_list_carries_a_duplicate() {
         for (name, list) in [
