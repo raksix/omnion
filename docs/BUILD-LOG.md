@@ -5223,3 +5223,56 @@ code), and the closing gate `cargo test --workspace && pnpm typecheck && QA walk
 zero high findings`. REQ-100 slice 2 is the real work next: `ai_identities` + `ai_tool_grants`
 CRUD, `/ai/identities`, `/ai/permissions` and the tri-state matrix, plus the REQ-099 box it
 owns - "a high-risk tool enabled without an approval gate warns on the agent form".
+
+## Tick 29 — w7 · REQ-099 slice 4 close-out: the trace that cost nothing
+
+**What.** The unticked "replay matches SSE" box turned out to be sitting on top of the
+largest defect REQ-099 ever shipped. `run_store::append_event` wrote one `note` step per loop
+event, stored the whole serialized event in `arguments`, and never closed the row. Three
+consequences, all product-level and none of them visible to a test that counted rows:
+
+- every step stayed `running` forever;
+- `run_totals_match_steps` sums `status = 'completed'`, so **every real run reported 0 tokens
+  and 0 cost** whatever the provider billed — and the panel's cost column is fed by that sum;
+- `resume_point` asks for the first non-completed step, so a *finished* run answered "step 1,
+  still running" and the resume route refused it as an ambiguous tool that may have fired.
+  `run.complete` was unreachable.
+
+The trace also misdescribed the run: a `ToolCall` rendered as `Note` carrying
+`{"ToolCall":{…}}` with a null `tool` column, while `ai_run_steps_tool_only_for_tool_kinds`
+exists to insist a tool kind carries its tool.
+
+The writer now folds each event into the row for **its own step** — the shape the unique
+`(run_id, step_no)` index was already asking for: kind promoted once a more specific one
+arrives, tool in its own column, streamed text accumulated in `result.text`, usage added to
+the step's counters, a step closed when the next begins, and `close_open_steps` at the end of
+the run. A parked run keeps its step `running` on purpose.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test ai_run_trace_shape` — 6 passed, 26.90 s, six walks through
+  **the runner's own persister** over the loop's real event sequence, plus a route-level walk
+  that reads `GET /ai/runs/{id}` and asserts the document the panel renders.
+- `cargo test -p omnion-api --test ai_agent_runs` — 19 passed (two walks updated: they asserted
+  the old note shape, and the tool now lives in the `tool` column).
+- `cargo test -p omnion-ai-hub --lib` — 384 passed.
+- `cargo test -p omnion-api --test ai_agent_workspace` 17 · `ai_telemetry` 18 ·
+  `ai_run_inputs` 7 — all green, so the shape change moved nothing else.
+- `cargo build --workspace` clean · `pnpm typecheck` clean (412 ms).
+- **Falsified before committing:** removing the kind promotion turns 3 of the 6 new walks red.
+
+**Two quiet failures worth the write-up.** sqlx reads a bare `?` in a statement as a *bind
+placeholder*, and `payload->>'text'` fails at prepare time with `operator does not exist: text
+->> unknown` because `::` binds tighter than `->>`. The persister logs a failed write with
+`tracing::warn!` and carries on, so every event was dropped, the trace kept its shape, and four
+walks reported "no tool_call step" on a run that looked perfectly healthy. The jsonb accessors
+are now the function forms (`jsonb_extract_path_text`, `jsonb_exists`). A fold that cannot fail
+loudly has to be proven by a walk that reads the rows, never by one that watches the log.
+
+**Next.** REQ-099's remaining two boxes are not this request's code: the approval decision and
+resume belong to REQ-101, and the closing gate (`cargo test --workspace`, `pnpm build`, a QA
+pass at zero high findings) wants a quiet box. So the next slice is **REQ-100 slice 2** —
+`ai_identities` + `ai_tool_grants` CRUD, `/ai/identities`, `/ai/permissions` and the tri-state
+matrix over migration `0173` (already shipped by slice 1; there is no store or route yet).
+
+---
