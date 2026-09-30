@@ -389,39 +389,59 @@ impl Fixture {
     async fn seed_page(&self, site: Uuid, slug: &str, status: &str, minutes_ago: i64) -> Uuid {
         let page_id = Uuid::new_v4();
         let revision_id = Uuid::new_v4();
-        let stamp = format!(
-            "now() - make_interval(mins => {minutes_ago})",
-            minutes_ago = minutes_ago
-        );
+        let stamp = time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago);
+        let published = status == "published";
+
+        // Both rows, in one transaction. The two foreign keys point at each other —
+        // `page_revisions.page_id` needs the page, and `pages.published_revision_id` needs the
+        // revision — so neither insert order is legal on its own. The store's own `create_page`
+        // has the same shape and solves it the same way: insert the page, insert the revision,
+        // then point the page at the revision, all inside one transaction so the intermediate
+        // state is never visible.
+        let mut tx = self.db.pool().begin().await.expect("a transaction must open");
         sqlx::query(
-            "insert into pages (id, site_id, slug, page_type, status, published_revision_id, \
-                               created_at, updated_at) \
-             values ($1, $2, $3, 'page', $4, $5, $6, $6)",
+            "insert into pages (id, site_id, slug, page_type, status, created_at, updated_at) \
+             values ($1, $2, $3, 'page', $4, $5, $5)",
         )
         .bind(page_id)
         .bind(site)
         .bind(slug)
         .bind(status)
-        .bind(revision_id)
-        .bind(time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago))
-        .execute(self.db.pool())
+        .bind(stamp)
+        .execute(&mut *tx)
         .await
         .expect("the page must be seeded");
+
         sqlx::query(
-            "insert into page_revisions (id, page_id, revision_no, state, title, body, summary, published_at) \
-             values ($1, $2, 1, $3, $4, $5, $6, $7)",
+            "insert into page_revisions (id, page_id, revision_no, state, title, body, summary, \
+                                       created_at, published_at) \
+             values ($1, $2, 1, $3, $4, $5, $6, $7, $8)",
         )
         .bind(revision_id)
         .bind(page_id)
-        .bind(if status == "published" { "published" } else { "draft" })
+        .bind(if published { "published" } else { "draft" })
         .bind(format!("Title of {slug}"))
         .bind(format!("Body of {slug}"))
         .bind(Some(format!("Summary of {slug}")))
-        .bind(time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago))
-        .execute(self.db.pool())
+        .bind(stamp)
+        .bind(published.then_some(stamp))
+        .execute(&mut *tx)
         .await
         .expect("the revision must be seeded");
-        let _ = stamp;
+
+        // Only a published page points at a revision. A draft carrying one is precisely the row
+        // the read surface must refuse, and leaving this `NULL` is what makes the
+        // "only published pages are served" walk a test rather than a test of the status column.
+        sqlx::query(
+            "update pages set published_revision_id = $2 where id = $1",
+        )
+        .bind(page_id)
+        .bind(published.then_some(revision_id))
+        .execute(&mut *tx)
+        .await
+        .expect("the publication pointer must be set");
+
+        tx.commit().await.expect("the fixture must commit");
         page_id
     }
 
