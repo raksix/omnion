@@ -1,4 +1,76 @@
 
+
+## 2026-09-30 — REQ-100 (AI tool system) · the operator's switch-off, and the denial it was reported as
+
+fix(ai-hub): read the operator's switch-offs from the row, not the catalogue
+fix(ai-hub): stop reporting an operator's switch-off as a permission denial
+fix(admin): give the AI permissions screen a retry and a real gated marker
+test(ai-hub): prove the disabled-tool criterion and record what it uncovered
+82143bde · 0cb43a32 · 30596830 · d5f98a44
+
+**What.** Two real defects behind one acceptance criterion, and the criterion's own
+walk had been asserting the first one as fact.
+
+`Pipeline::enabled` answered `catalogue::find(key).is_some()`. `model_facing` only ever
+asks it about a key that has *already* come out of `registry.catalogue()`, so the answer
+was `true` for every tool that reached it. `identity::resolve`'s first rule ("disabled
+wins") had no caller able to fire it, `ResolutionReason::Disabled` was unreachable, and
+the request's own `ai.tool.disabled` event had no producer anywhere in the tree. An
+operator switching a tool off on `/ai/tools` changed nothing at runtime while the screen
+said it had. The walk that should have caught this — `a_tool_disabled_by_an_operator_is_
+still_callable_inside_the_run_that_started_first` — passed, because its comment defended
+the behaviour as a latency trade: "`model_facing` runs this once per tool per step". It
+does not; the runner calls it once per run, at `ai_agent_runner.rs:575`. **A rule
+asserted in a comment is not a rule.**
+
+The second defect was found by the replacement walk, and only because the walk asserted
+something the product did not do. `DenyReason::from_code` had no row for `tool_disabled`,
+so `as_execution`'s `ToolDenied` fallback rewrote the outcome. The loop feeds
+`reason.code()` to the model and to the guardrail, so a run that called a globally
+disabled tool was told its *allow-list* refused it — a permissions problem with a
+permissions fix, when the real cause is a switch nobody at the agent level can undo. A
+model drawing that lesson retries, and no retry can ever succeed. `tool_limited` was
+missing from the same table. The hazard was already written down: `ToolTimeout` exists
+precisely because a timeout used to arrive as `ToolDenied`.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` → **430 passed, 0 failed** (0.91 s), up from 429:
+  the new `every_refusal_code_the_pipeline_documents_survives_the_projection_to_the_loop`.
+- **Verified red first**: deleting the two `from_code` rows again fails it with
+  "tool_disabled is documented on CallOutcome::Refused and must reach the loop as itself,
+  not as a generic denial".
+- `cargo test -p omnion-api --test ai_tool_execution -- --test-threads=1` → **20 passed,
+  0 failed** (601 s), including both replacement walks.
+- `pnpm typecheck` → **2 successful, 2 total** (admin is the one that matters: the
+  `⏸` → Lucide `Pause` swap is the admin half).
+- `pnpm build` → **2 successful, 2 total** (6m34s; admin recompiled for real, web was a cache hit). This is the admin half of the closing box: the retry and the Lucide `Pause` are in the bundle that was just produced.
+
+**Two reds that were not the product.** The parallel run reported
+`a_control_proves_the_fixture_tool_really_writes` and the new walk as FAILED. Run alone,
+the control passed and only the new walk failed — and the control is the walk that proves
+the fixture tool really writes, i.e. that a denial's "nothing was touched" is a statement
+about the denial. A falsification control failing for infrastructure reasons is worse than
+no control: it teaches you to ignore it. Cause: each walk opens a throwaway database, nine
+writers share one Postgres at `max_connections 100`, and the loser of a race surfaces as a
+test failure. **A parallel red here is a queue, not a verdict** — read *which* tests failed
+before believing it, and use `--test-threads=1` when the box is loaded (cost: 601 s
+instead of 317 s, and it is the only run whose result means anything).
+
+**What this costs the next tick.** The closing box (`cargo test --workspace`, `pnpm build`
+and the QA walkthrough, zero high findings) is still open, and the browser pass has not run
+for REQ-100. It did not run this tick for a measured reason, not a shrug: at 16:33 the box
+was at **load 88 with 5 GB RAM free** and a **sibling held the QA slot**
+(`/tmp/omnion-qa-slot/124574-1790785353`). The 2026-09-28 incident put this box into a
+swap death spiral with three Chromium sessions at once. `pnpm build` and the crate gates
+were the right instruments for a loaded box; a browser pass is not.
+
+**Next.** REQ-100's last box, on a quiet box: the workspace test suite, and the w7 QA pass
+(`QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206 bash scripts/qa/run.sh`).
+Both `/ai/tools`, `/ai/permissions` and `/ai/identities` are already in the walkthrough
+route list, and the retry this tick added to `/ai/permissions` is the one new control a
+pass has to see. Then **REQ-101 (AI approvals & action preview)**, `pending`, which is next
+in wave order.
+
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
