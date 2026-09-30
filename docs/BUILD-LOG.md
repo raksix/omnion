@@ -7572,3 +7572,58 @@ precisely the assertion that cannot fail.
 `--only=members`. (b) Read the members summary for `membersTableNoHorizontalScrollAt390`,
 `membersLayoutAt390`, `drawerFitsAt390` and `policyRouteNoHorizontalScrollAt390` — REQ-064 criterion 18
 closes on those four. (c) REQ-062 acceptance 15's render half.
+
+## 2026-09-30 · tick 39 · wave 2 · the QA slot's own invariant, and why two criteria are still unticked
+
+**No acceptance box is ticked by this tick, and no slice is claimed.** Both open criteria in this
+wave — REQ-063's criterion 17 and REQ-064's criterion 18 — are browser measurements, and the
+measurement is queued. What this tick produced is the fix for the mechanism that decides whether
+*any* writer on this box can run a pass at all, plus a look at why the queue had backed up.
+
+**The defect.** `qa-slot.sh` decided a place was busy by asking whether its **holder** was alive. The
+holder is a `sleep 30` loop, and the only process that ever kills it is the `EXIT` trap of the
+`run.sh` that took the place. A pass killed with `SIGKILL` — or one whose process group is taken down
+— never runs that trap, so the holder outlives the pass that owns the place. The reaper then reads a
+live pid, concludes the place is in use, and leaves it. The queue is blocked until a human walks over
+and kills a stranger's holder by hand.
+
+That is the 75-minute hostage the script's own header comment records, and it was reachable on
+*every* interrupted pass rather than only on a crash. The state was not hypothetical: **38 orphaned
+`qa-slot.sh` waiters** had accumulated box-wide, **14 of them in this worktree** — passes that no
+longer existed, still looping, each one a future immortal place. A place now records the pid of the
+pass that took it and the reaper reclaims a place whose owner is gone, killing its holder on the way
+out so nothing is left holding a place nobody owns.
+
+**Two of my own mistakes, caught by the gates this tick added.**
+
+1. The owner line made the holder file two lines, and the reader was not ready for it: `awk
+   '{print $NF}'` prints the last field of *every* line, so `owner 123\n456` read back as two pids,
+   `kill -0` could not parse it, and a place was judged holderless **while its owner was running** —
+   a live place stolen, which is the deadlock the original comment describes. The file warned about
+   exactly this; my change is what made it true. Read the last line before the last field.
+2. The first draft of the new test case **passed against the old script**, because its planted holder
+   was a `sleep &` of the test's own shell and was already a corpse when the reaper read it, so the
+   old code reclaimed the place for the wrong reason. A case that passes for the wrong reason is
+   indistinguishable from one that passes for the right one. The assertion on *which* reason fired is
+   what exposed it, and the fixture holder is now a `setsid sleep` that genuinely outlives the test.
+   The negative control — a **live** owner is never reclaimed — is what caught mistake 1.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `test-qa-slot.sh` (7 cases) | **21 passed, 0 failed**, exit 0 |
+| the same suite against `HEAD`'s `qa-slot.sh` (`git stash`) | **exit 1**, 3 failures — case 6 wrong reason, case 7 both assertions |
+| `bash -n` on `qa-slot.sh`, `test-qa-slot.sh`, `run.sh` | **exit 0** each |
+| `cargo test -p omnion-content --lib` | **252 passed, 0 failed** |
+| `apps/admin` `tsc --noEmit` | **exit 0** |
+| `node --check scripts/qa/walkthrough.cjs` | **exit 0** |
+| `node scripts/qa/check-tdz.cjs scripts/qa/walkthrough.cjs` | **clean**, 1906 bodies, 6 baselined |
+
+**Next.** (a) The queued `--only=block-editor,members` pass answers REQ-063 criterion 17
+(`canvasDrawnAt390`, `canvasCountMatchesStatus`) and REQ-064 criterion 18 (the four 390 px member
+keys); both are launched with `QA_OUT_ROOT` on tmpfs because `/mnt/apopic` was at 89% with six
+sibling writers, and a pass whose artifacts live there can be deleted out from under itself. (b) On
+green, tick both boxes **in the same tick that reads the summary** — the reason neither is ticked
+now is that the fix landed after the last measurement, and repeating that is what kept 17 open for
+three ticks. (c) REQ-062 acceptance 15's render half.
