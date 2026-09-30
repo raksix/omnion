@@ -23,6 +23,10 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 omnion-audit = { path = "../audit" }
+# The `ai.prompt` host action calls a model through the same router the console uses, so the
+# rule's prompt is resolved and billed by the AI Hub rather than by a second client here:
+# two clients would be two answers to "which provider serves this model".
+omnion-ai-hub = { path = "../ai-hub" }
 omnion-content = { path = "../content" }
 omnion-events = { path = "../events" }
 # A rule's host actions resolve the run-as account's *effective* permissions at run time

@@ -76,6 +76,10 @@ pub const HOST_ACTIONS: &[ActionDef] = &[
         key: "run_workflow",
         description: "Starts another rule's run as part of this one.",
     },
+    ActionDef {
+        key: "ai.prompt",
+        description: "Sends one prompt template to a model and puts its answer in the step output.",
+    },
 ];
 
 /// Methods an outbound call may use.
@@ -84,6 +88,15 @@ pub const HOST_ACTIONS: &[ActionDef] = &[
 /// the automation layer re-checks it against its own settings table at call time, because
 /// the two answer different questions (is this a method at all / may this host be reached).
 pub const OUTBOUND_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"];
+
+/// Largest output budget one `ai.prompt` step may ask for.
+///
+/// A platform ceiling rather than a per-organization setting, for the same reason
+/// `MAX_ANSWER_BYTES` is: a step that runs on a schedule multiplies every call, so an
+/// unbounded budget is an unbounded bill. Ten thousand tokens answers the "summarise this,
+/// rewrite that" prompts the action exists for, and a workflow that needs more is a
+/// workflow that should be split into steps.
+pub const MAX_AI_STEP_TOKENS: i64 = 10_000;
 
 /// Every action key, in catalogue order (synthetic first, then host actions).
 #[must_use]
@@ -178,6 +191,42 @@ pub fn validate_params(action: &str, params: &Value) -> Result<()> {
             require_text(params, "run_workflow", "workflow_id")?;
             Ok(())
         }
+        // A template, a model key and a token budget. The budget is bounded **here** rather
+        // than at call time because a definition is validated without a provider present: a
+        // rule that asks for a million tokens per step is refused when it is written, not
+        // when the event arrives. The ceiling is the platform's, not the author's, because a
+        // step that can spend an unbounded amount is a step nobody can safely put on a
+        // schedule.
+        "ai.prompt" => {
+            require_text(params, "ai.prompt", "prompt")?;
+            if let Some(model) = params.get("model") {
+                if !model.is_string() {
+                    return Err(WorkflowError::invalid(
+                        "invalid_step_params",
+                        "the `model` of an ai.prompt step is a model key as text, not a value \
+                         of another type",
+                    ));
+                }
+            }
+            if let Some(max_tokens) = params.get("max_tokens") {
+                let max_tokens = max_tokens.as_i64().ok_or_else(|| {
+                    WorkflowError::invalid(
+                        "invalid_step_params",
+                        "the `max_tokens` of an ai.prompt step is an integer",
+                    )
+                })?;
+                if max_tokens < 1 || max_tokens > MAX_AI_STEP_TOKENS {
+                    return Err(WorkflowError::invalid(
+                        "invalid_step_params",
+                        format!(
+                            "the `max_tokens` of an ai.prompt step is between 1 and \
+                             {MAX_AI_STEP_TOKENS}, got {max_tokens}"
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        }
         other => Err(WorkflowError::invalid(
             "invalid_step_action",
             format!("`{other}` is not a built-in action"),
@@ -258,7 +307,8 @@ mod tests {
                 "comment_revision",
                 "http_request",
                 "publish_page",
-                "run_workflow"
+                "run_workflow",
+                "ai.prompt"
             ]
         );
         for action in ACTIONS.iter().chain(HOST_ACTIONS.iter()) {
@@ -377,6 +427,56 @@ mod tests {
             .is_ok()
         );
         assert!(validate_params("run_workflow", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn the_ai_step_is_a_host_action_with_a_bounded_budget() {
+        // It is a HOST action, not a synthetic one, for the same reason `send_email` is: it
+        // leaves the process. The engine must refuse to run it itself rather than answering
+        // with a stub, because a stub that "succeeds" would let a rule be armed that can never
+        // do what its canvas says it does.
+        assert!(is_action("ai.prompt"));
+        assert!(is_host_action("ai.prompt"), "the provider lives outside the engine");
+        assert!(!ACTIONS.iter().any(|a| a.key == "ai.prompt"), "and never in the synthetic set");
+        let refusal = run("ai.prompt", &serde_json::json!({ "prompt": "hi" }), 1)
+            .expect_err("the engine must not run a host action itself");
+        assert!(refusal.contains("action handler"), "{refusal}");
+
+        // A prompt is required; a template in it is the normal case.
+        assert!(validate_params("ai.prompt", &serde_json::json!({ "prompt": "Summarise {{event.body}}" })).is_ok());
+        assert!(validate_params("ai.prompt", &serde_json::json!({})).is_err());
+        assert!(validate_params("ai.prompt", &serde_json::json!({ "prompt": "  " })).is_err());
+
+        // `model` and `max_tokens` are optional, but a present one must be the right TYPE.
+        // A `model` of `42` would otherwise reach the router as a string and produce a
+        // "model not found" message about a model nobody typed.
+        assert!(validate_params("ai.prompt", &serde_json::json!({ "prompt": "p", "model": "gpt-4o-mini" })).is_ok());
+        assert!(validate_params("ai.prompt", &serde_json::json!({ "prompt": "p", "model": 42 })).is_err());
+
+        // The budget is bounded at VALIDATION time, so a rule that would spend a million
+        // tokens per run is refused when it is written, not when its trigger fires. The
+        // boundaries are asserted on both sides because "at most" is where an off-by-one
+        // hides: a ceiling of 10_000 must accept 10_000 and refuse 10_001.
+        for (tokens, ok) in [
+            (1, true),
+            (MAX_AI_STEP_TOKENS, true),
+            (MAX_AI_STEP_TOKENS + 1, false),
+            (0, false),
+            (-5, false),
+        ] {
+            let error = validate_params(
+                "ai.prompt",
+                &serde_json::json!({ "prompt": "p", "max_tokens": tokens }),
+            );
+            assert_eq!(error.is_ok(), ok, "max_tokens {tokens}: {error:?}");
+        }
+        // A non-integer budget is refused rather than rounded — 1000.5 tokens is a mistake,
+        // and silently flooring it would let an author believe they asked for more.
+        assert!(validate_params(
+            "ai.prompt",
+            &serde_json::json!({ "prompt": "p", "max_tokens": 1000.5 })
+        )
+        .is_err());
     }
 
     #[test]

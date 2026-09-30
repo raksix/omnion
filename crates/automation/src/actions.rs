@@ -1,5 +1,5 @@
 //! The host actions this layer implements: `send_email`, `comment_revision`,
-//! `http_request`, `publish_page` and `run_workflow`.
+//! `http_request`, `publish_page`, `run_workflow` and `ai.prompt`.
 //!
 //! The engine runs the synthetic actions itself and hands host actions over
 //! (`omnion_workflows::Handler`), because they touch the world. This is that other side:
@@ -9,7 +9,8 @@
 //! * `http_request` — one signed outbound call, bounded by the host allow-list
 //!   ([`crate::outbound`]);
 //! * `publish_page` — one publication, bounded by the run's organization;
-//! * `run_workflow` — one chained rule's run, bounded by the chain depth.
+//! * `run_workflow` — one chained rule's run, bounded by the chain depth;
+//! * `ai.prompt` — one prompt to a model, resolved through the AI Hub router.
 //!
 //! A failure is a *message*, not an error type: the engine decides whether it means another
 //! attempt (the retry policy) or a failed run, and the message is what an operator reads in the
@@ -28,6 +29,19 @@ use omnion_workflows::{ActionContext, ActionFuture, ActionHandler};
 use crate::authority;
 use crate::mail::{self, Email, MailSettings};
 use crate::outbound::{self, HttpSettings};
+
+/// Output budget an `ai.prompt` step uses when its definition does not name one.
+///
+/// Deliberately smaller than the registry's `MAX_AI_STEP_TOKENS`: a ceiling is what a
+/// definition may ask for, and a default is what one normally gets. A step that says nothing
+/// about its budget is a step whose author did not think about tokens, and the smaller number
+/// is the one that is safe to spend by surprise. The limit is a platform fact, so it is read
+/// from the engine's own constant rather than repeated here — two numbers that could differ
+/// would mean a step silently running with a budget its definition was refused for.
+const DEFAULT_AI_STEP_TOKENS: u32 = 1_000;
+
+/// The largest budget a step may ask for, as the wire type.
+const MAX_AI_STEP_TOKENS_U32: u32 = omnion_workflows::actions::MAX_AI_STEP_TOKENS as u32;
 
 /// The engine's host actions, bound to one process's database and mail server.
 #[derive(Debug, Clone)]
@@ -92,6 +106,7 @@ impl ActionHandler for AutomationActions {
                 "http_request" => self.http_request(params, context).await,
                 "publish_page" => self.publish_page(params, context).await,
                 "run_workflow" => self.run_workflow(params, context).await,
+                "ai.prompt" => self.ai_prompt(params).await,
                 other => Err(format!(
                     "`{other}` is not a host action of the automation layer"
                 )),
@@ -202,6 +217,71 @@ impl AutomationActions {
             depth,
         )
         .await
+    }
+
+    /// Send one prompt template to a model and put the answer in the step output.
+    ///
+    /// The model is resolved through the **AI Hub router** rather than a client of its own,
+    /// so a rule's prompt is answered by the same provider, the same default and the same
+    /// credential handling as the console's — two clients would be two answers to "which
+    /// model serves this".
+    ///
+    /// The step output carries the answer under `text`, so a later step reads it as
+    /// `{{steps.N.output.text}}` — the same shape every other action produces, which is what
+    /// makes an AI step a normal step rather than a special case in the engine. The model
+    /// key is echoed back because "which model answered this" is the first question an
+    /// operator asks of a rule whose behaviour changed.
+    async fn ai_prompt(&self, params: &Value) -> Result<Value, String> {
+        let prompt = text(params, "prompt")?;
+        let model = params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let max_tokens = params
+            .get("max_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::from(DEFAULT_AI_STEP_TOKENS));
+        // Clamped to the engine's ceiling, not merely converted: the registry refused a
+        // definition above it when the rule was written, so reaching this point with a bigger
+        // number means the definition was stored before the rule existed — and a step must
+        // never spend more than the platform says a step may spend.
+        let max_tokens = max_tokens.clamp(1, i64::from(MAX_AI_STEP_TOKENS_U32));
+
+        let resolved = omnion_ai_hub::resolve(&self.pool, model)
+            .await
+            .map_err(|err| format!("no model could serve this step: {err}"))?;
+
+        let outcome = omnion_ai_hub::chat(
+            &omnion_ai_hub::ProviderTarget::from_provider(&resolved.provider),
+            &omnion_ai_hub::ChatRequest {
+                // The wire key, not the `provider/model` pair: the pair is the router's
+                // vocabulary and the provider only knows its own key.
+                model: resolved.model.model_key.clone(),
+                messages: vec![omnion_ai_hub::ChatMessage {
+                    role: omnion_ai_hub::ChatRole::User,
+                    content: prompt.clone(),
+                }],
+                // No temperature, like every other schema-shaped call: a step that returns
+                // prose does not need it to vary.
+                temperature: None,
+                // The engine already refused a budget above its ceiling at validation time,
+                // so this clamp is the second belt and not the first.
+                max_tokens: Some(u32::try_from(max_tokens).unwrap_or(DEFAULT_AI_STEP_TOKENS)),
+            },
+        )
+        .await
+        .map_err(|err| format!("the model did not answer this step: {err}"))?;
+
+        if outcome.content.trim().is_empty() {
+            return Err("the model answered with nothing, so the step produced no text".to_owned());
+        }
+
+        Ok(json!({
+            "action": "ai.prompt",
+            "text": outcome.content,
+            "model": resolved.id(),
+        }))
     }
 
     /// Check this step's action against the rule's authority.
@@ -452,5 +532,33 @@ mod tests {
             !message.starts_with(crate::authority::PERMISSION_REVOKED_EVENT),
             "an unknown action is not a permission problem: {message}"
         );
+    }
+
+    #[test]
+    fn the_ai_step_spends_tokens_and_so_rides_its_own_permission() {
+        // The load-bearing decision of the slice: a rule that prompts a model on a schedule
+        // costs money on every firing, so it must NOT inherit `workflows.run`. A role that may
+        // start rules but may not chat cannot arm one.
+        assert_eq!(crate::authority::permission_for("ai.prompt"), Some("ai.chat"));
+        assert_ne!(
+            crate::authority::permission_for("ai.prompt"),
+            crate::authority::permission_for("send_email"),
+            "an AI step and an email step spend different things, so they need different keys"
+        );
+    }
+
+    #[test]
+    fn the_ai_budget_is_read_from_the_engine_rather_than_repeated_here() {
+        // The comment on both constants claims they cannot drift. This is the claim: the
+        // ceiling this layer clamps to IS the ceiling the registry refuses a definition over,
+        // so a step can never spend more than the engine said it may.
+        assert_eq!(
+            i64::from(MAX_AI_STEP_TOKENS_U32),
+            omnion_workflows::actions::MAX_AI_STEP_TOKENS
+        );
+        // And the default is strictly inside the ceiling — a default above its own maximum
+        // would be a step that spends the maximum by accident.
+        assert!(DEFAULT_AI_STEP_TOKENS > 0);
+        assert!(DEFAULT_AI_STEP_TOKENS < MAX_AI_STEP_TOKENS_U32);
     }
 }

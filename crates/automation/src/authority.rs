@@ -60,6 +60,13 @@ pub fn permission_for(action: &str) -> Option<&'static str> {
         // Everything that leaves the process on the rule's own account is a `workflows.run`:
         // the person who may start a rule may have it send, call and chain.
         "send_email" | "http_request" | "run_workflow" => Some("workflows.run"),
+        // Spending tokens is not a privilege `workflows.run` should imply. A rule that
+        // prompts a model on a schedule costs money on every firing, so it rides `ai.chat`
+        // — the same key the console's generate button is behind — and a role that may run
+        // rules but may not chat cannot arm one. A new permission key would be a key no
+        // existing role carries, which silently means "nobody" until an admin visits the
+        // catalogue, so the existing one is the right one here.
+        "ai.prompt" => Some("ai.chat"),
         // The synthetic actions touch nothing outside the run, so they need no account: the
         // engine is the whole authority there.
         _ => None,
@@ -76,6 +83,7 @@ pub const ACTION_PERMISSIONS: &[(&str, &str)] = &[
     ("send_email", "workflows.run"),
     ("http_request", "workflows.run"),
     ("run_workflow", "workflows.run"),
+    ("ai.prompt", "ai.chat"),
 ];
 
 /// The account a rule's host actions run with.
