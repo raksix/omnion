@@ -9740,3 +9740,62 @@ them.
 `workflow_schedules` filter kinds still have no table on this branch and stay named rather than
 ticked. Next: keep the browser pass running for the dialog and 390px boxes, and take REQ-117's one
 missing screen (the REQ-064 form-editor `Lead delivery` card) once w2's forms module is on `main`.
+
+## Tick 46 — a dead endpoint that had a live gate pointing at it
+
+**What.** REQ-117's `GET /api/v1/crm/leads/flow` was registered with a `crm.leads.read` guard,
+given a client function `fetchLeadFlow`, a `FlowAvailability` type, and a
+`FlowAvailability::to_module` whose own doc said it existed *"for the pure step plan"* — and
+**nothing called any of them.** The stepper renders `detail.steps`, which
+`GET /api/v1/crm/leads/{id}` already returns **computed**, each `Blocked` step naming the module
+that would unblock it. This is the fourteenth instance of this branch's signature defect and the
+first whose dead thing was a whole *alternative design* rather than a missing link: the endpoint
+was not waiting to be wired, it was superseded by the time it was written.
+
+The duplication ran **two-way**, which is the part worth keeping: `get_lead` hand-built a *second*
+`Availability` from the same two `table_exists` lookups, so a step could read `Blocked` for a
+module the other copy considered installed. Both are now one `module_availability`.
+
+**Proof.** `scripts/qa/crm-stepper-truth.py` **16/16**, and **PROVEN TO FAIL twice** —
+re-registering the route fails 2 (naming the defect); re-introducing the duplicated `Availability`
+at the old call site fails **4/16**, the twelve survivors being exactly the assertions that never
+touch availability. `cargo build -p omnion-api` clean (10 pre-existing warnings, all in other
+waves' files), admin `tsc --noEmit` exit 0, `node --check scripts/qa/walkthrough.cjs` parses.
+
+**Why it survived, and the lesson.** The walkthrough carried `stepperAgreesWithFlow`, which DID
+fetch the dead endpoint — and then read only `flow.crm`, which is `true` wherever `crm_contacts`
+exists, so the branch it was written for (the CRM being absent) was vacuous by construction, and a
+404 answered `null` which it also read as "CRM absent". **A probe that answers `null` for a broken
+endpoint makes the assertion consuming it vacuously true** — that is how a dead endpoint had a
+green, actively-firing gate aimed at it. Replaced with `blockedStepsNameTheirModule`, which
+**returns false when it sees no blocked step at all**, because an assertion satisfiable by an empty
+page is not an assertion.
+
+**The gate's own first run was wrong twice, in the same direction.** `strip_comments` ran
+`re.sub(r'/\*.*?\*/', re.S)` over a file whose `/*` count exceeded its `*/` count and deleted
+**100 KB of a 102 KB file**, failing all four positive checks on code I had already fixed; and
+`Availability\s*\{` matched the function's own return *type*, reporting a second construction that
+does not exist. Both are this branch's recurring shape: **a check that fails for a reason the defect
+does not cause trains the reader to ignore it.** Fixed by verifying the substitution (more than a
+third of the file removed = it ran away, keep the original) and counting *constructions* behind a
+lookahead rather than signatures.
+
+**Merge.** origin/main was 10 ahead. Three files conflicted and all three were two writers
+appending to the same list; resolved as unions and then *proved* rather than eyeballed — every
+non-marker line of both parents survives, and both parents' route and mobile-route name sets are
+subsets of the merged sets. The lucide import union is 31 names with **zero unused**, which is the
+one merge where taking both sides blindly is right and the unused check is what proves it.
+
+**Not claimed — the browser pass, again.** The pass ran and died at `"fatal": "could not sign in"`
+after five screenshots: `pm2 restart` reused an API started without `OMNION_CSRF_SECRET`, so the
+setup wizard's writes were refused and no owner existed. Not a product defect, and **not fixed
+here** — the binary was also stale against migration `0188` (sqlx embeds migrations at compile
+time, so a pass started before the next build replays the old SQL), and the honest order is: drop
+the stack, rebuild, start *with* the secret. Load 81 across ten writers made a mid-tick rebuild the
+wrong trade. `target/debug/omnion-api` is current now, so the next pass starts from the right SQL.
+The CRM screens therefore remain un-observed and no line here claims otherwise.
+
+**Next.** REQ-117 still waits on REQ-064's forms module (absent from every branch) and REQ-118's
+catalogue on REQ-008 (`commerce_products` in zero migrations across all nine worktrees). The
+dead-caller detector that found this, re-run across the CRM and workflows surfaces now that its
+two false-positive bugs are fixed, is the cheapest next defect-hunt on this branch.
