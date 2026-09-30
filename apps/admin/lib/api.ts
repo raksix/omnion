@@ -6756,3 +6756,220 @@ export function releaseIdempotencyKey(
     { method: "DELETE", body: JSON.stringify({ reason }) },
   );
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 — retry policies, the attempt ledger and the outbound breakers (slice 3)
+// ---------------------------------------------------------------------------------------------
+//
+// Every function here talks to `/api/v1/reliability/retry-*` and `/api/v1/reliability/breakers`.
+//
+// Two shapes in this file are NOT interchangeable and the screens must not blur them:
+//
+// - `delay_preview` is the policy's **ceiling** curve (the server computed it with draw = 1.0).
+//   With `full` jitter the real delay is a random point at or below it. Rendering it as "the
+//   schedule" would promise timings the platform does not keep, so the screens label it as the
+//   worst case.
+// - `stored: false` means the subsystem has no row and the shipped in-process default is in
+//   force. It is NOT an unconfigured subsystem, and treating it as one is how an operator
+//   deletes a policy that was never written.
+
+export interface ReliabilityRetryPolicy {
+  subsystem: string;
+  /** `null` for the subsystem default; a provider's name for an override. */
+  provider_override: string | null;
+  max_attempts: number;
+  base_delay_ms: number;
+  factor: number;
+  jitter: string;
+  max_elapse_ms: number;
+  retry_on: string[];
+  enabled: boolean;
+  /** Whether a row exists, as opposed to the shipped default being in force. */
+  stored: boolean;
+  /** The ceiling curve for attempts 1-8. A real delay is at or below this, never above. */
+  delay_preview: number[];
+  /** The cumulative preview runs past the policy's own elapsed budget. */
+  exceeds_budget: boolean;
+}
+
+export interface ReliabilityRetryPolicies {
+  policies: ReliabilityRetryPolicy[];
+  subsystems: string[];
+  jitter_modes: string[];
+}
+
+export interface ReliabilityRetryPolicyInput {
+  provider_override?: string | null;
+  max_attempts: number;
+  base_delay_ms: number;
+  factor: number;
+  jitter: string;
+  max_elapse_ms: number;
+  retry_on?: string[];
+  enabled?: boolean;
+}
+
+/** One attempt row of the ledger. `next_attempt_at` is what a restarted worker reads. */
+export interface ReliabilityAttempt {
+  id: number;
+  subsystem: string;
+  subject_kind: string;
+  subject_id: string | null;
+  attempt: number;
+  scheduled_at: string | null;
+  executed_at: string | null;
+  outcome: string;
+  error_class: string | null;
+  next_delay_ms: number | null;
+  dead_letter: boolean;
+  next_attempt_at: string | null;
+  created_at: string;
+}
+
+export interface ReliabilityAttempts {
+  attempts: ReliabilityAttempt[];
+  dead_letters: ReliabilityAttempt[];
+  /** How many sequences are owed an attempt right now — the scheduler's own predicate. */
+  due_now: number;
+  /** Named so the counter can be traced to the worklist that spends it. */
+  scheduler: string;
+  subsystems: string[];
+}
+
+export interface ReliabilityBreaker {
+  key: string;
+  name: string;
+  state: string;
+  forced_open: boolean;
+  failure_threshold: number;
+  window_seconds: number;
+  cooldown_seconds: number;
+  half_open_probes: number;
+  success_threshold: number;
+  failures_in_window: number;
+  successes_in_half_open: number;
+  trips_total: number;
+  opened_at: string | null;
+  state_changed_at: string;
+  /** Seconds until a probe is allowed; `null` while held open deliberately. */
+  retry_after: number | null;
+}
+
+export interface ReliabilityBreakerEvent {
+  id: number;
+  key: string;
+  from_state: string;
+  to_state: string;
+  reason: string | null;
+  failure_rate: number | null;
+  created_at: string;
+}
+
+export interface ReliabilityBreakers {
+  breakers: ReliabilityBreaker[];
+  state_counts: [string, number][];
+  states: string[];
+  recent_events: ReliabilityBreakerEvent[];
+}
+
+export function fetchReliabilityRetryPolicies(): Promise<ReliabilityRetryPolicies> {
+  return request<ReliabilityRetryPolicies>("/api/v1/reliability/retry-policies", {
+    cache: "no-store",
+  });
+}
+
+/**
+ * Save a subsystem policy or one provider's override.
+ *
+ * `PUT` on `(subsystem, provider_override)`, which is the table's uniqueness constraint — so this
+ * creates on the first call and replaces on the second, and a double-click cannot produce two
+ * competing rows.
+ */
+export function saveReliabilityRetryPolicy(
+  subsystem: string,
+  input: ReliabilityRetryPolicyInput,
+): Promise<ReliabilityRetryPolicy> {
+  return request<ReliabilityRetryPolicy>(
+    `/api/v1/reliability/retry-policies/${encodeURIComponent(subsystem)}`,
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+export function fetchReliabilityAttempts(limit = 50): Promise<ReliabilityAttempts> {
+  return request<ReliabilityAttempts>(
+    `/api/v1/reliability/retry-attempts?limit=${encodeURIComponent(String(limit))}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Requeue one dead letter.
+ *
+ * The API **appends** an attempt rather than clearing the flag, so the failure stays in the
+ * timeline an operator reads afterwards. The screens must not claim the row is "fixed" — it is
+ * requeued, and the original failure is still there by design.
+ */
+export function retryNow(id: number): Promise<ReliabilityAttempt> {
+  return request<ReliabilityAttempt>(
+    `/api/v1/reliability/retry-attempts/${encodeURIComponent(String(id))}/retry-now`,
+    { method: "POST" },
+  );
+}
+
+export function fetchReliabilityBreakers(): Promise<ReliabilityBreakers> {
+  return request<ReliabilityBreakers>("/api/v1/reliability/breakers", { cache: "no-store" });
+}
+
+/**
+ * Retune a breaker's thresholds.
+ *
+ * Every field is optional: the form sends what the operator changed, and a `PATCH` that sent
+ * the whole row would overwrite a threshold somebody else moved while the form was open.
+ */
+export function updateReliabilityBreaker(
+  key: string,
+  input: Partial<
+    Pick<
+      ReliabilityBreaker,
+      | "name"
+      | "failure_threshold"
+      | "window_seconds"
+      | "cooldown_seconds"
+      | "half_open_probes"
+      | "success_threshold"
+    >
+  >,
+): Promise<ReliabilityBreaker> {
+  return request<ReliabilityBreaker>(
+    `/api/v1/reliability/breakers/${encodeURIComponent(key)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Close a breaker by hand. The reason is required by the API and asked for in the dialog.
+ *
+ * A reset clears `forced_open` as well as `state` — the two are separate columns, and a breaker
+ * that renders `closed` while the flag is set would refuse every call while looking healthy.
+ */
+export function resetReliabilityBreaker(
+  key: string,
+  reason: string,
+): Promise<ReliabilityBreaker> {
+  return request<ReliabilityBreaker>(
+    `/api/v1/reliability/breakers/${encodeURIComponent(key)}/reset`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/** Drain a provider until somebody says otherwise: the flag outranks the cooldown. */
+export function forceOpenReliabilityBreaker(
+  key: string,
+  reason: string,
+): Promise<ReliabilityBreaker> {
+  return request<ReliabilityBreaker>(
+    `/api/v1/reliability/breakers/${encodeURIComponent(key)}/force-open`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
