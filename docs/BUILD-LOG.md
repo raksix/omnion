@@ -6034,3 +6034,66 @@ the box ran out.
 the first thing its log should show is the builder depth pass rather than sixty static routes.
 If the box is still at 0 free, the honest answer is that the queue is ahead of the RAM, and
 the ledger now says so where the next tick will read it.
+
+**A HELP LIST IS THE ONE PIECE OF UI WHOSE VALUE IS *EXACTLY* AS FRESH AS ITS LAST EDIT, AND
+LAST TICK'S GUARD COVERED ONLY ONE DIRECTION.** Tick 28 built the catalogue and a test that
+walks the handler asking "does every key the canvas binds have a row?" — which a row for a key
+**nothing implements** passes. So the list said `Tab` → "Walk to the next card", this REQ's own
+script said `Tab` walks the selection onto a connection's target, and `onCanvasKeyDown` bound
+no `Tab` case at all. Every card is `tabIndex={-1}` (the canvas owns its focus ring, correctly),
+so the browser moved focus out to the next toolbar control and the selection never moved.
+`selection.ts` had exported `focusOrder` with a unit test on its shape for two ticks: **the
+walking order was written, tested and never called.**
+
+**THE NEW GUARD FAILED THREE TIMES, AND EVERY FAILURE WAS THE *INSTRUMENT* BEING BLIND.**
+That is the shape of the finding, not a footnote to it. A key can be bound **literally**
+(`event.key === "Delete"`), **delegated** to a module predicate (`readKey`,
+`shouldWalkCanvas`) or **table-indexed** (`nudge[event.key]` for the arrows — not a comparison
+at all, and a text search cannot see a table lookup). Version 1 read `Enter` as unbound.
+Version 2 read `Arrows` as unbound. Version 3 required the *reachability* and still did not
+have it, which the injection below proves. A module now **declares** what it owns in
+`WALK_KEYS` rather than being named in an exception list, and a delegation counts only while
+the handler still calls it — asserted, so the check cannot become a rubber stamp.
+
+**AN INJECTION CAUGHT THE GUARD LYING ABOUT ITS OWN SUBJECT, WHICH IS THE MOST USEFUL LINE IN
+THIS ENTRY.** Gating the case on a constant false — `if (NEVER_TRUE && shouldWalkCanvas(event))`
+— left the call's *text* in the file, so the first reachability assertion reported **11/11 green
+on a Tab that did nothing**. The very defect the test exists for, reproduced inside the
+instrument. The guard now demands the call be the *condition* of an `if`, and both injections
+(dead branch, full removal) turn it red; the restored file is 11/11. The honest limit is stated
+in the test rather than overclaimed: this stops the binding being *removed*. **Only a browser
+can prove Tab moves a selection, and the pass had not reached the builder when this landed.**
+
+**THE THREE QUESTIONS THE WALK HAS TO ANSWER ARE THREE QUIET WAYS TO BE WRONG.** *Where it
+starts* is the **focus**, not the group: a Shift+clicked group outlines several cards, and
+resuming from the group skips them while resuming from its first member jumps backwards from
+wherever the inspector is showing. *Which way* is **one rotation, not a scan**, and the test
+proves forward and backward are exact inverses at every id — a rotation whose backward half is
+not the inverse of its forward half still looks plausible, and only the wrap point disagrees.
+*Whether the key is ours at all* is the one that keeps the keyboard criterion satisfiable: `I`
+focuses the inspector's first input, so a walk that ate Tab inside a field would make
+"edits a parameter" impossible **while looking like the shortcut was broken**.
+
+**AN EDGE IS WALKABLE, AND THAT IS THIS REQ'S OWN REASON FOR THE WALK.** "Del on a selected
+edge removes it" is satisfiable from a keyboard only if a keyboard can *reach* an edge. The
+`<g>` gains `tabIndex={-1}` (the same deliberate choice the cards make) and an `aria-label`
+naming both ends, and a landed edge is selected the way a click selects it, so `Del` removes
+the line the author is looking at rather than a node the outline does not draw. The first
+version of the handler guessed `data-edge-id`; the real marker is `data-edge`, and a selector
+for a marker nothing emits **fails closed** — the selection would have moved and the focus
+would not, which is the disagreeing pair the comment forbids.
+
+**Proof.** `apps/admin` **183/183** unit (11 new) · `tsc --noEmit` exit 0 ·
+`omnion-workflows --lib` 143 ok · drift guard re-proved by two injections. Commit `e30f96cb`.
+
+**Not ticked, and why.** The pass (`20260929-233341`) is **alive and healthy** this tick — the
+opposite of tick 28, which died at `runPalette` with the box at 0 free. It has cleared 699
+clicks and is at `iam-approvals`, i.e. still in the static-route sweep, so the builder depth
+pass has not run. `Tab` therefore has never been in a browser.
+
+**Next.** Read the pass in this order: `shortcut-help`, then `tab-walk` (the new note), then
+`workflow-table` (`create.status` — expect **201**; the 422 was fixed a day before the note
+explaining it was written), then `validate-classes`, `cmd-s-writes-once`, `two-tab-conflict`,
+`run-from-here`, `step-trace`. The walk's probe must read the **selection** *and* the focus
+ring landing on the same card, reach a connection on a second press, and prove a Tab inside the
+inspector's field leaves the field instead of walking.

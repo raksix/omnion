@@ -1,6 +1,6 @@
 # REQ-004 — Visual Workflow Builder
 
-> **Status:** in-progress (slice 4 · `3ae8e19` (the ⌘/ shortcut list, and a unit test that reads the canvas SOURCE and fails on a chord the list omits — proved by injecting one, because a guard nobody has seen bite is a comment; locked rows say they are refused below 1024px), `a761562` (the probe for the save that answers 200 and carries its findings: read off the response body, since a probe written against the old contract would name a failure that did not happen), `91bcbda` (a rule is built by being incomplete: an unwired graph SAVES, records why it cannot project, leaves the last runnable step list alone, and the RUN is where it refuses — `workflow_not_runnable`; the save's body also stopped filtering warnings away, which had made the panel's warning branch unreachable), `6f3fef2`, `963c4e3` (harness: a SIGKILLed pass held the only QA place for 1h48m — the holder is immortal and the reaper must test the holder, so 17 writers were queued behind a pass dead for over an hour; the holder now watches its owner), `b227846`, `41f5ea3` (harness: four probes never reached the code they measure — table-create payload, edge `id`, and a run-from-here click that always landed on the end node), `9b9cb46` (a list row carries the version a save must quote), `ce8497d` (harness: the suite could not send a CSRF token, so every write test was a 403), `708e352` (harness: the organization step asked for a session a fresh reset does not have); slice 3 · `393687f` (plugin nodes), `b2d7b7a` (keyboard path, narrow-screen lock), `0558ec2`, `98010ed` (criterion 8); `633b620` (criterion 3), `9daeedb`, `26d8dbc`, `7de6e5d` (criterion 2, click half), `8f713fe`, `a021cb4` (criterion 2, pill half), `4b7df30`, `3a7ecc0`, `c355084`, `7bf3641`; slice 1 · `6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`; slice 2 · `c88273a`, `3739414`, `bc48938`, `c31bd75`, `c866c16`, `8611785`, `e14a5e1`, `0823f06`, `3b4cbfd`, `671b43c`, `c864ca1`, `0c9ee98`, `1814758`, `afbb92b`, `c72bcf5`, `314bcda`, `6222873`, `d995669`) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + `crates/workflows`
+> **Status:** in-progress (slice 4 · `e30f96cb` (the Tab walk the list had been advertising for two ticks while no handler existed, and the guard arm that asks whether a row names a real key), `3ae8e19` (the ⌘/ shortcut list, and a unit test that reads the canvas SOURCE and fails on a chord the list omits — proved by injecting one, because a guard nobody has seen bite is a comment; locked rows say they are refused below 1024px), `a761562` (the probe for the save that answers 200 and carries its findings: read off the response body, since a probe written against the old contract would name a failure that did not happen), `91bcbda` (a rule is built by being incomplete: an unwired graph SAVES, records why it cannot project, leaves the last runnable step list alone, and the RUN is where it refuses — `workflow_not_runnable`; the save's body also stopped filtering warnings away, which had made the panel's warning branch unreachable), `6f3fef2`, `963c4e3` (harness: a SIGKILLed pass held the only QA place for 1h48m — the holder is immortal and the reaper must test the holder, so 17 writers were queued behind a pass dead for over an hour; the holder now watches its owner), `b227846`, `41f5ea3` (harness: four probes never reached the code they measure — table-create payload, edge `id`, and a run-from-here click that always landed on the end node), `9b9cb46` (a list row carries the version a save must quote), `ce8497d` (harness: the suite could not send a CSRF token, so every write test was a 403), `708e352` (harness: the organization step asked for a session a fresh reset does not have); slice 3 · `393687f` (plugin nodes), `b2d7b7a` (keyboard path, narrow-screen lock), `0558ec2`, `98010ed` (criterion 8); `633b620` (criterion 3), `9daeedb`, `26d8dbc`, `7de6e5d` (criterion 2, click half), `8f713fe`, `a021cb4` (criterion 2, pill half), `4b7df30`, `3a7ecc0`, `c355084`, `7bf3641`; slice 1 · `6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`; slice 2 · `c88273a`, `3739414`, `bc48938`, `c31bd75`, `c866c16`, `8611785`, `e14a5e1`, `0823f06`, `3b4cbfd`, `671b43c`, `c864ca1`, `0c9ee98`, `1814758`, `afbb92b`, `c72bcf5`, `314bcda`, `6222873`, `d995669`) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + `crates/workflows`
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -281,7 +281,50 @@ the problems panel not covering the last row of the graph.
    `togglesOnTheSameKey` and `marksTheLockedRows`** — the pass is queued behind a live w8
    walkthrough, so a screen built this tick has not been in a browser yet.
 
-   **Still open in this slice:** accessibility assertions, and the sample-plugin *run* (the
+   **Tab walk 2026-09-30** (`e30f96cb`). Built, and the defect was that the list was **lying**.
+   The shortcut row said "Walk to the next card" and this criterion's own script says `Tab`/
+   `ArrowRight` walks the selection onto a connection's target — and `onCanvasKeyDown` bound no
+   `Tab` case at all. Every card is `tabIndex={-1}` (the canvas owns its focus ring, correctly),
+   so the browser moved focus out to the next toolbar control and the selection never moved.
+   `selection.ts` exported `focusOrder` and a unit test asserted its shape: **the walking order
+   was written, tested and never called**, which is why two ticks of shortcut-catalogue work
+   never noticed — the drift guard asks "does every key the handler binds have a row?", and a
+   row for a key *nothing implements* passes it. The guard had no arm for that direction.
+
+   Three questions the walk must answer, each a quiet way to be wrong: **where it starts** (the
+   *focus*, not the group — a Shift+clicked group outlines several cards and resuming from the
+   group skips them), **which way** (one rotation, not a scan; the test proves forward and
+   backward are exact inverses at every id, since a rotation whose backward half is not the
+   inverse of its forward half still looks plausible and only the wrap point disagrees), and
+   **whether the key is ours at all** (a Tab inside a field is the field's — and this is what
+   keeps the criterion satisfiable, because `I` focuses the inspector's first input, so a walk
+   that ate Tab there would make "edits a parameter" impossible while looking like a broken
+   shortcut). An edge is walkable, and that is *this* criterion's reason for it: "Del on a
+   selected edge" is only satisfiable from a keyboard if a keyboard can reach an edge. The `<g>`
+   gains `tabIndex={-1}` and an aria-label naming both ends; a landed edge is selected the way
+   a click selects it, so `Del` removes the line the author is looking at.
+
+   **The new guard is the missing arm, and it failed three times before it was right — every
+   failure being the *instrument* blind rather than the product.** A key can be bound literally
+   (`event.key === "Delete"`), **delegated** to a module predicate (`readKey`,
+   `shouldWalkCanvas`) or **table-indexed** (`nudge[event.key]` for the arrows, which is not a
+   comparison at all and a text search cannot see). The first version read `Enter` as unbound;
+   the second read `Arrows` as unbound. A module now *declares* what it owns in `WALK_KEYS`
+   rather than being added to an exception list, and a delegation counts only while the handler
+   still calls it — asserted, so the check is not a rubber stamp.
+   **The reachability assertion is stricter than it looks, and an injection is why.** Gating
+   the case on a constant false left the call's text in the file and the first assertion
+   passed **11/11 on a Tab that did nothing** — the exact defect reproduced inside the
+   instrument. It now requires the call to be the *condition* of an `if`, and both injections
+   (dead branch, full removal) turn it red. That is the honest limit of a text guard, and it is
+   stated in the test rather than overclaimed: this stops the binding being *removed*; only a
+   browser can prove Tab moves a selection.
+
+   **Not ticked until the pass drives `Tab` on the canvas** and reads the selection and the
+   focus ring landing on the same card, a second press reaching a connection, `⇧Tab` returning,
+   and a Tab inside the inspector's field leaving the field rather than walking.
+
+   **Still open in this slice:** accessibility assertions beyond the walk, and the sample-plugin *run* (the
    palette half and the honest-validation half are built and unticked).
 
 ### Risks / notes
