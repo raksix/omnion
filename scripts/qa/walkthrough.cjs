@@ -6550,16 +6550,94 @@ async function runMembersDepth(page, report) {
   steps.signupRestored =
     qaSql(`select signup_enabled from cms_member_settings where site_id = '${siteId}'`) === "t";
 
-  // ------------------------------------------------------------------ the mobile layout
+  // ------------------------------------------------------------------ the mobile layout, on BOTH routes
+  //
+  // Both halves of this screen, measured on the phone, and neither read off the other.
+  //
+  // The obvious single probe is wrong in a way that cannot fail: the pass sits on
+  // `/members/settings` here, a screen whose whole body is a policy form with no table and no
+  // drawer, so `noHorizontalScrollAt390` was measuring the narrowest layout in the module and
+  // publishing it as the answer for the screen with a seven-column table, a filter row, four
+  // dialogs and a card fallback. The table is `hidden sm:block` with `min-w-[760px]` and the
+  // cards are `sm:hidden`, so the two widths genuinely differ — measuring one tells you nothing
+  // about the other, and the phone is the width the cards exist for.
+  //
+  // The drawer is measured separately, because it is a fixed overlay whose width is set in its
+  // own class: a page can have no horizontal scroll and a drawer that runs off the edge, and
+  // `scrollWidth` on the document cannot see that.
+  const measureOverflow = () =>
+    page
+      .evaluate(() => {
+        const el = document.scrollingElement || document.documentElement;
+        return el.scrollWidth - el.clientWidth;
+      })
+      .catch(() => -1);
+
+  // The TABLE route first, at 390 px: rows, filters and the card fallback all live here.
+  await page.goto(`${URL_ADMIN}/members`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
-  await page.waitForTimeout(1600);
-  const overflow = await page
-    .evaluate(() => {
-      const el = document.scrollingElement || document.documentElement;
-      return el.scrollWidth - el.clientWidth;
-    })
-    .catch(() => -1);
-  steps.noHorizontalScrollAt390 = overflow <= 1;
+  await page.waitForTimeout(2200);
+  // `data-members-state="ready"` is the table route's own readiness marker (the settings route
+  // has a separate `data-members-settings-state`), and it is demanded FIRST because it is the
+  // one that proves a table was measured rather than an error or a loading shell — which also
+  // reports no horizontal scroll.
+  steps.membersTableReadyAt390 =
+    (await page.locator("[data-members-state=\"ready\"]").count()) > 0;
+  // Which layout is on screen is a fact this measurement depends on, so it is read rather than
+  // assumed: a pass that measured an empty page would also report no horizontal scroll.
+  steps.membersLayoutAt390 =
+    (await page.locator("[data-member-cards]").count()) > 0 ? "cards" : "table";
+  const tableOverflow = await measureOverflow();
+  steps.membersTableNoHorizontalScrollAt390 = tableOverflow <= 1;
+  await shot(page, "members-table-390");
+
+  // The DRAWER at 390 px. Its right edge is read against the viewport, because a drawer wider
+  // than the screen does not create document scroll — it just leaves the page unusable.
+  const firstMember = await page
+    .locator("[data-member-card]")
+    .first()
+    .getAttribute("data-member-card")
+    .catch(() => null);
+  if (firstMember) {
+    await page.locator(`[data-member-open="${firstMember}"]`).first().click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    steps.drawerOpenedAt390 = (await page.locator(`[data-member-drawer="${firstMember}"]`).count()) > 0;
+    steps.drawerFitsAt390 = await page
+      .evaluate((id) => {
+        const el = document.querySelector(`[data-member-drawer="${id}"]`);
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        // 1px of slack: a sub-pixel right edge on a fractional device pixel ratio is a rounding
+        // artefact, not an overflow, and refusing it would make this check unpassable on the
+        // very devices it is for.
+        return r.right <= window.innerWidth + 1 && r.left >= -1;
+      }, firstMember)
+      .catch(() => false);
+    await shot(page, "members-drawer-390");
+    await page.locator("[data-member-drawer-close]").first().click({ timeout: 4000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  } else {
+    // Named rather than skipped: an absent step reads as a pass, and "there was nothing to
+    // open" is a different fact from "the drawer fits".
+    steps.drawerOpenedAt390 = false;
+    steps.drawerFitsAt390 = false;
+    steps.reasonNoMemberToOpen =
+      "no member card on the table route at 390px, so the drawer had nothing to open";
+  }
+
+  // The POLICY route at 390 px — the probe that existed all along, kept because it is a
+  // genuinely different layout, and renamed so a reader can tell which screen each number is
+  // about. The retained `noHorizontalScrollAt390` below now carries that narrower truth.
+  await page.goto(`${URL_ADMIN}/members/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const policyOverflow = await measureOverflow();
+  steps.policyRouteNoHorizontalScrollAt390 = policyOverflow <= 1;
+  await shot(page, "members-policy-390");
+
+  steps.noHorizontalScrollAt390 = policyOverflow <= 1;
+  steps.noHorizontalScrollAt390IsAbout =
+    "the policy screen (/members/settings); the member table's answer is membersTableNoHorizontalScrollAt390";
   await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
 
   return steps;
@@ -10232,8 +10310,20 @@ async function main() {
       "settingsRouteHasNoMemberTable", "settingsRouteShowsTheSameBehaviour",
       "settingsRouteSaveIsInSql", "settingsRouteSaveSaidSo", "signupRestored",
       "noHorizontalScrollAt390",
+      // The phone measurement, demanded per screen rather than once for the module. The last
+      // two are the point of this list: an absent key reads as a pass, so a run that died
+      // between the routes would report a green that measured half the screen.
+      "membersTableReadyAt390", "membersLayoutAt390", "membersTableNoHorizontalScrollAt390",
+      "policyRouteNoHorizontalScrollAt390",
     ];
     const memberSteps = report.members || {};
+    // The drawer pair is conditional on there being a member to open, and the absence is
+    // itself recorded (`reasonNoMemberToOpen`). A precondition that cannot be satisfied must
+    // be demanded only when the pass says it could be — otherwise the criterion is
+    // "the members list was empty on a disposable database", which is a scheduling fact.
+    if (memberSteps.reasonNoMemberToOpen === undefined) {
+      required.push("drawerOpenedAt390", "drawerFitsAt390");
+    }
     const missing = required.filter((key) => memberSteps[key] === undefined);
     fs.writeFileSync(
       path.join(OUT, "summary.json"),
@@ -10434,6 +10524,15 @@ async function main() {
     // (a public signup, the confirmation link, the replayed link, the expiry, the unsubscribe,
     // a bounce with a reason, a CSV import that has to name what it skipped, and the archive).
     { path: "/newsletter", name: "newsletter" },
+    // Visitor accounts and the membership policy (REQ-064, slice 4c) — no untested screen.
+    // BOTH routes are listed, for the reason the members depth pass explains: two routes
+    // rendering the SAME component is the design, so walking only `/members` would leave the
+    // one an owner reaches for from a settings menu unmeasured, and walking only the settings
+    // route would never open the table whose drawer, dialogs and card layout are the whole
+    // screen. Acceptance 18 asks for every new screen at 390 px, and a screen absent from this
+    // list is not measured by any pass — it was walked by no pass at all, on any width.
+    { path: "/members", name: "members" },
+    { path: "/members/settings", name: "member-settings" },
     // The theme gallery (REQ-062, slice 1) — walked here so the screen is in the inventory,
     // and driven by `runThemesDepth` below, which activates a theme, reads the badge, restores
     // the previous one and requires the button to disappear when there is nothing to restore.
@@ -10901,7 +11000,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
