@@ -6040,6 +6040,12 @@ async function main() {
     // live in the same request chain, and a walk that visited only one of them would leave the
     // question "which document refused this caller" untested.
     { path: "/settings/reliability/limits", name: "reliability-limits" },
+    // The keyed-write ledger (REQ-127, slice 2) — a separate route from the limits screen
+    // because the two answer different questions ("how much may this caller spend" versus "did
+    // this write run twice"), and a walk that visited only one of them would leave an operator
+    // with no way to tell which screen answers which. Its depth pass below releases a stuck key
+    // and asserts the state column, the empty state and the detail pane.
+    { path: "/settings/reliability/idempotency", name: "reliability-idempotency" },
     // The identity & access screens (REQ-006, slice 2) — no untested screen: the depth pass below
     // creates accounts, attaches scopes, simulates verdicts, and drives a group and a key.
     { path: "/settings/iam", name: "iam-overview" },

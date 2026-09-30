@@ -39,9 +39,16 @@ use uuid::Uuid;
 
 const PASSWORD: &str = "correct horse battery";
 
-/// The endpoint family this suite keys. `POST /api/v1/automations` is the one the middleware is
-/// installed on, and the suffix keeps two accounts' keys apart even though they are already
-/// scoped by subject.
+/// The endpoint family this suite keys — **the route TEMPLATE**, which is what the layer scopes
+/// by and not the raw request path.
+///
+/// The two are different strings and the difference is the defect this walk's first run found:
+/// the layer is installed inside the nested `/api/v1` router, so `uri.path()` there is the
+/// fragment `/automations` while the template is `/api/v1/automations`. A key scoped to the
+/// fragment is a DIFFERENT key from the one the panel lists for the same endpoint — the unique
+/// index sees two rows, the middleware claims one, and a keyed request behaves as if it were
+/// unkeyed while an operator looks at a stuck key nobody can clear. The layer now reads
+/// `MatchedPath` for exactly this reason; this constant is the string it will produce.
 const SCOPE: &str = "POST /api/v1/automations";
 
 /// One in-process response, in the pieces the assertions need.
@@ -342,7 +349,10 @@ async fn a_replayed_key_returns_the_first_response_and_the_handler_runs_once() {
         "a replayed key must not run the handler a second time — this count is the whole feature"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
+        // `replay_count` is `int4` in the migration. `i64` decodes `int8` and sqlx does NOT
+        // widen one into the other: it refuses at RUNTIME with a `ColumnDecode`, which is the
+        // same trap the limits suite records for `count(*)` and in the opposite direction.
+        sqlx::query_scalar::<_, i32>(
             "select replay_count from idempotency_keys where key = $1 and subject_id = $2",
         )
         .bind(&key)
@@ -350,7 +360,7 @@ async fn a_replayed_key_returns_the_first_response_and_the_handler_runs_once() {
         .fetch_one(pool)
         .await
         .expect("the key row exists after the first execution"),
-        1,
+        1_i32,
         "the replay counts itself, or the screen's replay column is a number nobody measures"
     );
 
@@ -462,8 +472,7 @@ async fn a_replay_while_the_first_attempt_runs_is_a_409_with_a_wait() {
     // proved here is the layer's answer to an `in_progress` row, and that row is exactly what a
     // running attempt leaves.
     let now = OffsetDateTime::now_utc();
-    let fingerprint =
-        omnion_reliability::idempotency::fingerprint("POST", "/api/v1/automations", &automation_body(&name).to_string());
+    let fingerprint = fingerprint_for(&name);
     omnion_reliability::idem_store::claim(
         pool,
         SCOPE,

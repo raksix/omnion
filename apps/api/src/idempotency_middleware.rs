@@ -201,7 +201,24 @@ where
         }
 
         let method = parts.method.clone();
-        let path = parts.uri.path().to_owned();
+        // The scope is built from the MATCHED ROUTE TEMPLATE where the router has published one,
+        // and from the raw path only when it has not. A template is what makes the key portable:
+        // the layer runs inside a nested `/api/v1` router, so `uri.path()` is the fragment
+        // `/automations`, and a key scoped to THAT is a different key from the one an operator
+        // reading the panel sees for the same endpoint. The first version did exactly this — the
+        // walk claimed a row under `POST /api/v1/automations`, the layer claimed under
+        // `POST /automations`, the unique index treated them as two keys, and the keyed request
+        // ran as if unkeyed while the panel showed a stuck one nobody could clear.
+        //
+        // When no template is published (the layer is installed on a route the router has not
+        // matched, or by a harness that drives the service directly) the raw path is used, and
+        // the key is still consistent for as long as the caller keeps sending the same path —
+        // which is the property a fallback can honestly promise.
+        let path = parts
+            .extensions
+            .get::<axum::extract::MatchedPath>()
+            .map(|matched| matched.as_str().to_owned())
+            .unwrap_or_else(|| parts.uri.path().to_owned());
         let scope = format!("{} {path}", method.as_str().to_ascii_uppercase());
         let request_id = omnion_telemetry::LogContext::current()
             .request_id
@@ -330,7 +347,7 @@ async fn replay_answer(
             {
                 tracing::warn!(error = %error, "a replay was answered but its counter did not move");
             }
-            serve_stored(existing, status, body.unwrap_or_default(), true)
+            serve_stored(state, existing, status, body.unwrap_or_default(), true).await
         }
         Replay::Conflict => {
             emit_conflict(state, existing, fingerprint).await;
@@ -384,7 +401,42 @@ async fn replay_answer(
 }
 
 /// Rebuild a stored response, with the replay marker and the original request id.
-fn serve_stored(
+///
+/// The original request id is **read back from the stored headers**, not recomputed and not taken
+/// from the record. It is the id of the first execution, the only place it exists, and a replay
+/// that reported its own id would send an operator into the log explorer to a request that wrote
+/// no lines — it answered from the store. The first version of this function had no database
+/// argument and so had nowhere to read the id from, which is why it silently omitted the header;
+/// the walk caught it by comparing the replay's header against the first execution's.
+async fn serve_stored(
+    state: &AppState,
+    existing: &omnion_reliability::idempotency::KeyRecord,
+    status: i16,
+    body: String,
+    replay: bool,
+) -> Response<Body> {
+    let mut response = serve_stored_marked(existing, status, body, replay);
+    let original = stored_original_request_id(
+        state.db().pool(),
+        &existing.scope,
+        &existing.subject_id,
+        &existing.key,
+    )
+    .await;
+    if let Some(id) = original
+        && let Ok(value) = HeaderValue::from_str(&id)
+    {
+        response.headers_mut().insert(ORIGINAL_HEADER, value);
+    }
+    response
+}
+
+/// The part of [`serve_stored`] that touches no database.
+///
+/// Split out so the header map a replay publishes is unit-testable without a platform, and so the
+/// one query the replay path makes is visible as a single named call rather than as a line buried
+/// in a builder chain.
+fn serve_stored_marked(
     existing: &omnion_reliability::idempotency::KeyRecord,
     status: i16,
     body: String,
@@ -412,6 +464,42 @@ fn serve_stored(
         headers.insert(REPLAY_HEADER, HeaderValue::from_static("true"));
     }
     response
+}
+
+/// The original request id, read from the response headers stored with the first execution.
+///
+/// `None` — rather than the replay's own id — is the honest answer for a row written before the
+/// header was stored, and a replay that omitted the header is one a client can detect, while a
+/// replay that carried a WRONG id is one it cannot.
+async fn stored_original_request_id(
+    pool: &sqlx::PgPool,
+    scope: &str,
+    subject_id: &str,
+    key: &str,
+) -> Option<String> {
+    let headers: Option<serde_json::Value> = sqlx::query_scalar(
+        "select response_headers from idempotency_keys \
+          where scope = $1 and subject_id = $2 and key = $3",
+    )
+    .bind(scope)
+    .bind(subject_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // Two levels of absence, named rather than chained: the row may not exist, and the stored
+    // headers may be empty. `.ok().flatten()?` looks like it says both and says only the first —
+    // the `?` on the `Option` that survives it is the one that returns, so what the tail sees is
+    // the row's `Value` and not the column's. One compile error, and the comment is the receipt.
+    let headers = headers?;
+
+    headers
+        .get(IDEMPOTENCY_ORIGINAL_HEADER)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .filter(|id| !id.is_empty())
 }
 
 /// Store the handler's response and answer the caller with it.
@@ -597,7 +685,12 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_reports_itself_and_never_a_cookie() {
+    fn the_replay_marker_and_the_scope_are_the_only_headers_a_replay_adds() {
+        // The header MAP of a replay is a property of this module and needs no database, so it is
+        // unit-tested here; the request id — which is read from a stored row — is proved by the
+        // walk, against a real one. Splitting them like this is the honest division: a test that
+        // needs a platform to check a header name is a test that will be skipped one day and
+        // nobody will read the skip.
         let record = omnion_reliability::idempotency::KeyRecord::new(
             "POST /api/v1/x",
             "user",
@@ -607,11 +700,23 @@ mod tests {
             "hash",
             time::OffsetDateTime::now_utc(),
         );
-        let response = serve_stored(&record, 201, "{}".into(), true);
+        let response = serve_stored_marked(&record, 201, "{}".into(), true);
         assert_eq!(response.headers().get(REPLAY_HEADER), Some(&HeaderValue::from_static("true")));
+        assert_eq!(
+            response.headers().get("idempotency-scope").and_then(|v| v.to_str().ok()),
+            Some("POST /api/v1/x"),
+            "the scope is echoed so a client can tell WHICH key family answered"
+        );
         assert!(response.headers().get("set-cookie").is_none());
-        assert!(response.headers().get(IDEMPOTENCY_ORIGINAL_HEADER).is_none(),
-            "a replay takes the original request id from the STORED headers, not from the record");
+        // A request that has never been keyed stores no headers, and `subset_of` is the only
+        // thing that decides which headers a replay could ever inherit.
+        let empty = subset_of(&HeaderMap::new(), Uuid::new_v4());
+        assert_eq!(
+            empty.keys().collect::<Vec<_>>(),
+            vec![IDEMPOTENCY_ORIGINAL_HEADER],
+            "with no stored headers the ONLY header a replay carries is the original request id, \
+             and a replay that could inherit anything else is inheriting it from the request"
+        );
     }
 
     #[test]

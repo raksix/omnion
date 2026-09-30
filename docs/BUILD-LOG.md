@@ -6438,3 +6438,59 @@ own stale walk binaries (5.7 GB, `debug/deps` only, the API binary kept) took it
 middleware: claim after permission, `Idempotent-Replay: true` on the served response, `409
 idempotency_conflict` on a changed body, `409` + `Retry-After` while in progress, the two events
 (`idempotency.conflict`, `keys.released`), and the screen.
+
+## 2026-09-30 · REQ-127 slice 2 — the keyed write, on the request path and on the panel
+
+**What.** The key store landed last tick with no caller on the HTTP path. This tick writes the
+three halves that make the contract real: `apps/api/src/idempotency_middleware.rs` (claim,
+replay, complete), `apps/api/src/routes/reliability_idempotency.rs` (list, detail, release) and
+`/settings/reliability/idempotency` with its client functions. `POST /api/v1/automations` is the
+first endpoint to opt in, chosen because the request names the case itself — a **job
+submission** — and it is the write a client is most likely to retry.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test reliability_idempotency -- --test-threads=1` → **5 passed**.
+- `cargo test -p omnion-reliability` → 114. `cargo test -p omnion-api --lib` → 270. `apps/admin`
+  `tsc --noEmit` → clean.
+
+**Two defects the walks found, and both were invisible in the code.**
+
+1. **`.layer()` wraps what is already built, so the LAST call is the OUTERMOST.** My first
+   ordering put the keyed layer outside the permission guard. The guard writes the session into
+   the request's extensions and a mutation made deeper never propagates back up, so the keyed
+   layer saw an empty map, declined to claim, and every keyed request behaved as if it were
+   unkeyed — while every status code the walk asserted first (201, 201, 201) was correct. It was
+   caught on a **header** assertion, not on the status: the header is the only thing that can
+   tell a keyed platform from an unkeyed one.
+2. **The key was scoped by `uri.path()`, which inside a nested router is a FRAGMENT.** The
+   layer runs inside `/api/v1`, so it built `POST /automations` while the panel and every
+   operator-facing reading of the same endpoint says `POST /api/v1/automations`. The unique index
+   is on `(scope, subject_id, key)`, so the two are different keys: a replay claimed a fresh row,
+   the panel showed a stuck one nobody could clear, and the store's own concurrency guarantee was
+   intact while doing nothing. The layer now reads `MatchedPath` and falls back to the raw path
+   only where the router has published no template — and says which it used.
+
+**Decisions written down rather than implied.** A response that cannot be replayed (past the
+256 KB inline cap with no object-store reference) is recorded `failed`, not stored: a truncated
+body is a lie, and `failed` is the one state that says "run it again". The stored header subset
+is `location`, `etag` and the original request id; `set-cookie`, `www-authenticate` and every
+`X-RateLimit-*` are excluded **on purpose** — a replayed session cookie is a second authentication
+written by a request that already finished. The panel's detail route returns metadata and never
+the body, because the store must not become a second request archive.
+
+**Not done, and named.** Slice 3 (retries + breakers), slice 4 (the intake guard). The QA
+browser pass — the walkthrough now visits both reliability screens — **has still not run**: the
+single slot has been the main writer's live pass (`/proc/<pid>/cwd -> /mnt/apopic/omnion`) for
+every tick of this session. A screen nobody has opened in a browser is not finished.
+
+**Env.** `/` hit **0 bytes free** mid-tick and cargo died with `couldn't create a temp dir … No
+space left on device` naming a path under `/mnt/apopic` — the filesystem that had 6.6 GB free.
+The reclaim was mine and name-shaped: 1,265 duplicate `rlib`/`rmeta` artifacts in this worktree's
+own `debug/deps`, 3.09 GB, one hash per crate from two builds kept and the stale one dropped.
+/` 100% → 95%. `CARGO_INCREMENTAL=0` for the rest of the tick: a non-incremental rebuild writes
+its own `incremental/` cache anyway, so the flag saves nothing here and costs a full relink.
+
+**Next.** (1) The QA pass on both reliability screens — take the slot when it frees. (2) Slice 3:
+`retry_policies` / `retry_outcomes` store, the scheduler with its persisted next-attempt time, the
+breaker store and state machine on a real outbound call, both screens.
