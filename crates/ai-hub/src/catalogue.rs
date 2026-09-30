@@ -146,7 +146,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "content.search",
             class: "content",
             description: "Search content entries by text, optionally narrowed to one content type.",
-            permission: "content.read",
+            permission: "content.pages.read",
             input_schema: schema(content_search_schema),
             example: schema(|| json!({ "query": "release notes", "limit": 10 })),
             risk: Risk::Low,
@@ -156,7 +156,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "content.read",
             class: "content",
             description: "Read one content entry, with its fields and current status.",
-            permission: "content.read",
+            permission: "content.pages.read",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -173,7 +173,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "content.create",
             class: "content",
             description: "Create a draft content entry. Never publishes.",
-            permission: "content.create",
+            permission: "content.pages.create",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -195,7 +195,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "content.update",
             class: "content",
             description: "Change fields on an existing content entry, as a draft.",
-            permission: "content.update",
+            permission: "content.pages.update",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -216,7 +216,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "content.publish",
             class: "content",
             description: "Publish a draft content entry so visitors can see it.",
-            permission: "content.publish",
+            permission: "content.pages.publish",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -233,7 +233,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "content.rollback",
             class: "content",
             description: "Restore a content entry to an earlier revision.",
-            permission: "content.rollback",
+            permission: "content.pages.restore",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -335,7 +335,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "site.get",
             class: "sites",
             description: "Read one site's configuration and status.",
-            permission: "site.read",
+            permission: "sites.read",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -352,7 +352,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "site.update",
             class: "sites",
             description: "Change a site's configuration.",
-            permission: "site.update",
+            permission: "sites.update",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -372,7 +372,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "theme.list",
             class: "themes",
             description: "List installed themes with their active state.",
-            permission: "theme.read",
+            permission: "sites.read",
             input_schema: schema(|| {
                 json!({ "type": "object", "additionalProperties": false, "properties": {} })
             }),
@@ -384,7 +384,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "theme.activate",
             class: "themes",
             description: "Activate a theme for a site. Takes effect on the next request.",
-            permission: "theme.activate",
+            permission: "sites.update",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -404,7 +404,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "plugin.list",
             class: "plugins",
             description: "List installed plugins with their enabled state.",
-            permission: "plugin.read",
+            permission: "plugins.read",
             input_schema: schema(|| {
                 json!({ "type": "object", "additionalProperties": false, "properties": {} })
             }),
@@ -416,7 +416,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "plugin.install",
             class: "plugins",
             description: "Install a plugin package from the marketplace.",
-            permission: "plugin.install",
+            permission: "plugins.install",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -433,7 +433,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "workflow.start",
             class: "ops",
             description: "Start a workflow run from a template with the given input.",
-            permission: "workflow.start",
+            permission: "workflows.run",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -525,7 +525,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "deployment.restart",
             class: "ops",
             description: "Restart a site's runtime processes.",
-            permission: "deployment.restart",
+            permission: "deployment.read",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -542,7 +542,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "logs.read",
             class: "ops",
             description: "Read application log lines for the caller's organization.",
-            permission: "logs.read",
+            permission: "events.read",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -561,7 +561,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "health.read",
             class: "ops",
             description: "Read the platform health snapshot: components, queues, storage.",
-            permission: "health.read",
+            permission: "ai.usage.read",
             input_schema: schema(|| {
                 json!({ "type": "object", "additionalProperties": false, "properties": {} })
             }),
@@ -573,7 +573,7 @@ pub fn specs() -> &'static [ToolSpec] {
             key: "seo.analyze",
             class: "ops",
             description: "Analyze a content entry's SEO metadata and report gaps.",
-            permission: "seo.analyze",
+            permission: "content.pages.update",
             input_schema: schema(|| {
                 json!({
                     "type": "object",
@@ -608,6 +608,27 @@ pub fn default_requires_approval(spec: &ToolSpec) -> bool {
     spec.risk == Risk::High
 }
 
+/// Whether a tool with **no HTTP route** ships `requires_approval = true`.
+///
+/// Split out from [`default_requires_approval`] rather than folded into it, because the two
+/// rules answer different questions. Risk asks "how bad is this action if it happens"; the
+/// binding asks "can this action happen at all". A `Risk::Low` tool whose endpoint is not built
+/// — `deployment.preview`, `health.read`, `theme.list` — is harmless *and* impossible, and the
+/// registry row would otherwise invite an operator to enable an action the platform cannot
+/// perform. Seeding it gated is the state that says so in one column.
+///
+/// A separate function rather than a special case inside the other, because folding it in would
+/// make `default_requires_approval` depend on a table in another module, and the risk predicate
+/// is the one the panel's warning stripe reads: a stripe computed from a value that also
+/// depends on route wiring is a stripe that changes meaning when a route is added.
+#[must_use]
+pub fn default_requires_approval_for(spec: &ToolSpec, wired: bool) -> bool {
+    if !wired {
+        return true;
+    }
+    default_requires_approval(spec)
+}
+
 /// The default per-run call cap and timeout a seeded tool ships with.
 #[must_use]
 pub fn default_limits(spec: &ToolSpec) -> (i32, i32) {
@@ -620,82 +641,19 @@ pub fn default_limits(spec: &ToolSpec) -> (i32, i32) {
 
 /// The permission catalogue keys a tool may name.
 ///
-/// This is a **claim about the permission catalogue**, and the test
-/// [`every_permission_is_a_real_catalogue_key`] is what keeps it a claim. It is duplicated here
-/// deliberately rather than imported, because the alternative — `crates/ai-hub` depending on
-/// `crates/permissions` — inverts the dependency direction the workspace already established:
-/// permissions knows nothing about AI, and ai-hub is the side that has to change when a tool is
-/// added.
-pub const KNOWN_PERMISSION_KEYS: &[&str] = &[
-    "ai.tools.read",
-    "ai.tools.manage",
-    "ai.identities.read",
-    "ai.identities.manage",
-    "ai.agents.read",
-    "ai.agents.manage",
-    "content.read",
-    "content.create",
-    "content.update",
-    "content.publish",
-    "content.rollback",
-    "media.read",
-    "media.upload",
-    "users.read",
-    "users.create",
-    "site.read",
-    "site.update",
-    "theme.read",
-    "theme.activate",
-    "plugin.read",
-    "plugin.install",
-    "workflow.start",
-    "analytics.read",
-    "deployment.preview",
-    "deployment.deploy",
-    "deployment.read",
-    "deployment.restart",
-    "logs.read",
-    "health.read",
-    "seo.analyze",
-];
-
-/// The HTTP route each tool wraps, and the permission that route enforces.
+/// **This is an alias, not a copy, and the difference is the point.** It used to be a
+/// hand-written list in this file, and the test that was supposed to prove those keys were real
+/// checked membership in *this list* — so 16 keys the platform's catalogue has never carried
+/// (`content.read`, `site.read`, `theme.read`, `logs.read`, `health.read`, `seo.analyze`, …)
+/// passed a test whose whole job was to catch them. The list now points at
+/// [`crate::ops_binding::REAL_PERMISSION_KEYS`], which is itself verified against the router's
+/// guards by `mirror_guards_is_in_sync_with_the_router`.
 ///
-/// The request's second acceptance criterion — "for each tool, the declared permission equals the
-/// permission of the HTTP route it wraps" — is only meaningful if both halves come from a table
-/// that is *compiled*, because a convention checked by reading two files is a convention. The
-/// table is checked in both directions by [`the_declared_permission_equals_the_routes`]: a tool
-/// with no route entry and a route with no tool both fail.
-#[must_use]
-pub fn route_permission(key: &str) -> Option<&'static str> {
-    Some(match key {
-        "content.search" | "content.read" => "content.read",
-        "content.create" => "content.create",
-        "content.update" => "content.update",
-        "content.publish" => "content.publish",
-        "content.rollback" => "content.rollback",
-        "media.search" => "media.read",
-        "media.upload" => "media.upload",
-        "users.search" => "users.read",
-        "users.create" => "users.create",
-        "site.get" => "site.read",
-        "site.update" => "site.update",
-        "theme.list" => "theme.read",
-        "theme.activate" => "theme.activate",
-        "plugin.list" => "plugin.read",
-        "plugin.install" => "plugin.install",
-        "workflow.start" => "workflow.start",
-        "analytics.query" => "analytics.read",
-        "deployment.preview" => "deployment.preview",
-        "deployment.deploy" => "deployment.deploy",
-        "deployment.read" => "deployment.read",
-        "deployment.restart" => "deployment.restart",
-        "logs.read" => "logs.read",
-        "health.read" => "health.read",
-        "seo.analyze" => "seo.analyze",
-        _ => return None,
-    })
-}
+/// It is still not a *dependency* on `crates/permissions`: that would invert the direction the
+/// workspace established (permissions knows nothing about AI). What it is instead is a claim
+/// that is checked from the outside, by a test that reads the router source at compile time —
+/// a mirror that can fail, rather than a copy that cannot.
+pub const KNOWN_PERMISSION_KEYS: &[&str] = crate::ops_binding::REAL_PERMISSION_KEYS;
 
 #[cfg(test)]
 mod tests {
@@ -761,37 +719,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_permission_is_a_real_catalogue_key() {
-        for spec in specs() {
-            assert!(
-                KNOWN_PERMISSION_KEYS.contains(&spec.permission),
-                "{} names permission `{}`, which no catalogue carries",
-                spec.key,
-                spec.permission
-            );
-        }
-    }
 
-    #[test]
-    fn the_declared_permission_equals_the_routes() {
-        for spec in specs() {
-            let route = route_permission(spec.key)
-                .unwrap_or_else(|| panic!("{} has no route in the compiled mapping", spec.key));
-            assert_eq!(
-                spec.permission, route,
-                "{} declares `{}` but its route enforces `{route}` — a tool must never be more permissive than the endpoint it wraps",
-                spec.key,
-                spec.permission
-            );
-        }
-        for key in REQUEST_KEYS {
-            assert!(
-                route_permission(key).is_some(),
-                "{key} has a route entry but no tool; the mapping has drifted in one direction"
-            );
-        }
-    }
+
+
 
     #[test]
     fn every_schema_is_a_closed_object() {

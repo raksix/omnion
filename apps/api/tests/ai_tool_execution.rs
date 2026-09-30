@@ -1323,3 +1323,136 @@ async fn the_pruner_drops_only_rows_past_the_window() {
     );
     store.dispose().await;
 }
+
+// -------------------------------------------------------------------------------------------
+// REQ-100 · acceptance criterion 2 — "for each tool, the declared permission equals the
+// permission of the HTTP route it wraps", and the defect that criterion was hiding.
+// -------------------------------------------------------------------------------------------
+
+/// Every tool the seeder writes must name a permission the **platform** can actually grant.
+///
+/// This is the walk the unit test could not be. Sixteen of the twenty-five tools declared keys
+/// like `content.read`, `site.read`, `theme.read`, `logs.read` and `seo.analyze`, none of which
+/// exist in `crates/permissions`' catalogue. The catalogue test passed anyway, because it
+/// compared the tools against a list written by the same hand in the same file.
+///
+/// The instrument here is the **foreign key**. `role_permissions.permission_key` references
+/// `permissions(key)`, and `permissions` is populated at boot by
+/// `omnion_permissions::seed::ensure` from the same catalogue. So an ungrantable tool is not a
+/// policy nobody wrote — it is a row the database will not accept, which is the real shape of
+/// the defect: an operator opens the permission matrix, sees the tool's permission, and no role
+/// can ever be given it.
+///
+/// Each tool is attempted as its own insert, and the failures are collected and reported by name
+/// rather than asserted one at a time, because a reader wants the list, not the first entry.
+#[tokio::test]
+async fn every_seeded_tool_names_a_permission_the_platform_can_grant() {
+    let Some(store) = PipelineStore::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    // The catalogue must exist before a grant can be attempted, exactly as it does at boot.
+    omnion_permissions::seed::ensure(&store.pool)
+        .await
+        .expect("the permission catalogue must seed");
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("select key, permission from ai_tools where retired_note is null order by key")
+            .fetch_all(&store.pool)
+            .await
+            .expect("the seeded rows must be readable");
+    assert_eq!(
+        rows.len(),
+        omnion_ai_hub::catalogue::specs().len(),
+        "every compiled tool must have a row"
+    );
+
+    let mut ungrantable = Vec::new();
+    for (key, permission) in &rows {
+        // Written the way the IAM policy route writes a grant, so the walk is exercising the
+        // real constraint rather than a query of my own invention.
+        let role_id = Uuid::new_v4();
+        sqlx::query(
+            "insert into roles (id, organization_id, key, name, priority) \
+             values ($1, $2, $3, $4, 100)",
+        )
+        .bind(role_id)
+        .bind(store.organization_id)
+        .bind(format!("role-{}", key.replace('.', "-")))
+        .bind(format!("Role for {key}"))
+        .execute(&store.pool)
+        .await
+        .expect("the role must insert");
+
+        let granted = sqlx::query(
+            "insert into role_permissions (role_id, permission_key, effect) \
+             values ($1, $2, 'allow')",
+        )
+        .bind(role_id)
+        .bind(permission)
+        .execute(&store.pool)
+        .await;
+        if let Err(err) = granted {
+            ungrantable.push(format!("{key} -> {permission} ({err})"));
+        }
+    }
+
+    assert!(
+        ungrantable.is_empty(),
+        "these tools name permissions no role can be granted, so every agent holding one is \
+         denied forever by a switch the panel shows: {ungrantable:?}"
+    );
+    store.dispose().await;
+}
+
+/// The other half of criterion 2, read off the **seeded rows** rather than the compiled table:
+/// a tool the registry presents as wired must carry a route, and a tool it presents as unwired
+/// must be approval-gated.
+///
+/// A tool bound to nothing and a tool bound to a route are different claims, and the response
+/// says which: `route.live` is `false` and `route.permission` is `null` for the eleven planned
+/// tools. What must never happen is a row answered `live: true` whose permission differs from
+/// the row's own declaration, because that is the row an operator would trust.
+#[tokio::test]
+async fn a_seeded_tool_answered_as_wired_names_its_rows_own_permission() {
+    let Some(store) = PipelineStore::fresh().await else {
+        eprintln!("skipping: PostgreSQL is not reachable");
+        return;
+    };
+    let rows: Vec<(String, String, bool)> = sqlx::query_as(
+        "select key, permission, requires_approval from ai_tools \
+         where retired_note is null order by key",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .expect("the seeded rows must be readable");
+
+    let mut planned = 0;
+    for (key, permission, requires_approval) in rows {
+        let view = omnion_ai_hub::ops_binding::route_views()
+            .into_iter()
+            .find(|v| v.key == key)
+            .unwrap_or_else(|| panic!("{key} has no route view"));
+        if view.live {
+            assert_eq!(
+                view.permission.as_deref(),
+                Some(permission.as_str()),
+                "{key} is answered as wired to {:?} but the row declares `{permission}`",
+                view.label
+            );
+        } else {
+            planned += 1;
+            assert!(
+                requires_approval,
+                "{key} has no route and is not approval-gated, so the panel invites an \
+                 operator to enable an action the platform cannot perform"
+            );
+        }
+    }
+    assert!(
+        planned > 0,
+        "the build has documented-but-unbuilt surfaces, so at least one tool must be planned; a \
+         walk that saw none would mean the split is not being exercised at all"
+    );
+    store.dispose().await;
+}

@@ -18,6 +18,7 @@ pub mod agent;
 pub mod agent_sdk;
 pub mod catalog;
 pub mod catalogue;
+pub mod ops_binding;
 pub mod client;
 pub mod connection_test;
 pub mod cost;

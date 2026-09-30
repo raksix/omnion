@@ -132,6 +132,17 @@ pub struct SeedOutcome {
 /// `timeout_ms`, `max_calls_per_run` and `requires_approval` appear in neither the insert's
 /// defaults nor the update's assignments. A future column added to `ai_tools` is therefore
 /// inert by default, which is the correct direction for a mistake to fail in.
+/// Whether a tool's HTTP route exists, read from the compiled binding table.
+///
+/// One function so the seeder and the panel cannot answer differently: the question "is this
+/// tool wired?" has one answer, and it is the compiled table's, not a re-derivation.
+fn binding_is_live(key: &str) -> bool {
+    matches!(
+        crate::ops_binding::binding_for(key).map(|row| row.binding),
+        Some(crate::ops_binding::RouteBinding::Live { .. })
+    )
+}
+
 pub async fn seed(pool: &PgPool) -> Result<SeedOutcome> {
     let mut outcome = SeedOutcome::default();
     let compiled: Vec<String> = catalogue::specs().iter().map(|s| s.key.to_owned()).collect();
@@ -139,6 +150,10 @@ pub async fn seed(pool: &PgPool) -> Result<SeedOutcome> {
     for spec in catalogue::specs() {
         let (timeout_ms, max_calls_per_run) = catalogue::default_limits(spec);
         let row = spec.to_row();
+        // A tool with no HTTP route ships gated even when its risk is Low: the registry row
+        // would otherwise invite an operator to enable an action the platform cannot perform.
+        // `wired` comes from the compiled binding, so adding the route is what ungates it.
+        let requires_approval = catalogue::default_requires_approval_for(spec, binding_is_live(spec.key));
         // `on conflict (key) do update` with the code columns as assignments. The four operator
         // columns are deliberately absent from both halves.
         let sql = "insert into ai_tools (key, class, permission, risk, description, input_schema, \
@@ -165,7 +180,7 @@ pub async fn seed(pool: &PgPool) -> Result<SeedOutcome> {
             .bind(&row["input_schema"])
             .bind(&row["example"])
             .bind(spec.idempotent)
-            .bind(catalogue::default_requires_approval(spec))
+            .bind(requires_approval)
             .bind(timeout_ms)
             .bind(max_calls_per_run)
             .fetch_optional(pool)

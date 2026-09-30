@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use omnion_ai_hub::identity::{self, GrantEffect};
+use omnion_ai_hub::ops_binding::{RouteView, route_view_for};
 use omnion_ai_hub::registry::{self, AgentRef, ToolLimits, ToolRow, ToolUsage};
 use omnion_events::NewEvent;
 use omnion_events::bus;
@@ -100,6 +101,14 @@ pub struct ToolView {
     pub last_used: Option<time::OffsetDateTime>,
     /// The agents whose allow-list names this tool, for the disable confirmation.
     pub used_by_agents: Vec<AgentRef>,
+    /// The HTTP route this tool wraps and the guard that route enforces (REQ-100 criterion 2).
+    ///
+    /// Served from the compiled binding rather than left to the panel, because the panel and
+    /// the test that enforces the criterion must read the same value. `permission` above is the
+    /// tool's own declaration and this is the route's: they are asserted equal in
+    /// `ops_binding::tests`, and a response that carried only one of them would let a drifted
+    /// row look correct on screen while the test is the only thing that knows.
+    pub route: RouteView,
 }
 
 impl ToolView {
@@ -122,6 +131,7 @@ impl ToolView {
             error_rate_30d: usage.error_rate(),
             last_used: usage.last_used,
             used_by_agents: used_by,
+            route: route_view_for(&row.key),
         }
     }
 }
