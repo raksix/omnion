@@ -1174,6 +1174,17 @@ async function reviveMainPage() {
 // plus the report. A guard applied to 12 of 23 call sites is not a guard -- it is a pattern that
 // reads as one, which is why the route loop has the same comment and the same try.
 async function runDepthPass(name, pass) {
+  // A depth pass that RAN is coverage, and on a focused pass it is the only coverage there is:
+  // `--only=workflow-builder` matches no route by name, so the route loop adds nothing and this
+  // line is what tells the roll-up the pass was pointed at something real. Without it the same
+  // pass that had just measured thirty builder steps wrote two high findings -- `empty-pass` and
+  // `unknown-pass-name` -- reading as "this pass proved nothing", which is the exact opposite of
+  // what happened, and it is a finding that would send the next reader to re-verify a screen that
+  // was verified ten seconds earlier.
+  //
+  // It is added on entry rather than on success: a depth pass that throws still consumed the walk,
+  // and its failure is reported by the pass that failed, not by the coverage check.
+  matchedOnly.add(name);
   try {
     return await pass();
   } catch (cause) {
@@ -7595,7 +7606,13 @@ async function main() {
     );
   }
   if (report.web && report.web.error) pushFindings("high", "web-unreachable", report.web.error);
-  if (report.web && !report.web.error) {
+  // The published-page checks are about the CONTENT the walk created, and the content is created
+  // by the route/depth passes, not by the renderer. A focused pass that walked zero routes has no
+  // page to publish, so `/qa-sample` is a 404 for a reason that says nothing about the renderer --
+  // and the check reported it as `web-blank`, a high finding naming a screen nobody visited. The
+  // honest version states the precondition instead of asserting a defect it cannot support.
+  const webChecked = ONLY_ALL || matchedOnly.size > 0;
+  if (report.web && !report.web.error && webChecked) {
     const published = report.web.published;
     if (!published || published.status !== 200) {
       pushFindings("high", "web-page", `the published page /${SAMPLE_SLUG} did not render (status ${published ? published.status : "missing"})`);
@@ -10272,6 +10289,12 @@ note({
     // the step list in the same statement, so a graph that does not validate never reaches
     // the version check — the PUT would be refused for a reason that has nothing to do with
     // concurrency, and this probe would be reading a different failure than the one it names.
+    //
+    // The 409 below is the THING BEING PROVED, not a defect: tab one then saves a version the
+    // store has moved past, and the server refusing it is the criterion. Registered here so the
+    // roll-up reports it under `expectedRefusals`; without it every deliberate conflict reads as
+    // a high finding, and a pass whose whole subject is conflict detection reported itself broken.
+    expectRefusal(`${URL_ADMIN}/api/v1/workflows/`, "two tabs saving one graph: the stale version is refused on purpose");
     const tabTwoSave = await tabTwo.evaluate(async (id) => {
       const current = await (
         await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
