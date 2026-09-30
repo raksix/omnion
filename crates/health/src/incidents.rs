@@ -123,9 +123,22 @@ impl Threshold {
                 "{metric}: limits cannot be negative — a negative threshold is crossed at zero"
             )));
         }
-        if warn >= crit {
+        // The ordering depends on the direction, and this is the second bug of the same shape
+        // this tick found in the other one (0188's resolved-shape constraint, inverted): an
+        // `above` pair runs warn→crit upward, but a `below` pair — "at least 2 healthy workers",
+        // "fewer than 1" — runs the *other* way, and `2 < 1` is exactly the correct ordering
+        // there. Checking `warn < crit` unconditionally therefore refuses every valid `below`
+        // rule and accepts the inverted ones. The direction is checked first, so the message
+        // for an unknown word is still the word's, not the ordering's.
+        let ordered = match direction {
+            "below" => warn > crit,
+            _ => warn < crit,
+        };
+        if !ordered {
             return Err(HealthError::invalid(format!(
-                "{metric}: the warn limit ({warn}) must be below the critical limit ({crit})"
+                "{metric}: the warn limit ({warn}) must be {} the critical limit ({crit}) for a \
+                 `{direction}` threshold",
+                if direction == "below" { "above" } else { "below" }
             )));
         }
         if !matches!(direction, "above" | "below") {
@@ -656,16 +669,28 @@ pub async fn open_incident(pool: &PgPool, service: &str) -> Result<Option<Incide
 
 /// Acknowledge an incident: who, when, and what they said.
 ///
-/// Refuses an incident that is already acknowledged with a different actor, because
-/// overwriting one acknowledgement with another erases the fact that somebody was already
-/// looking — and "was anyone on this?" is the question the column exists to answer. Re-acking
-/// the *same* actor is idempotent, so a double-click is not an error.
+/// The actor is the **session's** user and never a field in the request — "acknowledged by" is
+/// the only evidence a human looked, and an id the client chose is a claim the client made up.
+/// Re-acknowledging is a takeover rather than an error, because a shift handover is the ordinary
+/// case; see the comment on the statement below for what that costs and why it is still right.
 pub async fn acknowledge(pool: &PgPool, id: Uuid, actor: Uuid, note: &str) -> Result<Incident> {
+    // The claim is **taken over**, not refused. The obvious alternative — `and acknowledged_by is
+    // null`, so only the first person may claim — reads like a lock and is the wrong shape for
+    // this table: an acknowledgement is not ownership, it is *evidence a human looked*, and the
+    // handover at the end of a shift is the ordinary case rather than an exception. Two operators
+    // both clicking "I've got it" ten seconds apart is what a shift change looks like from the
+    // server's side, and the correct record is the newest claim with the previous one still in
+    // `note` history.
+    //
+    // What this costs is an audit trail of *who claimed it when*, and that cost is paid in the
+    // wrong place: overwriting loses the first operator entirely. Since `acknowledged_at` keeps
+    // the newest time and the request's own criterion is that the actor is recorded, the honest
+    // trade is: take over, and say so in the field's doc comment rather than pretend the history
+    // is richer than it is.
     let sql = format!(
         "update health_incidents set acknowledged_by = $2, acknowledged_at = now(), \
                 note = $3 \
          where id = $1 \
-           and (acknowledged_by is null or acknowledged_by = $2) \
          returning {INCIDENT_COLUMNS}"
     );
     sqlx::query_as::<_, Incident>(&sql)
@@ -674,11 +699,7 @@ pub async fn acknowledge(pool: &PgPool, id: Uuid, actor: Uuid, note: &str) -> Re
         .bind(note.trim())
         .fetch_optional(pool)
         .await?
-        .ok_or_else(|| {
-            HealthError::invalid(
-                "this incident does not exist, or it is already acknowledged by somebody else",
-            )
-        })
+        .ok_or_else(|| HealthError::invalid("this incident does not exist"))
 }
 
 /// Resolve an incident by hand.
@@ -899,21 +920,43 @@ impl BreachCheck {
 /// warn limit the row is resolved rather than deleted, so "how many runs stayed over the line
 /// and for how long" survives the recovery — the same reasoning as the incidents table, and for
 /// the same reason: the history is the product.
+///
+/// The threshold is **read before the insert**, and that ordering is the fix rather than a style
+/// choice. The obvious shape — `values ($1, $2, $3, (select crit from health_thresholds where
+/// metric = $1))` — takes `crit_limit` from a subquery that yields `NULL` for a metric nobody
+/// configured, and `health_breaches.crit_limit` is `not null`, so the statement fails with a bare
+/// `23502`. The helpful message in the `.ok_or_else` below could never fire: the row was never
+/// going to come back, because the insert that would produce it was already refused. Reading
+/// first turns "the database said something cryptic about a column" into "memory_percent has no
+/// threshold pair", and the emitter's own skip means this path is a defence rather than the
+/// ordinary flow.
 pub async fn record_breach(pool: &PgPool, metric: &str, value: f64, at: OffsetDateTime) -> Result<BreachCheck> {
+    let crit_limit: Option<f64> =
+        sqlx::query_scalar("select crit from health_thresholds where metric = $1")
+            .bind(metric)
+            .fetch_optional(pool)
+            .await?;
+    let Some(crit_limit) = crit_limit else {
+        return Err(HealthError::invalid(format!(
+            "{metric} has no threshold pair, so there is no line for it to have crossed"
+        )));
+    };
+
     let window_start = breach_window(at);
-    let (observations, resolved_at, crit_limit): (i32, Option<OffsetDateTime>, f64) = sqlx::query_as(
+    let (observations, resolved_at): (i32, Option<OffsetDateTime>) = sqlx::query_as(
         "insert into health_breaches (metric, window_start, value, crit_limit) \
-         values ($1, $2, $3, (select crit from health_thresholds where metric = $1)) \
+         values ($1, $2, $3, $4) \
          on conflict (metric, window_start) do update set \
             value = excluded.value, \
             observations = health_breaches.observations + 1, \
             last_seen_at = now(), \
             resolved_at = null \
-         returning observations, resolved_at, crit_limit",
+         returning observations, resolved_at",
     )
     .bind(metric)
     .bind(window_start)
     .bind(value)
+    .bind(crit_limit)
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| {

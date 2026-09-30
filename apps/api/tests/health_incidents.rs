@@ -36,9 +36,9 @@
 #![allow(clippy::too_many_lines)]
 
 use omnion_health::{
-    BREACH_WINDOW_SECONDS, IncidentOutcome, SettingsUpdate, Threshold, Transition, breach_window,
-    Thresholds,
+    BREACH_WINDOW_SECONDS, SettingsUpdate, Threshold, Transition, breach_window, Thresholds,
 };
+use omnion_identity::{NewUser, users};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -171,6 +171,29 @@ async fn open_incidents(pool: &PgPool, service: &str) -> Vec<omnion_health::Inci
     .incidents
 }
 
+/// A real account, because both `acknowledged_by` and `created_by` are foreign keys to `users`.
+///
+/// A random `Uuid::new_v4()` is not enough and the failure it produces is worth remembering: the
+/// walk dies on a `23503 foreign key violation` that says nothing about maintenance windows, so
+/// the obvious reading is "the window insert is broken" and the real cause is a fixture that
+/// invented an actor the database has never heard of. Acknowledgement is *only* meaningful with
+/// a real user behind it — a row whose `acknowledged_by` points at nothing is exactly the
+/// un-evidenced acknowledgement the request rules out.
+async fn account(pool: &PgPool) -> Uuid {
+    users::create_user(
+        pool,
+        NewUser {
+            email: format!("walk-{}@omnion.test", Uuid::new_v4().simple()),
+            password: "Walkthrough-Passw0rd-1".to_owned(),
+            display_name: "Walk".to_owned(),
+            organization_id: None,
+        },
+    )
+    .await
+    .expect("the account must be created")
+    .id
+}
+
 // ---------------------------------------------------------------------------------------------
 // One steady outage is one incident
 // ---------------------------------------------------------------------------------------------
@@ -268,7 +291,7 @@ async fn an_acknowledgement_names_the_actor_and_survives_a_reread() {
         return;
     };
     let pool = harness.pool().clone();
-    let actor = Uuid::new_v4();
+    let actor = account(&pool).await;
 
     emit(&pool, &report("s3", "degraded", "slow HEAD"), now()).await;
     let id = open_incidents(&pool, "s3").await.remove(0).id;
@@ -287,13 +310,29 @@ async fn an_acknowledgement_names_the_actor_and_survives_a_reread() {
     assert_eq!(reread.acknowledged_by, Some(actor), "it has to persist, not just return");
     assert!(reread.is_open(), "acknowledging is not resolving — the outage is still open");
 
-    // A second acknowledgement from somebody else overwrites the first: that is the correct
-    // answer (the newest claim is the current one) but it must not resurrect a resolved row.
-    let other = Uuid::new_v4();
-    omnion_health::acknowledge(&pool, id, other, "").await.unwrap();
+    // A second acknowledgement **takes over** rather than being refused, because a shift handover
+    // is the ordinary case and not an attack: the newest claim is the current one, and the screen
+    // shows that operator. The alternative (`and acknowledged_by is null`) reads like a lock and
+    // refuses the one interaction this table exists to support.
+    let other = account(&pool).await;
+    omnion_health::acknowledge(&pool, id, other, "handing over").await.unwrap();
+    let handover = omnion_health::incident(&pool, id).await.unwrap();
     assert_eq!(
-        omnion_health::incident(&pool, id).await.unwrap().acknowledged_by,
-        Some(other)
+        handover.acknowledged_by,
+        Some(other),
+        "the newest claim is the one on the row"
+    );
+    assert_eq!(handover.note.as_deref(), Some("handing over"), "and its note replaces the old one");
+    assert!(
+        handover.resolved_at.is_none(),
+        "acknowledging never resolves — a handover claims the incident, it does not close the \
+         outage it describes"
+    );
+
+    // An acknowledgement of a row that does not exist is refused by id, not silently a no-op.
+    assert!(
+        omnion_health::acknowledge(&pool, Uuid::new_v4(), actor, "ghost").await.is_err(),
+        "a missing incident must be an error rather than a successful no-op"
     );
 
     harness.dispose().await;
@@ -317,7 +356,7 @@ async fn a_maintenance_window_suppresses_the_incident_and_keeps_the_state() {
     )
     .bind(at - time::Duration::minutes(5))
     .bind(at + time::Duration::minutes(5))
-    .bind(Uuid::new_v4())
+    .bind(account(&pool).await)
     .execute(&pool)
     .await
     .unwrap();
@@ -494,11 +533,28 @@ async fn an_unconfigured_threshold_never_breaches() {
         "the suggestion is a form placeholder, not a policy"
     );
 
-    let check = omnion_health::record_breach(&pool, "memory_percent", 99.0, now()).await.unwrap();
+    // The store refuses by *name*. The emitter's own `stored.get(metric)` skip means this is the
+    // defence rather than the ordinary path — but the failure mode it replaces is worth naming:
+    // before the fix, `record_breach` took `crit_limit` from a subquery that returned `NULL` for
+    // an unconfigured metric, so the statement died on `23502 not-null` and the caller learned
+    // nothing about which metric was the problem.
+    let err = omnion_health::record_breach(&pool, "memory_percent", 99.0, now())
+        .await
+        .expect_err("an unconfigured metric has no line to cross");
     assert!(
-        !check.should_announce(),
-        "nothing was configured, so nothing fires — defaulting to the suggestion would open \
-         incidents on a deployment nobody set up"
+        err.to_string().contains("memory_percent"),
+        "the refusal names the metric: {err}"
+    );
+
+    let rows: i64 =
+        sqlx::query_scalar("select count(*)::bigint from health_breaches where metric = 'memory_percent'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows, 0,
+        "and nothing was written — defaulting to the suggestion would open incidents on a \
+         deployment nobody set up"
     );
 
     harness.dispose().await;
@@ -566,7 +622,10 @@ fn the_threshold_pair_refuses_what_the_database_refuses() {
         "NaN has to be named as what it is, not as an ordering failure: {err}"
     );
 
-    // A valid pair classifies into three bands, and *below* inverts them.
+    // A valid pair classifies into three bands, and `below` inverts them. The ordering is the whole
+    // point: a `below` rule ("at least 2 healthy workers") is correctly written warn > crit, so the
+    // pair is `Threshold::new("workers", 2.0, 1.0, "below")` — 2 above 1 — and a validator that
+    // demands warn < crit unconditionally refuses every valid `below` threshold in the product.
     let above = Threshold::new("disk_percent", 80.0, 90.0, "above").unwrap();
     assert_eq!(above.classify(10.0), None, "under the warn line is 'no opinion'");
     assert_eq!(above.classify(85.0), Some("degraded"));
@@ -577,10 +636,20 @@ fn the_threshold_pair_refuses_what_the_database_refuses() {
     assert_eq!(below.classify(2.0), Some("degraded"));
     assert_eq!(below.classify(0.0), Some("down"));
 
-    // A non-finite reading must not be classified at all: `NaN >= 90` is false, so it would fall
-    // through to `None` and read as "no opinion" — which is right, but only by accident. This
-    // asserts it on purpose.
-    assert_eq!(above.classify(f64::INFINITY), Some("down"), "infinity is over the line");
+    // The inverted `below` pair is the one that is refused — and refused *because* it is `below`.
+    let err = Threshold::new("workers", 1.0, 2.0, "below").unwrap_err();
+    assert!(
+        err.to_string().contains("workers") && err.to_string().contains("below"),
+        "the message names the metric and the direction that decided it: {err}"
+    );
+
+    // A non-finite reading is **not** classified at all. This is the deliberate early return rather
+// than an accident of comparison: `NaN >= 90` is false and `inf.is_finite()` is false, so a
+// classifier that relied on the comparisons alone would put `NaN` in the same bucket as a healthy
+// reading — "no opinion" — which is precisely the reading that must never come from a broken
+// sensor. Asserted on purpose so the guard is not removed as dead code.
+assert_eq!(above.classify(f64::NAN), None, "a broken sensor is not a healthy metric");
+assert_eq!(above.classify(f64::INFINITY), None, "and infinity is not a reading either");
 }
 
 fn now() -> OffsetDateTime {

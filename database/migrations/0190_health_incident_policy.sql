@@ -57,7 +57,14 @@ create table health_thresholds (
     constraint health_thresholds_direction_check
         check (direction in ('above', 'below')),
     -- The pair the request names as a rejected input, enforced where a save cannot bypass it.
-    constraint health_thresholds_pair_check check (warn < crit),
+    --
+    -- Direction-aware, and this is the second half of the fix in `0191`: a `below` pair (a
+    -- "fewer than N healthy workers" rule) is *correctly* ordered warn > crit, so a bare
+    -- `warn < crit` would refuse every valid `below` threshold and accept the inverted ones.
+    -- Both orders are checked, so a pair that matches neither is refused either way round.
+    constraint health_thresholds_pair_check check (
+        (direction = 'above' and warn < crit) or (direction = 'below' and warn > crit)
+    ),
     -- A negative threshold would cross at zero and read as "everything is already breached",
     -- so both ends are bounded and finite. `NaN` compares false against everything, which is
     -- why `is_finite` is checked here rather than trusting `<`/`>` to do it.
