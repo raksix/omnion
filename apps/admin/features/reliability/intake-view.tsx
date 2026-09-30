@@ -695,7 +695,7 @@ export function ReliabilityIntakeView() {
                 </select>
                 <span className="text-[11.5px] text-muted">
                   Both profiles leave a legitimate JSON payload byte-identical; `strict` also
-                  strips ` ` escapes, which are almost never real data.
+                  strips `\x00` escapes, which are almost never real data.
                 </span>
               </label>
               <label className="flex flex-col gap-1 text-[12.5px]">
