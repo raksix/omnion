@@ -9470,3 +9470,75 @@ shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for t
 which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
+
+---
+
+## Tick 44 — REQ-133 slice 15: the move and the search index had never agreed
+
+**What.** Acceptance 5 ("global search … scoped to their projects") is enforced by one clause in
+`query::search`: `d.project_id = any($n) or d.project_id is null`, read off the **`search_documents`
+row**, not off the workflow. `move_workflow` wrote `workflows.project_id` and the audit row and
+nothing else, and **nothing re-indexes on the write path** — `index_entity` has no caller anywhere on
+the branch and there is no periodic reindex. A moved workflow therefore kept naming the project it
+left, for ever.
+
+The failure is **asymmetric**, and that is what makes it a security defect rather than a stale-cache
+nuisance: the member who *gained* access could not find it at all, and the member who *lost* access
+kept finding it. `?project=<id>` in a shared link does not save them — the clause reads the stored
+value.
+
+**The gate that named this defect was the gate that could not see it.** `run-search-project-scope.sh`
+carries a test called
+`a_workflow_moved_to_another_project_stops_answering_for_the_old_membership`, and that gate's header
+listed it as covering the move. It does not: the fixture moves the workflow with a raw `update` and
+then calls `reindex` **by hand**, so it exercises the reindexer's conflict tail and never
+`move_workflow`. The fixture performed away the only step under test. That is this branch's signature
+defect for the second time, and the first whose fixture — not just its wiring — was the reason.
+
+**Proof.**
+
+- `scripts/qa/run-move-reindex.sh` **4/4**, and **PROVEN TO FAIL at 2/4** with the stamp deleted. The
+  two survivors are the negative controls: a dry run stamps nothing, and a project the move never
+  touched keeps answering. The first failure is the defect verbatim — the row still names the project
+  the workflow left, and the member who gained access gets `[]`.
+- `run-search-project-scope.sh` **9/9** unchanged, `run-workflow-move.sh` **13/13** unchanged.
+- `cargo build -p omnion-api` green, `omnion-workflows --lib` green, admin `tsc --noEmit` exit 0.
+
+**Design decisions, all load-bearing.** The stamp goes **inside the move's transaction**, beside the
+audit row: a stamp that survived a rolled-back move is a document scoped to a project the workflow is
+not in — the leak this line exists to close, opened by the fix itself. It is a plain keyed `update`
+rather than a call into the search crate, because `omnion-workflows` must not grow that dependency and
+`omnion-search` takes project ids as *values* on purpose. **Zero rows updated is not an error:** an
+unindexed workflow has no document, and refusing the move over one would make a move impossible until
+somebody ran a reindex. The old test is **kept, not deleted** — a reindex really does repair the row —
+with its comment rewritten to say what it actually proves.
+
+The negative control caught a fixture bug of mine on the first run: the control workflow was written
+*after* the reindex, so it had no index row to assert on, and the control was failing for a reason that
+had nothing to do with the defect. Same class as the twelve before it, and the first one I introduced
+myself inside the gate written to catch one.
+
+**Also this tick: a bug in my own merge tool, found by the merge that needed it.**
+`scripts/qa/merge-build-log.py` refuses to write the merged BUILD-LOG with
+`ENTRIES LOST PROSE LINES: [('## Tick 77 addendum …', 23, 21)]`. The script's own docstring says *"a
+heading is not a unique key"* — and its truncation detector keyed a dict on the heading to find "the
+base entry with this title". Base holds **two** different entries titled `Tick 77 addendum` (21 and 23
+prose lines, neither a subset of the other), so the dict kept one and reported the other as having
+lost history. It had never lost any: the shorter entry is a genuinely shorter entry. Truncation is a
+**subset** relation, not a length relation, so the check now uses the `is_damaged_copy` predicate that
+steps 2 and 3 already share — the rule was written three times and this was the one place that had
+gotten it wrong. `8cc47633`.
+
+Fixed and then **proved the fix did not weaken it**: cutting three prose lines out of the 21-line entry
+is still detected, the 23-line sibling stays clean, and a clean merge reports zero. A check that only
+silences its own alarm is worth nothing, and this one had been blocking a merge for a tick.
+
+**Not proved, and stated.** No browser pass: the QA slot is held by a live w6 pass (holder pid alive,
+`/proc/<pid>/cwd` = `/mnt/apopic/omnion-w6`), load ran 79–100 across ten writers, and the projects
+surface has not been observed by a completed pass on this branch for many ticks. The defect was in the
+store, so no screen claim is made either way.
+
+**Next.** Acceptance 5's move half is closed. The `credentials` / `workflow_folders` /
+`workflow_schedules` filter kinds and the move-dependency refusal halves still have no table on this
+branch and stay named rather than ticked. The transfer-ownership dialog and the 390px criterion both
+still wait on a completed pass.
