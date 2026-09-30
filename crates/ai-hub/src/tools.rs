@@ -162,6 +162,17 @@ where
         &self.permission
     }
 
+    /// **This override is the whole point of [`FnTool::with_schema`].**
+    ///
+    /// Without it the builder wrote the schema into a field nothing read: `Tool::schema`'s
+    /// default (an object with no properties) is what every `FnTool` reported, so a tool that
+    /// declared `{"required": ["target"]}` was told the model it takes *no arguments* and then
+    /// refused the model's `target` as an unknown field. The failure is invisible in a test that
+    /// only checks "a call with a bad type is refused" — which was true, for the wrong reason.
+    fn schema(&self) -> Value {
+        self.schema.clone()
+    }
+
     fn run(
         &self,
         arguments: &Value,
