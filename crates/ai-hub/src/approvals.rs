@@ -40,6 +40,7 @@
 //!   a clock seam instead of waiting an hour.
 
 pub mod io;
+pub mod plan;
 
 use std::collections::BTreeMap;
 
