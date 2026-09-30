@@ -586,13 +586,29 @@ async fn a_backup_of_all_five_parts_writes_five_artifacts_and_lands_on_succeeded
     )
     .await;
     assert_eq!(cards.status, StatusCode::OK);
-    // `OffsetDateTime` serialises as a tuple, not an RFC 3339 string, so the card is a JSON
-    // array — an assertion written for the string form fails on a working endpoint, which is
-    // worse than no assertion: it trains the reader to distrust the test rather than the code.
+    // **A string, and that is the assertion's whole point.** This line used to demand a
+    // nine-element array, with a comment explaining that `OffsetDateTime` serialises as a
+    // tuple — which is true of `time` only when its `serde-human-readable` feature is off, and
+    // the workspace did not enable it. So it documented the defect as if it were the contract,
+    // and `8322d753` fixed the endpoint. A test that pins the *bug* is worse than no test: it
+    // is a green that tells the next reader to distrust the code rather than the test, and it
+    // makes the fix look like a regression.
+    //
+    // The panel's `formatTimestamp` returns an em dash for anything it cannot parse, and an
+    // em dash is also what it renders for a value that has not happened yet — a loss and a
+    // designed answer, pixel-identical. Asserting the **JSON type** is the only way to tell
+    // them apart, so the type is what is asserted, and the value is checked for the shape
+    // rather than merely for existing.
+    let stamp = &cards.body["last_successful_at"];
     assert!(
-        cards.body["last_successful_at"].is_array(),
-        "the card carries a timestamp, whatever shape it serialises in: {}",
-        cards.body["last_successful_at"]
+        stamp.is_string(),
+        "the card must carry an RFC 3339 string, not {}: {stamp}",
+        stamp
+    );
+    let stamp = stamp.as_str().expect("checked above");
+    assert!(
+        stamp.len() >= 20 && stamp.ends_with('Z') && stamp.contains('T'),
+        "the card must carry a timestamp whatever shape it serialises in: {stamp}"
     );
     assert!(
         cards.body["last_successful_age_seconds"].is_number(),
@@ -3311,5 +3327,755 @@ async fn a_strangers_schedule_is_a_404_and_running_one_needs_the_take_a_backup_k
     assert!(
         next > time::OffsetDateTime::now_utc(),
         "a manual run consumed the next scheduled slot: {next}"
+    );
+}
+
+// --------------------------------------------------------------------------------------------
+// The queued restore (REQ-013, slice 2c)
+// --------------------------------------------------------------------------------------------
+
+/// `POST /api/v1/backups/{id}/restore-queue` — what an operator sends to get a cancellable
+/// restore.
+async fn queue_restore(
+    state: &AppState,
+    token: &str,
+    csrf: &str,
+    run_id: Uuid,
+    parts: &[&str],
+    confirmation: &str,
+) -> TestResponse {
+    call(
+        state,
+        request(
+            Method::POST,
+            &format!("{}/restore-queue", backup_uri(run_id)),
+            Some(token),
+            Some(csrf),
+            Some(json!({ "parts": parts, "confirmation": confirmation })),
+        ),
+    )
+    .await
+}
+
+/// `POST /api/v1/restore-jobs/{id}/cancel` — the abort, addressed by the JOB's id.
+async fn cancel_restore(state: &AppState, token: &str, csrf: &str, job: Uuid) -> TestResponse {
+    call(
+        state,
+        request(
+            Method::POST,
+            &format!("/api/v1/restore-jobs/{job}/cancel"),
+            Some(token),
+            Some(csrf),
+            Some(json!({})),
+        ),
+    )
+    .await
+}
+
+/// The status a queued job is in, read **out of PostgreSQL** rather than from a response.
+///
+/// A response can carry a state the row is not in, and the whole feature is a claim about
+/// what the row says: the schema's check constraint refuses an `aborted` job that started, and
+/// that refusal is only meaningful against the stored value.
+async fn job_status(pool: &sqlx::PgPool, job: Uuid) -> (String, bool, Option<time::OffsetDateTime>) {
+    sqlx::query_as("select status, cancel_requested, started_at from backup_restore_jobs where id = $1")
+        .bind(job)
+        .fetch_one(pool)
+        .await
+        .expect("the job row must read")
+}
+
+/// A queued restore can be stopped before it writes anything, and the stop leaves the
+/// platform untouched.
+///
+/// **The criterion this slice was opened for.** Slice 2b refused a cancel outright and said
+/// why — a `POST` in flight cannot be un-pressed — so the acceptance criterion stayed open
+/// with a note that a genuine abort belongs with a queued restore. This is that proof, and
+/// the load-bearing assertion is the one at the end: a cancel that left a safety backup, a
+/// media row or a stored object behind would be an abort in name only, because the operator
+/// stopped it *because* they did not want their data touched.
+///
+/// Three things are in here besides the happy path, and each is a way the "abort" could be a
+/// lie:
+/// * **The cancel is honoured when it loses the race to the worker** — a `queued` job is
+///   marked `aborted` by the *cancel route itself*, not left for the worker's next tick,
+///   because a panel that keeps offering "stop" on a row the operator already stopped reads
+///   as broken.
+/// * **A second restore of the same run is refused while one is live** — two restores would
+///   take two safety backups and write every object twice.
+/// * **A stranger cannot see or cancel the job**, and cannot queue one: the tenant boundary
+///   is asserted on all three routes, not just the one that writes.
+#[tokio::test]
+async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_behind() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+    let site = create_site(fixture.db.pool(), fixture.org, "Queue Site").await;
+    let key = put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "queued.png",
+        b"the archived bytes",
+    )
+    .await;
+
+    let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
+    let run_id =
+        Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
+
+    // The live copy changes after the run, so a restore that half-happened would be visible.
+    put_object(&fixture.state, fixture.db.pool(), site, "queued.png", b"the live bytes").await;
+
+    let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
+    let preview = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await;
+    let phrase = preview.body["confirm_phrase"]
+        .as_str()
+        .expect("a phrase")
+        .to_owned();
+
+    // --- 1. The refusals, and they are refusals *before* the row exists -----------------------
+    // A refused queue must write nothing at all. A destructive route that minted an
+    // undeletable, protected row every time somebody fat-fingered a phrase would be its own
+    // denial of service, and the refusal would still be correct.
+    for (label, parts, confirmation, expected) in [
+        ("wrong phrase", vec!["media"], "RESTORE 00000000", "confirmation_mismatch"),
+        ("empty selection", vec![], phrase.as_str(), "nothing_selected"),
+        ("unknown part", vec!["media", "typo"], phrase.as_str(), "unknown_part"),
+        ("a part the run never produced", vec!["configuration"], phrase.as_str(), "part_not_in_run"),
+        // The fixture's run is a **media-only** one, so `database` is refused as "this run
+        // does not offer it" — the run-check comes first, and it is the better answer: it
+        // names what the run *can* offer. The deeper "that part is not restorable at all"
+        // rule needs a run that really produced it, and the walk below builds one.
+        ("a part this run never produced", vec!["database"], phrase.as_str(), "part_not_in_run"),
+    ] {
+        let answer = queue_restore(
+            &fixture.state,
+            &restorer_token,
+            &restorer_csrf,
+            run_id,
+            &parts,
+            confirmation,
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "{label} must be refused, not queued: {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body["error"]["code"], expected,
+            "{label} must be refused by name: {}",
+            answer.body
+        );
+    }
+    // The deeper rule, on a run that really produced the `database` part. Separate because
+    // the two refusals are different facts: "this run does not offer it" is about the run,
+    // and "that part is not restorable at all" is about the *platform* — a part that records
+    // a row count per table is an inventory, and restoring it would replace the schema with
+    // an inventory of it. A run that has the part and is still refused is the case that
+    // proves the rule is about the part and not about the run.
+    let db_run = take_backup(&fixture.state, &token, &csrf, &["database"]).await;
+    let db_run_id =
+        Uuid::parse_str(db_run.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
+    let db_phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, db_run_id).await.body
+        ["confirm_phrase"]
+        .as_str()
+        .expect("a phrase")
+        .to_owned();
+    let db_refused = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        db_run_id,
+        &["database"],
+        &db_phrase,
+    )
+    .await;
+    assert_eq!(
+        db_refused.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        db_refused.body
+    );
+    assert_eq!(
+        db_refused.body["error"]["code"], "part_not_restorable",
+        "a run that HAS the database part must still be refused, by name and for the right \
+         reason: {}",
+        db_refused.body
+    );
+
+    let queued_after_refusals: i64 =
+        sqlx::query_scalar("select count(*) from backup_restore_jobs")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the job table must read");
+    assert_eq!(
+        queued_after_refusals, 0,
+        "a refused queue wrote a row: the operator would see a restore that never happens"
+    );
+
+    // --- 2. The queue, and the answer is 202 with the job ------------------------------------
+    let queued = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    assert_eq!(queued.status, StatusCode::ACCEPTED, "body: {}", queued.body);
+    let job_id = Uuid::parse_str(queued.body["id"].as_str().expect("a job id")).expect("a uuid");
+    assert_eq!(
+        queued.body["status"], json!("queued"),
+        "body: {}",
+        queued.body
+    );
+    assert_eq!(
+        queued.body["cancellable"], json!(true),
+        "a queued job IS the cancellable window; body: {}",
+        queued.body
+    );
+    assert_eq!(queued.body["parts"], json!(["media"]));
+
+    // The instants must cross the wire as strings. `time`'s human-readable `Serialize` is
+    // gated on a feature this workspace does not enable, so a bare `OffsetDateTime` ships as
+    // a nine-element array and the panel renders an em dash — the same em dash it renders for
+    // a value that has not happened yet, which is what makes a *lost* timestamp and a
+    // *designed* one look alike.
+    for field in ["created_at", "started_at", "finished_at"] {
+        let value = &queued.body[field];
+        assert!(
+            value.is_null() || value.is_string(),
+            "{field} must be a string or null, not {}: {value}",
+            value
+        );
+    }
+    assert!(
+        queued.body["started_at"].is_null(),
+        "a queued job has not started, and the worker — not the request — stamps that: {}",
+        queued.body
+    );
+    assert!(queued.body["finished_at"].is_null());
+
+    // The agreed price is CARRIED, not recomputed: a job re-priced at execution time would
+    // restore against today's library while the operator agreed to yesterday's number.
+    assert_eq!(
+        queued.body["live_dropped"],
+        preview.body["total_live_dropped"],
+        "the queued job must carry the price the operator read"
+    );
+
+    // --- 3. A second restore of the same run is refused while one is live ---------------------
+    let again = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    assert_eq!(
+        again.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        again.body
+    );
+    assert_eq!(
+        again.body["error"]["code"], "restore_already_queued",
+        "two restores of one run would take two safety backups and write every object twice: {}",
+        again.body
+    );
+
+    // --- 4. The cancel, and the counts that make it a real abort -----------------------------
+    let runs_before = run_count(&fixture, fixture.org).await;
+    let media_before: i64 = sqlx::query_scalar(
+        "select count(*) from media where site_id = $1",
+    )
+    .bind(site)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the library must read");
+
+    let cancelled = cancel_restore(&fixture.state, &restorer_token, &restorer_csrf, job_id).await;
+    assert_eq!(cancelled.status, StatusCode::OK, "body: {}", cancelled.body);
+    assert_eq!(
+        cancelled.body["status"], json!("aborted"),
+        "an operator who pressed stop must be told it stopped: {}",
+        cancelled.body
+    );
+    assert_eq!(
+        cancelled.body["cancellable"], json!(false),
+        "a finished job must not offer another stop"
+    );
+
+    // The row, out of PostgreSQL. `started_at` is NULL — the schema's own check constraint
+    // refuses an `aborted` job that started, and that refusal is the feature: an abort is a
+    // statement that nothing was written.
+    let (status, cancel_requested, started_at) = job_status(fixture.db.pool(), job_id).await;
+    assert_eq!(status, "aborted", "the stored status is the claim being made");
+    assert!(
+        started_at.is_none(),
+        "an aborted restore must never have started: {started_at:?}"
+    );
+    assert!(cancel_requested, "the row records that somebody asked");
+
+    // **The load-bearing assertion.** No safety backup, no library row, no stored object.
+    assert_eq!(
+        run_count(&fixture, fixture.org).await,
+        runs_before,
+        "the cancel took a safety backup: a restore with nothing to go back to is the one \
+         outcome this feature will not allow, and an ABORT has to go back to nothing too"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("select count(*) from media where site_id = $1")
+            .bind(site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the library must read"),
+        media_before,
+        "the cancel wrote a library row"
+    );
+    assert_eq!(
+        fixture.state.storage().get(&key).await.unwrap_or_default(),
+        b"the live bytes",
+        "the cancel wrote into the object store: the live file must still hold what it held"
+    );
+
+    // The audit entry exists, naming the job — a restore that was authorised and then stopped
+    // is exactly the event an operator needs to find a month later.
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'backup.restore.queued'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit log must read");
+    assert!(audited >= 1, "queueing a restore left no audit entry");
+
+    // --- 5. Cancelling it twice, and cancelling a stranger's job --------------------------------
+    let twice = cancel_restore(&fixture.state, &restorer_token, &restorer_csrf, job_id).await;
+    assert_eq!(
+        twice.status,
+        StatusCode::BAD_REQUEST,
+        "a second stop must be refused, not silently accepted: {}",
+        twice.body
+    );
+    assert_eq!(twice.body["error"]["code"], "restore_not_cancellable");
+
+    let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
+    let stranger_cancel = cancel_restore(&fixture.state, &stranger_token, &stranger_csrf, job_id).await;
+    assert_eq!(
+        stranger_cancel.status,
+        StatusCode::NOT_FOUND,
+        "a stranger's cancel must be a 404, not a 403: {}",
+        stranger_cancel.body
+    );
+    assert!(
+        !stranger_cancel.body.to_string().contains("organization"),
+        "the 404 must not name the tenancy rule — that confirms the job exists: {}",
+        stranger_cancel.body
+    );
+
+    let stranger_list = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{}/restore-jobs", backup_uri(run_id)),
+            Some(&stranger_token),
+            Some(&stranger_csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        stranger_list.status,
+        StatusCode::NOT_FOUND,
+        "a stranger must not list this run's restores: {}",
+        stranger_list.body
+    );
+
+    let stranger_queue = queue_restore(
+        &fixture.state,
+        &stranger_token,
+        &stranger_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    assert_eq!(
+        stranger_queue.status,
+        StatusCode::NOT_FOUND,
+        "a stranger must not queue a restore of this run: {}",
+        stranger_queue.body
+    );
+
+    // --- 6. The list, and the permission split ------------------------------------------------
+    let listed = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{}/restore-jobs", backup_uri(run_id)),
+            Some(&restorer_token),
+            Some(&restorer_csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "body: {}", listed.body);
+    assert_eq!(
+        listed.body.as_array().map(Vec::len),
+        Some(1),
+        "the run's restores must be listed: {}",
+        listed.body
+    );
+    assert_eq!(listed.body[0]["status"], json!("aborted"));
+    assert!(listed.body[0]["error"].is_string(), "the reason must be readable");
+
+    // An operator holding read/create/manage but NOT `backup.restore` may **list** the jobs
+    // and may not **stop** one. The separation has to be provable, and the account that
+    // proves it is the one holding every *other* key.
+    let (operator_token, operator_csrf) = fixture.session(&fixture.operator_email).await;
+    let operator_cancel =
+        cancel_restore(&fixture.state, &operator_token, &operator_csrf, job_id).await;
+    assert!(
+        matches!(
+            operator_cancel.status,
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+        ),
+        "an operator without `backup.restore` must not be able to stop a restore: {}",
+        operator_cancel.body
+    );
+    let operator_list = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("{}/restore-jobs", backup_uri(run_id)),
+            Some(&operator_token),
+            Some(&operator_csrf),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        operator_list.status,
+        StatusCode::OK,
+        "reading that a restore is queued changes nothing, so it is `backup.read`: {}",
+        operator_list.body
+    );
+}
+
+/// The queued worker's own contract: a job nobody cancels runs, and a job that was cancelled
+/// is never picked up even when the tick finds it.
+///
+/// **The second half is the one the first implementation got wrong.** The worker read
+/// `queued_restore_jobs(pool, None)`, and `is not distinct from null` matches rows whose
+/// `organization_id` **is** null — the platform's own jobs. Every tenant's restore would
+/// have sat `queued` for ever while the tick reported a clean pass, which is the same silence
+/// as the uncalled `next_due_schedules` one feature over: a query that answers, a worker
+/// that polls, and no writer that reaches the rows anybody can see. The walk proves it by
+/// asserting the worker's *effect*, not by asserting a return value — `tick` returning `0`
+/// is exactly what a broken worker returns.
+#[tokio::test]
+async fn the_worker_restores_a_queued_job_and_skips_one_that_was_cancelled() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+    let site = create_site(fixture.db.pool(), fixture.org, "Worker Site").await;
+    let key = put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "worker.png",
+        b"worker archived bytes",
+    )
+    .await;
+
+    let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
+    let run_id =
+        Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
+    put_object(&fixture.state, fixture.db.pool(), site, "worker.png", b"worker live bytes").await;
+
+    let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
+    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await.body
+        ["confirm_phrase"]
+        .as_str()
+        .expect("a phrase")
+        .to_owned();
+
+    // --- 1. A cancelled job is never claimed -------------------------------------------------
+    let doomed = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    let doomed_id = Uuid::parse_str(doomed.body["id"].as_str().expect("a job id")).expect("a uuid");
+    // The row is cancelled WITHOUT going through the route, so the job is `queued` **and**
+    // flagged — the exact state a cancel that lost the race to the worker leaves behind, and
+    // the one the worker's own flag check exists for.
+    sqlx::query(
+        "update backup_restore_jobs set cancel_requested = true where id = $1",
+    )
+    .bind(doomed_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the flag must be settable");
+
+    let runs_before = run_count(&fixture, fixture.org).await;
+    let tick = omnion_api::restore_job_runner::tick(&fixture.state)
+        .await
+        .expect("the restore tick must answer");
+    assert_eq!(tick, 1, "exactly one job was queued: {tick}");
+
+    let (status, _, started) = job_status(fixture.db.pool(), doomed_id).await;
+    assert_eq!(
+        status, "aborted",
+        "a flagged job must be aborted by the worker, not restored"
+    );
+    assert!(
+        started.is_none(),
+        "an aborted job must never have started: {started:?}"
+    );
+    assert_eq!(
+        run_count(&fixture, fixture.org).await,
+        runs_before,
+        "the worker restored a job somebody had already stopped — this is the whole feature"
+    );
+
+    // --- 2. A fresh job for the same run runs, and writes the object -------------------------
+    let fresh = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    assert_eq!(
+        fresh.status,
+        StatusCode::ACCEPTED,
+        "an aborted job must not block a new one — history is not history *yet*: {}",
+        fresh.body
+    );
+    let fresh_id = Uuid::parse_str(fresh.body["id"].as_str().expect("a job id")).expect("a uuid");
+
+    let tick = omnion_api::restore_job_runner::tick(&fixture.state)
+        .await
+        .expect("the restore tick must answer");
+    assert_eq!(tick, 1, "the fresh job was the only one queued: {tick}");
+
+    let (status, _, started) = job_status(fixture.db.pool(), fresh_id).await;
+    assert_eq!(status, "succeeded", "the job must have run: {status}");
+    assert!(
+        started.is_some(),
+        "a job that ran stamped its start: the abort window is defined as before this"
+    );
+
+    // The effect, over the real store. Asserting the status alone would be the walk asserting
+    // the worker's own bookkeeping, which is the mistake REQ-017's batching criterion exists
+    // to warn about.
+    assert_eq!(
+        fixture.state.storage().get(&key).await.unwrap_or_default(),
+        b"worker archived bytes",
+        "the queued restore must write the archived bytes back"
+    );
+    let (safety, objects): (Option<Uuid>, i64) = sqlx::query_as(
+        "select safety_backup_id, (result->'media'->>'objects_restored')::bigint \
+         from backup_restore_jobs where id = $1",
+    )
+    .bind(fresh_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the job must read");
+    assert_eq!(objects, 1, "one object was archived and one must be restored");
+    let safety = safety.expect("a succeeded restore must name the run to go back to");
+    let protected: bool = sqlx::query_scalar("select protected from backups where id = $1")
+        .bind(safety)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the safety run must exist");
+    assert!(protected, "the safety run of a queued restore must be protected like any other");
+
+    // --- 3. A job nothing claims is stopped rather than left to spin ------------------------
+    // The panel draws a queued job as a spinner for ever. A worker that crashed and restarted
+    // against a new configuration is enough to produce one, and the operator pressed a
+    // button.
+    let stranded = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    let stranded_id =
+        Uuid::parse_str(stranded.body["id"].as_str().expect("a job id")).expect("a uuid");
+    // Backdate past the worker's own ceiling. The only time travel in this walk.
+    sqlx::query(
+        "update backup_restore_jobs set created_at = now() - interval '3 hours' where id = $1",
+    )
+    .bind(stranded_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the job must be backdatable");
+
+    omnion_api::restore_job_runner::tick(&fixture.state)
+        .await
+        .expect("the restore tick must answer");
+    let (status, cancel_requested, started) = job_status(fixture.db.pool(), stranded_id).await;
+    assert_eq!(
+        status, "aborted",
+        "a job nobody claimed must be stopped, not left spinning: {status}"
+    );
+    assert!(started.is_none(), "and it never started: {started:?}");
+    assert!(
+        cancel_requested,
+        "the platform did ask — the row must say so rather than claim a restore that stopped \
+         itself"
+    );
+
+    // --- 3b. A job the worker DIED on is reclaimed, not left blocking the run ----------------
+    // The sweep originally covered only `queued`, and this is the state that made that a
+    // product bug rather than an omission: a worker killed mid-restore leaves a `running`
+    // row, and **nothing else can ever move it** — the queue read is the only thing that
+    // advances a job, a dead worker is by definition not going to, and the partial unique
+    // index refuses a new restore of that run while the row stands. One deploy in the middle
+    // of a restore and that run could not be restored again by anybody.
+    //
+    // It is `failed` and NOT `aborted`, and that distinction is the whole assertion: a
+    // claimed job has already taken its safety backup and may have written objects, so
+    // "nothing was written" would be a lie. `failed` is the state that means "it began and
+    // nobody finished it", and the schema allows it only for a job with a start.
+    let orphaned = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    let orphaned_id =
+        Uuid::parse_str(orphaned.body["id"].as_str().expect("a job id")).expect("a uuid");
+    // Claim it the way a worker does, then age it: this is a restore that was interrupted,
+    // not one that nobody picked up.
+    omnion_backup::restore_jobs::claim_restore_job(fixture.db.pool(), orphaned_id)
+        .await
+        .expect("the job must be claimable");
+    sqlx::query(
+        "update backup_restore_jobs set created_at = now() - interval '3 hours' where id = $1",
+    )
+    .bind(orphaned_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the job must be backdatable");
+
+    omnion_api::restore_job_runner::tick(&fixture.state)
+        .await
+        .expect("the restore tick must answer");
+    let (status, _, started) = job_status(fixture.db.pool(), orphaned_id).await;
+    assert_eq!(
+        status, "failed",
+        "a job whose worker died must be reclaimed, not left running for ever: {status}"
+    );
+    assert!(
+        started.is_some(),
+        "a failed restore is one that began, so the start must survive: {started:?}"
+    );
+    let reason: Option<String> =
+        sqlx::query_scalar("select error from backup_restore_jobs where id = $1")
+            .bind(orphaned_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the job must read");
+    let reason = reason.unwrap_or_default();
+    assert!(
+        reason.contains("NOT known"),
+        "the reason must say what is unknown rather than claim nothing was written: {reason}"
+    );
+
+    // And the run is restorable again, which is the point of clearing it. The job this
+    // creates is **cancelled at once**, because the walk still has a step after this one and
+    // the partial unique index refuses a second live job for the same run — a leftover of a
+    // walk's own making blocking the walk's next step is a self-inflicted failure that reads
+    // exactly like a product bug.
+    let again = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    assert_eq!(
+        again.status,
+        StatusCode::ACCEPTED,
+        "a run whose interrupted restore was reclaimed must be restorable again, or one crash \
+         costs the run its restore point for ever: {}",
+        again.body
+    );
+    let again_id = Uuid::parse_str(again.body["id"].as_str().expect("a job id")).expect("a uuid");
+    let released = cancel_restore(&fixture.state, &restorer_token, &restorer_csrf, again_id).await;
+    assert_eq!(
+        released.status,
+        StatusCode::OK,
+        "the walk's own leftover must be cancellable: {}",
+        released.body
+    );
+
+    // --- 4. A job queued with a phrase that is not this run's is refused, not run ------------
+    // The phrase is re-checked at execution time because it is a hash of the run id: a job
+    // that outlived a re-created run would otherwise restore on a phrase that never belonged
+    // to it.
+    let mismatched = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    let mismatched_id =
+        Uuid::parse_str(mismatched.body["id"].as_str().expect("a job id")).expect("a uuid");
+    // The job was queued with a correct phrase, so the row says the right thing; the edit
+    // below is what a row tampered with on the destination looks like to the worker.
+    sqlx::query("update backup_restore_jobs set confirmation = $2 where id = $1")
+        .bind(mismatched_id)
+        .bind("RESTORE deadbeef")
+        .execute(fixture.db.pool())
+        .await
+        .expect("the job must be editable");
+
+    omnion_api::restore_job_runner::tick(&fixture.state)
+        .await
+        .expect("the restore tick must answer");
+    let (status, _, _) = job_status(fixture.db.pool(), mismatched_id).await;
+    assert_eq!(
+        status, "failed",
+        "a job whose phrase is not this run's must be refused, not performed: {status}"
+    );
+    let reason: Option<String> =
+        sqlx::query_scalar("select error from backup_restore_jobs where id = $1")
+            .bind(mismatched_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the job must read");
+    let reason = reason.unwrap_or_default();
+    assert!(
+        reason.contains("confirmation phrase"),
+        "the refusal must name the rule, not say \"failed\": {reason}"
     );
 }
