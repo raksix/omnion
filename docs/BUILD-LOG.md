@@ -5666,3 +5666,88 @@ server; it is the next thing to read.
 both of which need a node selected first. REQ-004's sample-plugin run stays BLOCKED on REQ-121
 (wave 5b, unclaimed): `plugins_enabled_for` returns an empty registry, so no plugin node can
 appear in any browser.
+
+## Tick 40 (wave3) — the last tick's fix was stated over the wrong collection
+
+Tick 40 was supposed to read `validate-classes.ambiguousBranch` off a browser pass. The pass
+still cannot run — `origin/main` does not compile, five errors in the main writer's in-flight
+REQ-014 `health_panel.rs` — and `cargo check -p omnion-api --lib` re-confirmed all five here,
+so the fast gate's blindness is now a measured fact rather than a habit.
+
+So the tick opened `graph.rs` to add the missing probe row, and the file answered a different
+question first. Two defects, both in code this branch owns, both found by reading the shape the
+last tick's fix was stated over rather than the shape it actually handled.
+
+**The tick-39 fix counted ports. The traversal picks edges.** `ambiguous_branch` collected the
+*distinct port keys* a node left on and refused a set of two. A switch with `case_1` wired to
+two different **targets** has one walked port, two edges, and two distinct
+`(source, port, target)` triples — so `ambiguous_branch` was quiet, and `duplicate_edge` was
+quiet too, because that check keys on the triple and two targets are two triples.
+
+The consequence is the wrong-run bug the whole check exists for, one shape narrower: the rule
+validates **clean**, `project` resolves the next node with `find(|edge| … follows(port))`, and
+the walk goes to whichever target the client serialised first. Re-saving the identical drawing
+with the edges reordered changes what it does. And this one was **introduced by the fix** —
+last tick's defect was two walked *ports*, this is two walked *edges*, and a check stated over
+ports cannot see edges.
+
+The invariant is now stated over edges, because that is what the walk consumes: more than one
+distinct target among a node's followed edges is refused at write time, naming the ports. Two
+edges on one port pointing at the **same** target stay `duplicate_edge`'s finding — a re-drawn
+line is not a choice, and one cause gets one sentence rather than two.
+
+**The registry and the projection are two hand-maintained lists, and nothing checked they
+agreed.** Found by the same grep, one function away: `step_for` has arms for `end`, `wait`,
+`condition`, `approval`, `http_request`, `transform`, `sub_workflow` and `action`. `switch` — the
+node type the palette **offers**, because `NODE_TYPES` advertises it and REQ-004's own
+node-types v1 list names it — has no arm, falls into `other =>`, and is refused with
+`unknown_node_type`: *`"switch" does not project onto a step`*. That code means "I have no such
+type", and for a key the palette just handed the author it is always false. The author's first
+thought is that the platform lost their card.
+
+The switch keeps its place in the palette and gains a refusal that says what is actually true —
+the engine runs one Condition per step and has no multi-arm step — with the alternative named
+(put a Condition on the canvas and chain them). "Not supported yet" with no next step is the
+answer that teaches people to ignore the problems panel. Its **palette summary** says the same
+thing before the card is dragged rather than after it is refused, because that sentence is
+drawn under the card *and* again above the node editor: it is what the author decides from.
+
+**Proof.** Both tests were written first and failed against the pre-fix code, with the failure
+messages naming the exact shape:
+
+* `a_node_with_two_edges_on_one_walked_port_is_refused_rather_than_guessed` → `two edges on one
+  walked port is the same un-walkable node as two walked ports: []` — `validate` returned **no
+  findings at all** for a graph that walks the wrong branch. It also asserts the verdict is
+  byte-identical when the two edges are swapped, so the ordering cannot creep back as a pass.
+* `every_node_type_the_palette_offers_projects_onto_a_step` → `"switch" is offered by the palette
+  and refused as a type the platform does not know`.
+
+Each fix was then re-proved by reverting *only* it: with the port-count check back, the first
+test fails; with the `switch` arm removed, the second fails. `cargo test -p omnion-workflows
+--lib` **150 passed / 0 failed** (148 before). `pnpm typecheck` 2/2.
+
+**The guard is a loop over `NODE_TYPES`, and it caught the test's own fixture twice.** Both are
+the shape of the lesson and neither is a nit:
+
+* `end` exports **no output port** — that is what makes it the end — so wiring it mid-spine
+  produced `unknown_source_port` before the projection was reached. The assertion would have been
+  measuring the port check instead of the thing it was written for.
+* `sample_param` now fills by the registry's declared `kind`. The first draft put `"sample"` in
+  every text field and three types came back refused (`wait` wants a number, `action` wants its
+  `parameters` to parse as JSON, `sub_workflow` wants a rule id that exists) — which reads as
+  *three more engine gaps* and would have been recorded as product findings. **A fixture that
+  cannot satisfy its own assertion is indistinguishable from a defect**, so the fixture is built
+  from the same schema the code under test reads.
+
+**The set of refused types is asserted as a LIST** (`vec!["switch"]`), which is a stronger claim
+than "nothing is refused as unknown": a second type entering that list becomes a product
+decision somebody has to make on purpose, rather than appearing because a `match` arm was
+forgotten.
+
+**Next.** Still no browser pass — `origin/main`'s five `health_panel.rs` errors are the main
+writer's REQ-014 and are verbatim on `origin/main`. When it builds: read
+`validate-classes.ambiguousBranch` with **both** rows (`found` AND `orderIndependent`), then the
+`listener` row (`panelFound:false, controlFound:false`) and `tab-walk`'s `reachedAnEdge:false`,
+both of which need a node selected first. REQ-004's plugin-node run stays **BLOCKED** on REQ-121
+(wave 5b, unclaimed): `plugins_enabled_for` returns an empty registry, so no plugin node can
+appear in any browser.
