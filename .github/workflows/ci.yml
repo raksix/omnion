@@ -512,3 +512,27 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate development compose stack
         run: docker compose -f infra/compose/docker-compose.dev.yml config --quiet
+
+  release-manifest:
+    # The release gate (REQ-128, slice 3). It runs on EVERY commit, not only on a tag, and
+    # that is the point: a tag is the moment the pipeline cannot refuse anything cheaply, and
+    # every rule here is a rule about repository facts that are already committed — the
+    # Dockerfiles, the chart, the migration list, the versions five files declare. A drift
+    # between those is findable in seconds on a commit and is only findable after the fact
+    # once an image has been pushed under a tag somebody believes is immutable.
+    name: Release — manifest contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Manifest unit tests
+        run: python3 release/tests/test_release_manifest.py
+      # The gate mutates the manifest nineteen ways and requires every one to be caught. A
+      # green run therefore means two things at once: the builder works, and the checks are
+      # capable of failing.
+      - name: Manifest gate (with mutations)
+        run: bash scripts/qa/release-manifest.sh
+      - name: Chart renders and lints
+        run: bash scripts/qa/helm-chart.sh

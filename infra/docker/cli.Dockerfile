@@ -8,6 +8,15 @@
 # target — the release pipeline builds the same binary for aarch64/amd64 as a separate
 # `release/` artifact, and this file is what puts it on a host that has Docker and nothing else.
 #
+# omnion:non-service — this image is deliberately NOT a compose service or a chart workload.
+# It publishes no ports, has no health endpoint and nothing routes to it: `docker compose run
+# --rm cli migrate` is how it is used, which is a different lifecycle from every other service
+# in the stacks. The release manifest cross-checks the images a Dockerfile builds against the
+# images the deployment artifacts deploy, and an image built for nothing is a registry orphan;
+# this marker is how an image states "nothing deploys me, and here is why", so the check can
+# allow exactly this case instead of naming `cli` as a hard-coded exception in a file that has
+# to be edited every time another non-service image appears.
+#
 # Size budget: cli ≤ 40 MB compressed.
 
 # ---------------------------------------------------------------------------------------------
