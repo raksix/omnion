@@ -11,7 +11,8 @@ use omnion_api::audit_retention;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, backup_sweep_runner, cdn_purge_runner,
+    analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
+    cdn_purge_runner,
     environment_clone_runner, event_retention_runner, event_runner, retention_runner, search_runner,
     workflow_runner,
 };
@@ -149,6 +150,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // because the two sweep different things: an installation that keeps every backup for
     // ever must be able to keep its media sweeper. `prune_candidates` shipped in slice 1 and
     // had no caller at all, so this is the tick that gives it one.
+    // The schedule worker takes the backups a `backup_schedules` row asked for. The table,
+    // the `next_due_schedules` query and the `cadence` sentence in the API all shipped in
+    // slice 1 and slice 2a; nothing wrote `next_run_at` and nothing called that query, so a
+    // schedule could be created, listed and rendered with an empty next-run cell for ever.
+    // This is the tick that gives both a writer and a reader.
+    let _backup_schedules = backup_schedule_runner::spawn(state.clone());
+
     if state.config().retention.backup_sweep_enabled {
         let _backup_sweep = backup_sweep_runner::spawn(state.clone());
     } else {

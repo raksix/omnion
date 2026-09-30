@@ -187,6 +187,7 @@ pub struct QuarantineBody {
     /// What the scanner said, in its own words.
     pub detail: String,
     /// When the file was held.
+    #[serde(with = "time::serde::rfc3339")]
     pub quarantined_at: OffsetDateTime,
     /// The run that produced it, when it came from one.
     pub run_id: Option<Uuid>,
@@ -240,8 +241,10 @@ pub struct ScanRunBody {
     /// The engine the scanner named.
     pub engine: String,
     /// When the run started.
+    #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     /// When it finished; null while it is still running.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     /// One sentence — never a number without a word.
     pub summary: String,

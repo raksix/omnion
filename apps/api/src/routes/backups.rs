@@ -75,16 +75,20 @@ pub struct BackupBody {
     /// Whether the prune sweep leaves it alone.
     pub protected: bool,
     /// When the prune sweep may remove it.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub retain_until: Option<OffsetDateTime>,
     /// Why it failed.
     pub error: Option<String>,
     /// Who started it.
     pub created_by: Option<Uuid>,
     /// When it was asked for.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it began.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
     /// When it stopped.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     /// The title the screen shows: the label, or the instant when there is no label.
     pub title: String,
@@ -189,6 +193,7 @@ pub struct BackupDetail {
 #[derive(Debug, Serialize)]
 pub struct StatusBody {
     /// When the last run that produced artifacts finished, and which one it was.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_successful_at: Option<OffsetDateTime>,
     /// That run's id, so the card links to a specific row rather than to the list.
     pub last_successful_id: Option<Uuid>,
@@ -201,6 +206,7 @@ pub struct StatusBody {
     /// How many backups the prune sweep will never remove.
     pub protected: i64,
     /// The nearest schedule that is due.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub next_scheduled_at: Option<OffsetDateTime>,
     /// The destination's health, from the last probe or from a fresh one.
     pub destination: DestinationBody,
@@ -245,6 +251,7 @@ pub struct SettingsBody {
     /// Whether a run re-reads its own artifacts.
     pub verify_after_backup: bool,
     /// When it was last saved.
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -289,8 +296,10 @@ pub struct ListQuery {
     /// Restrict to one destination.
     pub destination: Option<String>,
     /// Only runs created at or after this.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_after: Option<OffsetDateTime>,
     /// Only runs created at or before this.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_before: Option<OffsetDateTime>,
     /// Page size.
     #[serde(default)]
@@ -374,8 +383,10 @@ pub struct ScheduleBody {
     /// Whether it is active.
     pub enabled: bool,
     /// When it last ran.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_run_at: Option<OffsetDateTime>,
     /// When it next runs.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub next_run_at: Option<OffsetDateTime>,
     /// The run it produced last.
     pub last_backup_id: Option<Uuid>,
@@ -794,6 +805,338 @@ pub async fn list_schedules(
     Ok(Json(rows.iter().map(ScheduleBody::from_row).collect()))
 }
 
+/// What an operator sends to create or edit a schedule.
+#[derive(Debug, Deserialize)]
+pub struct ScheduleSave {
+    /// Display name, unique per tenant.
+    pub name: String,
+    /// `hourly|daily|weekly|monthly`.
+    pub frequency: String,
+    /// `HH:MM`; optional for hourly only.
+    #[serde(default)]
+    pub at_time: Option<String>,
+    /// 0–6, weekly only.
+    #[serde(default)]
+    pub day_of_week: Option<i16>,
+    /// 1–28, monthly only.
+    #[serde(default)]
+    pub day_of_month: Option<i16>,
+    /// IANA zone name.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// The parts it produces; at least one.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// How many of its own runs to keep.
+    #[serde(default)]
+    pub retention_count: Option<i32>,
+    /// `local|s3`.
+    #[serde(default)]
+    pub destination: Option<String>,
+    /// Whether the worker acts on it.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// The migration's default zone, repeated here as the API's default.
+///
+/// Spelled out rather than read from the crate so the request body and the stored row have
+/// one definition of "the zone an operator did not choose". A second `unwrap_or("UTC")` in
+/// the worker is how a schedule ends up computed in two different zones.
+fn default_timezone() -> String {
+    "UTC".to_owned()
+}
+
+/// `POST /api/v1/backup-schedules` — create one.
+///
+/// **`next_run_at` is written here, in the same statement that writes the row.** That is the
+/// entire point of the route: the column existed, the worker had a query for it, and nothing
+/// filled it, so a schedule could be created and never fire while the screen said "Every day
+/// at 02:00". The value comes from [`omnion_backup::Cadence`], which is unit-tested for both
+/// daylight-saving transitions, so this handler does no time arithmetic of its own.
+///
+/// A schedule whose cadence cannot be computed — an unknown timezone, a daily row with no
+/// time of day — is refused with a `400` naming the field rather than stored with a null
+/// next run. Storing it would let the row exist, the list render it, and the worker skip it
+/// for ever, which is the same defect one layer down.
+pub async fn create_schedule(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Json(body): Json<ScheduleSave>,
+) -> std::result::Result<Json<ScheduleBody>, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let settings = omnion_backup::load_settings(pool).await?;
+
+    let draft = omnion_backup::NewSchedule {
+        organization_id: org,
+        name: body.name.clone(),
+        frequency: body.frequency.clone(),
+        at_time: body.at_time.clone(),
+        day_of_week: body.day_of_week,
+        day_of_month: body.day_of_month,
+        timezone: body.timezone.clone(),
+        scopes: body.scopes.clone(),
+        retention_count: body.retention_count.unwrap_or(settings.default_retention),
+        destination: body
+            .destination
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| settings.destination.clone()),
+        enabled: body.enabled,
+        created_by: Some(current.user.id),
+    };
+
+    // Validate the cadence against the row as it will be stored, not against the request: a
+    // schedule that survives a round trip is one the worker will also be able to compute.
+    let cadence = cadence_of(&draft)?;
+    let now = OffsetDateTime::now_utc();
+    // A disabled schedule has no next run. Storing one anyway would put a future instant in
+    // a column the worker's query filters on `enabled`, and the schedule table would show a
+    // next run for something that will never run.
+    let next_run_at: Option<OffsetDateTime> =
+        draft.enabled.then(|| cadence.next_after(now)).transpose()?;
+
+    let row = omnion_backup::upsert_schedule(pool, None, &draft).await?;
+    omnion_backup::set_schedule_next_run(pool, row.id, next_run_at).await?;
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.schedule.updated",
+        row.id.to_string(),
+        json!({
+            "created": true,
+            "frequency": row.frequency,
+            "timezone": row.timezone,
+            "scopes": row.scopes,
+            "enabled": row.enabled,
+            "next_run_at": next_run_at,
+        }),
+    )
+    .await;
+
+    let mut body_out = ScheduleBody::from_row(&row);
+    body_out.next_run_at = next_run_at;
+    Ok(Json(body_out))
+}
+
+/// `PUT /api/v1/backup-schedules/{id}` — edit one.
+///
+/// The next run is recomputed on every edit rather than left alone. That is the half people
+/// forget: an operator who changes a schedule from 02:00 to 04:00 and does not see the next
+/// run move has been told the change did not take, when in fact it was stored and the stale
+/// column is what the worker reads.
+///
+/// A stranger's schedule is a `404` rather than a `403`, from the same rule as the rest of
+/// this file: a `403` confirms the id exists.
+pub async fn update_schedule(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ScheduleSave>,
+) -> std::result::Result<Json<ScheduleBody>, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let settings = omnion_backup::load_settings(pool).await?;
+
+    let draft = omnion_backup::NewSchedule {
+        organization_id: org,
+        name: body.name.clone(),
+        frequency: body.frequency.clone(),
+        at_time: body.at_time.clone(),
+        day_of_week: body.day_of_week,
+        day_of_month: body.day_of_month,
+        timezone: body.timezone.clone(),
+        scopes: body.scopes.clone(),
+        retention_count: body.retention_count.unwrap_or(settings.default_retention),
+        destination: body
+            .destination
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| settings.destination.clone()),
+        enabled: body.enabled,
+        created_by: Some(current.user.id),
+    };
+    let cadence = cadence_of(&draft)?;
+    let now = OffsetDateTime::now_utc();
+    let next_run_at: Option<OffsetDateTime> = draft
+        .enabled
+        .then(|| cadence.next_after(now))
+        .transpose()?;
+
+    let row = omnion_backup::upsert_schedule(pool, Some(id), &draft).await?;
+    omnion_backup::set_schedule_next_run(pool, row.id, next_run_at).await?;
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.schedule.updated",
+        row.id.to_string(),
+        json!({
+            "created": false,
+            "frequency": row.frequency,
+            "timezone": row.timezone,
+            "scopes": row.scopes,
+            "enabled": row.enabled,
+            "next_run_at": next_run_at,
+        }),
+    )
+    .await;
+
+    let mut body_out = ScheduleBody::from_row(&row);
+    body_out.next_run_at = next_run_at;
+    Ok(Json(body_out))
+}
+
+/// `DELETE /api/v1/backup-schedules/{id}` — remove one.
+///
+/// Its runs keep their own `kind` and lose only the link, so deleting a schedule never deletes
+/// the restore points it produced. That is the difference between "stop backing up" and
+/// "throw away the backups", and the schema is arranged so the second is not expressible here.
+pub async fn delete_schedule(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    omnion_backup::delete_schedule(pool, id, org).await?;
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.schedule.updated",
+        id.to_string(),
+        json!({ "deleted": true }),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/backup-schedules/{id}/run` — take a backup right now, on the schedule's terms.
+///
+/// `backup.create`, not `backup.manage`: pressing "run now" produces a backup and changes
+/// nothing else, which is the same power as the drawer's own button. A separate key for it
+/// would mean an operator who may take a backup may not test that the schedule works.
+///
+/// The run carries the schedule's **own** scopes and is tied to it with `kind = "scheduled"`,
+/// so the list can show which restore points came from a schedule and the schedule's "last
+/// run" column has something real in it. It does **not** move `next_run_at`: a manual run is
+/// not the scheduled one, and advancing the schedule would silently skip the next real slot
+/// because somebody clicked a button.
+pub async fn run_schedule_now(
+    state: State<AppState>,
+    current: CurrentSession,
+    address: ClientAddress,
+    Path(id): Path<Uuid>,
+) -> std::result::Result<(StatusCode, Json<CreateResult>), ApiError> {
+    let org = current.user.organization_id;
+    let pool = state.db().pool();
+    let schedule = omnion_backup::find_schedule(pool, id, org).await?;
+
+    let settings = omnion_backup::load_settings(pool).await?;
+    let scopes = if schedule.scopes.is_empty() {
+        omnion_backup::PARTS
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect()
+    } else {
+        schedule.scopes.clone()
+    };
+
+    let draft = omnion_backup::NewBackup {
+        organization_id: org,
+        label: format!("{} (run now)", schedule.name),
+        kind: "scheduled".to_owned(),
+        schedule_id: Some(schedule.id),
+        scopes,
+        destination: schedule.destination.clone(),
+        storage_prefix: String::new(),
+        // Never protected: a manual run is a backup like any other, and marking it protected
+        // because a button was pressed would put it outside the retention window forever.
+        protected: false,
+        retain_until: Some(OffsetDateTime::now_utc() + time::Duration::days(i64::from(
+            schedule.retention_count.max(1),
+        ))),
+        created_by: Some(current.user.id),
+    };
+    let row = omnion_backup::insert_backup(pool, &draft).await?;
+    let prefix = storage_prefix(&format!("{}/{}", row.created_at.date(), row.id));
+    let prefixed = omnion_backup::set_prefix(pool, row.id, &prefix).await?;
+    omnion_backup::start_run(pool, row.id).await?;
+
+    let parts = produce_all(&state, &prefixed).await;
+    let stored = omnion_backup::list_parts(pool, row.id).await?;
+    let finished = omnion_backup::finish_run(pool, row.id, &stored, &now_string()).await?;
+    let _ = settings;
+
+    record(
+        pool,
+        org,
+        current.user.id,
+        address.as_text(),
+        "backup.created",
+        finished.id.to_string(),
+        json!({
+            "schedule_id": schedule.id,
+            "schedule_name": schedule.name,
+            "manual_run": true,
+            "scopes": finished.scopes,
+            "status": finished.status,
+            "size_bytes": finished.size_bytes,
+            "failed_parts": parts.iter().filter(|p| p.status == PartStatus::Failed).count(),
+        }),
+    )
+    .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateResult {
+            backup: BackupBody::from_row(&finished),
+            parts: stored.iter().map(PartBody::from_part).collect(),
+        }),
+    ))
+}
+
+/// The cadence a draft schedule would have, validated before it is stored.
+///
+/// A separate function rather than an inline call because it is used by both write routes and
+/// the worker, and a second spelling of "read a cadence out of something schedule-shaped" is
+/// how a schedule the editor accepted gets refused by the worker — or worse, the other way.
+fn cadence_of(draft: &NewSchedule) -> std::result::Result<omnion_backup::Cadence, ApiError> {
+    let probe = omnion_backup::BackupSchedule {
+        id: Uuid::nil(),
+        organization_id: draft.organization_id,
+        name: draft.name.clone(),
+        frequency: draft.frequency.clone(),
+        at_time: draft.at_time.clone(),
+        day_of_week: draft.day_of_week,
+        day_of_month: draft.day_of_month,
+        timezone: draft.timezone.clone(),
+        scopes: draft.scopes.clone(),
+        retention_count: draft.retention_count,
+        destination: draft.destination.clone(),
+        enabled: draft.enabled,
+        last_run_at: None,
+        next_run_at: None,
+        last_backup_id: None,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+        updated_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    Ok(omnion_backup::Cadence::from_schedule(&probe)?)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
@@ -901,6 +1244,24 @@ pub async fn write_settings(
 /// deliberately honest: it reports zero components, because no package installer exists yet,
 /// and it says so in the document rather than failing — an empty part is a fact, a missing
 /// part is a bug.
+/// Produce a run's parts from outside this module — the schedule worker's entry point.
+///
+/// A one-line wrapper rather than making [`produce_all`] public, because the producer has two
+/// callers and they are the two routes to the same five artifacts: the create route and the
+/// schedule worker. A worker that grew its own producer loop would be a second implementation
+/// of "what a part is", on the path that runs unattended at 02:00 on every installation that
+/// set up a schedule. That is the same argument that put the safety backup on `produce_all`.
+pub(crate) async fn produce_for_worker(
+    state: &AppState,
+    run: &omnion_backup::Backup,
+) -> i32 {
+    produce_all(state, run)
+        .await
+        .iter()
+        .filter(|part| part.status == PartStatus::Failed)
+        .count() as i32
+}
+
 async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part> {
     let pool = state.db().pool();
     let prefix = run.storage_prefix.clone();

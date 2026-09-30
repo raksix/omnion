@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 pub mod apply;
+pub mod cadence;
 pub mod destination;
 pub mod error;
 pub mod media;
@@ -47,6 +48,7 @@ pub use apply::{
     ArchiveFacts, MAX_MEDIA_OBJECTS, MAX_SELECTED_PARTS, PlanError, PlanRefusal, RestorePlan,
     RestoreRequest, build_plan,
 };
+pub use cadence::Cadence;
 pub use destination::{
     DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
     storage_prefix,
@@ -83,9 +85,12 @@ pub use store::{
     Backup, BackupPage, BackupQuery, BackupSchedule, BackupSettings, NewBackup, NewPart,
     NewSchedule, NewSettings, PartTotals, StatusTotals, count_by_status, delete_backup,
     delete_schedule, find_backup, finish_run, insert_backup, insert_part, list_backups, list_parts,
-    list_schedules, load_settings, manifest_of, next_due_schedules, organizations_with_backups,
+    find_schedule, list_schedules, load_settings, manifest_of, next_due_schedules,
+    organizations_with_backups,
     protected_backup_count, prune_candidates, record_schedule_run, save_part, save_settings,
-    schedule_appears_due, set_prefix, set_protected, start_run, totals, upsert_schedule,
+    schedule_appears_due, set_prefix, set_protected, set_schedule_enabled,
+    set_schedule_next_run, start_run, totals,
+    upsert_schedule,
 };
 pub use sweep::{
     MAX_REPORTED_STRANDED, StrandedArtifact, SweepReport, sweep_all, sweep_organization,
