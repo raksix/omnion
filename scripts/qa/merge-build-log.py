@@ -164,9 +164,15 @@ for side, arr in (("ours", ours), ("theirs(main)", theirs)):
         sys.exit(1)
 
 # (d) truncation detector, on prose.
-bm = {head(b): b for b in base}
-trunc = [(head(b)[:60], len(content(bm[head(b)])), len(content(b)))
-         for b in merged if head(b) in bm and len(content(b)) < len(content(bm[head(b)]))]
+# A LENGTH comparison against "the base entry with this heading" is wrong, and this
+# script's own docstring says why: a heading is not a unique key. Two entries can
+# share one -- base holds two different "Tick 77 addendum" entries (21 and 23 prose
+# lines, neither a subset of the other), so the dict kept the 23-line one and called
+# the 21-line one truncated. Truncation is a SUBSET relation, not a length relation:
+# an entry is a wound exactly when its prose is a strict subset of a same-heading
+# base entry, which is the `is_damaged_copy` predicate steps 2 and 3 already share.
+trunc = [(head(b)[:60], len(content(b)), len(max(base_by_head[head(b)], key=len)))
+         for b in merged if is_damaged_copy(b)]
 if trunc:
     print("ENTRIES LOST PROSE LINES:", trunc[:5])
     sys.exit(1)
