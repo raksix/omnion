@@ -1,6 +1,6 @@
 # REQ-127 — Reliability Primitives
 
-> **Status:** in-progress (slice 1 is on the request path AND on the screen: the Redis counter, the store, the middleware, the headers on BOTH the served and the refused response, the `429` with `Retry-After`, the panel's policy CRUD, its dry-run and its refusal rollup at `/settings/reliability/limits`, plus the shipped default budgets — `crates/reliability` at 113 unit tests, migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database, `apps/admin` `tsc --noEmit` clean. The two stragglers in `apps/api/tests/reliability_limits` are **located, not fixed**: both are a `200` served with no `X-RateLimit-*` headers, which is the `Uncounted` verdict, and it is reachable because `resolve_user_id` treats a session it could not ask PostgreSQL about the same as one that does not exist — see "third pass" below for the measurement, the rejected hypothesis and the fix that is not yet written. The QA browser pass against the screen still has not run· **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 is COMPLETE and green end to end: the uncounted-request defect is fixed and its regression test fails against the old body, `reliability_limits` is 8/8 in one sequential run — both stragglers at once — `omnion-api --lib` 270/270 and `omnion-reliability` 114. Slice 2’s STORE is in and proved: `crates/reliability/src/idem_store.rs`, 11 walks including one where exactly one of eight concurrent claims wins, which found that the upsert’s takeover predicate compared the expiry the statement was writing, so all eight were granted. Still open for this REQ: the QA browser pass against `/settings/reliability/limits` has never run (the single slot was the main writer’s live pass for the whole tick), and slice 2’s middleware, events and screen are not written — the store is its persistence half only · **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -108,11 +108,11 @@ Migration: `database/migrations/0028_reliability.sql` (next free slot at tick ti
 
 - [x] `database/migrations/0028_reliability.sql` applies on a fresh and a populated database, and its down script reverses it. *(Shipped as `0162_reliability.sql`, the slot above the shared high-water mark at write time. Verified on a scratch database: the up half creates all nine tables, the commented reversal drops all nine, and — the reason the reversal is COMMENTED — `Db::migrate` executes a file's live statements on apply, so a down script written as live SQL would drop what it had just created and record a success doing it. That was a defect in the first draft, caught by the migration test rather than by reading the file.)*
 - [x] Login, password-reset and public form routes ship with conservative default budgets. *(Migration `0165_reliability_default_budgets.sql` seeds four rows, marked `is_default` so `store::delete_policy` DISABLES rather than removes them: sign-in 10/min +2 burst, password-reset 3/hour with no burst, the public subtree 120/min +20, and a per-user 600/min on the authenticated API. The last one is the row that makes the `user` scope reachable at all — without it a deployment has no user budget and the screen's scope dropdown offers a scope nothing can ever spend. Applied twice against a scratch database: four rows after two applies.)*
-- [ ] Replaying a keyed write with the same key and body returns the stored response with `Idempotent-Replay: true` and does not execute the handler twice (asserted by counting side effects).
-- [ ] The same key with a different body is `409 idempotency_conflict`.
-- [ ] A replay while the original attempt is running is `409` with `Retry-After`, and resolves once the original completes.
-- [ ] A keyed request that is refused by a permission check never consumes an idempotency key.
-- [ ] Expired keys are pruned, and an in-progress key past the execution deadline is released so it can be retried.
+- [ ] Replaying a keyed write with the same key and body returns the stored response with `Idempotent-Replay: true` and does not execute the handler twice (asserted by counting side effects). *(Store half done: `idem_store::complete` stores the status, headers and body verbatim and a second `claim` over the same key hands back that exact record — `a_replay_returns_the_stored_response_and_counts_itself`. The header and the side-effect count belong to the middleware, which is not written.)*
+- [ ] The same key with a different body is `409 idempotency_conflict`. *(Decision half proved: `decide` answers `Conflict` for a live key with a different fingerprint, and a DIFFERENT subject is a fresh key rather than a collision — `the_same_key_with_a_different_body_is_a_conflict_and_a_different_subject_is_not`. The `409` is the middleware.)*
+- [ ] A replay while the original attempt is running is `409` with `Retry-After`, and resolves once the original completes. *(Decision half proved: `claim` on a live `in_progress` key returns `Existing`, `decide` answers `InProgress` with `Retry-After`, and once `complete` commits the same key answers `ReturnStored` — `a_replay_returns_the_stored_response_and_counts_itself`. The `409` is the middleware.)*
+- [ ] A keyed request that is refused by a permission check never consumes an idempotency key. *(DESIGN, not yet enforced by code: the claim happens after authentication and permission and is never rolled back, because rolling back would let a refused request delete the winner’s `in_progress` row. There is no middleware yet, so this is documented rather than proved — `release_stale` exists for a CRASHED attempt and is not an undo.)*
+- [ ] Expired keys are pruned, and an in-progress key past the execution deadline is released so it can be retried. *(Both halves proved: `an_expired_key_is_freed_and_taken_by_the_next_caller` (the upsert takes an expired row over in ONE statement — deleting first would open a window where two callers both see no row), `an_in_progress_key_is_released_and_then_runs_again` and `a_completed_key_is_never_released` (releasing a completed key would destroy a real stored response). This walk also found that `decide` mapped a `failed` key to `ReturnStored` — a `200` with a NULL body for a write that never happened; it returns `Proceed` now.)*
 - [x] A `429` refusal carries `Retry-After`, `X-RateLimit-Limit/Remaining/Reset` and the standard error code. *(Proved over HTTP against a live router: a request past the ceiling gets `429` with `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` and the `rate_limited` code. The refusal names its own document through `details.limiter`, because the gateway limiter sits in the same chain and an unattributable `429` is a `429` an operator widens the wrong document over.)*
 - [x] A served request carries the same headers, so a client does not have to spend the ceiling discovering it. *(This is the one this tick found: it had never run, because the previous tick's link step died on a full `/dev/shm` before a single assertion executed. `decide_request` returned `Option<ApiError>`, so the allowed path computed a verdict, spent the budget, and dropped the verdict — `apply_headers` was written and documented for exactly that path and was reachable only from a refusal. It now returns a `Decision` enum carrying the verdict and the winning policy. `Unlimited` is returned explicitly for "no policy" rather than a bare "proceed", because that variant carries no number and is what stops the header publishing `Limit: 0` for a deployment nobody capped.)*
 - [x] Limits apply per user, per organization, per IP and per route; the most specific policy wins and the dry-run endpoint names it. *(The dry-run resolves through the same `pick`/`decide` the middleware calls and does not spend the budget it measures, so the screen cannot drift from the refusal a caller is actually seeing. It is a SERVER call, not a client-side reimplementation: a local copy agrees on the day it is written and disagrees the first time somebody tunes a limit. Specificity is the scope list's order, so "most specific wins" is a property of the data rather than of the resolver.)*
@@ -391,3 +391,65 @@ that ran — 110/110 unit tests, `0162` applied and reversed on a scratch databa
 twice with four rows after two applies — and the walk is recorded as **not run** rather than
 passed. A saturated box fails a build with a signal that does not name the cause, and a red gate
 reported as a test failure sends the next operator to the wrong file.
+
+### Slices — progress, fourth pass: three answers, and a claim the index arbitrates
+
+**The straggler is fixed, and the fix was already half-written.** The previous tick's diff had the
+`Result<Option<Uuid>, IdentityError>` signature, the call site's downgrade branch and the new test —
+but the function body still ended in `.ok().flatten()`, so nothing could ever produce an `Err` and the
+downgrade was unreachable. The signature changed and the behaviour did not, which is the shape a
+half-finished tick leaves: it compiles, it has a test that looks aimed at the defect, and the test
+was red for exactly the right reason. The mutation proof came free — **the test failed against the
+previous body and passes against this one**, which is the only kind of green worth quoting.
+
+**`resolve_user_id` has three answers now.** No cookie is `Ok(None)` — a fact about the request, not a
+lookup that failed. A found session is `Ok(Some(_))`. A database that cannot be asked is `Err`, and it
+travels to `decide_request`, which logs it, still spends the address budget (the old comment was right
+about that half) and downgrades the served verdict to `Uncounted`. **`Unlimited` was the wrong
+verdict**, not because it is wrong on its own but because it means "no budget is written for this
+scope" — a statement about the deployment — while `Uncounted` means "this request was not counted",
+which is the truth and is non-authoritative, so `apply_headers` withholds the numbers rather than
+publishing a measurement nobody took. The downgrade only fires when an enabled user-scoped policy
+existed, because a deployment with no user budget lost nothing and reporting an anomaly that cannot
+happen trains an operator to ignore the log line.
+
+**Slice 2's store, and the four defects its walks found.** `crates/reliability/src/idem_store.rs`
+claims a key with one `INSERT … ON CONFLICT DO UPDATE … WHERE` and reads `rows_affected`; a
+read-then-write cannot work because the read is not part of the decision the database makes.
+
+1. **The takeover predicate compared the wrong bound** — `where idempotency_keys.expires_at <= $8`,
+   where `$8` is the expiry the statement was about to *write*. Every live row satisfies that, so the
+   `do update` fired on every claim and **eight of eight concurrent claims returned `Claim::Claimed`**.
+   The unique index never arbitrated, because the upsert had already converted the conflict into an
+   update. This is the single most valuable thing in the slice: it is invisible to review, it is
+   invisible to every unit test, and one walk of eight simultaneous claims found it on its first run.
+2. **`jsonb` on both sides.** `response_body` is `jsonb` in the migration and `String` in
+   `KeyRecord`, so the write refused with `42804` and the read with a `ColumnDecode` — every replay of
+   a row carrying a body failed while every claim-only test was green. Two of the three halves of the
+   store are storage, and both directions need the cast.
+3. **`decide` mapped a `failed` key to `ReturnStored`** — status 200, NULL body, for a write that
+   never happened. A client told a write succeeded that did not, which is the worst answer the
+   subsystem can give. It returns `Proceed`, and the upsert takes a `failed` row over, so the retry
+   runs and the row is the evidence rather than a permanent silent refusal.
+4. **Two of my own tests asserted states the constructor cannot produce.** Both were resolved by asking
+   which side was right before editing anything: the release test expected a retry to *find* the
+   released row, while the takeover makes it a fresh claim (product right, test wrong), and the cap
+   test hand-built an oversized inline body that `seal` always drops to `None` (test wrong). Two
+   tests and two code fixes in one slice, and the mutations are recorded in the commit messages.
+
+**Where the slice actually stands.** The store is the *persistence* half. The middleware that claims
+after permission, the `Idempotent-Replay: true` header, the `409 idempotency_conflict`, the two
+events and the screen are **not written** — so the five idempotency acceptance lines are annotated
+rather than ticked, and each annotation names which half is proved. The QA browser pass against
+`/settings/reliability/limits` **still has not run**: the single slot belonged to the main writer's
+live pass for the whole tick (holder cwd verified as `/mnt/apopic/omnion`, alive, 46 s old at first
+check), and taking it is not mine to do.
+
+**Env.** `/` was at **100% with 9.9 MB free** on entry and this worktree's `target/` sits on it.
+Reclaiming only this worktree's own stale walk binaries from `debug/deps` — 5.7 GB, 38 executables,
+the API binary and the two this tick runs explicitly kept — took it to 95%. That reclaim is safe
+because it is name-shaped and confined to one worktree's own target; the six siblings' targets are
+never touched, and neither is anything under `/mnt/apopic` (83%).
+
+**Next.** (1) Take the QA slot and run the browser pass on the limits screen. (2) Slice 2's
+middleware and screen. (3) Slices 3 and 4.
