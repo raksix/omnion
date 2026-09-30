@@ -14,9 +14,18 @@
 # service_completed_successfully`, and the API container's boot path is unchanged. A failed
 # migration therefore stops the rollout instead of half-applying under live traffic.
 #
-# **No secret ever appears in this file.** Every credential is `${VAR:?set VAR in .env}` — the
-# `:?` form makes compose REFUSE TO START with a named error rather than substituting an empty
-# string, which is the difference between a loud failure and a database with an empty password.
+# **No secret ever appears in this file.** Every credential is written as the `:?` form —
+# `OMNION_DB_PASSWORD` followed by `:?set OMNION_DB_PASSWORD in .env` — which makes compose
+# REFUSE TO START with a named error rather than substituting an empty string. That is the
+# difference between a loud failure and a database with an empty password.
+#
+# Compose interpolates `$` expressions everywhere in this file, INCLUDING inside a comment, so
+# the `:?` form must be shown here as `$` + `{…}` written apart. Spelled with real braces this
+# paragraph asked the operator for a variable named `VAR` — one that appears nowhere else in
+# the file — so the stack refused to start with "required variable VAR is missing" while every
+# credential it actually needed was set. The bundle generator's undocumented-variable check
+# (release/lib/bundle.py) is what found it, and it is why that check reads the STACK file and
+# not only the `.env.example`: an interpolation in a comment is as real as one in a value.
 name: omnion
 
 x-restart: &restart

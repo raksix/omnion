@@ -19,7 +19,8 @@
 #     automation, events, retention, notifications, search) are inside the API process today, so
 #     this file scales `api` for request capacity and documents that a runner-dedicated service
 #     is the next step rather than pretending one exists.
-#   * Every endpoint is a REFERENCE (`${OMNION_EXTERNAL_POSTGRES_DSN:?…}`), never a default that
+#   * Every endpoint is a REFERENCE — the `:?` form, spelled with the braces apart on
+#     purpose, because compose interpolates comments too — never a default that
 #     silently points at localhost and turns an enterprise install into a single-host one.
 #   * `deploy.replicas` is set, so `docker compose up --scale` and an orchestrator reading this
 #     file agree on the intended shape.
