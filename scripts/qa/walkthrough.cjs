@@ -8031,6 +8031,11 @@ async function main() {
     { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
     { path: "/settings/reliability/limits", name: "reliability-limits" },
     { path: "/settings/reliability/idempotency", name: "reliability-idempotency" },
+    // REQ-127 slice 3's two screens. A screen that is not in this list is a screen nothing has
+    // ever rendered, and the retry editor's delay preview and the breaker's forced-open banner
+    // are exactly the kind of thing that only fails when it is actually opened.
+    { path: "/settings/reliability/retries", name: "reliability-retries" },
+    { path: "/settings/reliability/breakers", name: "reliability-breakers" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -8189,7 +8194,242 @@ async function main() {
     );
   }
 
-  // The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
+  
+// ---------------------------------------------------------------------------------------------
+// REQ-127 slice 3 — the retry screen and the breaker screen, driven end to end.
+//
+// Both passes click the thing that is dangerous rather than the thing that is easy: the retry
+// editor's delay preview (a wrong factor is invisible until you see the curve) and the breaker's
+// `Force open` (which changes production behaviour the moment it is pressed). A pass that only
+// opened the two pages would prove the routes render and nothing about whether they work.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `/settings/reliability/retries` (REQ-127, slice 3).
+ *
+ * The order of the steps follows the operator's: open the screen, see the backlog, read what is
+ * dead-lettered, open the editor and change a factor to watch the curve move, then close it with
+ * `Esc` and confirm the dialog is gone.
+ */
+async function runReliabilityRetriesDepth(page) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "reliability-retries-depth", action: "retries", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/reliability/retries`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-view=\"reliability-retries\"], [role=\"alert\"]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const alertText = (
+    await page.locator("[role=\"alert\"]").first().innerText().catch(() => "")
+  ).trim();
+  const dueText = (
+    await page.locator("[data-view=\"retry-due-now\"]").first().innerText().catch(() => "")
+  ).trim();
+  const deadText = (
+    await page.locator("[data-view=\"retry-dead-count\"]").first().innerText().catch(() => "")
+  ).trim();
+  const policyRows = await page.locator("[data-policy]").count();
+  const charts = await page.locator("[data-view=\"retry-delay-chart\"]").count();
+  const empty = (await page.locator("text=No retry policies").first().innerText().catch(() => "")).trim();
+  note({
+    step: "opened",
+    policyRows,
+    charts,
+    dueNow: dueText,
+    deadLetters: deadText,
+    alertChars: alertText.length,
+    emptyState: empty.length > 0,
+  });
+  // A screen that renders an error alert instead of the page is a finding; the pass records the
+  // alert rather than throwing, so the report can name it.
+  if (alertText) note({ step: "alert", text: alertText.slice(0, 200) });
+  await shot(page, "page-reliability-retries");
+
+  // The delay chart must exist for every policy row: a chart that silently drops out is how a
+  // wrong backoff factor ships unnoticed.
+  if (policyRows > 0 && charts < policyRows) {
+    note({ step: "missing-charts", policyRows, charts, reason: "a policy row has no delay preview" });
+  }
+
+  // ---- open the editor and move the factor --------------------------------------------------
+  const editButton = page.locator('[data-policy] button:has-text("Edit")').first();
+  if ((await editButton.count()) > 0) {
+    await editButton.click();
+    await page.waitForTimeout(400);
+    const dialog = page.locator('[role="dialog"]');
+    const dialogOpen = (await dialog.count()) > 0;
+    note({ step: "editor-opened", dialogOpen });
+    if (dialogOpen) {
+      const factor = dialog.locator('input[type="number"]').nth(2);
+      if ((await factor.count()) > 0) {
+        const before = await factor.inputValue().catch(() => "");
+        await factor.fill("3");
+        await page.waitForTimeout(300);
+        const after = await factor.inputValue().catch(() => "");
+        note({ step: "factor-edited", before, after });
+        const warns = await page.locator("text=curve runs past the budget").count().catch(() => 0);
+        note({ step: "budget-warning", warns });
+      }
+      await shot(page, "page-reliability-retries-editor");
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(400);
+      const closed = (await page.locator('[role="dialog"]').count()) === 0;
+      note({ step: "editor-closed", closed });
+      if (!closed) note({ step: "editor-stuck", reason: "Escape did not close the policy editor" });
+    }
+  } else {
+    note({ step: "no-policy-row", reason: "no policy row offers an editor" });
+  }
+
+  // ---- the dead-letter action ---------------------------------------------------------------
+  const retryNowBtn = page
+    .locator('[data-view="retry-dead-letters"] button:has-text("Retry now")')
+    .first();
+  if ((await retryNowBtn.count()) > 0) {
+    await retryNowBtn.click();
+    await page.waitForTimeout(900);
+    const status = (await page.locator('[role="status"]').first().innerText().catch(() => "")).trim();
+    note({ step: "retry-now", statusChars: status.length });
+  } else {
+    note({ step: "no-dead-letter", reason: "nothing is dead-lettered, so retry now has no row" });
+  }
+
+  // ---- `/` focuses the filter --------------------------------------------------------------
+  await page.keyboard.press("/");
+  await page.waitForTimeout(200);
+  const focused = await page.evaluate(() => document.activeElement?.tagName === "INPUT");
+  note({ step: "shortcut-slash", filterFocused: focused });
+
+  // ---- mobile --------------------------------------------------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  await shot(page, "page-reliability-retries-mobile");
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  note({ step: "mobile", overflowPx: overflow });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  return steps.length;
+}
+
+/**
+ * `/settings/reliability/breakers` (REQ-127, slice 3).
+ *
+ * The step that matters is the confirmation: `Force open` is the one control on this centre that
+ * changes what the platform does to a provider, so the pass opens the dialog, types a reason,
+ * checks that the confirm button is disabled while the reason is empty, and then cancels — a
+ * pass that pressed it would leave the QA stack refusing a real provider.
+ */
+async function runReliabilityBreakersDepth(page) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "reliability-breakers-depth", action: "breakers", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/reliability/breakers`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-view=\"reliability-breakers\"], [role=\"alert\"]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const alertText = (await page.locator("[role=\"alert\"]").first().innerText().catch(() => "")).trim();
+  const rows = await page.locator("[data-breaker]").count();
+  const empty = (await page.locator("text=No breaker has a row yet").count().catch(() => 0)) > 0;
+  note({ step: "opened", rows, emptyState: empty, alertChars: alertText.length });
+  if (alertText) note({ step: "alert", text: alertText.slice(0, 200) });
+  await shot(page, "page-reliability-breakers");
+
+  // The forced-open banner is the one thing an operator must not miss, so the pass asserts it
+  // exists whenever a row is forced rather than trusting the chip alone.
+  const forcedRows = await page.locator('[data-breaker]:has-text("Forced open")').count();
+  const banner = await page.locator("text=drained by hand").count().catch(() => 0);
+  note({ step: "forced-open", forcedRows, bannerCards: banner });
+  if (forcedRows > 0 && banner === 0) {
+    note({ step: "missing-forced-banner", reason: "a forced breaker shows no banner" });
+  }
+
+  // ---- the confirmation dialog for the dangerous action ---------------------------------------
+  const forceButton = page.locator('[data-breaker] button:has-text("Force open")').first();
+  if ((await forceButton.count()) > 0) {
+    const key = await page
+      .locator("[data-breaker]")
+      .first()
+      .getAttribute("data-breaker")
+      .catch(() => null);
+    await forceButton.click();
+    await page.waitForTimeout(400);
+    const dialog = page.locator('[role="dialog"]');
+    const open = (await dialog.count()) > 0;
+    note({ step: "force-open-dialog", open, key });
+    if (open) {
+      const confirmButton = dialog.locator("button").last();
+      const disabledEmpty = await confirmButton.isDisabled().catch(() => false);
+      note({ step: "reason-required", disabledWhileEmpty: disabledEmpty });
+      if (!disabledEmpty) {
+        note({ step: "reason-not-required", reason: "Force open was actionable with no reason" });
+      }
+      await dialog.locator("input").first().fill("qa walkthrough");
+      await page.waitForTimeout(300);
+      const enabledAfter = !(await confirmButton.isDisabled().catch(() => true));
+      note({ step: "reason-accepted", enabledAfter });
+      await shot(page, "page-reliability-breakers-force-open");
+      // CANCEL, never confirm: pressing it would leave the QA stack refusing a live provider.
+      await dialog.locator('button:has-text("Cancel")').click();
+      await page.waitForTimeout(400);
+      const closed = (await page.locator('[role="dialog"]').count()) === 0;
+      note({ step: "cancelled", closed, didNotPressConfirm: true });
+    }
+  } else {
+    note({ step: "no-breaker-row", reason: "no breaker row offers force open" });
+  }
+
+  // ---- the threshold editor ------------------------------------------------------------------
+  const thresholds = page.locator('[data-breaker] button:has-text("Thresholds")').first();
+  if ((await thresholds.count()) > 0) {
+    await thresholds.click();
+    await page.waitForTimeout(400);
+    const open = (await page.locator('[role="dialog"]').count()) > 0;
+    const hint = (await page.locator('[role="dialog"]').first().innerText().catch(() => "")).includes(
+      "resets",
+    );
+    note({ step: "thresholds-dialog", open, explainsHalfOpenReset: hint });
+    await shot(page, "page-reliability-breakers-thresholds");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    note({ step: "thresholds-closed", closed: (await page.locator('[role="dialog"]').count()) === 0 });
+  }
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  await shot(page, "page-reliability-breakers-mobile");
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+  );
+  note({ step: "mobile", overflowPx: overflow });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  return steps.length;
+}
+
+  if (wants("reliability-retries")) {
+    matchedOnly.add("reliability-retries");
+    report.reliabilityRetries = await runDepthPass("reliability-retries", () =>
+      runReliabilityRetriesDepth(page),
+    );
+  }
+  if (wants("reliability-breakers")) {
+    matchedOnly.add("reliability-breakers");
+    report.reliabilityBreakers = await runDepthPass("reliability-breakers", () =>
+      runReliabilityBreakersDepth(page),
+    );
+  }
+
+// The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
   // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
   // sentence and writes a log row even when it found nothing, and the file's hold switch is on
   // the tab where the file's other facts are.
