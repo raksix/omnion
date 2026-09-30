@@ -471,10 +471,19 @@ pub struct NewExpense {
     pub note: Option<String>,
 }
 
-/// The body of `POST /accounting/expenses/{id}/decision` and of the other two transitions.
+/// The body of `POST /accounting/expenses/{id}/decision`.
+///
+/// The direction is **explicit** rather than inferred from the presence of a comment or from the
+/// route's name: one route serves both decisions, and a route that guessed would let a rejection
+/// button post an approval. `None` reads as approve, because the REQ's own table describes the
+/// happy path first and a form that posts `{ approved: true }` is the common case.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct DecisionBody {
-    /// The comment. Mandatory for a rejection, optional otherwise.
+    /// `true` approves, `false` rejects. `None` approves.
+    #[serde(default)]
+    pub approved: Option<bool>,
+    /// The comment. **Mandatory for a rejection**, optional otherwise — the module enforces it, not
+    /// the route, because a rule a second route could forget is not a rule.
     #[serde(default)]
     pub comment: Option<String>,
 }

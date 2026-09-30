@@ -81,6 +81,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod accounting;
+pub mod accounting_expenses;
 pub mod accounting_invoices;
 pub mod accounting_payments;
 pub mod ai;
@@ -1649,6 +1650,61 @@ pub fn router(state: AppState) -> Router {
         post(accounting_payments::reverse_payment),
     );
 
+    // Expenses (docs/requests/REQ-054, slice 4). The read layer is fine here — a list and a detail
+    // refusal say nothing about a row the caller cannot see. The **transition routes carry no
+    // layer at all**, for the reason slice 3 removed one from the payment reversal: the path holds
+    // an id, and a layer answers 403 before the handler can ask whose expense that is, which
+    // confirms it exists somewhere. The handler reads (404) and then asks for the key.
+    let accounting_expenses_read = Router::new()
+        // `categories` is registered **before** `{id}`: axum matches in registration order, so a
+        // literal declared after a path parameter is read as a uuid and the route answers 400 for
+        // a word.
+        .route(
+            "/accounting/expenses/categories",
+            get(accounting_expenses::list_expense_categories),
+        )
+        .route(
+            "/accounting/expenses",
+            get(accounting_expenses::list_expenses),
+        )
+        .route(
+            "/accounting/expenses/{id}",
+            get(accounting_expenses::get_expense),
+        )
+        .route_layer(guards::require(&state, "accounting.expenses.read"));
+
+    let accounting_expenses_create = Router::new()
+        .route(
+            "/accounting/expenses",
+            post(accounting_expenses::create_expense),
+        )
+        .route_layer(guards::require(&state, "accounting.expenses.create"));
+
+    // Edit is its own key: a draft is a form, and letting anyone who may file one rewrite a
+    // colleague's draft is how two people overwrite each other's half-typed receipt.
+    let accounting_expenses_update = Router::new()
+        .route(
+            "/accounting/expenses/{id}",
+            patch(accounting_expenses::update_expense),
+        )
+        .route_layer(guards::require(&state, "accounting.expenses.update"));
+
+    // **No layer, and the absence is the feature** — see above. `CurrentSession` still answers 401
+    // for an anonymous caller before any of this runs, so the layer's other job is unchanged.
+    let accounting_expenses_decide = Router::new()
+        .route(
+            "/accounting/expenses/{id}/submit",
+            post(accounting_expenses::submit_expense),
+        )
+        .route(
+            "/accounting/expenses/{id}/decision",
+            post(accounting_expenses::decide_expense),
+        )
+        .route(
+            "/accounting/expenses/{id}/reimburse",
+            post(accounting_expenses::reimburse_expense),
+        );
+
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
     // a document would be prefetched by a crawler and accepted on the customer's behalf.
@@ -1685,7 +1741,11 @@ pub fn router(state: AppState) -> Router {
         .merge(accounting_invoices_issue)
         .merge(accounting_payments_read)
         .merge(accounting_payments_record)
-        .merge(accounting_payments_reverse);
+        .merge(accounting_payments_reverse)
+        .merge(accounting_expenses_read)
+        .merge(accounting_expenses_create)
+        .merge(accounting_expenses_update)
+        .merge(accounting_expenses_decide);
 
     // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
     // stock rollup and the append-only ledger.

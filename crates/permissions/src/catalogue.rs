@@ -925,6 +925,41 @@ pub const CATALOGUE: &[PermissionDef] = &[
         description:
             "Allocate more to an invoice than it has outstanding (refused with 422 without this)",
     },
+    // Expenses (docs/requests/REQ-054, slice 4). Four keys, and `.approve` is separated from
+    // `.update` for the same reason `.payments.reverse` is separated from `.payments.record`:
+    // writing the expense down is the routine act, and **deciding whether the business pays for
+    // it** is the statement. A role that can file its own expenses and also sign them off is a
+    // role nobody would grant on purpose.
+    PermissionDef {
+        key: "accounting.expenses.read",
+        category: "accounting",
+        description: "Read expenses, their receipts and who decided each one",
+    },
+    PermissionDef {
+        key: "accounting.expenses.create",
+        category: "accounting",
+        description: "File an expense and submit it for approval",
+    },
+    PermissionDef {
+        key: "accounting.expenses.update",
+        category: "accounting",
+        description: "Edit a draft expense (a submitted or decided one is a record, not a form)",
+    },
+    PermissionDef {
+        key: "accounting.expenses.approve",
+        category: "accounting",
+        description:
+            "Approve or reject an expense (approving posts the journal entry) and mark it paid",
+    },
+    // Reports. Read-only, and a key of its own rather than a synonym for `.journal.read`: the
+    // journal is rows, a report is an **interpretation** of them across a period, and the person
+    // who may see what was posted is not automatically the person who may see the ageing of
+    // everything that has not been paid yet.
+    PermissionDef {
+        key: "accounting.reports.read",
+        category: "accounting",
+        description: "Read and export the income/expense, ageing and cashflow reports",
+    },
 ];
 
 /// Look a permission up by key.
@@ -1241,15 +1276,34 @@ mod tests {
             );
         }
         // The keys the REQ's API table names for later slices must STILL not be here. **This
-        // guard moved forward in slice 3 and it is aimed at slice 4**, for the same reason slice
-        // 2 moved it: a key with no route is a promise the permission screen makes that the
-        // product does not keep. Slice 3 turned `accounting.payments.*` from "later" into "real",
-        // so those three left this list and entered the assertion above, and the list now names
-        // what slice 4 has to deliver.
-        for later in ["accounting.expenses.read", "accounting.reports.read"] {
+        // guard moved forward in slice 3 and again in slice 4**, for the same reason slice 2
+        // moved it: a key with no route is a promise the permission screen makes that the
+        // product does not keep. Slice 3 turned `accounting.payments.*` from "later" into "real"
+        // and slice 4 turned `accounting.expenses.*` and `accounting.reports.read` into real, so
+        // those left this list and entered the assertions above. **What is left is the tax
+        // summary**, which is the one report slice 4 still owes.
+        for later in ["accounting.reports.tax"] {
             assert!(
                 get(later).is_none(),
-                "{later} belongs to slice 4 and must not appear before its route does"
+                "{later} is still owed and must not appear before its route does"
+            );
+        }
+
+        for key in [
+            "accounting.expenses.read",
+            "accounting.expenses.create",
+            "accounting.expenses.update",
+            "accounting.expenses.approve",
+            "accounting.reports.read",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+            assert!(
+                !get(key).expect(key).description.is_empty(),
+                "{key} needs a description the permission screen can show"
             );
         }
     }
