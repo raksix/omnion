@@ -49,10 +49,26 @@ pub const MAX_FIELDS: usize = 32;
 
 /// The sort orders the surface offers.
 ///
-/// Only `updated_at` and `created_at` descending are accepted. Ascending would need its own
-/// keyset direction in the cursor, and a reverse-ordered cursor is exactly the sort of thing that
-/// works until the first page and then quietly duplicates rows.
+/// Only descending orders are accepted. Ascending would need its own keyset direction in the
+/// cursor, and a reverse-ordered cursor is exactly the sort of thing that works until the first
+/// page and then quietly duplicates rows.
 pub const SORTS: [&str; 3] = ["updated_at", "created_at", "title"];
+
+/// Which relation a sort expression is being written for.
+///
+/// A sort names a *column*, and a column does not exist everywhere: a page's title lives on
+/// `page_revisions`, not on `pages`, and a file has no title at all. The old code answered with a
+/// bare column name and the caller prefixed it with `p.`, which meant `p.title` — a name that has
+/// never existed on that table, so `?sort=title` was a `500` on every call and a `sort=title`
+/// cursor on media was a `500` on the second page. Naming the relation makes the difference
+/// explicit at the one place the vocabulary is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortSource {
+    /// `pages` joined to its published `page_revisions`.
+    Pages,
+    /// `media`, which has no title and whose `updated_at` is nullable.
+    Media,
+}
 
 /// Which column a `sort` value addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +82,10 @@ pub enum SortKey {
 }
 
 impl SortKey {
-    /// Parse a caller's `sort` value.
+    /// Parse a caller's `sort` value, without knowing which endpoint will run the query.
+    ///
+    /// Kept for callers that only need the vocabulary; an endpoint must use [`Self::parse_for`]
+    /// so a sort the relation does not have is refused by name instead of reaching SQL.
     pub fn parse(raw: &str) -> Result<Self> {
         match raw {
             "updated_at" => Ok(Self::UpdatedAt),
@@ -79,15 +98,117 @@ impl SortKey {
         }
     }
 
-    /// The SQL column, which is also the cursor's second component.
+    /// Parse a caller's `sort` for one specific relation.
+    ///
+    /// The refusal is a `400` naming the parameter and listing what *this* endpoint sorts by,
+    /// because "sort=title" against a media list is a question with no answer, and answering it
+    /// with a `500` from a missing column is how a documented parameter stays broken for a year.
+    pub fn parse_for(raw: &str, source: SortSource) -> Result<Self> {
+        let sort = Self::parse(raw)?;
+        sort.expression(source).ok_or_else(|| {
+            ContentError::InvalidQuery(format!(
+                "sort must be one of {} for this endpoint (got \"{raw}\")",
+                SORTS
+                    .iter()
+                    .copied()
+                    .filter(
+                        |name| Self::parse(name).is_ok_and(|key| key.expression(source).is_some())
+                    )
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        Ok(sort)
+    }
+
+    /// The SQL expression this sort keys on, qualified for `source`.
+    ///
+    /// **`None` means this relation cannot be sorted that way at all**, and that is why it is an
+    /// `Option` rather than a `&'static str` with a made-up name: a function that must invent a
+    /// column to return a `&str` will eventually have that invented column used.
+    ///
+    /// The expression is the *cursor's* value source too, so a sort and its keyset predicate can
+    /// never name different columns.
     #[must_use]
-    pub const fn column(self) -> &'static str {
-        match self {
-            Self::UpdatedAt => "updated_at",
-            Self::CreatedAt => "created_at",
-            Self::Title => "title",
+    pub const fn expression(self, source: SortSource) -> Option<&'static str> {
+        match (self, source) {
+            (Self::UpdatedAt, SortSource::Pages) => Some("p.updated_at"),
+            (Self::CreatedAt, SortSource::Pages) => Some("p.created_at"),
+            // The title is the revision's, which is why this is qualified and aliased.
+            (Self::Title, SortSource::Pages) => Some("r.title"),
+            // Media predates its own `updated_at`, so a NULL falls back to `created_at`. The
+            // coalesce is used in the ORDER BY, the keyset predicate and the cursor together —
+            // a cursor holding a `created_at` value compared against a coalesce is a walk that
+            // repeats or skips rows without ever saying so.
+            (Self::UpdatedAt, SortSource::Media) => Some("coalesce(m.updated_at, m.created_at)"),
+            (Self::CreatedAt, SortSource::Media) => Some("m.created_at"),
+            (Self::Title, SortSource::Media) => None,
         }
     }
+
+    /// The select-list alias the cursor's value is read back from.
+    ///
+    /// The expression above is what SQL compares; this is what the row carries. They are separate
+    /// names on purpose — `p.updated_at` is read as `updated_at` — and a reader that has to
+    /// re-derive one from the other is a reader that will guess wrong for at least one sort.
+    #[must_use]
+    pub const fn read_as(self, source: SortSource) -> Option<&'static str> {
+        match (self, source) {
+            (Self::UpdatedAt, SortSource::Pages) | (Self::CreatedAt, SortSource::Pages) => {
+                Some(match self {
+                    Self::UpdatedAt => "updated_at",
+                    _ => "created_at",
+                })
+            }
+            (Self::Title, SortSource::Pages) => Some("title"),
+            (Self::UpdatedAt, SortSource::Media) => Some("cursor_stamp"),
+            (Self::CreatedAt, SortSource::Media) => Some("created_at"),
+            (Self::Title, SortSource::Media) => None,
+        }
+    }
+}
+
+/// The one place a timestamp becomes text for a cursor.
+///
+/// A cursor is a *string*, so an instant has to be written and read in one agreed format. Both
+/// halves lived in the API layer and disagreed: the pages writer formatted RFC 3339 while the
+/// media writer used the driver's `Display` (`2026-09-30 21:53:21.509904 +00:00:00`), and the
+/// media reader parsed RFC 3339. Each one was internally consistent and every media page after the
+/// first was a `400`. The inverse had already been fixed once in the other direction, which is
+/// what makes this worth naming: the format has to be a function, not a convention.
+///
+/// [`cursor_instant`] is the reader, and it is the only thing that parses a cursor's value.
+#[must_use]
+pub fn stamp(value: OffsetDateTime) -> String {
+    value.format(&Rfc3339).unwrap_or_else(|_| value.to_string())
+}
+
+/// Read back a cursor value that [`stamp`] wrote, or refuse the sort order it belongs to.
+///
+/// The refusal is deliberately about the *sort*: a cursor from a `title` walk handed to a
+/// `updated_at` walk is a caller mistake the message can actually explain, whereas "this cursor
+/// is not valid" teaches the caller nothing.
+pub fn cursor_instant(value: &str) -> Result<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| {
+        ContentError::InvalidQuery("this cursor does not belong to this sort order".to_string())
+    })
+}
+
+/// Whether a result set that returned `fetched` rows for a `limit` has another page.
+///
+/// The list queries fetch `limit + 1`, so `fetched > limit` is the whole test and it is exact:
+/// a set of exactly `limit` rows returns `limit` and stops, and a set of `limit + 1` returns
+/// `limit + 1` and continues. There is no count query, no extra round trip and no guess.
+///
+/// **`fetched == limit` is the rule that was in this crate's `Page` helper, and it is wrong.** It
+/// reads a full page as "there may be more", so the last page of a set whose size is a multiple of
+/// the limit hands back a cursor that walks to an empty page — a client that stops on an empty
+/// page reports a duplicate empty fetch forever, and one that stops on the count reports a
+/// truncated set. The two rules differ on exactly the sets whose size is divisible by the limit,
+/// which is why a single-page assertion can never see the difference.
+#[must_use]
+pub const fn continues(fetched: i64, limit: i64) -> bool {
+    fetched > limit
 }
 
 /// The identity keys every item carries whatever `fields` asks for.
@@ -412,10 +533,13 @@ impl ReadPage {
             "locale".into(),
             Value::String(locale.map_or_else(|| "en".to_string(), str::to_string)),
         );
-        value.insert(
-            "updated_at".into(),
-            Value::String(self.updated_at.to_string()),
-        );
+        // **`stamp`, not the driver's `Display`.** These two are the *only* places the surface
+        // shows a caller an instant, and `updated_since` accepts only RFC 3339 — so a
+        // `to_string()` here means the documented rebuild primitive does not work: read a page,
+        // take its `updated_at`, ask for changes since it, get a `400`. The integration test had
+        // a hand-written `to_rfc3339` helper to work around exactly this, which is the shape of a
+        // product bug wearing a test's clothes. The API now round trips its own output.
+        value.insert("updated_at".into(), Value::String(stamp(self.updated_at)));
         value.insert(
             "etag".into(),
             Value::String(etag_for(self.updated_at, self.id)),
@@ -479,10 +603,13 @@ impl ReadMedia {
         value.insert("slug".into(), Value::String(self.slug.clone()));
         value.insert("type".into(), Value::String("media".into()));
         value.insert("locale".into(), Value::String("en".into()));
-        value.insert(
-            "updated_at".into(),
-            Value::String(self.updated_at.to_string()),
-        );
+        // **`stamp`, not the driver's `Display`.** These two are the *only* places the surface
+        // shows a caller an instant, and `updated_since` accepts only RFC 3339 — so a
+        // `to_string()` here means the documented rebuild primitive does not work: read a page,
+        // take its `updated_at`, ask for changes since it, get a `400`. The integration test had
+        // a hand-written `to_rfc3339` helper to work around exactly this, which is the shape of a
+        // product bug wearing a test's clothes. The API now round trips its own output.
+        value.insert("updated_at".into(), Value::String(stamp(self.updated_at)));
         value.insert(
             "etag".into(),
             Value::String(etag_for(self.updated_at, self.id)),
@@ -515,32 +642,13 @@ impl ReadMedia {
     }
 }
 
-/// One page of results plus the cursor that continues it.
-#[derive(Debug, Clone)]
-pub struct Page<T> {
-    /// The rows themselves.
-    pub items: Vec<T>,
-    /// Cursor for the next page, or `None` when this was the last one.
-    pub next_cursor: Option<String>,
-}
-
-impl<T> Page<T> {
-    /// Build a page, deriving `next_cursor` from whether more rows may exist.
-    ///
-    /// `fetched == limit` is the honest test. `has_more` computed by a second count query is
-    /// exact and costs a scan; a short page is the same answer for free, and a full page that
-    /// happens to be the last one costs the caller one empty round trip instead of a scan on
-    /// every request.
-    #[must_use]
-    pub fn new(items: Vec<T>, fetched: i64, limit: i64, cursor_of: impl Fn(&T) -> Cursor) -> Self {
-        let next_cursor = if fetched == limit && !items.is_empty() {
-            items.last().map(|item| encode_cursor(&cursor_of(item)))
-        } else {
-            None
-        };
-        Self { items, next_cursor }
-    }
-}
+// A `Page` helper used to live here, with `next_cursor` derived from `fetched == limit`. Nothing
+// ever called it: the routes build their own envelope, and they use the only correct rule —
+// `fetched > limit`, decided from an over-fetch of one row. So the helper and the product
+// disagreed about the same question, in the same crate, and the helper was the wrong one. A
+// "full page may have more" rule hands the last full page a cursor that walks to an empty result,
+// which is the behaviour the over-fetch exists to avoid; the wrong copy was only a bug away from
+// being the copy that got used.
 
 #[cfg(test)]
 mod tests {
@@ -661,28 +769,109 @@ mod tests {
     }
 
     #[test]
-    fn a_full_page_continues_and_a_short_one_does_not() {
-        let rows: Vec<Cursor> = (0..2)
-            .map(|n| Cursor::new(n.to_string(), Uuid::from_u128(n)))
-            .collect();
-        let full = Page::new(rows.clone(), 2, 2, |item| item.clone());
-        assert!(full.next_cursor.is_some(), "a full page may have more");
-
-        let short = Page::new(rows.clone(), 2, 5, |item| item.clone());
-        assert!(short.next_cursor.is_none(), "a short page is the last page");
-
-        let empty = Page::new(Vec::new(), 0, 5, |item: &Cursor| item.clone());
-        assert!(empty.next_cursor.is_none(), "an empty page has no cursor");
+    fn a_cursor_is_issued_only_when_a_row_is_left_behind() {
+        // The exact cases the old `fetched == limit` rule got wrong. `continues` is fed the count
+        // the query actually returns, which is `limit + 1` when more exist.
+        assert!(
+            continues(3, 2),
+            "three rows for a limit of two means one is behind the cursor"
+        );
+        assert!(
+            !continues(2, 2),
+            "two rows for a limit of two is the last page, and the rule that said otherwise \
+             handed this page a cursor that walks to an empty result"
+        );
+        assert!(!continues(0, 5), "an empty page has nothing to continue");
+        assert!(!continues(1, 5), "a short page is the last page");
     }
 
     #[test]
-    fn the_next_cursor_continues_from_the_last_row() {
-        let rows: Vec<Cursor> = (0..3)
-            .map(|n| Cursor::new(n.to_string(), Uuid::from_u128(n)))
-            .collect();
-        let page = Page::new(rows.clone(), 3, 3, |item| item.clone());
-        let decoded = decode_cursor(&page.next_cursor.expect("cursor")).expect("decodes");
-        assert_eq!(decoded, *rows.last().expect("a row"));
+    fn a_sort_the_relation_does_not_have_is_refused_by_name() {
+        // `pages` has no `title` column — the title is the revision's — and `media` has no title
+        // at all. Both used to be prefixed blindly and reach SQL as `p.title` / `m.title`.
+        assert_eq!(
+            SortKey::parse_for("title", SortSource::Pages).expect("pages sort by title"),
+            SortKey::Title
+        );
+        let refused = SortKey::parse_for("title", SortSource::Media)
+            .expect_err("a file has no title to sort by");
+        let message = refused.to_string();
+        assert!(
+            message.contains("title"),
+            "it names what was asked: {message}"
+        );
+        assert!(
+            message.contains("updated_at"),
+            "and lists what this endpoint does offer: {message}"
+        );
+        // And the refusal is not a crash on a missing column.
+        assert!(SortKey::Title.expression(SortSource::Media).is_none());
+    }
+
+    #[test]
+    fn every_sort_expression_is_a_column_that_qualifies_to_its_own_table() {
+        // The whole point of qualifying: a name that does not belong to the relation is a 500 the
+        // first time a caller uses the documented parameter.
+        for sort in [SortKey::UpdatedAt, SortKey::CreatedAt, SortKey::Title] {
+            let expression = sort
+                .expression(SortSource::Pages)
+                .expect("pages can sort three ways");
+            assert!(
+                expression.starts_with("p.") || expression.starts_with("r."),
+                "{expression} is not qualified to the pages query"
+            );
+        }
+        for sort in [SortKey::UpdatedAt, SortKey::CreatedAt] {
+            let expression = sort
+                .expression(SortSource::Media)
+                .expect("media sorts by its timestamps");
+            assert!(
+                expression.starts_with("m.") || expression.starts_with("coalesce(m."),
+                "{expression} is not qualified to the media query"
+            );
+        }
+    }
+
+    #[test]
+    fn the_media_sort_and_the_row_it_is_read_back_from_agree() {
+        // The media default sorts on a coalesce, so the value the cursor holds is NOT `updated_at`
+        // and cannot be read back as one. `read_as` names the alias, and the media query must
+        // select that alias — this is the pair that has to be built together.
+        assert_eq!(
+            SortKey::UpdatedAt.read_as(SortSource::Media),
+            Some("cursor_stamp"),
+            "a coalesce has to be selected under a name a row can be read by"
+        );
+        assert_eq!(
+            SortKey::CreatedAt.read_as(SortSource::Media),
+            Some("created_at")
+        );
+        assert_eq!(SortKey::Title.read_as(SortSource::Media), None);
+    }
+
+    #[test]
+    fn a_stamp_written_into_a_cursor_reads_back_as_the_same_instant() {
+        // The round trip the media list got wrong: the writer used the driver's `Display`
+        // (`2026-09-30 21:53:21.509904 +00:00:00`) and the reader parsed RFC 3339, so page one
+        // worked and every page after it was a 400.
+        let at = OffsetDateTime::parse("2026-09-30T21:53:21.509904Z", &Rfc3339).expect("time");
+        let written = stamp(at);
+        assert!(written.ends_with('Z'), "RFC 3339 in UTC: {written}");
+        assert!(
+            !written.contains(" +00:00:00"),
+            "and not the driver's display form: {written}"
+        );
+        assert_eq!(cursor_instant(&written).expect("reads back"), at);
+    }
+
+    #[test]
+    fn a_title_cursor_is_refused_where_a_timestamp_one_is_required() {
+        // The two ends of a walk, told apart by the sort rather than by a generic "not valid".
+        let error = cursor_instant("Some Title").expect_err("a title is not an instant");
+        assert!(
+            error.to_string().contains("sort order"),
+            "the message has to be actionable: {error}"
+        );
     }
 
     #[test]
