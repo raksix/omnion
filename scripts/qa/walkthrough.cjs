@@ -229,21 +229,28 @@ const clickLines = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
+let warnedAboutStream = false;
 function record(entry) {
   clickLines.push(entry);
-  // Every writer shares one disk, and a pass that frees space does it by removing build
-  // directories and artifact runs it does not own. The first write after that lands an
-  // ENOENT out of appendFileSync, and because `record` is called from the pass itself the
-  // throw unwinds the whole walkthrough — an hour of screens, on a screen with nothing
-  // wrong with it. The evidence of what the pass saw stays in `clickLines` either way, so
-  // a write that fails is reported once and the walk continues.
+  // The event stream is written for durability -- a killed pass should leave its clicks behind
+  // -- but it is a SECONDARY record: `clickLines` above is the one the report is built from. So
+  // a write that fails must not end the pass. It used to: this box runs a disk guard that trims
+  // QA artifacts, and when the guard's window landed mid-pass the output directory was gone,
+  // `appendFileSync` threw ENOENT, and the exception unwound the whole run. The pass had already
+  // walked seven screens and every one of them was thrown away because a cache file could not be
+  // appended to. A report written from memory and a report written from disk are the same report;
+  // only the forensic stream is lost, and it says so rather than pretending.
+  //
+  // The directory is re-created once before giving up, because on this box the commonest cause is
+  // a guard that trims an artifact run mid-pass and not a full disk: the run is gone but the pass
+  // is not, and the very next entry then appends successfully.
   try {
     fs.mkdirSync(OUT, { recursive: true });
     fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
-  } catch (err) {
-    if (!record.warned) {
-      record.warned = true;
-      console.log("[walk] artifact directory is gone (" + err.code + "), recording in memory only");
+  } catch (error) {
+    if (!warnedAboutStream) {
+      warnedAboutStream = true;
+      console.error(`[walk] the click stream is unwritable (${error.code || error.message}); the report continues without it`);
     }
   }
 }

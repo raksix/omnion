@@ -7169,3 +7169,53 @@ balances on a merge that duplicated a block; only the multiset sees duplication.
 stack, which must reach `ai-workflows` and click the approval bar now that the walkthrough
 fixture yields a real draft id. This tick's work changed no screen, so the pass is the REQ-close
 gate rather than a gate for the change itself.
+
+## Tick 75 — 2026-09-30 — REQ-012 slice 3 (rate limiting + lockout), plus the harness that had to be fixed to run it
+
+**What.** The security centre's two limiter screens (`/security/rate-limits`,
+`/security/sign-in-protection`) had never been opened by anything. Four commits:
+
+| Commit | Change |
+|---|---|
+| `1ded0b5c` | `--only` narrows a pass to named routes/depth passes; both screens walked on desktop and at 390px; the QA API now gets an `OMNION_CSRF_SECRET` |
+| `5ca68087` | a QA-slot holder file with two pids on one line deadlocked the pass queue |
+| `9e91f2c9` | the QA API could not reach its own database — a masked `***` password |
+| `669d584d` | the account lockout was unreachable behind the address lockout |
+| `25dddf5c` | a pass died when its click stream could not be written |
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| The lockout, measured | before: `403 address_blocked` x10, `429 rate_limited` x2, `users.failed_sign_in_count` = **0**, `locked_until` = never |
+| The slot deadlock | `reap` resolved `2332198 2332152` -> `2332152`, found it dead, freed the place |
+| The database credential | `psql` over TCP with the exact string `run.sh` hands the process returns `1` |
+| The click stream | `record()` against a missing directory warns once, keeps all 3 clicks |
+
+**The finding worth the tick.** The account lock and the address lock were compared against the
+**same number** (`lockout_attempts`). From one address the address rule therefore fired on the
+exact attempt that would have incremented the account counter, so the counter never moved, no
+account was ever locked, and the "currently locked accounts" table had no possible content. The
+module doc above `sign_in` states that the two dimensions exist for different reasons; the code
+gave them one value. The address threshold is now `lockout_attempts * 3`.
+
+**Three harness defects the pass had been hiding behind.**
+
+1. *The QA API had no `OMNION_CSRF_SECRET`.* Every cookie-authenticated write was refused with
+   `csrf_unavailable` before its handler ran — so every save, upload and backup in every pass
+   was recorded as a screen that "works" while the API answered 403 throughout. The refusal is
+   the documented behaviour of a deployment *without* a secret, which is why it read as the
+   product being correct.
+2. *The QA API's database password was `***`* — a masking artifact, committed long enough to
+   look deliberate. It survived a previous check because that check ran `docker exec psql`, which
+   uses the container's unix socket and never authenticates; the path that actually uses it (TCP
+   to `127.0.0.1:5433`) had never worked. Two paths, one of which nobody exercised.
+3. *The pass queue could not drain.* `reap()` handed a whole holder line to `kill -0`, which
+   wants one pid; a two-pid line answers false, so the place is judged ownerless -- reclaimed
+   while its owner walks, and unreclaimable by the owner whose trap then kills a string.
+
+**Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
+naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).

@@ -31,6 +31,22 @@ use crate::users::{User, normalize_email};
 /// How long a second-factor challenge stays valid.
 pub const CHALLENGE_TTL_MINUTES: i64 = 5;
 
+/// How many failures from ONE address refuse that address, when the organization has not
+/// chosen a number of its own.
+///
+/// The account threshold and the address threshold are two different numbers and the module
+/// doc above says why: an account lock alone lets one attacker spray every account from one
+/// address for ever. Sharing one number made the account lock unreachable — the address rule
+/// fired on the attempt that would have incremented the counter, so `users.failed_sign_in_count`
+/// stayed at 0, no account was ever locked, and the "currently locked accounts" table on
+/// `/security/sign-in-protection` had no possible content.
+///
+/// The address threshold is therefore a multiple of the account one, not the account one: an
+/// attacker gets refused before reaching one account's threshold, and a legitimate user who
+/// mistypes their own password a few times still reaches their account's threshold rather than
+/// being locked out by a rule they cannot see.
+pub const DEFAULT_ADDRESS_FAILURE_MULTIPLE: i32 = 3;
+
 /// Purpose of a challenge: the second factor of a sign-in.
 pub const PURPOSE_LOGIN: &str = "login";
 
@@ -174,6 +190,11 @@ pub async fn sign_in(
     };
     let lockout_attempts = policy.as_ref().map_or(10, |policy| policy.lockout_attempts);
     let lockout_minutes = policy.as_ref().map_or(15, |policy| policy.lockout_minutes);
+    // The ADDRESS threshold is deliberately larger than the ACCOUNT one. Sharing the number is
+    // what made the account lockout unreachable: the address rule fired on the same attempt
+    // that would have incremented the counter, so the counter never moved. See
+    // `DEFAULT_ADDRESS_FAILURE_MULTIPLE`.
+    let address_failure_limit = i64::from(lockout_attempts) * i64::from(DEFAULT_ADDRESS_FAILURE_MULTIPLE);
 
     // 1. The address lists — deny wins, an allowlist narrows. This runs before the password.
     if let Some(policy) = &policy {
@@ -201,7 +222,7 @@ pub async fn sign_in(
     // 2. An address that has failed too often is refused regardless of the account.
     if let Some(ip) = ip {
         let failures = recent_failures_from_address(pool, ip, lockout_minutes).await?;
-        if failures >= i64::from(lockout_attempts) {
+        if failures >= address_failure_limit {
             record_attempt(
                 pool,
                 &AttemptRecord {
@@ -213,7 +234,9 @@ pub async fn sign_in(
                     ip: Some(ip.to_owned()),
                     user_agent: user_agent.map(str::to_owned),
                     outcome: "blocked",
-                    reason: Some(format!("{failures} recent failures from this address")),
+                    reason: Some(format!(
+                        "{failures} recent failures from this address (limit {address_failure_limit})"
+                    )),
                 },
             )
             .await?;
@@ -609,6 +632,30 @@ mod tests {
     fn the_challenge_window_is_minutes_not_days() {
         assert_eq!(CHALLENGE_TTL_MINUTES, 5);
         assert_ne!(PURPOSE_LOGIN, PURPOSE_STEP_UP);
+    }
+
+    /// The invariant that was broken: an address is refused for spraying, an account is locked
+    /// for guessing *its own* password, and the second can still happen.
+    ///
+    /// A unit test is enough for the arithmetic, but it is worth stating why. The broken version
+    /// compiled, passed every unit test, and answered `403 address_blocked` on exactly the
+    /// attempt that would have incremented the account counter — so the counter never moved and
+    /// no account was ever locked. The reader has to be able to see that one number is strictly
+    /// larger than the other, because the code is where a future edit would undo it.
+    #[test]
+    fn the_address_threshold_is_strictly_larger_than_the_account_threshold() {
+        assert!(
+            DEFAULT_ADDRESS_FAILURE_MULTIPLE > 1,
+            "a multiple of 1 makes the address rule and the account rule fire on the same attempt"
+        );
+        for account_threshold in [3_i32, 5, 10, 50] {
+            let address_limit = i64::from(account_threshold) * i64::from(DEFAULT_ADDRESS_FAILURE_MULTIPLE);
+            assert!(
+                address_limit > i64::from(account_threshold),
+                "the address limit ({address_limit}) must leave room for the account threshold \
+                 ({account_threshold}) to be reached first"
+            );
+        }
     }
 
     #[test]

@@ -48,7 +48,15 @@ reap() {
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
     pid="$(basename "$f")"
-    holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
+    # The holder file must yield ONE pid. `run.sh` reads it with `tail -n 1` on the captured
+    # stdout, which is correct; a file holding two pids on one line then fails `kill -0`,
+    # so the place is judged ownerless and reclaimed *while its owner is still running* — and
+    # it is also never reclaimable by its own owner, which is how a queue deadlocks. Taking
+    # the LAST whitespace-separated field makes the test answer the only question it asks
+    # (is that process alive?) whatever the file happens to contain.
+    holder="$(awk '{print $NF}' "${HOLDERDIR}/${pid}" 2>/dev/null || true)"
+    [ -n "${holder:-}" ] || holder="$(cat "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
+    holder="$(printf '%s' "${holder}" | awk '{print $NF}')"
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$grace" ] || continue
     # No holder file at all, this long after the place appeared, means the pass died between
