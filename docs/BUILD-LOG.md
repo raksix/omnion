@@ -5335,3 +5335,44 @@ through the service layer → write `ai_tool_calls` and `audit_log`. It calls `i
 rather than re-deriving the ordering, and it is the slice that makes "no second door" true. The
 per-tool grant replacement (`PUT /ai/tools/{key}/grants`) and the warning stripe's agent-form
 half come with it.
+
+## 2026-09-30 · w7 tick 31 · REQ-100 slice 3, first half
+
+**What.** `crates/ai-hub/src/tool_calls.rs` is the first writer of `ai_tool_calls` (migrated in
+`0173`, untouched until now) and `crates/ai-hub/src/tool_exec.rs` is the pipeline the request's
+"no second door" clause names: identity → registry → enabled → grant → permission → arguments →
+cap → timeout → execute → log. It calls `identity::resolve` rather than re-deriving the ordering.
+`apps/api/tests/ai_tool_execution.rs` walks it against a real database.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --quiet` → **421 passed** (13 new unit tests).
+- `cargo test -p omnion-api --test ai_tool_execution -- --test-threads=1` → **15 passed**,
+  against `omnion_qa_w7`, read out of SQL rather than out of a return value.
+- `pnpm typecheck` → clean.
+
+**Three defects this tick found, and one of them was a test that could not fail.**
+
+1. **`FnTool::with_schema` never took effect.** It wrote `self.schema`, and no impl read it —
+   `FnTool` did not override `Tool::schema`, so every `FnTool` reported the default "takes no
+   arguments". A tool declaring `required: ["target"]` was told by the payload that it takes
+   nothing and then refused the model's `target` as an unknown field. It survived because the test
+   that motivated it ("a bad type is refused") was true for the wrong reason.
+2. **`identity::resolve` cannot express "no identity".** A deny is a stored `false`, so an empty
+   grant map plus a tool in the agent's list resolves to *allow*. The first `model_facing` left
+   this to `resolve` and failed its own test. The rule "a run with no resolvable identity executes
+   nothing" is a check in the pipeline, not a consequence of calling `resolve`.
+3. **A skipped walk reported as a passing one.** The harness printed "skipping" and returned when
+   PostgreSQL was unreachable, and the database I named (`omnion_test_w7`) does not exist — the QA
+   stack's is `omnion_qa_w7`. The first run said "15 passed" with every walk skipped. The macro now
+   panics with the URL it tried.
+
+**The control walk, and why it is in the file.** "A denied call leaves no side effect" compared the
+count of rows named `touched` against itself, and nothing ever created one — so it compared 0 with
+0 and would have passed for a pipeline that ran the body and *then* reported a refusal. The fixture
+tool now really writes, and `a_control_proves_the_fixture_tool_really_writes` calls it through the
+granted path. I falsified it first: with the write removed, the control went red.
+
+**Next.** Wire the pipeline into `ai_agent_runner` — it still does `ToolRegistry::empty()` and lets
+`loop_engine` call `tools::decide` itself, which is the second door the request forbids. Then the
+`audit_log` row (`actor_type = 'agent'`, written by the runner so `ai-hub` gains no dependency on
+`omnion-audit`) and the `ai.tool.*` events, then `PUT /ai/tools/{key}/grants` and the prune tick.
