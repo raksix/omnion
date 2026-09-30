@@ -1,6 +1,6 @@
 # REQ-101 — AI Approvals & Action Preview
 
-> **Status:** in-progress (slice 1 — 16f77d1d) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + admin
+> **Status:** in-progress (slice 1 panel half — 2fc7ed21, 4e7e011f, cacf8934, eb7f62a8) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + admin
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -104,9 +104,13 @@ All dotted lower-case on the signed webhook bus; approval events carry the organ
 
 > **Slice 1 ticked boxes are proof from `apps/api/tests/ai_approvals.rs` (17 walks, all green) and
 > `crates/ai-hub` (447 unit tests).** The boxes still open are the ones that need the panel, the
-> QA pass or the workspace suite — and, for the last of slice 1, the review screen itself. The
-> typed-confirmation box is ticked for the *server* half only: "the UI never sends the phrase
-> unless the field is filled" has no UI yet.
+> QA pass or the workspace suite. The typed-confirmation box is ticked for the *server* half only:
+> the UI now withholds an empty phrase (`approveAiApproval` omits the field rather than sending
+> `"yes"`), but "the UI never sends the phrase unless the field is filled" is a claim about a
+> browser, so it stays open until the w7 pass drives it. The same applies to the viewer-permission
+> box: `GET /ai/approvals` now serves `viewer_missing` from the caller's effective permissions and
+> both screens render the buttons disabled and named, but the API's 403 half was proven by the
+> walks while the *rendering* half is still for the pass to see.
 
 - [x] All six dangerous classes are gated by default on a fresh installation, and a gated tool call parks its run as `awaiting_approval` with no side effect (test asserts the target row is unchanged).
 - [x] An approval is required even when the caller holds the underlying domain permission — permissions gate *who may ask*, approval gates *what happens*.
