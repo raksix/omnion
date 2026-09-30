@@ -1551,8 +1551,26 @@ mod tests {
                 "comment_revision",
                 "http_request",
                 "publish_page",
-                "run_workflow"
-            ]
+                "run_workflow",
+                "ai.prompt"
+            ],
+            "the catalogue is the closed vocabulary in registration order — `ai.prompt` (REQ-046 \
+             slice 2) is the tenth action, and a name missing from this list is a name the \
+             console cannot offer"
+        );
+        // The list above is still a hand-written copy of the registry, so it needs a guard
+        // against going stale in the OTHER direction: an action the catalogue serves that this
+        // test has never heard of. The failure this fixes was the reverse (the list was right
+        // and the registry grew), and a test that only fails when someone remembers to update
+        // it is a test that sits red for a tick. Asserting set equality against the registry
+        // itself is what keeps both sides honest.
+        let registry: Vec<&str> = omnion_workflows::actions::keys();
+        assert_eq!(
+            catalogue.actions.len(),
+            registry.len(),
+            "the catalogue serves every registered action and no others: {:?} vs {:?}",
+            actions,
+            registry
         );
         assert!(
             catalogue
