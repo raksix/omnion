@@ -204,14 +204,21 @@ async fn the_daily_limit_is_refused_at_the_engine_boundary_by_name() {
         .await
         .expect("the limit is set");
 
-    // Two runs inside the cap.
+    // Two runs inside the cap. **Nothing here counts them by hand.** This test used to call
+    // `limits::record_usage` after each run, and that line is why the gate was 14/14 green while
+    // the product counted nothing: the fixture supplied the number the product was supposed to
+    // produce. The cap is only real if starting a run is what spends it, so the test now starts
+    // runs and reads the counter back.
     for index in 0..2 {
         store::create_execution(&pool, &workflow, TriggerKind::Manual, Some(org.owner), &[])
             .await
             .unwrap_or_else(|e| panic!("run {index} is inside the cap: {e}"));
-        limits::record_usage(&pool, project, false, 10).await
-            .expect("usage counted");
     }
+    let after_two = limits::usage_today(&pool, project).await.expect("today's counters");
+    assert_eq!(
+        after_two.runs, 2,
+        "two started runs are two counted runs — the counter is written by the start path, not by a test"
+    );
 
     // The third is refused, and the refusal comes from `create_execution_in` — the function all
     // four run-start paths share — rather than from the HTTP handler.
@@ -249,7 +256,6 @@ async fn raising_the_limit_lets_the_run_through_again() {
     store::create_execution(&pool, &workflow, TriggerKind::Manual, Some(org.owner), &[])
         .await
         .expect("the first run");
-    limits::record_usage(&pool, project, false, 5).await.expect("counted");
     store::create_execution(&pool, &workflow, TriggerKind::Manual, Some(org.owner), &[])
         .await
         .expect_err("the second run is refused");
@@ -307,13 +313,60 @@ async fn counters_agree_with_the_runs_they_count() {
     let project = make_project(&pool, &org, "METER", "Meter").await;
     let workflow = new_workflow(&pool, &org, project, "metered").await;
 
+    // Four started runs and nothing else: this test is the acceptance line ("usage counters match
+    // the underlying run records for a day"), so counting the runs itself would make it compare a
+    // number with itself.
+    //
+    // **Two of them are then made to genuinely fail**, through the real step row and the real
+    // settlement path, because `failures` is counted where the outcome is known and no other place
+    // can know it. The old version of this test passed `index % 2 == 0` to `record_usage`, which
+    // meant the failure counter was a value the test typed in rather than a consequence the
+    // platform reached — the same compensating fixture that hid the dead writer.
     for index in 0..4 {
-        store::create_execution(&pool, &workflow, TriggerKind::Manual, Some(org.owner), &[])
+        let (execution, steps) = store::create_execution(
+            &pool,
+            &workflow,
+            TriggerKind::Manual,
+            Some(org.owner),
+            &[omnion_workflows::definition::StepDefinition::task("go", "noop", serde_json::json!({}))],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("run {index}: {e}"));
+        if index % 2 == 0 {
+            let step = steps.first().expect("the run materialised its step");
+            // The step has to be **running** before it can fail: `fail_step` matches on that status
+            // and silently no-ops on a pending one, because in the engine the run is always claimed
+            // first. Writing the status directly is the fixture standing in for the claim, and the
+            // row count is asserted so the fixture cannot quietly become a no-op later.
+            let claimed = sqlx::query(
+                "update workflow_steps set status = 'running', started_at = now() where id = $1",
+            )
+            .bind(step.id)
+            .execute(&pool)
             .await
-            .unwrap_or_else(|e| panic!("run {index}: {e}"));
-        limits::record_usage(&pool, project, index % 2 == 0, 100).await
-            .expect("usage counted");
+            .expect("the step is claimed");
+            assert_eq!(claimed.rows_affected(), 1, "the step exists to be claimed");
+            store::fail_step(&pool, step.id, "the action refused")
+                .await
+                .expect("the step fails");
+            assert_eq!(
+                store::settle_execution(&pool, execution.id)
+                    .await
+                    .expect("the run settles"),
+                Some(omnion_workflows::model::ExecutionStatus::Failed),
+                "a run with a failed step settles as failed"
+            );
+        }
     }
+    // The compute time is the one number the start path cannot know, so it is seeded directly and
+    // asserted on its own rather than smuggled in through a counter call.
+    sqlx::query(
+        "update automation_project_usage set compute_ms = 400 where project_id = $1",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .expect("the compute time is seeded");
 
     let today = limits::usage_today(&pool, project).await.expect("today's counters");
     let rows: i64 = sqlx::query_scalar(
@@ -537,7 +590,6 @@ async fn an_archived_project_still_refuses_runs_before_the_limit_is_consulted() 
     store::create_execution(&pool, &workflow, TriggerKind::Manual, Some(org.owner), &[])
         .await
         .expect("one run inside the cap");
-    limits::record_usage(&pool, project, false, 1).await.expect("counted");
 
     projects::set_status(&pool, project, projects::ProjectStatus::Archived)
         .await

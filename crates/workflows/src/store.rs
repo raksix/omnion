@@ -256,6 +256,23 @@ pub async fn create_execution(
 /// A limit that is checked anywhere but inside the write it guards is a limit that counts a run
 /// before it exists — which, on a project one run below its cap, refuses the run that would have
 /// been the last one.
+///
+/// **The counter is written here for the same reason the guard is read here.** `record_usage_in`
+/// is the only writer of `automation_project_usage`, and for its whole life on this branch it had
+/// **no caller outside its own tests** — the thirteenth instance of the defect this module keeps
+/// meeting. Every guard read it, the screen rendered it, the notice sweep claimed on it, and the
+/// daily cap was therefore decided against a table nothing ever wrote: a project could run a
+/// hundred workflows a day under a cap of ten and never be refused, its limits bar sat at zero,
+/// its series was empty, and the CSV exported nothing. Not one of those checks could have told,
+/// because each of them asked the counter a question and the counter answered.
+///
+/// Placement is the whole of the fix. Counting here rather than at `settle_execution` is not a
+/// stylistic choice: the guard above reads the counter, so a counter written anywhere after the
+/// run completes counts *n+1* runs while the cap says *n* — a project would be allowed exactly
+/// its cap of runs and refused on the run after it, and "the cap is the cap" would be off by one
+/// in the direction that looks like an intermittent refusal. Counting where the guard reads it
+/// makes the two statements one transaction, so a run that was refused is never counted and a run
+/// that was counted is always counted once.
 pub async fn create_execution_in(
     connection: &mut sqlx::PgConnection,
     workflow: &Workflow,
@@ -265,6 +282,11 @@ pub async fn create_execution_in(
 ) -> Result<(WorkflowExecution, Vec<WorkflowStep>)> {
     crate::projects::ensure_run_allowed(connection, workflow.project_id).await?;
     crate::limits::ensure_run_within_limits(connection, workflow.project_id).await?;
+    // **After the guard, before the insert.** The counter is the guard's own input, so it has to be
+    // written by the same transaction that read it: a run refused above must leave the day's count
+    // untouched, and a run allowed above must be counted before this transaction ends or the next
+    // caller re-reads a cap that has already spent one of its runs.
+    crate::limits::record_usage_in(connection, workflow.project_id, false, 0).await?;
 
     let execution_sql = format!(
         "insert into workflow_executions (workflow_id, organization_id, status, trigger_kind, \
@@ -615,6 +637,15 @@ pub async fn cancel_step(pool: &PgPool, step_id: Uuid) -> Result<()> {
 ///
 /// Answers `Some(status)` only for the call that actually settled the run, so the caller can
 /// audit a state change exactly once.
+///
+/// **The project's failure counter is written here, in the same statement's transaction, and
+/// that is the placement argument rather than a convenience.** `runs` is counted when the run
+/// starts (see `create_execution_in`) because the daily cap reads it there; `failures` can only
+/// be counted where the outcome is known, which is here. Splitting the two columns across the two
+/// places that can actually see their own number is the whole point — a single write at start time
+/// cannot know whether the run will fail, and a single write at settlement would count a run the
+/// cap never saw. The `where status = 'running'` in the update below is the once: a second caller
+/// that races this one matches no row, `settled` is 0, and the failure is not counted twice.
 pub async fn settle_execution(
     pool: &PgPool,
     execution_id: Uuid,
@@ -673,7 +704,36 @@ pub async fn settle_execution(
     .await?
     .rows_affected();
 
+    // The failure counter, taken only by the caller that actually settled the row. `settled > 0`
+    // is the once, not a defensive re-read: the update above matches a running row, so a second
+    // caller racing it sees zero rows and must not count. Only `Failed` counts — a cancelled run
+    // was a person's decision and a completed run has nothing to report.
+    if settled > 0 && status == ExecutionStatus::Failed {
+        if let Some(project_id) = execution_project_id(pool, execution_id).await? {
+            let mut connection = pool.acquire().await?;
+            crate::limits::count_failed_run_in(&mut connection, project_id).await?;
+        }
+    }
+
     Ok(if settled > 0 { Some(status) } else { None })
+}
+
+/// The project a run belongs to, read through its workflow.
+///
+/// `workflow_executions` carries `organization_id` but not `project_id`, and the two are not
+/// interchangeable: an organization holds many projects and the usage counters are per project, so
+/// the join is the only path to the right number. Returns `None` when the workflow is gone — a run
+/// whose workflow was deleted while it was still settling has no project to attribute, and
+/// inventing one would charge an unrelated project's counter.
+async fn execution_project_id(pool: &PgPool, execution_id: Uuid) -> Result<Option<Uuid>> {
+    sqlx::query_scalar(
+        "select w.project_id from workflow_executions e \
+         join workflows w on w.id = e.workflow_id where e.id = $1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(WorkflowError::from)
 }
 
 /// Cancel a running execution: the flag is the row's status, and every open step is closed.

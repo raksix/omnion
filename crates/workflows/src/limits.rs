@@ -295,8 +295,35 @@ pub async fn usage_today(pool: &PgPool, project_id: Uuid) -> Result<UsageDay> {
 /// The increment is inside the upsert, so two engines counting the same run cannot read-modify-write
 /// over each other. This is the "counters update atomically" the REQ asks for, and it is why the
 /// limit check that reads the counter may overshoot by in-flight work and no more.
+///
+/// Thin wrapper over [`record_usage_in`], for a caller that holds only a pool.
 pub async fn record_usage(
     pool: &PgPool,
+    project_id: Uuid,
+    failed: bool,
+    compute_ms: i64,
+) -> Result<UsageDay> {
+    let mut connection = pool.acquire().await?;
+    record_usage_in(&mut connection, project_id, failed, compute_ms).await
+}
+
+/// The same write, inside a transaction the caller owns.
+///
+/// **This is the function the platform actually calls**, from `store::create_execution_in`, and the
+/// split is the one the module already uses everywhere else (`usage_today_in` / `usage_today`,
+/// `concurrent_runs_in` / `concurrent_runs`, `claim_due_notices_in` / `claim_due_notices`): the
+/// `*_in` half takes a connection so it can sit in the same transaction as the guard that reads it.
+///
+/// `failed` is `false` here and stays `false`, deliberately. The counter is written when a run
+/// **starts**, because that is the transaction that reads it — the daily cap is checked against
+/// runs that exist, not against runs that finished, and a run that started and is still running
+/// is the one an operator staring at "of 10 runs today" means to see. Writing at settlement
+/// instead would leave a long-running run invisible to the cap that is refusing to let it start,
+/// and would make the cap read *n* runs while the table holds *n+1*, so the project would be
+/// refused on exactly its tenth run rather than its eleventh. `failures` is therefore counted
+/// where failures are actually known: [`count_failed_run_in`], driven by the settlement path.
+pub async fn record_usage_in(
+    connection: &mut sqlx::PgConnection,
     project_id: Uuid,
     failed: bool,
     compute_ms: i64,
@@ -314,9 +341,38 @@ pub async fn record_usage(
     .bind(project_id)
     .bind(if failed { 1 } else { 0 })
     .bind(compute_ms.max(0))
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
     Ok(day)
+}
+
+/// Add one failure to today's row, for a run that just failed.
+///
+/// **A separate statement from [`record_usage_in`], and that is the whole point of it.** The
+/// `failures` column used to travel on the same write as `runs`, which is right only if a run is
+/// counted exactly once and already knows its own outcome. Counting at start time — which is what
+/// the cap requires — means the outcome is unknown at that moment, so a single write cannot carry
+/// both. Adding a failure later keeps `runs` and `failures` independent counters, each written
+/// once by the code that actually knows its number.
+///
+/// The upsert is unconditional rather than `do nothing` + update, and `compute_ms` is **not**
+/// touched: the run already contributed its compute time when it started, and adding it twice
+/// would make the series disagree with itself the moment a day contained both a success and a
+/// failure. A project with no row yet (a run that failed without ever being counted — only
+/// possible if a caller reaches this directly) gets a row with `runs` 0 rather than 1, because
+/// inventing a run that the start path did not count would be a worse lie than an absent row.
+pub async fn count_failed_run_in(connection: &mut sqlx::PgConnection, project_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "insert into automation_project_usage (project_id, usage_date, runs, failures, compute_ms) \
+         values ($1, current_date, 0, 1, 0) \
+         on conflict (project_id, usage_date) do update set \
+         failures = automation_project_usage.failures + 1, \
+         updated_at = now()",
+    )
+    .bind(project_id)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
 }
 
 /// How many runs are in flight right now.
