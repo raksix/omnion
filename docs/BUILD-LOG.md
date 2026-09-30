@@ -7329,3 +7329,49 @@ in its API build now.
 `editorNoHorizontalScrollAt390`, `noPublishControlAt390`, `canvasDrawnAt390` and
 `publicRendered`; tick 17 only when both halves are green. (b) REQ-064's open slices. (c)
 REQ-062 acceptance 15's render half.
+
+## 2026-09-30 · Tick 36b — the pass died at its first screen, and it was the harness (REQ-063 criterion 17 still open)
+
+**What.** The `--only=block-editor` pass granted the place at 07:58 with 7.8 GB free, built the API,
+seeded the owner and then wrote `fatal: "could not sign in"` with **zero** screens walked. The API
+log for the same pass says `session created` at `08:17:28.269`. The three timestamps are the whole
+finding: the screenshot of the filled form is `08:17:26.091`, the session exists at `08:17:28.269`,
+and `summary.json` is written at `08:17:32.192` — so `ensureSignedIn` asked whether it was still
+on `/login` about a second *before* the response landed. It filled the form, clicked Sign in,
+`sleep(1200)`, and on a box at load 90 the login POST took 2.2 s. Measured warm it is 675–817 ms,
+which is exactly why the constant was never caught: it is right most of the time and wrong when the
+box is busy, which is when a pass matters.
+
+`ensureSignedIn` now waits for the sign-in rather than for a number of milliseconds — the URL
+leaving `/login` (sign-in ends in a client-side `router.replace`, `apps/admin/app/login/page.tsx`)
+or the app shell appearing, with a 30 s ceiling. `scripts/qa/test-signin-wait.cjs` reproduces it in
+a browser: a Playwright route holds the login *response* for 3000 ms — the session is still
+created, exactly as in the outage — and the wait has to outlast both the stall and the old sleep.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `node scripts/qa/test-signin-wait.cjs` (live API + admin on the w2 stack) | **5 passed, 0 failed** — signed in after 5925 ms, left `/login`, shell rendered |
+| same test, first run | 5 passed in 23.6 s — the difference is Next's cold dev compile of `/` (9.5 s in the admin log) and nothing else |
+| login POST latency, live, 3 requests | 817 ms / 696 ms / 675 ms (load 103) — the 1200 ms sleep was marginal, not safe |
+| `cargo test -p omnion-content --quiet` | **252 passed, 0 failed**, exit 0 |
+| `apps/admin` `tsc --noEmit` | clean, exit 0 |
+| `bash scripts/qa/test-qa-slot.sh` | 15 passed, 0 failed |
+
+**Two wrong fixes were written before the right one, and both are worth the space.** The obvious
+`Promise.race` mapped every rejection to `false` — but `waitForFunction` rejects with "execution
+context was destroyed" the instant the redirect navigates, *which is the success path*, so that
+version declared a working sign-in a failure at the moment it worked. A branch that fails now
+hangs, and only the clock can report "not signed in". The same pass first waited on
+`document.cookie` containing `omnion_session`: the cookie is `HttpOnly` (`apps/api/src/cookies.rs`),
+so that branch can never fire and would have waited the full 30 s on every pass. The app shell is
+the signal that actually exists.
+
+**No acceptance box is ticked.** Criterion 17 is still unproven: the fix is what lets a pass reach
+the block editor at all, so the measurement it was blocking has not run yet.
+
+**Next.** (a) Queue `--only=block-editor` again now the sign-in survives a loaded box; read
+`summary.json` for `editorNarrowAt1440`, `editorNoHorizontalScrollAt390`, `noPublishControlAt390`,
+`canvasDrawnAt390`, `publicRendered`; tick 17 only when both halves are green. (b) REQ-064's open
+slices. (c) REQ-062 acceptance 15's render half.
