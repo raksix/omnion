@@ -1,6 +1,6 @@
 # REQ-014 — System Health
 
-> **Status:** in-progress (slice 1: probes + overview, `/health` + `/health/services/{key}`) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress (slices 1 and 2 shipped: probes + overview, `/health` + `/health/services/{key}`, and `/health/metrics` — named ranges, real aggregates, per-row sparklines and a server-rendered CSV export that matches the table) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -107,12 +107,25 @@ Webhook relevance: `health.service.degraded` and `health.service.recovered` are 
 - [x] Auto-refresh (15 s) visibly updates timestamps and values without a manual reload.
 - [x] "Run all checks" records a new sample set and reports per-probe failures instead of failing whole.
 - [x] Service detail lists each probe with latency and message and charts the last 24 h.
+      → the drill-down shipped in `5690748f` with `runHealthDepth` asserting the screen
+        *rendered* rather than that the URL resolved; the trend **line** itself arrives with
+        slice 2's `/health/metrics` rows, which carry each metric's own `series`.
 - [ ] A state transition opens an incident; recovery resolves it with a duration.
 - [ ] Acknowledging an incident stores the actor, the note and the timestamp.
 - [ ] A maintenance window suppresses incident creation while the state still shows degraded.
 - [ ] Thresholds save and a breach beyond the critical limit emits `health.threshold.breached` once.
 - [ ] Out-of-range settings (interval 0, heartbeat 0, warn above critical) are refused with messages.
-- [ ] Metric ranges (1 h, 24 h, 7 d) return real aggregates and CSV export matches the range shown.
+- [x] Metric ranges (1 h, 24 h, 7 d) return real aggregates and CSV export matches the range shown.
+      → shipped `8c445f52` + `9e7382b0`. A range is a **name** (`Range::Hour/Day/Week`, keys
+        `1h`/`24h`/`7d`) and `Range::parse` refuses anything else naming what is offered — the
+        clamp-and-answer shape produces a table labelled `7d` holding a day *and* a CSV that
+        matches that table perfectly, so the export criterion would pass while both were wrong.
+        The export and the table are rendered from one `metric_summaries` list, and the file
+        stamps the range into every row, the filename and an `X-Health-Range` header. An empty
+        window has `None` aggregates, not `0` (`avg()` over no rows is `NULL`). Proof: 11 crate
+        unit tests + 8 live-PostgreSQL walks (`health_history`), `tsc` exit 0. The walk asserts
+        the empty case *and* the populated case through the same function, because a read that
+        returned nothing for everybody would pass the empty leg.
 - [x] Sample retention prunes raw samples older than 30 days without touching incidents.
 - [x] Reads require `health.read`; run-checks and settings require `health.manage` (`403` otherwise).
 - [ ] Walkthrough passes with zero high findings.
@@ -124,7 +137,7 @@ The walkthrough must visit `/health`, `/health/metrics`, `/health/incidents`, `/
 ### Slices
 
 1. **Probes + overview** — schema for samples and settings, probe registry, run loop, `/health` with the seven service rows and the metric cards. Done: stopping a dependency changes the panel and restarting it recovers, all from real probes.
-2. **History + service detail** — sample aggregation, sparklines, ranges, per-service detail and CSV export, retention pruning. Done: 24 h trends render from stored samples and pruning keeps the configured retention.
+2. **History + service detail** — sample aggregation, sparklines, ranges, per-service detail and CSV export, retention pruning. Done: 24 h trends render from stored samples and pruning keeps the configured retention. **Shipped** (`8c445f52`, `9e7382b0`): `crates/health::history` (named `Range`, `MetricSummary`, `RollupDay`, `summaries_to_csv`), `/health/metrics` + `/health/metrics.csv` behind `health.read`, and `/health/metrics` with range selector, sparklines, CSV export, empty state and mobile cards. *Still open in this slice:* the **service detail page's own 24 h chart** — its metric table lists values but draws no trend, so the one remaining screen-state claim here is browser-verified behaviour, not code.
 3. **Incidents + thresholds** — transition detection, incident store, acknowledge/resolve, threshold policy and breach events, `/health/incidents`. Done: a scripted outage produces one incident with a duration and an acknowledgement that persists.
 4. **Workers + maintenance + summary** — worker heartbeats, stale detection, maintenance windows, platform summary endpoint feeding the security overview, webhook for degraded/recovered. Done: a killed worker is reported as stale and the summary endpoint reflects the worst current state.
 

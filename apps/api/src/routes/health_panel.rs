@@ -533,21 +533,33 @@ pub async fn metrics_csv(
             .await
             .map_err(map_store)?;
     let body = omnion_health::summaries_to_csv(&summaries, range);
-    Ok((
-        StatusCode::OK,
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "text/csv; charset=utf-8",
-            ),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"omnion-health-{}.csv\"", range.key()),
-            ),
-            ("x-health-range", range.key().to_string()),
-        ],
-        body,
-    ))
+    let filename = format!("omnion-health-{}.csv", range.key());
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "text/csv; charset=utf-8".to_owned(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        ),
+        (
+            axum::http::HeaderName::from_static("x-health-range"),
+            range.key().to_owned(),
+        ),
+    ];
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    for (name, value) in headers {
+        // `HeaderValue::from_str` rather than `from`: a name that came from a
+        // client's query is not yet known to be a legal header value, and
+        // `from` panics on one that is not. The range is already a closed
+        // vocabulary by this point, so this is belt and braces — a panic in a
+        // status screen's export is the worst place for one to happen.
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    Ok(response)
 }
 
 /// The query both metric endpoints accept.
