@@ -5786,6 +5786,59 @@ async function runNotificationSettingsDepth(page, report) {
   }).catch(() => {});
   steps.restored = true;
 
+  // ---- the test-delivery block (REQ-021, slice 5) ------------------------------------------
+  //
+  // **The legs that matter are the ones a shortcut would fail.** A screen that rendered a
+  // green "Delivered" without sending anything, or that reported a failed send as an HTTP
+  // error banner, is the failure this block exists to catch — so it asserts the *line* the
+  // server sent, not merely that a line appeared.
+  await page.goto(`${URL_ADMIN}/notifications/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+
+  steps.testBlockPresent = (await page.locator("[data-test-delivery]").count()) > 0;
+
+  // in-app must be *absent* from the offered channels: the screen explains why next to it,
+  // so its absence is a claim the copy has to back up.
+  const inAppRow = await page.locator("[data-test-channel=in_app]").count();
+  const copyMentionsInApp = await page
+    .locator("[data-test-delivery]")
+    .innerText()
+    .then((text) => /in-app/i.test(text))
+    .catch(() => false);
+  steps.inAppNotOffered = inAppRow === 0;
+  steps.inAppAbsenceIsExplained = copyMentionsInApp;
+
+  // A channel this installation cannot send over must still be offered and must answer with a
+  // readable reason. `web_push` is the honest one: no browser subscription exists in a
+  // headless pass, so the server's refusal is the expected result — and a *clicked* button that
+  // says why is the whole feature.
+  const pushButton = page.locator("[data-test-button=web_push]");
+  steps.pushButtonOffered = (await pushButton.count()) > 0;
+  if (steps.pushButtonOffered) {
+    await pushButton.first().click().catch(() => {});
+    await page.waitForTimeout(2500);
+    const result = page.locator("[data-test-result=web_push]");
+    steps.pushTestAnswered = (await result.count()) > 0;
+    if (steps.pushTestAnswered) {
+      steps.pushTestDelivered = (await result.getAttribute("data-delivered").catch(() => "")) === "yes";
+      const text = await result.innerText().catch(() => "");
+      // The detail is the sentence under the verdict. An empty one is the failure: "not
+      // delivered" with no reason sends the reader to their settings page to guess.
+      steps.pushTestExplainsItself = text.trim().length > 30 && /not delivered/i.test(text);
+    }
+  }
+
+  // The in-flight lock: a second press while one is running must not be possible, because two
+  // sends racing into one status line is a line whose number belongs to neither.
+  const emailButton = page.locator("[data-test-button=email]");
+  if ((await emailButton.count()) > 0) {
+    await emailButton.first().click().catch(() => {});
+    await page.waitForTimeout(120);
+    steps.testDisabledWhileInFlight =
+      (await emailButton.first().isDisabled().catch(() => false)) === true;
+  }
+  await shot(page, "page-notifications-test-delivery");
+
   return steps;
 }
 
