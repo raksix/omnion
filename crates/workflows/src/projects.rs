@@ -808,6 +808,163 @@ pub async fn update_project(
     Ok(row)
 }
 
+/// One project a person is the last remaining owner of.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct OwnedProject {
+    pub id: Uuid,
+    /// The project's short key, which is what a person reads in a refusal.
+    pub key: String,
+    pub name: String,
+}
+
+/// What a person still holds in the automation layer — the answer to "may this account be
+/// turned off?".
+///
+/// **Two different facts, deliberately not one number.** A project owner blocks; a workflow
+/// author does not. The REQ's sentence names both, but only one of them has a remedy on this
+/// branch: `transfer_ownership` moves a project to somebody else in one transaction, while a
+/// workflow's `created_by` is an authorship stamp the schema itself declares nullable
+/// (`on delete set null`). Refusing a deactivation over authorship would lock an account that
+/// cannot be turned off, with no action available that is not "delete somebody's work" — and
+/// the REQ asks for *reassignment*, not deletion. So `owned` is the refusal and `authored`
+/// is reported beside it, and the count travels into the audit row so the fact is not lost.
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+pub struct UserAssignments {
+    /// Projects whose only owner is this person.
+    pub owned: Vec<OwnedProject>,
+    /// Workflows this person created, in any project of theirs.
+    pub authored_workflows: i64,
+}
+
+impl UserAssignments {
+    /// Whether a deactivation has to be refused.
+    pub fn blocks_deactivation(&self) -> bool {
+        !self.owned.is_empty()
+    }
+}
+
+/// Everything a person still holds, read in one statement per question.
+///
+/// `role = 'owner'` on the membership is checked **as well as** `owner_user_id`, because the two
+/// can disagree: `transfer_ownership` writes both in one transaction, but `upsert_member` writes
+/// only the membership, so a project can carry an owner nobody is recorded as owning. A guard
+/// that read the column alone would let that person be switched off.
+pub async fn user_assignments(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<UserAssignments> {
+    let owned = sqlx::query_as::<_, OwnedProject>(
+        "select p.id, p.key, p.name \
+           from automation_projects p \
+          where p.organization_id = $2 \
+            and (p.owner_user_id = $1 \
+                 or exists (select 1 from automation_project_members m \
+                             where m.project_id = p.id and m.user_id = $1 and m.role = 'owner')) \
+            and not exists (select 1 from automation_project_members m2 \
+                             where m2.project_id = p.id and m2.role = 'owner' and m2.user_id <> $1) \
+          order by p.key",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_all(pool)
+    .await?;
+
+    let authored_workflows: i64 = sqlx::query_scalar(
+        "select count(*) from workflows w \
+          join automation_projects p on p.id = w.project_id \
+         where w.created_by = $1 and p.organization_id = $2",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(UserAssignments {
+        owned,
+        authored_workflows,
+    })
+}
+
+/// Read a person's assignments for the deactivation decision, refusing the account that still
+/// owns a project.
+///
+/// The refusal **names every project and the remedy**, because the only actions that unblock it
+/// are `POST /projects/{id}/transfer-ownership` and adding a second owner — and an operator
+/// holding only `users.manage` cannot do either, so the sentence has to say who to ask.
+///
+/// The read runs `for share` on the project rows. A check followed by an unconditional write is
+/// the two-statement version of the race where a transfer lands between the read and the update:
+/// the account goes off and the project is left owned by somebody who cannot sign in.
+pub async fn ensure_user_can_be_disabled_in(
+    connection: &mut sqlx::PgConnection,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<UserAssignments> {
+    let owned = sqlx::query_as::<_, OwnedProject>(
+        "select p.id, p.key, p.name \
+           from automation_projects p \
+          where p.organization_id = $2 \
+            and (p.owner_user_id = $1 \
+                 or exists (select 1 from automation_project_members m \
+                             where m.project_id = p.id and m.user_id = $1 and m.role = 'owner')) \
+            and not exists (select 1 from automation_project_members m2 \
+                             where m2.project_id = p.id and m2.role = 'owner' and m2.user_id <> $1) \
+          order by p.key \
+          for share of p",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    if !owned.is_empty() {
+        let list = owned
+            .iter()
+            .map(|p| {
+                let mut name: String = p.name.chars().take(24).collect();
+                if p.name.chars().count() > 24 {
+                    name.push('…');
+                }
+                format!("{} ({name})", p.key)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(WorkflowError::invalid(
+            "user_still_owns_projects",
+            format!(
+                "this account is the last owner of {list} — transfer ownership to another account, \
+                 or give the project a second owner, before disabling it"
+            ),
+        ));
+    }
+
+    let authored_workflows: i64 = sqlx::query_scalar(
+        "select count(*) from workflows w \
+          join automation_projects p on p.id = w.project_id \
+         where w.created_by = $1 and p.organization_id = $2",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .fetch_one(&mut *connection)
+    .await?;
+
+    Ok(UserAssignments {
+        owned,
+        authored_workflows,
+    })
+}
+
+/// [`ensure_user_can_be_disabled_in`] for a caller with only a pool.
+pub async fn ensure_user_can_be_disabled(
+    pool: &PgPool,
+    organization_id: Uuid,
+    user_id: Uuid,
+) -> Result<UserAssignments> {
+    let mut connection = pool.acquire().await?;
+    ensure_user_can_be_disabled_in(&mut connection, organization_id, user_id).await
+}
+
 /// Archive or restore a project.
 ///
 /// The default project refuses to archive, and the refusal is the migration's
