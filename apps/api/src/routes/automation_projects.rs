@@ -200,7 +200,7 @@ pub(crate) async fn is_instance_admin(
 }
 
 /// The caller as the store sees them, for one organization.
-async fn caller_for(
+pub(crate) async fn caller_for(
     state: &AppState,
     current: &CurrentSession,
     organization_id: Uuid,
