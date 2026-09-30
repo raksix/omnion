@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-startup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Startup theme \u2014 A launch site: a centred canvas, an oversized centred headline and a two-step call to action.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/startup.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

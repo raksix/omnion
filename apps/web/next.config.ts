@@ -25,7 +25,25 @@ const nextConfig: NextConfig = {
    * The workspace packages behind the theme engine ship TypeScript sources; Next compiles them
    * with the app so a theme can be read and debugged where it is written.
    */
-  transpilePackages: ["@omnion/types", "@omnion/theme-sdk", "@omnion/theme-minimal"],
+  // Every bundled theme is transpiled: the renderer imports all ten by package name, and a
+  // package the bundler treats as a prebuilt dependency would arrive as untransformed JSX.
+  // `transpilePackages` is a list of names, not a glob, so the ten are written out — which is
+  // also the moment a theme added without being added here fails `next build` rather than
+  // failing silently at runtime as an unstyled page.
+  transpilePackages: [
+    "@omnion/types",
+    "@omnion/theme-sdk",
+    "@omnion/theme-agency",
+    "@omnion/theme-commerce",
+    "@omnion/theme-corporate",
+    "@omnion/theme-documentation",
+    "@omnion/theme-government",
+    "@omnion/theme-magazine",
+    "@omnion/theme-minimal",
+    "@omnion/theme-portfolio",
+    "@omnion/theme-startup",
+    "@omnion/theme-tech",
+  ],
 };
 
 export default nextConfig;

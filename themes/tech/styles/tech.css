@@ -1,0 +1,431 @@
+/**
+ * Tech — A product site for software: a dark-canvas hero, a mono accent line and a dense type scale.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="tech"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="tech"] {
+  --te-tech-canvas: #fbfcfe;
+  --te-tech-surface: #f2f5fa;
+  --te-tech-ink: #0d1117;
+  --te-tech-muted: #57606f;
+  --te-tech-line: #e1e6ee;
+  --te-tech-accent: #5b3df5;
+  --te-tech-accent_soft: #eeecfe;
+  --te-tech-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --te-tech-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --te-tech-measure: 46rem;
+  --te-tech-title-scale: clamp(2.3rem, 1.5rem + 3.2vw, 3.8rem);
+  --te-tech-title-weight: 750;
+  --te-tech-title-tracking: -0.04em;
+  --te-tech-radius: 10px;
+  --te-tech-base-size: 16px;
+  --te-tech-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="tech"] {
+    --te-tech-canvas: #0b0e14;
+    --te-tech-surface: #141a25;
+    --te-tech-ink: #e8edf5;
+    --te-tech-muted: #8b96a8;
+    --te-tech-line: #222b39;
+    --te-tech-accent: #a394ff;
+    --te-tech-accent_soft: #1c1a3a;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="tech"] *,
+html[data-theme="tech"] *::before,
+html[data-theme="tech"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="tech"] {
+  background-color: var(--te-tech-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="tech"] body {
+  margin: 0;
+  background: var(--te-tech-canvas);
+  color: var(--te-tech-ink);
+  font-family: var(--te-tech-font-body);
+  font-size: var(--te-tech-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="tech"] ::selection {
+  background-color: var(--te-tech-accent-soft);
+}
+
+html[data-theme="tech"] a {
+  color: var(--te-tech-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="tech"] :focus-visible {
+  outline: 3px solid var(--te-tech-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="tech"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.te-tech-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.te-tech-header,
+.te-tech-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.te-tech-header {
+  border-bottom: 1px solid var(--te-tech-line); background: var(--te-tech-surface);
+}
+
+.te-tech-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--te-tech-line);
+  color: var(--te-tech-muted);
+  font-size: 0.8125rem;
+}
+
+.te-tech-main {
+  width: 100%;
+  max-width: var(--te-tech-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.te-tech-article {
+  max-width: var(--te-tech-measure);
+}
+
+.te-tech-title {
+  margin: 0;
+  font-family: var(--te-tech-font-title);
+  font-size: var(--te-tech-title-scale);
+  font-weight: var(--te-tech-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--te-tech-title-tracking);
+}
+
+.te-tech-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--te-tech-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.te-tech-summary {
+  margin: 1rem 0 0;
+  color: var(--te-tech-muted);
+  font-size: 1.15em;
+}
+
+.te-tech-meta {
+  margin: 1.5rem 0 0;
+  color: var(--te-tech-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.te-tech-body {
+  margin-top: 2.5rem;
+}
+
+.te-tech-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.te-tech-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.te-tech-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--te-tech-ink);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+}
+
+/* The mark is a shape rather than a letter, so it survives a wordmark of any length. */
+.te-tech-brand-dot {
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 3px;
+  background: var(--te-tech-accent);
+}
+
+.te-tech-pill {
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  background: var(--te-tech-accent);
+  color: var(--te-tech-canvas);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+/* Raised, not outlined: a product site's cards sit above the canvas. */
+.te-tech-card {
+  border: 0;
+  background: var(--te-tech-surface);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 8px 24px rgb(0 0 0 / 0.06);
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.te-tech-block {
+  margin: 0 0 1.75rem;
+}
+
+.te-tech-block:last-child {
+  margin-bottom: 0;
+}
+
+.te-tech-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--te-tech-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.te-tech-heading:first-child {
+  margin-top: 0;
+}
+
+.te-tech-align-center {
+  text-align: center;
+}
+
+.te-tech-align-right {
+  text-align: right;
+}
+
+.te-tech-figure {
+  margin-inline: 0;
+}
+
+.te-tech-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--te-tech-muted);
+  font-size: 0.8125rem;
+}
+
+.te-tech-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--te-tech-accent);
+  background: var(--te-tech-surface);
+  border-radius: var(--te-tech-radius);
+}
+
+.te-tech-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.te-tech-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--te-tech-muted);
+  font-size: 0.8125rem;
+}
+
+.te-tech-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.te-tech-gallery img {
+  border-radius: var(--te-tech-radius);
+}
+
+.te-tech-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.te-tech-cta {
+  padding: 1.75rem;
+  border-radius: var(--te-tech-radius);
+  background: var(--te-tech-accent-soft);
+}
+
+.te-tech-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.te-tech-cta p {
+  margin: 0 0 1rem;
+  color: var(--te-tech-muted);
+}
+
+.te-tech-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--te-tech-radius);
+  background: var(--te-tech-accent);
+  color: var(--te-tech-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.te-tech-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.te-tech-card {
+  padding: 1.25rem;
+  border: 1px solid var(--te-tech-line);
+  border-radius: var(--te-tech-radius);
+  background: var(--te-tech-surface);
+}
+
+.te-tech-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.te-tech-card p {
+  margin: 0 0 0.75rem;
+  color: var(--te-tech-muted);
+  font-size: 0.9375rem;
+}
+
+.te-tech-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.te-tech-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.te-tech-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--te-tech-line);
+  border-radius: var(--te-tech-radius);
+}
+
+.te-tech-plan h3 {
+  margin: 0;
+}
+
+.te-tech-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.te-tech-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--te-tech-muted);
+  font-size: 0.9375rem;
+}
+
+.te-tech-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--te-tech-line);
+}
+
+.te-tech-faq dt {
+  font-weight: 600;
+}
+
+.te-tech-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--te-tech-muted);
+}
+
+.te-tech-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--te-tech-radius);
+  background: var(--te-tech-surface);
+  font-size: 0.875rem;
+}
+
+.te-tech-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--te-tech-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.te-tech-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--te-tech-line);
+  border-radius: var(--te-tech-radius);
+  color: var(--te-tech-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .te-tech-gallery,
+  .te-tech-columns,
+  .te-tech-cards,
+  .te-tech-plans {
+    grid-template-columns: 1fr;
+  }
+}

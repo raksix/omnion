@@ -7,7 +7,7 @@
  * platform's design language.
  */
 
-:root {
+html[data-theme="minimal"] {
   --mn-canvas: #faf9f5;
   --mn-surface: #ffffff;
   --mn-ink: #262624;
@@ -26,7 +26,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  html[data-theme="minimal"] {
     --mn-canvas: #211f1d;
     --mn-surface: #26241f;
     --mn-ink: #edeae4;
@@ -37,12 +37,12 @@
   }
 }
 
-html {
+html[data-theme="minimal"] {
   background-color: var(--mn-canvas);
   color-scheme: light dark;
 }
 
-body {
+html[data-theme="minimal"] body {
   background-color: var(--mn-canvas);
   color: var(--mn-ink);
   font-family: var(--mn-font-body);
@@ -50,21 +50,21 @@ body {
   line-height: 1.7;
 }
 
-::selection {
+html[data-theme="minimal"] ::selection {
   background-color: var(--mn-accent-soft);
 }
 
-a {
+html[data-theme="minimal"] a {
   color: var(--mn-accent);
   text-decoration-thickness: 1px;
   text-underline-offset: 3px;
 }
 
-a:hover {
+html[data-theme="minimal"] a:hover {
   text-decoration-thickness: 2px;
 }
 
-:focus-visible {
+html[data-theme="minimal"] :focus-visible {
   outline: 2px solid var(--mn-accent);
   outline-offset: 3px;
   border-radius: 2px;

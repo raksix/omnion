@@ -51,12 +51,39 @@ importers:
 
   apps/web:
     dependencies:
+      '@omnion/theme-agency':
+        specifier: workspace:*
+        version: link:../../themes/agency
+      '@omnion/theme-commerce':
+        specifier: workspace:*
+        version: link:../../themes/commerce
+      '@omnion/theme-corporate':
+        specifier: workspace:*
+        version: link:../../themes/corporate
+      '@omnion/theme-documentation':
+        specifier: workspace:*
+        version: link:../../themes/documentation
+      '@omnion/theme-government':
+        specifier: workspace:*
+        version: link:../../themes/government
+      '@omnion/theme-magazine':
+        specifier: workspace:*
+        version: link:../../themes/magazine
       '@omnion/theme-minimal':
         specifier: workspace:*
         version: link:../../themes/minimal
+      '@omnion/theme-portfolio':
+        specifier: workspace:*
+        version: link:../../themes/portfolio
       '@omnion/theme-sdk':
         specifier: workspace:*
         version: link:../../packages/theme-sdk
+      '@omnion/theme-startup':
+        specifier: workspace:*
+        version: link:../../themes/startup
+      '@omnion/theme-tech':
+        specifier: workspace:*
+        version: link:../../themes/tech
       '@omnion/types':
         specifier: workspace:*
         version: link:../../packages/types
@@ -98,7 +125,151 @@ importers:
 
   packages/types: {}
 
+  themes/agency:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/commerce:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/corporate:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/documentation:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/government:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/magazine:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
   themes/minimal:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/portfolio:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/startup:
+    dependencies:
+      '@omnion/theme-sdk':
+        specifier: workspace:*
+        version: link:../../packages/theme-sdk
+      '@omnion/types':
+        specifier: workspace:*
+        version: link:../../packages/types
+      react:
+        specifier: '>=19'
+        version: 19.3.0
+    devDependencies:
+      '@types/react':
+        specifier: 19.3.0
+        version: 19.3.0
+
+  themes/tech:
     dependencies:
       '@omnion/theme-sdk':
         specifier: workspace:*

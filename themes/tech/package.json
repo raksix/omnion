@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-tech",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Tech theme \u2014 A product site for software: a dark-canvas hero, a mono accent line and a dense type scale.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/tech.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

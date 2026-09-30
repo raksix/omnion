@@ -1,0 +1,88 @@
+{
+  "key": "portfolio",
+  "name": "Portfolio",
+  "version": "1.0.0",
+  "description": "A personal site: one column, the name set large, and work presented as numbered entries.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#ffffff",
+      "dark": "#101010"
+    },
+    "surface": {
+      "light": "#fafafa",
+      "dark": "#191919"
+    },
+    "ink": {
+      "light": "#171717",
+      "dark": "#ededed"
+    },
+    "muted": {
+      "light": "#6a6a6a",
+      "dark": "#9d9d9d"
+    },
+    "line": {
+      "light": "#e5e5e5",
+      "dark": "#2b2b2b"
+    },
+    "accent": {
+      "light": "#b45309",
+      "dark": "#f0b354"
+    },
+    "accent_soft": {
+      "light": "#fdf1e3",
+      "dark": "#33240f"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 17,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "personal",
+    "freelance"
+  ]
+}

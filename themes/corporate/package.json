@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-corporate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Corporate theme \u2014 An institutional company site: a full-width masthead, a narrow reading column and section rules.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/corporate.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-government",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Government theme \u2014 A public-sector portal: a three-part institutional header, high contrast and a visible focus ring.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/government.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

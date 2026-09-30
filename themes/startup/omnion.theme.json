@@ -1,0 +1,88 @@
+{
+  "key": "startup",
+  "name": "Startup",
+  "version": "1.0.0",
+  "description": "A launch site: a centred canvas, an oversized centred headline and a two-step call to action.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#ffffff",
+      "dark": "#0d0b14"
+    },
+    "surface": {
+      "light": "#f7f5ff",
+      "dark": "#191527"
+    },
+    "ink": {
+      "light": "#120f1c",
+      "dark": "#ece7fa"
+    },
+    "muted": {
+      "light": "#635d75",
+      "dark": "#9a92b0"
+    },
+    "line": {
+      "light": "#e6e1f5",
+      "dark": "#2a2440"
+    },
+    "accent": {
+      "light": "#7c3aed",
+      "dark": "#c4b0ff"
+    },
+    "accent_soft": {
+      "light": "#f1ebff",
+      "dark": "#241a45"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 17,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 14,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "launch",
+    "landing"
+  ]
+}

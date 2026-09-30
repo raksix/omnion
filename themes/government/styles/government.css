@@ -1,0 +1,457 @@
+/**
+ * Government — A public-sector portal: a three-part institutional header, high contrast and a visible focus ring.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="government"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="government"] {
+  --go-government-canvas: #ffffff;
+  --go-government-surface: #f2f5f8;
+  --go-government-ink: #14181d;
+  --go-government-muted: #4d5866;
+  --go-government-line: #d3dae2;
+  --go-government-accent: #003a70;
+  --go-government-accent_soft: #e6eef7;
+  --go-government-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --go-government-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --go-government-measure: 44rem;
+  --go-government-title-scale: clamp(1.9rem, 1.5rem + 1.6vw, 2.7rem);
+  --go-government-title-weight: 700;
+  --go-government-title-tracking: -0.01em;
+  --go-government-radius: 2px;
+  --go-government-base-size: 17px;
+  --go-government-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="government"] {
+    --go-government-canvas: #101418;
+    --go-government-surface: #181d23;
+    --go-government-ink: #eef1f5;
+    --go-government-muted: #9aa5b2;
+    --go-government-line: #2b333c;
+    --go-government-accent: #79b2f0;
+    --go-government-accent_soft: #132338;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="government"] *,
+html[data-theme="government"] *::before,
+html[data-theme="government"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="government"] {
+  background-color: var(--go-government-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="government"] body {
+  margin: 0;
+  background: var(--go-government-canvas);
+  color: var(--go-government-ink);
+  font-family: var(--go-government-font-body);
+  font-size: var(--go-government-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="government"] ::selection {
+  background-color: var(--go-government-accent-soft);
+}
+
+html[data-theme="government"] a {
+  color: var(--go-government-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="government"] :focus-visible {
+  outline: 3px solid var(--go-government-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="government"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.go-government-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.go-government-header,
+.go-government-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.go-government-header {
+  border-bottom: 0; padding-bottom: 1rem;
+}
+
+.go-government-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--go-government-line);
+  color: var(--go-government-muted);
+  font-size: 0.8125rem;
+}
+
+.go-government-main {
+  width: 100%;
+  max-width: var(--go-government-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.go-government-article {
+  max-width: var(--go-government-measure);
+}
+
+.go-government-title {
+  margin: 0;
+  font-family: var(--go-government-font-title);
+  font-size: var(--go-government-title-scale);
+  font-weight: var(--go-government-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--go-government-title-tracking);
+}
+
+.go-government-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--go-government-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.go-government-summary {
+  margin: 1rem 0 0;
+  color: var(--go-government-muted);
+  font-size: 1.15em;
+}
+
+.go-government-meta {
+  margin: 1.5rem 0 0;
+  color: var(--go-government-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.go-government-body {
+  margin-top: 2.5rem;
+}
+
+.go-government-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.go-government-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.go-government-utility {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.5rem 1.5rem;
+  background: var(--go-government-surface);
+  color: var(--go-government-muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.go-government-utility-right {
+  text-transform: capitalize;
+}
+
+.go-government-brand {
+  color: var(--go-government-ink);
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.go-government-service {
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--go-government-accent);
+  border-radius: var(--go-government-radius);
+  color: var(--go-government-accent);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.go-government-rule {
+  width: 100%;
+  height: 3px;
+  background: var(--go-government-accent);
+}
+
+/* Public-sector legibility: the focus ring is part of the design, not a browser default.
+   The reset already draws one; this makes it wider still, which is the difference between
+   "passes WCAG" and "a keyboard user can see where they are on a government page". */
+html[data-theme="government"] :focus-visible {
+  outline: 3px solid var(--go-government-accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.go-government-card {
+  border: 1px solid var(--go-government-line);
+  border-left: 4px solid var(--go-government-accent);
+  border-radius: 2px;
+  background: var(--go-government-surface);
+}
+
+.go-government-main {
+  max-width: 1040px;
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.go-government-block {
+  margin: 0 0 1.75rem;
+}
+
+.go-government-block:last-child {
+  margin-bottom: 0;
+}
+
+.go-government-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--go-government-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.go-government-heading:first-child {
+  margin-top: 0;
+}
+
+.go-government-align-center {
+  text-align: center;
+}
+
+.go-government-align-right {
+  text-align: right;
+}
+
+.go-government-figure {
+  margin-inline: 0;
+}
+
+.go-government-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--go-government-muted);
+  font-size: 0.8125rem;
+}
+
+.go-government-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--go-government-accent);
+  background: var(--go-government-surface);
+  border-radius: var(--go-government-radius);
+}
+
+.go-government-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.go-government-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--go-government-muted);
+  font-size: 0.8125rem;
+}
+
+.go-government-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.go-government-gallery img {
+  border-radius: var(--go-government-radius);
+}
+
+.go-government-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.go-government-cta {
+  padding: 1.75rem;
+  border-radius: var(--go-government-radius);
+  background: var(--go-government-accent-soft);
+}
+
+.go-government-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.go-government-cta p {
+  margin: 0 0 1rem;
+  color: var(--go-government-muted);
+}
+
+.go-government-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--go-government-radius);
+  background: var(--go-government-accent);
+  color: var(--go-government-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.go-government-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.go-government-card {
+  padding: 1.25rem;
+  border: 1px solid var(--go-government-line);
+  border-radius: var(--go-government-radius);
+  background: var(--go-government-surface);
+}
+
+.go-government-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.go-government-card p {
+  margin: 0 0 0.75rem;
+  color: var(--go-government-muted);
+  font-size: 0.9375rem;
+}
+
+.go-government-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.go-government-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.go-government-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--go-government-line);
+  border-radius: var(--go-government-radius);
+}
+
+.go-government-plan h3 {
+  margin: 0;
+}
+
+.go-government-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.go-government-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--go-government-muted);
+  font-size: 0.9375rem;
+}
+
+.go-government-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--go-government-line);
+}
+
+.go-government-faq dt {
+  font-weight: 600;
+}
+
+.go-government-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--go-government-muted);
+}
+
+.go-government-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--go-government-radius);
+  background: var(--go-government-surface);
+  font-size: 0.875rem;
+}
+
+.go-government-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--go-government-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.go-government-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--go-government-line);
+  border-radius: var(--go-government-radius);
+  color: var(--go-government-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .go-government-gallery,
+  .go-government-columns,
+  .go-government-cards,
+  .go-government-plans {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "key": "documentation",
+  "name": "Documentation",
+  "version": "1.0.0",
+  "description": "Docs: a sticky table of contents rail, a monospace affordance line and tight line height.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#ffffff",
+      "dark": "#0e1116"
+    },
+    "surface": {
+      "light": "#f6f8fa",
+      "dark": "#161b22"
+    },
+    "ink": {
+      "light": "#1f2328",
+      "dark": "#e6edf3"
+    },
+    "muted": {
+      "light": "#636c76",
+      "dark": "#8d96a0"
+    },
+    "line": {
+      "light": "#d1d9e0",
+      "dark": "#262c36"
+    },
+    "accent": {
+      "light": "#0969da",
+      "dark": "#6cb6ff"
+    },
+    "accent_soft": {
+      "light": "#e6f0fb",
+      "dark": "#12243a"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 16,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 6,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "docs",
+    "manual"
+  ]
+}

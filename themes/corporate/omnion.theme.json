@@ -1,0 +1,88 @@
+{
+  "key": "corporate",
+  "name": "Corporate",
+  "version": "1.0.0",
+  "description": "An institutional company site: a full-width masthead, a narrow reading column and section rules.",
+  "author": "Omnion",
+  "engine": "omnion-web",
+  "modes": [
+    "light",
+    "dark"
+  ],
+  "pageTypes": [
+    "page"
+  ],
+  "layouts": [
+    "page"
+  ],
+  "slots": [
+    "header",
+    "footer",
+    "home",
+    "blog-list",
+    "single",
+    "product",
+    "404",
+    "search"
+  ],
+  "tokens": {
+    "canvas": {
+      "light": "#ffffff",
+      "dark": "#12161c"
+    },
+    "surface": {
+      "light": "#f6f7f9",
+      "dark": "#1a1f27"
+    },
+    "ink": {
+      "light": "#14181e",
+      "dark": "#eef1f5"
+    },
+    "muted": {
+      "light": "#5b6472",
+      "dark": "#98a2b3"
+    },
+    "line": {
+      "light": "#dfe3e9",
+      "dark": "#2a313c"
+    },
+    "accent": {
+      "light": "#0b4fa8",
+      "dark": "#7cb0ff"
+    },
+    "accent_soft": {
+      "light": "#e8f0fb",
+      "dark": "#16273d"
+    }
+  },
+  "settingsSchema": {
+    "containerWidth": {
+      "type": "number",
+      "default": 1120,
+      "min": 720,
+      "max": 1600
+    },
+    "baseSize": {
+      "type": "number",
+      "default": 17,
+      "min": 14,
+      "max": 22
+    },
+    "radius": {
+      "type": "number",
+      "default": 2,
+      "min": 0,
+      "max": 28
+    }
+  },
+  "compatibility": {
+    "engine": "omnion-web",
+    "minVersion": "0.1.0"
+  },
+  "previewImage": "preview.svg",
+  "screenshots": [],
+  "aliases": [
+    "business",
+    "enterprise"
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@omnion/theme-magazine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Omnion's Magazine theme \u2014 An editorial site: a serif display face, a rule above every section and a standfirst.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./styles/magazine.css",
+    "./omnion.theme.json": "./omnion.theme.json"
+  },
+  "dependencies": {
+    "@omnion/theme-sdk": "workspace:*",
+    "@omnion/types": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": ">=19"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}

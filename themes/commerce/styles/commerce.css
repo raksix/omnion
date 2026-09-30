@@ -1,0 +1,445 @@
+/**
+ * Commerce — A storefront: a compact utility header, product grids and a price set in a tabular figure.
+ *
+ * The tokens are the theme; everything below reads them. A settings revision overrides the
+ * same custom property names, which is why they are declared once and never spelled into a
+ * rule — two code paths computing "the effective colour" is how a preview ends up lying.
+ *
+ * Every element selector is scoped to `html[data-theme="commerce"]`. All ten bundled sheets are
+ * loaded by the renderer's static import graph, so an unscoped `body { … }` here would style
+ * every theme's pages with this theme's palette. Block classes are already prefixed and need
+ * no scoping; the resets, the focus ring and the media queries do.
+ */
+
+/* The theme's tokens. A theme is its palette: everything below reads these, and a
+   settings revision overrides them on the same custom property names, which is why they are
+   declared once here rather than spelled into each rule.
+
+   ## Why these rules are scoped to `data-theme`
+
+   All ten bundled stylesheets are loaded by the renderer's single import graph, because a
+   CSS import is static and `resolveTheme()` is a runtime call. Ten sheets declaring `body`
+   would therefore fight, and the winner would be whichever sheet the bundler happened to
+   order last — a site's theme would render with whichever palette sorted highest, which is
+   the "colour-swapped clones" failure in its purest form.
+
+   Scoping to `html[data-theme="<key>"]` is what makes one bundle carry ten themes: only the
+   sheet whose key matches the active theme matches anything. `data-theme` is written by
+   `apps/web/app/layout.tsx` from the same `resolveTheme()` the page is drawn with, so the
+   stylesheet and the markup can never be chosen by different code.
+*/
+html[data-theme="commerce"] {
+  --co-commerce-canvas: #ffffff;
+  --co-commerce-surface: #f7f6f4;
+  --co-commerce-ink: #1a1a1a;
+  --co-commerce-muted: #6b6b6b;
+  --co-commerce-line: #e5e2dd;
+  --co-commerce-accent: #146c43;
+  --co-commerce-accent_soft: #e6f4ec;
+  --co-commerce-font-body: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --co-commerce-font-title: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --co-commerce-measure: 72rem;
+  --co-commerce-title-scale: clamp(1.9rem, 1.4rem + 1.8vw, 2.6rem);
+  --co-commerce-title-weight: 650;
+  --co-commerce-title-tracking: -0.02em;
+  --co-commerce-radius: 8px;
+  --co-commerce-base-size: 16px;
+  --co-commerce-container: 1120px;
+}
+
+/* Dark mode is a token swap, never a second set of rules: the pair lives in the manifest and
+   the stylesheet only decides which pair the visitor gets. */
+@media (prefers-color-scheme: dark) {
+  html[data-theme="commerce"] {
+    --co-commerce-canvas: #121110;
+    --co-commerce-surface: #1d1b19;
+    --co-commerce-ink: #efece8;
+    --co-commerce-muted: #9d9a95;
+    --co-commerce-line: #2e2b28;
+    --co-commerce-accent: #6fd39b;
+    --co-commerce-accent_soft: #12291d;
+  }
+}
+
+
+/* The reset is scoped to the active theme for the reason the tokens are: all ten sheets ship
+   in one bundle, and an unscoped `body` rule would let every one of them style every page. */
+html[data-theme="commerce"] *,
+html[data-theme="commerce"] *::before,
+html[data-theme="commerce"] *::after {
+  box-sizing: border-box;
+}
+
+html[data-theme="commerce"] {
+  background-color: var(--co-commerce-canvas);
+  color-scheme: light dark;
+}
+
+html[data-theme="commerce"] body {
+  margin: 0;
+  background: var(--co-commerce-canvas);
+  color: var(--co-commerce-ink);
+  font-family: var(--co-commerce-font-body);
+  font-size: var(--co-commerce-base-size);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+html[data-theme="commerce"] ::selection {
+  background-color: var(--co-commerce-accent-soft);
+}
+
+html[data-theme="commerce"] a {
+  color: var(--co-commerce-accent);
+  text-underline-offset: 3px;
+}
+
+/* The focus ring is the one rule every theme shares unscoped in spirit and scoped in practice:
+   a theme that removed it would fail the accessibility bar rather than look different. */
+html[data-theme="commerce"] :focus-visible {
+  outline: 3px solid var(--co-commerce-accent);
+  outline-offset: 2px;
+}
+
+html[data-theme="commerce"] img {
+  max-width: 100%;
+  height: auto;
+}
+
+
+/* The shell: a full-height column that pins the footer to the bottom on a short page. */
+.co-commerce-shell {
+  display: flex;
+  min-height: 100dvh;
+  flex-direction: column;
+}
+
+.co-commerce-header,
+.co-commerce-footer {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+}
+
+.co-commerce-header {
+  border-bottom: 0; padding-block: 0.75rem; font-size: 0.875rem;
+}
+
+.co-commerce-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--co-commerce-line);
+  color: var(--co-commerce-muted);
+  font-size: 0.8125rem;
+}
+
+.co-commerce-main {
+  width: 100%;
+  max-width: var(--co-commerce-container);
+  margin-inline: auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.co-commerce-article {
+  max-width: var(--co-commerce-measure);
+}
+
+.co-commerce-title {
+  margin: 0;
+  font-family: var(--co-commerce-font-title);
+  font-size: var(--co-commerce-title-scale);
+  font-weight: var(--co-commerce-title-weight);
+  line-height: 1.1;
+  letter-spacing: var(--co-commerce-title-tracking);
+}
+
+.co-commerce-eyebrow {
+  margin: 0 0 0.75rem;
+  color: var(--co-commerce-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.co-commerce-summary {
+  margin: 1rem 0 0;
+  color: var(--co-commerce-muted);
+  font-size: 1.15em;
+}
+
+.co-commerce-meta {
+  margin: 1.5rem 0 0;
+  color: var(--co-commerce-muted);
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.co-commerce-body {
+  margin-top: 2.5rem;
+}
+
+.co-commerce-body p {
+  margin: 0 0 1.25rem;
+  white-space: pre-line;
+}
+
+.co-commerce-body p:last-child {
+  margin-bottom: 0;
+}
+
+
+.co-commerce-brand {
+  color: var(--co-commerce-ink);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  text-decoration: none;
+}
+
+.co-commerce-utility {
+  display: flex;
+  gap: 1.25rem;
+}
+
+.co-commerce-utility a {
+  color: var(--co-commerce-ink);
+  font-size: 0.875rem;
+  text-decoration: none;
+}
+
+.co-commerce-utility a:hover {
+  color: var(--co-commerce-accent);
+}
+
+.co-commerce-rule {
+  width: 100%;
+  height: 1px;
+  background: var(--co-commerce-ink);
+}
+
+/* The article runs the container's full width so a product grid has somewhere to go. */
+.co-commerce-article {
+  max-width: var(--co-commerce-measure);
+}
+
+.co-commerce-main {
+  max-width: 1200px;
+}
+
+.co-commerce-card {
+  border: 1px solid var(--co-commerce-line);
+  border-radius: var(--co-commerce-radius);
+  background: var(--co-commerce-surface);
+}
+
+/* Prices in a column have to line up. */
+.co-commerce-price,
+.co-commerce-card h3 + p {
+  font-variant-numeric: tabular-nums;
+}
+
+
+/* Blocks (REQ-063). The markup is the SDK's; everything here is this theme's styling of it. */
+.co-commerce-block {
+  margin: 0 0 1.75rem;
+}
+
+.co-commerce-block:last-child {
+  margin-bottom: 0;
+}
+
+.co-commerce-heading {
+  margin: 2.5rem 0 0.75rem;
+  font-family: var(--co-commerce-font-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.co-commerce-heading:first-child {
+  margin-top: 0;
+}
+
+.co-commerce-align-center {
+  text-align: center;
+}
+
+.co-commerce-align-right {
+  text-align: right;
+}
+
+.co-commerce-figure {
+  margin-inline: 0;
+}
+
+.co-commerce-figure figcaption {
+  margin-top: 0.5rem;
+  color: var(--co-commerce-muted);
+  font-size: 0.8125rem;
+}
+
+.co-commerce-testimonial {
+  margin-inline: 0;
+  padding: 1.25rem 1.5rem;
+  border-left: 3px solid var(--co-commerce-accent);
+  background: var(--co-commerce-surface);
+  border-radius: var(--co-commerce-radius);
+}
+
+.co-commerce-testimonial blockquote {
+  margin: 0;
+  font-size: 1.05em;
+}
+
+.co-commerce-testimonial figcaption {
+  margin-top: 0.5rem;
+  color: var(--co-commerce-muted);
+  font-size: 0.8125rem;
+}
+
+.co-commerce-gallery {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.co-commerce-gallery img {
+  border-radius: var(--co-commerce-radius);
+}
+
+.co-commerce-columns {
+  display: grid;
+  gap: 1.5rem;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.co-commerce-cta {
+  padding: 1.75rem;
+  border-radius: var(--co-commerce-radius);
+  background: var(--co-commerce-accent-soft);
+}
+
+.co-commerce-cta h2 {
+  margin: 0 0 0.5rem;
+}
+
+.co-commerce-cta p {
+  margin: 0 0 1rem;
+  color: var(--co-commerce-muted);
+}
+
+.co-commerce-cta-link {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: var(--co-commerce-radius);
+  background: var(--co-commerce-accent);
+  color: var(--co-commerce-canvas);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.co-commerce-cards {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.co-commerce-card {
+  padding: 1.25rem;
+  border: 1px solid var(--co-commerce-line);
+  border-radius: var(--co-commerce-radius);
+  background: var(--co-commerce-surface);
+}
+
+.co-commerce-card h3 {
+  margin: 0 0 0.5rem;
+}
+
+.co-commerce-card p {
+  margin: 0 0 0.75rem;
+  color: var(--co-commerce-muted);
+  font-size: 0.9375rem;
+}
+
+.co-commerce-plans {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.co-commerce-plans ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.co-commerce-plan {
+  padding: 1.25rem;
+  border: 1px solid var(--co-commerce-line);
+  border-radius: var(--co-commerce-radius);
+}
+
+.co-commerce-plan h3 {
+  margin: 0;
+}
+
+.co-commerce-price {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.co-commerce-plan ul li {
+  padding: 0.25rem 0;
+  color: var(--co-commerce-muted);
+  font-size: 0.9375rem;
+}
+
+.co-commerce-faq > div {
+  padding: 0.875rem 0;
+  border-bottom: 1px solid var(--co-commerce-line);
+}
+
+.co-commerce-faq dt {
+  font-weight: 600;
+}
+
+.co-commerce-faq dd {
+  margin: 0.35rem 0 0;
+  color: var(--co-commerce-muted);
+}
+
+.co-commerce-raw pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--co-commerce-radius);
+  background: var(--co-commerce-surface);
+  font-size: 0.875rem;
+}
+
+.co-commerce-raw-note {
+  margin: 0 0 0.5rem;
+  color: var(--co-commerce-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.co-commerce-unknown {
+  padding: 0.75rem 1rem;
+  border: 1px dashed var(--co-commerce-line);
+  border-radius: var(--co-commerce-radius);
+  color: var(--co-commerce-muted);
+  font-size: 0.9375rem;
+}
+
+@media (max-width: 720px) {
+  .co-commerce-gallery,
+  .co-commerce-columns,
+  .co-commerce-cards,
+  .co-commerce-plans {
+    grid-template-columns: 1fr;
+  }
+}
