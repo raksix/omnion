@@ -6014,3 +6014,64 @@ screens it can affect are the ones whose Validate button writes the column, and 
 difference is "a draft no longer overwrites the saved verdict" — invisible on a screen until
 someone presses Validate against an unsaved edit. The gate that measures it is the one that was
 proved to bite (neuter `may_record`, one test red), not a screenshot.
+
+## Tick 42 (w3) — the four-tick blocker was a reboot, and two "green" rows were measuring a graph the server never sees
+
+**The blocker was `/dev/shm`, not the box.** `cargo test` died with
+`failed to create directory /mnt/apopic/omnion-w3/target · Not a directory (os error 20)`. The
+worktree's `target` is a **symlink to `/dev/shm/w3-target`**, and the box had rebooted — `/dev/shm`
+is tmpfs, so the link dangled. `mkdir -p /dev/shm/w3-target` is a two-second boot-recovery step,
+and four ticks of "no browser pass possible" were spent diagnosing memory and migrations instead
+of reading the actual error. **After a reboot, check the symlinks into `/dev/shm` before anything
+else** — a dangling one reads as a permissions or disk fault and sends you looking at the wrong
+thing.
+
+**The pass ran, reached the builder, and returned `QA_FINDINGS=0` over 1744 clicks** — and its
+`summary.json` says `fatal: stack-gone`. The harness tore the stack down at the end of the pass,
+so the 209 findings in that file are **not** product defects and the number is meaningless; the
+rows in `clicks.jsonl` are the real reading. **The summary's `netFailures` is a count, and a
+count is not a verdict.**
+
+**TWO PROBE ROWS WERE GREEN BY ACCIDENT, AND ONE OF THEM HAD BEEN SO FOR THREE TICKS.**
+`validate-classes` read five of five classes `found: true`. Two rows were measuring something the
+server never sees:
+
+- `cycleOnABranch` built `condition.if`. The registry key is `condition` and `find_node_type` is
+  exact, so the graph answered `unknown_node_type` — and **that sentence became the row's
+  `names`** while `found: true` stayed green off the codes, which did contain `graph_cycle`. The
+  pass recorded `codes: ["unknown_node_type", "graph_cycle"]` and nobody read it.
+- `cycle` closed its ring from `a1`, which `spine()` had already given a `success` edge, so the
+  graph carried **two edges on one walked port**. `ambiguous_branch` sorts ahead of
+  `graph_cycle`: its `names` field was the ambiguity sentence, and it had been reporting the wrong
+  class for three ticks.
+
+**ONE DEFECT PER GRAPH IS THE REASON THE TABLE WAS SPLIT, SO THE ROW THAT BROKE THE RULE IS THE
+ROW NOBODY CHECKED.** Both are rebuilt from the registry, and the `cycle` row now records its
+whole code list — `found` cannot see a second defect that sorts behind the one it is looking for.
+A Rust test builds the same two graphs and asserts each carries **exactly one** class, which is
+what caught the `condition` spelling and then my own two fixtures' missing `event`/condition
+params. **Proven to bite:** reverting the type to `condition.if` turns that one test red on
+`["unknown_node_type", "graph_cycle"]` — the exact pair the browser pass recorded.
+
+**`switch_not_executable` HAD TO BE PROBED ON THE SAVE.** It is raised by the projection
+(`step_for`); `validate` never calls the projection, so a row in the `/validate` table could not
+have shown that code whether it worked or not. The new row saves a one-defect switch graph,
+reads the reason stored on the rule row, and restores the author's graph on the version the save
+produced. Measured `status 200 / savedNotRunnable true / namesCondition true / notATypo true /
+restored true`, with the sentence naming the Condition alternative. **The save answers 200 on
+purpose** — a rule that does not project is still storable, and the run is where it refuses.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **151 passed / 0 failed** (150 before this
+tick's test). `pnpm typecheck` (apps/admin) → clean. QA pass `20260930-185148` → `QA_FINDINGS=0`,
+`QA_CLICKS=1744`, builder depth pass reached, 5/5 validation classes found, `ambiguousBranch`
+`orderIndependent: true`, `two-tab-conflict` `refused/reloadOffered/localNodesKept 6/namesVersion
+true`.
+
+**Still open, and the next tick starts here.** (1) The corrected cycle rows are unit-proven but
+**not browser-proven** — re-run the pass and read `cycle` / `cycleOnABranch` with `codes`. (2)
+`run-from-here` read `skipped: 0`, `pillsPainted: 0`, `step-trace` `panelFound: false`: the probe
+chose the **trigger** (`canStart: "true"`), and a run from the trigger has no prefix to skip — the
+scan filters "is not the trigger", so with only the trigger startable it had nothing to pick.
+(3) `workflow-table` create read `503 database is unavailable` — the same `stack-gone` moment, so
+Table mode is unmeasured and its criterion stays unticked. (4) `listener` row: `controlFound:
+false`. (5) `tab-walk.reachedAnEdge: false`.
