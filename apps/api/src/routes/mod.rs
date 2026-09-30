@@ -635,8 +635,38 @@ pub fn router(state: AppState) -> Router {
         post(backups::verify).layer(guards::require(&state, "backup.create"));
     let backups_delete: MethodRouter<AppState, Infallible> =
         delete(backups::delete).layer(guards::require(&state, "backup.manage"));
+    // The manual retention sweep. `backup.manage`, not `backup.create`: this removes data,
+    // and the key that lets an operator take a backup is not the key that lets one remove it.
+    // The preview is a GET that writes nothing, so it sits under `backup.read`: reading a
+    // warning is free and non-destructive, and gating it behind `backup.restore` would mean
+    // the first time an operator meets this screen is a 403 that never showed them what
+    // they were agreeing to.
+    let backups_restore_preview: MethodRouter<AppState, Infallible> =
+        get(backups::restore_preview).layer(guards::require(&state, "backup.read"));
+    // The destructive call, and the only route in this file behind `backup.restore`. The
+    // preview stays under `backup.read` because reading a warning changes nothing; pressing
+    // the button overwrites live data, so it needs the key that means that. A platform
+    // where the schedule editor can also overwrite content is one where the nightly job and
+    // an operator's button are the same authority.
+    let backups_restore: MethodRouter<AppState, Infallible> =
+        post(backups::restore).layer(guards::require(&state, "backup.restore"));
+    let backups_sweep: MethodRouter<AppState, Infallible> =
+        post(backups::sweep).layer(guards::require(&state, "backup.manage"));
     let backup_schedules_read: MethodRouter<AppState, Infallible> =
         get(backups::list_schedules).layer(guards::require(&state, "backup.read"));
+    // Editing a schedule is `backup.manage`, the same key as the settings screen: both are
+    // unattended decisions about what the platform will do on its own at 02:00. And "run now"
+    // is `backup.create`, NOT `backup.manage` — pressing it produces a backup and changes
+    // nothing else, so it is the same power as the drawer's own button. An operator who may
+    // take a backup must be able to test that their schedule works.
+    let backup_schedules_write: MethodRouter<AppState, Infallible> =
+        post(backups::create_schedule).layer(guards::require(&state, "backup.manage"));
+    let backup_schedule: MethodRouter<AppState, Infallible> =
+        put(backups::update_schedule).layer(guards::require(&state, "backup.manage"));
+    let backup_schedule_delete: MethodRouter<AppState, Infallible> =
+        delete(backups::delete_schedule).layer(guards::require(&state, "backup.manage"));
+    let backup_schedule_run: MethodRouter<AppState, Infallible> =
+        post(backups::run_schedule_now).layer(guards::require(&state, "backup.create"));
     let backup_settings_read: MethodRouter<AppState, Infallible> =
         get(backups::read_settings).layer(guards::require(&state, "backup.read"));
     let backup_settings_write: MethodRouter<AppState, Infallible> =
@@ -1688,11 +1718,25 @@ pub fn router(state: AppState) -> Router {
         .route("/backups", backups_read)
         .route("/backups", backups_create)
         .route("/backups/status", backups_status)
+        // Registered BEFORE `/backups/{id}` and not after it. A `POST` against
+        // `/backups/sweep` would otherwise match `{id}` and fail to parse `sweep` as a UUID
+        // — a 500 that reads like a router bug on the one route whose whole point is to be
+        // callable by hand.
+        .route("/backups/sweep", backups_sweep)
         .route("/backups/{id}", backups_detail)
         .route("/backups/{id}", backups_delete)
         .route("/backups/{id}/manifest", backups_manifest)
+        .route("/backups/{id}/restore-preview", backups_restore_preview)
+        .route("/backups/{id}/restore", backups_restore)
         .route("/backups/{id}/verify", backups_verify)
         .route("/backup-schedules", backup_schedules_read)
+        .route("/backup-schedules", backup_schedules_write)
+        // Registered before any `/backup-schedules/{id}` route, and not after it, for the
+        // same reason `/backups/sweep` sits above `/backups/{id}`: a `POST` against a
+        // non-UUID segment would otherwise match `{id}` and fail to parse it.
+        .route("/backup-schedules/{id}", backup_schedule)
+        .route("/backup-schedules/{id}", backup_schedule_delete)
+        .route("/backup-schedules/{id}/run", backup_schedule_run)
         .route("/backup-settings", backup_settings_read)
         .route("/backup-settings", backup_settings_write)
         // The hold is on a *file*, so it lives under the file rather than under the policy.

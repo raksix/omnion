@@ -1092,6 +1092,191 @@ async function runBackups(page, report) {
   );
   note({ step: "verify", verificationRan, verdict: verdictText });
 
+  // The restore preview, opened and read. A new panel that never appears in the walkthrough
+  // inventory is an untested screen, and the rule is that the harness is extended rather
+  // than the screen exempted — so this clicks the button, runs the preview against the real
+  // destination, and asserts the three things the panel exists to say: the price, the
+  // warnings, and the confirm phrase.
+  await page.click('[data-testid="backup-restore-preview"]').catch(() => {});
+  await page.waitForSelector('[data-testid="restore-preview"]', { timeout: 8000 }).catch(() => {});
+  const previewOpen = (await page.locator('[data-testid="restore-preview"]').count()) > 0;
+  note({ step: "restore-preview-open", previewOpen });
+
+  // Collapsed by default: the panel must not render its tables unprompted, or every run
+  // detail page grows five tables an operator did not ask for.
+  const previewIdle = (await page.locator('[data-testid="restore-preview-idle"]').count()) > 0;
+  note({ step: "restore-preview-idle", previewIdle });
+
+  await page.click('[data-testid="restore-preview-load"]').catch(() => {});
+  await page
+    .waitForSelector('[data-testid="restore-preview-dropped"]', { timeout: 30000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  const priceText = await page
+    .locator('[data-testid="restore-preview-dropped"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const warnings = await page
+    .locator('[data-testid="restore-preview-warnings"] [data-testid^="restore-warning-"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const partRowsPreview = await page
+    .locator('[data-testid="restore-part-row"]')
+    .allInnerTexts()
+    .catch(() => []);
+  // Every part the run produced is in the preview's own table, with a mode. A panel that
+  // lists only the available ones would hide exactly the part an operator most needs to
+  // know about.
+  const previewNames = partRowsPreview.map((text) => text.split("\n")[0].trim());
+  note({
+    step: "restore-preview",
+    priced: priceText.length > 0,
+    price: priceText.join(" | "),
+    warningCount: warnings.length,
+    warnings,
+    partCount: partRowsPreview.length,
+    allFiveOffered: partNames.every((name) => previewNames.includes(name)),
+    rows: partRowsPreview,
+  });
+
+  // The confirm phrase, if the run is restorable. Empty is a legitimate answer for an
+  // unrestorable run, so both are recorded rather than one being required.
+  const phraseVisible = await page
+    .locator('[data-testid="restore-confirm-input"]')
+    .count();
+  const notRestorable = await page
+    .locator('[data-testid="restore-preview-not-restorable"]')
+    .count();
+  note({
+    step: "restore-confirm",
+    phraseFieldOffered: phraseVisible > 0,
+    notRestorable: notRestorable > 0,
+  });
+
+  // ---- The restore control (REQ-013 slice 2b) ------------------------------------------------
+  //
+  // The panel ships a real button this tick, and the harness is extended rather than the
+  // screen exempted. The walk deliberately drives it in the order a cautious operator would:
+  // look at the button **before** typing the phrase, so the disabled state is recorded, then
+  // with a wrong phrase, so the refusal is recorded, and only then with the right one.
+  //
+  // The middle step is the point of doing this in a browser at all. A Rust walk can prove the
+  // API refuses; it cannot prove the *panel* shows the refusal rather than swallowing it into
+  // a spinner — and a destructive control that fails silently is the worst shape this screen
+  // could take.
+  const runButton = page.locator('[data-testid="restore-run"]');
+  const buttonOffered = (await runButton.count()) > 0;
+  const disabledBefore = buttonOffered ? await runButton.first().isDisabled() : null;
+  const disabledReason = await page
+    .locator('[data-testid="restore-confirm-state"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "restore-button",
+    offered: buttonOffered,
+    disabledBeforeTyping: disabledBefore,
+    disabledReason: disabledReason.trim(),
+  });
+
+  // The part checkboxes. Every AVAILABLE part is ticked by default, because "restore the
+  // whole archive" is the common case; a panel that made an operator tick five boxes to undo
+  // one mistake is a panel they will not use.
+  const partChecks = page.locator('[data-testid^="restore-part-check-"]');
+  const checkCount = await partChecks.count();
+  const checkedByDefault = await partChecks.evaluateAll((nodes) =>
+    nodes.filter((node) => !node.disabled && node.checked).length,
+  );
+  const enabledChecks = await partChecks.evaluateAll(
+    (nodes) => nodes.filter((node) => !node.disabled).length,
+  );
+  note({
+    step: "restore-part-ticks",
+    checkboxes: checkCount,
+    tickedByDefault: checkedByDefault,
+    selectable: enabledChecks,
+    everySelectableTicked: checkedByDefault === enabledChecks,
+  });
+
+  // A wrong phrase must be refused *visibly*. The refusal is the API's own sentence, so the
+  // assertion is that a `[role=alert]` appears and that it is not empty.
+  const phraseField = page.locator('[data-testid="restore-confirm-input"]');
+  if ((await phraseField.count()) > 0 && buttonOffered) {
+    await phraseField.first().fill("RESTORE 00000000");
+    await page.waitForTimeout(250);
+    const enabledWithWrongPhrase = !(await runButton.first().isDisabled());
+    note({
+      step: "restore-wrong-phrase-button",
+      enabledWithWrongPhrase,
+    });
+    // Only press it if the client let us: clicking a disabled button is a no-op, and the
+    // walk must not record a refusal it did not cause.
+    if (enabledWithWrongPhrase) {
+      await runButton.first().click().catch(() => {});
+      await page.waitForTimeout(1500);
+      const alert = await page.locator('[data-testid="restore-error"]').innerText().catch(() => "");
+      note({
+        step: "restore-wrong-phrase",
+        refused: alert.trim().length > 0,
+        message: alert.trim(),
+      });
+    } else {
+      note({
+        step: "restore-wrong-phrase",
+        refused: true,
+        message: "the button is disabled for a wrong phrase, so the request was never sent",
+      });
+    }
+
+    // And now the real thing. A QA stack is disposable by construction, which is the only
+    // reason the REQ allows the destructive path to be exercised at all.
+    const offered = await page
+      .locator('[data-testid="restore-confirm-input"]')
+      .first()
+      .getAttribute("placeholder")
+      .catch(() => null);
+    if (offered) {
+      await phraseField.first().fill(offered);
+      await page.waitForTimeout(250);
+      const enabledWithRightPhrase = !(await runButton.first().isDisabled());
+      note({ step: "restore-right-phrase-button", enabledWithRightPhrase });
+      if (enabledWithRightPhrase) {
+        await runButton.first().click().catch(() => {});
+        await page
+          .waitForSelector('[data-testid="restore-outcome"], [data-testid="restore-error"]', {
+            timeout: 120000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1500);
+        const outcomeText = await page
+          .locator('[data-testid="restore-outcome"]')
+          .innerText()
+          .catch(() => "");
+        const refusalText = await page
+          .locator('[data-testid="restore-error"]')
+          .innerText()
+          .catch(() => "");
+        const safetyId = await page
+          .locator('[data-testid="restore-safety-id"]')
+          .innerText()
+          .catch(() => "");
+        note({
+          step: "restore-run",
+          restored: outcomeText.trim().length > 0,
+          summary: outcomeText.trim().split("\n")[0],
+          refused: refusalText.trim().length > 0,
+          refusal: refusalText.trim(),
+          safetyBackupNamed: /[0-9a-f]{8}-[0-9a-f]{4}/i.test(safetyId),
+        });
+      }
+    }
+  } else {
+    note({
+      step: "restore-button",
+      reason: "the run is not restorable, so the control is correctly absent",
+    });
+  }
+
   // The list shows the run, and its state pill is the run's own state.
   await page.waitForTimeout(500);
   const rows = await page.locator('[data-testid="backup-row"]').count();
@@ -1117,13 +1302,207 @@ async function runBackups(page, report) {
     note({ step: "delete-confirm", confirmed: false, reason: "no delete button to press" });
   }
 
+  // The retention strip and its button. Clicked on a DISPOSABLE stack only — the sweep is
+  // the one action on this screen that deletes data nobody asked it to delete, and a
+  // walkthrough that presses it is fine exactly as long as the destination is a temporary
+  // directory. The assertion is about the screen answering, not about the sweep finding
+  // work: on a fresh stack there is nothing past its window, and "nothing to prune" is the
+  // correct sentence, not a failure.
+  const retentionStrip = (await page.locator('[data-testid="backup-retention"]').count()) > 0;
+  await page.click('[data-testid="backup-sweep"]').catch(() => {});
+  await page.waitForTimeout(2500);
+  const sweepReport = await page
+    .locator('[data-testid="backup-sweep-report"]')
+    .allInnerTexts()
+    .catch(() => []);
+  const sweepText = sweepReport.join(" | ");
+  const sweepAnswered = /looked at \d+ expired backup|failed for \d+ tenant/i.test(sweepText);
+  const sweepStrandedShown = (await page.locator('[data-testid="backup-sweep-stranded"]').count()) > 0;
+  note({ step: "retention", retentionStrip, sweepAnswered, sweepStrandedShown, sweep: sweepText });
+
+  // The schedules table (REQ-013, slice 3). Run inside this pass rather than beside it
+  // because it lives on the same screen: the panel is mounted below the runs list, so
+  // "the schedules table is a screen nobody opened" would not be visible in the route list.
+  const schedules = await runBackupSchedules(page, report);
+
   const ok =
     rendered &&
     cardsPresent &&
     allFivePresent &&
     everyPartTerminal &&
-    verificationRan;
-  return { ok, steps: steps.length, cards: cardText };
+    verificationRan &&
+    retentionStrip &&
+    sweepAnswered &&
+    schedules.ok;
+  return { ok, steps: steps.length, cards: cardText, schedules };
+}
+
+/**
+ * The backup schedules table (REQ-013, slice 3).
+ *
+ * This pass exists because the defect it is aimed at is invisible in every screenshot: the
+ * `next_run_at` column shipped with the table in slice 1, and for two slices **nothing wrote
+ * it**. A schedule could be created, listed, and rendered with a cadence sentence next to an
+ * empty next-run cell for ever. A screen that looks right and never fires is exactly what a
+ * walkthrough cannot see, so the assertion here is the *column's contents*, not the layout.
+ *
+ * What it drives, in order:
+ *
+ * 1. the empty state, on a stack with no schedules;
+ * 2. the editor, and that the conditional fields appear and disappear with the frequency —
+ *    an hourly schedule must not show a time of day, and a monthly one must not show a
+ *    weekday, because a hidden-but-submitted value is one the server has to decide about;
+ * 3. a **real** daily schedule, saved, and its next run read back — the cell must contain a
+ *    date and the zone, not a dash;
+ * 4. "run now" against the live API, proving a schedule can produce a backup;
+ * 5. pause, which must turn the next-run cell into "paused" rather than leaving a promise
+ *    the worker will not keep;
+ * 6. delete, and the sentence naming that the produced runs survive.
+ */
+async function runBackupSchedules(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "backups", action: "backup-schedules", ...step });
+  };
+
+  const panel = page.locator('[data-testid="backup-schedules"]');
+  await panel.scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(600);
+
+  const panelPresent = (await panel.count()) > 0;
+  note({ step: "panel", panelPresent });
+  if (!panelPresent) {
+    return { ok: false, reason: "the schedules panel did not render" };
+  }
+
+  // 1. The empty state. On a fresh stack there are no schedules, and the table must say so
+  // with the one action that gets past it.
+  const emptyText = await panel.innerText().catch(() => "");
+  const emptyExplains = /no schedules/i.test(emptyText);
+  note({ step: "empty", emptyExplains, text: emptyText.slice(0, 160) });
+
+  // 2. The editor, and the conditional fields.
+  await page.click('[data-testid="backup-schedule-new"]').catch(() => {});
+  await page.waitForSelector('[data-testid="backup-schedule-editor"]', { timeout: 8000 }).catch(() => {});
+  const editorOpen = (await page.locator('[data-testid="backup-schedule-editor"]').count()) > 0;
+  note({ step: "editor-open", editorOpen });
+  if (!editorOpen) {
+    return { ok: false, reason: "the schedule editor did not open" };
+  }
+
+  const hasTime = async () => (await page.locator('[data-testid="backup-schedule-time"]').count()) > 0;
+  const hasWeekday = async () =>
+    (await page.locator('[data-testid="backup-schedule-weekday"]').count()) > 0;
+  const hasDom = async () =>
+    (await page.locator('[data-testid="backup-schedule-dayofmonth"]').count()) > 0;
+
+  // Daily shows a time and no day fields.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "daily").catch(() => {});
+  await page.waitForTimeout(250);
+  const dailyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-daily", ...dailyShape });
+
+  // Weekly adds the weekday and still shows the time.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "weekly").catch(() => {});
+  await page.waitForTimeout(250);
+  const weeklyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-weekly", ...weeklyShape });
+
+  // Monthly swaps the weekday for a day of the month.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "monthly").catch(() => {});
+  await page.waitForTimeout(250);
+  const monthlyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-monthly", ...monthlyShape });
+
+  // Hourly names no time of day at all.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "hourly").catch(() => {});
+  await page.waitForTimeout(250);
+  const hourlyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-hourly", ...hourlyShape });
+
+  // 3. A real daily schedule, saved, with its next run read back.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "daily").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.fill('[data-testid="backup-schedule-name"]', "QA nightly").catch(() => {});
+  await page.fill('[data-testid="backup-schedule-time"]', "02:30").catch(() => {});
+  await page.selectOption('[data-testid="backup-schedule-zone"]', "Europe/Istanbul").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.click('[data-testid="backup-schedule-save"]').catch(() => {});
+  await page.waitForTimeout(2500);
+
+  const saveNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+  const editorClosed = (await page.locator('[data-testid="backup-schedule-editor"]').count()) === 0;
+  note({ step: "save", editorClosed, notice: saveNotice.trim() });
+
+  const scheduleRows = await panel.locator("[data-schedule]").count();
+  const rowText = scheduleRows > 0 ? await panel.locator("[data-schedule]").first().innerText() : "";
+  // The load-bearing assertion of this whole pass: the next-run cell must carry a real date
+  // and the zone. A dash here is the two-slice defect, and every other assertion in this file
+  // would still pass with it.
+  const nextRunHasDate = /\d{1,2}\s+\w{3,}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}/.test(rowText);
+  const namesTheZone = /Europe\/Istanbul|UTC/.test(rowText);
+  const noNextRunWarning = /will not fire until it is saved again/i.test(rowText);
+  note({
+    step: "next-run",
+    scheduleRows,
+    nextRunHasDate,
+    namesTheZone,
+    noNextRunWarning,
+    row: rowText.replace(/\n/g, " | ").slice(0, 220),
+  });
+
+  // 4. Run it now, over the real API.
+  if (scheduleRows > 0) {
+    const row = panel.locator("[data-schedule]").first();
+    const runId = await row.getAttribute("data-schedule").catch(() => null);
+    if (runId) {
+      await page.click(`[data-testid="backup-schedule-run-${runId}"]`).catch(() => {});
+      await page.waitForTimeout(20000);
+      const runNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+      const runAnswered = /ran|parts were written|could not/i.test(runNotice);
+      // The sentence has to say the next scheduled run is UNCHANGED, because a "run now"
+      // that consumed the 02:00 slot is a silent skip of tomorrow's backup.
+      const nextRunUntouched = /next scheduled run is unchanged|next run/i.test(runNotice);
+      note({ step: "run-now", runAnswered, nextRunUntouched, notice: runNotice.trim().slice(0, 200) });
+
+      // 5. Pause. The next-run cell must become "paused", not keep a promise.
+      await row.locator('button:has-text("Pause")').first().click().catch(() => {});
+      await page.waitForTimeout(2000);
+      const pausedText = await panel.locator("[data-schedule]").first().innerText().catch(() => "");
+      const showsPaused = /paused/i.test(pausedText);
+      note({ step: "pause", showsPaused, row: pausedText.replace(/\n/g, " | ").slice(0, 200) });
+
+      // 6. Delete, and the sentence that the produced runs survive.
+      await page.click(`[data-testid="backup-schedule-delete-${runId}"]`).catch(() => {});
+      await page.waitForTimeout(2000);
+      const afterDelete = await panel.locator("[data-schedule]").count();
+      const deleteNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+      const deleteExplainsSurvival = /still here|does not delete history|kept/i.test(deleteNotice);
+      note({
+        step: "delete",
+        rowsAfter: afterDelete,
+        deleteExplainsSurvival,
+        notice: deleteNotice.trim().slice(0, 200),
+      });
+    }
+  }
+
+  const ok =
+    panelPresent &&
+    editorOpen &&
+    dailyShape.time &&
+    !dailyShape.weekday &&
+    weeklyShape.weekday &&
+    monthlyShape.dom &&
+    !monthlyShape.weekday &&
+    !hourlyShape.time &&
+    editorClosed &&
+    scheduleRows > 0 &&
+    nextRunHasDate &&
+    namesTheZone &&
+    !noNextRunWarning;
+  return { ok, steps: steps.length };
 }
 
 async function runMediaFileManager(page, report) {

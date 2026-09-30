@@ -631,6 +631,31 @@ pub async fn set_prefix(pool: &PgPool, id: Uuid, prefix: &str) -> Result<Backup>
     .map_err(BackupError::from)
 }
 
+/// The tenants that own at least one backup, oldest history first, plus the platform's own
+/// (`null`) row when it has one.
+///
+/// The retention sweep walks this list, and it is a **separate function rather than a query
+/// the runner writes**: the sweep has to walk tenants one at a time because
+/// [`prune_candidates`] is scoped by `organization_id` and `is not distinct from` is what
+/// keeps the platform's own backups in the same loop. A runner that wrote
+/// `select distinct organization_id from backups` inline would look identical and would be a
+/// second answer to "who gets swept" — the same mistake the walkthrough's own comment warns
+/// about, one layer up.
+///
+/// `null` is a real member of this list, not a missing value: `backups.organization_id` is
+/// nullable for the platform itself, and a sweep that filtered it away would never prune the
+/// platform's own restore points — the ones that matter most on a single-tenant installation.
+pub async fn organizations_with_backups(pool: &PgPool, batch: i64) -> Result<Vec<Option<Uuid>>> {
+    let rows: Vec<(Option<Uuid>,)> = sqlx::query_as(
+        "select organization_id from backups group by organization_id \
+         order by min(created_at) asc limit $1",
+    )
+    .bind(batch.clamp(1, 500))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(organization_id,)| organization_id).collect())
+}
+
 /// Delete a run. Its parts cascade; its artifacts do not, and slice 2 owns removing those.
 pub async fn delete_backup(pool: &PgPool, id: Uuid, organization_id: Option<Uuid>) -> Result<()> {
     let removed = sqlx::query(
@@ -816,6 +841,67 @@ pub async fn delete_schedule(pool: &PgPool, id: Uuid, organization_id: Option<Uu
     if removed.rows_affected() == 0 {
         return Err(BackupError::ScheduleNotFound);
     }
+    Ok(())
+}
+
+/// One schedule, read through the tenant boundary.
+///
+/// A `fetch_optional` filtered by `organization_id` rather than a read-then-check, because a
+/// read followed by a scope test is two statements and a race: a schedule that is reassigned
+/// between them answers a question about a row that no longer exists. The tenancy filter is
+/// inside the `where`, which is also what turns a stranger's id into a `ScheduleNotFound` and
+/// therefore a `404` — the same rule the rest of this file follows, for the same reason.
+pub async fn find_schedule(
+    pool: &PgPool,
+    id: Uuid,
+    organization_id: Option<Uuid>,
+) -> Result<BackupSchedule> {
+    sqlx::query_as(
+        "select id, organization_id, name, frequency, at_time::text as at_time, \
+                day_of_week, day_of_month, timezone, scopes, retention_count, destination, \
+                enabled, last_run_at, next_run_at, last_backup_id, created_at, updated_at \
+         from backup_schedules \
+         where id = $1 and organization_id is not distinct from $2",
+    )
+    .bind(id)
+    .bind(organization_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(BackupError::ScheduleNotFound)
+}
+
+/// Write a schedule's next run, or clear it.
+///
+/// A **separate** function rather than a parameter on `upsert_schedule`, because the two are
+/// different moments: the row is written first, and the next run is only known once the
+/// cadence has been validated. Folding them together would mean computing a time for a row
+/// that has not been accepted yet, and storing it if the row is later refused.
+pub async fn set_schedule_next_run(
+    pool: &PgPool,
+    id: Uuid,
+    next_run_at: Option<OffsetDateTime>,
+) -> Result<()> {
+    sqlx::query("update backup_schedules set next_run_at = $2, updated_at = now() where id = $1")
+        .bind(id)
+        .bind(next_run_at)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Enable or disable a schedule without touching the rest of it.
+///
+/// A separate function rather than a patch-style update because the only caller is the
+/// worker refusing a schedule whose cadence it cannot compute, and that caller must not be
+/// able to accidentally rewrite the scopes while it is disabling a row. A disabled schedule
+/// keeps its `next_run_at`, so re-enabling it through the editor recomputes the time and a
+/// row that is disabled by hand stays disabled until somebody says otherwise.
+pub async fn set_schedule_enabled(pool: &PgPool, id: Uuid, enabled: bool) -> Result<()> {
+    sqlx::query("update backup_schedules set enabled = $2, updated_at = now() where id = $1")
+        .bind(id)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

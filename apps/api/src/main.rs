@@ -11,8 +11,9 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_retention_runner, event_runner, search_runner,
-    secrets_runner, workflow_runner,
+    analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
+    event_retention_runner, event_runner,
+    search_runner, secrets_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -151,6 +152,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _retention = retention_runner::spawn(state.clone());
     } else {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
+    }
+
+    // The backup retention sweep removes expired runs from the destination, artifacts first
+    // (REQ-013, slice 3). It is gated by its own flag rather than by `OMNION_RETENTION_RUNNER`
+    // because the two sweep different things: an installation that keeps every backup for
+    // ever must be able to keep its media sweeper. `prune_candidates` shipped in slice 1 and
+    // had no caller at all, so this is the tick that gives it one.
+    // The schedule worker takes the backups a `backup_schedules` row asked for. The table,
+    // the `next_due_schedules` query and the `cadence` sentence in the API all shipped in
+    // slice 1 and slice 2a; nothing wrote `next_run_at` and nothing called that query, so a
+    // schedule could be created, listed and rendered with an empty next-run cell for ever.
+    // This is the tick that gives both a writer and a reader.
+    let _backup_schedules = backup_schedule_runner::spawn(state.clone());
+
+    if state.config().retention.backup_sweep_enabled {
+        let _backup_sweep = backup_sweep_runner::spawn(state.clone());
+    } else {
+        tracing::info!(
+            "the backup retention sweep is disabled (OMNION_BACKUP_SWEEP=false) — expired runs \
+             and their artifacts stay on the destination"
+        );
     }
 
     if state.config().analytics.runner_enabled {
