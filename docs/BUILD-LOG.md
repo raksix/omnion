@@ -8065,3 +8065,54 @@ fires. Verified by grep that both sides' `::spawn` calls survive, not by the imp
 **Next.** Acceptance 6 (member role changes bite on the very next request — the REQ's own risk note
 names the membership-revision cache key, and nothing on this branch invalidates anything) is the
 next unticked item that this branch can actually build.
+
+---
+
+## Tick 39 — REQ-133 slice 10: deactivating an account that still owns a project
+
+**What.** Acceptance 9 said *"Deactivating a user who owns a project or workflows blocks until
+reassignment completes"* and nothing on the branch enforced any part of it. `PATCH
+/api/v1/iam/users/{id}` took `status: "disabled"` and wrote it; so did `POST`, `PUT` and
+`DELETE /scim/v2/Users/{id}`. The rule that does exist — `remove_member` refusing to leave a
+project ownerless — guards a *membership being deleted*, not an *account being switched off*:
+switching somebody off leaves the membership row, the `owner_user_id` column and the check
+constraint all intact, and the project becomes unadministrable with an owner who cannot sign in.
+
+`projects::ensure_user_can_be_disabled` / `ensure_user_can_be_disabled_in` read **both**
+representations of ownership — `owner_user_id` *and* an `owner` membership — because
+`create_project` writes both while `upsert_member` writes only the membership, so a project can
+carry an owner nobody is recorded as owning. The read is `for share` of the project rows and the
+account's `update` runs on that same transaction. The `update` was lifted into
+`apply_user_update` over `sqlx::Executor` rather than pasted a second time next to the guard. The
+three SCIM paths ask the same question through `ensure_no_owned_projects`, answered as a `409`
+with SCIM's `mutability` type; `DELETE` is checked *before* `user.deleted` is emitted. The
+guard fires only on the *transition* — a save re-sending `disabled` for an already-disabled
+account keeps working, which matters the day somebody adds a second owner.
+
+Authorship is deliberately **not** a refusal: `workflows.created_by` is nullable `on delete set
+null` and no reassign-workflow action exists, so refusing there would build an account that can
+never be switched off, whose only remedy is deleting somebody's work. The count is real, is
+asserted, and travels into the `iam.user_updated` audit row beside the decision.
+
+**Proof.**
+- `bash scripts/qa/run-user-deactivation.sh` — **4/4**, and **PROVEN TO FAIL at 1/4** with the
+  refusal neutralised (`if !owned.is_empty()` → `if false && …`): the three ownership tests fail
+  and the one survivor is the negative control asserting that authorship must *not* block, which
+  is what shows the gate names this defect and not its neighbourhood.
+- `cargo test -p omnion-workflows --lib --quiet` — **56 passed**, 0 failed.
+- `cargo check -p omnion-api --tests` — clean; the first pass found three real errors of mine:
+  `&mut *tx` is not an `Executor` in sqlx 0.8 (it wants `&mut **tx`), and
+  `.map_err(PermissionsError::Database.into())` cannot infer its target — the closure needs an
+  explicit `-> ApiError` return type, twice.
+- `apps/admin`: `tsc --noEmit` exit 0. No screen changed and none claimed; the user-detail
+  profile tab already renders `error.message` plus the code, so the refusal surfaces there
+  unchanged.
+
+**Not proved here.** The IAM user screens are still un-observed by a completed `scripts/qa/run.sh`
+on this branch — the box ran at load 80–98 across ten writers for the whole tick, so no browser
+pass was started rather than start an unreliable one.
+
+**Next.** Acceptance 10 (*a project owner manages members and workflows through the API while
+every instance-wide endpoint returns `403` to them from direct calls*) is the next unticked line
+this branch can build; the `owner`-only caller and the instance-wide surface list are both
+already enumerable here.
