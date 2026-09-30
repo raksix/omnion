@@ -172,6 +172,63 @@ else
 fi
 rm -f "$d"/* "$d-holders"/* 2>/dev/null
 
+echo "qa-slot: case 6 — a place whose PASS was killed (no trap, no holder kill) is reclaimed"
+d="$WORK/case6"
+mkdir -p "$d" "$d-holders"
+# The case that had no coverage at all, and the one that had actually happened 14 times in this
+# worktree alone. A pass is SIGKILLed: its EXIT trap never runs, so `run.sh` never kills the
+# holder, and the holder -- a `sleep 30` loop with no parent left to inform it -- goes on living.
+# The reaper used to read that live holder, conclude the place was busy, and leave it: an
+# IMMORTAL place, held for exactly as long as the holder lived, blocking every writer behind it.
+#
+# So the state to plant is precisely the one SIGKILL leaves: a live holder AND a dead owner.
+#
+# The holder must be a real `setsid sleep`, not a `sleep &`. A background job of THIS shell dies
+# with it, and the first draft of this case used one: the "immortal" holder was already a corpse
+# by the time the reaper read it, so the OLD script reclaimed the place for the wrong reason and
+# the case passed against the very defect it exists to catch. The reason assertion below is what
+# made that visible -- a case that passes for the wrong reason is worse than no case, because it
+# is indistinguishable from one that passes for the right one.
+setsid sleep 300 </dev/null >/dev/null 2>&1 & live_holder=$!
+dead_owner="$( bash -c 'exit 0' & echo $! )"; wait "$dead_owner" 2>/dev/null
+# The holder has to be ALIVE, or the case is void.
+sleep 0.3
+if kill -0 "$live_holder" 2>/dev/null; then :; else bad "the planted holder is not alive — the case would not test anything"; fi
+name="killed-$$-$RANDOM"
+: > "$d/$name"
+{ echo "owner $dead_owner"; echo "$live_holder"; } > "$d-holders/$name"
+touch -d '10 minutes ago' "$d/$name"
+if [ -f "$d/$name" ]; then ok "planted a SIGKILLed pass's place (holder $live_holder alive, owner $dead_owner gone)"; else bad "failed to plant"; fi
+# A waiting pass must take it. If the reaper still trusts the holder, this is the pass that times
+# out and proceeds with no place -- two Chromiums on a box that cannot hold them, which is the
+# whole reason the slot exists.
+out="$(QA_SLOT_DIR="$d" QA_SLOTS=1 QA_SLOT_WAIT=30 bash "$SLOT" 2>"$WORK/case6.err" | tail -n 1)"
+new_holder="$(printf '%s' "$out" | awk '{print $NF}')"
+if [ -n "$new_holder" ] && kill -0 "$new_holder" 2>/dev/null; then ok "the waiting pass reclaimed the SIGKILLed pass's place ($new_holder)"; else bad "the waiting pass never got a place (out='${out:-}')"; fi
+if [ ! -f "$d/$name" ] && [ ! -f "$d-holders/$name" ]; then ok "the orphan's place AND holder file are both gone"; else bad "the immortal place was only half reclaimed"; fi
+if grep -q "whose pass" "$WORK/case6.err" 2>/dev/null; then ok "the reaper named the reason (the pass is gone, not the holder)"; else bad "the reaper reclaimed it for the wrong reason: $(cat "$WORK/case6.err" 2>/dev/null)"; fi
+kill "$live_holder" 2>/dev/null; wait "$live_holder" 2>/dev/null
+[ -n "$new_holder" ] && kill "$new_holder" 2>/dev/null
+rm -f "$d"/* "$d-holders"/* "$WORK/case6.err" 2>/dev/null
+
+echo "qa-slot: case 7 — a place whose pass is ALIVE is not reclaimed, holder or not"
+d="$WORK/case7"
+mkdir -p "$d" "$d-holders"
+# The negative control for case 6, and the assertion that keeps it from becoming a reaper that
+# steals live places: a living owner with a holder that has gone must NOT be reclaimed. Without
+# this, "reclaim when the owner is gone" and "reclaim everything" are indistinguishable.
+sleep 300 & live_holder=$!
+sleep 300 & live_owner=$!
+name="alive-$$-$RANDOM"
+: > "$d/$name"
+{ echo "owner $live_owner"; echo "$live_holder"; } > "$d-holders/$name"
+touch -d '10 minutes ago' "$d/$name"
+out="$(QA_SLOT_DIR="$d" QA_SLOTS=1 QA_SLOT_WAIT=2 bash "$SLOT" 2>&1 >/dev/null)"
+if [ -f "$d/$name" ]; then ok "a live pass keeps its place"; else bad "reclaimed a place whose pass is still running"; fi
+if printf '%s' "$out" | grep -q "reclaimed"; then bad "the reaper fired on a live owner: $out"; else ok "the reaper stayed quiet while the owner lived"; fi
+kill "$live_holder" "$live_owner" 2>/dev/null; wait "$live_holder" "$live_owner" 2>/dev/null
+rm -f "$d"/* "$d-holders"/* 2>/dev/null
+
 echo
 echo "qa-slot: ${pass} passed, ${fail} failed"
 [ "$fail" = "0" ] || exit 1

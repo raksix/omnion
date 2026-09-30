@@ -80,7 +80,11 @@ if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "testing the QA slot"
   bash "$(dirname "${BASH_SOURCE[0]}")/test-qa-slot.sh" || echo "[qa] slot test reported failures (continuing: a broken test is not a reason to skip a pass)"
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  # QA_SLOT_OWNER_PID is THIS shell's pid, so the slot can tell a place whose pass is still alive
+  # from one whose pass was killed without running its EXIT trap. Without it the holder is the
+  # only evidence a place is owned, and a holder outlives the pass that kills it — so a SIGKILLed
+  # pass held the queue hostage until a human walked over and killed a stranger's holder.
+  QA_SLOT_PID="$(QA_SLOT_OWNER_PID="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # A pass writes gigabytes of screenshots and six writers share this volume, so the two things
