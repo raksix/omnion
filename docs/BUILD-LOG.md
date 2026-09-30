@@ -8062,3 +8062,48 @@ health_incidents                          8 walks, live PostgreSQL
 **Next:** the browser pass (`bash scripts/qa/run.sh`) still has not run on this box, and it is now
 the only thing standing between REQ-014 and slice 4. Both new screens have depth passes written
 and registered; they have not been executed.
+
+## 2026-09-30 · omnion-wave6 tick 37 · REQ-128 slice 2b (Helm chart)
+
+**What.** Shipped `infra/helm/omnion/` — the chart the previous tick left UNTRACKED — plus
+`scripts/qa/helm-chart.sh`. The chart was written against a false premise recorded in the request
+file ("helm is not installed on this box"); helm 3.16.3 is installed, and the chart did not render
+at all. Seven product defects, every one found by running helm rather than reading the file:
+`omnion.image` read the wrong context (`$root := .` against a `dict "root" …` caller, so every
+render died on `index nil`), emitted its own `image:` key under the caller's, the migration Job
+requested `omnion-migrate` (an image nothing publishes), `migration.image.tag: ""` overrode the
+release tag so `--set image.tag` moved the pods and left the job on `appVersion`, `checksum/config`
+was unreachable without pod annotations, the migration Job had `readOnlyRootFilesystem` with no
+`/tmp`, and `migration.enabled` was documented but ignored. Also added `values.schema.json`, which
+refuses a misspelled TOP-LEVEL key — the per-object `additionalProperties` rules do not reach the
+root.
+
+**Proof.**
+- `bash scripts/qa/helm-chart.sh` → **70 passed, 0 failed** (13 sections: lint, resource counts,
+  image names, credential references, wrong-values refusals, the `--set` surface, digest pinning,
+  autoscaling, the migration hook, the rollout contract, label/selector integrity, component
+  toggles, packaging).
+- **13 mutations, 13 caught** — including the four the gate originally survived.
+- `bash scripts/qa/deployment-artifacts.sh` → 30 passed, 0 failed.
+- `pnpm typecheck` → 2/2.
+
+**The gate's own defects, which are the more useful half.** Six checks that were not checking, in
+order of how long each hid: (1) `set -o pipefail` + `grep -q` in a pipeline — `-q` exits on the first
+match, the upstream dies of SIGPIPE, 141 becomes the status, and the `if` took the `else` branch on
+exactly the file where the leak was present; (2) a grep for a secret is unrunnable when the display
+masks it, so the rule is structural (`scheme://` + userinfo `@`) rather than literal; (3) a pattern
+naming one syntax matched `value:` and missed `ENV=value`, which is the form NOTES.txt prints; (4)
+`[ 	]` is Python's `re`, not POSIX — green in a python spot-check, dead under `grep -E`; (5)
+NOTES.txt cannot be rendered without a cluster (`helm install --dry-run` dials the API server
+anyway), so the text moved into a `define` a probe template renders; (6) a check scoped to the whole
+file was satisfied by probe paths the operator never reads, so the readiness check now reads the
+notes document and the guidance sentence itself. A self-test fires the credential scanner on a
+deliberate leak, so its silence means something.
+
+**NOT claimed.** No cluster install, no `helm upgrade` cycle, no migration-hook ordering from job
+logs, no image built. The two Kubernetes acceptance lines that need those stay unticked, and the
+release pipeline, the artifacts screens and the upgrade helper are untouched.
+
+**Next.** REQ-128 slice 3 — the release pipeline (tag → multi-arch images, SBOM, CLI binaries,
+chart, manifest) and the `/deployment/artifacts` + `/deployment/install` screens. Slice 2's
+remaining lines need a cluster, which this box does not have.
