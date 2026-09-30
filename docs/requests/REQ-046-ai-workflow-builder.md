@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** in-progress (slice 4 · `7efa7989` (**the last criterion, run for real** — a workflow containing an `ai.prompt` step is driven through `engine::tick` against the mock provider and the run is read back out of the database; the later step is a **branch** on `steps.1.text` because `{{steps.1.output.text}}` is not a thing this engine has — the `{{ }}` namespace is `event` — and the retry had to be measured on the provider's call counter on a step that names `max_attempts`, since the default is `one` and a step that never asked to be retried lands in `failed` at attempt 1) · `f3943740`· slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815`, `375da98c`; slice 2 · `06f28399`; slice 1 · `b6392a80`)
+> **Status:** in-progress (slice 4 · `7efa7989` (**the last criterion, run for real** — a workflow containing an `ai.prompt` step is driven through `engine::tick` against the mock provider and the run is read back out of the database; the later step is a **branch** on `steps.1.text` because `{{steps.1.output.text}}` is not a thing this engine has — the `{{ }}` namespace is `event` — and the retry had to be measured on the provider's call counter on a step that names `max_attempts`, since the default is `one` and a step that never asked to be retried lands in `failed` at attempt 1) · `f3943740`· slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815`, `375da98c`; slice 2 · `06f28399`; slice 1 · `b6392a80`, `8a2f6eb1` (the QA stack had no tenant: `ensure-organization.mjs` existed and nothing called it; the console fixture read the org from an empty table and quoted a SQL literal with `JSON.stringify`), `d7c2125d` (the harness created an account it could not sign in to — the wizard's form filler used `qa-sample@` / `Sample-Passw0rd!` while `CREDS` said `qa-owner@` / `OmnionQa-Passw0rd-2026!`, so every API sign-in was a 401 and the database had zero organizations))
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -195,6 +195,23 @@ only: never the prompt body, never the definition, never a provider key.
       is not there, which is the same failure the three assertions in this REQ started with.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` are
       green and both screens appear in the walkthrough inventory (no untested screen).
+      — **STILL UNTICKED, and the reason is no longer the product.** `cargo test -p omnion-workflows
+      -p omnion-automation -p omnion-events` is **310 passed / 0 failed** and `pnpm typecheck` is
+      **2/2 packages, 0 errors**. `ai-workflows` *is* in the walkthrough inventory and rendered with
+      33 elements in the pass at 07:13 — the screen is walked. What is not yet measured is the
+      click half, and this tick found out why it could not be: **the harness had created an account
+      it could not sign in to.** The wizard's form filler answered the owner form with
+      `qa-sample@omnion.test` / `Sample-Passw0rd!` while `CREDS` said `qa-owner@omnion.test` /
+      `OmnionQa-Passw0rd-2026!`, so every API sign-in in the pass answered 401 — printed as one
+      line, never raised — and the QA database held one platform account with `organization_id
+      NULL` and **zero** organizations. The console fixture then wrote `''` into a uuid column and
+      quoted its rationale with `JSON.stringify`, which psql read as an identifier
+      (`column "The first step…"` does not exist), and the console reported itself as "no
+      provider" for three unrelated reasons stacked on one another. All four are fixed and proved
+      against the live stack (`d7c2125d`, `8a2f6eb1`); the click half is unmeasured because the
+      pass queued behind other writers for the whole of its 3 600 s deadline on a box running
+      eleven QA waiters. One owner, one address, one password, in one constant — and a fixture
+      that cannot fail is not a fixture.
 
 ### QA plan
 

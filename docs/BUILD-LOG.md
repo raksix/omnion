@@ -7219,3 +7219,50 @@ gave them one value. The address threshold is now `lockout_attempts * 3`.
 
 **Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
 naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+## Tick 36 — REQ-004/REQ-046 harness: a guard on 12 of 23 call sites, and a dead tab that decided the run
+
+**What.** Merged six commits from `origin/main` and then made the QA pass survive the box it runs
+on. Three commits: `8df53e21` the merge, `ef45ef49` the 23 unguarded depth-pass call sites,
+`1a317edb` the dead-tab replacement and the evidence the fatal handler was discarding.
+
+**The merge.** `scripts/qa/walkthrough.cjs` came back conflicted on the one place both branches had
+fixed the same defect — a mid-pass artifact directory that disappeared made `appendFileSync` throw
+`ENOENT` and unwind an hour of screens. Kept main's `warnedAboutStream` report and this branch's
+`mkdirSync` recovery, because on this box the commonest cause is a guard trimming an artifact run
+mid-pass: the pass survives and the very next append works. BUILD-LOG is append-only on both sides,
+so it was spliced from the merge base and verified by **multiset** — 0 lost from each side, 0
+duplicated, 4 918 → 7 221 lines.
+
+**The first finding was in the harness, and it was the whole tick.** The w3 pass reported
+`Page crashed` on twenty consecutive screens and then died with `Target crashed` inside `main()`.
+Two defects sat under that. **`runDepthPass` had existed for eight ticks and 12 call sites used it;
+23 did not** — `await runPalette(page, report)`, `await runWorkflowBuilderDepth(page, report)` and
+21 others. The file looked guarded and the log read guarded, and one thrown pass still unwound the
+whole walkthrough. A guard on some call sites is not a guard; it is a pattern that reads as one.
+
+**The second is the reason the first was fatal.** A dead renderer poisons every statement after it:
+`page.title()`, `locator.count()`, `page.url()` and `shot()` all throw on a tab whose renderer is
+gone, so the *first* crash decided the fate of every remaining screen. And `page.isClosed()` answers
+**false** for a crashed tab — the tab is open, the renderer is not — so a liveness check that asks the
+tab about itself sees a healthy tab and never fires. `runDepthPass` now swaps the tab through a
+module-level seam: `main`'s page is a local and all 23 call sites close over it, but they read it
+lazily (`() => runX(page, report)`), so one setter and no call-site edits.
+
+**The evidence that made both visible.** The two crashed passes wrote `pages: 0, steps: 0,
+mobile: 0` into `summary.json` next to a log showing 48 walked routes and ~140 screenshots. The pass
+had done the work and the report said only that it died — the one outcome a reader cannot tell apart
+from a pass that proved nothing. The report is module-scoped now and the fatal handler writes it
+alongside the error and a count of what came before.
+
+**Proof.** `--selfcheck-recovery` drives the swap with a **real** dead tab: `page.close()` is the
+same shape as a killed renderer (the object is still there and every call on it throws) and needs no
+stack, so it runs in 8 seconds. 4/4 green; removing the seam flips exactly one check
+(`thirdRanOnTheReplacement`) red, which is the only thing that makes the other three mean anything.
+`cargo test -p omnion-workflows -p omnion-automation -p omnion-events` **310 passed / 0 failed**
+(117 + 47 + 146). `pnpm typecheck` **2/2 packages, 0 errors**. Full w3 pass in progress.
+
+**Next.** Read the pass by URL, never by the raw finding count. REQ-046's last criterion needs this
+pass to reach `ai-workflows` and click the approval bar; REQ-004 has thirteen criteria whose probes
+are built and whose measurements are all still missing. If the pass survives to the depth passes
+this tick, the two are one measurement apart from both closing.
