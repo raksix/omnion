@@ -6846,3 +6846,43 @@ shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for t
 which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
+
+## Tick 36 — REQ-101 slice 1: the review inbox, the decisions, the policy
+
+**What.** Finished the slice the last tick was cut inside (the migration, the domain and the
+store were committed; the API mapping and the walk suite were on disk unverified), and built the
+route face on top of them.
+
+- `apps/api/src/routes/ai_approvals.rs` — inbox, review screen with its audit trail, approve,
+  reject, the class policy read/write/reset, and the sweeper. Seven `DecisionOutcome` arms
+  collapse into three HTTP shapes through one shared `render()`, called from both decision
+  handlers because both go through the same `decide()`.
+- `crates/permissions` — `ai.approvals.read` / `ai.approvals.act` / `ai.policies.manage`, with
+  the manager role getting read only.
+- Three product defects fixed in the store's write path, all found by walks, not by reading:
+  `ON CONFLICT` after `RETURNING` (a syntax error reported as "near `on`", pointing at the wrong
+  token), `created_at` bound to the same `$24` as `expires_at` (every row born violating its own
+  check constraint), and `decide()` testing `status != 'pending'` before the expiry — which made
+  a swept request answer `already_decided`, i.e. "a colleague released this", when nobody had.
+- Two defects in the walks themselves, both named in the commit: a fixture that inserted a
+  `tool_call` step without its tool (migration 0064 refuses it), and a decision-invariant control
+  asserting a violation that actually *satisfies* the constraint.
+
+**Proof.**
+
+- `cargo test -p omnion-api --test ai_approvals -- --test-threads=1` → **17 passed, 0 failed**
+  (151s). Walk 0→7→13→16→17 across the tick as each defect was fixed.
+- `cargo test -p omnion-ai-hub --lib` → **447 passed, 0 failed**.
+- Commits `a9801a11`, `b9d94790`, `414d5762`, `16f77d1d`, pushed to `origin/wave7`.
+- REQ-101 is `in-progress`: **10 of 20 acceptance boxes ticked**, each from the walk suite.
+
+**Not done, deliberately.** The admin panel for the inbox, the review screen and the policy screen;
+the walkthrough route entries; the QA pass; `cargo test --workspace`. The typed-confirmation box
+is ticked for the server half only — "the UI never sends the phrase unless the field is filled"
+has no UI to be true of yet.
+
+**Environment note.** `target` symlinks to `/dev/shm/w7-target` and a sibling's tmpfs cleanup
+deleted the directory mid-build: a 50-minute compile ended in `failed to create directory ...
+Not a directory (os error 20)` with no artifact. `/dev/shm/wN-target` is not private.
+
+**Next.** Slice 1's UI: the inbox, the review screen and the policy screen, then the w7 QA pass.

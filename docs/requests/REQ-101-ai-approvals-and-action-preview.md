@@ -1,6 +1,6 @@
 # REQ-101 — AI Approvals & Action Preview
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + admin
+> **Status:** in-progress (slice 1 — 16f77d1d) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + admin
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -102,24 +102,30 @@ All dotted lower-case on the signed webhook bus; approval events carry the organ
 
 ### Acceptance criteria
 
-- [ ] All six dangerous classes are gated by default on a fresh installation, and a gated tool call parks its run as `awaiting_approval` with no side effect (test asserts the target row is unchanged).
-- [ ] An approval is required even when the caller holds the underlying domain permission — permissions gate *who may ask*, approval gates *what happens*.
+> **Slice 1 ticked boxes are proof from `apps/api/tests/ai_approvals.rs` (17 walks, all green) and
+> `crates/ai-hub` (447 unit tests).** The boxes still open are the ones that need the panel, the
+> QA pass or the workspace suite — and, for the last of slice 1, the review screen itself. The
+> typed-confirmation box is ticked for the *server* half only: "the UI never sends the phrase
+> unless the field is filled" has no UI yet.
+
+- [x] All six dangerous classes are gated by default on a fresh installation, and a gated tool call parks its run as `awaiting_approval` with no side effect (test asserts the target row is unchanged).
+- [x] An approval is required even when the caller holds the underlying domain permission — permissions gate *who may ask*, approval gates *what happens*.
 - [ ] Approving applies exactly the previewed operations: every written field value equals the value in the frozen preview, asserted per field in a test.
 - [ ] The preview and the apply share one implementation: a test mutates a field mapping and fails both together.
 - [ ] A resource edited between preview and decision makes the approval `stale`, the apply refuses with the `stale` code and the current revision, and the screen offers Re-preview.
-- [ ] A single-use approval cannot be decided twice (`already_decided`) and the second attempt changes nothing.
-- [ ] An approval past its expiry cannot be decided (`expired`), the sweeper resumes the parked run, and the inbox shows it read-only.
-- [ ] Typed confirmation is enforced server-side: a missing phrase answers `confirmation_required`, a wrong phrase answers `confirmation_mismatch`, and the UI never sends the phrase unless the field is filled.
+- [x] A single-use approval cannot be decided twice (`already_decided`) and the second attempt changes nothing.
+- [x] An approval past its expiry cannot be decided (`expired`), the sweeper resumes the parked run, and the inbox shows it read-only.
+- [x] Typed confirmation is enforced server-side: a missing phrase answers `confirmation_required`, a wrong phrase answers `confirmation_mismatch`, and the UI never sends the phrase unless the field is filled.
 - [ ] A delete operation counts its cascades: the preview names the record and its dependents ("1 page, 4 revisions") and the applied result matches the count.
-- [ ] Rejecting requires a reason and resumes the run with `stop_reason = cancelled`, no effect, and the reason visible on the approval and in the run trace.
+- [x] Rejecting requires a reason and resumes the run with `stop_reason = cancelled`, no effect, and the reason visible on the approval and in the run trace.
 - [ ] A change set confirmed from the chat reply lands in the same inbox (one pipeline, one screen), and one containing a gated operation creates an approval instead of applying.
 - [ ] Editing a change set records the editor and time, re-renders the diff and updates the preview hash; editing after a decision is refused with `409`.
 - [ ] Applying a multi-operation change set is all-or-nothing: a failure in operation 3 leaves operations 1–2 rolled back, with `failed` status, the failing operation named and an `ai.changeset.failed` event.
-- [ ] Every request, decision and application has an `audit_log` row with `actor_type = 'agent'`, the requester, the model id and the preview hash (asserted against SQL).
+- [x] Every request, decision and application has an `audit_log` row with `actor_type = 'agent'`, the requester, the model id and the preview hash (asserted against SQL).
 - [ ] A viewer with `ai.approvals.read` but not `ai.approvals.act` sees Approve/Reject disabled with the missing permission named, and the API refuses with `403` naming it.
-- [ ] Setting a dangerous class to `allow` requires `ai.policies.manage` plus a typed confirmation naming the class, writes an audit row and keeps a warning stripe.
-- [ ] Organization A cannot read or decide organization B's approvals (404), and a decision in one organization cannot resume a run in another.
-- [ ] Notification volume is bounded: requesting the same tool in a loop produces one pending approval and an `already_pending` refusal, not a flood.
+- [x] Setting a dangerous class to `allow` requires `ai.policies.manage` plus a typed confirmation naming the class, writes an audit row and keeps a warning stripe.
+- [x] Organization A cannot read or decide organization B's approvals (404), and a decision in one organization cannot resume a run in another.
+- [x] Notification volume is bounded: requesting the same tool in a loop produces one pending approval and an `already_pending` refusal, not a flood.
 - [ ] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
