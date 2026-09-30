@@ -8771,3 +8771,36 @@ holds the single QA slot, so the keyboard leg is queued rather than barged for.
    ignore it.
 5. **Disk, again.** Ten writers at load 90+ means a queue, not a stall — and the failure looks like
    a timeout. Reclaim only your own cold cache (`lsof +D` + `find -newermt`), never a sibling's.
+
+## Tick 45 — the pass that could not report (2026-09-30)
+
+**What.** Not a feature slice: the two defects that made this writer's browser evidence
+unobtainable for four consecutive ticks, both in `scripts/qa/walkthrough.cjs`, both found by
+reading the harness rather than by running it.
+
+1. `925972d2` — the roll-up read `m.diagnostics.horizontalOverflow` unguarded. `diagnostics()`
+   resolves `undefined` when a tab navigates or closes mid-evaluate, so the 390×844 leg could
+   push an entry with no diagnostics and the roll-up threw a TypeError **before**
+   `summary.json` was written. The pass left no report, no findings and no screenshot index,
+   which is exactly what a pass that "died without saying why" looks like. An unmeasured screen
+   is now named in an `unmeasured-page` finding (medium) on both roll-ups, and the pass always
+   reaches the summary write.
+2. `8345f045` — `/crm/activities` and `/crm/leads` were in the desktop route list and in the
+   state list and **nowhere** in `mobileRoutes`, so the phone leg never opened the two screens
+   the mobile acceptance box names. `/crm/settings/pipelines` joined them. The pinning probe
+   diffs the two tables so the next one-sided addition fails instead of going quiet.
+
+**Proof.** `node --check scripts/qa/walkthrough.cjs` OK · `/tmp/w4-rollup-probe.cjs` **6/6** ·
+`/tmp/w4-harness-contract-probe.cjs` **6/6** against HEAD (30 phone routes) and **4/6 with two
+failures** against `HEAD~1` — the control is what makes the pass mean something ·
+`pnpm turbo run typecheck` **2/2** · `cargo test -p omnion-module-crm --lib` (result below).
+
+**The pass is queued again, not run.** The single slot is held by a *live* sibling pass
+(`qa-slot.sh` holder 2153263, cwd `/mnt/apopic/omnion-w3`, its `run.sh` + walkthrough + chromium
+tree all alive) — not a stale place, so it stays. `/mnt/apopic` is at 98% and the box at load 92.
+Running a pass into that is what produced the four silent deaths; queueing costs a tick and
+spending it produces no report at all. The two unticked boxes (390×844, keyboard sheet) stay
+**unticked** — the legs are written, and nothing here is a verdict on a screen.
+
+**Next.** Run the pass the moment the slot frees; read the keyboard leg and the phone box off
+`summary.json` — which now exists whatever the leg did — and tick only what it actually shows.
