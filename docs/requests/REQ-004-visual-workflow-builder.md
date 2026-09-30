@@ -1,6 +1,6 @@
 # REQ-004 — Visual Workflow Builder
 
-> **Status:** in-progress (slice 4 · `91bcbda` (a rule is built by being incomplete: an unwired graph SAVES, records why it cannot project, leaves the last runnable step list alone, and the RUN is where it refuses — `workflow_not_runnable`; the save's body also stopped filtering warnings away, which had made the panel's warning branch unreachable), `6f3fef2`, `963c4e3` (harness: a SIGKILLed pass held the only QA place for 1h48m — the holder is immortal and the reaper must test the holder, so 17 writers were queued behind a pass dead for over an hour; the holder now watches its owner), `b227846`, `41f5ea3` (harness: four probes never reached the code they measure — table-create payload, edge `id`, and a run-from-here click that always landed on the end node), `9b9cb46` (a list row carries the version a save must quote), `ce8497d` (harness: the suite could not send a CSRF token, so every write test was a 403), `708e352` (harness: the organization step asked for a session a fresh reset does not have); slice 3 · `393687f` (plugin nodes), `b2d7b7a` (keyboard path, narrow-screen lock), `0558ec2`, `98010ed` (criterion 8); `633b620` (criterion 3), `9daeedb`, `26d8dbc`, `7de6e5d` (criterion 2, click half), `8f713fe`, `a021cb4` (criterion 2, pill half), `4b7df30`, `3a7ecc0`, `c355084`, `7bf3641`; slice 1 · `6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`; slice 2 · `c88273a`, `3739414`, `bc48938`, `c31bd75`, `c866c16`, `8611785`, `e14a5e1`, `0823f06`, `3b4cbfd`, `671b43c`, `c864ca1`, `0c9ee98`, `1814758`, `afbb92b`, `c72bcf5`, `314bcda`, `6222873`, `d995669`) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + `crates/workflows`
+> **Status:** in-progress (slice 4 · `3ae8e19` (the ⌘/ shortcut list, and a unit test that reads the canvas SOURCE and fails on a chord the list omits — proved by injecting one, because a guard nobody has seen bite is a comment; locked rows say they are refused below 1024px), `a761562` (the probe for the save that answers 200 and carries its findings: read off the response body, since a probe written against the old contract would name a failure that did not happen), `91bcbda` (a rule is built by being incomplete: an unwired graph SAVES, records why it cannot project, leaves the last runnable step list alone, and the RUN is where it refuses — `workflow_not_runnable`; the save's body also stopped filtering warnings away, which had made the panel's warning branch unreachable), `6f3fef2`, `963c4e3` (harness: a SIGKILLed pass held the only QA place for 1h48m — the holder is immortal and the reaper must test the holder, so 17 writers were queued behind a pass dead for over an hour; the holder now watches its owner), `b227846`, `41f5ea3` (harness: four probes never reached the code they measure — table-create payload, edge `id`, and a run-from-here click that always landed on the end node), `9b9cb46` (a list row carries the version a save must quote), `ce8497d` (harness: the suite could not send a CSRF token, so every write test was a 403), `708e352` (harness: the organization step asked for a session a fresh reset does not have); slice 3 · `393687f` (plugin nodes), `b2d7b7a` (keyboard path, narrow-screen lock), `0558ec2`, `98010ed` (criterion 8); `633b620` (criterion 3), `9daeedb`, `26d8dbc`, `7de6e5d` (criterion 2, click half), `8f713fe`, `a021cb4` (criterion 2, pill half), `4b7df30`, `3a7ecc0`, `c355084`, `7bf3641`; slice 1 · `6c3f43b`, `775947a`, `f6d6a68`, `66442e9`, `b0dad65`; slice 2 · `c88273a`, `3739414`, `bc48938`, `c31bd75`, `c866c16`, `8611785`, `e14a5e1`, `0823f06`, `3b4cbfd`, `671b43c`, `c864ca1`, `0c9ee98`, `1814758`, `afbb92b`, `c72bcf5`, `314bcda`, `6222873`, `d995669`) · **Captured:** 2026-09-25 · **Layer:** `apps/admin` + `crates/workflows`
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -258,6 +258,31 @@ the problems panel not covering the last row of the graph.
    *Done when:* a mid-run status change paints on the canvas and a trace's node link resolves to the same step the API returned.
 4. **Plugins and polish** — plugin node registry from manifests, sub-workflow node, notes, mobile read-only gate, all states, `⌘/` help, accessibility assertions.
    *Done when:* an enabled sample plugin contributes a node that runs through its declarative spec, and disabling it degrades with a clear validation error.
+
+   **`⌘/` help 2026-09-29** (`3ae8e19`). Built, and the guard is the substance of it. The
+   rows live in a **catalogue** (`SHORTCUT_GROUPS`) rather than being written into the overlay,
+   because a help list is the one screen whose value is exactly as fresh as its last edit: it
+   is correct the day it is written and silently incomplete the day a shortcut is added, and
+   no test that presses the documented keys can see that. A unit test therefore reads the
+   **canvas source** and fails on a chord with no row — proved by injection, not by assertion
+   (a `⌘K` branch was added, the test named it, the file reverted clean). Two of the six new
+   tests failed first and **both were the test's fault**, which is the only way to read a new
+   test failing: one asserted `key: "Slash"` (that is `event.code`; binding it makes the
+   shortcut layout-dependent), the other demanded `KEYMAP.cancel`'s raw `"escape"` against a
+   row written `Esc`. The first fix made the assertion loose enough to pass a row for the
+   wrong key, so the alias table replaced it. **The chord could not have been read where the
+   single-key path is** — that block only runs with no modifier held, the same guard
+   `readKey` applies — so `⌘/` is wired beside the other chords, and Escape closes the overlay
+   *before* the canvas's three-step ladder, because a modal the keyboard cannot dismiss fails
+   the keyboard-only criterion on the one screen that teaches the shortcuts. Locked rows say
+   they are refused below 1024px: `isReadingKey` is a whitelist, so a shortcut added next year
+   is refused by default and a phone author needs to know which keys will not work.
+   **Not ticked until the pass reads `shortcut-help` with `openedByChord`, `closedByEscape`,
+   `togglesOnTheSameKey` and `marksTheLockedRows`** — the pass is queued behind a live w8
+   walkthrough, so a screen built this tick has not been in a browser yet.
+
+   **Still open in this slice:** accessibility assertions, and the sample-plugin *run* (the
+   palette half and the honest-validation half are built and unticked).
 
 ### Risks / notes
 

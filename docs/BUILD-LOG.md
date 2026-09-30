@@ -5945,3 +5945,71 @@ unmeasured and the boxes that depend on them stay unticked.
 then `validate-classes`, `cmd-s-writes-once`, `two-tab-conflict`, `run-from-here`,
 `step-trace`. A note that still reads empty after that is a **product** defect, because the
 instrument behind all six is now fixed and committed.
+
+## 2026-09-29 · omnion-w3 · REQ-004 slice 4 — ⌘/ help, and a guard that stops it going stale
+
+**What.** Two commits, and the second one is the one worth reading. `a761562` is the probe
+for the save/run split `91bcbda` introduced; `3ae8e19` builds the `⌘/` shortcut list, which
+slice 4 has been naming since the slice was written.
+
+**THE UNFINISHED-SAVE PROBE WAS MISSING, AND THE OLD INSTRUMENT WOULD HAVE REPORTED IT
+BACKWARDS.** `91bcbda` moved the guard from "you may not save" to "you may not run", so the
+save now answers **200 carrying `findings`**. A probe written against the previous contract —
+read the save state, expect `error` — does not merely go unmeasured, it names a *failure that
+did not happen*, and a reader of that note would go looking for a bug in the save path. The
+verdict on a 200 is read off the **response body**, which is the only place a 200 can carry
+one. Three claims, in the order the change makes them: the save stores a graph whose trigger
+has no event name and answers 200 with `error_count > 0` and a recorded reason; the run is
+refused 400, names the graph, and leaves **zero** execution rows; the panel must not claim
+"No problems" over a graph the server refuses. The step list is read after the refusal
+because the save leaves it alone — a save that blanked it makes "not yet runnable" and "has
+never run" the same row, which is the conflation the trace panel was fixed for.
+
+**`workflow-table`'s 422 WAS ALREADY FIXED, AND FOUR TICKS SPENT ON IT ARE THE LESSON.** The
+`create` note read `status: 422` because `WorkflowInput` requires `trigger` and `steps` and
+the probe posted `{name, description}`. `b227846` fixed the payload at 17:55 — and the note
+that documents the 422 is from the pass at 16:43. **The note was never re-read after the fix
+landed**, so three ticks reasoned about a defect that had been closed for a day. The lesson
+is narrower than "read the notes": a probe's last measurement has a **timestamp**, and a
+reason written about a run that predates its own fix is a reason about a build nobody has.
+`git log -S` on the payload answers it in one call.
+
+**A HELP LIST IS THE ONE PIECE OF UI WHOSE VALUE IS EXACTLY AS FRESH AS ITS LAST EDIT.** Every
+other screen is judged by whether it works; the shortcut list is judged by whether it is
+*complete*, and the failure is invisible to every test that presses the keys it documents. So
+the rows live in a catalogue and a unit test **reads the canvas source** and fails on a chord
+with no row. That guard was proved by injecting a `⌘K` branch that binds nothing else: the
+test named it, and the file reverted clean. A guard nobody has seen bite is a comment.
+
+**TWO OF THE SIX NEW TESTS FAILED FIRST, AND BOTH WERE THE TEST'S FAULT, WHICH IS THE ONLY
+WAY TO READ THEM.** The first asserted `key: "Slash"`, which is `event.code` — binding to it
+would make the shortcut work on one physical key and not on a layout where that key prints
+something else. The second demanded `KEYMAP.cancel`'s raw `"escape"` against a row written
+`Esc`, which is correct help text. The first fix made the assertion loose, which would have
+let a row for a *different* key pass; the alias table is the version that cannot.
+
+**THE CHORD COULD NOT HAVE BEEN READ WHERE THE SINGLE-KEY PATH IS.** The `⌘` block is entered
+only when **no modifier is held** — the same guard `readKey` applies to the intent — so a
+`help` case added to the single-key switch would be a shortcut nobody can press. It is wired
+beside the other chords, `⌘/` and not a bare `/`, and both facts are asserted rather than
+remembered. Escape closes the overlay **before** the canvas's three-step ladder: a modal the
+keyboard cannot dismiss fails the keyboard-only criterion on the one screen teaching the
+shortcuts. Every locked row *says* it is refused below 1024px, because `isReadingKey` is a
+whitelist and a phone author needs to know which of the keys will not work for them.
+
+**Proof.** `omnion-workflows --lib` 143 ok · `omnion-api --lib` 241 ok · `omnion-automation
+--lib` 115 ok · `apps/admin` **172/172** unit tests (6 new) · `tsc --noEmit` exit 0 ·
+`node --check` on the walkthrough clean. The drift guard re-proved by injection, above.
+
+**Not ticked, and why.** The pass is queued behind a **live** w8 walkthrough
+(`/tmp/omnion-qa-slot/1490013-…`, holder alive, `cwd=/mnt/apopic/omnion-w8`, walkthrough pid
+1570978 started 23:13) — a real queue, the same shape tick 26 mistook for a leak. `⌘/`
+renders in a browser only once a pass runs, so `shortcut-help` is unmeasured and the box
+stays unticked. The queued pass carries the **new** probe, because the older one was killed
+and relaunched after the commits landed.
+
+**Next.** Read `shortcut-help` first (it is the only note this tick adds), then the six
+REQ-004 notes in the order four ticks have agreed: `workflow-table` (`create.status` — expect
+**201** now, the 422 was fixed a day before the note was written), `validate-classes`,
+`cmd-s-writes-once`, `two-tab-conflict`, `run-from-here`, `step-trace`. An empty note after
+that is a **product** defect; the instrument behind all of them is committed.
