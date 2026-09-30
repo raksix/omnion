@@ -70,7 +70,7 @@ as the cheap gate; it is cheap because it is *narrow*, and the tick that only ra
 whether the file next door compiled. The cost of the full check is the thing to budget, not the
 thing to avoid.
 
-Both are fixed in `1a4e0d47`: the driver name is read through
+Both are fixed in `b7900559`: the driver name is read through
 `StorageConfig::from_env()` — the same source the live handle was built from, so the probe and the
 client it probes cannot disagree — and the four `?`s map through the module's existing
 `map_store`. `health_probes.rs` could not have caught either one: it exercises the crate's
