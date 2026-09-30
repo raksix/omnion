@@ -36,6 +36,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
 import { fetchEnvironments } from "./api";
+import { useSession } from "./session";
 import type { Environment } from "./types";
 
 /** The tenant whose selection is stored. A switch to another tenant resets it. */
@@ -110,6 +111,7 @@ function writeStored(tenantId: string | null, environmentId: string | null) {
 
 /** Provide the panel's active environment. */
 export function ActiveEnvironmentProvider({ children }: { children: React.ReactNode }) {
+  const { status: sessionStatus } = useSession();
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [tenantId, setTenantId] = useState<string | null>(null);
@@ -120,6 +122,12 @@ export function ActiveEnvironmentProvider({ children }: { children: React.ReactN
   // the list is what this provider fetches and reading it from itself would be a cycle. `null`
   // while signed out is the correct answer, and it clears the selection below.
   useEffect(() => {
+    // Nothing to key a stored selection on without a session, and a stale tenant id from the
+    // previous sign-in must not survive into the next one. Same gate as the read below.
+    if (sessionStatus !== "signed-in") {
+      setTenantId(null);
+      return;
+    }
     const read = () => {
       const match = document.cookie.match(/(?:^|;\s*)omnion_org=([^;]+)/);
       setTenantId(match ? decodeURIComponent(match[1]) : null);
@@ -128,9 +136,20 @@ export function ActiveEnvironmentProvider({ children }: { children: React.ReactN
     // A tenant switch is a navigation, not a state change this component can observe, so the
     // cookie is re-read whenever the list is re-read. It is a cheap string parse, and guessing
     // wrong would show one tenant's environments inside another's panel.
-  }, [reloadToken]);
+  }, [sessionStatus, reloadToken]);
 
   useEffect(() => {
+    // No session, no read. This provider is mounted by the app shell, so without the gate it
+    // fired on the sign-in screen, on every public render, and for every signed-in account that
+    // cannot read the list — and an unauthenticated `/environments` answers 401, which the
+    // browser logs as a failed request on *every* page of the panel. The two sibling providers
+    // (`tenant-status`, `sites`) gate on the same `sessionStatus`; this one did not, and the
+    // asymmetry is invisible from the code until you count the console.
+    if (sessionStatus !== "signed-in") {
+      setEnvironments([]);
+      setLoaded(true);
+      return;
+    }
     let cancelled = false;
     setLoaded(false);
     fetchEnvironments()
@@ -151,7 +170,7 @@ export function ActiveEnvironmentProvider({ children }: { children: React.ReactN
     return () => {
       cancelled = true;
     };
-  }, [reloadToken]);
+  }, [sessionStatus, reloadToken]);
 
   const select = useCallback(
     (id: string) => {
