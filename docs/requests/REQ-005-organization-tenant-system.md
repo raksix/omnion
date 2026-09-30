@@ -215,6 +215,34 @@ automation engine uses; the token never appears in an event payload.
   tenant is a platform fact, queues 0 deliveries, and the following tick claims 0 — the endpoints
   subscribed to that very name must not receive it._
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
+  _Closer, and the first part of the gate now has a name. Tick 77 ran the tenant-scoped pass that
+  this box had been waiting on: `focused pass: 1/54 routes`, **7 route/pass names walked, 0
+  unmatched**, 32 clicks, 59 screenshots — and the scoping itself is now trustworthy, because
+  `668b4b9b` fixed a flag that had been making every scoped pass walk all 54 routes while
+  reporting the narrow label. What the pass proved, from the run's own steps rather than from the
+  summary: the organizations list renders and the detail tab opens; an unusable address is
+  refused **in the field** with the format it wants; an invite is created and its row is shown;
+  the same address a second time is refused naming the pending invitation; the departments pass
+  runs empty-state → invalid key refused in the field → create → bind a role → unbind → archive
+  → delete, with the archived row still listed and marked; the tenant tabs toggle a module and
+  prove it **persists and restores**, save locale/accent/timezone and prove each persisted, and
+  render four labelled usage bars reading `0 of unlimited` / `1 of unlimited` — the `null` ceiling
+  rendering as "unlimited" rather than as a zero, which is the case a bare number would get
+  backwards._
+  _**Not ticked, and the reason is not the product.** The pass reported 44 high findings, and read
+  as a cause rather than a count they are three: ~20 × 401 and 1 × 409 are the harness's *own*
+  refusals (`expectRefusal` provokes the refusal it then asserts), and 7 are
+  `net::ERR_INSUFFICIENT_RESOURCES` on `/_next/static/chunks/*` with `free -g` showing 32 G RAM
+  at 0 free and 25 G of swap in use — six writers compiling at once. The 500 on
+  `/organizations/{id}/members` is the same starvation in the admin *dev server*: the API never
+  logged that request and every `/organizations/…` page answered 200. The remaining gates
+  (`cargo test --workspace`, `pnpm build`) also have not run this tick — a full workspace build
+  on a box at load 97 and 0 free RAM measures the box, not the code._
+  _Two product observations this pass did surface, neither tickable here: `runOrganizationSuspend`
+  skipped itself with *"the list carries no Suspend control for this row"*, and the member drawer
+  found no rows to open on a tenant whose owner is a member. Both are the pass meeting a screen it
+  cannot drive yet; they are the next slice, not this box._
+
 - [x] Below 1024px the member table becomes cards, the department tree an indented list, tabs a
   horizontal scroller, the switcher a sheet, and the usage bars stay labelled.
   _`296bb84`. The tabs were already a scroller and the billing bars were already labelled (the

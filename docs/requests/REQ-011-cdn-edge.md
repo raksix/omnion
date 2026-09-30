@@ -201,14 +201,27 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
 - [x] Every mutation writes an audit entry under the `cdn.*` namespace with actor and IP. (`0e2993c`)
 - [x] All endpoints are guarded by the catalogue keys and a forbidden call returns `403 permission_denied`. (`0e2993c`)
 - [ ] Filters, empty, loading and error states exist on every screen; the rows shown match the API counts.
-  _Not ticked, and the tick-21 pass is the reason to be careful here. The pass that would have measured this walked
-  `/cdn/purges` and found **0 elements** on a cold mount while `cdn-rules`, `cdn-settings` and `webhooks` rendered
-  29, 40 and 40 in the same run — and that same pass was under a scope that had silently matched all 46 routes
-  (`1aa8930`), so its numbers were gathered under a label that was wrong. The views do carry the states in code
-  (`EmptyState` in all five, `LoadingTable` in four, a field-level error in all five), but code presence is not the
-  acceptance line and the count match has never been measured on screen. It stays unticked until a clean, correctly
-  scoped pass reports both._
+  _The measurement now exists (`04bc7e73`); it has **not yet reported**. Two blockers, and the first
+  one is the one that mattered for 55 ticks. Until tick 77 the blocker recorded here was the tick-21
+  pass reporting "0 elements" on `/cdn/purges` — a harness-flakiness story, which sent every tick
+  looking at the pass instead of at the pass's own arithmetic. The real finding is that the count
+  match **had no instrument at all**: `runCdnPurgeDepth` stored the header sentence and
+  `runCdnRulesDepth` stored a row count, and neither compared either to the API, so the clause
+  could not have been ticked by any pass. `04bc7e73` builds it — two deterministic hooks, a
+  three-way comparison of DOM rows / API `total` / rendered sentence that **refuses to assert on a
+  single row** (where `Showing N of N` is true by construction), a deliberately different assertion
+  for the unpaged rules screen whose failure mode is a dropped row rather than a hidden page, and a
+  drive of the filtered empty state that no pass had reached (`status=failed AND kind=tag` empties
+  the table while the unfiltered one has rows — the only way to tell "nothing matches this filter"
+  from "no purges yet")._
+  _**Still unticked, deliberately.** The first scoped pass over these screens has not run: the pass
+  that would measure it was scoped to the tenant surface, and the CDN scope is the next one. The box
+  stays open until a correctly-scoped CDN pass reports the numbers; a measurement that exists but
+  has never spoken is not evidence._
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
+  _Blocked on the same missing run, and on the box rather than on the CDN code. `free -g` during
+  the tick-77 pass: 32 G RAM with 0 free and 25 G of swap in use, six writers compiling at once,
+  which made Chromium fail to fetch `/_next/static/chunks/*` with `ERR_INSUFFICIENT_RESOURCES`._
 
 ### QA plan
 
