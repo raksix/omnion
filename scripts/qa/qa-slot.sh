@@ -71,10 +71,17 @@ reap() {
     fi
   done
 }
-reap
-
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  # Reap on EVERY turn, not once before the loop. The reaper is the only thing that can free a
+  # place whose owner died, and the owner is most likely to die *while this loop is running* --
+  # that is exactly when a queued pass is waiting. Reaping once before the loop left every pass
+  # that was already queued when a sibling crashed to sit on a dead place until its own
+  # QA_SLOT_WAIT expired, which is 1800s here and 3600s in the writer loops: the whole queue
+  # stalled behind one corpse, and the passes it stalled then timed out and proceeded anyway.
+  # The grace period inside reap() covers the place/holder creation race, so re-reading it every
+  # 15s cannot reclaim a place that was taken a moment ago.
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
