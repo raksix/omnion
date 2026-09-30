@@ -1,6 +1,6 @@
 # REQ-063 — Block System & Page Builder
 
-> **Status:** in-progress (slice 4, acceptance 17 still UNMEASURED — a `--only=block-editor,members` pass is queued with `QA_OUT_ROOT` on tmpfs, because `/mnt/apopic` sat at 89% with six sibling writers and a pass whose screenshots live there is deleted out from under itself mid-walk. The 08:40 pass cannot close it: it finished at 09:11 and the fix landed at 09:24, so `canvasDrawnAt390: false` is a measurement of code this branch has already replaced. The fix is `7dea0378` (render-mode blocks carry the edit branch's identifying attributes plus `data-block-canvas-mode`) and `8b12f120` (the phone canvas is counted by that mode and against the editor's own `data-block-count`; the preview frame is held to never exceed its stated visible count; all eleven keys are demanded by `--only=block-editor` so a pass that dies before them reports `missing`). Tick both this criterion and REQ-064's 18 in the tick that READS that summary, because a fix landing after the last measurement is what kept 17 open for three ticks. **Meanwhile this tick fixed the mechanism that decides whether any writer can run a pass at all:** `qa-slot.sh` judged a place busy by asking whether its *holder* was alive, and the holder's only killer is `run.sh`'s EXIT trap — so a SIGKILLed pass left an immortal place and the queue blocked until a human killed a stranger's holder by hand (the 75-minute hostage its own header documents; 38 orphaned waiters box-wide, 14 in this worktree). `a3a1630e` records the owning pass in the holder file and reclaims a place whose owner is gone.)
+> **Status:** in-progress (slice 4 COMPLETE — the media-deleted degradation path shipped this tick as `0be1079d`/`2b0e4756`/`2477facb`/`7e7637af`/`f8c0293a`, so all four of slice 4's parts exist; 22 content unit tests, 274/0 in total, and 7 new integration walks, 7/0, asserting on the PUBLIC payload a visitor receives. Acceptance 17 is still UNMEASURED and stays that way: the frame changed under it again, so the queued `--only=block-editor,members` pass must run against THIS build before 17 and REQ-064's 18 can be read. The pass now also opens the new media panel and compares the frame's text before and after a simulation, because a simulation that quietly does nothing draws exactly the same page as one that works. The 08:40 pass still cannot close 17: it finished at 09:11 and the canvas fix landed at 09:24, so `canvasDrawnAt390: false` measures code this branch has already replaced. Two stale QA waiters of this writer's own were killed by hand this tick before they could measure anything: the mechanism a3a1630e added reclaims a *dead* pass's place, and a pass that is merely queued behind a sibling is neither dead nor entitled to hold a place while its own source changes under it. Next: the queued pass, then REQ-062 acceptance 15's render half.)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -303,6 +303,63 @@ It must also open a `raw_html` block in the inspector, paste markup carrying a `
    - A tree walker that descended only into `children` found no ids in a flat page, so the "two
      insertions never collide" assertion was comparing nothing and reading as a pass.
 4. **Polish and events.** Undo/redo persistence, mobile read-only behaviour, empty/loading/error states, the five events with a verified delivery, and the media-deleted degradation path. *Done when:* acceptance 16 passes, the walkthrough covers all new screens, and the QA report shows zero high findings.
+
+   **The media-deleted degradation path is BUILT (`0be1079d`, `2b0e4756`, `2477facb`, `7e7637af`,
+   `f8c0293a`) — the last of slice 4's parts, and the one that was silently missing.** Every other
+   claim in this REQ either refuses a mistake or draws content; this one has to do neither, which
+   is exactly the property that makes a broken implementation invisible. A page serving a dead
+   `<img>` is not red anywhere — it just looks like a page.
+
+   The degradation is a **join, not an event consumer**, for the reason `featured.rs` already
+   documents for a page's single image: a consumer that has not run (offline, or trashed before it
+   existed) leaves a published page with nothing on screen saying why. So it is derived on read,
+   every time, from the block tree's own media ids. `BlockMediaStore` collects them in one walk
+   and resolves them in a single `where id = any($1)` — one round trip for a gallery of forty, and
+   the same answer for every reader of the same page.
+
+   **It is deliberately not inside `validate()`.** The panel calls that on every keystroke behind
+   a 250 ms debounce, so a media lookup there would put a query behind the editor's every-change
+   dry run *and* surface a trashed file as a validation **error** — which blocks a publish. A
+   file deleted on purpose is not a broken page, and `featured.rs` says the same about a hero
+   image for the same reason: a working page taken down over a picture somebody removed on
+   purpose is the failure mode. So it is a warning, merged with the validation report only where
+   it is *shown* (the editor's bar, the frame), never inside the validator.
+
+   Four decisions worth keeping:
+
+   - **Trashed and purged are separate states.** Only a trash can be undone, so "restore it" is
+     actionable for one and meaningless for the other. A single "missing" would send an author to
+     empty the trash for a file that is not in it. Same split as `featured.rs`, same reason.
+   - **A hand-written URL is not a file.** The platform did not upload it, does not own it, and
+     cannot know whether it answers 404 tomorrow. Warning about it would train authors that the
+     panel nags about every external image, so a tree of URLs resolves to *no query at all*.
+   - **The degradation is specific per type.** An `image` becomes its caption (or an explicit
+     short note, because an empty block is a gap the author cannot see); a `gallery` keeps the
+     files that survived, because a gallery of four with one missing is still a gallery of three;
+     and a gallery that lost *everything* is not drawn at all, because an empty grid captioned
+     "0 images" is a lie in the platform's own voice.
+   - **The frame simulates instead of destroying.** `GET /pages/{id}/preview?media=<id>` names
+     ids the frame should pretend are gone. This is the question the whole feature exists to
+     answer and the one nobody could answer before: the only way to find out was to trash a real
+     file, which changes the page for every visitor and cannot be undone from the screen. It
+     writes nothing, and a walk proves it by naming a **live** file and then reading the row
+     back. A word that is not an id and a list longer than `MAX_MEDIA_FILTER` are both refused by
+     name rather than ignored — a silently shortened filter answers "this file was checked" for
+     a gallery it skipped.
+
+   **Proof: 22 new content unit tests (274/0, was 252) and 7 new integration walks (7/0).** The
+   walks assert on the **public** payload rather than the panel's, because "no broken image is
+   served" is a claim about what a browser receives, and `tree_mentions` searches the whole
+   subtree for the id rather than reading one prop — the failure being hunted is a dead id
+   surviving where nobody thought to look. Each walk's first assertion is the state *before* the
+   deletion, so a walk cannot pass on a payload that never carried the image at all.
+
+   **Not ticked, deliberately:** no acceptance criterion. Criterion 17 is still a browser
+   measurement and the frame changed under it again, so the queued `--only=block-editor,members`
+   pass has to run against THIS build before 17 and REQ-064's 18 can be read. What this tick
+   added to that pass is the media panel and — the part that matters — a comparison of the
+   frame's text before and after the simulation, because a simulation that quietly does nothing
+   draws exactly the same page as one that works.
 
    **The migration ledger needs one reservation, not one convention.** This slice renumbered
    `0026_content_patterns.sql` → `0038_content_patterns.sql`, and the reason is worth keeping:

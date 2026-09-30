@@ -7627,3 +7627,98 @@ sibling writers, and a pass whose artifacts live there can be deleted out from u
 green, tick both boxes **in the same tick that reads the summary** — the reason neither is ticked
 now is that the fix landed after the last measurement, and repeating that is what kept 17 open for
 three ticks. (c) REQ-062 acceptance 15's render half.
+
+## 2026-09-30 · tick 40 · wave 2 · REQ-063 slice 4 is complete: the media-deleted degradation
+
+**One slice, shipped and verified. No acceptance box is ticked, and the reason is the same as the
+last two ticks: the criterion is a browser measurement and the frame changed under it again.**
+
+Slice 4 listed four things — undo/redo persistence, mobile read-only behaviour, empty/loading/error
+states, the five events, and the media-deleted degradation path. Four were already built. **The
+fifth was not, and nothing said so**: it is a path, not a screen, so no route was missing, no
+button was dead, and every existing gate was green while the feature was simply absent. A REQ can
+be *almost* done in a way no checklist catches — the item is prose in a slice line, and prose does
+not fail a test.
+
+**What it does now.** A block stores a media id; a file somebody trashes breaks that silently.
+`BlockMediaStore` collects every file a tree names in one walk and resolves them in a single
+`where id = any($1)`, and `degrade_tree` turns the answer into markup: an `image` becomes its
+caption, a `gallery` keeps what survived, a gallery that lost everything is not drawn. The public
+payload degrades *before it leaves the API*, so no visitor gets a dead `<img>`.
+
+**It is a join and not an event consumer**, and that is the decision worth defending.
+`media.deleted` is a real event and a consumer is the obvious place to react; it is the wrong
+place for the reason `featured.rs` already documents — a consumer that has not run (offline, or
+trashed before it existed) leaves a published page with nothing on screen saying why. So it is
+derived from the join, on read, every time.
+
+**And it is deliberately NOT inside `validate()`.** That was the trap in this slice. The obvious
+place for a "your image is gone" message is the validator — the panel already renders its issues,
+and a broken file *is* a problem with the page. Folding it in would have put a database query
+behind the editor's every-keystroke dry run (250 ms debounce) and, worse, turned a trashed file
+into a validation **error**, which blocks a publish. A picture somebody deleted on purpose is not
+a broken page, and refusing the publish is precisely the "working page taken down" failure
+`featured.rs` warns about for the one-image case. So the media report is merged with the
+validation report only where it is *shown*, never inside the validator.
+
+**Three sub-decisions the walks pinned down, each of which is a way the obvious version lies:**
+
+- Trashed and purged are separate states. Only a trash can be undone, so the advice differs
+  ("restore it" vs "pick another"). Collapsing them sends an author to empty the trash for a
+  file that is not in it.
+- A hand-written URL is not a file. It resolves to *no query at all* — warning about
+  `https://…/photo.jpg` would train authors that the panel nags about every external image.
+- A gallery that lost every image is **not drawn**, because an empty grid captioned "0 images" is
+  a lie in the platform's own voice. A gap is honest where a fake grid is not.
+
+**And the frame simulates instead of destroying.** `GET /pages/{id}/preview?media=<id>` names ids
+the frame should pretend are gone. This is the question the whole feature exists to answer and the
+one nobody could answer before: the only way to find out was to trash a real file, which changes
+the page for every visitor and cannot be undone from the screen. A walk proves it writes nothing
+by naming a **live** file and then reading the row back.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-content --lib` | **274 passed, 0 failed** (252 before: 22 new) |
+| `cargo test -p omnion-api --test content_block_media` | **7 passed, 0 failed** (228 s, live PostgreSQL) |
+| `apps/admin` `tsc --noEmit` | **exit 0** |
+| `node --check scripts/qa/walkthrough.cjs` | **exit 0** |
+| `node scripts/qa/check-tdz.cjs` | **clean**, 1916 bodies, 6 baselined |
+
+The walks assert on the **public** payload rather than the panel's, because "no broken image is
+served" is a claim about what a browser receives, and a test that reads the panel's own GET proves
+the panel and the panel agree — which is the pair that can agree while the site shows nothing.
+`tree_mentions` searches the whole subtree for the id rather than reading one prop, because the
+failure being hunted is a dead id surviving where nobody thought to look.
+
+**Two box problems, and only one of them was mine.**
+
+1. `/` hit 99% and PostgreSQL could not write its init file
+   (`could not write init file: No space left on device`) — the walks failed on the *database*,
+   not on the code. Cause found and fixed: `/root/w2target`, 3.7 GB, **my own** stale build
+   directory from an earlier tick, no open handles (`lsof +D` empty), no writes in three hours
+   (`find -newermt '-180 minutes' | wc -l` = 0). Removed; `/` went to 95% with 6.5 GB free and
+   the walks then passed. The lesson is the one the invariants file already half-says: **the build
+   target is not only on `/mnt/apopic`.** `CARGO_TARGET_DIR` pointed there, but an older tick
+   built into `/root` and nothing reclaimed it.
+2. The suite then blocked for 15 minutes with 0% CPU: a cargo lock held by a sibling's build, with
+   box load 92 and ten writers. Not a failure and not a hang in my code — but it is the second
+   time this tick that "the test is stuck" turned out to be a *shared resource*, and both times
+   the cheap diagnostic was the same: read `ps` for CPU and `df` for space before believing the
+   tool.
+
+**I also killed this writer's own stale QA pass rather than let it measure code that had changed.**
+Two orphaned `qa-slot.sh` waiters (pids 2692601, 2701341) and a `run.sh` (2692517 -> 2710291 ->
+waiter 2710292) were queued behind w3's sibling, holding a place they would return only after
+walking the tree I was editing. `a3a1630e` reclaims a place whose *owner is gone*; a pass that is
+merely queued is neither gone nor entitled to run against a build that has moved. Verified after
+killing: no process with an `omnion-w2` cwd remains, and the one place file in `/tmp/omnion-qa-slot`
+is w3's. Their holder would have outlived them, so `rm`-ing the files by hand would have left an
+immortal holder; the kill is what frees it.
+
+**Next.** (a) The queued `--only=block-editor,members` pass — now also measuring the media panel and
+proving the simulation changes the render. It answers REQ-063's criterion 17 and REQ-064's 18, and
+both must be ticked in the tick that READS that summary. (b) REQ-062 acceptance 15's render half:
+the compiler accepts the scaffolded theme, nothing has ever watched a browser draw it.
