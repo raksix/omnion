@@ -52,6 +52,13 @@ trap 'rm -rf "$tmp"' EXIT
 export OMNION_DB_USER=gate OMNION_DB_PASSWORD=gate OMNION_S3_ACCESS_KEY=gate
 export OMNION_S3_SECRET_KEY=gate OMNION_PUBLIC_URL=https://gate.test OMNION_CSRF_SECRET=gate
 export OMNION_ADMIN_EMAIL=gate@gate.test OMNION_ADMIN_PASSWORD=gate
+# The enterprise stack reads its endpoints from a different variable set — that is the whole
+# contract it exists to express. They have to be exported here as well, or `config` refuses and
+# the check below reports a parse failure that looks like a defect in the file.
+export OMNION_EXTERNAL_POSTGRES_DSN=postgres://gate@gate.test:5432/gate
+export OMNION_EXTERNAL_REDIS_URL=redis://gate.test:6379
+export OMNION_EXTERNAL_S3_ENDPOINT=https://s3.gate.test
+export OMNION_S3_BUCKET=gate
 
 render() { # <compose file> -> the normalised config on stdout
   docker compose -f "$1" config 2>"$tmp/err"
@@ -242,6 +249,64 @@ for df in "$ROOT"/infra/docker/*.Dockerfile; do
     fail=$((fail + 1))
   fi
 done
+
+# ---------------------------------------------------------------------------------------------
+# 6b. The enterprise topology must define NO datastore container.
+# ---------------------------------------------------------------------------------------------
+# This is the acceptance line "the enterprise compose file starts with external PostgreSQL,
+# Redis and S3 endpoints and contains no database container", and it is checked against the
+# rendered service list rather than by reading the file: a `postgres` service added here would
+# be a container writing the organisation's production data into a throwaway volume on the day
+# somebody runs `up` without reading which file they are in. That is not visible in review
+# because the file is long and the addition looks like any other service.
+ent="$COMPOSE_DIR/docker-compose.enterprise.yml"
+if render "$ent" > "$tmp/ent.yml" 2>"$tmp/err"; then
+  printf 'ok   the enterprise stack parses under `docker compose config`\n'; pass=$((pass + 1))
+else
+  printf 'FAIL the enterprise stack does not parse\n'; sed 's/^/       /' "$tmp/err" | head -5
+  fail=$((fail + 1))
+fi
+
+ent_datastores="$(
+  python3 - "$tmp/ent.yml" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+names = set(d.get("services") or {})
+# Matched by name AND by image, so a service named `pg-primary` running a postgres image is
+# caught as readily as one called `postgres`. The name list is the first filter, not the only
+# one: an enterprise file that renamed its datastore to dodge a name check has still broken
+# the contract the check protects.
+banned_names = {"postgres", "postgresql", "pg", "redis", "minio", "mysql", "mariadb", "mongo", "mongodb"}
+banned_images = ("postgres:", "postgis/", "redis:", "minio/", "pgsty/minio", "mysql:", "mariadb:", "mongo:")
+hits = sorted(n for n in names if n.lower() in banned_names)
+for n in sorted(names):
+    image = ((d.get("services") or {}).get(n) or {}).get("image") or ""
+    if any(marker in image for marker in banned_images) and n not in hits:
+        hits.append(n)
+print(",".join(hits) or "none")
+PY
+)"
+check "the enterprise stack defines no datastore container" "none" "$ent_datastores"
+
+# And the endpoints must be external references rather than localhost defaults, because a
+# value that silently falls back to 127.0.0.1 turns an enterprise install into a single-host
+# one without a word of complaint.
+ent_localhost="$(
+  grep -cE '(DATABASE_URL|REDIS_URL|S3_ENDPOINT)[^:]*:[[:space:]]*"?\$\{[A-Z_]+:-(127\.0\.0\.1|localhost)' \
+    "$ent" 2>/dev/null | tr -d ' '
+)"
+check "no enterprise endpoint falls back to localhost" "0" "$ent_localhost"
+
+ent_replicas="$(
+  python3 - "$tmp/ent.yml" <<'PY'
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+api = (d.get("services") or {}).get("api", {})
+replicas = ((api.get("deploy") or {}).get("replicas"))
+print("yes" if isinstance(replicas, int) and replicas >= 2 else "no")
+PY
+)"
+check "the enterprise API is configured for more than one replica" "yes" "$ent_replicas"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
