@@ -649,11 +649,17 @@ export function fetchProjectAudit(
  * Hand the project to a new owner, with both confirmations.
  *
  * The two booleans are the REQ's two sentences, and the API refuses a request that carries only
- * one — so the dialog's checkboxes are a convenience and this is the rule.
+ * one. **The caller passes them; this function must not supply them.** Hardcoding `true` here --
+ * which is what the first version did -- makes `ownership_transfer_unconfirmed` unreachable from
+ * every client path: the dialog's two checkboxes gated its own button and then sent the same
+ * body as a caller who ticked nothing, so the acknowledgements were collected, discarded, and
+ * replaced by a constant. A server rule that only one client can violate, by construction, is a
+ * rule no gate can prove and a panel that cannot honour it.
  */
 export function transferProjectOwnership(
   projectId: string,
   toUserId: string,
+  confirmations: { owner: boolean; audit: boolean },
   organizationId?: string,
 ): Promise<{ previous_owner_user_id: string | null; owner_user_id: string | null; key: string }> {
   return request(`/api/v1/projects/${projectId}/transfer-ownership`, {
@@ -661,8 +667,8 @@ export function transferProjectOwnership(
     body: JSON.stringify({
       organization_id: organizationId,
       to_user_id: toUserId,
-      confirm_owner: true,
-      confirm_audit: true,
+      confirm_owner: confirmations.owner,
+      confirm_audit: confirmations.audit,
     }),
   });
 }

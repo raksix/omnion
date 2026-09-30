@@ -57,7 +57,10 @@ export function TransferOwnershipDialog({
     setBusy(true);
     setError(null);
     try {
-      const answer = await transferProjectOwnership(project.id, target);
+      const answer = await transferProjectOwnership(project.id, target, {
+        owner: confirmOwner,
+        audit: confirmAudit,
+      });
       onTransferred(answer.previous_owner_user_id);
     } catch (cause) {
       setError(
