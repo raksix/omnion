@@ -8796,3 +8796,57 @@ see it. The filter half of criterion 3 stays unticked: there is no `credentials`
 **Next.** The 390px criterion and the transfer-ownership confirmation dialog both wait on a pass
 that finishes. The move-dependency refusals and the usage-counter/CSV half have no substrate on this
 branch and are named rather than ticked.
+
+---
+
+## Tick 42 — REQ-133 slice 13: the counter nothing wrote (`bf4131fb`)
+
+**What.** `limits::record_usage` had **no caller outside its own tests**, so
+`automation_project_usage` was an empty table that the daily cap was decided against, the limits
+screen drew bars from, the notice sweep claimed on, and the usage CSV exported. Thirteenth instance
+of this branch's signature defect — and the first one that a *passing, proven-to-fail* gate had been
+actively hiding.
+
+**Proof.**
+
+- `scripts/qa/run-project-limits.sh` **14/14, PROVEN TO FAIL at 11/14** with the single
+  `record_usage_in` call deleted from `create_execution_in`. Three fail with the counter reading
+  `left: 0, right: 2`; the eleven survivors are exactly the tests that never start a run.
+- `scripts/qa/run-project-limit-notices.sh` **6/6** unchanged — its fixture writes the counter
+  directly on purpose (a sweep test that started runs would measure the start path again).
+- `cargo test -p omnion-workflows --lib` **56**; `cargo build -p omnion-api` green;
+  `apps/admin` `tsc --noEmit` clean.
+
+**The finding worth more than the fix.** The gate was 14/14 **and** proven to fail at 11/14, and
+both facts were true while the product counted nothing. The reason is that its fixtures called the
+dead function by hand after each run: the gate was measuring its own fixture. That is a different
+and worse state than "untested" — there was a test, it was green, and it tested the workaround. The
+new version starts runs and reads the counter back, and `failures = 2` is now *reached* (four real
+runs, a claimed step, `fail_step`, `settle_execution`) rather than typed in.
+
+**Placement was the whole of the fix.** `runs` is counted by `create_execution_in` — the one
+function all four run-start paths share, and the same transaction that *reads* the counter in
+`ensure_run_within_limits` — so a refused run leaves the day untouched and an allowed one spends
+exactly one. `failures` is counted by `settle_execution` at its `settled > 0` gate: the only place
+the outcome is known, and that row count is the once. Counting both at settlement was rejected by
+the cap itself — the guard would read *n* while the table held *n+1*, refusing the run *after* the
+cap, an off-by-one that reads as an intermittent refusal. That split is why `count_failed_run_in` is
+a separate function: a run starting does not yet know it will fail.
+
+**Also done this tick, and worth recording as a method.** Ran the branch's signature audit across
+the whole projects surface before picking a slice, and it came back **clean** — no dead function in
+four files, no struct field written and never read, no server-published field the panel ignores, no
+permission key outside the catalogue, no request field no call names. Twelve ticks of defect-shaped
+work would have found nothing. The defect was found by grepping for the *writers* of one specific
+table instead. A clean audit is a real result and also a dead end; the next writer should start from
+`grep -rn '<table name>'` and ask who writes it.
+
+**Not proved, and stated.** No browser pass ran: load was ~95 for the whole tick across ten writers
+and the QA slot is held by a live w3 pass (holder pid alive, cwd `/mnt/apopic/omnion-w3`). None was
+started rather than starting an unreliable one, and none is claimed. The CSV half of the criterion
+is typechecked and driven by the harness but un-observed by a completed pass.
+
+**Next.** Criterion 12's store half is now true and the criterion is ticked; the CSV half and the
+390px criterion still wait on a pass that finishes. The `credentials` / `workflow_folders` /
+`workflow_schedules` filter kinds and the move-dependency refusals have no table on this branch and
+stay named rather than ticked.
