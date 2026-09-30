@@ -169,6 +169,189 @@ mod tests {
         assert!(!is_open("nonsense"));
     }
 
+    /// The lists, the migrations' check constraints AND the admin panel are the same
+    /// closed lists, written three times.
+    ///
+    /// Each migration is read from the repository rather than pasted here, so the assertion
+    /// cannot itself drift out of date — and each is checked against the migration that
+    /// *owns* its constraint, because the assignment targets live in the slice-2 file and
+    /// asserting them against the slice-1 file would pass for a week after the constraint
+    /// was deleted from the database.
+    ///
+    /// The third source is `apps/admin/lib/crm-intake.ts`, and it is the one most likely to
+    /// drift: the panel holds its own `LEAD_STATUSES` because a language boundary cannot
+    /// import. Nothing in the TypeScript build can see a Rust constant, so a status added
+    /// here and not in the panel compiles cleanly on both sides and shows up in the product
+    /// as a lead whose status pill renders raw `snake_case`, or as a filter chip the server
+    /// quietly refuses. The panel is read as TEXT rather than executed — the check is
+    /// "does this file list exactly these values", which survives reformatting, whereas a
+    /// test that ran the module's own extractor would only prove the extractor agrees with
+    /// itself.
+    #[test]
+    fn the_panel_agrees_with_the_crate() {
+        let panel = read_panel("lib/crm-intake.ts");
+        for (constant, list) in [
+            ("LEAD_STATUSES", &STATUSES[..]),
+            ("SOURCE_KINDS", &SOURCE_KINDS[..]),
+            ("DEDUPE_POLICIES", &DEDUPE_POLICIES[..]),
+        ] {
+            // Set equality, not `panel.contains(needle)`. A `contains` check passes when the
+            // panel lists a strict PREFIX of the crate's list, which is the more likely
+            // half-drift: the ninth status someone adds in Rust is the one nobody copies,
+            // and "the first eight are there" is exactly what `contains` rewards.
+            let found = read_string_set(
+                &panel,
+                &format!("export const {constant}"),
+                "a vocabulary the panel no longer declares is a vocabulary it cannot render",
+            );
+            let expected: std::collections::BTreeSet<&str> = list.iter().copied().collect();
+            assert_eq!(
+                found,
+                expected.into_iter().map(str::to_string).collect::<std::collections::BTreeSet<_>>(),
+                "the panel's {constant} and the crate's list are different vocabularies — a \
+                 status the platform accepts and the panel does not know is a lead rendered as \
+                 raw snake_case, and a status the panel offers that the database refuses is a \
+                 filter that silently returns nothing"
+            );
+        }
+
+        // The label and tone maps are keyed by the same vocabulary, and a status missing from
+        // one of them is the *visible* half of the same drift: the pill falls back to
+        // `bg-quiet-soft text-muted` and the chip to the raw value, so the lead still lists and
+        // every row of it reads wrong. Both maps are checked for totality, not equality --
+        // their VALUES are panel design, and a test asserting them would freeze a colour.
+        for constant in ["LEAD_STATUS_LABEL", "LEAD_STATUS_TONE"] {
+            let keys = read_object_keys(
+                &panel,
+                constant,
+                "a status the panel has no wording for is a status an operator reads as a \
+                 snake_case token",
+            );
+            for status in STATUSES {
+                assert!(
+                    keys.contains(status),
+                    "{constant} has no entry for {status} — the lead still lists, and every \
+                     surface that shows it falls back to raw text"
+                );
+            }
+            assert_eq!(
+                keys.len(),
+                STATUSES.len(),
+                "{constant} carries a key the crate does not have, so the two will drift again"
+            );
+        }
+
+        // The panel's open/closed partition is the crate's `is_open`, so the two halves are
+        // read out of the panel's own source and compared value by value. Deriving the
+        // complement here instead would test `is_open` against itself.
+        let closed = read_string_set(
+            &panel,
+            "export const CLOSED_LEAD_STATUSES",
+            "the panel classifies a status nowhere; every chip it renders reads one of the two",
+        );
+        for status in STATUSES {
+            let expected = is_open(status);
+            assert_eq!(
+                closed.contains(status),
+                !expected,
+                "the panel and the crate disagree about whether {status} is open — one of them \
+                 is counting a filed verdict as work that still needs somebody"
+            );
+        }
+        assert_eq!(
+            closed.len(),
+            STATUSES.iter().filter(|s| !is_open(s)).count(),
+            "the panel's closed set names a status the crate does not have, or misses one it does"
+        );
+    }
+
+    /// The keys of an exported object literal, read out of the panel's source.
+    fn read_object_keys(
+        panel: &str,
+        constant: &str,
+        why: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let start = panel
+            .find(&format!("export const {constant}"))
+            .unwrap_or_else(|| panic!("{why} — the panel no longer exports {constant}"));
+        let rest = &panel[start..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("{why} — {constant} is not an object literal"));
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in rest[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("{why} — {constant} has an unterminated object"));
+        rest[open + 1..open + end]
+            .lines()
+            .filter_map(|line| object_key(line.trim()))
+            .collect()
+    }
+
+    /// `new: "New"` -> `new`. A comment line has no `:` and yields nothing, so a
+    /// documentation line above an entry is not read as a key of its own.
+    fn object_key(line: &str) -> Option<String> {
+        let (key, _value) = line.split_once(':')?;
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(key.to_string())
+    }
+
+    /// The string values of an exported array/set literal, read out of the panel's source.
+    ///
+    /// The bound is the first `[`…`]` after the declaration, so a constant written as
+    /// `= new Set<string>([ ... ])` reads the same way as `= [ ... ]`. `why` exists because a
+    /// panic that says "unwrap failed" cannot be told apart from the defect the check exists
+    /// to find, and a check that fails for a reason the defect does not cause trains its
+    /// reader to ignore it.
+    fn read_string_set(
+        panel: &str,
+        declaration: &str,
+        why: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let start = panel
+            .find(declaration)
+            .unwrap_or_else(|| panic!("{why} — the panel no longer declares {declaration}"));
+        let rest = &panel[start..];
+        let open = rest
+            .find('[')
+            .unwrap_or_else(|| panic!("{why} — {declaration} is not a list literal"));
+        let close = rest[open..]
+            .find(']')
+            .unwrap_or_else(|| panic!("{why} — {declaration} has an unterminated list"));
+        rest[open + 1..open + close]
+            .split(',')
+            .filter_map(|value| {
+                let value = value.trim();
+                value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn read_panel(relative: &str) -> String {
+        let path = format!("{}/../../apps/admin/{relative}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("cannot read {relative} ({error}); the closed lists are duplicated in it")
+        })
+    }
+
     /// The lists and the migrations' check constraints are the same lists, written twice.
     ///
     /// Each migration is read from the repository rather than pasted here, so the assertion

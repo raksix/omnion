@@ -29,7 +29,6 @@ import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
 import { ApiError } from "@/lib/api";
 import {
-  CLOSED_LEAD_STATUSES,
   DECISION_LABEL,
   LEAD_STATUS_LABEL,
   LEAD_STATUS_TONE,
@@ -38,6 +37,7 @@ import {
   SLA_STATE_TONE,
   contactLabel,
   countdown,
+  isOpenLeadStatus,
   ownerLabel,
   relativeInstant,
   slaState,
@@ -327,7 +327,11 @@ export function LeadInbox() {
           <legend className="sr-only">Filter by status</legend>
           {LEAD_STATUSES.map((status) => {
             const active = filters.status.includes(status);
-            const closed = CLOSED_LEAD_STATUSES.has(status);
+            // The chips read the OPEN half, because that is the question a
+            // reader is asking when they scan this row: which of these still
+            // need somebody. Inlining the inverse is what left
+            // `OPEN_LEAD_STATUSES` uncalled for the module's whole life.
+            const open = isOpenLeadStatus(status);
             return (
               <button
                 key={status}
@@ -338,9 +342,9 @@ export function LeadInbox() {
                 className={`rounded-full border px-2.5 py-1 text-[11.5px] transition ${
                   active
                     ? "border-accent bg-accent-soft text-accent-strong"
-                    : closed
-                      ? "border-line text-muted hover:text-ink"
-                      : "border-line text-ink hover:bg-quiet-soft"
+                    : open
+                      ? "border-line text-ink hover:bg-quiet-soft"
+                      : "border-line text-muted hover:text-ink"
                 }`}
               >
                 {LEAD_STATUS_LABEL[status] ?? status}

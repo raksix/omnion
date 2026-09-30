@@ -12,7 +12,22 @@
  * fall back to the raw value, so a server that grows a new status shows it instead of hiding it.
  */
 
-/** The status vocabulary the inbox renders; mirrors the module's `STATUSES`. */
+/**
+ * The status vocabulary the inbox renders; mirrors the module's `STATUSES`.
+ *
+ * This array and the Rust `STATUSES` are the same list written twice -- a
+ * language boundary cannot import, and "fetch the vocabulary from the server"
+ * would mean a screen that cannot render before its first response. The crate
+ * already reads its own list against the migration for exactly this reason
+ * (`the_migration_agrees_with_the_lists`); `the_panel_agrees_with_the_crate`
+ * extends that check to a THIRD copy, this one, because the two directions fail
+ * quietly and in opposite ways: a status the server allows and this list omits
+ * is a lead whose pill renders raw `snake_case` (a value the platform accepts,
+ * displayed as though the panel had never heard of it), and a status this panel
+ * offers as a filter that the database refuses is a chip that quietly returns
+ * nothing for ever. Neither raises anything, which is why the check has to read
+ * the file rather than trust the types.
+ */
 export const LEAD_STATUSES = [
   "new",
   "assigned",
@@ -24,22 +39,49 @@ export const LEAD_STATUSES = [
   "rejected",
 ] as const;
 
+/** A lead's status: the closed list, or a value a newer server added to it. */
+export type LeadStatus = (typeof LEAD_STATUSES)[number];
+
 /** The dedupe policies a source can carry. */
 export const DEDUPE_POLICIES = ["link", "create_anyway", "reject_duplicate"] as const;
 
 /** What a source can be: a form, a keyed endpoint, or a manual import. */
 export const SOURCE_KINDS = ["form", "endpoint", "import"] as const;
 
-/** The statuses an operator still works — a lead outside this set is a filed verdict. */
-export const OPEN_LEAD_STATUSES = new Set<string>([
-  "new",
-  "assigned",
-  "contacted",
-  "qualified",
-]);
+/**
+ * `true` when a lead in this status is still work -- the panel's half of the
+ * module's `is_open`, and the answer the SLA clock, the "Open" counter and the
+ * status filter chips all read.
+ *
+ * It was exported and never called for the whole life of the module while its
+ * complement, `CLOSED_LEAD_STATUSES`, was used in two places. That is the exact
+ * shape this branch has now paid for fourteen times -- a correct, documented,
+ * exported answer with no caller -- and the reason the filter chips read the
+ * complement twice (`closed ? muted : ink`) is that the code that needed the
+ * *open* half inlined the inverse rather than ask. Deriving both sets from the
+ * single `LEAD_STATUSES` array is what makes that impossible: a status added to
+ * the list lands in exactly one of them, and the panel cannot render a chip it
+ * has not classified.
+ */
+export function isOpenLeadStatus(status: string): boolean {
+  return !CLOSED_LEAD_STATUSES.has(status);
+}
 
-/** Statuses that are a file, not a task: the inbox hides them behind a filter. */
-export const CLOSED_LEAD_STATUSES = new Set<string>(["converted", "duplicate", "spam", "rejected"]);
+/**
+ * Statuses that are a file, not a task: the inbox hides them behind a filter.
+ *
+ * The panel's half of the module's partition -- `is_open` there, this set here.
+ * The two are checked against each other rather than derived from one another
+ * because they live in different languages, and a comment claiming they are
+ * derived is exactly the kind of claim that hides the next status added to one
+ * side only.
+ */
+export const CLOSED_LEAD_STATUSES: ReadonlySet<string> = new Set<string>([
+  "converted",
+  "duplicate",
+  "spam",
+  "rejected",
+]);
 
 /** The words a status is read as, rather than the stored snake_case value. */
 export const LEAD_STATUS_LABEL: Record<string, string> = {
@@ -133,7 +175,14 @@ export function slaState(lead: {
     }
     return "met";
   }
-  if (!lead.is_open || CLOSED_LEAD_STATUSES.has(lead.status)) {
+  // The clock only runs while somebody still has to answer it, so the OPEN half
+  // decides whether there is a state at all. `is_open` from the server is the
+  // module's own answer; the panel asks its own question the same way rather
+  // than trusting one of the two to carry the other.
+  if (!isOpenLeadStatus(lead.status)) {
+    return "none";
+  }
+  if (!lead.is_open) {
     return "none";
   }
   if (!lead.first_response_due_at) {
