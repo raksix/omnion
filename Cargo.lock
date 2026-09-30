@@ -1546,6 +1546,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnion-module-ai"
+version = "0.1.0"
+dependencies = [
+ "omnion-ai-hub",
+ "omnion-audit",
+ "omnion-workflows",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "omnion-module-analytics"
 version = "0.1.0"
 dependencies = [

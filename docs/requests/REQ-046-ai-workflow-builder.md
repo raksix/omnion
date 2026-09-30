@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
+> **Status:** in-progress (slice 1 · `9a4b1c72` — the draft store: migration `0174_ai_workflow_builder.sql`, the `modules/ai` crate (model/store/definition/generate) with the closed action registry driving the generation prompt, one repair round-trip that is never spent on a provider failure, and credential-shaped parameters refused in the answer) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -136,7 +136,7 @@ only: never the prompt body, never the definition, never a provider key.
 
 - [ ] The request's own example prompt produces a validated draft whose definition the workflow API
       accepts unchanged (`PUT /workflows/{id}` round-trip test in `cargo test`).
-- [ ] An unvalidatable answer triggers exactly one repair round-trip; a second failure lands the
+- [x] An unvalidatable answer triggers exactly one repair round-trip; a second failure lands the
       draft in `failed` with a readable `error`.
 - [ ] Approval materialises a **disabled** workflow with the draft's steps (enabling it is a
       separate action); a second approve answers `409` naming the workflow id.
@@ -152,7 +152,7 @@ only: never the prompt body, never the definition, never a provider key.
 - [ ] Empty, loading, error and no-provider states all exist; a failed generation never leaves the
       UI stuck in `generating`.
 - [ ] Every list filter is URL-persisted and survives a reload.
-- [ ] A generated definition never carries a secret: params are limited to the closed vocabulary,
+- [x] A generated definition never carries a secret: params are limited to the closed vocabulary,
       asserted by a validation test, and a deleted draft never disables its workflow.
 - [ ] Both screens use Lucide icons only, render in light and dark mode with visible focus rings,
       and show no clipped text at 1280 px or 390 px.
