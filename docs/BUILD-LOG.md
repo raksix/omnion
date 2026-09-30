@@ -10462,3 +10462,68 @@ free.
 a sentence in a document. That is a catalogue addition plus five emitters. The browser pass is still
 outstanding: the QA slot was **legitimately held** by a live w3 pass when this tick checked (holder
 pid alive, log one minute old), so it was left alone rather than reclaimed.
+
+
+## Tick 49 — the read with no reader, and the comment that described its opposite
+
+**`fetchIntakeSource` was exported, correct, documented — and never called in the module's whole
+life.** It sits in `apps/admin/lib/crm-intake-api.ts` between `fetchAutoresponderTemplates` and
+`createIntakeSource`, four of whose siblings *are* called. The dead-export sweep named it; this
+tick is what it was for. Sixteenth instance of this branch's signature defect, and the first
+whose dead thing was not a value but a **lost update**.
+
+**The editor opened from the list row.** `EditorState` carries nine fields and `save` puts all
+nine on the wire, so opening from a `rows` array captured at load time means: an operator opens a
+source thirty seconds after a colleague renamed it, types one character, saves — and the old name
+is written back. The API accepts it. The payload is valid; nothing anywhere can tell it apart from
+an intentional rename. `list_sources` and `find_source` select the same `SOURCE_COLUMNS`, so the
+two bodies are byte-identical **today**, and the defect is invisible until two people are in the
+screen at once. That is the whole reason it survived: not a subtle drift, but one with no
+reproducer a single-user test can produce.
+
+**The refresh handler was the mirror of its own comment.** It read *"the editor only follows the
+server when it is closed, and when the source it is editing is gone it closes too"* — and replaced
+an **open** editor's state with the freshly fetched row while returning `null` for a **closed**
+one. `Refresh` is a read. It is the one gesture that feels harmless, and it discarded a half-typed
+mapping, a rename in progress and a consent wording mid-sentence. The stated intent was right and
+the code was its inverse, which is the worst combination available: a comment that documents the
+correct behaviour trains the next reader to trust code that does the opposite.
+
+**Fixed by making the rule a pure function with a test.** `editorAfterRefresh(editing, sources)` in
+the panel's pure module: an open editor keeps its state **by identity** and closes only when its
+source is gone from the list. The identity half matters — returning `{...editing}` produces the
+same values in a new object, and a re-render that reconciles by reference can still drop the draft.
+
+**Proof: seven failures, each in the direction it catches.** The row-to-editor path (2), a refresh
+that rehydrates from the fetched row (8), a rule that never closes (7), a rule returning a shallow
+copy (3), a phantom selector (1), a null-tolerant assertion (1), a fixed timeout after the async
+click (1). 32 assertions green. `scripts/qa/crm-source-editor.ts` drives the **real** module under
+`node --experimental-strip-types` — `apps/admin` has no test runner and adding one is a bigger
+change than the fix — and the Python gate wraps it.
+
+**The gate was wrong three times before it was right, and all three were one mistake: a search not
+anchored to what it is checking reads the first match in a 9,000-line file and calls it evidence.**
+Scanning forward from the assertion reported `[data-required-target=job_title]` — three lines
+further down, never read by that assertion — and **passed on the wrong selector**. Dropping the
+anchor entirely reported the storefront pass's `siteId`, a different feature, and failed a correct
+step. And `.{0,400}` without `re.S` stops at the first newline, so the assertion body it compared
+against was the empty string, failing two assertions for a reason that had nothing to do with the
+defect. All three were caught only because the baseline was re-run after each edit and the pass
+count was **required to be exactly zero**, not "improved".
+
+**And the walkthrough's own new step had the defect it was written to catch.** It asserted
+`[data-source-name]`; the screen renders `id="source-name"`. `inputValue()` returns `null`, the
+comparison was guarded by `!== null`, and it would have gone **green on a control that is not
+there**. I found it by grepping the screen for the selector I had just written — which is the
+routine that has to run every time, because writing a gate is when the belief in the contract is
+weakest. The gate now reads the selector out of the assertion and looks it up in the screen's own
+markup, and refuses a comparison that tolerates `null`.
+
+**Not claimed: no browser pass.** QA slot held by a live w3 pass (cwd `/mnt/apopic/omnion-w3`),
+load 47–48 across ten writers, ~13 GB of 32 GB free. The Edit path became asynchronous, which is
+exactly the change a walkthrough exists to observe, so the screens are *less* verified than they
+were before this tick, and the new `waitForSelector` is the honest way to see it next time.
+
+**Next.** The CRM gates green, the module is at 169 tests, and the dead-export sweep is down to
+five, all in other waves. REQ-117's remaining blocker is unchanged and is not mine to resolve: the
+REQ-064 form-editor card needs a forms module that exists on no branch.
