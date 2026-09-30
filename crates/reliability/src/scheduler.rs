@@ -88,14 +88,26 @@ pub async fn due_sequences(
     limit: usize,
 ) -> Result<Vec<DueSequence>> {
     let limit = limit.clamp(1, crate::vocabulary::MAX_PAGE) as i64;
+    // The subquery picks the NEWEST row per subject and the outer WHERE filters it. The order
+    // matters and getting it backwards is a duplicate send, which is the one thing this whole
+    // subsystem exists to prevent:
+    //
+    // filtering `next_attempt_at is not null` INSIDE the `distinct on` removes a finished
+    // sequence's terminal row first, so "newest per subject" then resolves to the last row that
+    // still owes an attempt — and a delivery that SUCCEEDED on attempt four is offered a fifth.
+    // The walk `a_sequence_is_due_once_and_then_stops_being_due` caught exactly that.
     let rows = sqlx::query_as::<_, DueRow>(
-        "select distinct on (subject_kind, subject_id) \
-                id, subsystem, subject_kind, subject_id, attempt, next_attempt_at \
-           from retry_outcomes \
+        "select id, subsystem, subject_kind, subject_id, attempt, next_attempt_at \
+           from (select distinct on (subject_kind, subject_id) \
+                        id, subsystem, subject_kind, subject_id, attempt, next_attempt_at, \
+                        claimed_at \
+                   from retry_outcomes \
+                  where subject_id is not null \
+                  order by subject_kind, subject_id, attempt desc, id desc) newest \
           where next_attempt_at is not null \
             and next_attempt_at <= $1 \
             and (claimed_at is null or claimed_at < $2) \
-          order by subject_kind, subject_id, attempt desc, id desc \
+          order by next_attempt_at \
           limit $3",
     )
     .bind(now)
@@ -297,8 +309,15 @@ pub async fn advance(
 /// screen and the rows the scheduler will pick up are one question, and two queries that mean
 /// "due" differently is a screen that reports a backlog of zero while work is owed.
 pub async fn due_count(pool: &PgPool, now: OffsetDateTime) -> Result<i64> {
+    // The same "newest row per subject, then filter" shape as `due_sequences`, and for the same
+    // reason: counting every due row would report a sequence whose terminal attempt cleared the
+    // next time as two things owed, while the scan that spends it offers none.
     let row: (Option<i64>,) = sqlx::query_as(
-        "select count(distinct (subject_kind, subject_id)) from retry_outcomes \
+        "select count(*) from (select distinct on (subject_kind, subject_id) \
+                    subject_kind, subject_id, next_attempt_at \
+               from retry_outcomes \
+              where subject_id is not null \
+              order by subject_kind, subject_id, attempt desc, id desc) newest \
           where next_attempt_at is not null and next_attempt_at <= $1",
     )
     .bind(now)
