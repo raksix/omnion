@@ -32,6 +32,7 @@ import {
   Video,
   X,
 } from "lucide-react";
+import { useRouter } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
 import { ErrorState, ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
@@ -47,7 +48,7 @@ import {
   type CrmTimelineEntry,
   type CrmTimelineSource,
 } from "@/lib/crm";
-import { CRM_NAV } from "./crm-parts";
+import { CRM_NAV, CrmShortcutSheet, crmListItemCursor, useCrmKeyboard } from "./crm-parts";
 import { useCrmTenant } from "./crm-tenant";
 
 /** The icon and the word each kind is shown with, so a kind is never a bare string in a list. */
@@ -118,11 +119,58 @@ export function ActivitiesView() {
   const [formError, setFormError] = useState<{ field: string; message: string } | null>(null);
   const [saving, setSaving] = useState(false);
   const subjectRef = useRef<HTMLInputElement | null>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
 
   const filtered = search !== "" || kind !== "" || done !== "";
 
+  // This screen is a form with a feed under it rather than a `CrmShell` list, so it used to have
+  // **none** of the keyboard contract while the module's shortcut sheet still promised it `/`, `j`,
+  // `k`, `Enter`, `e` and `?`. A sheet is a claim about the whole section, so a screen that draws
+  // its own rows calls the same hook the shell does (`useCrmKeyboard`).
+  //
+  // `Enter` and `e` both go to the activity's **record** — the contact, company or deal the activity
+  // is about — because an activity has no view of its own; it is the note on somebody else's
+  // record. An activity with no subject record (a free-standing note) therefore has nowhere to open,
+  // and the cursor does not pretend otherwise: those rows still take the cursor, and pressing a key
+  // on one does nothing rather than navigating somewhere unrelated.
+  const rowIds = useMemo(() => (rows ?? []).map((row) => row.id), [rows]);
+  const recordHref = useCallback((id: string) => {
+    const row = (rows ?? []).find((entry) => entry.id === id);
+    if (!row) return null;
+    if (row.contact_id) return `/crm/contacts?focus=${row.contact_id}`;
+    if (row.company_id) return `/crm/companies?focus=${row.company_id}`;
+    if (row.deal_id) return `/crm/deals?focus=${row.deal_id}`;
+    return null;
+  }, [rows]);
+  const openRecord = useCallback(
+    (id: string) => {
+      const href = recordHref(id);
+      if (href) {
+        router.push(href);
+        return;
+      }
+      // No subject record: say so rather than opening the wrong thing. This is the honest answer
+      // for a free-standing note, and it is a sentence instead of silence.
+      const row = (rows ?? []).find((entry) => entry.id === id);
+      setNotice(
+        row
+          ? `“${row.subject}” is a note with no contact, company or deal attached, so there is no record to open.`
+          : "That activity is no longer in the list.",
+      );
+    },
+    [recordHref, rows],
+  );
+  const { selectedIndex, setSelectedIndex, showShortcuts } = useCrmKeyboard({
+    rowIds,
+    searchRef,
+    onOpen: openRecord,
+    onEdit: openRecord,
+    onCreate: () => subjectRef.current?.focus(),
+  });
+
   // The organization the panel is reading (REQ-051): a platform account has no primary one.
   const { organizationId } = useCrmTenant();
+  const router = useRouter();
 
   const load = useCallback(async () => {
     setError(null);
@@ -254,6 +302,7 @@ export function ActivitiesView() {
             <label className="flex items-center gap-1.5 text-[12px] text-muted">
               <span className="sr-only">Search activities</span>
               <input
+                ref={searchRef}
                 data-qa="activity-search"
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
@@ -352,15 +401,20 @@ export function ActivitiesView() {
             />
           ) : (
             <ul className="divide-y divide-line border-y border-line">
-              {rows.map((activity) => {
+              {rows.map((activity, index) => {
                 const Icon = KIND_ICON[activity.kind] ?? CircleDot;
+                // The cursor is drawn by the row, exactly as `CrmRow` does for a table: a shortcut
+                // nobody can see is indistinguishable from a broken one.
+                const cursor = crmListItemCursor(index === selectedIndex);
                 return (
                   <li
                     key={activity.id}
+                    {...cursor}
                     data-qa="activity-row"
                     data-kind={activity.kind}
                     data-done={activity.done_at ? "true" : "false"}
-                    className="flex flex-wrap items-start gap-3 py-2.5"
+                    onClick={() => setSelectedIndex(index)}
+                    className={`flex flex-wrap items-start gap-3 py-2.5 transition ${cursor.className}`}
                   >
                     <span className="mt-0.5 inline-flex h-6 w-6 items-center justify-center rounded-md border border-line text-muted">
                       <Icon aria-hidden className="h-3.5 w-3.5" />

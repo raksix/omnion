@@ -43,6 +43,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ErrorState, ErrorStrip, toScreenError, type ScreenErrorValue } from "@/components/error-state";
 
 import { useCrmTenant } from "./crm-tenant";
+import { CrmShortcutSheet, crmListItemCursor, useCrmKeyboard } from "./crm-parts";
 import { ApiError } from "@/lib/api";
 import {
   CRM_LEAD_OUTCOME_HINT,
@@ -129,20 +130,12 @@ export function LeadsView() {
       );
   }, [outcome, params.get("search"), reloadToken, organizationId]);
 
-  // `/` focuses the search, and the typing is debounced into the URL so a person does not
-  // produce a history entry per keystroke.
+  // Escape leaves the search. This one stays screen-local: the shared hook does not bind Escape
+  // (it is the copilot panel's and a dialog's key to own, and two owners of one key is how a
+  // person ends up with a shortcut that sometimes works). The `/` binding that used to live here is
+  // now the module's, so it cannot drift away from the sheet's claim about it.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const typing =
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target instanceof HTMLSelectElement;
-      if (event.key === "/" && !typing) {
-        event.preventDefault();
-        searchRef.current?.focus();
-        return;
-      }
       if (event.key === "Escape" && document.activeElement === searchRef.current) {
         searchRef.current?.blur();
       }
@@ -199,6 +192,50 @@ export function LeadsView() {
   }, [inbox]);
 
   const rows = inbox?.items ?? [];
+
+  // The keyboard contract, on this screen's own terms. A submission's id is its **event id**, not a
+  // uuid — the inbox is the bus's log, and a uuid here would not resolve to anything.
+  //
+  // `Enter` and `e` both open the record the submission became, in the order the module files them:
+  // a contact, then a deal, then a company. A submission that became **nothing** has no record to
+  // open, and that is the honest answer this inbox exists to give — the row says so and the key
+  // says the same thing out loud instead of navigating somewhere unrelated.
+  const rowIds = useMemo(() => rows.map((lead) => String(lead.event_id)), [rows]);
+  const openRecord = useCallback(
+    (id: string) => {
+      const lead = rows.find((entry) => String(entry.event_id) === id);
+      if (!lead) {
+        setNotice("That submission is no longer in the inbox.");
+        return;
+      }
+      if (lead.contact_id) {
+        router.push(`/crm/contacts?focus=${lead.contact_id}`);
+        return;
+      }
+      if (lead.deal_id) {
+        router.push(`/crm/deals?focus=${lead.deal_id}`);
+        return;
+      }
+      if (lead.company_id) {
+        router.push(`/crm/companies?focus=${lead.company_id}`);
+        return;
+      }
+      setNotice(
+        `“${lead.name || "That submission"}” became nothing: ${lead.detail ?? "the extractor found nothing usable, and the inbox keeps the reason."}`,
+      );
+    },
+    [rows, router],
+  );
+  const { selectedIndex, setSelectedIndex, showShortcuts } = useCrmKeyboard({
+    rowIds,
+    searchRef,
+    onOpen: openRecord,
+    onEdit: openRecord,
+    // There is no "new lead" on this screen: a lead arrives from a published form, and a button
+    // that fabricated one would be a dead control. `n` therefore runs the drain, which is the one
+    // thing a person on this screen can legitimately ask for.
+    onCreate: () => void runDrain(),
+  });
 
   return (
     <div className="flex h-full flex-col">
@@ -298,6 +335,8 @@ export function LeadsView() {
         ) : null}
       </nav>
 
+      {showShortcuts ? <CrmShortcutSheet /> : null}
+
       {error ? (
         <ErrorState
           error={error}
@@ -323,8 +362,14 @@ export function LeadsView() {
         />
       ) : (
         <ul className="divide-y divide-line">
-          {rows.map((lead) => (
-            <LeadRow key={lead.event_id} lead={lead} />
+          {rows.map((lead, index) => (
+            <LeadRow
+              key={lead.event_id}
+              lead={lead}
+              index={index}
+              selected={index === selectedIndex}
+              onSelect={() => setSelectedIndex(index)}
+            />
           ))}
         </ul>
       )}
@@ -370,12 +415,34 @@ function Chip({
 }
 
 /** One submission: who, what, what became of it, and where the records went. */
-function LeadRow({ lead }: { lead: CrmLead }) {
+/**
+ * One submission. It draws the keyboard cursor exactly as a `CrmRow` does for a table, and a click
+ * moves that cursor to the same place `j` would: clicking and pressing `j` are the same act, and a
+ * click that leaves the cursor somewhere else makes the two disagree about which row `Enter` opens.
+ */
+function LeadRow({
+  lead,
+  index,
+  selected,
+  onSelect,
+}: {
+  lead: CrmLead;
+  /** The row's position in the list, which is what `j`/`k` count in. */
+  index: number;
+  /** Whether the keyboard cursor is on this row — the same test `CrmRow` makes. */
+  selected: boolean;
+  /** Move the cursor here on click. */
+  onSelect: () => void;
+}) {
   const Icon = OUTCOME_ICON[lead.outcome];
+  const cursor = crmListItemCursor(selected);
   return (
     <li
+      {...cursor}
       data-qa-lead-row={lead.event_id}
-      className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-start sm:justify-between"
+      data-index={index}
+      onClick={onSelect}
+      className={`flex flex-col gap-2 px-4 py-3 transition sm:flex-row sm:items-start sm:justify-between ${cursor.className}`}
     >
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
