@@ -82,6 +82,7 @@
 
 pub mod accounting;
 pub mod accounting_expenses;
+pub mod accounting_reports;
 pub mod accounting_invoices;
 pub mod accounting_payments;
 pub mod ai;
@@ -1683,6 +1684,22 @@ pub fn router(state: AppState) -> Router {
     // layer at all**, for the reason slice 3 removed one from the payment reversal: the path holds
     // an id, and a layer answers 403 before the handler can ask whose expense that is, which
     // confirms it exists somewhere. The handler reads (404) and then asks for the key.
+    // The four reports and their export. `reports/{report}` names a REPORT, not a row, so a
+    // permission layer's 403 says nothing about a document the caller cannot see -- the reason
+    // the expense transitions omit a layer does not apply here. `/export` is registered after
+    // the read because it is a different path, not a parameter: axum matches in registration
+    // order and both are distinct segments.
+    let accounting_reports = Router::new()
+        .route(
+            "/accounting/reports/{report}",
+            get(accounting_reports::get_report),
+        )
+        .route(
+            "/accounting/reports/{report}/export",
+            get(accounting_reports::export_report),
+        )
+        .route_layer(guards::require(&state, "accounting.reports.read"));
+
     let accounting_expenses_read = Router::new()
         // `categories` is registered **before** `{id}`: axum matches in registration order, so a
         // literal declared after a path parameter is read as a uuid and the route answers 400 for

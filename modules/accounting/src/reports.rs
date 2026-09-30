@@ -77,6 +77,20 @@ impl ReportKind {
         }
     }
 
+    /// The permission key this report is read with.
+    ///
+    /// **The tax summary is not `accounting.reports.read`.** A tax summary is the input to a
+    /// filing; the other three are internal reading. Gating it under the same key would hand
+    /// every bookkeeper the tax position, which is a different decision from the one the
+    /// catalogue makes — so the route asks here rather than assuming one key for the section.
+    #[must_use]
+    pub const fn permission_key(self) -> &'static str {
+        match self {
+            Self::TaxSummary => "accounting.reports.tax",
+            _ => "accounting.reports.read",
+        }
+    }
+
     /// The label the screen titles itself with.
     #[must_use]
     pub const fn title(self) -> &'static str {
@@ -1135,6 +1149,22 @@ mod tests {
     fn the_four_names_round_trip() {
         for kind in ReportKind::ALL {
             assert_eq!(ReportKind::parse(kind.as_str()).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn the_tax_summary_is_not_gated_by_the_section_key() {
+        // The one permission decision in this module, and the easiest to get wrong by accident:
+        // a route layer is written once for the section, so the tax report would inherit
+        // `accounting.reports.read` and nobody would notice until a tax position leaked.
+        assert_eq!(ReportKind::TaxSummary.permission_key(), "accounting.reports.tax");
+        for kind in [ReportKind::IncomeExpense, ReportKind::Aging, ReportKind::Cashflow] {
+            assert_eq!(
+                kind.permission_key(),
+                "accounting.reports.read",
+                "{:?} reads under the section key",
+                kind.as_str()
+            );
         }
     }
 

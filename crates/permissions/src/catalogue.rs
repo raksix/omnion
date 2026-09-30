@@ -960,6 +960,14 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "accounting",
         description: "Read and export the income/expense, ageing and cashflow reports",
     },
+    // The tax summary is a **separate key**, and the separation is the point: a tax summary is
+    // the input to a filing, while the other three reports are internal reading. Handing every
+    // bookkeeper the tax position is a different decision from handing them the ageing.
+    PermissionDef {
+        key: "accounting.reports.tax",
+        category: "accounting",
+        description: "Read and export the tax summary (what has been collected, per rate)",
+    },
 ];
 
 /// Look a permission up by key.
@@ -1275,14 +1283,16 @@ mod tests {
                 "{key} belongs to the accounting category"
             );
         }
-        // The keys the REQ's API table names for later slices must STILL not be here. **This
-        // guard moved forward in slice 3 and again in slice 4**, for the same reason slice 2
-        // moved it: a key with no route is a promise the permission screen makes that the
-        // product does not keep. Slice 3 turned `accounting.payments.*` from "later" into "real"
-        // and slice 4 turned `accounting.expenses.*` and `accounting.reports.read` into real, so
-        // those left this list and entered the assertions above. **What is left is the tax
-        // summary**, which is the one report slice 4 still owes.
-        for later in ["accounting.reports.tax"] {
+        // **This list is now EMPTY, and that is the assertion.** It existed to hold back the
+        // keys the REQ's API table names before their routes did -- a key with no route is a
+        // promise the permission screen makes that the product does not keep. It emptied in
+        // slice 4b: `accounting.reports.tax` was the last one, and slice 4b's tax-summary route
+        // is what discharged it.
+        //
+        // It is kept as an empty loop with a comment rather than deleted, because the NEXT
+        // request that adds a key before its route will look here first, and "there is nothing
+        // left to hold back" is the fact that stops them.
+        for later in [] as [&str; 0] {
             assert!(
                 get(later).is_none(),
                 "{later} is still owed and must not appear before its route does"
@@ -1295,6 +1305,7 @@ mod tests {
             "accounting.expenses.update",
             "accounting.expenses.approve",
             "accounting.reports.read",
+            "accounting.reports.tax",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
