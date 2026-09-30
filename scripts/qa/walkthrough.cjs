@@ -6335,7 +6335,22 @@ async function runCdnRulesDepth(page, report) {
     site,
   );
   steps.orderBefore = before.length;
-  await page.locator(`[data-cdn-rule-up="${created?.id ?? ""}"]`).click({ timeout: 5000 }).catch(() => {});
+  // The rule this pass created is at rank 1 on an empty table, and the panel disables "move
+  // up" there — correctly, since there is nothing above it. The pass used to click that
+  // disabled button, swallow the timeout in a `.catch`, and then assert on an order that
+  // had not changed, so `reorderSwapped: false` said "the panel does not reorder" about a
+  // panel that was never asked to do anything.
+  //
+  // The move target is therefore chosen by position rather than by identity: the LAST rule
+  // in the API's own order, which is the one row where "up" is always available. Asserting
+  // on a control the pass has not first proved is moveable is how a green step measures
+  // nothing.
+  const mover = before[before.length - 1] ?? "";
+  const moverRow = page.locator(`[data-cdn-rule-row="${mover}"]`);
+  const moverUp = page.locator(`[data-cdn-rule-up="${mover}"]`);
+  steps.moverExists = (await moverRow.count()) > 0;
+  steps.moverUpEnabled = await moverUp.isEnabled().catch(() => false);
+  await moverUp.click({ timeout: 5000 });
   await page.waitForTimeout(1800);
   // Read the order back from the API, not from the table: the table is the thing under test.
   const after = await page.evaluate(
@@ -6351,7 +6366,14 @@ async function runCdnRulesDepth(page, report) {
     },
     site,
   );
-  steps.reorderSwapped = before[0] !== after.ids[0] && after.ids.includes(created?.id ?? "");
+  // The moved rule must be exactly one position higher, and everything else must be
+  // undisturbed. "The first id changed" is a weaker claim that a table which reversed the
+  // whole list would also satisfy.
+  const movedFrom = before.indexOf(mover);
+  steps.reorderSwapped =
+    movedFrom > 0 &&
+    after.ids[movedFrom - 1] === mover &&
+    after.ids.length === before.length;
   // Priorities must be a dense ascending run, which is the property a per-row renumber breaks.
   steps.prioritiesDense = after.priorities.every(
     (value, index) => value === after.priorities[0] + index,
@@ -6413,11 +6435,22 @@ async function runCdnRulesDepth(page, report) {
   steps.mobileNoTableScroll = await page.evaluate(
     () => document.documentElement.scrollWidth <= window.innerWidth + 1,
   );
-  // A card is a control a thumb can hit: the action row is measured against the 44px floor.
-  steps.mobileTouchTargets = await page.evaluate(() => {
+  // A card is a control a thumb can hit. The floor is the 32px the rest of the panel's mobile
+  // affordances are held to, and the assertion says 32 — the comment in the first version of
+  // this block said 44 while the code checked 32, which is a comment nobody reads against a
+  // number nobody re-checks.
+  //
+  // Disabled buttons count. A rank-1 row's "Up" is correctly disabled, and excluding disabled
+  // controls would measure a screen that is easier to use than it is.
+  const touch = await page.evaluate(() => {
     const buttons = Array.from(document.querySelectorAll("[data-cdn-rule-row] button"));
-    return buttons.length > 0 && buttons.every((button) => button.getBoundingClientRect().height >= 32);
+    const short = buttons
+      .map((button) => button.getBoundingClientRect().height)
+      .filter((height) => height > 0 && height < 32);
+    return { total: buttons.length, short: short.length, smallest: Math.min(...buttons.map((b) => b.getBoundingClientRect().height)) };
   });
+  steps.mobileTouchTargets = touch.total > 0 && touch.short === 0;
+  steps.mobileTouchTargetDetail = touch;
   await shot(page, "page-cdn-rules-mobile");
   await page.setViewportSize({ width: 1280, height: 900 });
 
