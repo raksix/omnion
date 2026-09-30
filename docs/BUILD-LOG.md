@@ -8300,3 +8300,55 @@ gave them one value. The address threshold is now `lockout_attempts * 3`.
 
 **Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
 naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+## Tick 42 — 2026-09-30 — REQ-054 slice 4b (the four reports + the CSV export), 15/15 GREEN
+
+**What.** `income-expense`, `aging`, `cashflow` and `tax-summary`, read-only, plus
+`GET /accounting/reports/{report}/export`. The module, two routes, the `accounting.reports.tax`
+key, and fifteen walks.
+
+**Proof.**
+* `cargo test -p omnion-module-accounting -p omnion-permissions --lib` — **67 + 68 = 135 passed, 0 failed**
+* `apps/api/tests/accounting_reports.rs` — **15/15 GREEN**, one walk per process, live PostgreSQL,
+  `passed=15 failed=0 zero-second=0` (`scripts/qa/run-report-walks.sh`)
+* `bash scripts/qa/walk-result-classifier-probe.sh` — **ALL 6 PASS**
+* `turbo run typecheck` — **2/2 successful**
+
+**FIVE REAL DEFECTS, and four of them are the same species this module has now paid for twice:
+a claim about the database written down instead of checked.**
+
+1. **The router was built and never merged.** `.merge(accounting_reports)` was missing, so both
+   routes answered 404 to everything while `cargo build` was green, 135 unit tests passed, and
+   both handlers were correct. Four walks failed on it. Nothing but a request tells a handler
+   from a route.
+2. **The tax summary joined `tax_rates`, a table that does not exist** — every request was a 500.
+   The table is `accounting_tax_rates`, and the second attempt joined on `l.tax_rate_id`, which is
+   a **sales** column; `accounting_invoice_lines` has no rate reference at all. The join is now
+   gone: the line's own `tax_percent` IS the rate for reporting, and joining a rate table would be
+   a second source for a number the row already owns — which would restate a filed period the
+   moment somebody corrected a rate, the exact property the REQ's acceptance box forbids.
+3. **`payment_number` is a `bigint`, and `number` and `customer_name` are also NOT NULL.** The
+   fixture went through four wrong guesses (23502, 42804, 23502, customer_name) reading a
+   migration excerpt each time. The fifth attempt asked `information_schema`, which is the
+   contract rather than the history.
+4. **The walk runner miscounted its own passes twice** — `grep -E 'test result: FAILED'` matches
+   the substring inside the success line (`0 passed; 0 failed` contains "failed"), and the fix
+   asked for the literal phrase `1 passed or more`, which only a full-suite summary prints. Fourteen
+   green walks read as `passed=0 failed=15`. It has its own probe now.
+5. **A window ending "today" cannot contain a not-yet-due invoice** (`due_date <= $3`), so an
+   aging report asked about today alone is structurally blind to its own `current` bucket. Caught
+   only because the walk asserts its fixture COUNT before summing.
+
+**Three of the fifteen walks were the TEST being wrong, not the module** — the aging walk read the
+default 30-day window over fixtures up to 200 days late, the export walk compared two *different*
+windows (which passes even if the export drops every old row), and my own arithmetic said 80.00
+where the report's 140.00 was right. All three are the same lesson: a walk that does not name the
+window it wants is asserting whatever the default happens to be.
+
+**Next.** Slice 4b's remaining halves: the `/accounting/reports` **screen** (the REQ's Screens
+table asks for a type selector, period filters, table + chart and the export button — the routes
+exist and no screen has been rendered by anything), the **PDF** export half of the export box
+(deliberately not built and the box says so), the `⌘K` and global-search box, and the audit-row
+assertion. The empty/loading/error and mobile boxes stay unticked until a browser pass runs —
+load 78–88 across ten writers this tick, which is the same condition under which earlier passes
+reported UI defects that did not exist.
