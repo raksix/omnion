@@ -6625,13 +6625,49 @@ async function runEnvironmentsDepth(page, report) {
       });
     }
     await shot(page, "environments-wizard-confirm");
-    await page.click("[data-env-wizard-submit]").catch(() => {});
+    // The submit is clicked through a locator rather than `page.click`, and the response is
+    // awaited, because "the button was enabled" and "the request left the browser" are two
+    // different claims and only one of them was being measured. A `.catch(() => {})` on a click
+    // that lands on nothing — a stale node, an overlay, a guard that made the button a no-op —
+    // is indistinguishable from a submit the API refused, and the pass reported the second while
+    // the first was what happened.
+    const submit = page.locator("[data-env-wizard-submit]");
+    const submitPresent = (await submit.count().catch(() => 0)) > 0;
+    const submitEnabled = submitPresent
+      ? await submit.isEnabled().catch(() => false)
+      : false;
+    steps.submitPresent = submitPresent;
+    steps.submitEnabled = submitEnabled;
+    const [response] = await Promise.all([
+      page
+        .waitForResponse(
+          (r) => r.url().includes("/api/v1/environments") && r.request().method() === "POST",
+          { timeout: 15000 },
+        )
+        .catch(() => null),
+      submit.click({ timeout: 8000 }).catch(() => {}),
+    ]);
+    steps.submitResponse = response
+      ? { status: response.status(), body: (await response.text().catch(() => "")).slice(0, 200) }
+      : null;
     await page.waitForTimeout(2500);
 
     environmentId = qaSql(`select id from environments where key = '${key}' limit 1`);
     steps.created = Boolean(environmentId);
     if (!environmentId) {
-      return { ok: false, reason: `the wizard submitted but no environment with key ${key} exists` };
+      // The reason names the response rather than restating the symptom, because "no environment
+      // with this key" is what every distinct failure looks like from here: a refused host, a 403,
+      // a 500, a click that never fired. The step that failed is carried with it.
+      return {
+        ok: false,
+        reason: `the wizard submitted but no environment with key ${key} exists`,
+        steps: {
+          ...steps,
+          submitPresent,
+          submitEnabled,
+          submitResponse: steps.submitResponse,
+        },
+      };
     }
 
     // ---- The clone really copies ------------------------------------------------------------
