@@ -184,9 +184,9 @@ pub async fn request(pool: &PgPool, new: &NewApproval) -> Result<Requested> {
          confirmation_phrase, preview, preview_hash, base_revision, status, requested_by, \
          model_id, expires_at, created_at) \
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, \
-         'pending',$22,$23,$24,$24) \
-         returning {APPROVAL_COLUMNS} \
-         on conflict do nothing"
+         'pending',$22,$23,$24, now()) \
+         on conflict do nothing \
+         returning {APPROVAL_COLUMNS}"
     );
     let inserted: Option<Approval> = sqlx::query_as(&sql)
         .bind(new.organization_id)
@@ -439,9 +439,24 @@ async fn decide(
         return Err(AiHubError::ApprovalNotFound(id));
     };
 
-    // The expiry check runs **before** the typed-confirmation check, so a request that is both
-    // expired and unconfirmed answers `expired`: the reviewer needs to know the request is gone
-    // before being told what phrase to type for a decision that cannot happen.
+    // Three states, in this order, and the ORDER is the contract.
+    //
+    // 1. **Already swept** (`status = 'expired'`) answers `expired`. This arm exists because the
+    //    first version of this function tested `status != 'pending'` first and reported every
+    //    swept request as `already_decided` — telling the reviewer somebody else released it.
+    //    That is a lie in the one direction that matters: somebody reading the inbox concludes
+    //    a colleague approved a deletion when nobody did. The sweeper writes the status, so a
+    //    decision arriving after a sweep lands here rather than in the pending branch.
+    // 2. **Decided by somebody else** answers `already_decided`.
+    // 3. **Past its expiry and still pending** sweeps it now and answers `expired`.
+    //
+    // The expiry check precedes the typed-confirmation check for the same reason it precedes the
+    // others: a request that is both expired and unconfirmed must answer `expired`, because the
+    // reviewer needs to know the request is gone before being told what phrase to type for a
+    // decision that cannot happen.
+    if row.status == "expired" {
+        return Ok(DecisionOutcome::Expired(Box::new(row)));
+    }
     if row.status != "pending" {
         return Ok(DecisionOutcome::AlreadyDecided(Box::new(row)));
     }

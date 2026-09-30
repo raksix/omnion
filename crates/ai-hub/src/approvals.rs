@@ -51,6 +51,7 @@ use uuid::Uuid;
 use crate::error::{AiHubError, Result};
 
 /// Every column the store reads back, in one place so a write and a read cannot drift.
+/// Every column the store reads back, in the order `Approval` declares them.
 const APPROVAL_COLUMNS: &str = "id, organization_id, site_id, run_id, step_id, agent_id, \
      identity_id, change_set_id, tool_key, tool_class, resource_type, resource_id, \
      resource_label, risk, title, summary, operation_count, irreversible, \
