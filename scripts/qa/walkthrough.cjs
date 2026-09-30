@@ -4067,6 +4067,66 @@ function qaSql(statement) {
 }
 
 /**
+ * The site every depth pass reads, created on demand — with the organization under it.
+ *
+ * A dozen depth passes open with the same two lines:
+ *
+ *   const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+ *   if (!siteId) { steps.reason = "the QA site does not exist…"; return steps; }
+ *
+ * On a FULL pass the first-run wizard creates that site, so the guard never fires. On a
+ * `--only=<pass>` pass — the entry point that exists precisely because a full pass gets cut
+ * down halfway — `runWizard` sees the bootstrapped admin, reports "installation already
+ * exists" and returns, and nothing has ever created the site. Every step of the pass is then
+ * skipped, and the pass still exits 0 after printing one `reason` line. That is what happened
+ * to `--only=theme-builder` on 2026-09-30: 59/59 steps skipped, reported as a completed pass.
+ *
+ * A skip that reports itself as a pass is the worst shape a guard can have, so the fix is
+ * below the guard rather than inside every pass: make the rows exist.
+ *
+ * ## Why the organization is created here too, and not read
+ *
+ * The first version of this helper read `users.organization_id` and gave up when it was empty.
+ * It always is, on a scoped pass: `run.sh` seeds the first account straight into `users`, and
+ * an account with no organization is a *platform* account — the whole point of the bootstrap.
+ * The wizard is what gives the installation its organization, and the wizard is exactly what a
+ * scoped pass skips. So reading the organization asked a question whose answer is "no" in the
+ * only case that reaches this code, and the helper's own log line ("no QA site and no
+ * organization to create one under") was the honest report of a design that had to guess.
+ *
+ * The organization is therefore written here, by slug, from the same constants the wizard
+ * fills its own form from (`CREDS.org`, `CREDS.orgSlug`) — so a full pass and a scoped pass
+ * produce the same rows and a later pass that asserts on either finds them.
+ *
+ * Both writes are `on conflict do nothing`, and the site is only inserted once the
+ * organization is known to exist. That ordering is the whole point: a site whose organization
+ * id is empty fails the `sites.organization_id` not-null constraint, and a `select` that
+ * returns an empty string rather than `null` is exactly what made the first attempt look like
+ * a database problem.
+ *
+ * Returns the site id, or `""` when the account itself is missing — a genuinely broken
+ * bootstrap, which the caller reports rather than papers over.
+ */
+function ensureQaSite() {
+  const existing = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (existing) return existing;
+  const account = qaSql(`select id from users where email = '${CREDS.email}' limit 1`);
+  if (!account) return "";
+  qaSql(
+    `insert into organizations (name, slug) values ('${CREDS.org}', '${CREDS.orgSlug}') ` +
+      `on conflict (slug) do nothing`,
+  );
+  const organization = qaSql(`select id from organizations where slug = '${CREDS.orgSlug}'`);
+  if (!organization) return "";
+  qaSql(
+    `insert into sites (organization_id, key, name, status, theme) ` +
+      `select '${organization}', '${CREDS.siteKey}', '${CREDS.site}', 'active', 'minimal' ` +
+      `on conflict (organization_id, key) do nothing`,
+  );
+  return qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+}
+
+/**
  * Two pages for a pass that needs them: one published (with the revision a published page carries
  * its title in) and one draft.
  *
@@ -9173,6 +9233,14 @@ async function main() {
   }
   await shot(page, "11-overview-after-login");
 
+  // The site the depth passes read. On a full pass the wizard just created it and this is a
+  // read; on a `--only=<pass>` pass nothing has, and every pass that opens with
+  // "if (!siteId) return" would skip all of its steps and still exit 0.
+  report.qaSite = ensureQaSite();
+  if (!report.qaSite) {
+    log("no QA site and no organization to create one under — depth passes will skip");
+  }
+
   // `--only=block-editor` runs this wave's own depth passes and nothing else.
   //
   // A full pass is ~45 minutes on a box five writers share, and it dies in the middle: the box
@@ -9401,6 +9469,11 @@ async function main() {
       log(`theme builder depth pass ${required.length}/${required.length}`);
     }
     await page.context().browser()?.close().catch(() => {});
+    // A scoped pass that did not run its steps is a FAILED pass, not a pass with nothing to
+    // report. `run.sh` runs under `set -e`, so returning here made "the QA site does not
+    // exist" exit 0 — a green result for a pass that checked nothing, which is how 59 skipped
+    // steps came to be read as a pass on 2026-09-30. A missing step now ends the process.
+    if (missing.length > 0) process.exit(4);
     return;
   }
   if (process.argv.includes("--only=newsletter")) {
