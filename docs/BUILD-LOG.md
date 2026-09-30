@@ -8200,3 +8200,61 @@ models would be a security trap.
 about this slice. Then the `/content-api/docs` tab (the document is already served; only the screen
 is missing), and then slice 3: the explorer with real calls, Redis metering, the rate limiter with
 `429`/`Retry-After` and the usage tab.
+
+## 2026-09-30 — REQ-019 slice 2: the Docs tab, and a token that authenticates nothing
+
+**What shipped.** `02a6f329` — the `/content-api/docs` tab, generated from the server's OpenAPI
+document; a session-authenticated copy of that document (`GET /api/v1/content-api/openapi.json`,
+`?format=yaml` for the second serialization); `ContentApiShell` as the section's tab bar; and a
+`runContentApiDepth` walkthrough pass. `52646b67` and `4e907f4a` are two fixture repairs found by
+running the suite for the first time.
+
+**Proof — what ran.**
+
+- `apps/admin` `tsc --noEmit` — **exit 0**.
+- `cargo test -p omnion-api --test content_read_surface` — **0/13, and the number is measured.**
+  Three distinct causes, in the order they surfaced:
+  1. `Migration(VersionMismatch(38))` on the shared dev database. The 0038→0039 renumber left a
+     `_sqlx_migrations` row behind, and the suite refuses to reuse somebody's ledger. Fixed by a
+     disposable database (`omnion_t42_read`), not by dropping the shared one.
+  2. Every walk then failed at the same line with `403 csrf_unavailable`. **The middleware refuses
+     before it reads the header**, so the fixture's missing `x-omnion-csrf` was hidden behind a
+     message that named an environment variable — the one signal in the failure pointed at the
+     wrong thing. Both halves fixed; the mint call answers **201** now.
+  3. **Still open, and it is in the product rather than in a fixture:** the minted token is then
+     refused by `authenticate_any_organization` with `Invalid` where the walk expects 200.
+     Probing the store narrowed it: `split_token` accepts the value, the lookup returns the row,
+     the 13-column decode succeeds when run by hand with the same statement, and the digest of the
+     secret half does not match what the same process stored.
+
+**The lesson this tick is actually about.**
+
+`api_tokens::authenticate` ends its fetch with `.map_err(|_| AuthFailure::Invalid)`. That is a
+**refusal to distinguish** — a pool timeout, a decode mismatch and a wrong credential are three
+different problems, and the store answers all three in the same voice, to the caller who most
+needs to know which one it was. I spent most of this tick bisecting a defect by hand *because the
+library refused to tell me where it was*, and the ledger already carries this lesson from a
+different angle ("a header read after `into_body()` reads nothing"). A `map_err` that erases an
+error class does not fail loudly; it fails as an unhelpful success. It is written down here as its
+own defect, independent of whatever the root cause turns out to be.
+
+Two smaller ones, both found by looking rather than by running:
+
+- **`?? 0.5` on `byte % 16` halves the alphabet of the token's secret half.** The generator maps
+  an operating-system byte through `% ALPHABET.len()` with a 16-character alphabet, so the
+  modulo bias is total and every odd index of the alphabet is unreachable. The secret is still 32
+  characters drawn from 8 distinct characters rather than 16 — less entropy than the length
+  suggests, from a function whose contract says "drawn from the operating system".
+- **A probe that mirrors source code is still a probe, and two of my three probes were wrong
+  before the code under test was.** The first violated the prefix check constraint (`omn_p…` —
+  `p` is not hex), the second collided with `api_tokens_token_hash_key` because it reused a fixed
+  secret, and the third hit the foreign key because it invented an organization id. Three setup
+  defects in a row, in a file written to answer one question about the product. The same lesson as
+  the walkthrough's `[data-page-new]` note, one layer down: when a probe fails before it reaches
+  its subject, the failure is in the probe.
+
+**Next.** Run the four-line `mint_then_authenticate` probe (it now needs a real organization row,
+which is the only thing missing) and read `hash_secret(secret)` against the stored digest in one
+process. Then decide whether the `.map_err` swallow is fixed or the digest comparison is at fault
+— the two are distinguishable the moment the probe prints both. Then slice 3: the explorer with
+real calls, Redis metering, the rate limiter with `429`/`Retry-After`, and the usage tab.
