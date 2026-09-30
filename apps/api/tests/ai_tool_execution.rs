@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use omnion_ai_hub::agent::ToolCall;
 use omnion_ai_hub::identity::{self, GrantEffect, NewIdentity};
-use omnion_ai_hub::registry;
+use omnion_ai_hub::registry::{self, disabled_keys};
 use omnion_ai_hub::run_store::{NewAgent, create_agent};
 use omnion_ai_hub::tool_calls::CallStatus;
 use omnion_ai_hub::tool_exec::{
@@ -427,6 +427,7 @@ async fn a_permitted_call_runs_and_writes_exactly_one_row() {
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -475,6 +476,7 @@ async fn a_row_carries_the_size_of_its_arguments_and_never_the_arguments() {
         Some(identity.clone()),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -534,6 +536,7 @@ async fn an_explicit_deny_beats_the_agent_allow_list_and_touches_nothing() {
         Some(identity),
         vec!["content.create".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -582,6 +585,7 @@ async fn a_tool_the_caller_may_not_perform_is_refused_with_the_key_named() {
         Some(identity),
         vec!["content.create".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -627,6 +631,7 @@ async fn a_run_with_no_identity_executes_nothing_at_all() {
         None,
         vec!["content.create".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -649,12 +654,20 @@ async fn a_run_with_no_identity_executes_nothing_at_all() {
 }
 
 #[tokio::test]
-async fn a_tool_disabled_by_an_operator_is_still_callable_inside_the_run_that_started_first() {
-    // The trade `Pipeline::enabled` documents, asserted as a fact so that changing it is a
-    // deliberate diff rather than an accident. The check reads the *compiled* catalogue rather
-    // than the operator's row, because `model_facing` runs it once per tool per step and 20 round
-    // trips to assemble a payload is its own cost. The consequence: a tool switched off while a
-    // run is live keeps working until that run ends, and the next run refuses it.
+async fn a_tool_the_operator_switched_off_is_absent_from_the_payload_and_refused_when_named() {
+    // The request's criterion in one walk: "a disabled tool is absent from the model-facing tool
+    // payload of a run and refused with a stable code when named anyway". Both halves, because
+    // either alone is satisfiable by a broken pipeline — a filter that hides everything passes the
+    // first, and an execution path that refuses everything passes the second.
+    //
+    // **This walk used to assert the opposite.** It was called
+    // `a_tool_disabled_by_an_operator_is_still_callable_inside_the_run_that_started_first` and
+    // passed, because `Pipeline::enabled` answered `catalogue::find(key).is_some()` and the key
+    // was in the catalogue. The comment above it defended that as a latency trade: `model_facing`
+    // "runs this once per tool per step". It does not — the runner calls it exactly once, at
+    // line 575, when it assembles the provider payload. The rule was asserted as a fact, the
+    // fact was false, and `ResolutionReason::Disabled` had no reachable caller anywhere in the
+    // product, which is also why `ai.tool.disabled` was never published by anything.
     let store = pipe!();
     let registry = registry();
     let agent_id = store.agent("writer", &["content.search"]).await;
@@ -673,13 +686,20 @@ async fn a_tool_disabled_by_an_operator_is_still_callable_inside_the_run_that_st
     )
     .await
     .expect("the tool must be patchable");
-    // The row really is off, so the assertion below is about the pipeline and not about a patch
-    // that silently did nothing.
+    // The row really is off, so the assertions below are about the pipeline and not about a
+    // patch that silently did nothing.
     let row = registry::get_tool(&store.pool, "content.search")
         .await
         .expect("the registry must answer")
         .expect("the row exists");
     assert!(!row.enabled, "the operator's decision must be on the row");
+
+    // The payload is built from the operator's decision, read the way the runner reads it.
+    let disabled = disabled_keys(&store.pool).await.expect("the registry must answer");
+    assert!(
+        disabled.contains("content.search"),
+        "the payload's input is the disabled set, and it must carry the operator's decision"
+    );
 
     let gate = allow_all();
     let pipe = Pipeline::new(
@@ -687,17 +707,120 @@ async fn a_tool_disabled_by_an_operator_is_still_callable_inside_the_run_that_st
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled,
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
-    let outcome = pipe
+
+    // Half one: invisible, not merely refused.
+    let payload = pipe.model_facing();
+    assert!(
+        !payload.iter().any(|summary| summary.key == "content.search"),
+        "a switched-off tool must not appear in the model payload at all. Got: {:?}",
+        payload.iter().map(|summary| summary.key.as_str()).collect::<Vec<_>>()
+    );
+
+    // Half two: named anyway, refused with the request's stable code — and by the **row**, not
+    // by the snapshot, so the same pipeline refuses a tool disabled *after* it was built.
+    let call = ToolCall::new("content.search", json!({"q": "report"}));
+    match pipe
+        .call(&store.pool, &call)
+        .await
+        .expect("the pipeline must answer")
+    {
+        CallOutcome::Refused { code, reason, .. } => {
+            assert_eq!(
+                code, "tool_disabled",
+                "the code is API surface and the request names a stable one"
+            );
+            assert!(
+                reason.contains("content.search") || reason.contains("switched off"),
+                "the refusal must name the tool or the decision. Got: {reason}"
+            );
+        }
+        other => panic!("a disabled tool must be refused, got {other:?}"),
+    }
+
+    // The refusal is evidence, and the request's "the target row is unchanged" still has to hold:
+    // a tool body that ran and then reported a refusal would satisfy the assertion above.
+    let rows = store.rows_for(run_id, "content.search").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one denial row and no executed call. Got: {rows:?}"
+    );
+    assert_eq!(rows[0].0, "denied");
+    assert_eq!(
+        rows[0].1.as_deref(),
+        Some("tool_disabled"),
+        "the call log carries the same code the model was told"
+    );
+    assert_eq!(
+        store.touched().await,
+        0,
+        "nothing ran, so the side-effect probe is untouched"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_disable_that_lands_mid_run_is_refused_by_the_row_not_the_snapshot() {
+    // The asymmetry the pipeline documents, asserted: `model_facing` answers from the snapshot it
+    // was built with, because a provider payload cannot be retracted, while `call` re-reads the
+    // row. So an operator's disable reaches a run that is **already in flight**, which is the
+    // strongest statement they can make and the one the previous design silently deferred to the
+    // next run.
+    let store = pipe!();
+    let registry = registry();
+    let agent_id = store.agent("writer", &["content.search"]).await;
+    let run_id = store.run(agent_id, "find the report").await;
+    let identity = store
+        .identity("editor", &[("content.search", GrantEffect::Allow)])
+        .await;
+
+    // Built while the tool is still on: the payload must include it, or this walk proves nothing
+    // about the disable.
+    let enabled_at_start = disabled_keys(&store.pool).await.expect("the registry must answer");
+    assert!(!enabled_at_start.contains("content.search"));
+    let pipe = Pipeline::new(
+        std::sync::Arc::new(registry),
+        Some(identity),
+        vec!["content.search".to_owned()],
+        Vec::new(),
+        enabled_at_start,
+        std::sync::Arc::new(allow_all()),
+        store.caller(agent_id, run_id),
+    );
+    assert!(
+        pipe.model_facing()
+            .iter()
+            .any(|summary| summary.key == "content.search"),
+        "the payload was built while the tool was on, so it must carry it"
+    );
+
+    // The operator switches it off now. No new pipeline, no new run.
+    registry::update_tool(
+        &store.pool,
+        "content.search",
+        &registry::ToolLimits {
+            enabled: Some(false),
+            ..registry::ToolLimits::default()
+        },
+    )
+    .await
+    .expect("the tool must be patchable");
+
+    match pipe
         .call(&store.pool, &ToolCall::new("content.search", json!({"q": "report"})))
         .await
-        .expect("the pipeline must answer");
-    assert!(
-        matches!(outcome, CallOutcome::Ran { .. }),
-        "the compiled enabled() check does not read the operator's row mid-run. Got: {outcome:?}"
-    );
+        .expect("the pipeline must answer")
+    {
+        CallOutcome::Refused { code, .. } => assert_eq!(
+            code, "tool_disabled",
+            "the call must read the operator's current decision, not the snapshot"
+        ),
+        other => panic!("a tool disabled mid-run must be refused, got {other:?}"),
+    }
     store.dispose().await;
 }
 
@@ -716,6 +839,7 @@ async fn an_unknown_field_is_refused_before_the_tool_runs() {
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -792,6 +916,7 @@ async fn one_call_past_the_cap_is_refused_and_the_cap_survives_a_resume() {
             Some(identity.clone()),
             vec!["content.search".to_owned()],
             Vec::new(),
+            disabled_keys(&store.pool).await.expect("the registry must answer"),
             std::sync::Arc::clone(&gate),
             store.caller(agent_id, run_id),
         );
@@ -807,6 +932,7 @@ async fn one_call_past_the_cap_is_refused_and_the_cap_survives_a_resume() {
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         gate,
         store.caller(agent_id, run_id),
     );
@@ -863,6 +989,7 @@ async fn a_slow_tool_is_cut_off_with_status_timeout() {
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -947,6 +1074,7 @@ async fn the_payload_hides_a_denied_tool_and_the_call_still_refuses_it() {
         Some(identity),
         vec!["content.search".to_owned(), "content.create".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -997,6 +1125,7 @@ async fn the_payload_carries_the_registry_row_schema_the_call_validates_against(
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -1059,6 +1188,7 @@ async fn a_run_another_organization_cannot_read_the_calls_for() {
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
@@ -1198,6 +1328,7 @@ async fn a_control_proves_the_fixture_tool_really_writes() {
         Some(identity),
         vec!["content.create".to_owned()],
         Vec::new(),
+        disabled_keys(&store.pool).await.expect("the registry must answer"),
         std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
