@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ArrowLeft, Archive, ArchiveRestore, FolderInput, Loader2, Save, Trash2, TriangleAlert, UserPlus } from "lucide-react";
+import { ArrowLeft, Archive, ArchiveRestore, ArrowRightLeft, FolderInput, Loader2, Save, Trash2, TriangleAlert, UserPlus } from "lucide-react";
 
 import { LoadingTable } from "@/components/loading-table";
 import { EmptyState } from "@/components/empty-state";
@@ -36,6 +36,7 @@ import {
   updateProject,
 } from "@/lib/api";
 import { MoveDialog } from "@/features/workflows/move-dialog";
+import { TransferOwnershipDialog } from "@/features/projects/transfer-ownership-dialog";
 import type { Project, ProjectMember, ProjectRole, Workflow } from "@/lib/types";
 
 /** What each role may do, in the words the members screen needs. */
@@ -71,6 +72,7 @@ export function ProjectDetail() {
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [workflowsError, setWorkflowsError] = useState<string | null>(null);
   const [moving, setMoving] = useState<Workflow | null>(null);
+  const [handingOver, setHandingOver] = useState(false);
 
   const load = useCallback(async () => {
     if (!projectId) return;
@@ -252,6 +254,34 @@ export function ProjectDetail() {
           {project.caller_role ? <span className="tag">{project.caller_role}</span> : null}
         </span>
       </div>
+
+      {/* The two sub-screens the REQ's route table names, linked rather than reachable only by
+          typing a URL. A screen with no link is a screen nobody finds, and a route nobody visits
+          is a route the walkthrough cannot judge. */}
+      <nav className="flex flex-wrap items-center gap-1.5" aria-label="Project sections">
+        <Link
+          href={`/automation/projects/${project.id}`}
+          data-project-nav="detail"
+          aria-current="page"
+          className="rounded-lg border border-line px-2.5 py-1 text-[12px]"
+        >
+          Overview
+        </Link>
+        <Link
+          href={`/automation/projects/${project.id}/limits`}
+          data-project-nav="limits"
+          className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:text-ink"
+        >
+          Limits &amp; usage
+        </Link>
+        <Link
+          href={`/automation/projects/${project.id}/audit`}
+          data-project-nav="audit"
+          className="rounded-lg border border-line px-2.5 py-1 text-[12px] transition hover:text-ink"
+        >
+          Audit
+        </Link>
+      </nav>
 
       {error ? (
         <div role="alert" className="flex items-start gap-2 rounded-lg border border-red-500/40 bg-red-500/5 px-3 py-2.5 text-[12.5px]">
@@ -487,8 +517,24 @@ export function ProjectDetail() {
         ) : null}
       </section>
 
-      {!project.is_default ? (
-        <section>
+      <section>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-project-transfer-ownership
+            disabled={busy || archived || members.length < 2}
+            title={
+              members.length < 2
+                ? "Nobody else is in this project yet — add a member before handing it over"
+                : "Hand this project to another member, with two confirmations"
+            }
+            onClick={() => setHandingOver(true)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-[12.5px] transition hover:text-ink disabled:opacity-50"
+          >
+            <ArrowRightLeft className="size-3.5" aria-hidden />
+            Hand over ownership
+          </button>
+          {!project.is_default ? (
           <button
             type="button"
             data-project-toggle-archive
@@ -505,7 +551,20 @@ export function ProjectDetail() {
             )}
             {archived ? "Restore this project" : "Archive this project"}
           </button>
-        </section>
+          ) : null}
+        </div>
+      </section>
+
+      {handingOver ? (
+        <TransferOwnershipDialog
+          project={project}
+          members={members}
+          onClose={() => setHandingOver(false)}
+          onTransferred={() => {
+            setHandingOver(false);
+            void load();
+          }}
+        />
       ) : null}
 
       {moving ? (
