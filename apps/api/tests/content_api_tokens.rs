@@ -583,6 +583,11 @@ async fn a_token_from_another_organization_is_invalid_and_never_forbidden() {
     assert_eq!(
         omnion_content::api_tokens::authenticate(fixture.db.pool(), fixture.outsider_org, plaintext)
             .await
+            // The success arm is mapped to `()` for the same reason the helper above does: an
+            // `AuthenticatedToken` carries the row, and comparing it against a unit expectation
+            // would be a type error rather than a verdict — so a *successful* cross-tenant
+            // authentication would not even compile, let alone fail.
+            .map(|_| ())
             .map_err(|failure| failure.code().to_owned()),
         Err("invalid_token".to_owned()),
         "another organization must not learn that this token exists"

@@ -442,9 +442,16 @@ pub struct ListEnvelope {
 }
 
 /// A read response plus the cache headers that make it revalidatable.
-struct ReadResponse {
+///
+/// Public because it is a handler's return type, and Axum requires a route's `IntoResponse`
+/// output to be nameable from the module that registers the route. Its *fields* stay private:
+/// the router needs to know the type exists, not to build one.
+pub struct ReadResponse {
+    /// The envelope, serialized by `IntoResponse`.
     body: Value,
+    /// Weak validator over the rows.
     etag: String,
+    /// Always `200` today; a `304` path is slice 3's rate-limit work, not this slice's.
     status: StatusCode,
 }
 
@@ -561,19 +568,24 @@ async fn list_pages_of_type(
         // cannot be parsed as the requested sort is refused rather than compared: a caller that
         // changes `sort` mid-walk would otherwise get a page from the wrong ordering that looks
         // like a legitimate one.
+        // The cursor's value is bound as TEXT in both cases, because the keyset predicate
+        // compares a *column* against it and the column's type follows the sort. Binding it
+        // once as a string and letting PostgreSQL cast per the column keeps one code path and
+        // makes the "wrong sort order" refusal a real check rather than a type error.
         let value = match request.sort {
-            SortKey::Title => cursor.value.clone(),
+            SortKey::Title => Ok(cursor.value.clone()),
             SortKey::CreatedAt | SortKey::UpdatedAt => OffsetDateTime::parse(
                 &cursor.value,
                 &time::format_description::well_known::Rfc3339,
             )
+            .map(|parsed| parsed.to_string())
             .map_err(|_| {
                 bad_parameter(
                     "cursor",
                     "this cursor does not belong to this sort order".into(),
                 )
-            })?,
-        };
+            }),
+        }?;
         statement = statement.bind(value).bind(cursor.id);
     }
     let rows = statement
@@ -998,7 +1010,7 @@ mod tests {
             Some("Bearer "),
         ] {
             let error = bearer_token(&headers(case)).expect_err("must be refused");
-            assert_eq!(error.status, StatusCode::UNAUTHORIZED, "case: {case:?}");
+            assert_eq!(error.status(), StatusCode::UNAUTHORIZED, "case: {case:?}");
         }
     }
 
@@ -1011,7 +1023,6 @@ mod tests {
                 site_id: Some(Uuid::from_u128(20)),
                 name: "frontend".into(),
                 prefix: "omn_00000000".into(),
-                token_hash: "x".repeat(64),
                 scopes: vec!["content:read".into()],
                 allowed_origins: vec![],
                 rate_limit_per_minute: 120,
@@ -1053,7 +1064,6 @@ mod tests {
                 site_id: None,
                 name: "wide".into(),
                 prefix: "omn_11111111".into(),
-                token_hash: "y".repeat(64),
                 scopes: vec!["content:read".into()],
                 allowed_origins: vec![],
                 rate_limit_per_minute: 120,
@@ -1080,7 +1090,6 @@ mod tests {
                 site_id: None,
                 name: "pages only".into(),
                 prefix: "omn_22222222".into(),
-                token_hash: "z".repeat(64),
                 scopes: vec!["content:read".into()],
                 allowed_origins: vec![],
                 rate_limit_per_minute: 120,
@@ -1095,7 +1104,7 @@ mod tests {
         let error = token
             .require_scope("media:read")
             .expect_err("no media scope");
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
