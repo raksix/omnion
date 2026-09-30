@@ -30,8 +30,8 @@ use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
 use omnion_events::{NewEvent, bus};
 use omnion_backup::{
-    DestinationReport, NewBackup, NewPart, NewSchedule, NewSettings, Part, PartStatus, probe_local,
-    storage_key, storage_prefix, validate_label,
+    NewBackup, NewPart, NewSchedule, NewSettings, Part, PartStatus, probe_local, storage_key,
+    storage_prefix, validate_label,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
