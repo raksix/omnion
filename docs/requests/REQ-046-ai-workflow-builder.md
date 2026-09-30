@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** in-progress (slice 1 · `b6392a80` — the draft store: migration `0174_ai_workflow_builder.sql`, the `modules/ai` crate (model/store/definition/generate) with the closed action registry driving the generation prompt, one repair round-trip that is never spent on a provider failure, and credential-shaped parameters refused in the answer) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
+> **Status:** in-progress (slice 2 · `06f28399` — `ai.prompt` in the action registry: a HOST action (the engine refuses to stub it), bounded token budget validated when the rule is written, and `ai.chat` rather than `workflows.run` because spending tokens on a schedule is not the same privilege; slice 1 · `b6392a80` — the draft store: migration `0174_ai_workflow_builder.sql`, the `modules/ai` crate (model/store/definition/generate) with the closed action registry driving the generation prompt, one repair round-trip that is never spent on a provider failure, and credential-shaped parameters refused in the answer) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -144,6 +144,9 @@ only: never the prompt body, never the definition, never a provider key.
       a field-level message.
 - [ ] `ai.prompt` runs as an ordinary task step: a run passes a template through the model, later
       steps read the output, and a provider failure is retried by the existing step backoff.
+      *(Partly proven: the action is a registry host action with a bounded budget, it is wired
+      to the AI Hub router, and its output shape (`text`) is what a later step reads. The run
+      itself needs a connected provider — slice 4's probe.)*
 - [ ] Test-run performs no external side effects — asserted by “no events emitted during the test
       run”.
 - [ ] Permission keys hold: no `ai.chat` → generation `403`; `workflows.read` without

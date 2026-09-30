@@ -6549,3 +6549,50 @@ have destroyed a pass that has been queueing for two ticks.
 **Next.** Slice 2: `ai.prompt` in the action registry plus the runner wiring, so a generated
 step runs as an ordinary task. Then slice 3 (console) and slice 4 (approve / activate /
 revise / test-run + events).
+
+## 2026-09-30 — REQ-046 slice 2 (`ai.prompt` in the engine) · the AI side's test proved itself
+
+**What.** `ai.prompt` joins the closed action registry as a **host** action, with a prompt
+template, an optional model key and a bounded token budget, wired in
+`AutomationActions` to the AI Hub router. The node vocabulary and the
+`workflow_steps.kind` constraint are untouched: an AI step is a normal `kind = 'task'`
+step whose output a later step reads as `{{steps.N.output.text}}`.
+
+**THE MODULE'S OWN TEST IS THE PROOF THAT SLICE 1'S WIRING WAS REAL.** `modules/ai` builds
+its generation prompt from `omnion_workflows::actions` and asserts every registry key
+appears in it. Adding a key to the registry made that assertion cover a new action with
+**not one edit on the AI side**. A hand-written action list would have passed every other
+test in that file and shipped a model that could not write the very step this commit adds —
+which is the argument for building the list from the registry that slice 1 made and this
+commit cashes in.
+
+**SPENDING TOKENS IS NOT `workflows.run`.** A rule that prompts a model on a schedule costs
+money on every firing, so `ai.prompt` rides `ai.chat` — the key the console's generate button
+already sits behind. A new permission key would have been a key no existing role carries,
+which silently means "nobody" until an admin visits the catalogue, so the existing one is
+the right one. The existing test that compares `ACTION_PERMISSIONS` against
+`permission_for` covers the new entry for free, which is what that const is for.
+
+**THE BUDGET IS BOUNDED AT VALIDATION TIME, in the registry, not at call time.** A
+definition is validated without a provider present, so a rule asking for a million tokens
+per step is refused when it is *written*. Both sides of the ceiling are asserted (10_000
+accepted, 10_001 refused) because "at most" is where an off-by-one hides, and a fractional
+budget is refused rather than floored — an author who typed 1000.5 should not believe they
+asked for more than they did. The ceiling is **read from** the engine's constant in the layer
+that spends it, with a test asserting the two are equal: two numbers that could differ would
+mean a step silently running with a budget its own definition was refused for.
+
+**Proof.** `cargo test -p omnion-automation` **117/117** (was 115, +2) · `-p omnion-workflows`
+**144/144** (was 143, +1) · `-p omnion-module-ai` **40/40 unchanged** — the prompt test now
+covers `ai.prompt` without an edit · `cargo build -p omnion-api` clean. Commit `06f28399`.
+
+**Not ticked.** The `ai.prompt` acceptance criterion stays open with a note: the action, the
+bound and the wiring are proven, but *a run* through a connected provider is slice 4's probe.
+Writing a checkbox for "it is wired" when the criterion says "a run completes" would make
+the checklist a list of what was easy.
+
+**Next.** Slice 3: the console (`/ai/workflows` list + generate, `/ai/workflows/[id]` review)
+with the routes behind `ai.chat` / `workflows.read` / `workflows.manage`, the URL-persisted
+filters, the streaming progress panel and the empty / loading / error / no-provider states.
+This is the first slice with a screen, so it is also the first that needs the walkthrough
+route added and a probe — and the pass that would read it is still queueing.
