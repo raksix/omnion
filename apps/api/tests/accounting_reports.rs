@@ -274,12 +274,17 @@ impl Fixture {
     /// A payment, so the income and cashflow reports have money in them.
     async fn payment(&self, amount: &str, paid_on: &str) -> Uuid {
         let reference = format!("RPT-PAY-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        // `payment_number` is NOT NULL and `reference` is the EXTERNAL one (a bank transfer id
+        // that may be empty). Writing a reference and no number answers 23502 -- the fixture
+        // being wrong, not the report.
+        let number = format!("PAY-{}", &Uuid::new_v4().simple().to_string()[..8]);
         sqlx::query_scalar::<_, Uuid>(
             "insert into accounting_payments \
-                 (organization_id, reference, method, amount, paid_on, created_by) \
-             values ($1, $2, 'bank_transfer', $3::numeric, $4::date, $5) returning id",
+                 (organization_id, payment_number, reference, method, amount, paid_on, created_by) \
+             values ($1, $2, $3, 'bank_transfer', $4::numeric, $5::date, $6) returning id",
         )
         .bind(self.organization)
+        .bind(&number)
         .bind(&reference)
         .bind(amount)
         .bind(paid_on)
@@ -584,6 +589,11 @@ async fn the_aging_buckets_sum_to_the_outstanding_total() {
     // these fixtures are up to 200 days late: read with the default, the due_date filter drops
     // every one of them and the identity below is asserted over a fraction of its own rows. The
     // report was right and the walk was reading a window it had not asked for.
+    // **The window reaches FORWARD as well as back, and that is not decoration.** A period
+    // ending today cannot contain an invoice that is not yet due -- its due date is in the
+    // future -- so the one fixture that proves the `current` bucket is exactly the row an
+    // "everything up to today" filter drops. An aging report asked about today alone is
+    // structurally blind to the largest bucket it has.
     let response = call(
         &fixture.state,
         request(
@@ -591,7 +601,7 @@ async fn the_aging_buckets_sum_to_the_outstanding_total() {
             &format!(
                 "/api/v1/accounting/reports/aging?from={}&to={}",
                 today - time::Duration::days(400),
-                today
+                today + time::Duration::days(60)
             ),
             Some(&session),
             None,
@@ -604,7 +614,12 @@ async fn the_aging_buckets_sum_to_the_outstanding_total() {
     let buckets = response.body["buckets"]
         .as_array()
         .expect("buckets must be an array");
-    assert_eq!(rows.len(), 5, "all five fixtures must be inside the window: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        5,
+        "all five fixtures must be inside the window: {}",
+        response.body["meta"]["row_count"]
+    );
 
     // **The identity, summed off the wire the way a reader would.**
     let outstanding = sum_of(rows, "outstanding");
@@ -772,7 +787,12 @@ async fn the_export_carries_exactly_the_rows_the_table_shows() {
     // **The acceptance box, as a row COUNT rather than a promise.** The header carries the
     // number too, and a caller that believes the header must be able to check it.
     let screen_rows = on_screen.body["rows"].as_array().expect("rows must be an array").len();
-    assert_eq!(screen_rows, 3, "all three fixtures must be in the window: {on_screen}");
+    assert_eq!(
+        screen_rows,
+        3,
+        "all three fixtures must be in the window: {}",
+        on_screen.body["meta"]["row_count"]
+    );
     let csv_rows = csv_data_rows(&exported.raw).len();
     assert_eq!(
         csv_rows, screen_rows,

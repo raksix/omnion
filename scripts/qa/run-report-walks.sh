@@ -18,7 +18,15 @@ TEST=accounting_reports
 LOG=/tmp/w4-report-walks.log
 : >"$LOG"
 
-mapfile -t WALKS < <(cargo test -p omnion-api --test "$TEST" -- --list 2>/dev/null | grep ': test$')
+# The listing is built WITHOUT a pipe to the parser, so a compile failure is visible as one.
+# "0 found" is otherwise ambiguous: an empty suite and a suite that did not build look identical,
+# and the earlier run of this script reported `NO WALKS FOUND` for a binary with a type error.
+if ! cargo test -p omnion-api --test "$TEST" -- --list >/tmp/w4-walk-list.txt 2>/tmp/w4-walk-list.err; then
+  echo "[walks] the test binary did not build — refusing to run an empty suite"
+  tail -20 /tmp/w4-walk-list.err
+  exit 1
+fi
+mapfile -t WALKS < <(grep -E ': test$' /tmp/w4-walk-list.txt)
 echo "[walks] ${#WALKS[@]} found"
 [ "${#WALKS[@]}" -eq 0 ] && { echo "NO WALKS FOUND — refusing to report 0/0 as green"; exit 1; }
 
@@ -41,7 +49,8 @@ for entry in "${WALKS[@]}"; do
   elif [ -z "$result" ] && printf '%s\n' "$out" | grep -qE '^error'; then
     FAIL=$((FAIL + 1)); FAILED_NAMES+=("$name (build error)")
     printf '%s\n' "$out" >"/tmp/w4-walk-$name.log"
-  elif printf '%s\n' "$result" | grep -q '1 passed or more'; then
+  elif printf '%s\n' "$result" | grep -qE '^test result: ok\.' \
+       && printf '%s\n' "$result" | grep -qE '(^|[^0-9])[1-9][0-9]* passed'; then
     if printf '%s\n' "$result" | grep -q 'finished in 0\.00s'; then
       ZERO=$((ZERO + 1)); FAILED_NAMES+=("$name (0.00s: returned early, did not run)")
     else
