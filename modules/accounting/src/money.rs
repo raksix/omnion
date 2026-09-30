@@ -156,6 +156,51 @@ impl Amount {
             cents: self.cents - other.cents,
         }
     }
+
+    /// Multiply by a quantity given in **thousandths**, rounding half away from zero once.
+    ///
+    /// # Why thousandths and not a decimal
+    ///
+    /// A quantity column is `numeric(14,3)` — three decimals, because a weight, an hour and a
+    /// kilogram are all quantities. The invoice form sends `2`, `1.5` and `0.125`, and the module
+    /// stores them as integers so the multiplication happens in the same integer space as the
+    /// money: no `f64` ever touches a price. The single rounding is here, once, so a line of
+    /// `33.335 × 3` becomes `100.01` on the panel, in the PDF and in the report — the rule the
+    /// REQ's "round once per line, sum rounded lines" note asks for, and the reason the three
+    /// cannot drift apart.
+    #[must_use]
+    pub fn multiply_qty(self, qty_thousandths: i64) -> Self {
+        // `1000` is the scale factor, not a magic number in the arithmetic below: 1.000 is one.
+        const THOUSAND: i128 = 1_000;
+        let product = self.cents * i128::from(qty_thousandths);
+        // Half away from zero, matching PostgreSQL's `round()` on `numeric` — which is what the
+        // SQL side does when it recomputes the same figure, and the reason the two agree.
+        let rounded = if product >= 0 {
+            (product + THOUSAND / 2) / THOUSAND
+        } else {
+            (product - THOUSAND / 2) / THOUSAND
+        };
+        Self::from_cents(rounded).unwrap_or(Self::ZERO)
+    }
+
+    /// This amount's `percent` of itself, where the percent arrives in **hundredths of a percent**.
+    ///
+    /// `20` percent is `2_000`, and `2.5` percent is `250`. Rounded once, half away from zero, for
+    /// the same reason as [`Amount::multiply_qty`]: a tax figure the panel and the ledger disagree
+    /// about by a cent is a VAT return nobody can file.
+    #[must_use]
+    pub fn percent_of(self, percent_hundredths: i64) -> Self {
+        // The basis-points divisor: 1% is 10_000 hundredths of a percent, so a percent of an
+        // amount is `cents × percent_hundredths / 10_000`.
+        const BASIS: i128 = 10_000;
+        let product = self.cents * i128::from(percent_hundredths);
+        let rounded = if product >= 0 {
+            (product + BASIS / 2) / BASIS
+        } else {
+            (product - BASIS / 2) / BASIS
+        };
+        Self::from_cents(rounded).unwrap_or(Self::ZERO)
+    }
 }
 
 /// The absolute value of an amount, for a `numeric(14,2)` column that is `not null` but must not
@@ -333,5 +378,56 @@ mod tests {
     fn an_amount_above_the_column_is_refused_at_the_boundary() {
         let too_big = i128::from(100_000_000_000_000_i64);
         assert!(Amount::from_cents(too_big).is_none());
+    }
+
+    #[test]
+    fn a_quantity_multiplies_exactly_when_it_can_and_rounds_once_when_it_cannot() {
+        let price = Amount::parse("10.00").expect("parses");
+
+        // Whole and half quantities are exact; nothing is rounded away.
+        assert_eq!(price.multiply_qty(1_000).to_text(), "10.00");
+        assert_eq!(price.multiply_qty(2_000).to_text(), "20.00");
+        assert_eq!(price.multiply_qty(1_500).to_text(), "15.00");
+        assert_eq!(price.multiply_qty(2_500).to_text(), "25.00");
+
+        // A third decimal is the case the rule exists for. `33.335 × 3` is `100.005`, which is
+        // not a number money can hold, and the answer is `100.01` — half away from zero, the same
+        // direction PostgreSQL's `round(numeric)` goes, so the panel and a SQL recompute agree.
+        let third = Amount::parse("33.33").expect("parses");
+        assert_eq!(third.multiply_qty(3_000).to_text(), "99.99");
+        let half = Amount::from_cents(3_335).expect("33.35 is representable");
+        assert_eq!(half.multiply_qty(3_000).to_text(), "100.05");
+        // And the tie case itself: exactly .005 goes up, not to even and not to zero.
+        let tie = Amount::from_cents(3_333).expect("33.33 is representable");
+        assert_eq!(tie.multiply_qty(3_000).to_text(), "99.99");
+    }
+
+    #[test]
+    fn a_percent_of_an_amount_rounds_once_and_zero_is_not_special() {
+        let amount = Amount::parse("100.00").expect("parses");
+
+        assert_eq!(amount.percent_of(2_000).to_text(), "20.00"); // 20%
+        assert_eq!(amount.percent_of(0).to_text(), "0.00"); // 0%
+        assert_eq!(amount.percent_of(10_000).to_text(), "100.00"); // 100%
+        // A quarter-percent rate — the case that makes a VAT return wrong when it truncates.
+        // 10.01 × 2.5% is 0.25025, which is not a number money holds, and the answer is 0.25.
+        assert_eq!(
+            Amount::parse("10.01").expect("parses").percent_of(250).to_text(),
+            "0.25"
+        );
+        // 33.33 at 20% is 6.666, which rounds to 6.67, not 6.66.
+        assert_eq!(
+            Amount::parse("33.33").expect("parses").percent_of(2_000).to_text(),
+            "6.67"
+        );
+    }
+
+    #[test]
+    fn a_negative_amount_rounds_away_from_zero_too() {
+        // A credit line rounds the same way a debit does; rounding half to zero would make a
+        // credit note not the mirror of the invoice it credits.
+        let negative = Amount::parse("-10.00").expect("parses");
+        assert_eq!(negative.multiply_qty(1_500).to_text(), "-15.00");
+        assert_eq!(negative.percent_of(2_000).to_text(), "-2.00");
     }
 }

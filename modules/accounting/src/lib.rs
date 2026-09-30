@@ -30,6 +30,7 @@
 pub mod accounts;
 pub mod dates;
 pub mod error;
+pub mod invoices;
 pub mod journal;
 pub mod model;
 pub mod money;
@@ -40,6 +41,9 @@ pub use accounts::{
     TaxRateView,
 };
 pub use error::{AccountingError, Result, status_of};
+pub use invoices::{
+    InvoiceLineView, InvoiceStatus, InvoiceSummary, InvoiceView, NewInvoice, NewInvoiceLine,
+};
 pub use journal::{
     EntrySource, JournalEntrySummary, JournalEntryView, JournalLineInput, JournalLineView,
     NewJournalEntry,

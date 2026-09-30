@@ -98,6 +98,46 @@ pub fn parse_instant(raw: &str) -> Result<OffsetDateTime, time::error::Parse> {
     }
 }
 
+/// The nullable **date** helpers, under the name the invoice views use.
+///
+/// Deliberately not `Option<time::Date>`: serde's own `Option` impl serializes `None` as `null`,
+/// which a `<input type="date">` cannot fill, and a list column that has to print "—" for a
+/// missing due date is better served by the same `to_wire` the non-optional path uses. The
+/// timestamp `option` module below has the identical shape, and the two being separate is what
+/// stops a timestamp being formatted as a date somewhere in a response.
+pub mod option {
+    use super::{Date, Serializer, to_wire};
+    use serde::{Deserialize, Deserializer};
+
+    /// Serialize an optional day.
+    pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(date) => serializer.serialize_str(&to_wire(date)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Deserialize an optional day, accepting `null` and the empty string.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // A form that posts `""` for a field nobody filled in is normal, and treating the empty
+        // string as "no date" is what makes an optional due date actually optional.
+        let raw = match Option::<String>::deserialize(deserializer)? {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+        super::parse(&raw).map(Some).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The non-optional timestamp helpers, under the name the views use.
 pub mod instant {
     use super::{OffsetDateTime, Serializer, instant_to_wire};
