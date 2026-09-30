@@ -34,7 +34,7 @@ pub use delivery::{
 };
 pub use error::{NotificationError, Result};
 pub use model::{
-    CategoryCount, ListQuery, NewNotification, Notification, NotificationPage, Summary,
+    CategoryCount, DeliveryRow, ListQuery, NewNotification, Notification, NotificationPage, Summary,
 };
 pub use preference_store::{
     allowed_channels, read_preferences, read_settings, reset_preferences, write_preferences,
