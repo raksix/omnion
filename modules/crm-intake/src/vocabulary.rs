@@ -97,6 +97,41 @@ pub fn is_source_kind(value: &str) -> bool {
     SOURCE_KINDS.contains(&value)
 }
 
+/// Whether a source of this kind may carry an endpoint key.
+///
+/// ## Why this is a function and not a `kind == "endpoint"` written twice
+///
+/// Three places decide the same fact and all three must agree, or the surface leaks:
+///
+/// * [`crate::store::create_source`] — issues a key, and issues none for a form source,
+///   because a form source is authenticated by the form's own submission validation.
+/// * [`crate::store::rotate_key`] — may only rotate a source that *has* a key.
+/// * [`crate::store::find_source_by_key`] — the public lookup, which matches the stored digest
+///   **and** this rule, so a digest that reached a row by any other route does not open a
+///   public capture path.
+///
+/// The third one is what makes the first two load-bearing rather than tidy. A digest written
+/// onto a form-bound row is a live public capture path onto a source that was never configured
+/// to have one, and the lookup would happily serve it. Writing the rule at each of the three
+/// sites means it is only as good as the last edit, and the last edit has nothing to fail: no
+/// unit test can tell that a form source became key-addressable.
+///
+/// A fourth kind in `SOURCE_KINDS` therefore has to answer this question here, once, where the
+/// reader can see that adding a kind *also* decides whether it is addressable by a credential.
+/// The SQL in [`crate::store::find_source_by_key`] binds [`KEY_BEARING_KIND`] rather than a
+/// literal, so the two cannot drift.
+#[must_use]
+pub fn carries_endpoint_key(kind: &str) -> bool {
+    kind == KEY_BEARING_KIND
+}
+
+/// The one source kind addressable by an endpoint key.
+///
+/// Bound as a query parameter (not interpolated) so the SQL and the predicate above are provably
+/// the same fact, and named rather than inlined because a credential boundary that exists only
+/// as a literal is a boundary a future kind can widen without a test failing.
+pub const KEY_BEARING_KIND: &str = "endpoint";
+
 /// `true` when `value` is a dedupe policy the platform knows.
 #[must_use]
 pub fn is_dedupe_policy(value: &str) -> bool {
@@ -165,6 +200,38 @@ mod tests {
             !is_round_robin_target("round_robin"),
             "a target the evaluator cannot honour is a rule that saves and then does nothing"
         );
+    }
+
+    /// Exactly one kind is addressable by an endpoint key, and the constant the public lookup
+    /// binds is the same one this predicate compares against.
+    ///
+    /// The assertion is per-kind rather than "some kinds carry keys" because the failure this
+    /// pins is a *widening*: a fourth kind added to `SOURCE_KINDS` inheriting key-addressability
+    /// by accident. A test written as `assert!(carries_endpoint_key(k) == (k == "endpoint"))` is
+    /// the same statement twice; naming each kind is what a reader can check by eye, and it
+    /// fails loudly with the offending kind's name when the list grows.
+    #[test]
+    fn exactly_one_kind_is_addressable_by_an_endpoint_key() {
+        for kind in SOURCE_KINDS {
+            let expected = kind == KEY_BEARING_KIND;
+            assert_eq!(
+                carries_endpoint_key(kind),
+                expected,
+                "kind {kind:?} disagrees with the rule `carries_endpoint_key`; a kind that \
+                 carries a key must be one whose authentication is that key"
+            );
+        }
+        // The two non-key kinds are named explicitly because they are the reason the rule
+        // exists: a form source is authenticated by the form's own submission validation, and
+        // an import source is not addressable by any caller at all.
+        assert!(!carries_endpoint_key("form"), "a form source authenticates by its form");
+        assert!(!carries_endpoint_key("import"), "an import source has no caller to key");
+        assert!(carries_endpoint_key("endpoint"));
+        // An unknown kind is never key-bearing. The closed list is the default: a typo in a
+        // `kind` column answers "not key-addressable" rather than reaching for the literal.
+        assert!(!carries_endpoint_key("Endpoint"));
+        assert!(!carries_endpoint_key(""));
+        assert!(!carries_endpoint_key("webhook"));
     }
 
     #[test]

@@ -102,7 +102,10 @@ pub async fn create_source(
 ) -> Result<(IntakeSource, Option<keys::IssuedKey>)> {
     validate_source(draft)?;
 
-    let issued = (draft.kind == "endpoint").then(keys::issue_key);
+    // The key is issued through the shared predicate, not a second `kind == "endpoint"`:
+    // `rotate_key` and `find_source_by_key` both consult `carries_endpoint_key`, and three
+    // copies of this fact is two copies too many for a credential boundary.
+    let issued = crate::vocabulary::carries_endpoint_key(&draft.kind).then(keys::issue_key);
     let query = format!(
         "insert into crm_intake_sources \
          (organization_id, site_id, name, kind, form_key, endpoint_key_hash, endpoint_key_hint, \
@@ -337,15 +340,38 @@ pub async fn delete_source(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Re
 
 /// Rotate a source's endpoint key, returning the new clear key once.
 ///
-/// Refused for a source that has no key (a form-bound one), because "rotate" on a surface
-/// with no key is a button that appears to work and does nothing.
+/// Refused for a source that has no key — a form-bound one, and anything `import`-shaped —
+/// because "rotate" on a surface with no key is a button that appears to work and does
+/// nothing. It is worse than nothing, in fact: the digest is all [`find_source_by_key`]
+/// matches on, so issuing one onto a form-bound row is a **new public capture path** onto a
+/// source that was never configured to have one, and that source is authenticated by the
+/// form's own submission validation rather than by this credential.
+///
+/// **The doc comment promised this refusal since the key surface shipped and there was no
+/// refusal anywhere** — the function found the source, issued a key and wrote it. What hid it
+/// is that the panel is *correct* here (`source.kind === "endpoint"` gates the button in
+/// `intake-sources.tsx`), and every gate that touched rotation created an endpoint source and
+/// asserted only that the digest changed: a test that asserts the happy path passes on an
+/// implementation with no guard at all. `tests/crm_key_lifecycle.rs` is the gate.
+///
+/// `Ok(None)` still means "no such source in this organization" and nothing else, because the
+/// handler maps it to `not_found("intake source")` and a *wrong reason for a refusal* would
+/// send an operator looking for a source that is right there. The refusal for a live source is
+/// an error, not an empty answer.
 pub async fn rotate_key(
     pool: &PgPool,
     organization_id: Uuid,
     id: Uuid,
 ) -> Result<Option<keys::IssuedKey>> {
-    if find_source(pool, organization_id, id).await?.is_none() {
+    let Some(existing) = find_source(pool, organization_id, id).await? else {
         return Ok(None);
+    };
+    if !crate::vocabulary::carries_endpoint_key(&existing.kind) {
+        return Err(CrmIntakeError::invalid(format!(
+            "this intake source has no endpoint key: a \"{}\" source is authenticated by its \
+             own form validation, so there is no key to rotate",
+            existing.kind
+        )));
     }
     let issued = keys::issue_key();
     sqlx::query(
@@ -367,14 +393,27 @@ pub async fn rotate_key(
 /// and the clear key never reaches the database. An unknown key is `None`, not an error: the
 /// caller answers `401` for both an unknown key and a wrong one, because a distinct answer
 /// for a source that does not exist is a source enumeration.
+///
+/// **The predicate reads `kind` as well as the digest**, and that is the second half of
+/// `rotate_key`'s refusal. The digest alone is not the credential boundary — it is the *fact
+/// that a key was written*, and a key can reach a row by a path that is not a rotation: a
+/// restored dump, a hand-written insert, an import tool, a future kind that is given a digest
+/// by its own migration. Matching on the digest alone would serve all of them, so the rule
+/// that decides which kinds are key-addressable is consulted **here, on the public path**,
+/// where it cannot be bypassed by anything that got a digest in.
+///
+/// It is a second predicate on the same indexed column, so it costs no scan, and it cannot
+/// make the surface *less* permissive than the REQ promises: `create_source` issues a key
+/// only for `endpoint`, so every row this now refuses was one the API itself created wrongly.
 pub async fn find_source_by_key(pool: &PgPool, key: &str) -> Result<Option<IntakeSource>> {
     let hash = keys::hash_key(key);
     let query = format!(
         "select {SOURCE_COLUMNS} from crm_intake_sources \
-                         where endpoint_key_hash = $1 and active"
+                         where endpoint_key_hash = $1 and active and kind = $2"
     );
     Ok(sqlx::query_as::<_, IntakeSource>(&query)
         .bind(hash)
+        .bind(crate::vocabulary::KEY_BEARING_KIND)
         .fetch_optional(pool)
         .await?)
 }
