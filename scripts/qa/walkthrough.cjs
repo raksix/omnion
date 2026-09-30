@@ -6500,7 +6500,11 @@ async function runEnvironmentsDepth(page, report) {
     await page.waitForTimeout(300);
     const hostRefused = (await page.locator("text=/A host is a name, not a URL/i").count()) > 0;
     steps.hostRefusedOnScreen = hostRefused;
-    await page.fill("[data-env-host]", `staging-${stamp}.qa.omnion.test`).catch(() => {});
+    // The chip and the banner both name the host, so the walk needs to know which host it
+    // created. Read it back from the row rather than repeating the string: a pass that hardcodes
+    // its own fixture and then asserts against a different value asserts nothing.
+    const environmentHost = `staging-${stamp}.qa.omnion.test`;
+    await page.fill("[data-env-host]", environmentHost).catch(() => {});
     await shot(page, "environments-wizard-host");
     await page.click("[data-env-wizard-next]").catch(() => {});
     await page.waitForTimeout(400);
@@ -6888,6 +6892,100 @@ async function runEnvironmentsDepth(page, report) {
       await shot(page, "environments-promotions-expanded");
     }
 
+    // ---- The header chip and the staging banner (REQ-017, slice 5) -------------------------
+    // This runs BEFORE the archive, deliberately: an archived staging environment is read-only
+    // and the chip is defined to report production for it, so measuring after the archive would
+    // prove the *opposite* of what the criterion asks. The selection is also the only way to
+    // reach the state at all — nothing in the URL selects an environment, which is the whole
+    // reason the chip is a control (see `lib/active-environment.tsx`).
+    await page.goto(`${URL_ADMIN}/environments/${environmentId}`, { waitUntil: "domcontentloaded" }).catch(
+      () => {},
+    );
+    await page.waitForTimeout(1400);
+    const chipBefore = (await page.locator("[data-env-chip]").count()) > 0;
+    const chipProductionBefore = await page
+      .locator('[data-env-chip][data-env-chip="production"]')
+      .count();
+    const bannerBefore = await page.locator("[data-qa-staging-banner]").count();
+    await shot(page, "environments-chip-production");
+
+    await page.click("[data-env-chip]").catch(() => {});
+    await page.waitForTimeout(500);
+    const listOpened = (await page.locator("[data-env-chip-list]").count()) > 0;
+    await shot(page, "environments-chip-open");
+    await page.click(`[data-env-chip-option="${key}"]`).catch(() => {});
+    await page.waitForTimeout(1600);
+
+    const chipStaging = await page.locator('[data-env-chip][data-env-chip="staging"]').count();
+    const bannerVisible = await page.locator(`[data-qa-staging-banner="${key}"]`).count();
+    const bannerText = (await page
+      .locator(`[data-qa-staging-banner="${key}"]`)
+      .first()
+      .innerText()
+      .catch(() => "")) || "";
+    // "Cannot be dismissed" is a claim about a control that must not exist, so it is measured as
+    // one: no close button, no role=dialog with a dismiss affordance, and — the part a person
+    // actually does — it is still there after navigating to another screen entirely.
+    const dismissControls = await page
+      .locator(
+        `[data-qa-staging-banner="${key}"] button[aria-label*="ismiss" i], ` +
+          `[data-qa-staging-banner="${key}"] [data-env-banner-dismiss]`,
+      )
+      .count();
+    await shot(page, "environments-chip-staging-banner");
+
+    // Navigate somewhere unrelated. A banner that lives on /environments is not a panel banner.
+    await page.goto(`${URL_ADMIN}/environments`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const bannerElsewhere = await page.locator(`[data-qa-staging-banner="${key}"]`).count();
+    await shot(page, "environments-chip-banner-elsewhere");
+
+    // The banner's link must reach the changes tab it names, and the chip's selection must have
+    // survived the navigation — a chip that resets on every route is a caption, not a control.
+    const chipSurvived = await page.locator('[data-env-chip][data-env-chip="staging"]').count();
+    await page.click(`[data-qa-staging-banner-link]`).catch(() => {});
+    await page.waitForTimeout(1500);
+    const bannerLinkWentToChanges = page.url().includes("/environments/") && page.url().includes("tab=changes");
+    await shot(page, "environments-banner-link-target");
+
+    // And the way out: choosing production removes the banner, which is the only control that
+    // does. A banner with an ✕ is a banner that can be dismissed; this proves it cannot be
+    // dismissed *by hiding it* — only by leaving.
+    await page.click("[data-env-chip]").catch(() => {});
+    await page.waitForTimeout(500);
+    await page.click('[data-env-chip-option="main"], [data-env-chip-option="production"]').catch(() => {});
+    await page.waitForTimeout(1500);
+    const bannerAfterLeaving = await page.locator("[data-qa-staging-banner]").count();
+
+    steps.chipAndBanner = {
+      chipBefore,
+      chipProductionBefore: chipProductionBefore > 0,
+      listOpened,
+      chipStaging: chipStaging > 0,
+      bannerVisible: bannerVisible > 0,
+      bannerNamesTheHost: environmentHost ? bannerText.includes(environmentHost) : null,
+      dismissControls,
+      bannerElsewhere: bannerElsewhere > 0,
+      chipSurvivedNavigation: chipSurvived > 0,
+      bannerLinkWentToChanges,
+      bannerAfterLeaving,
+    };
+    if (chipBefore && !listOpened) {
+      record({ page: "environments", action: "environment-chip-does-not-open-its-list" });
+    }
+    if (chipStaging > 0 && bannerVisible === 0) {
+      record({ page: "environments", action: "staging-selected-without-a-banner" });
+    }
+    if (dismissControls > 0) {
+      record({ page: "environments", action: "staging-banner-is-dismissible" });
+    }
+    if (bannerElsewhere === 0) {
+      record({ page: "environments", action: "staging-banner-is-not-panel-wide" });
+    }
+    if (bannerAfterLeaving > 0) {
+      record({ page: "environments", action: "staging-banner-survives-leaving-staging" });
+    }
+
     // ---- Archive keeps the content ----------------------------------------------------------
     await page.click("[data-env-detail-archive]").catch(() => {});
     await page.waitForTimeout(500);
@@ -6919,6 +7017,17 @@ async function runEnvironmentsDepth(page, report) {
       steps.promotionDialog?.namesAnItemCount === true &&
       steps.promotionRowWritten > 0 &&
       steps.promotionsTab?.rendered === true &&
+      // The chip and the banner are not decoration on this screen: without them the criterion
+      // "the chip appears in the panel header while staging is active" is unmeasured, and an
+      // unmeasured screen is the exact failure this pass exists to prevent.
+      steps.chipAndBanner?.listOpened === true &&
+      steps.chipAndBanner?.chipStaging === true &&
+      steps.chipAndBanner?.bannerVisible === true &&
+      steps.chipAndBanner?.dismissControls === 0 &&
+      steps.chipAndBanner?.bannerElsewhere === true &&
+      steps.chipAndBanner?.chipSurvivedNavigation === true &&
+      steps.chipAndBanner?.bannerLinkWentToChanges === true &&
+      steps.chipAndBanner?.bannerAfterLeaving === 0 &&
       steps.archive?.keptContent === true;
     return { ok, steps };
   } finally {

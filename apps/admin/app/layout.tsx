@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 
 import "./globals.css";
 import { AppReady } from "@/components/app-ready";
+import { ActiveEnvironmentProvider } from "@/lib/active-environment";
 import { SessionProvider } from "@/lib/session";
 import { readSessionUser } from "@/lib/session-server";
 import { SitesProvider } from "@/lib/sites";
@@ -32,7 +33,13 @@ export default async function RootLayout({ children }: { children: ReactNode }) 
           <SitesProvider>
             {/* Inside `SitesProvider`, outside nothing: the banner only reads the session, and
                 the switcher it sits beside is the control that changes the answer. */}
-            <TenantStatusProvider>{children}</TenantStatusProvider>
+            <TenantStatusProvider>
+              {/* The chip and the staging banner are panel chrome rather than a screen's own
+                  header, so they live beside the freeze notice: both are standing conditions
+                  that must be visible on every page, and a provider mounted under a page would
+                  be a chip that vanishes on navigation. */}
+              <ActiveEnvironmentProvider>{children}</ActiveEnvironmentProvider>
+            </TenantStatusProvider>
           </SitesProvider>
         </SessionProvider>
         <AppReady />

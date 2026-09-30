@@ -14,6 +14,7 @@ import { SiteSwitcher } from "@/components/site-switcher";
 import { OrganizationSwitcher } from "@/components/organization-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
+import { EnvironmentChip, StagingEnvironmentBanner } from "@/components/environment-chip";
 import { TenantStatusBanner } from "@/components/tenant-status-banner";
 import { useSession } from "@/lib/session";
 import { useTenantStatus } from "@/lib/tenant-status";
@@ -253,6 +254,9 @@ export function AppShell({ title, description, children }: AppShellProps) {
               scrolls away is a banner a person reads once and then forgets, and the whole point
               is that it stays until the tenant is reactivated. */}
           <TenantStatusBanner />
+          {/* Staging sits directly under the freeze notice and above the title row, for the same
+              reason: a banner that scrolls away is a banner a person reads once and forgets. */}
+          <StagingEnvironmentBanner />
           <div className="flex flex-wrap items-center gap-3 px-4 py-3 sm:px-6">
             <button
               type="button"
@@ -274,6 +278,10 @@ export function AppShell({ title, description, children }: AppShellProps) {
                 row under the header on small ones. */}
             <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
             <NotificationBell />
+            {/* The environment chip sits with the other tenant-scoped chrome, before the site
+                switcher: which copy of the content you are in is a *wider* fact than which site,
+                and a person reading left to right meets it first. */}
+            <EnvironmentChip />
             <OrganizationSwitcher />
             <SiteSwitcher />
           </div>
