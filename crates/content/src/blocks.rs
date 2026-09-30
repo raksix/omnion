@@ -708,6 +708,56 @@ pub fn blocks_to_value(blocks: &[Block]) -> Value {
     Value::Array(blocks.iter().map(Block::to_value).collect())
 }
 
+/// Every block type the registry knows, in registry order.
+///
+/// One call instead of a caller reading `REGISTRY` and mapping `kind`: the package validator
+/// needs the list to *name* what a package got wrong, and a second implementation of "the list
+/// of block types" is how a validator ends up refusing a type the renderer happily draws.
+#[must_use]
+pub fn known_types() -> Vec<String> {
+    REGISTRY
+        .iter()
+        .map(|entry| (*entry.key).to_owned())
+        .collect()
+}
+
+/// Validate, sanitise and normalise a block tree in the one order the platform stores one.
+///
+/// **This exists because the path was written three times and had already drifted.** A page
+/// save, a pattern save and a template save each had their own sequence, and the page one
+/// normalised *after* sanitising while another normalised first — so a payload took a different
+/// stored shape depending on which door it came in, and the revision diff then reported every
+/// block as changed for a page nobody had edited. The order below is the one the page path
+/// already used, and it is the only one now:
+///
+/// 1. **validate** — read the tree and collect issues. Nothing is written yet.
+/// 2. **parse** — turn the JSON into `Block`s, which is where a malformed id or type is caught.
+/// 3. **sanitise** — strip `script`, `on*` handlers and non-allow-listed embeds from `raw_html`
+///    *on the way into storage*, so every reader downstream inherits safety.
+/// 4. **normalise** — fill each block's registry defaults, so a tree stored today and read after
+///    a schema change compares equal to itself.
+///
+/// The returned report is the validator's, computed on the *incoming* payload: sanitisation and
+/// normalisation change what is stored, not what was wrong with what you sent, and a report
+/// that described the stored tree would report a problem the author never had.
+///
+/// [`crate::pages::update_page`] calls this, and so does a theme slot save. A caller that wants
+/// only the fatal issues reads `report.first_fatal()`; a caller that wants the tree refused
+/// checks that first, because warnings (a heading with no text, an empty column) are a page in
+/// progress rather than a broken page.
+pub fn prepare_tree(payload: Value) -> Result<(Value, BlockValidationReport)> {
+    let report = validate(&payload);
+    let mut parsed = parse_blocks(&payload)?;
+    let _sanitized = sanitize_tree(&mut parsed);
+    for block in &mut parsed {
+        // `normalize` returns the value it did not understand as a warning list, and this
+        // caller has already run the validator — which is where those warnings come from. A
+        // second copy of them in the report would be one finding shown twice.
+        let _ = normalize(block);
+    }
+    Ok((blocks_to_value(&parsed), report))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Per-block settings (`meta`)
 // ---------------------------------------------------------------------------------------------
@@ -948,16 +998,21 @@ impl BlockIssue {
     /// The two are different problems and they are answered differently. A heading without its
     /// text is an author mid-sentence: the draft saves, the editor shows the field, and the
     /// publish is refused. A payload that is not an array, a block with no type, a tree four
-    /// levels deep or one naming a type this platform does not ship is not content at all —
-    /// storing it would put a row in the database that no renderer can draw and no later edit
-    /// can make sense of, so the save itself is refused.
     ///
-    /// A block whose *settings* are unreadable belongs with the unstorable ones rather than with
-    /// the unfinished ones, and the reason is the same in both directions: `hide_on` is read
-    /// server-side to decide whether the block is in the response at all. A save that accepted
-    /// `hide_on: "tablet"` would publish a page whose author believes a block is off on phones
-    /// while it renders on every one of them — a silent disagreement between the panel and the
-    /// site, which is worse than a refused save the author can fix in the inspector.
+    /// **This list and `Severity::Error` are NOT the same thing, and the codes missing from it
+    /// are a decision rather than an oversight.** The three columns codes are exactly those:
+    /// `block_column_orphan`, `block_column_empty` and `block_column_count` all report
+    /// `Severity::Error`, and none of them appears here, because slice 2's half-built-pattern
+    /// feature depends on the answer being "stores, does not publish". An author cutting a
+    /// pattern out of a page that is itself half-finished has to be able to SAVE the work —
+    /// `patterns::a_half_built_pattern_stores_and_reports_what_it_still_needs` is the test
+    /// that says so, and it fails loudly if this list ever grows a columns code.
+    ///
+    /// So the rule for a new code is: does the platform have a reason to hold on to a payload
+    /// it cannot yet render? For `column` the answer is yes (an author is mid-edit). For an
+    /// unknown type or a malformed array the answer is no (nobody can do anything with it).
+    /// The drift test below enumerates the structural codes so that "which side am I on" is a
+    /// question with a written answer rather than an accident of this list.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         matches!(
@@ -969,6 +1024,115 @@ impl BlockIssue {
                 | "block_too_deep"
                 | "block_unknown_type"
         )
+    }
+}
+
+/// The two lists — `Severity::Error` and `is_fatal()` — agree on purpose, and this is where
+/// that agreement is checked.
+///
+/// They are not the same predicate and the difference is load-bearing: an `is_fatal` code is
+/// one every store refuses, while an error that is merely an error is one a store may keep so
+/// the author can keep working on it. The drift this module exists to catch is a code that
+/// moves to `Severity::Error` and is never given a decision, leaving it silently storable
+/// because it happened to be absent from a hand-written list.
+///
+/// So each structural code is asserted against the classification the product wants, in BOTH
+/// directions: the ones that must be refused, and the columns family that must not be. The
+/// second list is the one that would break a feature if someone "fixed" it.
+#[cfg(test)]
+mod fatal_classification {
+    use super::*;
+
+    /// A block value with the props the validator needs to reach the code under test.
+    fn block_value(kind: &str, props: Value) -> Value {
+        json!({ "id": "00000000-0000-4000-8000-000000000000", "type": kind, "props": props })
+    }
+
+    /// `(code, payload)` for every code that must be **refused** by every store.
+    ///
+    /// A function and not a `const`: the payloads are built, and a `const` would need
+    /// `serde_json`'s constructors to be `const fn`, which they are not.
+    fn must_be_refused() -> [(&'static str, Value); 2] {
+        [
+            ("block_payload_invalid", json!({ "not": "an array" })),
+            ("block_unknown_type", json!([block_value("no_such_block", json!({}))])),
+        ]
+    }
+
+    #[test]
+    fn an_unrenderable_payload_is_refused_by_every_store() {
+        for (code, payload) in must_be_refused() {
+            let report = validate(&payload);
+            let issue = report
+                .issues
+                .iter()
+                .find(|issue| issue.code == code)
+                .unwrap_or_else(|| panic!("{code} must still be reported for its own payload"));
+            assert_eq!(issue.severity, "error", "{code} is an error");
+            assert!(
+                issue.is_fatal(),
+                "{code} reports Severity::Error but is_fatal() says it can be stored, so every \
+                 store accepts a tree the renderer cannot draw"
+            );
+        }
+    }
+
+    /// The half-built contract, stated where the classifier is defined so that adding
+    /// `block_column_orphan` to `is_fatal` breaks a test rather than a feature.
+    ///
+    /// An author mid-edit saves their work and is told what is still wrong. That is the whole
+    /// reason `is_fatal` is a list rather than "everything at Error" — and the reason a theme
+    /// slot save also stores an unfinished tree and returns the issues with it.
+    #[test]
+    fn an_orphan_column_blocks_the_publish_without_blocking_the_save() {
+        let report = validate(&json!([block_value("column", json!({}))]));
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "block_column_orphan")
+            .expect("a stray column is reported");
+        assert_eq!(issue.severity, "error", "the author is told");
+        assert!(!report.can_publish, "and the publish is refused");
+        assert!(
+            !issue.is_fatal(),
+            "but the SAVE is not: an author cutting a pattern out of a half-built page has to \
+             be able to keep their work. Making this fatal is not a fix, it is the loss of \
+             the half-built feature"
+        );
+    }
+
+    /// An empty column is a lint: a gap the author can see and fill, not a broken tree.
+    #[test]
+    fn an_empty_column_is_a_warning_and_stores() {
+        // TWO columns, one of them empty. `columns: 2` with a single wrapper is itself a
+        // `block_column_count` error, which would mean this asserted about a different code.
+        let mut columns = block_value("columns", json!({ "columns": 2 }));
+        columns["children"] = json!([
+            {
+                "id": "00000000-0000-4000-8000-000000000001",
+                "type": "column",
+                "props": {},
+                "children": [block_value("text", json!({ "text": "left" }))]
+            },
+            {
+                "id": "00000000-0000-4000-8000-000000000002",
+                "type": "column",
+                "props": {},
+                "children": []
+            }
+        ]);
+        let report = validate(&json!([columns]));
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.code == "block_column_empty")
+            .expect("an empty column is reported");
+        assert_eq!(issue.severity, "warning");
+        assert!(
+            !issue.is_fatal(),
+            "an empty column renders as a gap the author can see; refusing the save would be \
+             a wall where the REQ asks for a lint"
+        );
     }
 }
 
@@ -1548,7 +1712,10 @@ fn is_blank(value: &Value) -> bool {
 /// Fill absent optional props with their defaults, so a stored payload always says what the
 /// author sees. Unknown props are kept: dropping them would lose a value the moment a future
 /// schema adds the field the author already typed.
-#[must_use]
+///
+/// No `#[must_use]`: the function returns `()`, so the attribute could only ever produce a
+/// warning about a value that does not exist, and it did — at every call site, including the
+/// tests. A caller that cares about the result is `sanitize_tree`, which reports.
 pub fn normalize(block: &mut Block) {
     if let Some(entry) = definition(&block.kind) {
         if let Some(object) = block.props.as_object_mut() {
