@@ -6862,3 +6862,58 @@ With the URL set: **17/17 in 143 s**. The discriminator is the DURATION: a suite
 seeds and signs in takes minutes, and 0.10 s means it never got past the connect. Resetting the
 wrong database twice before reading the port would have been the expensive version of the same
 mistake.
+
+## Tick 33 — REQ-062 slice 4, part 1: `omnion create-theme` (2026-09-30)
+
+**What.** The scaffolding CLI the REQ asks for: `omnion create-theme <key>` writes the six
+documented files (manifest, workspace package, `defineTheme` wiring, surface, page layout,
+stylesheet) and refuses a key that is not a key, a directory that already exists, and a
+non-empty directory even with `--force`. A write that fails part way removes the tree, because
+a manifest with no stylesheet loads in the gallery and renders nothing — which reads as a
+platform bug rather than as a scaffolder that died.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-cli --quiet` | **24/0** |
+| scaffold → link → register → `apps/web tsc --noEmit` | **exit 0** (the theme's own files reached the compiler) |
+| `omnion create-theme` on a bad key, a traversal key, an existing dir, a second key, no key | **exit 2 each**, no directory created |
+
+**Three defects, all of which the unit tests passed.** The lesson is the shape of the proof,
+not the three bugs: I read the code first and it looked right, and the whole suite was green.
+Scaffolding for real found all three in one minute.
+
+1. `src/index.ts` shipped a literal `{PLACEHOLDER}PageLayout`. A `const` cannot be formatted,
+   and the test that should have caught it asserted "the file is not empty" — which is not
+   "the file is valid TypeScript". There is now a placeholder scan over the whole generated set
+   and a second test that every name the surface re-exports is *defined somewhere in the set*.
+2. The component name reused the CSS class prefix: `ed-editorialPageLayout`. A CSS class may
+   contain a dash; a TypeScript identifier may not. There are now two functions, and the test
+   asserts the identifier RULE over five keys rather than string equality with one.
+3. "First two letters" gave `non-profit` the prefix `no` — the same prefix `nonprofit` gets, so
+   two themes would share a class namespace in one bundle. Initials now skip the dash.
+
+**The `Next` output was wrong and I only found it by following it.** It said `pnpm install`,
+which does not link a theme into `apps/web` — the renderer imports themes by package name, so
+the new theme was never a dependency, never linked, and the registry import failed `TS2307`.
+The honest version of that proof is: my first "it compiles" run passed `tsc` **with the theme
+not linked at all**, because a file nothing imports is never compiled. It is the same lesson
+as "installs as inactive is proved by the ABSENCE of a row", applied to a compiler: absence of
+an error is only evidence when the thing that would have produced the error was in scope.
+`Next` now names `pnpm --filter @omnion/web add @omnion/theme-<key>@workspace:*`.
+
+**QA pass deferred, and this time it says so honestly.** The pass was queued correctly
+(`QA_STACK=w2`, `--only=theme-builder`, `OMNION_DATABASE_URL` exported, `/dev/shm` avoided) and
+timed out at its 1400 s wait with `QA_EXIT=124`. The slot's holder was a **live** `qa-slot.sh`
+(821838, place 1352 s old) and a sibling's walkthrough was visibly mid-pass on `iam-simulator`.
+The invariant is to kill a queued pass rather than let it hit a full disk, and it is equally to
+let a queued pass die rather than take the box from a pass that is working. Acceptance 15 is
+therefore left **unticked** even though its build half passed: the compiler accepting a theme
+and a browser drawing a page with it are two different claims, and a scaffolder that has never
+rendered is a scaffolder whose first real author discovers the bug.
+
+**Next.** (a) The `--only=theme-builder` depth pass when the slot frees, which closes
+acceptance 10 and 13. (b) Acceptance 15's render half: the QA stack's API plus a published page,
+so the scaffolded theme is drawn rather than compiled. (c) Slice 4's larger half — the ten
+themes, which is the wave's last big piece.
