@@ -5842,3 +5842,88 @@ mine were dropped — w2 had a live cargo, so every sibling's database was left 
 **Still open:** the browser pass (`scripts/qa/run.sh`) has still not run on this box — the QA slot
 was held by a live w3 pass for the whole tick, so the only remaining box in this REQ's checklist is
 the one this loop cannot claim until a slot frees.
+
+---
+
+## Tick 85 — REQ-021 slice 5: the button that tests your e-mail
+
+The first open box I read was the one everybody had written off as "needs a browser pass".
+It did not need a browser pass. **It needed to exist.**
+
+REQ-021's API table has listed `POST /api/v1/notifications/preferences/test` — "send a test
+notification through one channel" — since the request was written on 2026-09-25, and the
+screen spec in the same file describes a per-channel `Test delivery` button. Neither was there:
+
+```console
+$ grep -rn "preferences/test" apps/ crates/ scripts/
+   (nothing)
+```
+
+So the control a reader reaches for when asking *did my e-mail actually go out?* did not exist,
+and the acceptance box naming it had been open for four days for a reason no amount of
+walkthrough would have closed. That is the same defect class this REQ has now produced four
+times — a reader with no writer, a setting nobody reads, a sentence nobody runs, an outage
+that writes no sample — and this instance is the purest form of it: **the specification is the
+only place the feature exists.**
+
+### What writing it turned up, one level down
+
+The route sends a real notification through a real transport, which meant the webhook
+transport had to work, and it could not:
+
+```rust
+// apps/api/src/notification_runner.rs, before
+let Some(url) = job.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else { ... };
+self.client.post(url)
+```
+
+`job.url` is the notification's **in-app deep link** — `/settings/iam/sessions`,
+`/media/files/{id}`. Every module fills it, because that is what the bell deep-links into.
+`reqwest` refuses a relative URL with no base. So every webhook delivery failed three times
+and landed in `failed`, and the outbox's reason column read `builder error: relative URL
+without a base`, which is not a sentence an operator can act on.
+
+The tempting repair — give the notification a real URL — is the wrong one: it would break the
+in-app channel to fix the webhook one. The destination belongs on `notification_channels`,
+which is per-organization anyway (a process-wide URL would send one customer's notifications
+to another customer's collector). Migration **0197** adds `endpoint_id` (a reference into the
+bus REQ-016 already owns, so no second copy of a signing secret) and `endpoint_url`, with a
+check refusing a webhook channel that has neither.
+
+**And the readiness branch had been lying the whole time:**
+
+```rust
+"webhook" => (true, "delivery rides the platform's existing event bus".to_owned()),
+```
+
+Unconditionally `true`, on an installation with no endpoint at all. So the settings screen
+showed the channel as configured while every delivery it queued failed. Readiness that cannot
+notice a missing destination is not readiness — it is a green light wired to nothing. It now
+reads the same destination the transport does.
+
+### A gate that reported the opposite of the truth
+
+`scripts/qa/run-notifications-http.sh` failed seven of seventeen legs with
+`csrf_unavailable`. Not one had anything to do with the code under test: without
+`OMNION_CSRF_SECRET` the API refuses **every** cookie-authenticated write, which is its
+*documented* behaviour — so a red line there reads as the product refusing a bad request
+rather than as the harness being under-configured. `scripts/qa/run.sh` has always exported the
+variable; this gate did not. Confirmed in a scrubbed `env -i` so the pass is the script's own
+doing and not an inherited variable.
+
+**Proof**
+
+```
+cargo test -p omnion-notifications --lib    95 passed   (90 → 95, 5 new on readiness)
+cargo test -p omnion-api --lib              247 passed   (4 new on destination logic)
+cargo test -p omnion-permissions --lib       63 passed
+tsc -p apps/admin/tsconfig.json --noEmit    exit 0
+bash scripts/qa/run-notifications-http.sh   PASS 21/21   (17 → 21, in `env -i`)
+bash scripts/qa/run-notifications-routes.sh PASS          (44 migrations applied, 0197 included)
+```
+
+Commits: `511a50d8` (the destination fix), `43a86c13` (the route), `65e06222` (the screen
+block), `b6c9bdfe` + `f611569f` (the gate fix and the four new legs).
+
+**Still open.** The keyboard and mobile boxes want a browser pass; the QA slot was held by a
+live w3 pass for 24 minutes of this tick, so that instrument was not available here.
