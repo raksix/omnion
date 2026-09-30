@@ -68,6 +68,7 @@ pub mod probes;
 pub mod registry;
 pub mod store;
 pub mod vocabulary;
+pub mod workers;
 
 pub use error::{HealthError, Result};
 pub use history::{
@@ -75,7 +76,8 @@ pub use history::{
     metric_summaries, sparkline_values, summaries_to_csv,
 };
 pub use incidents::{
-    BreachCheck, BREACH_WINDOW_SECONDS, HealthSettings, Incident, IncidentFilter, IncidentOutcome,
+    BreachCheck, BREACH_WINDOW_SECONDS, DEFAULT_CHECK_INTERVAL_SECONDS,
+    DEFAULT_WORKER_STALE_SECONDS, HealthSettings, Incident, IncidentFilter, IncidentOutcome,
     IncidentPage, MAX_CHECK_INTERVAL_SECONDS, MAX_WORKER_STALE_SECONDS,
     MIN_CHECK_INTERVAL_SECONDS, MIN_WORKER_STALE_SECONDS, SettingsUpdate, THRESHOLD_METRICS,
     Threshold, Thresholds, Transition, acknowledge, apply, breach_count, breach_window, clear_breach,
@@ -97,6 +99,11 @@ pub use registry::{
 pub use store::{
     SAMPLE_RETENTION_DAYS, last_sample_at, latest_sample, latest_samples, prune_old_samples,
     record, record_run, recorded_metrics, sample_count, samples_in_window,
+};
+pub use workers::{
+    Heartbeat, KindCount, WORKER_STATES, WorkerRow, WorkerSummary, beat, default_meta,
+    heartbeat_id, hostname, is_worker_state, mark_stopped, prune, rows, self_heartbeat, summarise,
+    validate,
 };
 pub use vocabulary::{
     HOST_METRICS, HOST_SERVICE, SERVICES, STATE_WHEN_UNPROBED, STATES, all_services,

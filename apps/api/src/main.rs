@@ -162,6 +162,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
     }
 
+    // The health runner publishes this process's heartbeat and runs the scheduled probes
+    // (REQ-014, slice 4). Both halves of it were missing before: `worker_heartbeats` had a
+    // reader and no writer, so the `n/m` worker card could only ever say "no worker has
+    // registered a heartbeat", and `run_and_record` was reached from the four route handlers
+    // and nowhere else, so samples existed only while somebody was looking at the panel.
+    let _health = omnion_api::health_runner::spawn(state.clone());
+
     // The backup retention sweep removes expired runs from the destination, artifacts first
     // (REQ-013, slice 3). It is gated by its own flag rather than by `OMNION_RETENTION_RUNNER`
     // because the two sweep different things: an installation that keeps every backup for
@@ -241,6 +248,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let limiter = omnion_api::rate_limit_middleware::RateLimiter::from_store(&state).await;
     let _ = omnion_api::rate_limit_middleware::install(limiter);
 
+    // The runner spawns each got a clone; this one is kept so the shutdown path can still
+    // reach `state` after `router(state)` has taken the original by value.
+    let state_for_runners = state.clone();
     let app = routes::router(state);
     axum::serve(
         listener,
@@ -248,6 +258,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Mark this worker's heartbeat stopped on the way out, so a clean stop is distinguishable
+    // from a crash. Without it the panel says "stale" for a worker that was deliberately
+    // restarted, and those are the two answers an operator needs apart.
+    omnion_api::health_runner::stopped(&state_for_runners).await;
 
     tracing::info!("shutdown complete");
     telemetry.shutdown();
