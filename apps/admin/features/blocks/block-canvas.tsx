@@ -250,8 +250,27 @@ function CanvasBlock({
     ) : null;
 
   if (mode === "render") {
+    // The SAME identifying attributes the edit branch below carries, and for the same reason.
+    //
+    // A read-only phone editor that emits an unidentifiable `<div class="bl-canvas-block">`
+    // looks identical to the edit branch to a reader and completely anonymous to a step: the
+    // walkthrough's `canvasDrawnAt390` counts `[data-block-canvas-block]`, so it read FALSE on
+    // a page whose blocks were all on screen — and an assertion that cannot see the thing it
+    // is about cannot fail for the right reason. `previewDrawnBlocks` and `previewPhoneBlocks`
+    // were reading zero for the same cause, which is how a preview that reports 6 visible
+    // blocks could sit next to a count of 0 drawn.
+    //
+    // Which mode is on screen is recorded as data too, so a step can demand the READ-ONLY
+    // branch specifically rather than "some block, from either mode".
     return (
-      <div className="bl-canvas-block">
+      <div
+        data-block-canvas-block={block.type}
+        data-block-canvas-mode="render"
+        data-block-has-error={blocking ? "true" : "false"}
+        data-block-inline-editable="false"
+        data-block-selected="false"
+        className="bl-canvas-block"
+      >
         {body}
         {frame}
       </div>
