@@ -33,6 +33,8 @@ use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use std::collections::BTreeSet;
+
 use omnion_ai_hub::approvals::io::{self, ApprovalFilter, AuditRow, PolicyChange};
 use omnion_ai_hub::approvals::PolicyView;
 use omnion_ai_hub::approvals::DecisionOutcome;
@@ -72,17 +74,35 @@ pub struct InboxQuery {
     pub limit: Option<i64>,
 }
 
-/// `GET /ai/approvals` — the inbox, plus the per-status counts the tab strip renders and the
-/// pending total the sidebar badge shows.
+/// `GET /ai/approvals` — the inbox, plus the per-status counts the tab strip renders, the
+/// pending total the sidebar badge shows, and **what this viewer may do with a row**.
 ///
 /// The counts come out of the same store call as the rows, so the badge cannot disagree with
 /// the list it sits beside — a mismatch there is how an operator stops trusting the badge.
+///
+/// [`io::Inbox`] is flattened rather than wrapped: the rows and the counts are different shapes
+/// (a list and a map), and a wrapper object the client has to unwrap buys nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct InboxScreen {
+    #[serde(flatten)]
+    pub inbox: io::Inbox,
+    pub viewer_permissions: BTreeSet<String>,
+    /// The decision keys this viewer is missing. Served beside the rows so the inbox can
+    /// render Approve/Reject **disabled and named** rather than enabled-then-refused — the same
+    /// contract `/ai/permissions` keeps for its cells, and the write paths enforce it with a
+    /// `403` naming the key, so the disabled state is a promise the API keeps.
+    pub viewer_missing: BTreeSet<String>,
+}
+
+/// The decision keys the inbox and the review screen check against the viewer.
+const DECISION_KEYS: [&str; 2] = ["ai.approvals.act", "ai.policies.manage"];
+
 pub async fn list_approvals(
     State(state): State<AppState>,
     current: CurrentSession,
     Query(scope): Query<OrgQuery>,
     Query(query): Query<InboxQuery>,
-) -> Result<Json<io::Inbox>, ApiError> {
+) -> Result<Json<InboxScreen>, ApiError> {
     let organization = resolve_organization(&current, scope.organization_id)?;
 
     let filter = ApprovalFilter {
@@ -101,10 +121,44 @@ pub async fn list_approvals(
         .await
         .map_err(ApiError::from)?;
 
-    Ok(Json(io::Inbox {
-        approvals: inbox.approvals,
-        counts: inbox.counts,
+    let (viewer_permissions, viewer_missing) =
+        viewer_decision_keys(state.db().pool(), &current).await?;
+
+    Ok(Json(InboxScreen {
+        inbox,
+        viewer_permissions,
+        viewer_missing,
     }))
+}
+
+/// The viewer's decision keys, split the way the panel needs them.
+///
+/// The split is recomputed per request from the caller's **effective** permissions rather than
+/// from the role's name: two people with the same role can differ, and a panel that guessed
+/// from the role would show a button the API refuses.
+async fn viewer_decision_keys(
+    pool: &sqlx::PgPool,
+    current: &CurrentSession,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), ApiError> {
+    let effective = omnion_permissions::effective_permissions(
+        pool,
+        current.user.id,
+        crate::guards::scope_of(&current.user),
+    )
+    .await?;
+
+    let granted = DECISION_KEYS
+        .iter()
+        .filter(|key| effective.allows(**key))
+        .map(|key| (*key).to_string())
+        .collect();
+    let missing = DECISION_KEYS
+        .iter()
+        .filter(|key| !effective.allows(**key))
+        .map(|key| (*key).to_string())
+        .collect();
+
+    Ok((granted, missing))
 }
 
 /// One row, as the inbox and the review screen render it.
