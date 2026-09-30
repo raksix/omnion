@@ -526,9 +526,23 @@ pub async fn fail_stale_restore_jobs(
     pool: &PgPool,
     max_age_minutes: i64,
 ) -> Result<u64> {
+    // **`running` as well as `queued`, and that widening is the defect this function was
+    // missing.** A worker that is killed mid-restore — a deploy, a panic, a node going away
+    // — leaves a row in `running` for ever. The panel draws it as in progress, the partial
+    // unique index refuses a new restore of that run because a live job exists, and
+    // `fail_stale_restore_jobs` used to sweep only `queued`, so **nothing could ever clear
+    // it**: one crash and the run could not be restored again by anybody. The queue read
+    // (`all_queued_restore_jobs`) is the only thing that moves jobs out of `queued`, and a
+    // dead worker is by definition not going to.
+    //
+    // A `running` job is a harder case than a `queued` one, and it is **not** aborted: it was
+    // claimed, so it very likely already took a safety backup, and some of its objects may
+    // have landed. Claiming "nothing was written" about it would be the exact lie this
+    // feature exists to avoid. So it becomes `failed` with a reason that says what is
+    // unknown, which the schema allows precisely because a `failed` job is one that started.
     let stale = sqlx::query_as::<_, RestoreJob>(&format!(
         "select {JOB_COLUMNS} from backup_restore_jobs \
-         where status = 'queued' \
+         where status in ('queued', 'running') \
            and created_at < now() - make_interval(mins => $1::int) \
          order by created_at asc limit 20"
     ))
@@ -542,23 +556,42 @@ pub async fn fail_stale_restore_jobs(
     .await?;
 
     for job in &stale {
-        // `where status = 'queued'` again: a job claimed between the read above and this
-        // write is somebody's restore in progress, and aborting it here would report a
-        // running job as stopped before it wrote anything — which is the exact lie this
-        // whole feature is built to avoid telling.
-        let reason = format!(
-            "this restore waited {} minutes for a worker and none claimed it, so the platform \
-             stopped it rather than leaving it to spin for ever. Nothing was written. Queue it \
-             again when you are ready.",
-            max_age_minutes
-        );
-        sqlx::query(
+        // `where status in ('queued', 'running')` again: a job claimed between the read
+        // above and this write is somebody's restore in progress, and touching it here
+        // would report a running restore as stopped — which is the exact lie this whole
+        // feature is built to avoid telling.
+        let (status, cancel, reason) = if job.status == "running" {
+            (
+                "failed",
+                "false",
+                format!(
+                    "this restore was claimed {} minutes ago and no worker has touched it since, \
+                     so it is assumed to have been interrupted mid-flight. Whether it wrote \
+                     anything is NOT known: the safety backup named below is the run to go back \
+                     to. Verify the library before queueing another restore of this run.",
+                    max_age_minutes
+                ),
+            )
+        } else {
+            (
+                "aborted",
+                "true",
+                format!(
+                    "this restore waited {} minutes for a worker and none claimed it, so the \
+                     platform stopped it rather than leaving it to spin for ever. Nothing was \
+                     written. Queue it again when you are ready.",
+                    max_age_minutes
+                ),
+            )
+        };
+        sqlx::query(&format!(
             "update backup_restore_jobs \
-             set status = 'aborted', cancel_requested = true, finished_at = now(), \
-                 error = $2, updated_at = now() \
-             where id = $1 and status = 'queued'",
-        )
+             set status = $2, cancel_requested = {cancel}, finished_at = now(), \
+                 error = $3, updated_at = now() \
+             where id = $1 and status in ('queued', 'running')"
+        ))
         .bind(job.id)
+        .bind(status)
         .bind(&reason)
         .execute(pool)
         .await?;

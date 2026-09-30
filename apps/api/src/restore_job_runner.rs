@@ -104,6 +104,12 @@ pub async fn tick(state: &AppState) -> std::result::Result<usize, omnion_backup:
     // first. Before the claim, not after: a row that has been spinning for an hour is a lie
     // the panel is telling an operator right now, and the operator is the one who has to be
     // able to trust this screen.
+    //
+    // The sweep covers `running` as well as `queued`, and that is not tidiness. A worker
+    // killed mid-restore leaves a `running` row that **nothing else can ever move**: the
+    // queue read is the only thing that advances a job, a dead worker is by definition not
+    // going to, and the partial unique index refuses a new restore of the run while it
+    // stands. One deploy mid-restore and the run becomes unrestorable by anybody.
     let stale = omnion_backup::restore_jobs::fail_stale_restore_jobs(pool, QUEUE_MAX_AGE_MINUTES)
         .await?;
     if stale > 0 {
