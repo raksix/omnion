@@ -428,6 +428,41 @@ pub async fn move_workflow(
     .execute(&mut *tx)
     .await?;
 
+    // Re-stamp the search index row, in this transaction.
+    //
+    // **`search_documents.project_id` is the scoping column for global search.** The clause in
+    // `omnion_search::query::search` filters on the value stored on the document, not on the
+    // workflow row, and the document is written by the search provider's upsert — which runs on a
+    // reindex and on nothing else: `index_entity` has no caller and there is no periodic reindex.
+    // So without this line the index keeps naming the project the workflow LEFT, and the failure is
+    // not symmetric. The member who **gained** access cannot find it; the member who **lost** access
+    // keeps finding it, for ever, because nothing re-stamps the row. A `?project=<id>` in a shared
+    // link does not help — the clause reads the stored value.
+    //
+    // Why a plain `update` rather than a call into the search crate: `omnion-workflows` must not
+    // grow a dependency on `omnion-search`, whose whole design is to take project ids as *values*
+    // (see `omnion-search`'s Cargo.toml, which says so). The index row is keyed
+    // `(provider, entity_type, entity_id)` and carries no foreign key to `workflows`, so stamping
+    // one column is well defined — and it is `where provider = 'workflows'`, so a document for
+    // some other entity that happens to share the id cannot be touched.
+    //
+    // **Touching zero rows is not an error.** An unindexed workflow has no document to update, and
+    // refusing the move over one would mean a workflow could not be moved until somebody ran a
+    // reindex. The stale-index problem is fixed at the source (the move); the missing-row case is
+    // handled by the indexer when it eventually runs.
+    //
+    // Inside the transaction rather than after the commit, for the same reason the audit row is:
+    // a stamp that survives a rolled-back move is a document scoped to a project the workflow is
+    // not in — the leak this line exists to close, opened by the fix itself.
+    sqlx::query(
+        "update search_documents set project_id = $1, indexed_at = now() \
+         where provider = 'workflows' and entity_type = 'workflow' and entity_id = $2::text",
+    )
+    .bind(to_project_id)
+    .bind(workflow_id)
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
     Ok(MoveReport {
         dry_run: false,
