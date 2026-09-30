@@ -495,6 +495,9 @@ fn map_token_error(error: omnion_content::ContentError) -> ApiError {
             format!("a token named \"{name}\" already exists in this organization"),
         )
         .with_details(json!({ "field": "name" })),
+        ContentError::InvalidQuery(message) => {
+            ApiError::new(StatusCode::BAD_REQUEST, "invalid_parameter", message)
+        }
         ContentError::InvalidName(message)
         | ContentError::InvalidText(message)
         | ContentError::InvalidKey(message) => {

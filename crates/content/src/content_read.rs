@@ -220,7 +220,7 @@ impl Fields {
     pub fn parse(raw: Option<&str>, whitelist: &[&str]) -> Result<Self> {
         let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(Self {
-                selected: whitelist.to_vec(),
+                selected: whitelist.iter().map(|field| (*field).to_string()).collect(),
             });
         };
         let mut seen: Vec<String> = IDENTITY_FIELDS
@@ -385,7 +385,7 @@ impl ReadPage {
                 // serves Turkish to a caller asking for `tr-TR`.
                 None => language
                     .split_once('-')
-                    .and_then(|(base, _)| base)
+                    .map(|(base, _)| base)
                     .and_then(|base| {
                         translations
                             .iter()

@@ -429,6 +429,11 @@ impl ContentError {
             // is a field the person typed, and a name that is malformed is the same field with a
             // different mistake. Both answer 409/400 with `name_taken` / `invalid_parameter`.
             Self::TokenNameTaken(_) => "name_taken",
+            // A read query that names a parameter the surface does not accept. Its own code so
+            // the API layer can answer `400 invalid_parameter` with `details.field` pointing at
+            // the offending input — the Explorer highlights that field rather than printing a
+            // sentence the caller has to parse.
+            Self::InvalidQuery(_) => "invalid_parameter",
         }
     }
 }
