@@ -135,6 +135,13 @@ step "free space: ${AVAIL_MB}MB"
 # begins from a clean set and the box is not carrying yesterday's processes.
 stop_stack() {
   pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+  # Turbopack leaves a build cache behind when the server is killed, and the cache is
+  # the largest thing any worktree holds: ten stacks held 13 GB of it and filled the
+  # disk twice. The next pass rebuilds what it needs, so this is pure waste — but only
+  # drop it when the pass actually ran, so a stack that failed to start keeps its cache.
+  if [ "${QA_KEEP_NEXT:-0}" != "1" ]; then
+    rm -rf "$ROOT/apps/admin/.next" "$ROOT/apps/web/.next" 2>/dev/null || true
+  fi
 }
 # One trap, both cleanups: a second trap would replace the first and leave the slot held.
 release() {
@@ -143,7 +150,10 @@ release() {
   return 0
 }
 trap release EXIT INT TERM
-stop_stack
+# Only the exit path drops the build cache: the pre-pass call below is here to clear
+# stale servers, and deleting .next there would throw away a warm cache every tick and
+# turn each QA pass into a cold Turbopack build.
+QA_KEEP_NEXT=1 stop_stack
 
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
@@ -186,6 +196,17 @@ if [ "$QA_BUILD_TARGET" != "$ROOT/target" ] && [ -x "$QA_BUILD_TARGET/debug/omni
   mkdir -p "$ROOT/target/debug"
   cp "$QA_BUILD_TARGET/debug/omnion-api" "$ROOT/target/debug/omnion-api"
 fi
+# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
+# handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
+# walkthrough that saves a header policy, uploads a file or takes a backup would record screens
+# that "work" while the API answered 403 the whole time -- and because that refusal is the
+# documented behaviour of a deployment *without* a secret, it reads as the product being correct
+# rather than the harness being under-configured. It is a throwaway value: the process points at
+# a database that was dropped two lines above and listens on loopback.
+#
+# The comment sits here rather than inside the command because a `#` line between two backslash
+# continuations is not a comment: bash keeps reading the command, `#` and the words after it
+# become its arguments, and `pm2 start` is handed a stray name it never recovers from.
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
@@ -203,6 +224,7 @@ else
   OMNION_ENV=development \
   OMNION_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
   OMNION_ADMIN_PASSWORD="$QA_ADMIN_PASSWORD" \
+  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
@@ -228,8 +250,20 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --api "$API_URL" --out "$OUT" ${QA_ONLY:+--only="$QA_ONLY"}
+# `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
+# them, which is the right thing for a full acceptance run and the wrong thing for a loop that
+# has just built two screens and needs them proven before the tick ends. It is a filter on the
+# walk, never on the harness around it: the stack, the reset, the vision review and the report
+# all run exactly as they do for a full pass.
+QA_ONLY_ARGS=()
+[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
+
+# `--api` is not optional. `walkthrough.cjs` declares `URL_API = process.env.QA_API_URL ||
+# arg("api", URL_ADMIN)`, and the admin origin is NOT the API origin: the depth passes that POST
+# (headers, media, forms, SEO, comments) would answer 404 the whole way and report screens that
+# "work" because they never reached the API.
+step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --api "$API_URL" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
 # The vision review reads the whole shot set and judges it against the product's visual rules.
 # On a scoped pass that set is a fraction of the screens, so its verdicts describe a product
