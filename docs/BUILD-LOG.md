@@ -9217,3 +9217,37 @@ scripts/qa/walkthrough-navigation-probe.cjs` OK, the probe 4/4 (and 2 failures p
 `fatal`, the 390×844 and keyboard boxes can be read off it. The ledger's standing warning applies
 to this tick's own evidence: the probes are static checks of structure, and a structural check is
 not a screenshot. The walk is still the only thing that can tick those two boxes.
+
+### A breakpoint prefix is a layout decision (tick 48, third part — `3c006e29`, `fde0b3a9`)
+
+With the pass finally runnable, the mobile acceptance box became answerable, and the answer was
+"no" — so the tick went looking for *why* rather than waiting for a screenshot to prove it. Four
+business screens carried a Tailwind multi-column token with no breakpoint prefix:
+
+| Screen | Was | Now |
+|---|---|---|
+| `crm/activities-view.tsx` — "Hangs off" / "Record id" | `grid-cols-2` | `gap-2 sm:grid-cols-2` |
+| `inventory/stock-list-view.tsx` — on hand / reserved / available | `grid-cols-3` | `gap-2 sm:grid-cols-3` |
+| `inventory/inventory-parts.tsx` — drawer preview | `grid-cols-3` | `gap-2 sm:grid-cols-3` |
+| `inventory/transfers-view.tsx` — four timestamps | `grid-cols-2 … sm:grid-cols-4` | `gap-2 sm:grid-cols-2 … sm:grid-cols-4` |
+
+`sm:grid-cols-2` collapses to one column below 640 px and `grid-cols-2` does not, which is the
+entire mechanism — a layout that is correct on desktop and unfixable on a phone is not "responsive",
+it is one breakpoint away from the acceptance box it was written against. The transfers row is the
+one worth naming: it grew a bare `grid-cols-2` beside an `sm:grid-cols-4`, so it rendered
+one-up-then-four instead of 2 → 4, a defect that only exists *because* the 4-up was already right.
+
+**The probe that found them is structural, and that is stated rather than hidden.**
+`scripts/qa/multi-column-grid-probe.cjs` reads the shipped `.tsx` files and fails any multi-column
+`grid-cols-*` that has no `sm:`/`md:`/`lg:` prefix. It is proven in both directions against the
+pre-fix files (it names the four sites), which is the only reason to believe it would ever fail.
+
+**Typecheck caught two ways to write a comment that stops the file parsing** — both in the same
+edit, both invisible to `node --check` because the file is TSX: a brace comment inside a ternary
+arm (`preview ? (/* … */ …) : …`) is not an expression, and a brace comment that quotes another
+brace comment's token closes early on its own `*/`, leaving the rest of the paragraph to parse as
+JSX text. Gates: `pnpm turbo run typecheck` **2/2**, `node --check` on both harness files, `bash -n`
+on the probe.
+
+**Next.** Run the CRM-focused pass (`QA_ONLY=crm`) on the private stack and read the mobile and
+keyboard legs off it. The box stays unticked until the walk says so — the probe is not the walk.
