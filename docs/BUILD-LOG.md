@@ -9392,3 +9392,71 @@ at the same time. Then slice 3 (incidents + thresholds), whose schema
 (`health_incidents`, `health_settings`) has shipped empty since slice 1 and whose
 empty-only screen the migration comment explicitly refuses to build.
 
+
+## 2026-09-30 — wave 4 · tick 50: the first pass with evidence found two real bugs, and the sweep was grading its own ruler
+
+`47d822b7` (the product) · `ee3387de` (the instrument)
+
+**The run that finally produced evidence.** Ticks 46–48 each recorded a pass and
+none of them had a `summary.json`; tick 49's queued pass finished at 21:04 and is
+the first CRM pass in this module to write one: **119 screenshots, 0 capture
+failures, `voidReasons: []`**, against a live stack (`apiLiveness.up: true`). The
+void-pass guard from `e8d26476` is what makes the difference legible — a pass that
+loses its captures now exits 4, so "no report" can no longer be read as "no
+findings". Everything below is read out of that file.
+
+**`/crm/deals` threw on every load.** `DealsView` calls the list hook at line 507
+and renders the `CrmShell` that provides it *below itself*, so the hook ran before
+any provider existed:
+
+```
+Error: useCrmList must be used inside <CrmShell>
+    at useCrmList (features/crm/crm-parts.tsx:399:11)
+    at DealsView  (features/crm/deals-view.tsx:507:27)
+    at CrmDealsPage (app/crm/deals/page.tsx:18:11)
+```
+
+Twelve console errors in the report, all of them this. The comment two lines above
+the call already said *"`useCrmList` answers null outside the frame"* — a
+documented contract that was never implemented, and the gap between the two is the
+whole bug. The board therefore never rendered (`boardColumns: 0`,
+`boardRendered: false`, `cardHasAButton: false`), and because the route was a
+runtime error page, the state sweep found no error state on it either. **One line
+of a hook, two acceptance boxes.** `useOptionalCrmList` is that contract, kept as a
+separate export so the toolbar keeps the loud throw where a toolbar outside a list
+really is a wiring mistake.
+
+**"2 contactss match."** The count line dropped the plural for every total but 1
+*and* for the whole `deals` entity, so contacts and companies read "contactss" on
+every screen. Found by reading the screenshot the sweep was supposed to have
+captured *as a failure* — the capture that shows the screen working is the same
+capture the report calls broken.
+
+**The sweep was grading its own ruler.** 76 high findings, and they collapse to
+three causes: the two bugs above, and the pass's own instruments. The state sweep
+exists to fail a read, so its 503 logs a console error and a failed request per
+screen — six pairs, plus the retry's — and the roll-up counted all of them. A pass
+that *proved* three screens survive a lost dependency was simultaneously the
+module's worst offender. The lead drain's 403 is designed (`drain_now` refuses an
+account with no primary organization) and the pass signs in as exactly that
+account. Both now register `expectRefusal` immediately before the act, so an
+allowance can only excuse what arrives after it; the sweep's own state steps still
+have to pass on their merits.
+
+**`--only=crm` was called a typo.** A SECTION is asked as "is this name in the
+list", never "is this string a route", so it is absent from `matchedOnly` by
+construction and the unmatched-name guard reported `high unknown-pass-name` — a
+false finding sitting in the same report as the real ones, which is the one thing
+that makes a reader stop believing a report. A group now counts as matched when a
+route under its prefix was actually walked.
+
+**Gates.** `cargo test -p omnion-module-crm --lib` **172/172**; `turbo run
+typecheck` **2/2**; `node --check scripts/qa/walkthrough.cjs` OK. The confirming
+pass is queued behind a live `omnion-w3` holder (pid 542657, `/proc/542657/cwd` =
+`omnion-w3`, its walkthrough still writing) — so **no acceptance box is ticked by
+this entry**, and REQ-051 stays `in-progress`.
+
+**Next.** Harvest the queued CRM pass. If `boardRendered: true` and the three
+formerly-failing state steps answer, the mobile and keyboard boxes have their
+evidence and REQ-051 can close; if the board still does not draw, the crash moved
+rather than died and the screenshot says where.

@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — tick 47 is the tick the null pass stopped being able to hide. The pass that tick 46 recorded as `high 160 / exit 0` was computed from **no evidence at all**: every one of its 47 captures failed on ENOSPC and the same full disk had taken Postgres out, so the API answered a real `503 "database is unavailable"` on every read. The harness had no way to say so — `shot()` logged the failure and carried on, a dead backend was filed as 26 product findings, and the exit code said `fine`. Three fixes in `e8d26476`: failures are counted and stated **above** the findings in both reports; `probeApiLiveness()` asks `/readyz` first (an alive process with a dead database answers `/healthz` 200 and `/readyz` 503 — exactly the state the pass was in) and downgrades the server's own wording to one `qa-stack-down` cause in both the network and console arms; and `passIsVoid()` makes a proofless pass exit **4** while `run.sh` keeps its artifacts and re-exits non-zero. The classifier is proven by `scripts/qa/void-pass-classifier-probe.sh` (**12/12**), which extracts the real function with `sed` rather than re-typing it — and which found two defects in the change that introduced it (`.length` on a number is `undefined`, so a roll-up count read as *no* evidence and voided every well-formed pass). Also merged `origin/main` (3 conflicts: app-shell icons, the mobile route list, the append-only BUILD-LOG via `merge-build-log.py`, 0 entries lost) and reclaimed my own cold `target/` after a `/proc/*/cwd` holder check: 1.9 GB, 97% → 94%. Gates: `turbo run typecheck` **2/2**, `node --check` OK, `bash -n run.sh` OK. **The walk itself has still not run** — the QA slot is held by a sibling writer's live pass (`/proc/1896211/cwd` = `omnion-w6`), and no acceptance box is ticked by this commit. · previous: tick 46 removed the `API_BIN` blocker that had kept this REQ's browser evidence unobtainable for four ticks (`87ec641c`); tick 45 fixed the roll-up's unguarded `m.diagnostics` read and the two CRM screens missing from `mobileRoutes` (`925972d2`, `8345f045`); tick 44 closed the keyboard contract in code for `/crm/activities` and `/crm/leads` (`a38ff972`, `656aa8e2`), which advertised `/`, `j`, `k`, `Enter`, `e`, `?` but listened for none of them.
+> **Status:** in-progress (tick 50 — the first pass in this module that wrote a `summary.json`, and it found two real bugs: `/crm/deals` threw on every load because `DealsView` calls `useCrmList` above the `CrmShell` that provides it, and every count line read "2 contactss". `47d822b7`. The state sweep was also filing its own injected 503s and a designed 403 as defects, and `--only=crm` was reported as a typo; `ee3387de`. Proof: 119 screenshots, 0 capture failures, `voidReasons: []`, `apiLiveness.up: true`, `cargo test -p omnion-module-crm --lib` 172/172, `turbo run typecheck` 2/2. **No box is ticked by this entry** — the confirming pass is queued behind a live sibling holder. Previous: tick 47 made a passless pass exit 4 rather than report `high 160 / exit 0`; tick 46 removed the `API_BIN` blocker that had kept this REQ's browser evidence unobtainable for four ticks; tick 45 fixed the roll-up's unguarded `m.diagnostics` read and the two CRM screens missing from `mobileRoutes`; tick 44 closed the keyboard contract in code for `/crm/activities` and `/crm/leads`.
 
   *Re-run against a database this branch's migration set has seen.* The suite pointed at the shared
   dev database answered 56 × `Migration(VersionMissing(19))`: 19 is a **shared-number collision**
@@ -161,6 +161,14 @@ Payloads carry ids and the changed field list only — never a rendered document
 - [ ] Empty, loading and error states exist on all six screens; no dead buttons and no placeholder rows.
   *Two thirds are in, and both halves were defects rather than omissions.*
 
+  *Tick 50 read this box for the first time with a report behind it, and the answer was
+  "the sweep was grading its own ruler": three of the six screens came back clean
+  (activities, leads, stages) while contacts, companies and deals came back empty — which
+  the screenshots then explained. Contacts and companies were fine and the stub simply
+  never fired on them; deals was the crash above. All six 503s the sweep injects on
+  purpose were being filed as high findings, which is how a pass that *proved* the screens
+  survive a lost dependency was also the module's worst offender (`ee3387de`).
+
   *The state sweep was itself the defect (`fa6181c`).* It reported the contacts and companies
   screens as having **no** error state. They have one — the list's own read renders it. What had
   happened is that both screens fire four reads at once (column catalogue, saved views, company
@@ -251,6 +259,15 @@ Payloads carry ids and the changed field list only — never a rendered document
   without a serving stack, exits **4** and says which — so the next run either ticks this box or
   names the leg that broke. A number that cannot be wrong about its own evidence is the
   precondition for a box like this one ever closing.*
+  *The one defect this box was measuring, found by the first pass that had a screenshot to
+  look at (`47d822b7`, tick 50). The board is the screen's whole body, so it reads the
+  keyboard cursor out of `CrmShell` — and it called the **throwing** form of the hook from
+  *above* the shell it is a child of. `/crm/deals` therefore threw on every load and the
+  board never drew: `boardColumns: 0`, `boardRendered: false`, `cardHasAButton: false`, and
+  the same crash is why the state sweep read no error state on the deals screen. The comment
+  two lines above the call already claimed a `null` contract; `useOptionalCrmList` is it.
+  Re-proved in the browser by the pass this entry queues.*
+
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
   *Half of the module never listened for any of it, and the sheet is shared. `/crm/activities` and
   `/crm/leads` draw their own rows instead of rendering `CrmShell`, so the bindings — which were
