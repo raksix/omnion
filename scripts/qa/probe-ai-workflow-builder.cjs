@@ -392,6 +392,35 @@ function seedDraft() {
         check("approving swaps the bar for the decided state", false, "no approve button");
       }
     }
+    /* ------------------------------------------------- every filter is URL-persisted */
+    // Typed live and verified by hand this tick, then moved in here so it cannot rot: a
+    // filter that lives in React state looks identical until somebody reloads the page and
+    // the console is empty again. The assertion is the *value after a reload*, not the URL
+    // after typing — a screen can write the query string and still re-seed its own state.
+    await page.goto(`${ADMIN}/ai/workflows`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1800);
+    const search = page.locator("[data-draft-search], input[type='search']").first();
+    if (await search.count()) {
+      await search.fill("QA probe");
+      await page.waitForTimeout(1400);
+      const urlAfterTyping = page.url();
+      check(
+        "typing a search writes it to the URL",
+        /[?&]q=/.test(urlAfterTyping),
+        urlAfterTyping.replace(ADMIN, "")
+      );
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(1800);
+      const valueAfter = await search.inputValue().catch(() => "");
+      check(
+        "the search survives a reload, read from the URL",
+        valueAfter === "QA probe",
+        `value=${JSON.stringify(valueAfter)} url=${page.url().replace(ADMIN, "")}`
+      );
+    } else {
+      check("typing a search writes it to the URL", false, "no search input on the console");
+    }
+
   } finally {
     await browser.close();
   }
