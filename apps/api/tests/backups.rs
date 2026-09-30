@@ -203,6 +203,12 @@ fn verify_uri(id: Uuid) -> String {
 fn settings_uri() -> String {
     "/api/v1/backup-settings".to_owned()
 }
+fn schedules_uri() -> String {
+    "/api/v1/backup-schedules".to_owned()
+}
+fn schedule_uri(id: Uuid) -> String {
+    format!("/api/v1/backup-schedules/{id}")
+}
 
 // --------------------------------------------------------------------------------------------
 // Fixture
@@ -2983,5 +2989,327 @@ async fn a_media_index_this_build_cannot_read_is_refused_not_treated_as_empty() 
     assert!(
         runs_after_phase_one >= runs_before,
         "sanity: the two phases are on the same run"
+    );
+}
+
+// --------------------------------------------------------------------------------------------
+// The schedules (REQ-013, slice 3)
+// --------------------------------------------------------------------------------------------
+
+/// A schedule is stored with a **computed** next run, and the worker fires it.
+///
+/// The defect this walk was written for is a silence: `backup_schedules` and
+/// `next_due_schedules` shipped in slice 1 and nothing wrote the column the query reads, so a
+/// schedule could be created, listed and rendered with a cadence sentence beside an empty
+/// next-run cell for ever. A unit test on the cadence cannot catch that — it has no idea
+/// whether a writer exists — so the assertion here is about the column's contents, read out
+/// of PostgreSQL rather than out of the response, and then about a run appearing because the
+/// time came.
+///
+/// The three refusals are in the same walk because they are the same decision: a schedule the
+/// server stores but the worker cannot compute is a row that looks live and never fires, so
+/// it is refused at the door with the field named.
+#[tokio::test]
+async fn a_schedule_is_stored_with_a_next_run_and_the_worker_takes_the_backup() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // --- 1. a daily schedule, and the next run is written -----------------------------------
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &schedules_uri(),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "name": "QA nightly",
+                "frequency": "daily",
+                "at_time": "02:30",
+                "timezone": "Europe/Istanbul",
+                "scopes": ["database", "configuration"],
+                "retention_count": 7,
+                "enabled": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::OK,
+        "body: {}",
+        created.body
+    );
+    let id: Uuid = created.body["id"].as_str().unwrap().parse().unwrap();
+    assert!(
+        created.body["next_run_at"].is_string(),
+        "the response must carry the computed next run: {}",
+        created.body
+    );
+
+    // Read it back OUT OF POSTGRESQL, not from the response. A response can carry a computed
+    // value that was never stored, and the worker reads the column.
+    let stored: Option<time::OffsetDateTime> = sqlx::query_scalar(
+        "select next_run_at from backup_schedules where id = $1",
+    )
+    .bind(id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the schedule must read");
+    assert!(
+        stored.is_some(),
+        "the column the worker reads was left null — the schedule would never fire"
+    );
+
+    // And it is in the FUTURE and, crucially, not at 02:30 UTC. Istanbul is UTC+3, so a
+    // scheduler that stored the wall clock verbatim would be three hours out and this is the
+    // assertion that sees it.
+    let next = stored.expect("checked above");
+    assert!(
+        next > time::OffsetDateTime::now_utc(),
+        "the next run is in the past: {next}"
+    );
+    let utc_hour = next.hour();
+    // 02:30 in Istanbul is 23:30 UTC the previous day, never 02:30 UTC. The assertion is
+    // "not the naive value" rather than "is exactly 23:30" so it does not become a test of
+    // the zone table's contents.
+    assert_ne!(
+        utc_hour, 2,
+        "the next run was stored as the wall clock in UTC, so it is three hours out: {next}"
+    );
+
+    // --- 2. the worker takes the backup when the time comes -----------------------------------
+    // Backdate the column rather than waiting for 02:30: the walk has to be about the worker
+    // finding a due schedule, and a walk that sleeps until half past two is a walk nobody
+    // runs. This is the only time travel in the suite and it touches one column.
+    sqlx::query("update backup_schedules set next_run_at = now() - interval '1 second' where id = $1")
+        .bind(id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the schedule must be backdated");
+
+    let before = run_count(&fixture, fixture.org).await;
+    let started = omnion_api::backup_schedule_runner::tick(&fixture.state)
+        .await
+        .expect("the schedule tick must answer");
+    assert_eq!(started, 1, "exactly one schedule was due: {started}");
+    let after = run_count(&fixture, fixture.org).await;
+    assert_eq!(
+        after,
+        before + 1,
+        "the worker claimed a due schedule and did not take a backup"
+    );
+
+    // The run is a real one: it has the schedule's OWN scopes, not all five. A worker that
+    // walked `PARTS` would produce five artifacts for a schedule that asked for two, which is
+    // the media-counting defect this crate exists to remove, in its most expensive form.
+    let scheduled_parts: i64 = sqlx::query_scalar(
+        "select count(*) from backup_parts bp join backups b on b.id = bp.backup_id \
+         where b.schedule_id = $1 and b.kind = 'scheduled'",
+    )
+    .bind(id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the scheduled run's parts must read");
+    assert_eq!(
+        scheduled_parts, 2,
+        "a schedule for two parts produced {scheduled_parts} — the worker ignored its scopes"
+    );
+
+    // The schedule is rearmed: `next_run_at` is in the future again. A worker that fired but
+    // did not rearm would take the same backup on every tick for ever.
+    let rearmed: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select next_run_at from backup_schedules where id = $1")
+            .bind(id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the schedule must read");
+    let rearmed = rearmed.expect("a fired schedule must still have a next run");
+    assert!(
+        rearmed > time::OffsetDateTime::now_utc(),
+        "the schedule was not rearmed: {rearmed}"
+    );
+
+    // And it does not fire twice for the same slot.
+    let second = omnion_api::backup_schedule_runner::tick(&fixture.state)
+        .await
+        .expect("the second tick must answer");
+    assert_eq!(second, 0, "a rearmed schedule fired again immediately");
+    assert_eq!(
+        run_count(&fixture, fixture.org).await,
+        after,
+        "the second tick took another backup"
+    );
+
+    // --- 3. the refusals --------------------------------------------------------------------
+    // An unknown timezone is refused by name. Storing it would leave a row that looks live
+    // and never fires, which is the defect this whole walk is about.
+    let bad_zone = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &schedules_uri(),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "name": "QA bad zone",
+                "frequency": "daily",
+                "at_time": "02:00",
+                "timezone": "Europe/Istanbool",
+                "scopes": ["database"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        bad_zone.status,
+        StatusCode::BAD_REQUEST,
+        "an unknown timezone must be refused, not stored: {}",
+        bad_zone.body
+    );
+    assert!(
+        bad_zone.body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Europe/Istanbool"),
+        "the refusal must name the zone: {}",
+        bad_zone.body
+    );
+
+    // A daily schedule with no time of day is refused rather than defaulted to midnight,
+    // which is exactly the fallback nobody chose.
+    let no_time = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &schedules_uri(),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "name": "QA no time",
+                "frequency": "daily",
+                "timezone": "UTC",
+                "scopes": ["database"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        no_time.status,
+        StatusCode::BAD_REQUEST,
+        "a daily schedule with no time of day must be refused: {}",
+        no_time.body
+    );
+
+    // And the two refusals left nothing behind.
+    assert_eq!(
+        run_count(&fixture, fixture.org).await,
+        after,
+        "a refused schedule produced a backup"
+    );
+}
+
+/// A stranger's schedule is a `404`, and "run now" is `backup.create` rather than
+/// `backup.manage`.
+///
+/// The key split is the interesting half: pressing "run now" produces a backup and changes
+/// nothing else, so an operator who may take a backup must be able to test that their
+/// schedule works. An operator holding every key **except** `backup.create` may edit
+/// schedules — they are the one who set the cadence — and must not be able to produce one.
+#[tokio::test]
+async fn a_strangers_schedule_is_a_404_and_running_one_needs_the_take_a_backup_key() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &schedules_uri(),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({
+                "name": "QA tenancy",
+                "frequency": "daily",
+                "at_time": "03:00",
+                "timezone": "UTC",
+                "scopes": ["database"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+    let id: Uuid = created.body["id"].as_str().unwrap().parse().unwrap();
+
+    // The fixture's own stranger: a full session in another tenant, holding every backup key
+    // this suite knows. A stranger that is *missing* a key would answer 403 and the walk
+    // would be asserting the boundary at the wrong layer — the guard, not the tenancy.
+    let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
+
+    for (label, method, uri, body) in [
+        ("update", Method::PUT, schedule_uri(id), json!({ "name": "hijacked", "frequency": "daily", "at_time": "04:00", "timezone": "UTC", "scopes": ["database"] })),
+        ("delete", Method::DELETE, schedule_uri(id), json!({})),
+        ("run", Method::POST, format!("{}/run", schedule_uri(id)), json!({})),
+    ] {
+        let answer = call(
+            &fixture.state,
+            request(
+                method,
+                &uri,
+                Some(&stranger_token),
+                Some(&stranger_csrf),
+                Some(body),
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            StatusCode::NOT_FOUND,
+            "a stranger's {label} must be a 404, not a 403: {}",
+            answer.body
+        );
+    }
+
+    // The schedule is untouched: a 403-or-404 is only a boundary if the row is still there.
+    let name: String = sqlx::query_scalar("select name from backup_schedules where id = $1")
+        .bind(id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the schedule must still read");
+    assert_eq!(name, "QA tenancy", "a stranger changed the schedule");
+
+    // An account with read+create+manage is the operator, who CAN run it — and the run is a
+    // real backup tied to the schedule.
+    let before = run_count(&fixture, fixture.org).await;
+    let ran = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("{}/run", schedule_uri(id)),
+            Some(&token),
+            Some(&csrf),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(ran.status, StatusCode::CREATED, "body: {}", ran.body);
+    assert_eq!(run_count(&fixture, fixture.org).await, before + 1);
+
+    // And a manual run does NOT consume the next slot. An operator testing a 03:00 schedule
+    // at 09:00 must not have silently skipped tomorrow's 03:00.
+    let next: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select next_run_at from backup_schedules where id = $1")
+            .bind(id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the schedule must read");
+    let next = next.expect("running a schedule must not clear its next run");
+    assert!(
+        next > time::OffsetDateTime::now_utc(),
+        "a manual run consumed the next scheduled slot: {next}"
     );
 }
