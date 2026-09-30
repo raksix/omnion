@@ -2006,6 +2006,35 @@ export interface MediaRestoreReport {
 }
 
 /** What a restore did, as the result panel renders it. */
+/**
+ * A queued restore (REQ-013, slice 2c).
+ *
+ * `cancellable` is a field rather than a `status === "queued"` derivation the panel makes.
+ * "Can I still stop this" is the only question an operator is asking when they look at a
+ * restore, and a panel that re-derives it from a status list is one edit away from offering a
+ * "stop" button on a restore that has already taken its safety backup — which would discard
+ * the one thing the operator was told they had.
+ */
+export interface RestoreJob {
+  id: string;
+  backup_id: string;
+  parts: string[];
+  status: "queued" | "running" | "succeeded" | "failed" | "aborted";
+  /** Whether an abort is still possible. Only ever true while `status` is `queued`. */
+  cancellable: boolean;
+  cancel_requested: boolean;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  /** The protected run to go back to. Present on every `succeeded` job. */
+  safety_backup_id: string | null;
+  /** The loss the operator agreed to, carried from the preview they read. */
+  live_dropped: number;
+  live_matches: number;
+  result: RestoreOutcome | null;
+  error: string | null;
+}
+
 export interface RestoreOutcome {
   backup_id: string;
   /** The parts considered, in manifest order. */
