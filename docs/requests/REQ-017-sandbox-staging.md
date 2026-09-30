@@ -167,13 +167,26 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
 - [x] A new organization gets exactly one `production` environment; a second production insert fails at the database (partial unique index proven in a test).
 - [x] `POST /api/v1/environments` creates a staging environment with status `cloning` and returns immediately; the clone job reaches `done` and per-area counts match the production
   counts.
-- [ ] Clone copies pages, revisions, translations, menus, site settings, theme selection and workflow definitions, and copies **no** media blobs (verified by storage object count before
+- [x] Clone copies pages, revisions, translations, menus, site settings, theme selection and workflow definitions, and copies **no** media blobs (verified by storage object count before
   and after).
-  *(tick 67 is the reason this reads oddly: three of the six areas — theme selection, workflow
-  definitions and site settings — were being **labelled and priced** in the wizard while copying
-  **nothing**, and `Area::copies()` now declares the truth in the crate. The unticked box is
-  still honest: the criterion asks for a storage-object count across a clone, and no walk
-  measures one.)*
+  *(tick 67 is the reason this reads oddly: three of the six areas — menus, site settings and the
+  theme — were being **labelled and priced** in the wizard while copying **nothing**, and
+  `Area::copies()` now declares the truth in the crate. **Tick 74 ran the walk for the first
+  time and it was wrong twice before it was right** (`9c9749ab`), which is the honest shape of
+  this box: `a_clone_copies_content_and_leaves_every_media_byte_where_it_was` had been written
+  and committed without ever executing, and a walk that has never run is a *guess about a
+  schema*, not evidence. It decoded `environment_clone_jobs.areas` as `jsonb` when it is
+  `text[]` (the per-area counts are `area_counts jsonb`), and once that was fixed it asserted
+  the theme area was priced and copied — which is the exact defect tick 67 closed, asserted
+  back into existence by a test nothing contradicted. It now asserts the true claim: the job
+  must **not** list `theme` among its counts, the three areas that really copy must each be
+  present, and `items_done` must equal the sum of `area_counts` (a self-consistent runner that
+  reported 3 of 3 having copied nothing is the shape the batching bugs took). The object count
+  itself comes from `omnion_backup::pending_objects` — the reader an archive uses — so the
+  before and after numbers are comparable by construction rather than by agreeing on a
+  definition; it also compares the **key set**, because a clone that moved bytes would keep the
+  count and break production's copy, and finally reads the object back to prove it is still
+  there. PASS, 8.3s.)*
 - [x] Clone is idempotent: re-cloning an unchanged environment produces the same counts and no duplicate rows (natural keys are unique per environment).
 - [x] Staging nesting is refused with `staging_nesting_refused` for a staging source.
 - [x] Editing a page in staging leaves the production row byte-identical (asserted by comparing `updated_at` and revision hashes).
