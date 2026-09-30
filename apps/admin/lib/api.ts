@@ -6228,6 +6228,160 @@ function skillScopeParams(organizationId?: string | null): string {
   return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
 }
 
+// ---- The AI tool registry (REQ-100) ------------------------------------------------------
+//
+// `ungated_high_risk` and `used_by_agents` are computed by the API on purpose. The stripe and the
+// disable confirmation are the two places this screen can quietly lie — a client that derived
+// "is this high risk and ungated" from `risk === "high" && !requires_approval` would have to
+// re-implement the disabled-wins rule to get the same answer, and one that derived the agent list
+// from its own copy of the agents table would name agents from another organization.
+
+/** One registry row. */
+export type AiTool = {
+  key: string;
+  class: string;
+  /** The single permission this tool needs. Never a list. */
+  permission: string;
+  risk: "low" | "medium" | "high";
+  description: string;
+  idempotent: boolean;
+  requires_approval: boolean;
+  enabled: boolean;
+  timeout_ms: number;
+  max_calls_per_run: number;
+  /** Set once the tool has left the compiled catalogue. */
+  retired_note: string | null;
+  /** Enabled, high risk, no approval gate — the row that gets a warning stripe. */
+  ungated_high_risk: boolean;
+  calls_30d: number;
+  /** `null` when the tool was never called, which is not the same as 0 %. */
+  error_rate_30d: number | null;
+  last_used: string | null;
+  used_by_agents: { id: string; name: string }[];
+};
+
+/** The list body. `seeded: false` renders the "seeding has not run" banner. */
+export type AiToolList = { tools: AiTool[]; seeded: boolean };
+
+/** One row of a tool's Recent calls. Arguments are never returned. */
+export type AiToolCall = {
+  id: number;
+  created_at: string;
+  agent_id: string | null;
+  agent_name: string | null;
+  run_id: string | null;
+  status: "ok" | "denied" | "failed" | "timeout" | "limited";
+  error_code: string | null;
+  duration_ms: number | null;
+  args_bytes: number | null;
+  result_bytes: number | null;
+};
+
+/** One tool with its schema, limits and recent calls. */
+export type AiToolDetail = AiTool & {
+  input_schema: unknown;
+  example: unknown;
+  /** `false` for a row whose tool has left the compiled catalogue. */
+  compiled: boolean;
+  recent_calls: AiToolCall[];
+};
+
+/** The class metadata the filters and grouping read. */
+export type AiToolClass = { key: string; label: string; order: number; default_risk: string };
+
+/** One tool's usage chart: totals plus the per-day series.
+ *
+ *  NOT `AiToolUsage` — REQ-099's agent telemetry already owns that name at line ~5507, and a
+ *  second export under it would make the telemetry's `tools: Record<string, number>` shadow the
+ *  registry's per-day series depending on import order. `AiToolUsageChart` says which of the two
+ *  is meant at the call site. */
+export type AiToolUsageChart = {
+  key: string;
+  days: number;
+  calls: number;
+  errors: number;
+  error_rate: number | null;
+  avg_duration_ms: number | null;
+  series: { day: string; calls: number; errors: number; avg_duration_ms: number | null }[];
+};
+
+function toolScopeParams(organizationId?: string | null): string {
+  return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+}
+
+/** The registry, with every filter the spec's table lists. */
+export function fetchAiTools(options?: {
+  organizationId?: string | null;
+  q?: string;
+  class?: string;
+  risk?: string;
+  gated?: boolean;
+  enabled?: boolean;
+}): Promise<AiToolList> {
+  const params = new URLSearchParams();
+  if (options?.organizationId) params.set("organization_id", options.organizationId);
+  if (options?.q) params.set("q", options.q);
+  if (options?.class) params.set("class", options.class);
+  if (options?.risk) params.set("risk", options.risk);
+  if (options?.gated !== undefined) params.set("gated", String(options.gated));
+  if (options?.enabled !== undefined) params.set("enabled", String(options.enabled));
+  const query = params.toString();
+  return request<AiToolList>(`/api/v1/ai/tools${query ? `?${query}` : ""}`);
+}
+
+/** One tool. */
+export function fetchAiTool(
+  key: string,
+  organizationId?: string | null,
+): Promise<AiToolDetail> {
+  return request<AiToolDetail>(
+    `/api/v1/ai/tools/${encodeURIComponent(key)}${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** The class list, for the filter chips and the grouping order. */
+export function fetchAiToolClasses(organizationId?: string | null): Promise<AiToolClass[]> {
+  return request<AiToolClass[]>(
+    `/api/v1/ai/tools/classes${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** The four operator-owned decisions. An absent field is left as it is. */
+export async function updateAiTool(
+  key: string,
+  changes: {
+    enabled?: boolean;
+    requires_approval?: boolean;
+    timeout_ms?: number;
+    max_calls_per_run?: number;
+  },
+  organizationId?: string | null,
+): Promise<AiTool> {
+  return request<AiTool>(`/api/v1/ai/tools/${encodeURIComponent(key)}${toolScopeParams(organizationId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(changes),
+  });
+}
+
+/** One tool's usage chart over a window.
+ *
+ *  NOT `fetchAiToolUsage` — REQ-099's agent telemetry already exports that name for the
+ *  tenant-wide `{ since, tools: Record<string, number> }` shape. Two exports under one name in a
+ *  6700-line module is a duplicate-implementation error, and the *right* fix is the more specific
+ *  name rather than renaming the one three other files already import. */
+export function fetchAiToolUsageChart(
+  key: string,
+  options?: { organizationId?: string | null; days?: number },
+): Promise<AiToolUsageChart> {
+  const params = new URLSearchParams();
+  if (options?.organizationId) params.set("organization_id", options.organizationId);
+  if (options?.days) params.set("days", String(options.days));
+  const query = params.toString();
+  return request<AiToolUsageChart>(
+    `/api/v1/ai/tools/${encodeURIComponent(key)}/usage${query ? `?${query}` : ""}`,
+  );
+}
+
 /** The registry, optionally filtered to the rows that are enabled. */
 export function fetchAiSkills(options?: {
   organizationId?: string | null;
