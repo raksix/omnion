@@ -1,16 +1,19 @@
 # REQ-021 — Notification Center
 
-> **Status:** in-progress — slices 1–3 code-complete. **This tick fixed a defect the settings
-> screen could not have shown you** (`c48db9d`): `read_settings` read the `time` columns with
-> `::text`, which Postgres renders as `22:00:00`, while the platform's clock vocabulary is
-> `HH:MM`. So every saved quiet window came back in a shape `parse_clock` rejected, and
-> `in_quiet_hours` took its documented "no window means not quiet" arm — the setting a reader
-> had just turned on decided nothing from the next request onwards. The read now uses
-> `to_char(..., 'HH24:MI')`, and `parse_clock` tolerates the padded spelling so a row written
-> earlier is still a window. Two gate legs added (`60a28ea`), proven in both directions: the
-> pre-fix tree answers `22:00:00` and fails, the fixed tree answers `22:00` and passes.
-> **Not closed** — the keyboard leg and the two settings boxes still need a *browser* pass
-> against a binary built after this, and no such pass has run yet. · **Captured:** 2026-09-25 · **Layer:** core (`crates/notifications`) + admin UI
+> **Status:** in-progress — slices 1–3 code-complete, **slice 4 (the delivery runner) shipped
+> 2026-09-30**. That slice closed the box that described a runner which had never existed: the
+> `notification_deliveries` table had readers since slice 1 and no writer at all.
+> `delivery.rs` (queue), `0185` (the claim lease), `notification_runner.rs` (the transports) and
+> a live-database walk of the whole lifecycle. **Two defects were found by writing the walk**,
+> both of which would have shipped as silent behaviour — see the build log. Also fixed 2026-09-30
+> (`c48db9d`): `read_settings` read the `time` columns with `::text`, which Postgres renders as
+> `22:00:00`, while the platform's clock vocabulary is `HH:MM` — so every saved quiet window came
+> back in a shape `parse_clock` rejected and the setting a reader had just turned on decided
+> nothing from the next request onwards (`60a28ea` proves both directions). **Not closed** — the
+> keyboard leg and the two settings boxes still need a *browser* pass against a binary built
+> after all of this, and no such pass has run; the QA slot queue is 1 deep but held by a live
+> sibling pass and the box sat at load 60–102 with 8 concurrent `rustc`, so a browser pass was
+> not a usable instrument for this tick. · **Captured:** 2026-09-25 · **Layer:** core (`crates/notifications`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 > **Slice 1 shipped** (9137f16 the record, 8f9d570 the panel, c856fb2 the HTTP gate): the
@@ -160,7 +163,7 @@ Migration: `database/migrations/0011_notifications.sql` (take the next free numb
 - [ ] Test delivery through e-mail and webhook reports success or a readable failure inline.
 - [ ] Web Push: subscribe, receive one real notification, unsubscribe; a revoked endpoint is pruned.
 - [x] The in-app column cannot be disabled (server rejects it, UI shows it locked). *(pass 23:51: `inAppLocked` true, `lockedColumnExplainsItself` true, and the refusal itself is asserted over the wire — status **400** with a message that names the reason rather than the field)*slice 2's preference matrix; `in_app` is already in the channel list so the matrix can render it locked)*
-- [ ] Delivery runner retries a failing channel per backoff and marks it `failed` after the cap.
+- [x] Delivery runner retries a failing channel per backoff and marks it `failed` after the cap. *(closed 2026-09-30, `slice 4`. The table `notification_deliveries` shipped with slice 1 and every later slice *read* it — the outbox lists it, the retry button re-queues it, the channel filter joins it — but nothing ever wrote a row or claimed one, so the box described a runner that did not exist. It exists now: `crates/notifications/src/delivery.rs` (enqueue, `for update skip locked` claim with a lease, `attempts` incremented in the same statement, exponential backoff clamped and capped, `failed` at the cap) + migration `0185` (the `claimed_at` lease column, which is what a claim needs and the table never had) + `apps/api/src/notification_runner.rs` (the transports, deliberately *not* in the crate: a transport is an SMTP conversation and an HTTP POST, and `omnion-automation` already owns the mail sender, so putting one in the crate would have made infrastructure depend on a mail stack to satisfy a trait it defined itself). `apps/api/tests/notification_delivery.rs` drives the whole lifecycle over a live database: 8 walks including the cap, the lease recovery, the multi-tenant settlement and the outbox reading the queue's own writes back. **The walks found two real defects while being written, both now fixed**: `enqueue` had an early return that contradicted its own contract (a caller with no remote channel to ask about got *no rows at all*, so the notification existed with no delivery record — the in-app row is the inbox and must be unconditional), and `settle_not_ready`'s `not exists` was uncorrelated, so on a multi-tenant install one organization configuring e-mail would have silently stopped delivery for every other organization. See the build log for the counts)*
 - [x] `notifications.admin` sees the outbox; a user without it gets `403` and no nav entry. *(pass 23:51 — the first that produced `report.notificationOutbox`: `loaded` true, 5 chips all carrying counts, `chiptotalMatchesSql` true, `targetHiddenForActor` true, `targetAppearsForPermission` true, `noTargetWroteNothing` true, `actorActuallyWroteARow` true, `removeStatus` 204 and `removedFromTheTable` true, `retryIsNotRetryable` true. The database is fresh so `deliveryRows` is 0 and the empty state is the honest answer — no fixture row was added to make the table look full)*slice 3's outbox; the key is deliberately not in the catalogue yet — a permission with no route behind it is a promise the platform cannot keep)*
 - [x] A notification the reader has already read stays on the list until it is archived. *(this tick's defect, `ab3c105` + `4933c10` + `797a3e8`. `with_read` was a `bool` defaulting to `false`, so **every** caller that named no filter got an unread-only list while the State menu labelled that state "Unread and read" — a screen promising a list it was not sending. It surfaced as `keyboard: "no rows to drive"`, four lines after the pass marked its own three rows read. `Option<bool>` carries absent-vs-off, `?with_read=0` is the inbox, and two gates now hold it: the walkthrough asserts `readRowsStayVisible` right after the bulk action, the HTTP gate asserts `all=1 inbox=0 live=1` over a socket)*
 - [x] Another user's notification returns `404`, never its content. *(HTTP gate: 404, and the body carries no content from the row)*

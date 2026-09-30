@@ -24,6 +24,7 @@ pub mod intent_resolver;
 // "keep both" — dropping either would leave a file that nothing references (or a module with no
 // file). A merge that silently drops one side's `pub mod` compiles cleanly and fails at runtime
 // with a route that is not registered.
+pub mod notification_runner;
 pub mod publishing_runner;
 pub mod rate_limit_middleware;
 pub mod retention_runner;
