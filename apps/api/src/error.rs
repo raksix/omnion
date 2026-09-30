@@ -681,6 +681,55 @@ impl From<ContentError> for ApiError {
                 "theme_settings_contrast_required",
                 message,
             ),
+            // Theme layouts and packages (REQ-062 slice 3). The statuses are three different
+            // next steps again: a slot the platform does not render is a bad request (the
+            // caller named something that cannot exist), a reset with no shipped default is a
+            // conflict (the request is well-formed; this site never had that default), a
+            // package with errors is 422 with the whole report in the message so the upload
+            // screen can point at the line — and a removal that is refused because the theme is
+            // bundled or in use is a CONFLICT, because nothing about the request was malformed:
+            // it is a resource in a state that forbids the write.
+            ContentError::ThemeUnknownSlot(slot) => Self::bad_request(
+                "theme_unknown_slot",
+                format!("'{slot}' is not a slot this platform renders"),
+            ),
+            ContentError::ThemeSlotTooLong(slot, max) => Self::bad_request(
+                "theme_slot_too_long",
+                format!("the slot name must stay under {max} characters ('{slot}')"),
+            ),
+            ContentError::ThemeSlotTooManyBlocks(max) => Self::bad_request(
+                "theme_slot_too_many_blocks",
+                format!("a slot may hold at most {max} blocks"),
+            ),
+            ContentError::ThemeSlotInvalid(message) => Self::bad_request(
+                "theme_slot_invalid",
+                format!("this slot cannot be stored: {message}"),
+            ),
+            ContentError::ThemeSlotNoDefault(slot) => Self::new(
+                StatusCode::CONFLICT,
+                "theme_slot_no_default",
+                format!("this theme ships no default layout for '{slot}'"),
+            ),
+            ContentError::ThemePackageInvalid(count) => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "theme_package_invalid",
+                format!("the package has {count} error(s) and was not installed"),
+            ),
+            ContentError::ThemeBundledCannotBeRemoved(key) => Self::new(
+                StatusCode::CONFLICT,
+                "theme_bundled_cannot_be_removed",
+                format!("'{key}' is a bundled theme and cannot be removed"),
+            ),
+            ContentError::ThemeInUse(key) => Self::new(
+                StatusCode::CONFLICT,
+                "theme_in_use",
+                format!("'{key}' is still in use and cannot be removed"),
+            ),
+            ContentError::ThemePackageTooLarge(max) => Self::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "theme_package_too_large",
+                format!("the package is larger than the {max} byte limit"),
+            ),
             other => Self::bad_request("invalid_request", other.to_string()),
         }
     }

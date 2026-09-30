@@ -69,6 +69,7 @@
 //! cap, a per-site rate limit and a collector that decides before it writes. The worker that
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
+pub mod theme_layouts;
 pub mod theme_settings;
 pub mod themes;
 pub mod ai;
@@ -1148,6 +1149,31 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "themes.read"));
     let theme_settings_restore = post(theme_settings::restore_revision)
         .layer(guards::require(&state, "themes.customize"));
+    // Theme layouts and packages (REQ-062 slice 3). The builder reads with `themes.read` and
+    // writes with `themes.customize`, exactly as the settings surface does — a slot and a
+    // colour token are the same power over the same site.
+    //
+    // The package routes are `themes.install`/`themes.export` and NOT `themes.customize`,
+    // because they are not about one site: a package crosses sites, and an account that may
+    // restyle the site it is on has no business writing a row every site in the installation
+    // can see. The validate route carries `themes.install` too — a dry run that an editor
+    // cannot perform is a dry run they guess at instead.
+    let theme_layouts_read =
+        get(theme_layouts::read_layouts).layer(guards::require(&state, "themes.read"));
+    let theme_layout_slot_read =
+        get(theme_layouts::read_slot).layer(guards::require(&state, "themes.read"));
+    let theme_layout_slot_save = put(theme_layouts::save_slot)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_layout_slot_reset = post(theme_layouts::reset_slot)
+        .layer(guards::require(&state, "themes.customize"));
+    let theme_package_export =
+        get(theme_layouts::export_package).layer(guards::require(&state, "themes.export"));
+    let theme_package_validate =
+        post(theme_layouts::validate_package).layer(guards::require(&state, "themes.install"));
+    let theme_package_install =
+        post(theme_layouts::install_package).layer(guards::require(&state, "themes.install"));
+    let theme_remove = delete(theme_layouts::remove_theme)
+        .layer(guards::require(&state, "themes.install"));
     let seo_redirect_create =
         post(seo::create_redirect).layer(guards::require(&state, "seo.manage"));
     let seo_redirect_write = put(seo::update_redirect)
@@ -1898,6 +1924,32 @@ pub fn router(state: AppState) -> Router {
             "/sites/{site_id}/theme-settings/revisions/{revision_no}/restore",
             theme_settings_restore,
         )
+        // Theme layouts and packages (REQ-062 slice 3). `/themes/{key}` above is a GET, and a
+        // `DELETE` on the same path is a different method — axum merges those, so the two
+        // coexist. `validate` and `install` are registered BEFORE `/themes/{key}` for the
+        // reason `/backups/sweep` is: a `POST /themes/validate` would otherwise be a perfect
+        // `key` and no conflict at all, so this is a readability choice rather than a
+        // correctness one — but it keeps the static names next to each other.
+        .route("/themes/validate", theme_package_validate)
+        .route("/themes/install", theme_package_install)
+        .route("/sites/{site_id}/theme-layouts", theme_layouts_read)
+        .route(
+            "/sites/{site_id}/theme-layouts/{slot}",
+            theme_layout_slot_read,
+        )
+        .route(
+            "/sites/{site_id}/theme-layouts/{slot}",
+            theme_layout_slot_save,
+        )
+        .route(
+            "/sites/{site_id}/theme-layouts/{slot}/reset",
+            theme_layout_slot_reset,
+        )
+        .route(
+            "/sites/{site_id}/theme-package/export",
+            theme_package_export,
+        )
+        .route("/themes/{key}", theme_remove)
         .route("/public/media/{id}", public_media)
         // The share token route: unauthenticated by nature, because the token is the
         // credential. It is a *static* `shared` segment, so it never collides with the

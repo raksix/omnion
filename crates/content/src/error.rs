@@ -212,6 +212,39 @@ pub enum ContentError {
     /// it needs an explicit acknowledgement rather than a correction.
     #[error("the settings fail the contrast check: {0}")]
     ThemeSettingsContrastRefused(String),
+    // --- Theme layouts and packages (REQ-062 slice 3) ---------------------------------------
+    // Each of these is a sentence an operator acts on, and each is a *different* next step,
+    // which is why they are separate variants rather than one `ThemeError(String)`: a screen
+    // that receives "unknown slot 'foot'" needs to say "that is not a slot — here are the
+    // eight we render", while a screen that receives "the tree cannot be stored" needs to
+    // point the author at the block that caused it.
+    /// A slot name that is not one the platform renders.
+    #[error("'{0}' is not a slot this platform renders")]
+    ThemeUnknownSlot(String),
+    /// A slot name longer than the column allows.
+    #[error("the slot name must stay under {1} characters ('{0}')")]
+    ThemeSlotTooLong(String, usize),
+    /// A slot tree carrying more top-level blocks than a slot may hold.
+    #[error("a slot may hold at most {0} blocks — this one is larger")]
+    ThemeSlotTooManyBlocks(usize),
+    /// A slot tree the store cannot hold, with the validator's own reason.
+    #[error("this slot cannot be stored: {0}")]
+    ThemeSlotInvalid(String),
+    /// Reset was asked for a slot the theme never shipped a default for.
+    #[error("this theme ships no default layout for '{0}'")]
+    ThemeSlotNoDefault(String),
+    /// A package with errors in it, with the count so the screen does not recount the list.
+    #[error("the package has {0} error(s) and was not installed")]
+    ThemePackageInvalid(usize),
+    /// A bundled theme was asked to be deleted; it is a file, not a row.
+    #[error("'{0}' is a bundled theme and cannot be removed")]
+    ThemeBundledCannotBeRemoved(String),
+    /// An uploaded theme is still the active one, or a site still holds its layouts.
+    #[error("'{0}' is still in use and cannot be removed")]
+    ThemeInUse(String),
+    /// An uploaded package was larger than the platform accepts.
+    #[error("the package is larger than the {0} byte limit")]
+    ThemePackageTooLarge(usize),
     /// No comment carries this identifier, or it belongs to another site (REQ-064 slice 4a).
     #[error("no such comment")]
     CommentNotFound,
@@ -372,6 +405,19 @@ impl ContentError {
             Self::ThemeSettingsNothingToPublish => "theme_settings_nothing_to_publish",
             Self::ThemeSettingsDraftStale { .. } => "theme_settings_draft_stale",
             Self::ThemeSettingsContrastRefused(_) => "theme_settings_contrast_required",
+            // Slot and package failures (REQ-062 slice 3). Each one is its own code because the
+            // upload screen branches on them: an unknown slot and an unknown block type are two
+            // different sentences about two different parts of the same file, and a client that
+            // only had "theme_package_invalid" could not point at the line that was wrong.
+            Self::ThemeUnknownSlot(_) => "theme_unknown_slot",
+            Self::ThemeSlotTooLong(_, _) => "theme_slot_too_long",
+            Self::ThemeSlotTooManyBlocks(_) => "theme_slot_too_many_blocks",
+            Self::ThemeSlotInvalid(_) => "theme_slot_invalid",
+            Self::ThemeSlotNoDefault(_) => "theme_slot_no_default",
+            Self::ThemePackageInvalid(_) => "theme_package_invalid",
+            Self::ThemeBundledCannotBeRemoved(_) => "theme_bundled_cannot_be_removed",
+            Self::ThemeInUse(_) => "theme_in_use",
+            Self::ThemePackageTooLarge(_) => "theme_package_too_large",
         }
     }
 }

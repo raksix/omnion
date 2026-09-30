@@ -173,6 +173,29 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Edit, publish and restore a site's theme settings",
     },
+    // Packages (REQ-062 slice 3). Two more powers, and neither is implied by the three above —
+    // the argument is the one the whole surface is built on, applied to a resource that
+    // crosses sites.
+    //
+    // `themes.export` is separate from `themes.read` on purpose even though it looks like a
+    // read: an export carries every published token and every customised slot *off* the
+    // platform, and "may look at the gallery" is not a grant to take the site's look with you.
+    //
+    // `themes.install` is the strongest of the five: it writes a row every site in the
+    // installation can see, and an uploaded theme is the only one that can carry markup and
+    // tokens an operator did not write. It is deliberately NOT implied by `themes.activate`,
+    // because activating something you cannot install is harmless while installing something
+    // you cannot activate is how a package nobody vetted reaches the gallery.
+    PermissionDef {
+        key: "themes.export",
+        category: "content",
+        description: "Export a site's theme as a package",
+    },
+    PermissionDef {
+        key: "themes.install",
+        category: "content",
+        description: "Validate, install and remove uploaded theme packages",
+    },
     PermissionDef {
         key: "newsletter.read",
         category: "content",
