@@ -179,7 +179,16 @@ QA_ONLY_ARGS=()
 [ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
 
 step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
+# Exit 4 is the walkthrough's "this run is not a verdict" — it lost its evidence or the stack
+# stopped serving. It must NOT abort the script: the summary and the report below are the record
+# of a pass that went wrong, and losing them leaves nobody anything to triage. So the code is
+# kept, the roll-up still runs, and the script still fails at the end. `set -e` is what would
+# otherwise swallow all three, which is precisely how the tick-46 null reached a BUILD-LOG.
+WALK_EXIT=0
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}" || WALK_EXIT=$?
+if [ "$WALK_EXIT" != "0" ]; then
+  printf '\n[qa] the walkthrough exited %s — the report below is a record of the run, not a verdict.\n' "$WALK_EXIT"
+fi
 
 step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"
@@ -201,6 +210,13 @@ const doc = [
   `- Console errors: ${summary.counts?.consoleErrors ?? 0} · failed requests: ${summary.counts?.failedRequests ?? 0} · dialogs: ${summary.counts?.dialogs ?? 0}`,
   `- Programmatic findings: ${summary.findings?.length ?? 0} (high ${summary.bySeverity?.high ?? 0} · medium ${summary.bySeverity?.medium ?? 0} · low ${summary.bySeverity?.low ?? 0})`,
   `- Vision issues: ${vision.issues ? vision.issues.length : "skipped"}${vision.skipped ? ` (${vision.skipped})` : ""}`,
+  ...(summary.voidReasons && summary.voidReasons.length
+    ? [
+        "",
+        `> **THIS RUN IS NOT A VERDICT — ${summary.voidReasons.length} reason(s):** ${summary.voidReasons.join("; ")}.`,
+        `> The counts below were computed without the evidence a verdict needs. Re-run the pass.`,
+      ]
+    : []),
   "",
   "## Top findings",
   "",
@@ -216,3 +232,14 @@ step "done"
 echo "QA_ARTIFACTS=$OUT"
 echo "QA_REPORT=$OUT/report.md"
 grep -E "^QA_|^VISION_" "$OUT"/*.log 2>/dev/null || true
+
+# The verdict is the exit status, carried through from the walkthrough itself rather than
+# re-derived here: the walkthrough is the only place that knows whether the run produced evidence,
+# and a second implementation of that rule in the shell would be one more thing that can disagree
+# with the first. A pass that cannot be believed must fail the command that ran it, or "zero high
+# findings" keeps reading as a green result on a BUILD-LOG line.
+if [ "$WALK_EXIT" != "0" ]; then
+  echo "QA_VERDICT=void (walkthrough exit $WALK_EXIT)"
+  exit "$WALK_EXIT"
+fi
+echo "QA_VERDICT=pass"

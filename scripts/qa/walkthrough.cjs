@@ -318,6 +318,10 @@ const netFailures = [];
 const netAborted = [];
 const dialogs = [];
 const shots = [];
+// Screenshots the pass TRIED to take and could not write. Kept beside `shots` on purpose: the
+// difference between "this screen has no visual problem" and "this screen was never photographed"
+// is invisible in `shots` alone, because a failed capture adds nothing to it. See `shot()`.
+const shotFailures = [];
 
 async function shot(page, name, { full = true } = {}) {
   const file = path.join(SHOTS, `${name}.png`);
@@ -325,6 +329,20 @@ async function shot(page, name, { full = true } = {}) {
     await page.screenshot({ path: file, fullPage: full, timeout: 15000 });
     shots.push({ name, file, url: page.url(), bytes: fs.statSync(file).size });
   } catch (err) {
+    // A screenshot is the pass's only evidence, so a failure to write one is not a cosmetic
+    // problem to log and move past: it is the pass losing the ability to prove anything about
+    // this screen. The tick-46 pass is the reference case — `/mnt/apopic` reached 100%, every
+    // `page.screenshot` raised ENOSPC, the loop below "interact: 0 elements" on screens that had
+    // in fact rendered, and the report came out as `high 160` and exit 0. 160 findings computed
+    // from no evidence is not a verdict on the product; it is arithmetic on a null, and it reads
+    // exactly like one because the number was printed in the same shape.
+    //
+    // So a failed capture is now counted, and the count is reported in three places that a
+    // reader actually consults: the roll-up (`counts.shotFailures`), the report's own headline,
+    // and the `QA_*` line. Nothing about the *findings* changes — they are still computed, still
+    // written, still useful for triage — but they can no longer be quoted as a result without the
+    // missing-evidence number travelling with them.
+    shotFailures.push({ name, url: page.url(), error: err.message });
     log(`screenshot failed for ${name}: ${err.message}`);
   }
 }
@@ -8673,6 +8691,91 @@ async function runAnalyticsSettingsDepth(page, report) {
 
 // ---------------------------------------------------------------- run
 
+/**
+ * Ask the QA API whether it is still serving.
+ *
+ * `/healthz` is the liveness probe and `/readyz` is the readiness one, and the difference is the
+ * point: an API whose process is alive but whose database is gone answers `/healthz` 200 and
+ * `/readyz` 503, which is precisely the state the tick-46 pass was in. A probe that only checked
+ * "is something listening" would have called that stack healthy, and the pass would have gone on
+ * converting a dead database into 26 product findings.
+ *
+ * So both are asked, and the reason names which one failed. The URL is reported back rather than
+ * assumed, because the admin panel is reached on one port and the API on another and a report
+ * that names the wrong one sends the reader to the wrong process.
+ */
+async function probeApiLiveness() {
+  const url = `${URL_ADMIN}/healthz`;
+  // Ready first: it is the stricter question, so a green answer already implies liveness.
+  for (const [probe, why] of [
+    ["readyz", "the database behind it is not available"],
+    ["healthz", "the API process is not answering"],
+  ]) {
+    try {
+      const res = await fetch(`${URL_ADMIN}/${probe}`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) return { up: true, url, reason: "" };
+      return { up: false, url: `${URL_ADMIN}/${probe}`, reason: `answered ${res.status} — ${why}` };
+    } catch (err) {
+      return { up: false, url: `${URL_ADMIN}/${probe}`, reason: String(err.message || err) };
+    }
+  }
+  return { up: false, url, reason: "unreachable" };
+}
+
+/**
+ * A refusal that names a dead dependency rather than the product: Postgres is not reachable, so
+ * the read failed on the way to the handler and no screen can be judged by it.
+ *
+ * The substring list is deliberately the server's own wording rather than a status code. A 500
+ * from a healthy database is a product defect; a 503 whose body says the database is unavailable
+ * is the harness's stack, and the two must not share a severity column. `database is unavailable`
+ * is the API's message, so a change to it shows up here as a miss — which is the correct outcome:
+ * the fallback is then "classified as a product finding", i.e. the strict reading.
+ */
+function isStackFailure(entry) {
+  const text = `${entry.detail || ""} ${entry.error || ""} ${entry.reason || ""}`.toLowerCase();
+  return /database is unavailable|connection refused|terminating connection|server closed the connection|too many connections|remaining connection slots/.test(
+    text,
+  );
+}
+
+/**
+ * A pass that lost its evidence or ran against a dead stack has produced no verdict, so it must
+ * not be able to hand one back in the shape of a number.
+ *
+ * `shot()` already records every capture it could not write, and `probeApiLiveness()` already
+ * records whether the stack was serving. This is the third place: the exit code. Every other gate
+ * in this repo treats a red run as a failed run, and the walkthrough's exit status is the one
+ * signal that cannot be misread as a passing product — a findings list with a low number and a
+ * zero exit is the combination that let a null pass sit in a BUILD-LOG for a tick looking like
+ * careful triage.
+ *
+ * The findings themselves are still written: they are useful for triage, and throwing them away
+ * would lose the record of what the pass did see. Only the verdict is withheld.
+ */
+function passIsVoid({ shotFailures, apiLiveness, clicks, shots }) {
+  const reasons = [];
+  // `clicks` and `shots` are ARRAYS at the call site, but the same rule is asked of the roll-up's
+  // `counts` elsewhere, where they are NUMBERS. A predicate that only understands one of those
+  // reads `undefined` on the other and answers from noise — `.length` on a number is undefined,
+  // so `!undefined` is true and every well-formed pass would be voided. The count is what the
+  // rule actually wants, so the array is measured instead of trusted.
+  const size = (v) => (typeof v === "number" ? v : (v?.length ?? 0));
+  // `size(...)` and not `shotFailures?.length`: a count of 0 is falsy, a count of 3 is a number
+  // with no `.length`, so the optional-chain guard above read the number form as "no failures" and
+  // voided nothing. The predicate is `size > 0` in both shapes, and that is the whole point of
+  // routing both through one measurement.
+  if (size(shotFailures) > 0) reasons.push(`${size(shotFailures)} screenshot(s) could not be written`);
+  if (apiLiveness && apiLiveness.up === false) reasons.push(`the QA stack was not serving (${apiLiveness.reason})`);
+  // A pass that interacted with nothing has not tested anything, whatever its findings say. This
+  // is how the tick-46 null actually read from the outside: 35 clicks on a report full of findings
+  // looks like a thorough pass until you notice no evidence survived it.
+  const clickCount = size(clicks);
+  const shotCount = size(shots);
+  if (!clickCount || !shotCount) reasons.push(`the pass recorded ${clickCount} clicks and ${shotCount} screenshots`);
+  return reasons;
+}
+
 async function main() {
   const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
@@ -9571,6 +9674,26 @@ async function main() {
     );
   }
   const refusedOnPurpose = [];
+  // Is the stack still up? A pass that walks twenty screens against an API which stopped
+  // answering turns every screen's read into a 503, and each of those becomes a `high`
+  // `request-failed` that is indistinguishable, in the report, from a screen that genuinely
+  // misbehaves. The tick-46 pass is the case: 26 findings quoted `503 "database is unavailable"`
+  // and were read as 26 defects.
+  //
+  // The API is asked directly rather than inferred from the failure pile, because inference is
+  // exactly what fails here — the *symptom* is what is being classified, so it cannot be the
+  // evidence. One request, before the findings are rolled up, and the answer is recorded whether
+  // it is up or down: a green pass and a broken stack then differ by a sentence in the report
+  // rather than by nothing at all.
+  const apiLiveness = await probeApiLiveness();
+  if (!apiLiveness.up) {
+    pushFindings(
+      "high",
+      "qa-stack-down",
+      `the QA API did not answer ${apiLiveness.url} (${apiLiveness.reason}). Every screen read below answers ` +
+        `against a stack that is not serving, so these findings describe the pass, not the product — re-run the pass.`,
+    );
+  }
   for (const [index, f] of consoleLog.entries()) {
     if (f.type === "warning") continue;
     // A console line names the status, not the URL: the allowance for one is the window it was
@@ -9584,6 +9707,14 @@ async function main() {
       continue;
     }
     const isWeb = f.phase === "web";
+    // The same rule as the network arm, for the same reason and by the same evidence: a console
+    // line that repeats the API's own "database is unavailable" is the stack speaking, not a
+    // screen misbehaving. Without this the two arms disagree — the network one says "the database
+    // died" and the console one still files 26 `high` findings that look like product defects.
+    if (isStackFailure({ detail: f.text })) {
+      pushFindings("low", "stack-failure", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
+      continue;
+    }
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-console" : "console-error", `${f.phase} ${f.url}: ${f.text.slice(0, 180)}`);
   }
   for (const [index, n] of netFailures.entries()) {
@@ -9600,6 +9731,13 @@ async function main() {
       continue;
     }
     const isWeb = n.phase === "web";
+    // A read that failed because Postgres was gone is not a screen's behaviour. It is downgraded
+    // and labelled so the severity column stops mixing "the product refused" with "there was no
+    // product to ask" — and `qa-stack-down` above carries the one finding that names the cause.
+    if (isStackFailure(n)) {
+      pushFindings("low", "stack-failure", `${n.phase} ${n.status || "net"} ${n.url} ${n.error || ""}`.trim());
+      continue;
+    }
     pushFindings(isWeb ? "medium" : "high", isWeb ? "web-request" : "request-failed", `${n.phase} ${n.status || "net"} ${n.url} ${n.error || ""}`);
   }
   for (const c of clicks.filter((c) => ["click-error", "console-error", "request-failed"].includes(c.outcome))) {
@@ -9703,6 +9841,10 @@ async function main() {
       filled: clickLines.filter((e) => e.action === "fill").length,
       forms: clickLines.filter((e) => e.action === "form").length,
       screenshots: shots.length,
+      // Printed next to the screenshot count, not in the findings, because it is a statement
+      // about the pass rather than about the product. A reader who sees `0 screenshots` learns
+      // it; a reader who sees only the findings learns nothing at all.
+      shotFailures: shotFailures.length,
       consoleErrors: consoleLog.filter((c) => c.type !== "warning").length,
       warnings: consoleLog.filter((c) => c.type === "warning").length,
       failedRequests: netFailures.length,
@@ -9710,9 +9852,15 @@ async function main() {
       dialogs: dialogs.length,
     },
     bySeverity,
+    // Recorded whether it is up or down. A reader has to be able to tell "the pass found nothing
+    // wrong" from "the pass could not have found anything", and the difference is here.
+    apiLiveness,
+    // The list of reasons this run is not a verdict. Empty is the only value that means "run it".
+    voidReasons: passIsVoid({ shotFailures, apiLiveness, clicks, shots }),
     findings,
     expectedRefusals: refusedOnPurpose,
     shots,
+    shotFailures,
     consoleLog,
     netFailures,
   };
@@ -9725,6 +9873,17 @@ async function main() {
   md.push(`- Admin: ${URL_ADMIN} · Web: ${URL_WEB}`);
   md.push(`- Pages walked: ${report.pages.length} · interactions: ${clicks.length} clicks, ${summary.counts.filled} fills, ${summary.counts.forms} form submissions`);
   md.push(`- Screenshots: ${shots.length} · console errors: ${summary.counts.consoleErrors} · failed requests: ${netFailures.length} · dialogs: ${dialogs.length}`);
+  // A pass that lost its evidence says so ABOVE the findings, not in a footnote under them.
+  // The tick-46 report led with `Findings — 165 (high 160 …)` while every one of its 47 captures
+  // had failed on a full disk; the number that decides whether the number can be believed has to
+  // sit next to the number, or a reader takes the second as the verdict and never reads on.
+  if (shotFailures.length) {
+    md.push("");
+    md.push(`> **EVIDENCE INCOMPLETE — ${shotFailures.length} screenshot(s) could not be written.** The findings below were`);
+    md.push(`> computed without them and must not be read as a verdict on the product. Most common cause is a full`);
+    md.push(`> disk: the captures are the first writes to fail and the screens still render. First failures:`);
+    for (const f of shotFailures.slice(0, 5)) md.push(`> - \`${f.name}\` — ${f.error}`);
+  }
   md.push("");
   md.push(`## Findings — ${findings.length} (high ${bySeverity.high} · medium ${bySeverity.medium} · low ${bySeverity.low})`);
   md.push("");
@@ -9760,7 +9919,19 @@ async function main() {
 
   log(`done: ${findings.length} findings (high ${bySeverity.high}), ${clicks.length} clicks, ${shots.length} shots`);
   console.log(`QA_OUT=${OUT}`);
-  console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length}`);
+  // `QA_SHOT_FAILURES` is on this line rather than buried in `summary.json` because this line is
+  // what a script, a CI grep or a person skimming the tail of a log reads. A pass that produced
+  // no evidence has to be unable to print a clean-looking pair of numbers.
+  console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length} QA_SHOT_FAILURES=${shotFailures.length}`);
+  // A run that cannot be believed exits non-zero, loudly, after writing everything it saw. The
+  // findings file is still produced on purpose: the record of a broken pass is worth keeping,
+  // and a future tick can read which screens it did reach.
+  const voidReasons = passIsVoid({ shotFailures, apiLiveness, clicks, shots });
+  if (voidReasons.length) {
+    console.error(`[walk] THIS PASS IS NOT A VERDICT: ${voidReasons.join("; ")}`);
+    console.error(`[walk] artifacts kept at ${OUT} — re-run the pass before reading any finding above.`);
+    process.exit(4);
+  }
 }
 
 main().catch(async (err) => {
