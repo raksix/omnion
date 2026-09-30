@@ -970,6 +970,52 @@ pub fn validate_with_plugins(
         }
     }
 
+    // A node the linear walk cannot choose between.
+    //
+    // `find_cycle` follows every edge out of a node (that was the tick-38 fix), and the
+    // projection is the consumer that has to *pick* one, because the v0 engine executes an
+    // ordered list. It used to pick with `find(|edge| … follows(port))` — the first matching
+    // edge in the saved array — which means a node carrying two edges on ports the walk
+    // follows (`case_1` and `default` on a switch; two `out` edges) resolved to whichever one
+    // the client happened to serialise first.
+    //
+    // That is a wrong-run bug dressed as a working feature: the rule validates clean, and it
+    // silently runs the other branch on every execution. Worse, the answer is not a property
+    // of the drawing at all — re-saving the identical graph with the edges in a different
+    // order would change what it does.
+    //
+    // So it is refused here, at write time, naming the ports. Two walkable ports on one node
+    // is not a shape the engine can execute, and the author needs to hear that from the
+    // problems panel rather than from a run that did the wrong thing.
+    let mut walkable: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for edge in &graph.edges {
+        if follows(edge.source_port.as_str()) {
+            let entry = walkable.entry(edge.source.as_str()).or_default();
+            if !entry.contains(&edge.source_port.as_str()) {
+                entry.push(edge.source_port.as_str());
+            }
+        }
+    }
+    for (source_id, ports) in &walkable {
+        if ports.len() < 2 {
+            continue;
+        }
+        let label = graph
+            .node(source_id)
+            .map_or(*source_id, |node| node.label.as_str());
+        findings.push(Finding::error(
+            "ambiguous_branch",
+            format!(
+                "{:?} leaves on two ports the run follows ({}), so the engine cannot tell \
+                 which one to take — connect one of them to something else, or route the \
+                 other through a condition",
+                label,
+                ports.join(", ")
+            ),
+            Some(source_id),
+        ));
+    }
+
     // Reachability from the trigger, and orphans.
     let trigger_id = triggers.first().map(|node| node.id.as_str());
     let reachable = trigger_id
@@ -1932,6 +1978,62 @@ mod tests {
         assert!(
             project(&graph).is_err(),
             "and a graph that loops cannot be stored, rather than stored and hanging at run time"
+        );
+    }
+
+    #[test]
+    fn a_node_with_two_followed_ports_is_refused_rather_than_guessed() {
+        // The sibling of `a_loop_that_closes_on_a_branch_is_still_a_loop`, one level down.
+        // `find_cycle` was fixed to follow every edge; the projection still resolves the
+        // *next* node with `find(|edge| … follows(port))`, so a node carrying two edges on
+        // ports the linear walk follows (`case_1` and `default` on a switch, or two `out`
+        // edges) resolves to whichever one sits earlier in the saved array.
+        //
+        // The consequence is worse than the cycle bug in one way and better in another: a
+        // rule whose author drew the *default* branch second would run it as if it were the
+        // case, silently, on every run — while validating clean. And the array order is not
+        // the author's intent: it is the order the client happened to PUT, so the same
+        // drawing can project to two different rules depending on how it was saved.
+        //
+        // The v0 engine walks ONE linear path, so two followed ports on one node is not a
+        // shape it can execute. It must be refused at write time with the ports named —
+        // never resolved by array position.
+        let graph = Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                {
+                    let mut sw = node("sw", "switch");
+                    sw.params = json!({ "cases": "a\nb" });
+                    sw
+                },
+                action("taken"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "sw".to_owned() },
+                // `case_1` first in the array, so the old walk followed THIS one.
+                Edge { id: "e1".to_owned(), source: "sw".to_owned(), source_port: "case_1".to_owned(), target: "taken".to_owned() },
+                Edge { id: "e2".to_owned(), source: "sw".to_owned(), source_port: "default".to_owned(), target: "end".to_owned() },
+                Edge { id: "e3".to_owned(), source: "taken".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+            ],
+        };
+
+        let err = project(&graph).expect_err("a switch with two walkable ports is not walkable");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("two") && (rendered.contains("case_1") || rendered.contains("port")),
+            "the refusal names the ports rather than picking one: {rendered}"
+        );
+
+        // And the array order must not decide: reversing it has to produce the SAME
+        // sentence, or the rule still depends on how the client saved it.
+        let mut reversed = graph.clone();
+        reversed.edges.swap(1, 2);
+        let err2 = project(&reversed).expect_err("order must not change the verdict");
+        assert_eq!(
+            err2.code(),
+            err.code(),
+            "the verdict is a property of the drawing, not of the saved array order"
         );
     }
 
