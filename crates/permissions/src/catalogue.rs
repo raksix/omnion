@@ -482,6 +482,31 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "backup",
         description: "Manage backup schedules, retention and destination settings",
     },
+    // System health (docs/requests/REQ-014). Two powers, and the split is the one the
+    // request draws: **seeing** that a dependency is unhappy is an operational fact every
+    // support conversation needs, and **changing what counts as unhappy** is a decision
+    // about this deployment that a reader must not be able to make.
+    //
+    // * `health.read` is the overview, the service detail, the metrics and the incidents.
+    //   It is safe to grant broadly for the same reason `backup.read` is: knowing Redis
+    //   stopped answering is the alarm, and hiding it from somebody who can see the
+    //   dashboard is how a support call turns into an outage.
+    // * `health.manage` runs the probes on demand, writes thresholds and intervals, and
+    //   acknowledges or resolves an incident. It is NOT implied by `read`, for the reason
+    //   the request gives explicitly: `POST /checks/run` is a mutation — it writes samples
+    //   — so it rides the managing key rather than the reading one. A reader who could
+    //   trigger a run could also fill the retention window with samples of their own
+    //   choosing, one button press at a time.
+    PermissionDef {
+        key: "health.read",
+        category: "health",
+        description: "Read system health, metrics and incidents",
+    },
+    PermissionDef {
+        key: "health.manage",
+        category: "health",
+        description: "Run health checks, set thresholds and acknowledge incidents",
+    },
     PermissionDef {
         key: "notifications.read",
         category: "notifications",
@@ -870,6 +895,21 @@ mod tests {
                 get(key).map(|entry| entry.category),
                 Some("ai"),
                 "{key} belongs to the ai category"
+            );
+        }
+    }
+
+    #[test]
+    fn the_health_family_is_catalogued() {
+        // REQ-014: seeing that a dependency is unhealthy and deciding what counts as
+        // unhealthy are two powers, and the run-checks mutation is the second one
+        // because it writes samples — a reader must not be able to fill the
+        // retention window with samples of their own choosing.
+        for key in ["health.read", "health.manage"] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("health"),
+                "{key} belongs to the health category"
             );
         }
     }
