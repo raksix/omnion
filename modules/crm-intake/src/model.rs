@@ -264,6 +264,15 @@ pub struct Lead {
     pub spam_score: i32,
     /// Why it was rejected, when it was.
     pub rejection_reason: Option<String>,
+    /// The submitter's address, as the request carried it.
+    ///
+    /// Nullable on purpose: a submission that arrived through the events bus has no HTTP
+    /// request behind it, and a bus delivery that the platform itself made must not be
+    /// attributed to an address. The column exists so the per-address ceiling
+    /// ([`crate::store::submissions_from_address_this_hour`]) can count a *durable* fact —
+    /// the address can not be recovered after the request is gone, and the trail line's
+    /// `detail->>'ip'` is jsonb a `where` clause cannot use.
+    pub submitter_ip: Option<String>,
     /// When it arrived.
     pub received_at: OffsetDateTime,
     /// When conversion finished.
@@ -844,6 +853,7 @@ mod tests {
             escalated_at: None,
             spam_score: 0,
             rejection_reason: None,
+            submitter_ip: None,
             received_at: OffsetDateTime::UNIX_EPOCH,
             converted_at: None,
             created_at: OffsetDateTime::UNIX_EPOCH,

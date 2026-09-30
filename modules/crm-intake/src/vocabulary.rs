@@ -65,6 +65,20 @@ pub const MAX_BULK_IDS: usize = 200;
 /// because nobody can see it.
 pub const MAX_PAYLOAD_BYTES: usize = 262_144;
 
+/// How many submissions **one address** may send to one source in an hour.
+///
+/// The second ceiling, and deliberately not a source setting: a per-address limit is a
+/// property of abuse, not of the business. An operator with a busy form and a bot hammering
+/// the same source has one dial today (`rate_limit_per_hour`) and it moves both at once —
+/// lowering it stops the flood and their real enquiries with it. This is that second dial.
+///
+/// The number is the one a person would pick: nobody types a company name and a message
+/// eleven times in sixty minutes, and a form's own ceiling is almost always higher. A
+/// visitor who genuinely sends more than this is a caller the source's own `rate_limit_per_hour`
+/// will still answer — so the two ceilings compose rather than compete, and this one refuses
+/// first because it is the cheaper signal to explain ("this address sent eleven in an hour").
+pub const MAX_SUBMISSIONS_PER_ADDRESS_PER_HOUR: i64 = 10;
+
 /// `true` when `value` is a status the platform knows.
 #[must_use]
 pub fn is_status(value: &str) -> bool {
