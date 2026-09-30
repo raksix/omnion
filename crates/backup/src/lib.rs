@@ -40,6 +40,7 @@ pub mod part;
 pub mod preview;
 pub mod purge;
 pub mod restore;
+pub mod restore_jobs;
 pub mod restore_objects;
 pub mod store;
 pub mod sweep;
@@ -89,7 +90,7 @@ pub use store::{
     organizations_with_backups,
     protected_backup_count, prune_candidates, record_schedule_run, save_part, save_settings,
     schedule_appears_due, set_prefix, set_protected, set_schedule_enabled,
-    set_schedule_next_run, start_run, totals,
+    set_schedule_next_run, start_run, totals, last_succeeded_at,
     upsert_schedule,
 };
 pub use sweep::{

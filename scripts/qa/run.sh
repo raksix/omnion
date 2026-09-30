@@ -61,15 +61,12 @@ wait_http() { # url, seconds
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  # Invoked through `bash` for the same reason as cargo-slot.sh below: the executable bit is
-  # not carried by every clone, and a pass that dies holding the slot blocks the other seven
-  # writers behind it.
-  #
-  # `$$` is THIS shell, not the qa-slot.sh child, and that distinction is the fix. The place
-  # lives in a holder the reaper must find alive, so a pass killed with SIGKILL — the OOM
-  # killer, a terminal timeout — leaves the holder reparented to init and holding the one
-  # place for the life of the box. Passing our own pid lets the holder watch us and exit on
-  # its own when the pass dies the way no trap can catch.
+  # `QA_SLOT_OWNER_PID=$$` is THIS shell, not the qa-slot.sh child, and that distinction is the
+  # fix: a pass killed with SIGKILL — the OOM killer, a terminal timeout — cannot run its EXIT
+  # trap, so the holder it left behind is reparented to init and holds the one place for the
+  # life of the box. The holder watches the pid it is given, so it exits on its own when the
+  # pass dies the way no trap can catch. (Main's qa-slot.sh reads the variable; only the call
+  # site here is mine.)
   QA_SLOT_PID="$(QA_SLOT_OWNER_PID="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" \
     bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
@@ -85,6 +82,13 @@ fi
 # begins from a clean set and the box is not carrying yesterday's processes.
 stop_stack() {
   pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+  # Turbopack leaves a build cache behind when the server is killed, and the cache is
+  # the largest thing any worktree holds: ten stacks held 13 GB of it and filled the
+  # disk twice. The next pass rebuilds what it needs, so this is pure waste — but only
+  # drop it when the pass actually ran, so a stack that failed to start keeps its cache.
+  if [ "${QA_KEEP_NEXT:-0}" != "1" ]; then
+    rm -rf "$ROOT/apps/admin/.next" "$ROOT/apps/web/.next" 2>/dev/null || true
+  fi
 }
 # One trap, both cleanups: a second trap would replace the first and leave the slot held.
 release() {
@@ -93,77 +97,46 @@ release() {
   return 0
 }
 trap release EXIT INT TERM
-stop_stack
+# Only the exit path drops the build cache: the pre-pass call below is here to clear
+# stale servers, and deleting .next there would throw away a warm cache every tick and
+# turn each QA pass into a cold Turbopack build.
+QA_KEEP_NEXT=1 stop_stack
 
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
-# A gate that only builds on a missing binary silently exercises the last binary that happened
-# to be there: the stack restarts fine, every request answers, and the route or column added this
-# tick is simply not there — which reads as a broken screen rather than as a stale build. That is
-# not hypothetical: this file's `if [ ! -x … ]` once made a REQ-close pass report "green" against
-# a binary that predated the migration under test. A newer mtime is the only signal available
-# without asking cargo, and it is exactly the one that matters. `database/migrations` is in the
-# list because sqlx embeds the SQL at COMPILE time — an edited migration with an older binary
-# replays the old statement, and the failure ("column does not exist" / "duplicate table")
-# reads like a missing `alter` or a re-run rather than like a stale build. Sources are in it
-# too, which is the half a migration-only check misses: a route added this tick compiles into
-# nothing until the next full build.
-NEEDS_BUILD=0
-if [ ! -x target/debug/omnion-api ]; then
-  NEEDS_BUILD=1
-  step "building the API (no binary yet)"
-elif [ -n "$(find apps/api crates database/migrations Cargo.toml -newer target/debug/omnion-api -print -quit 2>/dev/null)" ]; then
-  NEEDS_BUILD=1
-  step "building the API (sources or migrations are newer than the binary)"
-fi
-if [ "$NEEDS_BUILD" = "1" ]; then
+# A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
+# a migration edited after the last build is silently the previous version — and a syntax error in
+# it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
+# than the newest migration, which is cheap when nothing changed and correct when something did.
+if [ ! -x target/debug/omnion-api ] \
+   || [ -n "$(find database/migrations -name '*.sql' -newer target/debug/omnion-api -print -quit)" ]; then
+  step "building the API (first pass, or a migration changed since the last build)"
   # Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
   # compiling at once instead of every pass grabbing all six threads for itself.
-  #
-  # `bash <script>`, not `<script>`: git records the executable bit as a MODE, so a helper
-  # added in one commit and invoked in the next arrives 100644 on every fresh clone and every
-  # worktree that merges it, and the pass dies at the build step with "Permission denied"
-  # AFTER it has reset the database and taken the QA slot. Running it through the interpreter
-  # the `set -euo pipefail` above already implies costs nothing and cannot be broken by a mode
-  # bit; a harness that only runs for the writer who happened to chmod it locally is a
-  # harness that fails on every other writer.
-  # `CARGO_INCREMENTAL=0`: eight writers share one box and their target directories sit side
-  # by side, and a build that is interrupted or raced leaves the incremental session's
-  # `dep-graph.bin` / `query-cache.bin` half-written. The next build then fails with
-  # "failed to move dependency graph ... No such file or directory (os error 2)" - which is
-  # os error 2, NOT the os error 28 of a full tmpfs, and reads like a source problem rather
-  # than a cache one. Incremental compilation buys minutes on a developer's machine and buys
-  # nothing for a pass that must produce a binary it can trust, so the build that a pass
-  # depends on does without it. (The unit tests keep it: they are re-run constantly and are
-  # not gating a browser against a stack somebody else may reset.)
-  CARGO_INCREMENTAL=0 bash "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
+  "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
-# The CSRF secret is the one variable the platform refuses to invent: a deployment that sets
-# none still boots, and every cookie-authenticated mutation then answers 403
-# `csrf_unavailable` (apps/api/src/headers_middleware.rs). Refusing writes beats silently
-# dropping the control, so the product is right -- but a QA stack started without the secret
-# loses EVERY write, and the pass reports that as a product defect: the builder could not
-# create its rule, the rule list stayed empty, and every depth note downstream read as a
-# broken screen rather than a stack that cannot write.
+# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
+# handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
+# walkthrough that saves a header policy, uploads a file or takes a backup would record screens
+# that "work" while the API answered 403 the whole time -- and because that refusal is the
+# documented behaviour of a deployment *without* a secret, it reads as the product being correct
+# rather than the harness being under-configured. It is a throwaway value: the process points at
+# a database that was dropped two lines above and listens on loopback.
 #
-# It is a test-only value derived from the stack name, it never leaves this box, and it is
-# passed to the RESTART branch too on purpose: `pm2 restart` re-reads the env the process was
-# created with, so a stack started before this line existed keeps the old (empty) env and
-# stays broken for every later pass until it is deleted.
-API_ENV=(
-  "OMNION_DATABASE_URL=postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME"
-  "OMNION_REDIS_URL=redis://127.0.0.1:6380"
-  "OMNION_PORT=$API_PORT"
-  "OMNION_ENV=development"
-)
-API_ENV+=("OMNION_CSRF_SECRET=qa-${QA_STACK:-default}-$(printf %s "$QA_DB_NAME" | cksum | cut -d' ' -f1)")
-
+# The comment sits here rather than inside the command because a `#` line between two backslash
+# continuations is not a comment: bash keeps reading the command, `#` and the words after it
+# become its arguments, and `pm2 start` is handed a stray name it never recovers from.
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  env "${API_ENV[@]}" pm2 restart "$API_NAME" --update-env >/dev/null
+  pm2 restart "$API_NAME" >/dev/null
 else
-  env "${API_ENV[@]}" pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
+  OMNION_DATABASE_URL="postgres://omnion:***@127.0.0.1:5433/$QA_DB_NAME" \
+  OMNION_REDIS_URL="redis://127.0.0.1:6380" \
+  OMNION_PORT="$API_PORT" \
+  OMNION_ENV=development \
+  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
+    pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
@@ -187,20 +160,6 @@ else
     pm2 start "$NEXT_WEB" --name "$WEB_NAME" --cwd "$ROOT/apps/web" --time -- dev --port "$WEB_PORT" --hostname 127.0.0.1 >/dev/null
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
-
-# Every rule belongs to a tenant, and a tenant is not something the wizard leaves behind: it
-# creates the owner account and stops there, so a freshly reset database has a platform account
-# whose organization list is EMPTY. The rule editor then refuses its own save with "Choose an
-# organization before saving a rule.", the list stays empty, and every depth note downstream
-# reads as a broken screen. The tenant picker does not even render (`organizations.length > 1`),
-# so there is nothing on the page to click -- this is a harness gap, not a product defect.
-#
-# `POST /onboarding/organization` exists for exactly this state and refuses once a tenant exists,
-# so this is idempotent: it fills the gap when it is there and is a no-op when it is not.
-step "ensuring the QA organization exists"
-node scripts/qa/ensure-organization.mjs --url "$API_URL" --admin "http://127.0.0.1:$ADMIN_PORT" || {
-  echo "[qa] the QA organization could not be created; rule screens will report empty"
-}
 
 step "browser walkthrough"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"

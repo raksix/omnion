@@ -32,22 +32,32 @@
  *   RESTORE ae11f7e8" becomes "Invalid confirmation", which is the version that gets a
  *   support ticket.
  */
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   AlertTriangle,
   CircleAlert,
   CircleCheck,
+  Clock3,
   Info,
   Loader2,
+  OctagonX,
   ShieldAlert,
   TriangleAlert,
 } from "lucide-react";
 
-import { ApiError, previewRestore, restoreBackup } from "@/lib/api";
-import { formatBytes } from "@/lib/format";
+import {
+  ApiError,
+  cancelRestoreJob,
+  listRestoreJobs,
+  previewRestore,
+  queueRestore,
+  restoreBackup,
+} from "@/lib/api";
+import { formatBytes, formatTimestamp } from "@/lib/format";
 import type {
   RestorablePart,
+  RestoreJob,
   RestoreOutcome,
   RestorePreview,
   RestoreWarning,
@@ -82,6 +92,43 @@ const MODE_TONE: Record<string, string> = {
 /** The severities, loudest first, so a screen reader hits the worst warning first. */
 const SEVERITY_ORDER = ["danger", "caution", "notice"] as const;
 
+/**
+ * Each restore job's own tone, and the sentence that goes with it.
+ *
+ * **An abort is a success, and it is drawn as one.** This is the half a queue makes easy to
+ * get wrong: the panel is full of danger colours, so an operator who stopped a restore — who
+ * *got what they wanted* — is the person most likely to read a red row as a failure. `aborted`
+ * is therefore drawn in the ordinary ink, and it says in words that nothing was written. A
+ * loss and a designed answer must not look alike, in either direction.
+ */
+const JOB_TONE: Record<RestoreJob["status"], { box: string; text: string; note: string }> = {
+  queued: {
+    box: "border-line",
+    text: "text-muted",
+    note: "Waiting for a worker. You can still stop it — nothing has been written.",
+  },
+  running: {
+    box: "border-info",
+    text: "text-info",
+    note: "The safety backup has been taken and the objects are being written. This one can no longer be stopped.",
+  },
+  succeeded: {
+    box: "border-ok",
+    text: "text-ok",
+    note: "Finished. The objects are back in the library.",
+  },
+  failed: {
+    box: "border-danger",
+    text: "text-danger",
+    note: "It stopped on an error. The reason is below.",
+  },
+  aborted: {
+    box: "border-line",
+    text: "text-ink",
+    note: "Stopped before the first write. Nothing on the platform was changed.",
+  },
+};
+
 function sortedWarnings(warnings: RestoreWarning[]): RestoreWarning[] {
   return [...warnings].sort(
     (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity),
@@ -105,6 +152,17 @@ export function RestorePreviewPanel({
   const [restoring, setRestoring] = useState(false);
   const [outcome, setOutcome] = useState<RestoreOutcome | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+
+  // --- The queued restore (REQ-013 slice 2c) ---------------------------------------------
+  // The immediate restore above cannot be stopped: it runs inside the `POST` and a `POST` in
+  // flight cannot be un-pressed. So there are two buttons, and the difference is stated on
+  // both of them rather than left for the operator to infer — a panel with one green "restore"
+  // and one red "restore, but stoppable" and no words is a panel where the wrong one gets
+  // pressed by somebody in a hurry.
+  const [jobs, setJobs] = useState<RestoreJob[]>([]);
+  const [queueing, setQueueing] = useState(false);
+  const [queueError, setQueueError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -154,6 +212,93 @@ export function RestorePreviewPanel({
       setRestoring(false);
     }
   }
+
+  /**
+   * Read this run's restores.
+   *
+   * **A failure here is silent on purpose, and deliberately so.** Two facts are independent:
+   * "I cannot see whether anything is queued" and "I may restore". An unrelated `GET`
+   * failing must not take away a working restore button — and it must not leave an error
+   * banner over the confirmation, where an operator would read it as "this restore is
+   * refused". The list simply shows its own empty state, which is a lie by omission, so the
+   * empty state names the possibility: it says what an empty list means *and* that the read
+   * may have failed.
+   */
+  const loadJobs = useCallback(async () => {
+    try {
+      setJobs(await listRestoreJobs(backupId));
+    } catch {
+      setJobs([]);
+    }
+  }, [backupId]);
+
+  /** Queue the restore instead of performing it, so it can still be stopped. */
+  async function performQueue() {
+    if (!preview) return;
+    setQueueing(true);
+    setQueueError(null);
+    setOutcome(null);
+    try {
+      const job = await queueRestore(backupId, selected, typed);
+      setJobs((current) => [job, ...current.filter((other) => other.id !== job.id)]);
+      setTyped("");
+    } catch (cause) {
+      setQueueError(
+        cause instanceof ApiError
+          ? cause.message
+          : "The restore could not be queued. Nothing was changed.",
+      );
+    } finally {
+      setQueueing(false);
+    }
+  }
+
+  /**
+   * Stop a queued restore.
+   *
+   * The job is replaced by whatever the API says it is now, rather than by a locally
+   * invented "stopped". A cancel can lose the race to the worker, and a panel that showed
+   * "stopped" in that case would be telling an operator their library is untouched while
+   * objects land in it.
+   */
+  async function performCancel(job: RestoreJob) {
+    setCancelling(job.id);
+    setQueueError(null);
+    try {
+      const settled = await cancelRestoreJob(job.id);
+      setJobs((current) => current.map((other) => (other.id === settled.id ? settled : other)));
+    } catch (cause) {
+      setQueueError(
+        cause instanceof ApiError
+          ? cause.message
+          : "This restore could not be stopped. Re-read the list before assuming it is still queued.",
+      );
+      await loadJobs();
+    } finally {
+      setCancelling(null);
+    }
+  }
+
+  // Poll the queue while the panel is open.
+  //
+  // **Two seconds, and only while something can change.** A job advances because the *worker*
+  // advanced it, and nothing the operator does here produces that event — so a list that only
+  // refreshes on a click is a spinner for ever, and a cancel that appears not to work is a
+  // control an operator learns to distrust. The interval stops the moment nothing is in a
+  // live state: a finished restore cannot change again, and a poll that costs one request a
+  // second on every backup detail screen is the kind of cost that gets the whole panel
+  // switched off.
+  const liveJob = jobs.some(
+    (job) => job.status === "queued" || job.status === "running",
+  );
+  useEffect(() => {
+    void loadJobs();
+  }, [loadJobs]);
+  useEffect(() => {
+    if (!liveJob) return;
+    const timer = setInterval(() => void loadJobs(), 2000);
+    return () => clearInterval(timer);
+  }, [liveJob, loadJobs]);
 
   // The phrase is never pre-filled, and the input is never enabled before the preview has
   // arrived: a confirmation field that accepts a guess typed from a previous restore is
@@ -411,6 +556,28 @@ export function RestorePreviewPanel({
                     ? "Restoring…"
                     : `Restore ${selected.length} part${selected.length === 1 ? "" : "s"}`}
                 </button>
+                {/*
+                  The two ways to restore, and the difference is on the labels. The immediate
+                  one is the default because a restore of a small library finishes before an
+                  operator can change their mind; the queued one is offered beside it, never
+                  hidden behind a menu, because the moment somebody *wants* to stop a restore is
+                  the moment they are looking for a control and a menu is one click too late.
+                */}
+                <button
+                  type="button"
+                  onClick={() => void performQueue()}
+                  disabled={blocked || queueing}
+                  data-testid="restore-queue"
+                  title="Queue this restore so you can stop it before it writes anything"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {queueing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Clock3 className="h-3.5 w-3.5" />
+                  )}
+                  {queueing ? "Queueing…" : "Queue it (can be stopped)"}
+                </button>
                 <span className="text-[11.5px] text-muted">
                   {selected.length > 0 ? (
                     <>
@@ -421,6 +588,12 @@ export function RestorePreviewPanel({
                   )}
                 </span>
               </div>
+              <p className="mt-1 text-[11.5px] text-muted" data-testid="restore-queue-hint">
+                The button above starts the restore now and cannot be stopped.{" "}
+                <strong className="font-medium text-ink">Queue it</strong> instead and the
+                restore waits for a worker — you get a Stop control until it begins writing,
+                and the platform takes a safety backup first either way.
+              </p>
             </div>
           ) : (
             <p
@@ -511,6 +684,107 @@ export function RestorePreviewPanel({
               </p>
             </div>
           ) : null}
+
+          {/* The queue. Every state the API can hold, each drawn at its own tone, each with
+              the one control that is meaningful for it. */}
+          <div className="border-t border-line pt-2" data-testid="restore-jobs">
+            <p className="flex items-center gap-1.5 text-[11.5px] font-medium">
+              <Clock3 className="h-3.5 w-3.5" />
+              Queued and finished restores
+            </p>
+
+            {queueError ? (
+              <p
+                className="mt-1.5 flex items-start gap-1.5 rounded-lg border border-danger bg-danger-soft px-2.5 py-1.5 text-[12px] text-danger"
+                role="alert"
+                data-testid="restore-queue-error"
+              >
+                <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{queueError}</span>
+              </p>
+            ) : null}
+
+            {jobs.length === 0 ? (
+              <p className="mt-1 text-[11.5px] text-muted" data-testid="restore-jobs-empty">
+                Nothing is queued. An immediate restore is above; a queued one waits for a
+                worker and can be stopped until it starts writing. If you expected to see one
+                here, this list could not be read — the restore controls above are unaffected.
+              </p>
+            ) : (
+              <ul className="mt-1.5 space-y-1.5">
+                {jobs.map((job) => {
+                  const tone = JOB_TONE[job.status];
+                  const stopping = cancelling === job.id;
+                  return (
+                    <li
+                      key={job.id}
+                      className={`rounded-lg border px-2.5 py-1.5 ${tone.box}`}
+                      data-testid={`restore-job-${job.status}`}
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className={`text-[12px] font-medium ${tone.text}`}>
+                            <span className="font-mono">{job.parts.join(", ")}</span> ·{" "}
+                            {job.status}
+                          </p>
+                          <p className="text-[11.5px] text-muted">{tone.note}</p>
+                          <p className="mt-0.5 text-[11px] text-muted">
+                            Queued {formatTimestamp(job.created_at)}
+                            {job.started_at ? ` · started ${formatTimestamp(job.started_at)}` : ""}
+                            {job.finished_at ? ` · ended ${formatTimestamp(job.finished_at)}` : ""}
+                            {job.live_dropped > 0
+                              ? ` · ${job.live_dropped} live item(s) priced as dropped`
+                              : ""}
+                          </p>
+                          {job.safety_backup_id ? (
+                            <p className="mt-0.5 text-[11px] text-muted">
+                              Safety backup:{" "}
+                              <span className="font-mono">{job.safety_backup_id}</span>
+                            </p>
+                          ) : null}
+                          {job.error ? (
+                            <p
+                              className="mt-0.5 text-[11.5px] text-danger"
+                              data-testid="restore-job-error"
+                            >
+                              {job.error}
+                            </p>
+                          ) : null}
+                          {job.result ? (
+                            <p className="mt-0.5 text-[11.5px] text-muted">
+                              {job.result.media.objects_restored} object(s) restored,{" "}
+                              {job.result.media.objects_failed} failed.
+                            </p>
+                          ) : null}
+                        </div>
+
+                        {/* Exactly one control, and only where it means something. A Stop
+                            button on a running restore would be a control that discards the
+                            safety backup the operator was told they had. */}
+                        {job.cancellable ? (
+                          <button
+                            type="button"
+                            onClick={() => void performCancel(job)}
+                            disabled={stopping}
+                            data-testid={`restore-job-stop-${job.id}`}
+                            aria-label="Stop this queued restore before it writes anything"
+                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] font-medium text-ink disabled:opacity-60"
+                          >
+                            {stopping ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <OctagonX className="h-3 w-3" />
+                            )}
+                            {stopping ? "Stopping…" : "Stop"}
+                          </button>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         </div>
       ) : null}
     </div>
