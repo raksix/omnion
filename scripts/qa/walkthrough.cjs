@@ -10191,6 +10191,43 @@ async function runWorkflowBuilderDepth(page, report) {
         // keys on, so reusing one id would make this a different case entirely.
         edges: [edge("t1", "a1", "out"), edge("t1", "a1", "out", 1), edge("a1", "e1", "success")],
       },
+      // Two edges on ports the linear walk FOLLOWS, out of one node. This is the class that
+      // used to pass every other row and still run the wrong branch: the projection resolved
+      // the next node with a `find` over the saved array, so the verdict depended on the
+      // order the client serialised the edges rather than on what the author drew.
+      //
+      // The two cases below are the same drawing with the array reversed, so a validator that
+      // still guesses produces a *different* answer for each — and the pair is what proves the
+      // answer is a property of the graph rather than of the request body. `case_1` and
+      // `default` are both followed ports on a switch, which is the shape that triggers it.
+      ambiguous_branch: {
+        nodes: [
+          trigger("t1"),
+          { ...act("sw"), type: "switch", params: { cases: "a\nb" } },
+          act("a1"),
+          finish("e1"),
+        ],
+        edges: [
+          edge("t1", "sw", "out"),
+          edge("sw", "a1", "case_1"),
+          edge("sw", "e1", "default"),
+          edge("a1", "e1", "success"),
+        ],
+      },
+      ambiguous_branch_reversed: {
+        nodes: [
+          trigger("t1"),
+          { ...act("sw"), type: "switch", params: { cases: "a\nb" } },
+          act("a1"),
+          finish("e1"),
+        ],
+        edges: [
+          edge("t1", "sw", "out"),
+          edge("sw", "e1", "default"),
+          edge("sw", "a1", "case_1"),
+          edge("a1", "e1", "success"),
+        ],
+      },
     };
 
     const out = {};
@@ -10255,6 +10292,22 @@ async function runWorkflowBuilderDepth(page, report) {
     duplicateEdge: {
       found: validationClasses.duplicate_edge?.codes?.includes("duplicate_edge"),
       names: validationClasses.duplicate_edge?.firstMessage ?? "",
+    },
+    // Two walkable ports out of one node. The row records TWO readings, because "found" on
+    // its own is exactly the reading that was green before the fix: the old projection picked
+    // a branch and the graph still projected successfully, so a probe that only asked "does
+    // this validate" would have reported a pass on a rule that runs the wrong arm.
+    //
+    // `orderIndependent` is the load-bearing half. Both cases are the same drawing with the
+    // two edges swapped, so a validator that answers from array position gives a different
+    // verdict for each; one that refuses the drawing gives the same code for both.
+    ambiguousBranch: {
+      found: validationClasses.ambiguous_branch?.codes?.includes("ambiguous_branch"),
+      names: validationClasses.ambiguous_branch?.firstMessage ?? "",
+      reversedCodes: validationClasses.ambiguous_branch_reversed?.codes ?? [],
+      orderIndependent:
+        (validationClasses.ambiguous_branch?.codes ?? []).join(",") ===
+        (validationClasses.ambiguous_branch_reversed?.codes ?? []).join(","),
     },
   });
 
