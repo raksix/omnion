@@ -176,8 +176,27 @@ export function EnvironmentsView() {
   const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [wizard, setWizard] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
+
+  // The wizard's open state lives in the URL, for the same reason the filters do: a modal that
+  // only exists in component state cannot be linked to, cannot survive the browser's Back button,
+  // and — the reason this tick found it — cannot be measured at a phone width by anything that
+  // drives the panel through a URL. `?wizard=1` is the deep link, and every close path clears it,
+  // so the address bar never claims a dialog that is not on screen.
+  const wizard = params.get("wizard") === "1";
+  const setWizard = useCallback(
+    (open: boolean) => {
+      const query = new URLSearchParams(params.toString());
+      if (open) {
+        query.set("wizard", "1");
+      } else {
+        query.delete("wizard");
+      }
+      const suffix = query.toString();
+      router.replace(suffix ? `/environments?${suffix}` : "/environments");
+    },
+    [params, router],
+  );
 
   const writeFilter = useCallback(
     (next: EnvironmentFilters) => {
@@ -191,10 +210,17 @@ export function EnvironmentsView() {
       if (next.search) {
         query.set("search", next.search);
       }
+      // `wizard` is carried across a filter write. Both live in the one address bar now, and a
+      // filter change that silently dropped it would close the dialog out from under a person
+      // typing in the list behind it — which is the exact shape "two sources of truth" takes when
+      // one of them can rewrite the other's parameter.
+      if (params.get("wizard") === "1") {
+        query.set("wizard", "1");
+      }
       const suffix = query.toString();
       router.replace(suffix ? `/environments?${suffix}` : "/environments");
     },
-    [router],
+    [params, router],
   );
 
   useEffect(() => {
