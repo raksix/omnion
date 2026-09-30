@@ -7255,12 +7255,45 @@ had done the work and the report said only that it died — the one outcome a re
 from a pass that proved nothing. The report is module-scoped now and the fatal handler writes it
 alongside the error and a count of what came before.
 
+**The third finding was the one that had been hiding for days, and it is a harness account, not a
+product defect.** The pass reported the AI console as "no provider" on a database with **zero**
+organizations, one user whose `organization_id` was NULL, and zero drafts. `ensure-organization.mjs`
+exists and its own doc comment says it is "run BEFORE the walkthrough so the pass measures the
+product rather than the seeding" — **nothing called it**. On top of that the console's fixture read
+the organization from `ai_workflow_drafts`, which on an empty table is `''`, so the insert wrote an
+empty string into a uuid column; and it quoted the rationale with `JSON.stringify`, which produces a
+double-quoted SQL **identifier** — psql answered `column "The first step asks a model…" does not
+exist`. Three defects stacked, each reading like a broken screen.
+
+**And the cause under all three.** The wizard's own account form is filled by `sampleValueFor` and
+`fillSubtree`, and those answered an email field with `qa-sample@omnion.test` and a password field
+with `Sample-Passw0rd!` while `CREDS` said `qa-owner@omnion.test` / `OmnionQa-Passw0rd-2026!`. The
+wizard therefore **created an account that no API sign-in in the harness addressed**: every one
+answered 401, printed as a single line, and was never raised. The rule screens had been reporting
+"Choose an organization before saving a rule" for days on a database that had no tenant in it.
+
+**The boundary that would have eaten the fix.** `fillSubtree`'s callback runs *inside* the page —
+`page.evaluate` serialises it, so it closes over nothing, and reading `CREDS.email` there is a
+ReferenceError **in the browser** in a file that `node --check` passes. The values are passed through
+`evaluate`'s argument object instead, and a grep for the constant inside `page.evaluate` bodies
+(a five-second check) reports zero.
+
 **Proof.** `--selfcheck-recovery` drives the swap with a **real** dead tab: `page.close()` is the
 same shape as a killed renderer (the object is still there and every call on it throws) and needs no
 stack, so it runs in 8 seconds. 4/4 green; removing the seam flips exactly one check
 (`thirdRanOnTheReplacement`) red, which is the only thing that makes the other three mean anything.
 `cargo test -p omnion-workflows -p omnion-automation -p omnion-events` **310 passed / 0 failed**
-(117 + 47 + 146). `pnpm typecheck` **2/2 packages, 0 errors**. Full w3 pass in progress.
+(117 + 47 + 146). `pnpm typecheck` **2/2 packages, 0 errors**. The org step was then run against the
+live stack: `[qa] no account yet — the first-run wizard seeds the owner, organization and site` —
+the correct answer on a reset database, and the first evidence that the step runs at all.
+
+**The tick's blocker is the box, and it is not a product finding.** The full pass waited
+**3 605 s** for the single QA place and then proceeded without one, as designed. `pgrep -f qa-slot.sh`
+found **40** waiter processes, nearly all `ppid=338` (reparented) from w9 and w2, each running a
+`find` over the slot directory every 15 s. The pass that then started had its browser killed at
+`ensureSignedIn` before a single route was walked — and `fatalAfter: {pages: 0, steps: 0, mobile: 0}`
+says exactly that, which is the report a reader can tell apart from a pass that walked 48 screens.
+Nothing here is a REQ-046 or REQ-004 defect; the measurements that close them are one quiet box away.
 
 **Next.** Read the pass by URL, never by the raw finding count. REQ-046's last criterion needs this
 pass to reach `ai-workflows` and click the approval bar; REQ-004 has thirteen criteria whose probes
