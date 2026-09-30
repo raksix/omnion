@@ -46,29 +46,38 @@ fn webhook_policy() -> Policy {
 async fn a_policy_is_edited_without_a_deploy_and_an_override_wins_outright() {
     let state = state_or_fail().await;
     let pool = state.db().pool();
+    // A provider override unique to this run. The override key is
+    // `(subsystem, provider_override)` and the table is GLOBAL — a fixed literal here would be
+    // the same row a sibling walk writes, and two tests editing one row is a test that passes or
+    // fails depending on which one the scheduler ran first.
+    let (_, _, id) = fixture();
+    let provider = format!("hooks-{id}.example.com");
 
     let mut policy = webhook_policy();
     policy.base_delay_ms = 250;
     let written = rstore::upsert_policy(pool, &policy).await.expect("upsert");
     assert_eq!(written.base_delay_ms, 250);
 
-    // Writing the same (subsystem, NULL override) again REPLACES rather than duplicating: the
-    // `unique nulls not distinct` constraint is what makes "editable" and "one row" the same
-    // fact rather than two properties an operator has to keep in sync.
+    // Writing the same (subsystem, NULL override) again REPLACES rather than duplicating. The
+    // claim under test is "the newest value is the one a reader gets", so it is proved by RESOLVING
+    // the key — a COUNT of rows for the subsystem would be a different claim, and one that is not
+    // isolation-safe: the table is global and a sibling walk's policy would be counted as a
+    // duplicate of this one's.
     policy.base_delay_ms = 900;
     rstore::upsert_policy(pool, &policy).await.expect("second upsert");
-    let all = rstore::load_policies(pool).await.expect("load");
-    let subs: Vec<_> = all.iter().filter(|p| p.subsystem == "webhook").collect();
-    assert_eq!(subs.len(), 1, "a subsystem policy must be one row, not one per save");
-    assert_eq!(subs[0].base_delay_ms, 900);
+    let read_back = rstore::resolve_policy(pool, "webhook", None)
+        .await
+        .expect("resolve")
+        .expect("the base policy is there");
+    assert_eq!(read_back.base_delay_ms, 900, "the newest save is the one a reader gets");
 
     // A provider override is a DIFFERENT row, and it wins outright rather than merging.
     let mut over = policy.clone();
-    over.provider_override = Some("hooks.example.com".into());
+    over.provider_override = Some(provider.clone());
     over.max_attempts = 9;
     rstore::upsert_policy(pool, &over).await.expect("override");
 
-    let resolved = rstore::resolve_policy(pool, "webhook", Some("hooks.example.com"))
+    let resolved = rstore::resolve_policy(pool, "webhook", Some(&provider))
         .await
         .expect("resolve")
         .expect("the override is there");
@@ -77,7 +86,10 @@ async fn a_policy_is_edited_without_a_deploy_and_an_override_wins_outright() {
         .await
         .expect("resolve base")
         .expect("the base is there");
-    assert_eq!(base.max_attempts, policy.max_attempts, "the base is untouched");
+    assert_eq!(
+        base.max_attempts, policy.max_attempts,
+        "an override does not mutate the subsystem it overrides"
+    );
 }
 
 #[tokio::test]
@@ -130,7 +142,16 @@ async fn a_restart_resumes_from_the_persisted_next_attempt_time() {
         .await
         .expect("next attempt time")
         .expect("a retry is owed");
-    assert_eq!(resumed, next_at, "the schedule came back, not the count");
+    // Compared at POSTGRESQL's precision, not the caller's. `timestamptz` stores microseconds, so
+    // a value written with nanosecond precision comes back truncated and an exact `==` would fail
+    // on a round trip that in fact preserved the instant to the resolution the column can hold.
+    // Anything coarser than a microsecond and the test would stop proving the time came back at
+    // all — a store that returned `now()` would still pass at minute resolution.
+    let precision = Duration::microseconds(1);
+    assert!(
+        (resumed - next_at).abs() < precision,
+        "the schedule came back, not the count: wrote {next_at}, read {resumed}"
+    );
 
     // The ATTEMPT COUNT is equally a property of the database, for the same reason: a scheduler
     // counting attempts in a field it owns loses the count with the process.
@@ -332,7 +353,7 @@ async fn a_breaker_trips_on_failures_and_probes_its_way_back() {
         if t.state.state == "open" {
             opened = Some(t.clone());
         }
-        current = t.state;
+        current = t.state.clone();
         bstore::observe(pool, &t).await.expect("observe");
     }
     let opened = opened.expect("two failures with a threshold of two must open the breaker");
@@ -343,14 +364,23 @@ async fn a_breaker_trips_on_failures_and_probes_its_way_back() {
     let reloaded = bstore::load(pool, &key).await.expect("load").expect("row");
     assert_eq!(reloaded.state, "open");
 
-    // Past the cooldown the next observation IS the probe.
+    // Past the cooldown the next observation IS the probe. The move to half-open RESETS the
+    // success counter (the machine's own comment says so), so the probe that opened the window
+    // is not counted toward `success_threshold` — otherwise a single success would satisfy a
+    // threshold of two and close a provider that has recovered exactly once.
     let later = OffsetDateTime::now_utc() + Duration::seconds(30);
     let probing = breaker::record(&reloaded, Observation::Success, later, None);
     assert_eq!(probing.state.state, "half_open", "the cooldown's end is the probe");
+    assert_eq!(probing.state.successes_in_half_open, 0, "the counter starts from zero here");
     bstore::observe(pool, &probing).await.expect("observe");
 
-    // One more success closes it: success_threshold is 2.
-    let closing = breaker::record(&probing.state, Observation::Success, later, None);
+    // One success is one: `success_threshold` is 2, so this is still probing.
+    let one = breaker::record(&probing.state, Observation::Success, later, None);
+    assert_eq!(one.state.state, "half_open", "one success of two is not a recovery");
+    bstore::observe(pool, &one).await.expect("observe");
+
+    // The second closes it.
+    let closing = breaker::record(&one.state, Observation::Success, later, None);
     assert_eq!(closing.state.state, "closed");
     assert!(closing.event.is_some());
     bstore::observe(pool, &closing).await.expect("observe");

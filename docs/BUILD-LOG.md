@@ -6840,3 +6840,36 @@ reliability routes and the four observability depth passes.
 scheduler itself — the thing that reads `next_attempt_time` and calls `next_attempt`, which is the
 remaining half of slice 3. (3) The retry and breaker screens. (4) The QA pass, focused, with
 `QA_ONLY`.
+
+**Continued, tick 28.** The nine walks compiled on the third attempt and **10 passed / 0 failed**
+against `omnion_w6_dev` — after two of them failed first, both worth the run:
+
+- `a_breaker_trips_on_failures_and_probes_its_way_back` asserted that the success which moves the
+  breaker to `half_open` counts toward `success_threshold`, and failed `left: half_open, right:
+  closed`. **The machine was right and the walk was wrong**: entering half-open RESETS the counter,
+  so the probe that opens the window is not one of the successes that close it. A threshold of two
+  satisfied by one success closes a provider that has recovered exactly once. The walk now asserts
+  the counter is zero on entry, that one of two is still probing, and that the second closes it.
+- `a_policy_is_edited_without_a_deploy_and_an_override_wins_outright` counted rows in the **GLOBAL**
+  `retry_policies` table for the fixed key `webhook` and saw 2, because a sibling walk in the same
+  suite had written the same key. The claim under test was never "only one webhook row exists" — it
+  is "the newest save is the one a reader gets" — so it is now proved by RESOLVING the key, and the
+  provider override uses a per-run host. A count that passes today and fails on a different
+  scheduler ordering is a landmine; a resolve is the actual claim.
+- `a_restart_resumes_from_the_persisted_next_attempt_time` failed on `left: …429599 +00:00:00,
+  right: …429599396 +00:00:00`. PostgreSQL `timestamptz` stores **microseconds**; the write carried
+  nanoseconds. The round trip preserved the instant to the resolution the column can hold, and the
+  walk now compares inside one microsecond — tight enough that a store returning `now()` still
+  fails, loose enough to describe the column.
+
+**The box, the whole tick, three separate times.** `/` went 100% → 322 MB free → disk-full in
+`incremental/` mid-build. What worked: reclaiming only my own artefacts (1,078 duplicate rlib/rmeta,
+604 MB, then 936 MB of my worktree's `.next`, both with `lsof` confirming no live holder) and
+running with **`CARGO_INCREMENTAL=0`**, which cut the retry from 115 crates to 11. The lesson is
+that `incremental/` is not free: it is a few hundred MB per build that pays for itself only if you
+build again soon, and on a box this full it is the first thing to die and the cheapest thing to
+switch off.
+
+**Proof, final for the tick.** `cargo build -p omnion-reliability` exit 0 · `omnion-reliability
+--lib` **114 passed / 0 failed** · `omnion-api --lib` **276 passed / 0 failed** ·
+`reliability_retry_breaker_store` **10 passed / 0 failed** against a real database.
