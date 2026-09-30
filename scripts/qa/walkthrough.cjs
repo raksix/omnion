@@ -681,8 +681,45 @@ async function ensureSignedIn(page, report) {
   await pass.fill(CREDS.password).catch(() => {});
   await shot(page, "10-login-filled");
   const clicked = await primaryClick(page);
-  await page.waitForTimeout(1200);
-  report.steps.push({ action: "login", clicked, url: page.url() });
+  // Wait for the SIGN-IN to actually complete, not for a fixed number of milliseconds. This
+  // screen has no error to look for: the form was filled, the API created the session, and the
+  // pass still reported "could not sign in" — because it gave the request 1200 ms and the
+  // request took 2.2 s on a box at load 90. A pass that dies at its first screen reports a
+  // harness failure as if it were a product one, and a hard-coded sleep is the reason: the
+  // right answer is to wait for the state that means signed in (the session cookie, or the
+  // app shell that only renders once it is there), with a timeout generous enough for a loaded
+  // machine.
+  //
+  // The fallback wait is what makes this a fix and not a race: if neither the cookie nor the
+  // shell arrives, we say so and let the caller decide, instead of silently reading the URL.
+  //
+  // A REJECTION must not end the race. `waitForFunction` rejects with "execution context was
+  // destroyed" the moment the login redirect navigates the page — which is precisely the success
+  // path — so mapping a rejection to `false` would declare a successful sign-in a failure at the
+  // exact moment it worked. A branch that fails hangs instead, and the only thing that can report
+  // "not signed in" is the clock.
+  //
+  // The session cookie is `omnion_session`, but it is `HttpOnly` (apps/api/src/cookies.rs), so
+  // `document.cookie` cannot see it and that branch can never fire — the app shell is the signal
+  // that actually exists. The URL branch is the primary one: sign-in ends in a client-side
+  // `router.replace("/")` (apps/admin/app/login/page.tsx), so leaving /login IS the success event.
+  const neverSettles = () => new Promise(() => {});
+  const signedIn = await Promise.race([
+    page
+      .waitForURL((u) => !/\/login|\/setup/.test(u.toString()), { timeout: 30000 })
+      .then(() => true, neverSettles),
+    page
+      .waitForSelector('nav[aria-label="Sections"]', { timeout: 30000 })
+      .then(() => true, neverSettles),
+    page.waitForTimeout(30000).then(() => false),
+  ]);
+  // A short settle so the shell has painted before the first screen is measured.
+  await page.waitForTimeout(signedIn ? 400 : 0);
+  report.steps.push({ action: "login", clicked, url: page.url(), signedIn, waitedFor: "cookie-or-shell" });
+  if (signedIn) return true;
+  // The wait can still lose a race of its own — the cookie may be HttpOnly, which
+  // `document.cookie` cannot see, and the shell may not render. Fall back to the original
+  // question so a pass that really is signed in is not thrown away.
   return !/\/login/.test(page.url());
 }
 
