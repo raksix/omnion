@@ -2271,3 +2271,36 @@ export type HealthSamplePoint = {
 
 /** What the retention prune deleted. */
 export type HealthPruneResult = { deleted: number; retention_days: number };
+
+/**
+ * The three windows the metric table offers.
+ *
+ * A name rather than an hour count, so the label on screen, the label in the CSV filename and
+ * the window the server queried are the same string. Anything else is refused server-side.
+ */
+export type HealthRangeKey = "1h" | "24h" | "7d";
+
+/** One row of `GET /api/v1/health/metrics`. */
+export type HealthMetricRow = {
+  service: string;
+  metric: string;
+  unit: string;
+  samples: number;
+  /** `null` on a window with no samples — never `0`, which is a value. */
+  current: number | null;
+  min: number | null;
+  avg: number | null;
+  max: number | null;
+  state: string;
+  last_sample_at: string | null;
+  /** The window's values, oldest first. Empty when there are no samples. */
+  series: number[];
+};
+
+/** `GET /api/v1/health/metrics` — the aggregated table for one range. */
+export type HealthMetricsReport = {
+  range: string;
+  ranges: string[];
+  metrics: HealthMetricRow[];
+  total_samples: number;
+};

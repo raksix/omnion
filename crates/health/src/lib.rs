@@ -61,6 +61,7 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod history;
 pub mod model;
 pub mod probes;
 pub mod registry;
@@ -68,6 +69,10 @@ pub mod store;
 pub mod vocabulary;
 
 pub use error::{HealthError, Result};
+pub use history::{
+    CSV_HEADER, DEFAULT_RANGE, MetricSummary, RANGE_KEYS, Range, RollupDay, daily_rollup,
+    metric_summaries, sparkline_values, summaries_to_csv,
+};
 pub use model::{
     CheckDescription, HealthBanner, HealthOverview, HostMetric, NewSample, Sample, ServiceReport,
 };

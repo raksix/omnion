@@ -1238,6 +1238,14 @@ pub fn router(state: AppState) -> Router {
             "/health/summary",
             get(health_panel::summary).layer(guards::require(&state, "health.read")),
         )
+        .route(
+            "/health/metrics",
+            get(health_panel::metrics).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/metrics.csv",
+            get(health_panel::metrics_csv).layer(guards::require(&state, "health.read")),
+        )
         // Pruning is destructive and irreversible, so it is a POST behind the managing key
         // and not a side effect of a settings save.
         .route(

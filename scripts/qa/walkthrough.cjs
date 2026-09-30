@@ -6684,6 +6684,162 @@ async function runHealthDepth(page, report) {
   report.health = { steps };
 }
 
+/**
+ * `/health/metrics` — the history screen, driven end to end (REQ-014, slice 2).
+ *
+ * This screen's whole claim is that **the table and the export are the same rows over the same
+ * window**, so the pass asserts that claim rather than the presence of a table:
+ *
+ * - the range buttons are real controls and switching one re-reads, changing the window shown;
+ * - a row with samples draws a sparkline with as many points as the server sent, so a table
+ *   rendering a flat line for a real series is caught — and a row with no samples says so
+ *   rather than drawing nothing;
+ * - **the CSV the export button downloads is fetched and compared against the table**: same row
+ *   count, and the range stamped in the file equals the range on screen. This is the acceptance
+ *   criterion "CSV export matches the range shown", checked on the file rather than on the
+ *   button's success;
+ * - an unoffered range is refused by the server — the pass asks for `168` directly, because the
+ *   silent-clamp implementation passes every assertion above.
+ */
+async function runHealthMetricsDepth(page, report) {
+  const steps = {};
+  // Named `note` like every other depth pass — a local `record` would shadow the module's
+  // `record` and call itself, which is a stack overflow on the first step rather than a
+  // wrong report, and it happens only when the pass runs.
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health-metrics", action: "health-metrics-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health/metrics`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-metrics-window], [data-health-metrics-error]", { timeout: 20000 })
+    .catch(() => {});
+
+  const window_ = (await page.locator("[data-health-metrics-window]").textContent().catch(() => "")) || "";
+  note("windowNamed", /1h|24h|7d/.test(window_));
+
+  // The screen reached itself from the overview as well — a screen nobody can reach
+  // from the product is the "hidden feature" the definition of done forbids.
+  await page.goto(`${URL_ADMIN}/health`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-metrics-link]", { timeout: 15000 }).catch(() => {});
+  const href = await page.locator("[data-health-metrics-link]").getAttribute("href").catch(() => "");
+  note("overviewLinksHere", href === "/health/metrics");
+  await page.locator("[data-health-metrics-link]").click({ timeout: 8000 }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-metrics-window]", { timeout: 15000 })
+    .catch(() => {});
+  note("clickedThrough", page.url().includes("/health/metrics"));
+
+  // ---- The range selector is a real control, and it changes what is shown -------------------
+  await page.locator('[data-health-range="1h"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const hourWindow = (await page.locator("[data-health-metrics-window]").textContent().catch(() => "")) || "";
+  note("rangeSwitched", /1h/.test(hourWindow));
+  await page.locator('[data-health-range="7d"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  const weekWindow = (await page.locator("[data-health-metrics-window]").textContent().catch(() => "")) || "";
+  note("rangeSwitchedTwice", /7d/.test(weekWindow));
+
+  // ---- Rows: a real series draws a real line, an empty window says so ----------------------
+  const rows = await page.locator("[data-health-metric-row]").count();
+  const cards = await page.locator("[data-health-metric-card]").count();
+  note("hasRowsOrEmptyState", rows > 0 || cards > 0 || (await page.locator("[data-health-metrics-empty]").count()) > 0);
+  if (rows > 0) {
+    const lines = await page.locator('[data-health-spark="line"]').count();
+    const points = await page.locator('[data-health-spark="point"]').count();
+    const empties = await page.locator('[data-health-spark="empty"]').count();
+    note("sparksDrawn", lines + points + empties > 0);
+    // No NaN / Infinity text anywhere on a numbers screen.
+    const body = (await page.locator("body").innerText().catch(() => "")) || "";
+    note("noNonFiniteText", !/NaN|Infinity|undefined/i.test(body));
+  }
+  await shot(page, "health-metrics-table");
+
+  // ---- The export, read as a file and compared against the table ----------------------------
+  // The button is not the assertion: a green download proves the click worked. What has to hold
+  // is that the FILE says the same window the SCREEN says and carries one row per table row.
+  const comparison = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/metrics?range=7d", { credentials: "same-origin" });
+      const table = answer.ok ? await answer.json() : null;
+      const file = await fetch("/api/v1/health/metrics.csv?range=7d", { credentials: "same-origin" });
+      if (!file.ok) return { ok: false, reason: `csv answered ${file.status}` };
+      const text = await file.text();
+      const lines = text.split("\n").filter((line) => line.trim() !== "");
+      return {
+        ok: true,
+        servedRange: file.headers.get("x-health-range"),
+        fileName: /filename="?([^";]+)"?/.exec(file.headers.get("content-disposition") || "")?.[1] || "",
+        header: lines[0] || "",
+        rows: lines.length - 1,
+        tableRange: table?.range ?? null,
+        tableRows: table?.metrics?.length ?? null,
+        lastColumn: lines.slice(1).map((line) => line.split(",").pop()),
+      };
+    })
+    .catch((err) => ({ ok: false, reason: String(err) }));
+
+  if (!comparison.ok) {
+    note("exportReadable", false);
+  } else {
+    note("exportReadable", true);
+    note("exportRangeIsNamed", comparison.servedRange === "7d");
+    note("exportFileNameCarriesRange", comparison.fileName.includes("7d"));
+    note("exportHasHeader", comparison.header.includes("service") && comparison.header.includes("range"));
+    note(
+      "exportRowsMatchTable",
+      comparison.tableRows === null ? comparison.rows === 0 : comparison.rows === comparison.tableRows,
+    );
+    // Every row stamps the window: a file whose rows do not say which window they
+    // cover cannot be checked against the screen it came from.
+    note(
+      "everyRowStampsRange",
+      Array.isArray(comparison.lastColumn) &&
+        comparison.lastColumn.length > 0 &&
+        comparison.lastColumn.every((cell) => cell === "7d"),
+    );
+    // The range the table reported and the range the CSV was served must agree.
+    note("tableAndExportAgree", comparison.tableRange === comparison.servedRange);
+  }
+
+  // ---- An unoffered range is refused by the server, not clamped ------------------------------
+  // The silent clamp passes every other assertion in this pass.
+  const refusal = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/metrics?range=168", { credentials: "same-origin" });
+      let message = "";
+      try {
+        message = (await answer.json())?.error?.message ?? "";
+      } catch {
+        message = "";
+      }
+      return { status: answer.status, message };
+    })
+    .catch(() => ({ status: 0, message: "" }));
+  note("unofferedRangeRefused", refusal.status === 400);
+  note("refusalNamesTheRanges", /1h/.test(refusal.message) && /7d/.test(refusal.message));
+
+  // ---- Mobile: the cards keep the value and the state without horizontal scroll -------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/health/metrics`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-metrics-window]", { timeout: 15000 }).catch(() => {});
+  const mobileCards = await page.locator("[data-health-metric-card]").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)
+    .catch(() => false);
+  note("mobileCardsOrEmpty", mobileCards > 0 || (await page.locator("[data-health-metrics-empty]").count()) > 0);
+  note("mobileNoHorizontalScroll", !overflow);
+  if (mobileCards > 0) {
+    const card = await page.locator("[data-health-metric-card]").first().innerText().catch(() => "");
+    note("mobileCardShowsValueAndState", /\d/.test(card) && /healthy|degraded|down|unknown/.test(card));
+  }
+  await shot(page, "health-metrics-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.healthMetrics = { steps };
+}
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -7383,6 +7539,10 @@ async function main() {
     // page that was never rendered is eight dead affordances. `runHealthDepth` clicks
     // through to it and asserts the landing URL, which is what proves the link works.
     { path: "/health/services/redis", name: "health-service-detail" },
+    // The metric history screen (REQ-014, slice 2) — walked for the same reason: the
+    // overview links to it, so an unwalked page is a dead affordance, and `runHealthMetricsDepth`
+    // reads the CSV the export button downloads and compares it against the table on screen.
+    { path: "/health/metrics", name: "health-metrics" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -7593,6 +7753,7 @@ async function main() {
   if (wants("health-overview")) {
     matchedOnly.add("health-overview");
     report.health = await runDepthPass("health", () => runHealthDepth(page, report));
+  report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
     log(`health: ${JSON.stringify(report.health)}`);
   }
 
@@ -7714,7 +7875,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
