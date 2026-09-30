@@ -7902,6 +7902,97 @@ its own timeout has verified nothing about the pages after the cut.
 UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
 rather than a test alone. (c) Slice 4, encryption.
 
+1|
+2|## Tick 38 · REQ-133 slice 9 — the capability matrix, finally given a caller (acceptance 6)
+3|
+4|**What.** A project member's `owner` / `editor` / `operator` / `viewer` role now decides what the
+5|API will let that member do — on all seven write paths, which until this tick consulted nothing
+6|but visibility.
+7|
+8|**The defect, and the check that shaped the fix.** `ProjectRole::can_edit` / `can_run` /
+9|`can_administer` / `can_manage_members` / `can_manage_credentials` have been unit-tested since
+10|slice 1, the members screen renders all four roles, and `automation_project_members.role` has
+11|carried one of them since migration 0164. Nothing asked. `PUT /workflows/{id}`,
+12|`DELETE /workflows/{id}`, `POST /workflows/{id}/run`, `POST /workflows` and
+13|`POST`/`PUT`/`DELETE /automations` all reached the store through `workflow_in_scope`,
+14|`automation_in_scope` or `resolve_target` — each answers *"may this caller see the row"*, a
+15|question **every member of a project answers yes to**. A viewer could rewrite a definition, delete
+16|one, and start a run of an automation somebody else wrote. The tenth instance on this branch of
+17|its signature defect, in the purest form: not a function that computed the wrong answer, but a
+18|function that computed the *right* answer, was *right about caching*, and had no caller to be
+19|stale.
+20|
+21|The REQ's own risk note names the mechanism it expected — *"the cache key includes a membership
+22|revision"*. Checked rather than assumed: `grep -rn cache crates/permissions/src
+23|crates/workflows/src` finds nothing that memoizes a role, `crates/permissions/src/groups.rs` says
+24|it outright ("resolution never caches"), and `role_of` is one indexed primary-key lookup on
+25|`automation_project_members`. **So migration 0181 deliberately adds no revision counter.** A
+26|number incremented by the membership writers and read by nobody would be the greenest possible lie
+27|this branch has not yet paid for; the honest artefact is the gate that proves the next decision
+28|re-reads the row.
+29|
+30|**Four commits' worth of work, in three.**
+31|
+32|1. **`0181_automation_project_role_enforcement.sql`** — `automation_projects.default_member_role
+33|   text not null default 'viewer'`, with the same role `check` constraint the membership table
+34|   carries. The column exists because "which role does a non-member hold in the visible default
+35|   project" was previously decided *implicitly*, by the absence of a check; `viewer` is the value,
+36|   because that project is where an organization's automations accumulate and "you are not a
+37|   member" must not read as "you may run everything everybody built".
+38|2. **`crates/workflows/src/projects.rs`** — `effective_role` (membership role, else the project's
+39|   own `default_member_role` when the project is visible and the caller is not a member, else
+40|   `None`) and `permits` on top of it. `effective_role` is deliberately **not** `role_of`: they
+41|   differ for exactly one caller — someone who may see the default project without being a member
+42|   of it — and `role_of`'s `None` there becomes a `404` on their own organization.
+43|3. **The routes** — `workflows::workflow_with_capability` (`can_edit` on update and delete,
+44|   `can_run` on run) and `automation::automation_with_capability` (`can_edit` on replace and
+45|   delete), plus the capability check inside `resolve_project` and inside
+46|   `create_automation`, so `POST /workflows` is covered too. `require_capability` in the projects
+47|   surface now asks `effective_role`. Refusals are `403 project_capability_required` and **name the
+48|   role** — a refusal that says only "forbidden" is what an operator reads as a bug, and the
+49|   acceptance line is about the role being legible as much as enforced.
+50|
+51|**Proof.** `scripts/qa/run-project-role-freshness.sh` **5/5 and PROVEN TO FAIL at 2/5** with
+52|`permits`' capability consultation removed. The two survivors are the negative controls — an owner
+53|keeps all six capabilities, and the instance-administrator short-circuit is intact — which is what
+54|shows the gate names this defect and not its neighbourhood.
+55|
+56|Four decisions in one test, one account, one project, membership written between them and **no
+57|re-login**: no membership ⇒ refused (so nothing downstream is vacuous); granted `operator` ⇒
+58|`can_run` yes and `can_edit` **no**; revoked ⇒ `can_run` no again; granted `editor` ⇒ `can_edit`
+59|yes. The `operator`-runs-but-does-not-edit assertion is the load-bearing one — a guard that
+60|treated "is a member" as "may do anything" passes the other three. The re-role-in-place case is a
+61|separate test because it is a different statement: nothing inserted, nothing deleted, so a guard
+62|reading a stale *join* rather than a stale cache still gets it wrong.
+63|
+64|**The gate found a second defect in its first run, and it was not mine.** The default-project test
+65|answered `None` where it expected `Some(Viewer)`. The cause: `visible_project_ids` admits the
+66|organization's default project to every account, while `find_visible` — the single-project read —
+67|did not. So the default project appeared in `GET /projects`, in the switcher and in every scoped
+68|list, and then answered `404` from `GET /projects/{id}`. Two functions answering the same question
+69|differently is this module's recurring shape; `find_visible` now carries the same `p.is_default`
+70|arm, which `resolve_target` and `can_see` inherit.
+71|
+72|**Fixture defect of mine, first.** The capability table is annotated
+73|`[(fn(ProjectRole) -> bool, &str); 6]` rather than inferred: six *fn items* with the same signature
+74|are six distinct types, so the first element silently decided the array's type and the other five
+75|did not coerce.
+76|
+77|**Gates.** `omnion-workflows --lib` **56** unchanged, `omnion-api --lib` **254** unchanged,
+78|`run-project-isolation.sh` **14/14** unchanged (the twelve pre-existing assertions plus the two
+79|archive guards), `omnion-api` builds, admin `tsc --noEmit` exit 0.
+80|
+81|**Not claimed.** No screen changed, so no walkthrough line is ticked in either direction. The
+82|acceptance line is about the API's answer; the members screen that performs the role change is
+83|typechecked and harness-driven but still un-observed by a completed `scripts/qa/run.sh` pass on this
+84|branch.
+85|
+86|**Next.** Acceptance 7 (a credential from project A cannot be referenced by a workflow in project
+87|B) names a `credentials` table that exists on no branch — the same "the sentence names a resource
+88|this branch does not have" position slice 3 took with workflow schedules, and it needs the same
+89|treatment: prove what can be proved, name the half that cannot.
+90|
+
 ## Tick 37 · REQ-133 slice 8 — global search, scoped to the caller's projects
 
 Acceptance 5 ("Global search returns only resources the caller may see, scoped to their projects,
