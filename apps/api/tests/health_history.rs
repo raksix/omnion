@@ -34,7 +34,7 @@
 
 #![allow(clippy::too_many_lines)]
 
-use omnion_health::{MetricSummary, Range, omnion_health};
+use omnion_health::{MetricSummary, Range};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -197,7 +197,6 @@ async fn an_empty_window_reports_no_aggregates_rather_than_zero() {
     }
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -241,7 +240,6 @@ async fn a_populated_window_reports_real_aggregates_and_its_own_bounds() {
     );
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -283,7 +281,6 @@ async fn the_sparkline_is_the_window_values_oldest_first() {
     assert!(none.is_empty());
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -339,7 +336,6 @@ async fn the_export_carries_exactly_the_rows_the_table_rendered() {
     assert!(week.lines().nth(1).expect("a row").ends_with(",7d"));
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -361,7 +357,6 @@ async fn an_export_of_an_empty_window_is_a_file_and_not_an_error() {
     assert!(csv.contains("range"), "the header names the window column");
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -384,7 +379,7 @@ async fn retention_leaves_the_windows_the_table_reads_intact() {
     // A week-old sample — the oldest the widest range shows — must survive the
     // sweep, and a 45-day-old one must not.
     insert_sample(harness.pool(), "queue", "queue_depth", 12.0, 24.0 * 6.0).await;
-    await insert_sample(harness.pool(), "queue", "queue_depth", 1.0, 24.0 * 45.0).await;
+    insert_sample(harness.pool(), "queue", "queue_depth", 1.0, 24.0 * 45.0).await;
 
     let deleted = omnion_health::prune_old_samples(harness.pool())
         .await
@@ -403,7 +398,6 @@ async fn retention_leaves_the_windows_the_table_reads_intact() {
     assert_eq!(queue.min, Some(1.0), "and it is the only one in range");
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 // ---------------------------------------------------------------------------------------------
