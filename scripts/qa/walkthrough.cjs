@@ -2128,10 +2128,20 @@ async function runAiWorkflowConsole(page, report) {
   // box has no key for. The row is written in the shape `apply_answer` leaves it in — status
   // `draft`, a definition the engine's own validator accepts — so the screen is reading the
   // same thing a real answer would leave behind.
-  const org = qaSql(
-    "select organization_id from ai_workflow_drafts limit 1" ) === ""
-    ? qaSql("select id from organizations order by created_at desc limit 1")
-    : qaSql("select organization_id from ai_workflow_drafts limit 1");
+  // The organization is read from the drafts table when one exists and from `organizations`
+  // otherwise -- but the fallback has to be a READ that can be empty, and this box has had two
+  // writers reach this point with a fresh QA database where `ai_workflow_drafts` is empty and the
+  // organization the walkthrough signed in with is not the newest row in `organizations`. An empty
+  // string went into a uuid column, so the insert died and the console reported "no provider"
+  // for a reason that had nothing to do with the console.
+  const orgFromDraft = qaSql("select organization_id from ai_workflow_drafts limit 1");
+  const org = (orgFromDraft || "").trim() || qaSql("select organization_id from users order by created_at desc limit 1").trim();
+  if (!/^[0-9a-f-]{36}$/i.test(org)) {
+    const userOrg = qaSql("select organization_id from users order by created_at desc limit 1");
+    log(
+      `ai workflow console: no organization to seed a draft into (drafts="${orgFromDraft}", user="${userOrg}", organizations=${qaSql("select count(*) from organizations")})`,
+    );
+  }
   const definition = JSON.stringify({
     trigger: { kind: "manual" },
     steps: [
@@ -2143,7 +2153,7 @@ async function runAiWorkflowConsole(page, report) {
     `insert into ai_workflow_drafts (organization_id, title, prompt, rationale, definition, status, model_key, tokens_input, tokens_output, created_by)
      values ('${org}', 'QA console draft',
              'Summarise each new support ticket and file it under the right topic.',
-             ${JSON.stringify(rationale).replace(/'/g, "''")},
+             '${rationale.replace(/'/g, "''")}',
              '${definition.replace(/'/g, "''")}'::jsonb,
              'draft', 'qa/mock-model', 42, 17,
              (select id from users order by created_at desc limit 1))

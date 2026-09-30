@@ -169,6 +169,21 @@ wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did 
 QA_ONLY_ARGS=()
 [ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
 
+# The tenant has to exist before the walkthrough runs, and this step is what puts it there.
+#
+# A freshly reset QA database holds a platform account with `organization_id IS NULL` and an EMPTY
+# organizations table -- the first-run wizard creates the owner and stops. Every rule belongs to a
+# tenant, so the editor refuses its own save with "Choose an organization before saving a rule",
+# the lists render empty, and each depth note downstream reads as a broken screen. The tenant
+# picker is gated on `organizations.length > 1`, so a probe does not even have a control to click.
+#
+# The script existed and nothing called it. The symptom that finally named it was the AI console's
+# fixture: `insert into ai_workflow_drafts (organization_id, …) values ('' …)` — a uuid column fed
+# an empty string — which read as a broken console on a database that had no tenant in it at all.
+step "ensure the QA organization exists"
+node scripts/qa/ensure-organization.mjs --url "http://127.0.0.1:$API_PORT" --admin "http://127.0.0.1:$ADMIN_PORT" \
+  || echo "[qa] the organization could not be created; the rule screens will report an empty tenant"
+
 step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
