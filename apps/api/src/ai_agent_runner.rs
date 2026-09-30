@@ -33,12 +33,14 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use omnion_ai_hub::agent::{AgentEvent, RunLimits, StepKind, StepStatus, StopReason};
+use omnion_ai_hub::identity;
 use omnion_ai_hub::loop_engine::{
     CancelHandle, OutputVerification, Persist, RunOptions, Runtime, Sink, run_with as run_agent,
 };
 use omnion_ai_hub::provider_model::ProviderModel;
 use omnion_ai_hub::run_store::{self, Run};
-use omnion_ai_hub::tools::{AllowList, ToolRegistry};
+use omnion_ai_hub::tool_exec::{self, ToolExecutor};
+use omnion_ai_hub::tools::{AllowList, Execution, ToolRegistry, ToolSummary};
 use omnion_ai_hub::{DecisionContext, ProviderTarget, Scope, resolve_and_record};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
@@ -46,6 +48,211 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::state::AppState;
+
+/// The permission decision for a run's caller, read from the platform's own resolver.
+///
+/// **A run is not more powerful than whoever started it.** The AI identity narrows what the
+/// *agent* may do; this narrows what the *person* behind it may do, and a run started by a system
+/// (a schedule, a webhook) has no user and therefore no grant — which is the conservative
+/// direction, and the one an agent triggered by an untrusted payload should land in.
+///
+/// The resolution is cached per run rather than read per call: a run's permissions do not change
+/// under it, and a `select` per tool call would put the permission engine in the middle of the
+/// money path for no benefit. A permission revoked mid-run takes effect on the next run, which is
+/// the same contract the tool's own `enabled` flag already has.
+struct PermissionsForCaller {
+    organization_id: Uuid,
+    user_id: Option<Uuid>,
+    /// Loaded once by [`PermissionsForCaller::load`]; a run's permissions do not change under it.
+    cached: std::sync::OnceLock<PermissionSet>,
+}
+
+impl omnion_ai_hub::tool_exec::PermissionGate for PermissionsForCaller {
+    fn allows(&self, permission: &str) -> bool {
+        // The trait is synchronous and the resolution is not, so the answer is fetched once by
+        // [`PermissionsForCaller::load`] before the pipeline is built and this is a pure lookup
+        // from there on. The `OnceLock` is initialised in that constructor and never poisoned:
+        // a failed load fills it with "denies everything" rather than leaving it unset, because
+        // an uninitialised gate would have to be handled in `allows` and the second failure mode
+        // (a gate that panics) is worse than the first.
+        self.cached
+            .get()
+            .map_or(false, |set| set.iter().any(|held| held == permission))
+    }
+}
+
+/// The set of permission keys a run's caller holds, loaded once.
+type PermissionSet = std::collections::BTreeSet<String>;
+
+impl PermissionsForCaller {
+    async fn load(pool: &PgPool, organization_id: Uuid, user_id: Option<Uuid>) -> Self {
+        let cached = std::sync::OnceLock::new();
+        let held = match user_id {
+            Some(user_id) => {
+                omnion_permissions::effective_permissions(
+                    pool,
+                    user_id,
+                    omnion_permissions::Scope::Organization { organization_id },
+                )
+                .await
+                .map(|permissions| permissions.granted_keys().into_iter().collect::<PermissionSet>())
+                // A run whose caller's permissions could not be read gets an empty set: every
+                // tool call is refused with `permission_denied` and the reason is in the trace.
+                // Guessing the other way would make a database blip into a privilege escalation.
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%user_id, %error, "a run's caller permissions could not be read");
+                    PermissionSet::new()
+                })
+            }
+            None => PermissionSet::new(),
+        };
+        let _ = cached.set(held);
+        Self {
+            organization_id,
+            user_id,
+            cached,
+        }
+    }
+}
+
+/// The one executor a run uses: the execution pipeline, plus the two things only the API can do.
+///
+/// The pipeline owns the *policy*; this struct owns the *evidence* — the `audit_log` row and the
+/// `ai.tool.*` event, both of which live in crates that `ai-hub` must not depend on. The split is
+/// not cosmetic: `omnion-audit` depends on `omnion-events` and `omnion-permissions` depends on
+/// nothing from `ai-hub`, so a `ai-hub → omnion-audit` edge would be a new cycle risk the moment
+/// anybody wired it the other way. `apps/api` already has both edges, so the rows are written
+/// here, from the same outcome value the pipeline produced.
+struct RunExecutor {
+    pool: PgPool,
+    run_id: Uuid,
+    organization_id: Uuid,
+    agent_id: Uuid,
+    user_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    pipeline: tool_exec::Pipeline,
+}
+
+impl RunExecutor {
+    /// The tools the model is shown — the pipeline's own filter, called once at construction.
+    fn payload(&self) -> Vec<ToolSummary> {
+        self.pipeline.model_facing()
+    }
+}
+
+impl ToolExecutor for RunExecutor {
+    fn execute<'a>(
+        &'a self,
+        step_no: u32,
+        call: &'a omnion_ai_hub::agent::ToolCall,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Execution> + Send + 'a>> {
+        Box::pin(async move {
+            // The step row the run's own event stream wrote for this step. The criterion is
+            // "both carrying the same run and step", and `ai_tool_calls.step_id` is a uuid
+            // reference — so the executor reads the id the step actually got, rather than
+            // inventing one. A run whose step was never opened leaves it null, which the column
+            // allows: `set null`, not `not null`.
+            let step_id = run_store::step_id(&self.pool, self.run_id, i32::try_from(step_no).unwrap_or(i32::MAX))
+                .await
+                .ok()
+                .flatten();
+            let outcome = self
+                .pipeline
+                .with_step(step_id)
+                .call(&self.pool, call)
+                .await;
+
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // A store failure inside the pipeline is not a tool failure and must not be
+                    // reported as one: the call may or may not have run. The loop gets a refusal
+                    // with the error's own code so the model can retry, and the operator gets a
+                    // log line naming the run — because "the tool failed" and "we could not
+                    // record the tool" are different incidents with different fixes.
+                    tracing::warn!(
+                        %self.run_id,
+                        %error,
+                        "the tool pipeline could not complete a call"
+                    );
+                    tool_exec::CallOutcome::Refused {
+                        tool: call.tool.clone(),
+                        code: "tool_pipeline_error".to_owned(),
+                        reason: format!("the platform could not complete this call: {error}"),
+                        call_id: 0,
+                    }
+                }
+            };
+            self.record(&outcome).await;
+            tool_exec::as_execution(&outcome)
+        })
+    }
+}
+
+impl RunExecutor {
+    /// The two records only the API can write: the append-only audit row and the bus event.
+    ///
+    /// **Both are best-effort, and neither can undo the call.** The tool has already run by the
+    /// time this is called; a failed audit write is a gap in the evidence, not a reason to tell
+    /// the model the call did not happen. That is why the failures are logged at `warn` and the
+    /// outcome is passed through untouched.
+    async fn record(&self, outcome: &tool_exec::CallOutcome) {
+        let tool = tool_exec::other_key(outcome);
+        let risk = omnion_ai_hub::catalogue::find(&tool).map_or("unknown", |spec| spec.risk.as_str());
+        let permission = omnion_ai_hub::catalogue::find(&tool)
+            .map_or("unknown", |spec| spec.permission);
+
+        let entry = omnion_audit::NewAuditEntry {
+            organization_id: Some(self.organization_id),
+            actor_user_id: None,
+            actor_type: omnion_audit::ActorType::Agent,
+            action: "ai.tool.call",
+            target_type: Some("ai_tool"),
+            target_id: Some(tool.clone()),
+            metadata: serde_json::json!({
+                "tool_key": tool,
+                "run_id": self.run_id,
+                "agent_id": self.agent_id,
+                "user_id": self.user_id,
+                "site_id": self.site_id,
+                "risk": risk,
+                "permission": permission,
+                "outcome": outcome.code(),
+                "ran": outcome.ran(),
+                "call_id": call_id_of(outcome),
+            }),
+            ip_address: None,
+        };
+        if let Err(error) = omnion_audit::record(&self.pool, entry).await {
+            tracing::warn!(%self.run_id, %error, "a tool call's audit row could not be written");
+        }
+
+        let Some(name) = outcome.alert_event() else {
+            return;
+        };
+        let event = omnion_events::NewEvent::new(name)
+            .payload(serde_json::json!({
+                "run_id": self.run_id,
+                "tool_key": tool,
+                "error_code": outcome.code(),
+                "identity_id": self.pipeline.identity_id(),
+            }));
+        if let Err(error) = omnion_events::bus::emit(&self.pool, event).await {
+            tracing::warn!(%self.run_id, %error, "a tool alert event could not be published");
+        }
+    }
+}
+
+/// The call log row's id, for the audit metadata. Zero for an outcome the pipeline refused
+/// before it wrote one.
+fn call_id_of(outcome: &tool_exec::CallOutcome) -> i64 {
+    match outcome {
+        tool_exec::CallOutcome::Ran { call_id, .. }
+        | tool_exec::CallOutcome::Refused { call_id, .. }
+        | tool_exec::CallOutcome::TimedOut { call_id, .. } => *call_id,
+        tool_exec::CallOutcome::Parked { .. } => 0,
+    }
+}
 
 /// The tick cadence: how often a worker looks for a queued run.
 ///
@@ -279,24 +486,95 @@ pub async fn execute_with_sink(
         };
     };
 
-    // The tools this agent may call. REQ-100 owns the catalogue; until it lands the registry is
-    // empty and an agent's `tools` column names keys nothing implements. That is not a silent
-    // success: the allow-list still governs, a call to an unregistered key is refused with
-    // `tool_unknown` in the trace, and the run's own prompt says what it may do.
+    // -- the tools. **This is the wiring REQ-100 slice 3 existed to make possible.** The line
+    //    used to be `ToolRegistry::empty()`, with a comment that the allow-list still governed:
+    //    it did, because a run with no registered tool can call nothing at all. But `empty()` also
+    //    meant the run had no *identity*, so the first time a tool was registered this run would
+    //    have had a tool and no policy. The pipeline below is the only door: identity, grant,
+    //    permission, schema, cap, timeout and the call log, in the order the request names them.
+    //
+    //    The identity is resolved **here**, once, before the first step. A pipeline that looked
+    //    its own identity up would need an organization on every call site — which is how a tool
+    //    ends up callable from a path that never resolved one.
     let registry = ToolRegistry::empty();
     let allow = AllowList::new(agent.tools.clone(), agent.approvals.clone());
+
+    let resolved_identity = match identity::default_identity(pool, run.organization_id)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(row) => {
+            let grants = identity::grants_of(pool, row.id).await.unwrap_or_default();
+            Some(tool_exec::identity_of(&row, grants))
+        }
+        None => {
+            // Not a failure: a run with no resolvable identity still *runs*, it simply cannot
+            // call anything, and the model is shown an empty tool payload. Saying so out loud is
+            // the difference between an installation whose identities were never configured and
+            // an operator staring at a run that refuses every tool for no visible reason.
+            tracing::warn!(
+                %run.id,
+                %run.organization_id,
+                "this run resolved no AI identity, so it may call no tools"
+            );
+            None
+        }
+    };
+
+    // A run is not more powerful than whoever started it. The identity narrows what the *agent*
+    // may do; this narrows what the *person* behind it may do, and a run started by a schedule or
+    // a webhook has no user and therefore no grant — the conservative direction, and the one an
+    // agent triggered by an untrusted payload should land in.
+    let gate = Arc::new(PermissionsForCaller::load(pool, run.organization_id, run.user_id).await);
+
+    // The pipeline borrows the registry and the gate, and the executor holds the pipeline, so
+    // both live behind an `Arc` the executor also holds. That is the whole ownership story: one
+    // registry, one gate, one pipeline, one executor, and no path that can assemble a run with
+    // the pipeline and without them.
+    //
+    // **The gate is coerced to `Arc<dyn PermissionGate>` here**, once. The variable's type is the
+    // inference's to choose, and leaving it as `Arc<PermissionsForCaller>` is a wall of `E0308`s
+    // three lines later at the `clone` — one of which is the only place the type is written down.
+    let registry = std::sync::Arc::new(registry);
+    let gate: Arc<dyn tool_exec::PermissionGate> = gate;
+    let executor = Arc::new(RunExecutor {
+        pool: pool.clone(),
+        run_id: run.id,
+        organization_id: run.organization_id,
+        agent_id,
+        user_id: run.user_id,
+        site_id: run.site_id,
+        pipeline: tool_exec::Pipeline::new(
+            std::sync::Arc::clone(&registry),
+            resolved_identity,
+            agent.tools.clone(),
+            agent.approvals.clone(),
+            std::sync::Arc::clone(&gate),
+            tool_exec::Caller {
+                organization_id: run.organization_id,
+                agent_id,
+                run_id: run.id,
+                // The step row is written by the loop's own event stream, so at construction
+                // there is no step yet; the executor fills it in from the step the loop names.
+                step_id: None,
+                user_id: run.user_id,
+                site_id: run.site_id,
+            },
+        ),
+    });
+
+    // The model is offered **only** the tools the pipeline would let it call. A tool the model
+    // can see but cannot call is a tool it will try, and three tries is `loop_detected` — so the
+    // payload and the refusal come from one filter, and a disabled or denied tool is invisible
+    // rather than merely refused.
     let provider = ProviderModel::new(
         ProviderTarget::from_provider(&model.provider),
         model.model.model_key.clone(),
     )
-    .with_registry(&registry)
+    .with_tools(executor.payload())
     .temperature(Some(agent.temperature));
-    let runtime = Runtime::new(
-        Arc::new(provider),
-        registry,
-        allow,
-        agent.system_prompt.clone(),
-    );
+    let runtime = Runtime::new(Arc::new(provider), executor, agent.system_prompt.clone());
 
     let limits = RunLimits::clamped(run_limits_for(&run, &agent));
     // The sink is the one thing the caller supplies. The background runner passes `None` and gets
