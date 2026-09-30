@@ -10145,3 +10145,102 @@ health_incidents                          8 walks, live PostgreSQL
 **Next:** the browser pass (`bash scripts/qa/run.sh`) still has not run on this box, and it is now
 the only thing standing between REQ-014 and slice 4. Both new screens have depth passes written
 and registered; they have not been executed.
+
+## Tick 48 — the signature defect, in the second language (2026-09-30)
+
+**What.** Ported this branch's dead-caller sweep to TypeScript and found two more
+instances of the same defect, one of them a *partition* that classified nothing and one a
+contract that was annotated as checked and was not.
+
+`scripts/qa/dead-exports.py` reads `apps/admin` (322 exported symbols, 182 files) and reports
+what no line outside its own definition mentions. It was wrong twice before it was right, and
+both bugs are written into the file rather than the commit message, because both produced a
+**clean** result:
+
+1. A `Path` compared against a `str`, so the "mentioned in no other file" set was always empty
+   and the first run reported **zero** candidates. On this branch a detector that reports
+   nothing is a broken tool far more often than a clean codebase — the previous detector
+   reported 665, then 497, then 59, then 40, and every one of those drops was its own bug.
+2. Template-literal *bodies* were blanked, which is right for Rust (a doc link is not a call
+   site) and wrong here: this codebase calls its own helpers from inside JSX `className`
+   templates — `${scanTone(status)}` — so every such helper read as uncalled. **A screen's
+   styling is exactly where a dead helper hides.** `scanTone` was the detector's first false
+   positive and the product was right.
+
+68 of the 77 first-pass candidates were `app/**/page.tsx` default exports, which Next calls by
+convention. They are counted and printed separately, never mixed with real findings — a triage
+list padded with framework entries is a triage list nobody reads.
+
+**The two defects.**
+
+`OPEN_LEAD_STATUSES` was exported, documented as "the statuses an operator still works", and
+**never called for the whole life of the module**, while its complement was used twice. The
+places that needed the open half inlined its inverse: the filter chips rendered the inverse of a
+closed check, and `slaState` guarded on `!lead.is_open || CLOSED.has(status)` — two answers to
+one question, one the server's and one the panel's, with nothing saying they must agree. Both
+call `isOpenLeadStatus` now.
+
+The deeper half is that the status vocabulary exists in **three** places — Rust, the migration's
+check constraint, and `apps/admin/lib/crm-intake.ts` — and the crate guarded only the first two.
+Nothing could guard the third: a TypeScript build cannot see a Rust constant, so a status added
+in Rust and SQL and forgotten in the panel compiles green on both sides. `the_panel_agrees_with_the_crate`
+reads the panel as text and compares the arrays **as sets** — `contains()` passes on a strict
+prefix, and the more likely half-drift is the ninth status nobody copies — plus **totality** of
+the label and tone maps, because a status with no wording still lists and every surface showing
+it falls back to raw `snake_case`.
+
+`STOREFRONT_DRAFT_FIELDS` was exported with no reader, under a comment saying the naming "keeps
+the two honest". The list was typed `(keyof Draft)[]`, which catches a key that **does not
+exist** and nothing else: the drift a developer actually performs — add a field to the interface,
+forget the list — compiled green, rendered no control, and could not be carried by the `PUT` body
+either. That is the shape the slice exists to prevent, produced by the safeguard meant to prevent
+it. Completeness is now a type-level assertion in both directions that reads the exported
+constant, which is what finally gives that export a caller.
+
+**Proof.** Each fix proven to fail, in the direction it is meant to catch:
+
+| drift | failure |
+|---|---|
+| status added to the panel only | `left: 9, right: 8` on the set comparison |
+| status added to the closed set only | `left: 5, right: 4` |
+| status listed, no label | `LEAD_STATUS_LABEL has no entry for converted` |
+| field added to the interface | `Type '"gift_wrap"' does not satisfy the constraint 'never'` |
+| field named that does not exist | the same on both type arms |
+
+`cargo test -p omnion-module-crm-intake --lib` **169/169** (168 before), 0 clippy in the file
+touched, `cargo build -p omnion-api` clean (10 pre-existing warnings, all other waves' files),
+`pnpm typecheck` clean, dead-export scan **8 → 6** (one of the six is Next's own `proxy.ts`).
+
+**Not claimed: no browser pass.** The QA slot is held by a live w3 pass (holder pid alive, cwd
+`/mnt/apopic/omnion-w3`) and load ran 42–57 across ten writers. The status chips changed and no
+`scripts/qa/run.sh` was started rather than starting one that would produce an unreliable result.
+
+**Next.** Four of the six remaining findings belong to other waves (search palette: `groupCommands`,
+`groupsSettled`; media: `PreviewLoading`; notifications: `EverythingMutedHint`) — recorded here
+so the owner of each wave has a triage list rather than a re-run. `fetchIntakeSource` is mine and
+is next: the API has `GET /crm/intake/sources/{id}` and the panel has a client function and no
+caller, and the sources screen has a row-to-editor path that copies the list row instead. **Still
+blocked and unchanged:** REQ-117 on REQ-064's forms module (absent from every branch) and REQ-118's
+cart on REQ-008 (`commerce_products` in zero migrations anywhere).
+
+### Lessons
+
+- **A detector that reports nothing is a broken tool until proven otherwise.** The `Path`/`str`
+  comparison gave a clean scan of 322 symbols on its first run. The previous detector in this
+  repo reported 665 → 497 → 59 → 40 candidates across four fixes, and every drop was a bug in the
+  detector rather than a fix to the product. Fix the tool, not the code, until the tool has
+  produced a finding you believe.
+- **Stripping strings is a language-specific decision.** Blank doc comments and string bodies in
+  Rust; do not blank template bodies in a codebase that calls its own helpers from inside JSX
+  templates. The false positive was `scanTone`, whose only call site is a `className`, and a
+  screen's styling is exactly where a dead helper hides.
+- **A `contains()` check on a list is a prefix check.** The most likely vocabulary drift is the
+  value somebody added last and nobody copied, which is a strict superset of what the old copy
+  has. Compare sets, not substrings.
+- **A type annotation can look like a check and be half of one.** `(keyof Draft)[]` proves every
+  listed key exists; it says nothing about whether every key is listed. The comment claiming the
+  export "keeps the two honest" is what made the gap invisible — the safeguard was described more
+  confidently than it was implemented.
+- **A partition with only one half called is a question asked twice.** The panel had both
+  `is_open` (server) and a status set (panel) answering "is this still work", and the two
+  consumers inlined the inverse of whichever half was convenient.
