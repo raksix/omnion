@@ -34,6 +34,7 @@ import type {
   ProjectLimitsSave,
   ProjectMember,
   ProjectRole,
+  ProjectSwitcher,
   WebhookEndpoint,
   WebhookList,
   WebhookRedeliverBatch,
@@ -426,6 +427,40 @@ export async function fetchOrganizations(): Promise<Organization[]> {
 // knows which projects an account may see, and a client-side filter over a list that is
 // already scoped is how the two drift. `mine: true` is the switcher's own question, and it is
 // asked of the server rather than answered here.
+
+/**
+ * The switcher's list (REQ-133, acceptance 3).
+ *
+ * Its own endpoint rather than a filter over `fetchProjects`, and the reason is in the server's
+ * comment: the recents ranking, the caller's per-row role and the stored selection are three
+ * answers `/api/v1/projects` does not carry, so a client-side filter would have had to reconstruct
+ * all three — and would have drifted the first time an instance administrator opened it.
+ */
+export async function fetchProjectSwitcher(organizationId?: string): Promise<ProjectSwitcher> {
+  const query = new URLSearchParams({ mine: "1" });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<ProjectSwitcher>(`/api/v1/projects/switcher?${query.toString()}`);
+}
+
+/**
+ * Switch into a project, or — with `null` — into "All projects".
+ *
+ * One POST for both directions, so the panel cannot get the two out of step by forgetting the
+ * clear. A project the caller may not see answers `404` like every other project read, and
+ * `request` raises it as a normal error rather than as something the panel has to special-case.
+ */
+export function selectProject(
+  projectId: string | null,
+  organizationId?: string,
+): Promise<ProjectSwitcher> {
+  const query = new URLSearchParams();
+  if (organizationId) query.set("organization_id", organizationId);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return request<ProjectSwitcher>(`/api/v1/projects/switcher${suffix}`, {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId }),
+  });
+}
 
 /** The projects the caller may see, in the API's own order. */
 export async function fetchProjects(organizationId?: string): Promise<Project[]> {

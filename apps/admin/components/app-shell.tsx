@@ -6,11 +6,12 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, GitBranch, Globe, HardDriveDownload, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, ShoppingBag, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, Copy, FileText, Fingerprint, FolderKanban, GitBranch, Globe, HardDriveDownload, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, ShoppingBag, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
+import { ProjectSwitcher } from "@/features/projects/project-switcher";
 import { GlobalSearch } from "@/components/global-search";
 import { NotificationBell } from "@/components/notification-bell";
 import { useSession } from "@/lib/session";
@@ -30,6 +31,12 @@ const NAV = [
   // platform think happened" and "who was told" — and an operator chasing a missing webhook
   // needs both on the same shelf.
   { href: "/events", label: "Events", icon: Activity },
+  // Projects (REQ-133). It sits with the automation surfaces rather than under Settings, because
+  // it is not a setting: a project is the bucket the other three of those screens are filed into,
+  // and an entry buried in a settings sub-path reads as a preference. Until this tick the whole
+  // feature had four screens and no navigation entry, so the switcher this slice adds had exactly
+  // one reachable host and a reader had to know the URL.
+  { href: "/automation/projects", label: "Projects", icon: FolderKanban },
   // The endpoints and their delivery history (REQ-016, slice 2). It sits next to Events
   // rather than under Settings because the two are the same investigation from both ends:
   // the feed says what happened, this says who was told and whether they got it.
@@ -233,6 +240,11 @@ export function AppShell({ title, description, children }: AppShellProps) {
             <GlobalSearch title={title} className="order-last w-full lg:order-none lg:w-80" />
             <NotificationBell />
             <SiteSwitcher />
+            {/* The project switcher renders itself only on the screens where a project scopes the
+                content, so the header can carry it unconditionally: on `/pages` it renders `null`
+                rather than a disabled pill, because a visible control that does nothing teaches the
+                reader that pages are filed in projects. */}
+            <ProjectSwitcher />
           </div>
         </header>
         <main className="flex-1 px-4 py-6 sm:px-6">{children}</main>

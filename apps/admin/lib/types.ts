@@ -2328,3 +2328,37 @@ export interface ProjectMember {
   /** When they joined. */
   created_at: string;
 }
+
+/**
+ * One row of the project switcher (REQ-133, acceptance 3).
+ *
+ * The project's own fields, plus the three facts only the switcher needs and which
+ * `fetchProjects` deliberately does not answer: this person's role in *this* row, whether
+ * it is the one they are currently in, and where it sits in their recents.
+ *
+ * `recent_rank` is nullable and the null is load-bearing: `0` means "you were here a
+ * minute ago" and `null` means "you have never been in this one". A client that read
+ * `recent_rank ?? 0` would put every project ever seen at the top of the recents.
+ */
+export interface ProjectSwitcherEntry extends Project {
+  /** The recents position (0 = most recent), or `null` for a project never switched into. */
+  recent_rank: number | null;
+  /** Whether this person may administer the project. An entry you can see but not manage is a real state. */
+  can_manage: boolean;
+  /** `true` on the one row that is this person's stored selection. */
+  selected: boolean;
+}
+
+/**
+ * The switcher's answer.
+ *
+ * `selected` is repeated outside the rows so the panel can say "you have not chosen one"
+ * — a client that had to infer it from a set of flags could not distinguish an empty
+ * switcher from an unchosen one.
+ */
+export interface ProjectSwitcher {
+  /** The projects this person may switch into, recents first. */
+  projects: ProjectSwitcherEntry[];
+  /** The stored selection, or `null` when this person has never chosen one. */
+  selected: string | null;
+}
