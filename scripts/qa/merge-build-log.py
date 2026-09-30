@@ -100,19 +100,44 @@ for h in diverged:
 #    Each side gets its OWN copy of the base multiset. Sharing one depleted counter
 #    made ours' 67 matches consume main's slots, and main's 70 base entries came out
 #    "new" - which is how a 6783-line log became 11335 lines.
+#    A side can carry a TRUNCATED copy of an entry base has in full -- an earlier
+#    line-level merge ate part of it, and the damage rode along ever since. Step 1
+#    repairs the base entry from the side holding the superset, but the damaged copy
+#    then fails to match `resolved` by content, is classified "new", and is appended
+#    as if it were another writer's tick. The log grows, the entry exists twice, and
+#    the truncation detector at the bottom fires on the damage *this script* just
+#    wrote. A block whose heading is a base heading and whose prose is a strict subset
+#    of that base entry is not history; it is a wound.
 merged = list(resolved)
 appended = []
+base_by_head = {}
+for b in base:
+    base_by_head.setdefault(head(b), []).append(b)
+
+
+def is_damaged_copy(b):
+    if head(b) not in base_by_head:
+        return False
+    return any(contains(c, b) and content(c) != content(b)
+               for c in base_by_head[head(b)])
+
+
 for side, arr in (("ours", ours), ("theirs(main)", theirs)):
     have = Counter(resolved)
-    fresh = []
+    fresh, dropped = [], []
     for b in arr:
         if have[b] > 0:
             have[b] -= 1
+        elif is_damaged_copy(b):
+            dropped.append(head(b)[:70])
         else:
             fresh.append(b)
     merged.extend(fresh)
     appended.extend(fresh)
-    print(f"  {side}: {len(fresh)} new entries appended at the end")
+    print(f"  {side}: {len(fresh)} new entries appended at the end"
+          + (f", {len(dropped)} damaged copies dropped" if dropped else ""))
+    for h in dropped:
+        print(f"    DROPPED truncated copy of an entry base holds in full: {h!r}")
 
 # (a)+(b) no base entry lost, base order unchanged.
 hb = [head(b) for b in base]
@@ -123,12 +148,20 @@ if lost:
     print("BASE ENTRIES LOST OR REORDERED:", lost[:5])
     sys.exit(1)
 
-# (c) every entry a side has and base lacks is present verbatim.
+# (c) every entry a side has and base lacks is present verbatim -- except a damaged
+#     copy, which step 2 deliberately dropped. Dropping is only allowed where the
+#     merged file still holds that entry in FULL: otherwise "dropped" would be a
+#     quieter way to lose history, and this check is the one that catches it.
 for side, arr in (("ours", ours), ("theirs(main)", theirs)):
     for b in arr:
-        if not any(b == x for x in base) and b not in merged:
-            print(f"APPENDED ENTRY LOST [{side}]: {head(b)[:70]!r}")
-            sys.exit(1)
+        if any(b == x for x in base) or b in merged:
+            continue
+        if is_damaged_copy(b) and any(
+                head(x) == head(b) and contains(content(x), content(b))
+                for x in merged if head(x) == head(b)):
+            continue
+        print(f"APPENDED ENTRY LOST [{side}]: {head(b)[:70]!r}")
+        sys.exit(1)
 
 # (d) truncation detector, on prose.
 bm = {head(b): b for b in base}
@@ -151,7 +184,11 @@ for bad in ("<<<<<<<", ">>>>>>>"):
 # multiset of the two sides summed: both sides carry the shared base entries, so
 # summing wants each shared line twice and reports the merged file - which has it once
 # - as missing. That false alarm is what kept the previous run from writing.
+# The damaged copies step 2 dropped are subtracted first, by the same predicate that
+# dropped them -- a third copy of the rule is how it drifted out of sync with the two
+# above in the first place.
 for side, arr in (("ours", ours), ("theirs(main)", theirs)):
+    arr = [b for b in arr if b in merged or not is_damaged_copy(b)]
     missing = Counter(arr) - Counter(merged)
     if missing:
         for line, n in list(missing.items())[:8]:

@@ -13,7 +13,8 @@ use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
     crm_autoresponder_runner, crm_sla_runner, event_retention_runner, event_runner,
-    project_limit_runner, restore_job_runner, search_runner, workflow_runner,
+    notification_runner, project_limit_runner, restore_job_runner, search_runner,
+    workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -98,6 +99,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     } else {
         tracing::info!("the webhook delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
+    }
+
+    // The notification delivery runner ticks here for the same reason and under the same flag
+    // (REQ-021, slice 4): `notification_deliveries` is a durable queue with a claim lease, so a
+    // tick that cannot reach the database is logged and the next one picks the work up. It
+    // shares the events cadence rather than growing a second set of knobs, because the two
+    // queues are drained by the same kind of work at the same kind of rate — and a second
+    // `*_POLL_MS` variable would be one more thing an operator has to match between a
+    // web node and a dedicated worker.
+    if state.config().events.runner_enabled {
+        if notification_runner::spawn(state.clone()).is_none() {
+            tracing::warn!("the notification delivery runner is not running");
+        }
+    } else {
+        tracing::info!(
+            "the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)"
+        );
     }
 
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own
