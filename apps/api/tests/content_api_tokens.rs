@@ -63,11 +63,24 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    // EVERY `Set-Cookie`, joined. Sign-in issues two headers — the session and the CSRF token —
+    // and a suite that keeps only the first is a suite whose every mutation answers `403`. The
+    // alternative, `headers().get_all(...)`, is the "right" API; joining is equivalent here
+    // because a cookie value never contains `; `.
+    let set_cookie = {
+        let values: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(|value| {
+                // Trim the attributes — `Path`, `HttpOnly`, `SameSite` — so the string is
+                // re-sendable as a `Cookie:` request header.
+                value.split(';').next().unwrap_or(value).trim().to_owned()
+            })
+            .collect();
+        (!values.is_empty()).then(|| values.join("; "))
+    };
     let bytes = response
         .into_body()
         .collect()
@@ -91,7 +104,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(cookies) => builder.header(header::COOKIE, cookies),
         None => builder,
     };
     match body {
@@ -167,17 +180,29 @@ async fn login(state: &AppState, email: &str) -> String {
         response.status,
         response.body
     );
-    response
+    // Both cookies, read by name and rejoined. Sign-in issues `omnion_session` *and*
+    // `omnion_csrf`; taking only the first — which is what this used to do, with
+    // `.split(';').next()` — leaves every cookie-authenticated mutation answered `403 csrf_failed`.
+    // The error names the missing header, so it is a loud failure rather than a silent one, and
+    // reading by name survives the platform adding a third cookie.
+    let header = response
         .set_cookie
         .as_deref()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("the cookie has a value")
-        .split_once('=')
-        .expect("the cookie is name=value")
-        .1
-        .to_owned()
+        .expect("login must set the session cookie");
+    let mut cookies: Vec<String> = Vec::new();
+    for part in header.split(';') {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=') {
+            if matches!(key.trim(), "omnion_session" | "omnion_csrf") && !value.is_empty() {
+                cookies.push(format!("{}={}", key.trim(), value));
+            }
+        }
+    }
+    assert!(
+        cookies.iter().any(|cookie| cookie.starts_with("omnion_session=")),
+        "login must set the session cookie: {header}"
+    );
+    cookies.join("; ")
 }
 
 async fn grant(db: &Db, organization_id: Uuid, user_id: Uuid, keys: &[&str], label: &str) {

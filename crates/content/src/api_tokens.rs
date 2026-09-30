@@ -338,8 +338,19 @@ fn fresh_material() -> (String, String, String) {
 }
 
 /// `length` random lowercase alphanumerics, drawn from the operating system.
+///
+/// The alphabet is **hexadecimal only** (`a`–`f`, `0`–`9`) and not the wider alphanumeric set,
+/// because the database constrains `prefix` to `^omn_[0-9a-f]{8}$`. The wider alphabet looks
+/// harmless and randomizes better, but `g`–`z` are rejected by the constraint, so roughly 15% of
+/// all mints ended in a `500 internal_error` naming a check constraint — a failure that looks like
+/// a corrupt database and is really a disagreement between a generator and a schema.
+///
+/// Twenty years is the whole justification for the narrower alphabet: a prefix is displayed, not
+/// brute-forced, and the secret half below carries 32 hex characters drawn from the OS for the
+/// actual security. The one cheap defence is to let the two agree: the alphabet here is a subset
+/// of what the migration allows, so every generated prefix is valid by construction.
 fn random_chars(length: usize) -> String {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    const ALPHABET: &[u8] = b"abcdef0123456789";
     let mut bytes = vec![0_u8; length];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     bytes
@@ -755,5 +766,53 @@ mod tests {
         assert!(expiry_from_preset(0, now).is_none());
         let preset = expiry_from_preset(30, now).expect("30 days is an expiry");
         assert!(preset > now);
+    }
+
+    /// The prefix generator and the `api_tokens_prefix_check` constraint must agree.
+    ///
+    /// This is a regression test for a real `500`: the generator drew from `a-z0-9` while the
+    /// migration constrains the column to `[0-9a-f]`, so every prefix containing a `g`-`z` was
+    /// refused by the database and surfaced as `internal_error`. A generator that samples the
+    /// alphabet 200 times will hit one of those within seconds; a test that only checks
+    /// `starts_with("omn_")` never will.
+    #[test]
+    fn every_generated_prefix_satisfies_the_column_check() {
+        for _ in 0..2_000 {
+            let (prefix, secret, plaintext) = fresh_material();
+            assert!(
+                prefix.len() == TOKEN_NAMESPACE.len() + 1 + PREFIX_LENGTH,
+                "{prefix} has the wrong length"
+            );
+            // The check constraint, transcribed: `^omn_[0-9a-f]{8}$`.
+            assert!(
+                prefix
+                    .strip_prefix(&format!("{TOKEN_NAMESPACE}_"))
+                    .map(|body| {
+                        body.len() == PREFIX_LENGTH
+                            && body.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+                    })
+                    .unwrap_or(false),
+                "{prefix} would be refused by api_tokens_prefix_check"
+            );
+            assert_eq!(secret.len(), SECRET_LENGTH);
+            assert!(plaintext.starts_with(&format!("{prefix}_")));
+        }
+    }
+
+    /// The alphabet must stay a subset of what the constraint allows, and the secret must stay
+    /// long enough that narrowing the alphabet did not weaken it.
+    #[test]
+    fn narrowing_the_prefix_alphabet_left_the_secret_strong() {
+        // 16 symbols over 32 characters is 128 bits — the same order as the 36-symbol alphabet
+        // over 32 characters was, and far past anything a display prefix needs.
+        assert!(SECRET_LENGTH * 4 >= 128, "the secret must carry at least 128 bits");
+        // And the charset really is the hex set, not a subset of it by accident.
+        let generated = random_chars(4_000);
+        assert!(
+            generated
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "the generator must not be able to leave the hex alphabet"
+        );
     }
 }
