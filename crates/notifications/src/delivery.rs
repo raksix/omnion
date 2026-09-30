@@ -89,9 +89,22 @@ pub struct DeliveryJob {
     /// The body to deliver.
     pub body: String,
     /// Where the reader should go.
+    ///
+    /// **This is the in-app deep link, not a transport destination.** A module that emits
+    /// `with_url("/media/files/{id}")` is telling the *bell* where to go, and reading it as
+    /// somewhere to POST would send every webhook delivery to a relative path — which
+    /// `reqwest` refuses with `relative URL without a base` after three attempts. A transport
+    /// that needs a destination reads [`Self::webhook_endpoint`], which comes from the
+    /// channel's own row.
     pub url: Option<String>,
     /// The recipient's address, from `users`, when the channel needs one.
     pub user_email: Option<String>,
+    /// The `webhook` channel's destination: the organization's own endpoint when it referenced
+    /// one, otherwise the literal URL it configured.
+    ///
+    /// `None` for every other channel, and `None` for a webhook channel that has neither — a
+    /// row that cannot say where to send says so here rather than by sending the in-app link.
+    pub webhook_endpoint: Option<String>,
 }
 
 /// What one tick did. Zero-valued means nothing happened, which is the runner's normal state.
@@ -343,10 +356,15 @@ pub async fn claim_due(pool: &PgPool, batch: i64, lease_seconds: f64) -> Result<
     }
 
     let sql = "select d.id, d.notification_id, n.user_id, d.channel, d.attempts, d.max_attempts, \
-                      n.title, n.body, n.url, u.email as user_email \
+                      n.title, n.body, n.url, u.email as user_email, \
+                      coalesce(c.endpoint_url, w.url) as webhook_endpoint \
                from notification_deliveries d \
                join notifications n on n.id = d.notification_id \
                left join users u on u.id = n.user_id \
+               left join notification_channels c \
+                      on c.organization_id = n.organization_id and c.channel = 'webhook' \
+                     and c.enabled \
+               left join webhook_endpoints w on w.id = c.endpoint_id and w.enabled \
                where d.id = any ($1) \
                order by d.next_attempt_at asc, d.created_at asc";
     Ok(sqlx::query_as(sql).bind(claimed).fetch_all(pool).await?)
