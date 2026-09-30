@@ -94,7 +94,11 @@ struct OutcomeRow {
 }
 
 /// One row of the attempt ledger, as the panel's timeline and dead-letter list read it.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// `PartialEq` is here so the scheduler's `Advance` (which carries a record) can be compared in
+/// a test. The row is a plain read of one table row with no identity beyond its columns, so
+/// comparing two of them for equality is not a claim about identity that could go stale.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AttemptRecord {
     pub id: i64,
     pub subsystem: String,

@@ -42,6 +42,7 @@ pub mod limiter_redis;
 pub mod limits;
 pub mod retry;
 pub mod retry_store;
+pub mod scheduler;
 pub mod store;
 pub mod vocabulary;
 
