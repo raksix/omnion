@@ -8804,3 +8804,47 @@ spending it produces no report at all. The two unticked boxes (390×844, keyboar
 
 **Next.** Run the pass the moment the slot frees; read the keyboard leg and the phone box off
 `summary.json` — which now exists whatever the leg did — and tick only what it actually shows.
+
+## 2026-09-30 · omnion-wave4 · tick 46 · REQ-051 (CRM)
+
+**What.** The blocker was never the QA slot — it was that a pass *could not name the binary it
+starts*. `scripts/qa/run.sh` spelled `$ROOT/target/debug/omnion-api` in three places, which
+assumes every writer builds inside its own worktree. This worktree does not (its target is
+`/mnt/apopic/omnion-w4-target`), so `$ROOT/target` did not exist, the freshness test found no
+binary, and the pass started a stale one or died — the `could not create file …/target/…` that
+tick 45 recorded as a sibling's doing. The in-repo `target/` is shared ground a sibling may
+delete mid-link, and that failure is `os error 2`, not 28, so it never reads as a full disk.
+Fixed in `87ec641c`: resolve the path once into `API_BIN` from `CARGO_TARGET_DIR`, so the
+freshness test, the `pm2 start` and the `cargo build` that precedes them all agree on one path.
+
+**The four-tick sign-in blocker is dead.** The pass reached the sign-in screen, ran the wizard,
+and walked **all six CRM screens** for the first time in this branch's history
+(`--only=crm`, 6/6 routes, 35 clicks, 47 screenshots, exit 0).
+
+**Proof.** `cargo build -p omnion-api` `REAL_EXIT=0` out-of-tree, binary at the resolved
+`API_BIN` (`198 MB`, 260 crates) with **no in-repo `target/` at all** — the fix is what makes
+the pass runnable here · `bash -n scripts/qa/run.sh` OK · `node --check scripts/qa/walkthrough.cjs`
+OK · `pnpm turbo run typecheck` **2/2** · `cargo test -p omnion-module-crm --lib` (below) ·
+pass exit **0**, report `qa-artifacts/20260930-134950`.
+
+**This pass is a NULL, and it is worth saying why precisely.** `/mnt/apopic` hit 99-100% mid-run
+(99% when the API binary finished building, 984 MB free at the tightest point). Every screenshot
+then failed with `ENOSPC: no space left on device, write`, which the walker swallows into
+`interact: … → 0 elements` — so the screens were never *clicked*, only loaded. The same full disk
+took Postgres out mid-pass and the API answered a real
+`503 dependency_unavailable "database is unavailable"` (26 of the 165 findings quote it, and the
+walkthrough's own `export` call recorded that 503 verbatim). So `160 high` is 160 counts of
+*infrastructure*, not 160 defects: `crm-state` 29, `console-error` 54 and `request-failed` 46 are
+the 503s, and the `crm-depth`/`crm-deals` legs are the screens that were loaded but never
+clicked. **Nothing here is a verdict on a screen** and no box is ticked on it.
+
+**The disk fight is the real lesson.** I reclaimed my own cold `target/` (2.5 GB) at the start,
+which is what made the build possible, and then spent exactly that gain on a build **and** a
+browser pass at the same time; the pass and the test build then raced for the last gigabyte and
+the test build lost — `REAL_EXIT=101` with `rustc-LLVM ERROR: IO failure on output stream`, which
+prints **no** `error[]` line and looks like an ordinary compile failure rather than a full disk.
+One heavy thing at a time on this box, and measure the disk *while* the heavy thing runs.
+
+**Next.** Re-run the CRM pass alone, with the build cache warm and no competing test build, and
+read the two unticked boxes (390×844, keyboard sheet) off `summary.json` — the leg now *runs*,
+which is the first time that has been true in four ticks.
