@@ -6407,3 +6407,30 @@ begins, and the `backup.restored` audit entry. (b) The `partial` box is still un
 where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
 is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
 read the price, the warnings and the phrase, so when the slot frees there is something to run.
+
+
+## Tick 70 — REQ-063 criterion 17: the `?site=` the walkthrough asked for was never sent
+
+- **What.** Merged 13 commits of `origin/main` (`fabe5085`), then read REQ-063's last open
+  criterion instead of re-queuing a pass, because the blocker was one question: is
+  `publicRendered` false because the harness addresses the wrong site, or because the product
+  cannot be addressed that way? `apps/web/lib/api.ts` resolved the site from `OMNION_SITE` or
+  the visitor's host and nothing else, so the `?site=main` in the walkthrough's URL was inert,
+  and `visitorHost()` returns `null` on 127.0.0.1 — the API was asked for the page with *no
+  site at all*. The API has always taken `?site=` (`PublicPageQuery`, host-or-key); the renderer
+  never forwarded it. Fixed in `fef91938`: `normalizeSiteHint` bounds the value to a token and
+  host resolution stays the default; `generateMetadata` takes the hint too, because the same
+  slug can exist on two sites with two different titles.
+- **Proof.** `omnion-content --lib` 249 passed · `apps/admin` `tsc --noEmit` clean over 747
+  files · `apps/web` `tsc --noEmit` clean. The merge's BUILD-LOG advisory ("dropped
+  `pnpm typecheck` line") was checked by multiset against both parents: the difference is empty
+  and the line it names is a verbatim duplicate this branch already had, so the splice dropped
+  nothing; the two duplicated `## ` headings in the result are in both parents already.
+- **Not done, and why.** Criterion 17 stays UNTICKED — a code fix is not a proof. No pass ran:
+  the QA slot was held by a *live* w3 walkthrough (not a stale place — its log is old because
+  the log is from a different pass), and /mnt/apopic fell 3.2 GB → 473 MB (100%) while I
+  waited, so starting would have killed the pass halfway. Freed my own `w2-target`
+  incremental/build/deps (2.9 GB off /dev/shm, binary kept) and left every sibling's alone.
+- **Next.** Run `--only=theme-settings` (REQ-062 slice 2, still unrun for two ticks) and
+  `--only=block-editor` (this criterion) the moment a slot is GRANTED, checking `df -h
+  /mnt/apopic` at grant time rather than at queue time.
