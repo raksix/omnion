@@ -7145,3 +7145,46 @@ free.
 a sentence in a document. That is a catalogue addition plus five emitters. The browser pass is still
 outstanding: the QA slot was **legitimately held** by a live w3 pass when this tick checked (holder
 pid alive, log one minute old), so it was left alone rather than reclaimed.
+
+---
+
+## 2026-09-30 · REQ-101 slice 1, the panel half (tick 37, omnion-w7)
+
+**What**
+
+The three screens slice 1 was still missing, plus the API field that makes their guardrail real:
+
+- `GET /ai/approvals` now answers `viewer_permissions` / `viewer_missing`, computed **per request**
+  from the caller's effective permissions rather than from the role's name. Two people with the
+  same role can differ, and a panel that guessed from the role would show a button the API refuses.
+- `/ai/approvals` — the inbox: status tabs with counts, class filter, resource search, row actions
+  (Review + quick Reject with a required reason), a pending badge, and the empty state linking to
+  the policy screen.
+- `/ai/approvals/[id]` — the review screen: who asked, the model, the run link, the preview hash,
+  an expiry line, the **frozen** diff (OLD/NEW per field, unchanged collapsed behind a toggle,
+  cascade line for deletes), the danger zone with the typed phrase, the audit timeline, and the
+  decision bar that sticks to the bottom on a phone.
+- `/ai/approvals/policies` — six classes, mode, typed confirmation, expiry, reset. The un-gate
+  demands the exact phrase `set <class> to allow`; the row keeps a warning stripe afterwards.
+
+**Proof**
+
+```
+cargo build -p omnion-api                      exit 0
+cargo test -p omnion-ai-hub --lib              447 passed, 0 failed
+tsc -p apps/admin/tsconfig.json --noEmit       exit 0
+node --check scripts/qa/walkthrough.cjs        clean
+```
+
+**The browser pass did NOT run, and saying so is the point.** The QA slot's holder pid (542657)
+is alive and its `/proc/542657/cwd` is `/mnt/apopic/omnion-w3` — a live sibling pass, not a stale
+file. Load 64, 1.3 GB free on `/mnt/apopic` (98%). Starting a fourth Chrome under those numbers is
+how the 2026-09-28 swap spiral happened. The pass is written and wired; it runs on the first tick
+that finds the slot free.
+
+**Next**
+
+Run the w7 pass (`QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206`) against the
+three new routes, then tick the boxes the pass proves: the empty/loading/error states, the
+disabled-and-named decision controls, and the review screen's diff. Slice 2 (the shared
+preview/apply module, base revisions, stale detection at the API level) is untouched.
