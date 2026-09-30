@@ -10546,6 +10546,107 @@ async function runWorkflowBuilderDepth(page, report) {
     },
   });
 
+  // ---- A switch the engine cannot run, said in words the author can act on ----------------
+  //
+  // This one is measured on the SAVE, not on `/validate`, and the distinction is the whole
+  // reason the row exists. `switch_not_executable` is raised by the *projection* (`step_for`),
+  // and `validate` never calls the projection — a table of cases posted at `/validate` could
+  // never show this code whether it worked or not, and the note would have read that as
+  // "validation cannot find it" about a check that is not on that path at all.
+  //
+  // The graph carries exactly ONE defect (the switch) on an otherwise valid spine, so a
+  // refusal is attributable to it. The assertion is on the WORDS as much as the fact: the old
+  // sentence was `"switch" does not project onto a step`, which reads as a typo for a card the
+  // palette had just handed the author. It must name the Condition alternative instead, since
+  // "not supported yet" with no next step is what teaches people to ignore the panel.
+  //
+  // The rule is restored afterwards. This probe overwrites a LIVE rule's graph, so leaving a
+  // switch on it would poison every later row in this pass (and the author's saved work).
+  const switchNotExecutable = await page.evaluate(async (id) => {
+    const current = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    const triggerNode = (nid) => ({
+      id: nid,
+      type: "trigger.event",
+      label: `Event ${nid}`,
+      params: { event: "qa.switch.probe" },
+      position: { x: 40, y: 40 },
+    });
+    const act = (nid) => ({
+      id: nid,
+      type: "action",
+      label: `Act ${nid}`,
+      params: { action: "log", parameters: "{}" },
+      position: { x: 320, y: 40 },
+    });
+    const finish = (nid) => ({
+      id: nid,
+      type: "end",
+      label: `End ${nid}`,
+      params: {},
+      position: { x: 600, y: 40 },
+    });
+    const edge = (from, to, port, seq = 0) => ({
+      id: `e-${from}-${port}-${to}-${seq}`,
+      source: from,
+      source_port: port,
+      target: to,
+    });
+    // One switch, one arm, one end: the smallest drawing whose ONLY defect is the switch.
+    // Two arms would add `ambiguous_branch`, and the row would be measuring two codes.
+    const graph = {
+      nodes: [
+        triggerNode("t1"),
+        { ...act("sw"), type: "switch", params: { cases: "only" } },
+        act("a1"),
+        finish("e1"),
+      ],
+      edges: [
+        edge("t1", "sw", "out"),
+        edge("sw", "a1", "case_1"),
+        edge("a1", "e1", "success"),
+      ],
+    };
+    const response = await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph, graph_version: current.graph_version }),
+    });
+    // The save answers 200 on purpose: a rule that does not project is still STORABLE, and
+    // the run is where it refuses. A probe asserting a 4xx here would be asserting the
+    // opposite of the design.
+    const saved = await (
+      await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" })
+    ).json();
+    // Put the author's graph back on the version this save produced, so the restore cannot
+    // itself be refused as a conflict.
+    await fetch(`/api/v1/workflows/${id}/graph`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        graph: current.graph,
+        graph_version: saved.graph_version,
+      }),
+    });
+    const reason = saved.validation_error ?? "";
+    return {
+      status: response.status,
+      // The save carried the reason onto the rule row — this is what turns a non-runnable
+      // rule into one an author can read about from the list screen.
+      storedReason: reason.slice(0, 200),
+      savedNotRunnable: reason.length > 0,
+      // The two sentences must stay apart; a test in graph.rs asserts the same split, and a
+      // probe that only counted refusals would pass on the typo wording.
+      namesCondition: /condition/i.test(reason),
+      notATypo: !/does not project onto a step/i.test(reason),
+      restored: true,
+    };
+  }, workflowId);
+  note({ step: "switch-not-executable", ...switchNotExecutable });
+
   // ---- The toolbar's Validate, and the problems panel it fills -----------------------------
   await page.locator("[data-testid='builder-validate']").first().click({ timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(1500);
