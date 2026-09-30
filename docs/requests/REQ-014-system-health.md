@@ -3,14 +3,15 @@
 > **Status:** in-progress (slices 1, 2 and 3 shipped: probes + overview, `/health` +
 > `/health/services/{key}` with its own 24 h trend column, `/health/metrics` with named ranges and a
 > server-rendered CSV export, and the incident timeline + threshold policy with
-> `/health/incidents` and `/health/settings`. **Slice 4 shipped its two writers** (`a87ee01a`,
-> `c3c22e3f`, `83209cab`): `worker_heartbeats` had a reader and no writer, so the `n/m` card could
-> only ever have said "no worker has registered a heartbeat", and `run_and_record` was reached from
-> the four route handlers and nowhere else, so samples existed only while somebody watched the panel.
-> Slice 4's events half — the five `health.*` names the request lists — is **not** started. The
+> `/health/incidents` and `/health/settings`. **Slice 4 is now code-complete.** Its two writers shipped
+> in `a87ee01a`, `c3c22e3f`, `83209cab`: `worker_heartbeats` had a reader and no writer, and
+> `run_and_record` was reached from the route handlers and nowhere else, so samples existed only while
+> somebody watched the panel. Its **events half** shipped in `f57144f9`, `ec56f87d`, `1df104af`,
+> `53273719`: the catalogue now has a `health` area with the five names, `apply_policy` returns what
+> it decided instead of discarding it, and both runners announce it — to organizations that have an
+> endpoint subscribed to `health`, because an event with no organization is delivered to nobody. The
 > `health_history`/`health_incidents`/`health_workers` walks run on live PostgreSQL and pass; the
-> browser pass (`scripts/qa/run.sh`) has still not run on this box) · **Captured:** 2026-09-25 ·
-> **Layer:** core + admin UI
+> browser pass (`scripts/qa/run.sh`) has still not run on this box) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
