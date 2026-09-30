@@ -172,6 +172,37 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<
         .map_err(IdentityError::from)
 }
 
+/// Attach an account to a tenant, and answer the updated row.
+///
+/// **This is the column tenancy is read from.** `onboarding_state` is a single global row
+/// (`where id = 1`) recording that a first run happened; it is a setup marker, not a
+/// membership. `apps/api::scope` resolves every request's organization from
+/// `users.organization_id`, so a tenant that exists but was never attached to its owner leaves
+/// every organization-scoped route answering `400 organization_required` — a wizard that
+/// reports "organization: done" while the account still has no tenant.
+///
+/// The onboarding step is the only caller today, and it is exactly the place the write was
+/// missing: the step created the organization, recorded it in the setup state, audited it, and
+/// stopped. Attaching the actor is the same transaction's business — the two must not be able
+/// to disagree.
+///
+/// `None` means no such account; the caller is a setup step acting on itself, so that is a bug
+/// rather than a state to handle, and the caller says so.
+pub async fn set_organization(
+    pool: &PgPool,
+    id: Uuid,
+    organization_id: Option<Uuid>,
+) -> Result<Option<User>> {
+    let sql =
+        format!("update users set organization_id = $2, updated_at = now() where id = $1 returning {USER_COLUMNS}");
+    sqlx::query_as::<_, User>(&sql)
+        .bind(id)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(IdentityError::from)
+}
+
 /// Look an account up by email address.
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
     let email = normalize_email(email)?;
