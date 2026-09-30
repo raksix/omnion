@@ -1,6 +1,6 @@
 # REQ-013 — Backup Center
 
-> **Status:** in-progress (slices 1, 3 (retention sweep), 2a (restore preview) and 2b (the destructive restore) shipped; 2c is the queued/abortable worker) · **Captured:** 2026-09-25 · **Layer:** core (`crates/backup`) + admin UI
+> **Status:** in-progress (slices 1, 3 (retention sweep), 2a (restore preview) and 2b (the destructive restore) shipped; 2c is the queued/abortable worker. **The date cells on this screen were empty for a second, unrelated reason, now fixed: every instant crossed the wire as a nine-element array rather than a timestamp** — see `8322d753` and the wire-format note in BUILD-LOG) · **Captured:** 2026-09-25 · **Layer:** core (`crates/backup`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request

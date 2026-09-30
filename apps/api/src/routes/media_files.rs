@@ -313,8 +313,10 @@ pub struct FileQuery {
     /// Only files uploaded by this account.
     pub uploaded_by: Option<Uuid>,
     /// Only files uploaded at or after this moment.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_after: Option<OffsetDateTime>,
     /// Only files uploaded before this moment.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_before: Option<OffsetDateTime>,
     /// Only files carrying this tag.
     pub tag: Option<String>,
