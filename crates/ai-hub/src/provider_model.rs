@@ -64,10 +64,25 @@ impl ProviderModel {
     /// decide what may run. They are the same object, so a tool the model was told about is a
     /// tool the run can execute — a model told about a tool the loop would refuse produces an
     /// agent that fails on a call it was designed to make.
+    ///
+    /// **Every caller should prefer [`Self::with_tools`].** This one offers *every* registered
+    /// tool, with no identity, no grant and no permission filter — which is exactly what the
+    /// execution pipeline exists to prevent. It survives for the crate's own tests, where there
+    /// is no database to resolve an identity against; shipping code that calls it would hand a
+    /// model tools the pipeline would then refuse, and the run would die on a call it was
+    /// designed to make.
     #[must_use]
     pub fn with_registry(mut self, registry: &ToolRegistry) -> Self {
-        self.tools = registry
-            .catalogue()
+        self.with_tools(registry.catalogue())
+    }
+
+    /// The same model, offering exactly the tools the caller decided to show.
+    ///
+    /// The declarations come from one filter — the execution pipeline's own `model_facing()` —
+    /// so a tool that is invisible and a tool that is refused are the same fact computed once.
+    #[must_use]
+    pub fn with_tools(mut self, visible: Vec<crate::tools::ToolSummary>) -> Self {
+        self.tools = visible
             .into_iter()
             // The tool's own schema, not a placeholder: a declaration with empty properties
             // tells the model to call the tool with nothing, and the tool then runs on a
@@ -455,7 +470,7 @@ mod tests {
     }
 
     fn runtime(model: std::sync::Arc<ProviderModel>) -> crate::loop_engine::Runtime {
-        crate::loop_engine::Runtime::new(
+        crate::loop_engine::Runtime::for_tests(
             model,
             tool_registry(),
             AllowList::new(vec!["page.search".to_owned()], Vec::new()),
@@ -673,7 +688,7 @@ mod tests {
         ]])
         .await;
         let model = std::sync::Arc::new(ProviderModel::new(mock.target.clone(), "mock-model"));
-        let runtime = crate::loop_engine::Runtime::new(
+        let runtime = crate::loop_engine::Runtime::for_tests(
             model,
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -731,7 +746,7 @@ mod tests {
             ModelAnswer::calling(vec![RequestedCall::new("page.search", serde_json::json!({ "q": "x" }))]),
             ModelAnswer::text("done"),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model,
             tool_registry(),
             AllowList::new(vec!["page.search".to_owned()], Vec::new()),

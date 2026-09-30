@@ -75,6 +75,23 @@ where
     }
 }
 
+/// A shared handle forwards, so a caller can hold one gate for several pipelines.
+///
+/// The trait already says `Send + Sync`; this impl is what makes that *useful* rather than merely
+/// required. A `Pipeline` owns its dependencies, so without it a caller that wanted to share one
+/// gate between two pipelines would have to build two. `?Sized` is what lets the same impl serve
+/// an `Arc<dyn PermissionGate>` as well as an `Arc<Concrete>`.
+///
+/// **Not `&T` as well**, and the reason is worth keeping: a blanket impl for references collides
+/// with the closure impl above (`&F` is itself `Fn`), and Rust cannot order the two. A borrowed
+/// gate is a test-only convenience, so the tests take a concrete `Arc` instead of teaching the
+/// trait a rule it would have to break every time a caller wanted a closure.
+impl<T: PermissionGate + ?Sized> PermissionGate for std::sync::Arc<T> {
+    fn allows(&self, permission: &str) -> bool {
+        self.as_ref().allows(permission)
+    }
+}
+
 /// The caller of a call, as far as the log and the permission gate care.
 ///
 /// Separate from the agent because the two really are different: a workflow node's run has a
@@ -218,9 +235,14 @@ impl CallOutcome {
 }
 
 /// The execution context: what the pipeline needs beyond the call itself.
-pub struct Pipeline<'a> {
+pub struct Pipeline {
     /// The compiled tools. `get` is the only capability this module has over them.
-    registry: &'a ToolRegistry,
+    ///
+    /// `Arc` rather than a borrow, and that is what lets an executor hold a pipeline **inside**
+    /// the `Arc` the loop owns. With a `&'a ToolRegistry` the executor would have to outlive a
+    /// registry held on its own stack, and the only way to express that is a self-referential
+    /// struct — which is the point at which a design is telling you it wants a handle instead.
+    registry: std::sync::Arc<ToolRegistry>,
     /// The identity whose grants apply. `None` executes nothing — the request's "a run with no
     /// resolvable identity executes nothing".
     identity: Option<ResolvedIdentity>,
@@ -228,21 +250,21 @@ pub struct Pipeline<'a> {
     agent_tools: Vec<String>,
     /// The agent's approval list, from the same jsonb column.
     approvals: Vec<String>,
-    /// The permission decision for the caller.
-    gate: &'a dyn PermissionGate,
+    /// The permission decision for the caller. Shared for the same reason as the registry.
+    gate: std::sync::Arc<dyn PermissionGate>,
     /// Who is calling, for the log and the permission gate.
     caller: Caller,
 }
 
-impl<'a> Pipeline<'a> {
+impl Pipeline {
     /// Build a pipeline. Nothing is checked here; the first call is the first check.
     #[must_use]
     pub fn new(
-        registry: &'a ToolRegistry,
+        registry: std::sync::Arc<ToolRegistry>,
         identity: Option<ResolvedIdentity>,
         agent_tools: Vec<String>,
         approvals: Vec<String>,
-        gate: &'a dyn PermissionGate,
+        gate: std::sync::Arc<dyn PermissionGate>,
         caller: Caller,
     ) -> Self {
         Self {
@@ -301,6 +323,41 @@ impl<'a> Pipeline<'a> {
     /// The identity's decided grants, or an empty map when there is no identity.
     fn grants(&self) -> BTreeMap<String, bool> {
         self.identity.as_ref().map_or_else(BTreeMap::new, |id| id.grants.clone())
+    }
+
+    /// The same pipeline with the step row a call belongs to filled in.
+    ///
+    /// The step is a parameter of the call, not of the pipeline, because a run opens a new one on
+    /// every step and the pipeline is built once per run. Returning a borrowed view rather than
+    /// taking `&mut self` is what lets the executor hold one pipeline and use it from a
+    /// `ToolExecutor` implementation that is `&self`.
+    #[must_use]
+    pub fn with_step(&self, step_id: Option<Uuid>) -> Self {
+        Self {
+            registry: std::sync::Arc::clone(&self.registry),
+            identity: self.identity.clone(),
+            agent_tools: self.agent_tools.clone(),
+            approvals: self.approvals.clone(),
+            gate: std::sync::Arc::clone(&self.gate),
+            caller: Caller {
+                organization_id: self.caller.organization_id,
+                agent_id: self.caller.agent_id,
+                run_id: self.caller.run_id,
+                step_id,
+                user_id: self.caller.user_id,
+                site_id: self.caller.site_id,
+            },
+        }
+    }
+
+    /// The identity a call is attributed to, for the audit row and the alert event.
+    ///
+    /// `None` for a run that resolved nothing — and a call in that state always ends `denied`
+    /// with `identity_unresolved`, so a `None` here describes a real state rather than a gap in
+    /// the log.
+    #[must_use]
+    pub fn identity_id(&self) -> Option<Uuid> {
+        self.identity.as_ref().map(|id| id.id)
     }
 
     /// Whether the operator has the tool switched on.
@@ -594,14 +651,74 @@ fn refusal_sentence(reason: &ResolutionReason) -> String {
     }
 }
 
+/// How the loop gets one tool call done.
+///
+/// **This trait is the "no second door" claim, made structural.** `loop_engine` used to call
+/// `tools::decide` itself: a pure function over a registry and an allow-list, with no identity,
+/// no permission, no schema validation, no cap, no timeout and no log. A run started from the
+/// panel and a run started from a workflow node therefore took two different paths, and the
+/// second one walked past every check REQ-100 names. The loop now asks for an *execution* and
+/// nothing else; the answer comes from [`Pipeline`] in a process that has a database, and the
+/// loop's three-way match is a projection of the same value (`as_execution`) rather than a
+/// second decision.
+///
+/// `step_no` is a parameter rather than part of the construction because the step a call belongs
+/// to is only known at the call site: the row is written when the step begins, and the criterion
+/// "both carrying the same run and step" needs the row's **id**, not its number.
+pub trait ToolExecutor: Send + Sync {
+    /// Run one call through the whole path and say what happened, in the loop's own vocabulary.
+    fn execute<'a>(
+        &'a self,
+        step_no: u32,
+        call: &'a ToolCall,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Execution> + Send + 'a>>;
+}
+
+/// The executor the loop's **unit tests** use, and the only one compiled into a test build.
+///
+/// It is deliberately the old `decide` and deliberately `#[cfg(test)]`. REQ-100's test surface
+/// needs a loop that can be driven with no database at all — the guardrails, the repeated-call
+/// detector and the stop conditions are all properties of the loop, and each of them has a
+/// walk that builds a `Runtime` in one line. But the *in-crate* executor existing only in test
+/// builds is the point: a second decider that ships is a second door, and this makes the
+/// production build incapable of having one rather than relying on review to notice it.
+///
+/// `#[doc(hidden)]` rather than private, so the module's own doctest — which is compiled as an
+/// external crate and therefore cannot see `cfg(test)` items — can still show a builder chain
+/// that works. The example uses it precisely to say "this is the *test* wiring; production hands
+/// the builder a `Pipeline`", and a reader who copies the production path is the one the type
+/// system should stop.
+#[cfg(test)]
+#[doc(hidden)]
+pub struct LocalExecutor {
+    /// The compiled tools.
+    pub registry: ToolRegistry,
+    /// The keys the run may call.
+    pub allow: crate::tools::AllowList,
+}
+
+#[cfg(test)]
+#[doc(hidden)]
+impl ToolExecutor for LocalExecutor {
+    fn execute<'a>(
+        &'a self,
+        _step_no: u32,
+        call: &'a ToolCall,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Execution> + Send + 'a>> {
+        Box::pin(crate::tools::decide(&self.registry, &self.allow, call))
+    }
+}
+
 /// Adapters so a call outcome is also the loop's own [`Execution`], without the loop re-deriving
 /// anything.
 ///
-/// **This is the seam that makes "no second door" testable.** `loop_engine` used to call
-/// `tools::decide` itself, which meant a run started through the panel and a run started through
-/// a workflow node took two different paths — and the second one skipped the identity, the
-/// permission and the log entirely. Converting rather than duplicating means there is one
-/// implementation to audit; the loop's three-way match is now a projection of this function.
+/// **This is the seam that makes "no second door" testable.** Converting rather than duplicating
+/// means there is one implementation to audit; the loop's three-way match is now a projection of
+/// this function. The refusal arm maps the outcome's own code through
+/// [`DenyReason::from_code`] rather than collapsing every refusal to `ToolDenied`: the loop
+/// feeds `reason.code()` to the guardrail and to the model's own tool result, and a trace that
+/// said `tool_denied` for a missing permission is a trace that sends an operator looking in the
+/// wrong place.
 #[must_use]
 pub fn as_execution(outcome: &CallOutcome) -> Execution {
     match outcome {
@@ -616,9 +733,14 @@ pub fn as_execution(outcome: &CallOutcome) -> Execution {
             tool: tool.clone(),
             arguments: arguments.clone(),
         },
-        other => Execution::Refused {
-            tool: other_key(other),
-            reason: crate::tools::DenyReason::ToolDenied,
+        CallOutcome::Refused { tool, code, .. } => Execution::Refused {
+            tool: tool.clone(),
+            reason: crate::tools::DenyReason::from_code(code)
+                .unwrap_or(crate::tools::DenyReason::ToolDenied),
+        },
+        CallOutcome::TimedOut { tool, .. } => Execution::Refused {
+            tool: tool.clone(),
+            reason: crate::tools::DenyReason::ToolTimeout,
         },
     }
 }
@@ -695,20 +817,20 @@ mod tests {
         }
     }
 
-    /// The gate that allows everything, which is the shape a real caller's gate takes when the
-    /// human holds everything the tool needs.
-    fn allow_all() -> impl PermissionGate {
-        |_: &str| true
-    }
-
-    fn pipeline<'a>(
-        registry: &'a ToolRegistry,
+        /// A pipeline over borrowed inputs, wrapping them the way every caller must.
+    ///
+    /// The borrows are this helper's convenience; the `Arc`s are the product's contract, and a
+    /// test that spelled out the product's own shape at each of its thirty call sites would be
+    /// thirty chances to typo it. Wrapping here is what keeps the tests honest about the *rules*
+    /// they check rather than about plumbing.
+    fn pipeline(
+        registry: &ToolRegistry,
         identity: Option<ResolvedIdentity>,
         agent_tools: &[&str],
-        gate: &'a dyn PermissionGate,
-    ) -> Pipeline<'a> {
+        gate: std::sync::Arc<dyn PermissionGate>,
+    ) -> Pipeline {
         Pipeline::new(
-            registry,
+            std::sync::Arc::new(registry.clone()),
             identity,
             agent_tools.iter().map(|k| (*k).to_owned()).collect(),
             Vec::new(),
@@ -716,6 +838,17 @@ mod tests {
             caller(),
         )
     }
+
+    /// [`allow_all`] behind the `Arc` the pipeline takes.
+    ///
+    /// A helper rather than a macro because **the gate has to be the one the test wrote**: a
+    /// wrapper that returned "allow everything" regardless of its argument would leave the
+    /// permission walks asserting against a gate that grants every key, which is the vacuous
+    /// assertion this file has already been bitten by once.
+    fn gate_all() -> std::sync::Arc<dyn PermissionGate> {
+        std::sync::Arc::new(|_: &str| true)
+    }
+
 
     // -- the pure half: the payload filter -----------------------------------------------------
 
@@ -725,12 +858,11 @@ mod tests {
         // model can see but not call is a tool it retries, and three retries is `loop_detected` —
         // so invisibility is a cost property, not a politeness one.
         let registry = registry();
-        let gate = allow_all();
         let pipe = pipeline(
             &registry,
             Some(identity(&[("deployment.deploy", false)])),
             &["content.search", "deployment.deploy"],
-            &gate,
+            gate_all(),
         );
         let keys: Vec<String> = pipe.model_facing().into_iter().map(|t| t.key).collect();
         assert_eq!(keys, vec!["content.search".to_owned()]);
@@ -741,8 +873,7 @@ mod tests {
         // The identity can only narrow here: an identity's allow never widens the agent's own
         // list, so a tool the agent does not carry is invisible even with a grant.
         let registry = registry();
-        let gate = allow_all();
-        let pipe = pipeline(&registry, Some(identity(&[])), &["content.search"], &gate);
+        let pipe = pipeline(&registry, Some(identity(&[])), &["content.search"], gate_all());
         let keys: Vec<String> = pipe.model_facing().into_iter().map(|t| t.key).collect();
         assert_eq!(keys, vec!["content.search".to_owned()]);
     }
@@ -753,12 +884,13 @@ mod tests {
         // not deploy should not be shown a deploy button either. Without this the panel and the
         // runtime would disagree about what a read-only operator can see.
         let registry = registry();
-        let gate = |key: &str| key == "content.read";
+        let gate: std::sync::Arc<dyn PermissionGate> =
+            std::sync::Arc::new(|key: &str| key == "content.read");
         let pipe = pipeline(
             &registry,
             Some(identity(&[])),
             &["content.search", "deployment.deploy"],
-            &gate,
+            gate,
         );
         let keys: Vec<String> = pipe.model_facing().into_iter().map(|t| t.key).collect();
         assert_eq!(keys, vec!["content.search".to_owned()]);
@@ -769,8 +901,7 @@ mod tests {
         // "A run with no resolvable identity executes nothing" — and it is *shown* nothing, so a
         // model is never told a tool exists that it will then be refused.
         let registry = registry();
-        let gate = allow_all();
-        let pipe = pipeline(&registry, None, &["content.search"], &gate);
+        let pipe = pipeline(&registry, None, &["content.search"], gate_all());
         assert!(pipe.model_facing().is_empty());
     }
 
@@ -780,12 +911,11 @@ mod tests {
         // is told to send a field that is then refused as unknown — so the two must be the same
         // object, and this asserts the payload's own copy is the declared one.
         let registry = registry();
-        let gate = allow_all();
         let pipe = pipeline(
             &registry,
             Some(identity(&[])),
             &["deployment.deploy"],
-            &gate,
+            gate_all(),
         );
         let summary = pipe
             .model_facing()

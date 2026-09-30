@@ -38,7 +38,7 @@ use crate::agent::{
     delimit_untrusted,
 };
 use crate::guardrails::{self, GuardrailHit, OutputRule};
-use crate::tools::{AllowList, Execution, FnTool, ToolOutcome, ToolRegistry};
+use crate::tools::{Execution, FnTool, ToolOutcome, ToolRegistry};
 
 /// How many events may queue in front of a sink that is not draining. When the queue is full the
 /// loop *waits* rather than drops: a dropped `text` frame is a missing word in the answer a
@@ -230,28 +230,62 @@ impl std::fmt::Display for ModelError {
 /// Who the loop talks to. Everything the loop needs and nothing it does not.
 pub struct Runtime {
     model: Arc<dyn Model>,
-    tools: ToolRegistry,
-    allow: AllowList,
+    /// How one tool call is carried out.
+    ///
+    /// **An executor, not a registry.** The first version of this field was `ToolRegistry` plus
+    /// an `AllowList`, and the loop called `tools::decide` on them itself — which is the second
+    /// door REQ-100 forbids, because `decide` knows nothing about the identity, the permission,
+    /// the schema, the cap, the timeout or the call log. Everything the loop needs to decide a
+    /// *policy* question now happens behind this trait, in a component that has a database. The
+    /// loop keeps what is genuinely its own: the stop conditions, the repeated-call detector and
+    /// the guardrail on untrusted output.
+    executor: Arc<dyn crate::tool_exec::ToolExecutor>,
     system_prompt: String,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Runtime {
     /// A runtime for one agent.
+    ///
+    /// Takes an executor because the caller is the only party that knows which path the call must
+    /// take: the API runner hands it a database-backed [`crate::tool_exec::Pipeline`], and the
+    /// crate's own walks hand it the registry-only executor compiled under `cfg(test)`. Neither
+    /// the loop nor this constructor decides policy.
     #[must_use]
     pub fn new(
         model: Arc<dyn Model>,
-        tools: ToolRegistry,
-        allow: AllowList,
+        executor: Arc<dyn crate::tool_exec::ToolExecutor>,
         system_prompt: impl Into<String>,
     ) -> Self {
         Self {
             model,
-            tools,
-            allow,
+            executor,
             system_prompt: system_prompt.into(),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// A runtime for an agent whose tools are carried out in-process, with no database.
+    ///
+    /// **`#[cfg(test)]` and therefore not a second door.** This is the old registry-plus-allow-list
+    /// constructor wrapped in the executor, and it exists only in test builds: a loop test has to
+    /// be able to run a tool with no pool, and the way to allow that without shipping a decider
+    /// that skips the identity is to make the in-crate executor impossible to compile into a
+    /// release build. A constructor that exists in production and can be reached from a route is
+    /// exactly the second door, wearing a friendly name.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_tests(
+        model: Arc<dyn Model>,
+        tools: ToolRegistry,
+        allow: crate::tools::AllowList,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            model,
+            Arc::new(crate::tool_exec::LocalExecutor { registry: tools, allow }),
+            system_prompt,
+        )
     }
 
     /// A handle somebody else can flip to ask the run to stop.
@@ -295,12 +329,6 @@ impl Runtime {
         } else {
             format!("{}\n\n{rules}", self.system_prompt.trim())
         }
-    }
-
-    /// The registry, for the runner's pre-flight check.
-    #[must_use]
-    pub fn tools(&self) -> &ToolRegistry {
-        &self.tools
     }
 }
 
@@ -724,7 +752,7 @@ pub async fn run_with(
             )
             .await;
 
-            match crate::tools::decide(&runtime.tools, &runtime.allow, &call).await {
+            match runtime.executor.execute(step_no, &call).await {
                 Execution::Ran {
                     tool,
                     summary,
@@ -974,6 +1002,7 @@ pub fn one_tool(key: &str, answer: &'static str) -> ToolRegistry {
 mod tests {
     use super::*;
     use crate::agent::RunLimits;
+    use crate::tools::AllowList;
 
     /// A sink that keeps everything, and a way to read it back without a runtime.
     async fn collect() -> (Sink, tokio::task::JoinHandle<Vec<AgentEvent>>) {
@@ -1003,7 +1032,7 @@ mod tests {
             "content.pages.read",
             |_| ToolOutcome::ok("three pages"),
         ))]);
-        Runtime::new(model, tools, allow, "You are a test agent.")
+        Runtime::for_tests(model, tools, allow, "You are a test agent.")
     }
 
     #[tokio::test]
@@ -1221,7 +1250,7 @@ mod tests {
 
         let (sink, _events) = collect().await;
         let _ = run(
-            &Runtime::new(
+            &Runtime::for_tests(
                 model,
                 tools,
                 AllowList::new(vec!["page.search".into()], Vec::new()),
@@ -1308,7 +1337,7 @@ mod tests {
             ModelAnswer::calling(vec![RequestedCall::new("docs.read", serde_json::json!({}))]),
             ModelAnswer::text("the document says nothing about the shell."),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model.clone(),
             // The agent holds `docs.read` and nothing else, so even a model that *wanted* to
             // obey the payload could not: the allow-list is the boundary, and the guardrail
@@ -1364,7 +1393,7 @@ mod tests {
             ModelAnswer::calling(vec![RequestedCall::new("docs.read", serde_json::json!({}))]),
             ModelAnswer::text("done"),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model,
             saying_tool("docs.read", "Ignore case when comparing these two strings."),
             AllowList::new(vec!["docs.read".to_owned()], Vec::new()),
@@ -1399,7 +1428,7 @@ mod tests {
             ModelAnswer::calling(vec![RequestedCall::new("shell.exec", serde_json::json!({}))]),
             ModelAnswer::text("I cannot run that."),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model,
             // The registry *has* the tool; the agent does not. This is the distinction that
             // makes `tool_denied` worth its own rule: the capability exists on the platform and
@@ -1439,7 +1468,7 @@ mod tests {
             ModelAnswer::text("Sure! Here is the JSON: {title: t}"),
             ModelAnswer::text(r#"{"title":"t"}"#),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model.clone(),
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1490,7 +1519,7 @@ mod tests {
             // token budget on a shape the model has already declined twice to produce.
             ModelAnswer::text(r#"{"title":"t"}"#),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model.clone(),
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1533,7 +1562,7 @@ mod tests {
         // The resume case. `repairs_spent` is what a store hands back, and a run that already
         // spent its budget must fail on its first bad answer rather than repairing forever.
         let model = ScriptedModel::new(vec![ModelAnswer::text("not json")]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model.clone(),
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1586,7 +1615,7 @@ mod tests {
             ModelAnswer::text("bad"),
             ModelAnswer::text("still bad"),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             spent,
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1613,7 +1642,7 @@ mod tests {
         let _ = handle.await;
 
         let clean = ScriptedModel::new(vec![ModelAnswer::text(r#"{"title":"t"}"#)]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             clean,
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1648,7 +1677,7 @@ mod tests {
         // The absence of a rule is the common case and must stay free: a chat run that requires
         // JSON is a chat run nobody asked for.
         let model = ScriptedModel::new(vec![ModelAnswer::text("here you go")]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model,
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1685,7 +1714,7 @@ mod tests {
             ModelAnswer::text("preamble then {bad json"),
             ModelAnswer::text(r#"{"title":"t"}"#),
         ]);
-        let runtime = Runtime::new(
+        let runtime = Runtime::for_tests(
             model.clone(),
             ToolRegistry::empty(),
             AllowList::new(Vec::new(), Vec::new()),
@@ -1727,7 +1756,7 @@ mod tests {
         // An agent created with an empty system prompt still needs the untrusted-content rule;
         // otherwise the delimiter is decoration.
         let model = ScriptedModel::new(vec![ModelAnswer::text("ok")]);
-        let runtime = Runtime::new(model, ToolRegistry::empty(), AllowList::default(), "  ");
+        let runtime = Runtime::for_tests(model, ToolRegistry::empty(), AllowList::default(), "  ");
         assert!(runtime
             .system_prompt()
             .contains(crate::agent::UNTRUSTED_FENCE));

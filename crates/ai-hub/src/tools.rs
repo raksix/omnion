@@ -193,6 +193,14 @@ pub enum DenyReason {
     ApprovalRequired,
     /// The arguments were not a JSON object.
     BadArguments,
+    /// The tool started and was cut off by its own `timeout_ms`.
+    ///
+    /// Added with the execution pipeline (REQ-100 slice 3). A timeout used to reach the loop as
+    /// `ToolDenied`, which is a lie the trace could not recover from: the reader saw a *denial*
+    /// for a tool that was permitted, ran, and ran out of time. The variant exists so
+    /// `as_execution` has something truthful to map to, and `tool_timeout` is the code the model
+    /// reads back.
+    ToolTimeout,
 }
 
 impl DenyReason {
@@ -204,6 +212,7 @@ impl DenyReason {
             Self::ToolDenied => "tool_denied",
             Self::ApprovalRequired => "approval_required",
             Self::BadArguments => "tool_bad_arguments",
+            Self::ToolTimeout => "tool_timeout",
         }
     }
 
@@ -215,6 +224,7 @@ impl DenyReason {
             "tool_denied" => Some(Self::ToolDenied),
             "approval_required" => Some(Self::ApprovalRequired),
             "tool_bad_arguments" => Some(Self::BadArguments),
+            "tool_timeout" => Some(Self::ToolTimeout),
             _ => None,
         }
     }

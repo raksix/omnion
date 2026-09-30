@@ -9,8 +9,8 @@
 //! argument order. A workflow node that wants "ask this agent, then use its answer" should not
 //! have to open a socket to itself, mint a session token, and parse an SSE stream.
 //!
-//! So this is deliberately thin: a builder that assembles the five things the loop needs
-//! (model, tools, allow-list, prompt, limits), an event listener that turns the loop's typed
+//! So this is deliberately thin: a builder that assembles the four things the loop needs
+//! (model, executor, prompt, limits), an event listener that turns the loop's typed
 //! events into a callback instead of a channel the caller must drain, and one entry function.
 //!
 //! # What it deliberately does *not* do
@@ -37,8 +37,33 @@
 //!
 //! use omnion_ai_hub::agent::RunLimits;
 //! use omnion_ai_hub::agent_sdk::AgentSdk;
+//! use omnion_ai_hub::agent::ToolCall;
 //! use omnion_ai_hub::loop_engine::ScriptedModel;
-//! use omnion_ai_hub::tools::AllowList;
+//! use omnion_ai_hub::tool_exec::ToolExecutor;
+//! use omnion_ai_hub::tools::{DenyReason, Execution};
+//!
+//! /// A stand-in for the real thing.
+//! ///
+//! /// In production this is `tool_exec::Pipeline`, and the pool, the identity, the permission
+//! /// gate and the call log all come with it — which is why the builder takes an executor and
+//! /// not a tool list. A two-line refusal is the honest minimum an embedder can write here,
+//! /// and it is the shape that fails safe.
+//! struct NothingRuns;
+//!
+//! impl ToolExecutor for NothingRuns {
+//!     fn execute<'a>(
+//!         &'a self,
+//!         _step_no: u32,
+//!         call: &'a ToolCall,
+//!     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Execution> + Send + 'a>> {
+//!         Box::pin(async move {
+//!             Execution::Refused {
+//!                 tool: call.tool.clone(),
+//!                 reason: DenyReason::ToolDenied,
+//!             }
+//!         })
+//!     }
+//! }
 //!
 //! # async fn example() {
 //! // A model that asks for one tool and then answers. In production this is the router's
@@ -50,17 +75,16 @@
 //!             serde_json::json!({ "slug": "pricing" }),
 //!         ),
 //!     ]),
-//!     omnion_ai_hub::loop_engine::ModelAnswer::text("The pricing page lists three plans."),
+//!     omnion_ai_hub::loop_engine::ModelAnswer::text("I could not read the page."),
 //! ]);
 //!
 //! let sdk = AgentSdk::builder()
 //!     .model(model)
-//!     .tools(omnion_ai_hub::loop_engine::one_tool("page.read", "plans: free, pro, scale"))
-//!     .allow(AllowList::new(vec!["page.read".into()], vec![]))
+//!     .executor(Arc::new(NothingRuns))
 //!     .system_prompt("You answer questions about the published site.")
 //!     .limits(RunLimits { max_steps: 4, ..RunLimits::default() })
 //!     .build()
-//!     .expect("a builder chain that names a model and a tool always assembles");
+//!     .expect("a builder chain that names a model and an executor always assembles");
 //!
 //! let answer = sdk
 //!     .run("What plans do you publish?", |event| {
@@ -70,11 +94,20 @@
 //!     })
 //!     .await;
 //!
-//! assert!(answer.is_success());
-//! assert_eq!(
-//!     answer.final_text.as_deref(),
-//!     Some("The pricing page lists three plans.")
-//! );
+//! // The refusal reached the model rather than the run hanging or a tool running unasked.
+//! assert_eq!(answer.final_text.as_deref(), Some("I could not read the page."));
+//! # }
+//! # /// Run a future to completion: a doctest is an ordinary `fn main`, and a workflow node
+//! # /// already has a runtime to `.await` in.
+//! # fn futures_lite_block_on<F: std::future::Future>(future: F) -> F::Output {
+//! #     tokio::runtime::Builder::new_current_thread()
+//! #         .enable_all()
+//! #         .build()
+//! #         .expect("a runtime")
+//! #         .block_on(future)
+//! # }
+//! # fn main() {
+//! #     futures_lite_block_on(example());
 //! # }
 //! ```
 //!
@@ -88,9 +121,8 @@ use std::sync::Arc;
 use crate::agent::RunLimits;
 use crate::error::{AiHubError, Result};
 use crate::loop_engine::{
-    Model, Outcome, Persist, RunOptions, Runtime, ScriptedModel, run_with as run_loop,
+    Model, Outcome, Persist, RunOptions, Runtime, run_with as run_loop,
 };
-use crate::tools::{AllowList, ToolRegistry};
 
 /// What an embedder is handed, and what it gives back.
 ///
@@ -194,8 +226,7 @@ impl AgentSdk {
 /// free.
 pub struct AgentSdkBuilder {
     model: Option<Arc<dyn Model>>,
-    tools: Option<ToolRegistry>,
-    allow: Option<AllowList>,
+    executor: Option<Arc<dyn crate::tool_exec::ToolExecutor>>,
     system_prompt: Option<String>,
     limits: Option<RunLimits>,
 }
@@ -204,8 +235,7 @@ impl Default for AgentSdkBuilder {
     fn default() -> Self {
         Self {
             model: None,
-            tools: None,
-            allow: None,
+            executor: None,
             system_prompt: None,
             limits: None,
         }
@@ -220,18 +250,22 @@ impl AgentSdkBuilder {
         self
     }
 
-    /// The tool registry. Absent means *no tools at all*, not "all tools" — an agent with an
-    /// empty registry is a chatbot, and that is a legitimate thing to build.
+    /// How tool calls are carried out.
+    ///
+    /// **An executor, and required.** The builder used to take `(tools, allow)` and assemble a
+    /// registry-only decider, which was the second door REQ-100's own risk note names: "the deny
+    /// list must hold wherever the runtime is invoked — a workflow node or the internal SDK, not
+    /// only the panel-facing run endpoint". An embedder that could hand the loop a bare registry
+    /// could bypass the identity, the permission and the call log simply by choosing the
+    /// convenient builder method. So the embedder now supplies the *same* executor the runner
+    /// does — in practice a [`crate::tool_exec::Pipeline`] — and the two cannot drift.
+    ///
+    /// There is deliberately no default and no "no tools" fallback: an SDK that silently
+    /// assembled an unrestricted decider when this was omitted would be a builder whose failure
+    /// mode is a tool call nobody authorised.
     #[must_use]
-    pub fn tools(mut self, tools: ToolRegistry) -> Self {
-        self.tools = Some(tools);
-        self
-    }
-
-    /// The keys the agent may call, and the subset that needs a person first.
-    #[must_use]
-    pub fn allow(mut self, allow: AllowList) -> Self {
-        self.allow = Some(allow);
+    pub fn executor(mut self, executor: Arc<dyn crate::tool_exec::ToolExecutor>) -> Self {
+        self.executor = Some(executor);
         self
     }
 
@@ -259,25 +293,21 @@ impl AgentSdkBuilder {
                 "AgentSdk needs a model: the loop has no other way to reach a provider".to_owned(),
             ));
         };
-        let tools = self.tools.unwrap_or_else(ToolRegistry::empty);
-        // An allow-list naming a key the registry does not have is a definition bug, not a
-        // runtime condition: the agent was told it could call something it was never given, and
-        // the run would fail at the first call with a code that reads like a provider error.
-        for key in self.allow.as_ref().map_or(&[][..], AllowList::allowed) {
-            if !tools.contains(key) {
-                return Err(AiHubError::InvalidAgent(format!(
-                    "the allow-list names `{key}`, which the tool registry does not have"
-                )));
-            }
-        }
+        // The executor is required for the same reason the model is, and the message says which
+        // of the two it is. A builder that defaulted it would be a builder whose omission
+        // produces a run that *works* while walking past the identity, the permission and the
+        // call log — the quietest possible failure and the one the request's risk note is
+        // written about.
+        let Some(executor) = self.executor else {
+            return Err(AiHubError::InvalidAgent(
+                "AgentSdk needs an executor: pass the same tool_exec::Pipeline the API runner \
+                 uses, or the run has no identity, no permission check and no call log"
+                    .to_owned(),
+            ));
+        };
         let limits = RunLimits::clamped(self.limits.unwrap_or_default());
         Ok(AgentSdk {
-            runtime: Runtime::new(
-                model,
-                tools,
-                self.allow.unwrap_or_default(),
-                self.system_prompt.unwrap_or_default(),
-            ),
+            runtime: Runtime::new(model, executor, self.system_prompt.unwrap_or_default()),
             limits,
         })
     }
@@ -294,7 +324,7 @@ fn no_persistence() -> Persist {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loop_engine::{ModelAnswer, RequestedCall};
+    use crate::loop_engine::{ModelAnswer, RequestedCall, ScriptedModel};
     use serde_json::json;
 
     /// A scripted model that calls `tool` once and then answers.
@@ -303,6 +333,16 @@ mod tests {
             ModelAnswer::calling(vec![RequestedCall::new(tool, json!({}))]),
             ModelAnswer::text(answer),
         ])
+    }
+
+    /// The in-crate executor: one tool, permitted. The database-backed `Pipeline` is what
+    /// production hands the builder, and it needs a pool; a test that only proves the loop's
+    /// wiring does not, so the shape is the one the loop walks with.
+    fn executor(tool: &'static str) -> Arc<dyn crate::tool_exec::ToolExecutor> {
+        Arc::new(crate::tool_exec::LocalExecutor {
+            registry: crate::loop_engine::one_tool(tool, "x"),
+            allow: crate::tools::AllowList::new(vec![tool.to_owned()], Vec::new()),
+        })
     }
 
     #[tokio::test]
@@ -315,11 +355,7 @@ mod tests {
         let model = two_turn("page.read", "The pricing page lists three plans.");
         let sdk = AgentSdk::builder()
             .model(model)
-            .tools(crate::loop_engine::one_tool(
-                "page.read",
-                "plans: free, pro, scale",
-            ))
-            .allow(AllowList::new(vec!["page.read".into()], vec![]))
+            .executor(executor("page.read"))
             .system_prompt("You answer questions about the published site.")
             .limits(RunLimits {
                 max_steps: 4,
@@ -359,31 +395,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_builder_without_a_model_says_so() {
-        let message = build_error(
-            AgentSdk::builder().tools(crate::loop_engine::one_tool("page.read", "x")),
-        );
+        let message = build_error(AgentSdk::builder().executor(executor("page.read")));
         assert!(message.contains("model"), "{message}");
     }
 
     #[tokio::test]
-    async fn an_allow_list_naming_a_missing_tool_is_refused() {
-        // The failure this catches is a run that ends `tool_denied` on its first call, which
-        // reads as a permission problem and is actually a definition problem.
-        let message = build_error(
-            AgentSdk::builder()
-                .model(two_turn("page.read", "answer"))
-                .tools(crate::loop_engine::one_tool("page.read", "x"))
-                .allow(AllowList::new(vec!["page.write".into()], vec![])),
-        );
-        assert!(message.contains("page.write"), "{message}");
+    async fn a_builder_without_an_executor_says_so() {
+        // The failure this replaced was worse than an error: a builder that defaulted the
+        // executor would have assembled a run that *worked* while walking past the identity,
+        // the permission and the call log. The message names the field because "invalid agent"
+        // on its own leaves a caller guessing which of the four it forgot.
+        let message = build_error(AgentSdk::builder().model(two_turn("page.read", "answer")));
+        assert!(message.contains("executor"), "{message}");
+        assert!(message.contains("Pipeline"), "{message}");
     }
 
     #[tokio::test]
     async fn limits_are_clamped_on_the_way_in() {
         let sdk = AgentSdk::builder()
             .model(two_turn("page.read", "answer"))
-            .tools(crate::loop_engine::one_tool("page.read", "x"))
-            .allow(AllowList::new(vec!["page.read".into()], vec![]))
+            .executor(executor("page.read"))
             .limits(RunLimits {
                 max_steps: 0,
                 deadline_seconds: 0,
@@ -400,8 +431,7 @@ mod tests {
     async fn the_system_prompt_carries_the_guardrail_rules() {
         let sdk = AgentSdk::builder()
             .model(two_turn("page.read", "answer"))
-            .tools(crate::loop_engine::one_tool("page.read", "x"))
-            .allow(AllowList::new(vec!["page.read".into()], vec![]))
+            .executor(executor("page.read"))
             .system_prompt("Answer briefly.")
             .build()
             .expect("assembles");
@@ -423,8 +453,7 @@ mod tests {
         ]);
         let sdk = AgentSdk::builder()
             .model(model)
-            .tools(crate::loop_engine::one_tool("page.read", "x"))
-            .allow(AllowList::new(vec!["page.read".into()], vec![]))
+            .executor(executor("page.read"))
             .build()
             .expect("assembles");
         let cancel = sdk.cancel_handle();

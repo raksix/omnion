@@ -695,6 +695,20 @@ pub async fn list_steps(pool: &PgPool, run_id: Uuid) -> Result<Vec<Step>> {
     Ok(sqlx::query_as::<_, Step>(&sql).bind(run_id).fetch_all(pool).await?)
 }
 
+/// The id of one step row, for the rows that reference a step by uuid.
+///
+/// `ai_tool_calls.step_id` is a `uuid` foreign key, not a step number, so the executor needs the
+/// row's identity and not its position. `None` is a real answer — a run whose event stream never
+/// opened this step — and the column allows it (`references … on delete set null`), so the caller
+/// writes `null` rather than inventing a uuid that points at nothing.
+pub async fn step_id(pool: &PgPool, run_id: Uuid, step_no: i32) -> Result<Option<Uuid>> {
+    Ok(sqlx::query_scalar("select id from ai_run_steps where run_id = $1 and step_no = $2")
+        .bind(run_id)
+        .bind(step_no)
+        .fetch_optional(pool)
+        .await?)
+}
+
 /// Append a step in `running` and return its number.
 ///
 /// This is the call that makes resume safe, and its ordering is the whole point: the row exists
