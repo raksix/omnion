@@ -6,7 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, Images, Import, KeyRound, Layers, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, Building2, ClipboardCheck, FileText, Fingerprint, Gauge, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, Layers, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X, type LucideIcon } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -35,6 +35,12 @@ const NAV: readonly NavItem[] = [
   // files and can I get them back" is one question, and burying half of it under a
   // settings sub-path is what makes somebody believe the platform has no restore point.
   { href: "/backups", label: "Backups", icon: HardDriveDownload },
+  // System health (REQ-014, slice 1). It sits with Backups rather than under Settings for
+  // the same reason: "can I get my data back" and "is anything answering" are both questions
+  // an operator asks at the same moment, usually while something is already wrong — and
+  // burying the liveness screen under a settings sub-path is how a platform looks healthy
+  // to the person who opened the admin panel to find out that it is not.
+  { href: "/health", label: "System Health", icon: HeartPulse },
   { href: "/analytics", label: "Analytics", icon: BarChart3, module: "analytics" },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // Exact-match only: `/cdn` is the overview and `/cdn/rules` is a different screen, so the
