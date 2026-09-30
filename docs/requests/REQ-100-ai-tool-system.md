@@ -9,8 +9,10 @@
 > `61d54ea1`, which replaced a mapping table that agreed with itself and corrected 16 tool
 > permissions the platform could never grant; the ops-tool service-layer criterion —
 > `036c82c2`, which proved the command half in the tool's schema and the tenancy half against a
-> real database, because the registry holds no organization to scope. Outstanding in this REQ:
-> every screen's empty/loading/error states, and the workspace + QA gate) ·
+> real database, because the registry holds no organization to scope; the disabled-tool and
+> screen-state boxes — `82143bde` … `d5f98a44`, which proved a criterion whose own walk had
+> been asserting the bug as fact and then found that the refusal was reaching the loop as a
+> permission denial. Outstanding in this REQ: the workspace + QA gate alone) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + `crates/permissions`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
