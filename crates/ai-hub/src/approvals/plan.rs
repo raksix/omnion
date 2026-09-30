@@ -436,6 +436,69 @@ pub fn writes(plan: &Plan, mapping: Mapping) -> Result<Vec<Write>> {
     Ok(out)
 }
 
+impl Plan {
+    /// The tool arguments this plan was resolved from — the **inverse** of [`plan`].
+    ///
+    /// Re-previewing needs it: to recompute a diff against a moved target you must re-plan the
+    /// *same* edit, and a plan stores resolved values rather than arguments. Reading the fields
+    /// back out is the only place that mapping from a column to an argument name lives, so it
+    /// lives here beside the forward direction rather than in the caller that happens to need it
+    /// — the same reason [`writes`] is in this module.
+    ///
+    /// The mapping is taken as an argument rather than looked up, so a preview read back under
+    /// a resource type this build has no mapping for is **refused** instead of being re-planned
+    /// with arguments the reader would then misapply.
+    ///
+    /// A cleared field comes back as an **empty string**, because that is the argument that
+    /// re-coerces to the same `Null`. Two spellings of "cleared" reach this function and both
+    /// have to be handled, which is the trap: `coerce` represents a clear as
+    /// `Some(Value::Null)`, so `diff.after` is `Some(Null)` and not `None` — a `None` match
+    /// alone passes `Value::Null` straight back as an argument, and `coerce` then refuses it as
+    /// "expected text, got null". The symptom is a re-preview of a cleared field failing for a
+    /// reason that has nothing to do with the field. The round trip is therefore idempotent by
+    /// construction: preview, re-preview and apply all agree on the same write.
+    ///
+    /// # Errors
+    ///
+    /// `Err(InvalidApproval)` when a diff names an argument the mapping does not have — a stored
+    /// preview from a different mapping, which must not be re-planned by guessing a name.
+    pub fn arguments(&self, mapping: Mapping) -> Result<Value> {
+        let mut args = Map::new();
+        for diff in &self.diffs {
+            if !mapping.iter().any(|spec| spec.arg == diff.arg) {
+                return Err(AiHubError::InvalidApproval(format!(
+                    "the stored preview writes `{}`, which the current mapping does not know",
+                    diff.arg
+                )));
+            }
+            // `None` and `Some(Null)` are the two spellings of "this operation clears the
+            // field"; both become the empty string `coerce` turns back into a clear.
+            args.insert(
+                diff.arg.clone(),
+                match &diff.after {
+                    None | Some(Value::Null) => Value::from(""),
+                    Some(value) => value.clone(),
+                },
+            );
+        }
+        Ok(Value::Object(args))
+    }
+
+    /// The operation this plan describes, rebuilt for a re-preview.
+    ///
+    /// `plan` is a pure function of `(mapping, operation, current)`, so recomputing a diff is
+    /// `plan` with the *same operation* and a *fresh* current — which is exactly what
+    /// [`Self::arguments`] plus the caller's read gives.
+    pub fn operation(&self, mapping: Mapping) -> Result<Operation> {
+        Ok(Operation {
+            kind: self.kind,
+            resource_type: self.resource_type.clone(),
+            resource_id: self.resource_id.clone(),
+            args: self.arguments(mapping)?,
+        })
+    }
+}
+
 /// One column write, derived from a plan and the same mapping that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
@@ -1254,4 +1317,96 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn re_planning_a_plan_from_its_own_arguments_reproduces_the_same_write() {
+        // The re-preview contract in one assertion: `plan` is pure in `(mapping, op, current)`,
+        // so `arguments` inverts it exactly. Without this, a re-preview would re-derive a
+        // *different* edit from the frozen one and the reviewer would be asked to approve
+        // something the request never proposed.
+        let original = ok_plan(json!({ "title": "About our team", "summary": "a short line" }));
+        let args = original.arguments(PAGE_UPDATE).expect("the arguments are readable");
+        let replayed =
+            plan(PAGE_UPDATE, &update(args), &current(), "About us", "r7", Vec::new())
+                .expect("the replayed plan resolves");
+        assert_eq!(
+            replayed.diffs, original.diffs,
+            "the replay must write exactly the fields the frozen preview wrote"
+        );
+        assert_eq!(replayed.hash, original.hash, "and bind to the same hash");
+    }
+
+    #[test]
+    fn a_cleared_summary_round_trips_as_the_argument_that_clears_it_again() {
+        // `after: Null` is how the preview spells a cleared summary. Reading it back as an
+        // argument has to produce `""` — the one input that coerces back to `Null`. Reading it
+        // back as `null` would be refused by `coerce` (it is not text), and reading it back as
+        // the string "null" would write four characters into the page.
+        let original = ok_plan(json!({ "summary": "" }));
+        assert_eq!(original.diffs[0].after, Some(Value::Null));
+        let args = original.arguments(PAGE_UPDATE).expect("readable");
+        assert_eq!(args.get("summary"), Some(&Value::from("")));
+        let replayed = plan(
+            PAGE_UPDATE,
+            &update(args),
+            &current(),
+            "About us",
+            "r7",
+            Vec::new(),
+        )
+        .expect("replays");
+        assert_eq!(
+            replayed.diffs[0].after,
+            Some(Value::Null),
+            "a re-preview must still clear, not store an empty string"
+        );
+        assert_eq!(replayed.hash, original.hash);
+    }
+
+    #[test]
+    fn a_mapping_that_no_longer_knows_a_stored_argument_is_refused_rather_than_guessed() {
+        // The stored preview is the frozen record. If the mapping is renamed under it, the
+        // re-preview must say so instead of dropping the field — a re-preview that silently
+        // re-plans fewer fields is a narrower proposal presented as the same one.
+        let stored = ok_plan(json!({ "title": "New" }));
+        let narrower: Mapping = &[FieldSpec {
+            arg: "body",
+            field: "body",
+            kind: FieldKind::Body,
+        }];
+        let err = stored
+            .arguments(narrower)
+            .expect_err("`title` is not in this mapping")
+            .to_string();
+        assert!(
+            err.contains("title"),
+            "the refusal must name the field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_rebuilt_operation_keeps_the_kind_and_the_target() {
+        // A re-preview that dropped the `delete` kind would turn a deletion into an update —
+        // the exact "approve a change that did not happen" failure the request forbids. The
+        // target travels with it for the same reason: a re-preview against another row is not a
+        // re-preview.
+        let plan = Plan {
+            kind: OpKind::Delete,
+            resource_type: "page".to_owned(),
+            resource_id: "22222222-2222-2222-2222-222222222222".to_owned(),
+            label: "About us".to_owned(),
+            diffs: Vec::new(),
+            cascades: vec![Cascade {
+                label: "page revisions".to_owned(),
+                count: 3,
+            }],
+            base_revision: "r7".to_owned(),
+            hash: "h".to_owned(),
+        };
+        let operation = plan.operation(PAGE_UPDATE).expect("a delete carries no arguments");
+        assert_eq!(operation.kind, OpKind::Delete);
+        assert_eq!(operation.resource_id, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(operation.resource_type, "page");
+    }
+
 }
