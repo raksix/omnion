@@ -413,6 +413,7 @@ mod tests {
             escalated_at: None,
             spam_score: 0,
             rejection_reason: None,
+            submitter_ip: None,
             received_at: time::OffsetDateTime::UNIX_EPOCH,
             converted_at: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
