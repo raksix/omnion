@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** in-progress (slice 1 · `9a4b1c72` — the draft store: migration `0174_ai_workflow_builder.sql`, the `modules/ai` crate (model/store/definition/generate) with the closed action registry driving the generation prompt, one repair round-trip that is never spent on a provider failure, and credential-shaped parameters refused in the answer) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
+> **Status:** in-progress (slice 1 · `b6392a80` — the draft store: migration `0174_ai_workflow_builder.sql`, the `modules/ai` crate (model/store/definition/generate) with the closed action registry driving the generation prompt, one repair round-trip that is never spent on a provider failure, and credential-shaped parameters refused in the answer) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request

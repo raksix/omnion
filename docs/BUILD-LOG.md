@@ -6483,3 +6483,69 @@ walkthrough's probe must read the four regions *before* any save — that is the
 **Slice 4 cannot close on the sample-plugin run**: `plugins_enabled_for` is the seam **REQ-121**
 (wave 5b, unclaimed) fills, so no plugin node can appear in any browser, and building a plugin
 store on this branch would be taking a slice of another wave.
+
+## 2026-09-30 — REQ-046 slice 1 (the draft store) · the number 0173 was already taken three times
+
+**What.** `modules/ai` — model, store, definition and generate — and
+`0174_ai_workflow_builder.sql`. A prompt becomes a row in `generating`; a validated
+answer turns it into a `draft`; a person decides. The generation prompt's action list is
+built from `omnion_workflows::actions` rather than typed out, and the definition is checked
+by the engine's own `validate()` so a generated workflow is an ordinary one.
+
+**Five defects were in what a cut-off tick left behind, and all five compiled silently.**
+(1) The list's status filter built a `QueryBuilder::Separated` handle and pushed nothing
+into it — a no-op filter that read exactly like the two beside it. (2)
+## 2026-09-30 — REQ-046 slice 1 (the draft store) · the number 0173 was already taken three times
+
+**What.** `modules/ai` — model, store, definition and generate — and
+`0174_ai_workflow_builder.sql`. A prompt becomes a row in `generating`; a validated answer
+turns it into a `draft`; a person decides. The generation prompt's action list is built
+from `omnion_workflows::actions` rather than typed out, and the definition is checked by the
+engine's own `validate()`, so a generated workflow is an ordinary one.
+
+**Five defects were in what a cut-off tick left behind, and all five compiled silently.**
+(1) The list's status filter built a `QueryBuilder::Separated` handle and pushed nothing into
+it — a no-op filter that read exactly like the two beside it. (2) The row count ignored
+every filter, so the console said "12 drafts" above a list of one. Both are now one
+`push_filter` used by the count and the page: **a builder you cannot forget to extend is
+worth more than a comment saying to extend it.** (3) `fold` took a whole `Attempt` to
+quote one `String`, forcing a `Clone` onto an error holding a `sqlx::Error`; it takes the
+refused text now. (4) The driver called `repair_prompt("")` — the model was told the answer
+was refused with a **blank where the evidence was**. (5) `{"steps": […]}` reached the engine
+and returned "missing field `trigger`": true, and useless to a model, which now gets a
+message naming the three trigger shapes.
+
+**THE MIGRATION NUMBER IS A SHARED NAMESPACE.** Three worktrees had already taken `0173`
+(w2 `theme_layout_default_blocks`, w7 `ai_tool_registry`, and this slice's own first
+draft), so the file is `0174`. The collision is silent: it compiles, the tests pass, and
+two branches disagree about what a number means. Take the high-water across **every**
+worktree, never from your own branch.
+
+**A PROVIDER FAILURE NEVER SPENDS THE REPAIR.** A timeout reproduced with an identical
+request fails identically, so repairing it buys a second round of tokens for the same
+answer. The policy lives in the pure `fold`, so "exactly one" is measured by folding a
+scripted provider instead of counting network calls; the fixture pops a queue, so a third
+call panics naming the fact rather than reusing an answer.
+
+**Proof.** `cargo test -p omnion-module-ai` **40/40** · `cargo test -p omnion-workflows`
+**143/143** (the crate whose action registry the prompt is built from) · zero warnings.
+Commit `b6392a80`.
+
+**Not ticked, and why.** The round-trip and no-secrets criteria are ticked; the round-trip
+one is measured against a *scripted provider*, not a connected one, and "a prompt against a
+connected provider stores a `draft` row" is slice 4's probe. No route, no console, no
+approval in this commit.
+
+**Box: `/mnt/apopic` hit 100% mid-fix and a write failed with `No space left on device`.**
+Two things are worth writing down. First, the failed write left a **0-byte
+`.hermes-tmp.5qkh30`** beside the source — invisible in a content diff, and it would have
+been committed by the next `git add -A`. **Check `git status` for `.hermes-tmp.*` before
+every commit on this box.** Second, the disk was not freed by my own build cache: it was my
+*own aborted* QA artifact directory (11 MB) plus a `.next` that a sibling's build recreated
+within a minute. **Reclaim by ownership, not by size** — my live QA pass (pid 3357242,
+1h46m CPU, writing into `qa-artifacts/20260929-233341`) was 136 MB and deleting it would
+have destroyed a pass that has been queueing for two ticks.
+
+**Next.** Slice 2: `ai.prompt` in the action registry plus the runner wiring, so a generated
+step runs as an ordinary task. Then slice 3 (console) and slice 4 (approve / activate /
+revise / test-run + events).
