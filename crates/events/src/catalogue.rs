@@ -908,7 +908,10 @@ mod tests {
         assert_eq!(order.area, "commerce");
         assert_eq!(order.group(), "order");
 
-        assert!(group_members("commerce").is_empty(), "no event is emitted as commerce.*");
+        assert!(
+            group_members("commerce").is_empty(),
+            "no event is emitted as commerce.*"
+        );
         assert!(!group_members("order").is_empty());
         assert!(lookup("commerce.*").is_none());
     }
@@ -923,7 +926,10 @@ mod tests {
         .expect("valid");
 
         assert_eq!(
-            stored.iter().filter(|name| *name == "page.published").count(),
+            stored
+                .iter()
+                .filter(|name| *name == "page.published")
+                .count(),
             1,
             "the same subscription twice is one subscription"
         );
@@ -949,9 +955,18 @@ mod tests {
     fn an_empty_or_broken_subscription_is_refused() {
         assert!(reconcile(&[]).is_err());
         assert!(reconcile(&["   ".to_owned()]).is_err());
-        assert!(reconcile(&["page".to_owned()]).is_err(), "a bare name is not a name");
-        assert!(reconcile(&["*".to_owned()]).is_err(), "an empty group is not a group");
-        assert!(reconcile(&["PAGE.*".to_owned()]).is_err(), "a group is lower-case");
+        assert!(
+            reconcile(&["page".to_owned()]).is_err(),
+            "a bare name is not a name"
+        );
+        assert!(
+            reconcile(&["*".to_owned()]).is_err(),
+            "an empty group is not a group"
+        );
+        assert!(
+            reconcile(&["PAGE.*".to_owned()]).is_err(),
+            "a group is lower-case"
+        );
     }
 
     #[test]
@@ -971,7 +986,10 @@ mod tests {
     #[test]
     fn areas_are_listed_once_in_table_order() {
         let areas = areas();
-        assert_eq!(areas.len(), BTreeSet::from_iter(areas.iter().copied()).len());
+        assert_eq!(
+            areas.len(),
+            BTreeSet::from_iter(areas.iter().copied()).len()
+        );
         assert!(areas.contains(&"content"));
         assert!(areas.contains(&"commerce"));
         assert!(
@@ -984,7 +1002,10 @@ mod tests {
     fn the_ceiling_counts_what_the_operator_typed_not_what_it_expanded_to() {
         // Eight groups covering every member of the catalogue: forty-odd names once expanded,
         // eight selections as typed.
-        let typed: Vec<String> = areas().into_iter().map(|area| format!("{area}.*")).collect();
+        let typed: Vec<String> = areas()
+            .into_iter()
+            .map(|area| format!("{area}.*"))
+            .collect();
         assert!(
             typed.len() <= crate::validation::MAX_SUBSCRIPTIONS,
             "the table has more areas than the ceiling allows, so this test cannot say what it means"
@@ -1031,7 +1052,11 @@ mod tests {
             ("ai.identity.removed", "key", FieldKind::String),
         ] {
             let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be in the catalogue"));
-            assert_eq!(entry.status, Status::Live, "{name} is emitted today, not reserved");
+            assert_eq!(
+                entry.status,
+                Status::Live,
+                "{name} is emitted today, not reserved"
+            );
             assert_eq!(entry.area, "ai", "{name} belongs to the AI area");
             let field = entry
                 .payload_fields
@@ -1039,7 +1064,10 @@ mod tests {
                 .find(|candidate| candidate.name == required_field)
                 .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
             assert!(field.required, "{name}.{required_field} is required");
-            assert_eq!(field.kind, kind, "{name}.{required_field} has the wrong kind");
+            assert_eq!(
+                field.kind, kind,
+                "{name}.{required_field} has the wrong kind"
+            );
         }
     }
     fn the_health_area_carries_the_five_names_the_request_names() {
@@ -1072,8 +1100,14 @@ mod tests {
             assert_eq!(entry.group(), "health", "{name} is not behind health.*");
         }
         // The pair the request calls out, stated as a pair.
-        assert!(subscribed_to(&["health.*".to_owned()], "health.service.degraded"));
-        assert!(subscribed_to(&["health.*".to_owned()], "health.service.recovered"));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.degraded"
+        ));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.recovered"
+        ));
     }
 
     #[test]
@@ -1106,11 +1140,18 @@ mod tests {
         // actionable, so both must be *optional* (a denial outside a run is real — the execution
         // path also enforces a named tool) rather than required and wrong.
         let entry = lookup("ai.tool.denied").expect("listed");
-        let required: Vec<&str> = entry.required_fields().iter().map(|f| f.name).collect();
-        assert_eq!(required, vec!["tool_key"], "a denial must always name the tool");
+        let required: Vec<&str> = entry.required_fields().map(|f| f.name).collect();
+        assert_eq!(
+            required,
+            vec!["tool_key"],
+            "a denial must always name the tool"
+        );
         for optional in ["run_id", "step_id", "identity_id", "reason"] {
             assert!(
-                entry.payload_fields.iter().any(|f| f.name == optional && !f.required),
+                entry
+                    .payload_fields
+                    .iter()
+                    .any(|f| f.name == optional && !f.required),
                 "ai.tool.denied must carry {optional} as optional"
             );
         }
@@ -1121,8 +1162,17 @@ mod tests {
         let entry = lookup("ai.tool.grant_changed").expect("listed");
         // `effect` is required because the whole event is the direction of the change: a payload
         // that could carry "no change" would be an event nobody could alert on.
-        assert!(entry.required_fields().iter().any(|f| f.name == "effect" && f.kind == FieldKind::Boolean));
-        assert!(entry.payload_fields.iter().any(|f| f.name == "changed_by" && !f.required));
+        assert!(
+            entry
+                .required_fields()
+                .any(|f| f.name == "effect" && f.kind == FieldKind::Boolean)
+        );
+        assert!(
+            entry
+                .payload_fields
+                .iter()
+                .any(|f| f.name == "changed_by" && !f.required)
+        );
     }
 
     #[test]
@@ -1145,7 +1195,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must declare {field}"));
             assert!(found.required, "{name}.{field} is required in the test");
             assert!(
-                entry.required_fields().any(|candidate| candidate.name == field),
+                entry
+                    .required_fields()
+                    .any(|candidate| candidate.name == field),
                 "{name}.{field} must be reachable through required_fields()"
             );
         }
