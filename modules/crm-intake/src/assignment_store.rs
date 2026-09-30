@@ -570,14 +570,14 @@ pub async fn policy_for_source(
 ) -> Result<Option<SlaPolicy>> {
     ensure_defaults(pool, organization_id).await?;
     if let Some(id) = source_id {
-        // Qualified at the *query*, not in the constant — see `POLICY_COLUMNS_SCALAR`.
+        // Derived from `POLICY_COLUMNS` and qualified here, not open-coded — see
+        // [`qualified_columns`], which is why the two lists cannot drift.
         let query = format!(
-            "select p.id, p.organization_id, p.name, p.first_response_minutes, \
-             p.business_hours_only, p.reminder_minutes, p.escalate_to_user_id, \
-             p.business_hours, p.active, p.created_at, p.updated_at \
+            "select {columns} \
              from crm_sla_policies p \
              join crm_intake_sources s on s.sla_policy_id = p.id \
-             where s.organization_id = $1 and s.id = $2 and p.active"
+             where s.organization_id = $1 and s.id = $2 and p.active",
+            columns = qualified_columns("p")
         );
         if let Some(policy) = sqlx::query_as::<_, SlaPolicy>(&query)
             .bind(organization_id)
@@ -598,35 +598,32 @@ pub async fn policy_for_source(
         .await?)
 }
 
-/// The policy columns for the *joined* query, which must qualify every name.
+/// [`POLICY_COLUMNS`] with every name qualified for an alias.
 ///
-/// **A real defect, found by the entry-point gate, and the shape is worth stating plainly:
-/// this constant carried its own `p.` prefixes while the query that used it wrote
-/// `select p.{POLICY_COLUMNS_SCALAR}`.** The expansion was `select p.p.id, p.p.organization_id, …`
-/// and PostgreSQL refused it with `invalid reference to FROM-clause entry for table "p"` on
-/// every execution — the error names a table alias, which is why a reader chasing a "policy
-/// problem" reads past it.
+/// **A third spelling of the same list, and the drift is invisible until PostgreSQL runs it.**
+/// This module has carried the policy column list three times: the constant, a
+/// `POLICY_COLUMNS_SCALAR` that carried its own `p.` prefixes while its query wrote
+/// `select p.{POLICY_COLUMNS_SCALAR}` (which expanded to `select p.p.id` and raised
+/// `invalid reference to FROM-clause entry for table "p"` on every execution), and — when
+/// that was fixed — the open-coded `select p.id, p.organization_id, …` left behind. That
+/// last copy compiles, passes clippy, and is the *only* thing a reader compares against, so
+/// a column added to `POLICY_COLUMNS` afterwards would leave the joined arm returning a row
+/// `sqlx` cannot decode, or returning one that silently omits the new field. `SlaPolicy` is
+/// decoded by name, so a *missing* name is a runtime error the first time that arm is
+/// reached — and that arm is only reached when a source names a policy.
 ///
-/// Two things kept it invisible for twenty-four ticks, and both are the same lesson as the
-/// missing caller it sat behind:
-///
-///   * **No production caller.** The arm is only reached when a source names a policy, and
-///     nothing named a policy — because the *column* it joined on did not exist either
-///     (`0163`). Two independent defects stacked in the same function, and either one alone
-///     would have hidden the other: fixing the column would have turned a `42703` into a
-///     `42P01`, which reads like a different bug entirely.
-///   * **The tests never reached it.** `policy_for_source` is exercised with a `source_id` of
-///     `None` and with organizations that have one policy, so both take the fallback arm and
-///     the joined query is never built.
-///
-/// The constant is now unprefixed, like `POLICY_COLUMNS` and `RULE_COLUMNS` beside it, and the
-/// query writes `select {POLICY_COLUMNS_SCALAR} … from crm_sla_policies p` — so every name
-/// has to be qualified at the query, which is the only place that knows the alias. A
-/// constant that carries its own prefix *and* is used behind a prefix can only be correct by
-/// accident, and this one was correct in neither arrangement.
-const POLICY_COLUMNS_SCALAR: &str = "id, organization_id, name, first_response_minutes, \
-     business_hours_only, reminder_minutes, escalate_to_user_id, business_hours, \
-     active, created_at, updated_at";
+/// So the joined arm derives its list. There is one list, and qualification is a
+/// transformation applied to it at the query rather than a second copy to remember.
+#[must_use]
+pub fn qualified_columns(alias: &str) -> String {
+    POLICY_COLUMNS
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{alias}.{name}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// One breached lead, ready to escalate. The read is bounded and ordered so the worker is
 /// reproducible: given the same database and the same `now`, it escalates the same leads in
@@ -921,5 +918,53 @@ mod tests {
         // a live database; the mapping itself is exercised by the QA gate.
         let error = CrmIntakeError::Invalid("a rule with that name already exists".into());
         assert!(error.to_string().contains("already exists"));
+    }
+
+    /// The joined arm's column list, against the struct it is decoded into.
+    ///
+    /// **The assertion the open-coded list could not fail.** `SlaPolicy` is decoded by name,
+    /// so the joined query's list has to name every field or the arm raises at runtime — and
+    /// the arm only runs when a source names a policy, which is why nothing noticed for
+    /// twenty-four ticks. Deriving the list from `POLICY_COLUMNS` makes the two agree by
+    /// construction; this test is what notices if somebody reintroduces a hand-written copy.
+    #[test]
+    fn the_joined_policy_query_names_every_field_the_struct_decodes() {
+        let qualified = qualified_columns("p");
+        let names: Vec<&str> = qualified
+            .split(',')
+            .map(|entry| entry.trim().rsplit('.').next().unwrap_or_default())
+            .collect();
+        let unprefixed: Vec<&str> = POLICY_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(
+            names, unprefixed,
+            "the joined arm qualifies the same list, in the same order, with no member lost"
+        );
+        for field in [
+            "id",
+            "organization_id",
+            "name",
+            "first_response_minutes",
+            "business_hours_only",
+            "reminder_minutes",
+            "escalate_to_user_id",
+            "business_hours",
+            "active",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                names.contains(&field),
+                "the joined policy query does not select `{field}`: {qualified}"
+            );
+        }
+        // No accidental double qualification — the defect this replaced produced `p.p.id`.
+        assert!(
+            !qualified.contains(".p."),
+            "a name was qualified twice: {qualified}"
+        );
     }
 }
