@@ -9542,3 +9542,56 @@ store, so no screen claim is made either way.
 `workflow_schedules` filter kinds and the move-dependency refusal halves still have no table on this
 branch and stay named rather than ticked. The transfer-ownership dialog and the 390px criterion both
 still wait on a completed pass.
+
+## Tick 45 — the stored selection had three writers and no reader
+
+**What.** REQ-133's API table promises `GET /workflows` gains "a `project_id` filter **and scoped
+defaults**", and acceptance 3 says the switcher "filters workflows, credentials, folders, schedules
+and executions; the selection survives navigation". Only the filter half ever shipped.
+
+`automation_project_selection` was written by `select_project` and read back by `selected_project`
+— which is the switcher's own button label. **No list ever consulted it.** `list_scoped_workflows`
+and `list_automations` both computed `match wanted { Some(id) => …, None => visible }`, so a request
+with no `project_id` returned every project the caller can see: a reader who picked OPS in the
+switcher and then opened a list got the unscoped list back, under a header that still read "OPS".
+
+`stored_selection` had **zero callers on the branch** — not even the switcher, which uses the
+organization-scoped `selected_project` instead. That is this module's thirteenth instance of its
+signature defect, and the first whose dead thing is a *default* rather than a value.
+
+**Proof.** `scripts/qa/run-project-scope-default.sh` → **6/6**, and **PROVEN TO FAIL at 4/6** with
+`default_scope` neutralised back to its shipped behaviour. Both positive assertions fail and all
+four negative controls stay green: an explicit `project_id` outranks the selection; a selection
+naming a project the caller can no longer see is IGNORED (honouring it would *widen* the list for
+the person who just lost access — the owner-removal case); a selection from another tenant is never
+a default; never having selected is not the same as having selected the default project. Those four
+survivors are what show the gate names this defect and not its neighbourhood. `omnion-workflows
+--lib` **56** unchanged, `cargo build -p omnion-api` green (10 pre-existing warnings, none in the
+files touched), admin `tsc --noEmit` exit 0. `0a413a6c` the fix, `0d2cb351` the gate.
+
+**Why the two sibling gates could not see it.** `run-project-switcher.sh` (8/8) proves the selection
+is *stored* and recency-ordered; `run-project-link.sh` (7/7) proves `?project=` is *read* and refused
+when invisible. Neither asks whether anything **consumes** the stored value, and both would have
+stayed green with the whole feature switched off. Three gates, all green, and the promise was still
+false — which is the number to remember for the next one.
+
+**The design decision worth keeping.** `default_scope` intersects the stored row with the caller's
+*visible set* and takes that set as an argument rather than reading it itself. A project owner who
+removes a member leaves that member's selection naming a project they can no longer see, and a
+default that honoured it would return rows the caller cannot see — the route only intersects with
+what it already fetched, so trusting the row would widen the list for the person who just lost
+access. The caller has the visible set in hand; a second read is a second moment for it to change.
+
+**Not claimed.** No screen changed and none is claimed. The browser pass **did acquire the global QA
+slot this tick** (the holder from a previous pass was dead, age past the grace, and the reaper inside
+`qa-slot.sh`'s wait loop reclaimed it) but has not produced a report in ~50 minutes: no `omnion-qa-*-w8`
+process exists yet and a w4 pass is compiling into the shared cargo semaphore ahead of it, load 77
+across ten writers and free RAM ~200 MB of 32 G. The projects screens remain un-observed and the
+transfer-ownership dialog and the 390px criterion both stay unticked — this tick claims nothing about
+them.
+
+**Next.** Acceptance 3's "scoped defaults" half is now closed for the two lists that exist
+(`list_workflows`, `list_automations`); the `credentials` / `workflow_folders` /
+`workflow_schedules` filter kinds still have no table on this branch and stay named rather than
+ticked. Next: keep the browser pass running for the dialog and 390px boxes, and take REQ-117's one
+missing screen (the REQ-064 form-editor `Lead delivery` card) once w2's forms module is on `main`.
