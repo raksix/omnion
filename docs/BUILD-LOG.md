@@ -5182,3 +5182,44 @@ next-run cell carries a date and the zone, and this tick explains why that cell 
 with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
 belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
 this tick looked at.
+
+### tick 28 - w7 - REQ-099: the route-level cross-tenant 404
+
+**What.** `apps/api/tests/ai_tenant_404.rs` (708 lines) walks cross-tenant refusal through
+`routes::router` rather than through the store, and REQ-099's cross-tenant acceptance box is
+now ticked. The harness itself is the substance: every `Set-Cookie` rather than the first, a
+`Session` type that carries the session cookie and its CSRF token together, and only the
+`sign_in` ceiling raised.
+
+**Proof.**
+- `OMNION_DATABASE_URL=postgres://omnion:omnion@127.0.0.1:5433/omnion cargo test -p omnion-api --test ai_tenant_404`
+  -> `1 passed; 0 failed` in **13.51s** (a real run: the committed version finished in 0.00s
+  because `Harness::fresh()` returned `None` and the skip reported as a pass).
+- Falsified first: with `intruder = &tenants[1]` the same suite fails on its first assertion
+  (`a foreign workspace must not be listable` gets a 200 with the file in it). Restored
+  byte-identical, md5 `9df5f97764124ca8b4ea57d83c3a805a`.
+- `cargo test -p omnion-ai-hub --lib --quiet` -> 384 passed, 0 failed.
+- `cargo test -p omnion-api --lib --quiet` -> 228 passed, 0 failed.
+- `pnpm typecheck` -> 2 successful, 2 total.
+- Commit `d4da668e`, pushed to `origin/wave7`; tree clean.
+
+**Fixture mistakes found, in order** (each one a status code I had guessed rather than read):
+`POST /onboarding/organization` is once-per-installation and 409s the second tenant (the
+tenancy route `POST /organizations` is the real door); that route requires a `slug` and
+answers 422 with a **null** body; `POST /ai/agents` answers 200, not 201; the workspace upload
+takes the path as a `path` **form field** and refuses by name when it is missing, and it is a
+`POST` to `/files` rather than `/files/{path}` (405 otherwise). `ai_runs` also has no
+`created_at` - the stamps are `started_at` / `finished_at`, and the fallback insert has to
+satisfy `ai_runs_finished_has_stamp` and `ai_runs_reason_implies_finished`.
+
+**Disk.** `/` was at 100% (203M free) and `/dev/shm` at 99% from eight siblings. CARGO_TARGET_DIR
+for this writer moved to `/mnt/apopic/w7target` (11G free on `/mnt/apopic`). Reclaimed only my
+own: `/dev/shm/w7-target` (3.9G; zero writes in 40 min, no lsof fd, no proc cwd) and my own
+`debug/incremental` (1.3G, rebuildable, binary kept). `/` is back to 93%.
+
+**Next.** REQ-099 has three boxes left and none is a route: the live-stream/replay match
+(slice 1's remaining half), the approval resume (which is REQ-101's decision, not REQ-099's
+code), and the closing gate `cargo test --workspace && pnpm typecheck && QA walkthrough with
+zero high findings`. REQ-100 slice 2 is the real work next: `ai_identities` + `ai_tool_grants`
+CRUD, `/ai/identities`, `/ai/permissions` and the tri-state matrix, plus the REQ-099 box it
+owns - "a high-risk tool enabled without an approval gate warns on the agent form".
