@@ -173,7 +173,13 @@ async fn check_interval(state: &AppState) -> StdDuration {
 async fn run_once(state: &AppState) {
     let ctx = crate::routes::health_panel::probe_context(state).await;
     match omnion_health::run_and_record(state.db().pool(), &ctx).await {
-        Ok(overview) => {
+        Ok((overview, policy)) => {
+            // The changes first, then the run itself. Order is not cosmetic: a receiver that
+            // opens on `health.checks.completed` and then receives the degraded event for the
+            // same tick has to reconcile the two, and delivering the news before the "still
+            // working on it" is the order that reads correctly.
+            let announced = crate::health_events::announce_changes(state.db().pool(), &policy).await
+                + crate::health_events::announce_run(state.db().pool(), &overview, None).await;
             let worst = overview
                 .services
                 .iter()
@@ -184,6 +190,8 @@ async fn run_once(state: &AppState) {
                 services = overview.services.len(),
                 state = overview.banner.state,
                 worst,
+                transitions = policy.transitions.len(),
+                announced,
                 "the scheduled health run completed"
             );
         }

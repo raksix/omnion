@@ -167,6 +167,28 @@ impl WebhookTransport {
             "url": job.url,
         })
     }
+
+    /// The URL to POST to, and the sentence when there is none.
+    ///
+    /// **The channel's own destination, never `job.url`.** `job.url` is the in-app deep link
+    /// — `/settings/iam/sessions`, `/media/files/{id}` — and posting to it is a relative URL
+    /// with no base, which `reqwest` refuses with `builder error`. That failure was live for
+    /// as long as this transport shipped: three attempts, then `failed`, with a reason in the
+    /// outbox no reader could act on. `webhook_endpoint` comes from `notification_channels`
+    /// instead, which is the only place a per-organization destination can live.
+    ///
+    /// The two are separated into a pure function because the *missing* branch is the one that
+    /// matters and it is unreachable without a database.
+    #[must_use]
+    pub fn destination(job: &DeliveryJob) -> Result<String, &'static str> {
+        match job.webhook_endpoint.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => Ok(url.to_owned()),
+            _ => Err(
+                "this organization's webhook channel has no destination — set one on the \
+                 notification settings",
+            ),
+        }
+    }
 }
 
 impl Transport for WebhookTransport {
@@ -180,13 +202,16 @@ impl Transport for WebhookTransport {
         _config: &'a DeliveryConfig,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TransportOutcome> + Send + 'a>> {
         Box::pin(async move {
-            // A webhook channel with no endpoint cannot be delivered, and saying so is the
+            // A webhook channel with no destination cannot be delivered, and saying so is the
             // whole answer: the queue claimed the row, so something has to explain it.
-            let Some(url) = job.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
-                return TransportOutcome::Failed {
-                    status: None,
-                    reason: "this notification names no endpoint to post to".to_owned(),
-                };
+            let url = match Self::destination(job) {
+                Ok(url) => url,
+                Err(reason) => {
+                    return TransportOutcome::Failed {
+                        status: None,
+                        reason: reason.to_owned(),
+                    }
+                }
             };
 
             match self.client.post(url).json(&Self::payload(job)).send().await {
@@ -316,6 +341,15 @@ mod tests {
             body: "Somebody asked for a review.".to_owned(),
             url: None,
             user_email: Some("reader@example.com".to_owned()),
+            webhook_endpoint: None,
+        }
+    }
+
+    /// One job with a webhook destination configured, for the destination tests below.
+    fn job_posting_to(endpoint: Option<&str>) -> DeliveryJob {
+        DeliveryJob {
+            webhook_endpoint: endpoint.map(str::to_owned),
+            ..job("webhook")
         }
     }
 
@@ -408,6 +442,57 @@ mod tests {
             "the body must not leave through a webhook"
         );
         assert!(!keys.contains(&"user_email"), "nor the reader's address");
+    }
+
+    #[test]
+    fn the_webhook_destination_is_the_channel_and_never_the_in_app_link() {
+        // **The regression this tick exists for.** The transport used to post `job.url`, which
+        // every module fills with an in-app deep link — `/settings/iam/sessions`,
+        // `/media/files/{id}`. `reqwest` refuses a relative URL with no base, so every webhook
+        // delivery failed three times and landed in `failed` with a builder error no reader
+        // could act on. The two are asserted separately because conflating them is exactly
+        // the bug: a job can legally carry *both*, and only one of them is a destination.
+        let job = DeliveryJob {
+            url: Some("/settings/iam/sessions".to_owned()),
+            webhook_endpoint: Some("https://collector.example/hook".to_owned()),
+            ..job("webhook")
+        };
+        assert_eq!(
+            WebhookTransport::destination(&job).as_deref(),
+            Ok("https://collector.example/hook")
+        );
+    }
+
+    #[test]
+    fn a_webhook_channel_with_no_destination_says_where_to_set_one() {
+        // The failure branch, which is unreachable without a database and therefore the one
+        // most likely to be wrong. It has to name the screen: "this notification names no
+        // endpoint to post to" pointed at the notification, and the notification never named
+        // one — the *channel* did not, which is a different page and a different fix.
+        let reason = WebhookTransport::destination(&job_posting_to(None)).unwrap_err();
+        assert!(reason.contains("notification settings"), "{reason}");
+        assert!(!reason.contains("this notification"), "{reason}");
+    }
+
+    #[test]
+    fn a_blank_destination_is_absent_rather_than_an_empty_post() {
+        // `Option<String>` holding `Some("")` is what a settings form posts for an input the
+        // reader cleared, and posting to it would be `builder error: empty URL` — a different
+        // failure with the same honest outcome, so both shapes are refused by one branch.
+        assert!(WebhookTransport::destination(&job_posting_to(Some("   "))).is_err());
+        assert!(WebhookTransport::destination(&job_posting_to(Some(""))).is_err());
+    }
+
+    #[test]
+    fn the_in_app_deep_link_is_never_treated_as_a_destination() {
+        // The specific shape that broke it: an in-app path *and* no channel destination.
+        // Answering with the path would re-introduce the relative-URL send; answering with
+        // the configuration sentence is the honest one.
+        let job = DeliveryJob {
+            url: Some("/notifications".to_owned()),
+            ..job_posting_to(None)
+        };
+        assert!(WebhookTransport::destination(&job).is_err());
     }
 
     #[test]
