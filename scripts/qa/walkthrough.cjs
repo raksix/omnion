@@ -8093,6 +8093,187 @@ async function runAiToolsDepth(page, report) {
 }
 
 /**
+ * The approval gate (REQ-101, slice 1) — the inbox, the review screen and the class policy.
+ *
+ * Its own pass, because the two things worth proving here are invisible on a screenshot:
+ *
+ * 1. **The review screen renders a REAL row.** The detail route is `/ai/approvals/{id}`, so
+ *    walking it on an empty queue proves nothing but the empty state. The pass plants a pending
+ *    approval, opens the screen, asserts the frozen diff rendered, then reads the row back out of
+ *    the database to confirm the screen's Approve actually moved it.
+ *
+ * 2. **The typed confirmation is not a checkbox.** The pass un-gates a class with a wrong phrase
+ *    and asserts the policy table did NOT change, then with the right phrase and asserts it did.
+ *    A client that sent the field unconditionally would pass the second check and fail the first
+ *    in a way only the database can see — and a guard made of a field's *absence* cannot be
+ *    proven by watching the happy path work.
+ *
+ * The organization is read rather than hard-coded: it is the single QA tenant, and a pass that
+ * pinned its uuid would fail loudly the next time the QA database is rebuilt.
+ */
+async function runAiApprovalsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-approvals", action: "ai-approvals", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  const scalar = (sql) => qaSql(sql).split("\n").filter(Boolean)[0]?.split("|")[0]?.trim() ?? "";
+
+  const organizationId = scalar("select id from organizations order by created_at limit 1");
+  if (!organizationId) {
+    note({ step: "theQaTenantExists", passed: false });
+    return steps;
+  }
+
+  // A previous run's leftovers. The table is real, so without this a second run would pile rows
+  // onto the first run's inbox and the pending count would climb every pass.
+  qaSql(`delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = '${organizationId}')`);
+  qaSql(`delete from ai_approvals where organization_id = '${organizationId}'`);
+
+  // ---- the policy table ------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/approvals/policies`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({ step: "allSixClassesRender", passed: (await page.locator("[data-policy-row]").count()) === 6 });
+  // Every class ships gated. A row reading "Allowed without approval" on a fresh database means
+  // the seed shipped open — the exact failure this screen exists to prevent.
+  const policyText = await page.locator("body").innerText().catch(() => "");
+  note({ step: "everyClassShippedGated", passed: !policyText.includes("Allowed without approval") });
+  await shot(page, "ai-approval-policies");
+
+  const gateClass = "content_publish";
+  const policyRow = () =>
+    scalar(
+      `select mode from ai_approval_policies where organization_id = '${organizationId}' and tool_class = '${gateClass}'`,
+    );
+
+  await page.locator(`[data-policy-edit="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(600);
+  await page.locator(`[data-policy-mode-select="${gateClass}"]`).selectOption("allow").catch(() => {});
+  await page.locator(`[data-policy-confirmation="${gateClass}"]`).fill("yes").catch(() => {});
+  await page.locator(`[data-policy-save="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(1000);
+  // The wrong phrase must be refused AND leave no organization row behind.
+  note({ step: "wrongPhraseWritesNothing", passed: policyRow() === "" });
+  note({
+    step: "theRefusalIsShownOnTheRow",
+    passed: (await page.locator("[data-policy-error]").count()) > 0,
+  });
+
+  await page.locator(`[data-policy-confirmation="${gateClass}"]`)
+    .fill(`set ${gateClass} to allow`)
+    .catch(() => {});
+  await page.locator(`[data-policy-save="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(1300);
+  note({ step: "theTypedPhraseUnGatesTheClass", passed: policyRow() === "allow" });
+  note({
+    step: "theRowKeepsItsWarningStripe",
+    passed: (await page.locator(`[data-policy-row="${gateClass}"][data-permissive="true"]`).count()) > 0,
+  });
+  await shot(page, "ai-approval-policy-ungated");
+
+  await page.locator(`[data-policy-reset="${gateClass}"]`).click().catch(() => {});
+  await page.waitForTimeout(1000);
+  note({ step: "resetNeedsNoPhrase", passed: policyRow() === "" });
+
+  // ---- a real row for the review screen ---------------------------------------------------------
+  // `cascades` and an unchanged field are in the frozen preview on purpose: the diff card's two
+  // hard parts — the collapse toggle and the cascade line — are what this plants.
+  const plantedId = scalar(
+    `insert into ai_approvals (id, organization_id, tool_key, tool_class, resource_type, resource_id, ` +
+      `resource_label, risk, title, summary, operation_count, irreversible, requires_confirmation, ` +
+      `preview, preview_hash, base_revision, status, expires_at, created_at) values ` +
+      `(gen_random_uuid(), '${organizationId}', 'content.publish', '${gateClass}', 'page', 'qa-page', ` +
+      `'QA walkthrough page', 'high', 'QA publish approval', ` +
+      `'A row the walkthrough planted so the review screen has something to render.', ` +
+      `1, false, false, ` +
+      `'{"operations":[{"action":"update","resource":"page:qa-page","fields":[` +
+      `{"field":"status","old":"draft","new":"published"},` +
+      `{"field":"author","old":"QA","new":"QA"}]}]}'::jsonb, ` +
+      `'qa-preview-hash', 'rev-1', 'pending', now() + interval '60 minutes', now()) returning id`,
+  );
+  note({ step: "aRowExistsToReview", passed: Boolean(plantedId) });
+
+  // ---- the inbox -------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/approvals`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  note({ step: "inboxRendersTheRow", passed: (await page.locator("[data-approval-row]").count()) > 0 });
+  note({
+    step: "theEmptyStateIsHiddenWhileRowsExist",
+    passed: (await page.locator("text=Nothing waiting for you").count()) === 0,
+  });
+  note({
+    step: "theResourceColumnNamesTheTarget",
+    passed: (await page.locator("body").innerText().catch(() => "")).includes("QA walkthrough page"),
+  });
+  await shot(page, "ai-approvals-inbox");
+
+  // ---- the review screen -----------------------------------------------------------------------
+  if (plantedId) {
+    await page.goto(`${URL_ADMIN}/ai/approvals/${plantedId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    note({
+      step: "reviewScreenRendersTheFrozenDiff",
+      passed: (await page.locator("[data-diff-operation]").count()) > 0,
+    });
+    // Unchanged fields are collapsed by default and the changed one carries a marker that is not
+    // colour-only — a diff whose only signal is a background tint fails the visual check.
+    note({
+      step: "unchangedFieldsAreCollapsedByDefault",
+      passed: (await page.locator("[data-diff-changed='true']").count()) === 1,
+    });
+    note({
+      step: "theChangedFieldIsMarkedNotMerelyTinted",
+      passed: (await page.locator("[data-diff-changed-marker]").count()) === 1,
+    });
+    await page.locator("[data-diff-toggle-unchanged]").first().click().catch(() => {});
+    await page.waitForTimeout(600);
+    note({
+      step: "theToggleRevealsTheUnchangedField",
+      passed: (await page.locator("[data-diff-changed='false']").count()) >= 1,
+    });
+    note({
+      step: "oldAndNewAreBothLabelled",
+      passed:
+        (await page.locator("[data-diff-old]").count()) > 0 &&
+        (await page.locator("[data-diff-new]").count()) > 0,
+    });
+    note({
+      step: "theDecisionBarIsPresent",
+      passed: (await page.locator("[data-approval-approve]").count()) > 0,
+    });
+    note({
+      step: "thePreviewHashIsShown",
+      passed: (await page.locator("body").innerText().catch(() => "")).includes("qa-preview-hash"),
+    });
+    await shot(page, "ai-approval-review");
+
+    // Approve it, then read the row back. A screen that renders a green notice while the row
+    // never moves is a screen that lies about a decision.
+    await page.locator("[data-approval-approve]").click().catch(() => {});
+    await page.waitForTimeout(1500);
+    note({
+      step: "approveMovedTheRow",
+      passed: (() => {
+        const status = scalar(`select status from ai_approvals where id = '${plantedId}'`);
+        return status !== "" && status !== "pending";
+      })(),
+    });
+  } else {
+    // No row and no way to make one. Recording this as skipped is honest; a check that cannot run
+    // must say so rather than pass quietly.
+    note({ step: "reviewScreenRendersTheFrozenDiff", passed: "skipped: no approval row to open" });
+    note({ step: "approveMovedTheRow", passed: "skipped: no approval row to open" });
+  }
+
+  // ---- clean up so the next run starts clean ---------------------------------------------------
+  qaSql(`delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = '${organizationId}')`);
+  qaSql(`delete from ai_approvals where organization_id = '${organizationId}'`);
+
+  return steps;
+}
+
+/**
  * The identities and the matrix (REQ-100, slice 2).
  *
  * The pass walks the tri-state in the order the spec names it — inherit → allow → deny → back to
@@ -9154,6 +9335,14 @@ async function main() {
     // empty state and error state nobody has seen.
     { path: "/ai/identities", name: "ai-identities", area: "ai" },
     { path: "/ai/permissions", name: "ai-permissions", area: "ai" },
+    // The approval gate (REQ-101, slice 1) — three routes, all walked. The inbox is where a
+    // gated agent run parks, the review screen is the frozen diff plus the decision, and the
+    // policy table is the guardrail that decides what ever gets here. The review screen needs a
+    // row to exist before it renders anything but its error state, so the depth pass below drives
+    // the three in order: open the policy screen, read a class, then walk the inbox and the
+    // detail route.
+    { path: "/ai/approvals", name: "ai-approvals", area: "ai" },
+    { path: "/ai/approvals/policies", name: "ai-approval-policies", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -9357,6 +9546,15 @@ async function main() {
   }
   log(`ai identities: ${JSON.stringify(report.aiIdentities)}`);
   }
+  // The approval gate (REQ-101, slice 1). Its own pass, after the identities one, because it
+  // reads the policy table the same way — against the database, not the screen — and because the
+  // review route is a detail screen that needs a planted row to be worth walking at all.
+  if (inScope("ai")) {
+    report.aiApprovals = await runDepthPass("ai-approvals", () =>
+      runAiApprovalsDepth(page, report),
+    );
+  }
+  log(`ai approvals: ${JSON.stringify(report.aiApprovals)}`);
   log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
 
   // The file manager's depth pass (REQ-010, slice 1): a folder is created, the listing is filtered,
