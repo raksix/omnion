@@ -5836,3 +5836,60 @@ writer's REQ-014 and are verbatim on `origin/main`. When it builds: read
 both of which need a node selected first. REQ-004's plugin-node run stays **BLOCKED** on REQ-121
 (wave 5b, unclaimed): `plugins_enabled_for` returns an empty registry, so no plugin node can
 appear in any browser.
+
+### Tick 41 (wave 3) — a draft's verdict was written onto the saved rule (`271c02b0`)
+
+**`POST /workflows/{id}/validate` had two callers and one behaviour.** The rule list's "invalid"
+chip wants a verdict about the **stored** graph. The builder toolbar's Validate button posts the
+author's **unsaved draft** (`{nodes, edges}`) so the problems panel answers while they are still
+typing. The handler derived its findings from whichever graph it was handed and then wrote the
+verdict to the rule row unconditionally — so the draft's answer became the rule's answer.
+
+The consequence is not cosmetic, and `engine::admit_to_run` is why: a non-empty
+`validation_error` is what turns into `workflow_not_runnable`. An author who deletes the broken
+edge and presses Validate watches the panel go green **and** marks their saved rule unrunnable,
+because the clean draft overwrote the stored graph that still carries the defect. The rule stops
+firing on its schedule and the defect is still there. The mirror case is the same bug inverted: a
+card half-drawn in the canvas takes a healthy rule down with it. One tab, one button, no race, and
+the guard whose entire job is "do not run this" moved on an edit that was never saved.
+
+**The fix is a decision about the request's SHAPE, not a version check.** A body *is* the draft —
+its presence is the only signal separating "check this graph" from "check the rule", and the
+handler's own doc comment already promised the caller "validates that graph without storing it".
+`Validated` makes that decision once; `record_verdict` performs the write through it, so the route
+has no call site that can bypass it.
+
+**The first version was an assertion nobody had watched bite, and it took a revert to find out.**
+The decision was left as `if may_record()` at the call site and the test called `may_record`
+directly — and it stayed **green with the call-site guard removed**, because a test of a pure
+function cannot see whether its one caller used it. Moving the write behind a method is what makes
+the same test cover the route. Proof that the guard bites now: neuter `may_record` (return `true`)
+and exactly one test goes red (`263 passed / 1 failed`).
+
+**A WRONG HYPOTHESIS THAT A FIXTURE GUARD CAUGHT, WHICH IS WHAT THE GUARD IS FOR.** I first
+wrote the test around an orphan node, on the theory that `replace_graph` records the *projection's*
+refusal while `record_validation` records the *first validate error*, so a graph the walk accepts
+but `validate` calls an error would flip the column between the two writers. The fixture guard
+(`the fixture must be a graph the projection ACCEPTS`) failed immediately and printed the real
+answer: `"stray" is not reachable from the trigger`. `project_walk` runs `validate_with_plugins`
+first and refuses on the first error, so **the orphan cannot reach `replace_graph` at all** and the
+two writers can never disagree there. The hypothesis was wrong, the same shape as the tick-40 fix
+being stated over the wrong collection — and the guard caught it in seconds instead of shipping a
+test that measured a code path nobody had written.
+
+**Gates.** `cargo test -p omnion-api --lib` **264 passed / 0 failed**;
+`cargo test -p omnion-workflows --lib` **150 passed / 0 failed**; `pnpm typecheck` **2/2**.
+The browser pass is running on the private stack (`QA_STACK=w3`).
+
+**A PASS DIED ON A BUILD ERROR THAT WAS NOT MINE, AND THE DIAGNOSTIC IS IN THE SHAPE OF THE
+MESSAGE.** The first attempt reported `could not compile omnion-permissions` and died — the crate
+had not changed. The real lines were two levels up: `failed to move dependency graph … No such
+file or directory` against `/dev/shm/w3-target/debug/incremental/…`, i.e. another writer emptied
+the shared tmpfs mid-build. `CARGO_INCREMENTAL=0` is the whole remedy (it also cut a 115-crate
+retry storm to 11 last tick).
+
+**Next.** Read `validate-classes.ambiguousBranch` with **both** rows (`found` AND
+`orderIndependent`) once the pass lands, and add a probe row for `switch_not_executable` — a graph
+whose only defect is a switch, asserting the panel names the Condition alternative rather than
+"does not project onto a step". Then the `listener` row and `tab-walk`'s `reachedAnEdge:false`,
+both of which need a node selected first.
