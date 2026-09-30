@@ -6491,6 +6491,28 @@ own `debug/deps`, 3.09 GB, one hash per crate from two builds kept and the stale
 /` 100% → 95%. `CARGO_INCREMENTAL=0` for the rest of the tick: a non-incremental rebuild writes
 its own `incremental/` cache anyway, so the flag saves nothing here and costs a full relink.
 
+
+### The QA pass, and why it is not in this entry's proof list
+
+The single slot came free for the first time this session (the holder was dead and the reaper had
+not run), so the pass was started with the private stack — `QA_STACK=w6` on 18085/3105/3205.
+Both pm2 stacks came up and `/healthz` answered `200`, and the walkthrough began on the right
+ports. It then ran for **23 minutes at a load average of 18 → 109** and got through 22 of the
+harness's pages and 781 of its clicks, reaching `sites` and never arriving at `/settings/
+reliability/*`, which sit later in the route list.
+
+**I stopped it deliberately and released the slot.** A browser pass at load 109 measures the box,
+not the product: 9 clicks in the last two minutes, and every finding it produced would have been
+about eight writers sharing six cores. Holding the single slot for a walk that cannot finish also
+starves every sibling queued behind it, and one of them (`w5`) was already waiting on it. Killing
+it was the cheaper loss than letting the queue stall, and the slot is reaped and free now.
+
+So the honest position is unchanged from the two ticks before: **the reliability screens have
+still not been opened in a browser.** The walkthrough's route list carries both of them, so the
+harness will visit them the next time a pass can actually run, and the next tick should treat that
+as its first job rather than as a formality — a screen nobody has opened is not finished, and the
+Rust walks (5/5) prove the API and the store, not the rendering.
+
 **Next.** (1) The QA pass on both reliability screens — take the slot when it frees. (2) Slice 3:
 `retry_policies` / `retry_outcomes` store, the scheduler with its persisted next-attempt time, the
 breaker store and state machine on a real outbound call, both screens.
