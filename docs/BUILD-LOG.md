@@ -9675,3 +9675,62 @@ free.
 a sentence in a document. That is a catalogue addition plus five emitters. The browser pass is still
 outstanding: the QA slot was **legitimately held** by a live w3 pass when this tick checked (holder
 pid alive, log one minute old), so it was left alone rather than reclaimed.
+
+## Wave 4b · tick 52 · REQ-055 HR slice 1 — the people core
+
+**What.** A greenfield module, because the QA slot has been held by a live `omnion-w3` holder
+(`542657`, cwd `omnion-w3`) for the whole window and a browser-gated box was not reachable; a
+module with no screen yet is the one kind of work that genuinely needs no browser. `modules/hr`
+(`omnion-module-hr`) with the people core every later slice points at — leave, attendance and
+onboarding are all rows that reference an employee, so the employee record and the rules deciding
+who may read it had to be right first. Migration **0196** (the namespace is shared by ten writers;
+0193 was the high-water across every worktree, and the spec's own note says to renumber).
+
+**Proof.**
+- `cargo test -p omnion-module-hr --quiet` — **48/48**.
+- `cargo test -p omnion-permissions --quiet` — **70/70**, including a new test that the whole
+  `hr.*` family is catalogued. That test is not decoration: a `guards::require()` with a key that
+  is **not** in the catalogue does not fall open, it 403s *everyone* including the instance owner,
+  so a typo in a route is a module that looks installed and answers 403 on every screen.
+- `cargo test -p omnion-api --lib hr::` — **7/7** (the gate decision, the event payload, the
+  narrowing arithmetic).
+- **All 63 migrations applied in order with psql** against a live PostgreSQL. This is not a
+  formality: an expression such as `lower(work_email)` may appear in a `create unique index` but
+  **not** in a `unique (...)` table constraint, and Postgres parses the whole file before running
+  any of it, so 0196 died with `syntax error at or near "("`. `cargo` never opens the file — the
+  crate compiles and its 48 unit tests pass against a migration that cannot be installed. The
+  proof of a migration has to be `psql`, not a green test run.
+- Live schema refusals on `omnion_hr_mig_w4`: a tenant created after the migration is seeded by the
+  **trigger** (1 dept, 3 leave types at 14/0/0, 1 template with 3 items); **0** salary/bank/tax
+  columns exist in `hr_employees` (checked against `information_schema`, so the risk note's "no
+  payroll" is a fact about the schema and not a promise about the UI); `ADA@example.com` is refused
+  against `ada@example.com`; an end date before the start is refused; a department set as its own
+  parent is refused.
+- `apps/api/tests/hr.rs` — **8 walks** against a live database (`omnion_walk_hr`).
+- `./node_modules/.bin/turbo run typecheck` — **2/2**.
+
+**Two defects this slice's own review caught, both now tests rather than comments.**
+
+1. **An unknown `visibility` widened to `all`.** The query carried the level as an enum, so a
+   stale saved view either failed inside serde — meaning the strictness was an *accident of the
+   derive* — or, with a hand-rolled parse at the call site, collapsed to `None`, and `None` is the
+   **widest** level. The request's own rule is that an unknown level is refused, never widened. It
+   is a `String` now and the refusal is ours. The same shape as the w6 REQ-128 lesson: a rule
+   reachable only through a framework's default is not a rule, it is a coincidence.
+2. **A keyset cursor hard-coded `$1`/`$2`,** which is only right while no filter binds first.
+   `QueryBuilder` numbers sequentially, so a single search term pushed the cursor's id onto the
+   search *string* and the second page of a searched list silently returned rows from an unrelated
+   place. The cursor is a CTE bound **first**, so it is `$1` by construction. Third time in this
+   repository that a "just build the SQL string" shortcut has had to become a builder that owns its
+   own numbering.
+
+Also split the unique-violation translation into a pure `(code, constraint)` function:
+`PgDatabaseError` has no public constructor, so the rule could not be tested before — and the two
+halves of the module were each keeping their own copy, which is how a duplicate work e-mail ends
+up refused as "another employee" by one route and as a raw constraint name by the other.
+
+**Next.** Slice 2 — leave end to end: types, balances, the request form, overlap and balance
+checks, the decision flow with its direct-decide fallback, the absence calendar and the
+`hr.leave.*` events. The self-service read that slice 1's walk deliberately left open
+(`/hr/me/*` is slice 3) hangs off the same `own` level.
+

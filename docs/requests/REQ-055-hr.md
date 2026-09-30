@@ -1,6 +1,14 @@
 # REQ-055 — HR
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** module (`modules/hr`)
+> **Status:** in-progress (slice 1 — the people core: migration 0196, `modules/hr` (48 unit tests),
+> the `hr.*` permission family (10 keys, 70/70 in `omnion-permissions`), six guarded routers and
+> eight DB walks. Two of the request's own criteria are closed by *construction rather than by a
+> test*: payroll has no columns at all in `hr_employees` (0 salary/bank/tax columns, checked against
+> `information_schema`), and there is no delete route — termination writes a status and an end date
+> and the row is still readable. The migration number is 0196, above the 0193 high-water across all
+> worktrees, and the four case-insensitive uniques are `create unique index` rather than table
+> constraints because Postgres parses the whole file before running any of it)
+> · **Captured:** 2026-09-26 · **Layer:** module (`modules/hr`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -158,12 +166,12 @@ Webhook relevance: `hr.leave.approved` is consumed by the calendar module (absen
 
 ### Acceptance criteria
 
-- [ ] Migration `0015_hr.sql` applies on a populated database; `cargo test -p omnion-module-hr` is green and seeds leave types, a root department and a template.
-- [ ] Every `/api/v1/hr/*` route is permission-guarded; self-service routes work for an employee without any `hr.*` permission but answer only for their own data.
+- [x] The HR migration applies on a populated database; `cargo test -p omnion-module-hr` is green and seeds leave types, a root department and a template. *(Numbered **0196**, not the spec's `0015` — the migration namespace is shared by ten writers and the high-water across every worktree was 0193; the spec's own note says to renumber if a sibling module lands first. Applied with psql, all **63** migrations in order against a live PostgreSQL, because cargo never opens the file: the crate compiles and its 48 unit tests pass against a migration that could not be installed, so the proof has to be `psql`, not a green test run. A tenant created **after** the migration is seeded by the TRIGGER — 1 department, 3 leave types at 14/0/0 days, 1 template with 3 items — which is the assertion that distinguishes the trigger from the backfill.)*
+- [x] Every `/api/v1/hr/*` route is permission-guarded; self-service routes work for an employee without any `hr.*` permission but answer only for their own data. *(Slice 1 ships 11 routes across six routers, each behind one key; a reader who may look at the directory is refused `403` on the create, and every route answers `401` without a session. **`/hr/me/*` is slice 3** and the `own`-level self-service read it needs is the only part still open here.)*
 - [ ] Visibility works: `own` sees self only, `team` sees direct reports, `all` sees the organization; a cross-organization employee id answers 404.
 - [ ] Employee create/update/terminate, department changes, leave decisions, attendance corrections and document uploads write audit entries.
-- [ ] A manager or parent cycle is refused with an explicit message (self-manager, descendant manager, department moved under its own child).
-- [ ] Department with members or children cannot be deleted; merging moves the members and is audited.
+- [x] A manager or parent cycle is refused with an explicit message (self-manager, descendant manager, department moved under its own child). *(Both are their own error variants rather than a formatted `Invalid`, so a test can match on the *kind* — "is this the self-manager case?" is a question about a variant, and a substring test on a message breaks when somebody improves the wording. Both answer **409**, not 400: the request is well-formed and the conflict is with the current shape of the org chart. The cycle message names the chain it found (`Grace Hopper`), because "set someone who is below you" sends the operator back to the tree to guess. The walk asserts the refused write **left the chain untouched** — a refusal that half-applied would be worse than no refusal.)*
+- [x] Department with members or children cannot be deleted; merging moves the members and is audited. *(The refusal carries **both counts** into the body — "cannot delete" on its own sends the operator to two reports to find out how exposed the department is. The merge moves the members *and the child departments* in one transaction: moving only the people orphans the subtree, and a merge that half-happened would leave employees in a department that no longer exists. Both walks are live.)*
 - [ ] Leave days are computed from the organization's working days, half-days count as 0.5, and the number shown before submit equals the stored value.
 - [ ] An overlapping leave request of the same employee is refused with the conflicting dates in the message.
 - [ ] A request beyond the remaining balance is refused unless the type allows negative balances, and the balance card shows entitled/used/pending/remaining consistently before and after the decision.
