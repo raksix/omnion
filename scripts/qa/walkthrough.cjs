@@ -9824,13 +9824,18 @@ async function main() {
         ]
       : []),
     // The staging surfaces (REQ-017). `/environments` carries the detail route's id and so is
-    // walked by `runEnvironmentsDepth`, but the CREATE WIZARD has no id and was walked by
-    // nothing at any width — while the spec names its phone layout explicitly ("below `lg` the
-    // wizard becomes a single scrolling form"). A three-step wizard that overflows sideways on a
-    // phone is exactly the failure that clause exists to prevent, and no desktop screenshot and
-    // no depth-pass step can show it: the depth pass drives the wizard at 1280px and only ever
-    // opens step one, because submitting is what creates a row.
-    { path: "/environments/new", name: "environments-wizard" },
+    // walked by `runEnvironmentsDepth`; the create wizard has no id either, and it has no ROUTE
+    // either — it is a modal the list opens with `data-env-new`. The spec names its phone layout
+    // explicitly ("below `lg` the wizard becomes a single scrolling form") and nothing measured
+    // it: the depth pass drives the wizard, but at 1280px.
+    //
+    // The list deep-links its own wizard through `?wizard=1` (the panel's other list screens do
+    // the same for their own drawers), so this route IS the wizard at 390px. The assertion below
+    // is what keeps that honest — a query parameter that the view ignores would photograph the
+    // list and file it as a form, and the check is `[data-env-wizard]` on the page, not the path
+    // that produced it.
+    { path: "/environments", name: "environments" },
+    { path: "/environments?wizard=1", name: "environments-wizard", expect: "[data-env-wizard]" },
   ];
   for (const r of mobileTenantRoutes) MOBILE_NAMES.add(r.name);
   for (const route of (ONLY_ALL
@@ -9838,9 +9843,19 @@ async function main() {
     : mobileTenantRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(1200);
+    let rendered = true;
+    if (route.expect) {
+      rendered = (await mpage.locator(route.expect).count()) > 0;
+      if (!rendered) {
+        // A deep link that opens nothing is a broken deep link, and the screenshot would be of
+        // whatever the URL fell back to — recorded here rather than left for a human to notice
+        // that two of the twenty screenshots are the same screen.
+        record({ page: "qa", action: "deep-link-render-failed", route: route.path, expect: route.expect });
+      }
+    }
     const diag = await diagnostics(mpage);
     await shot(mpage, `mobile-${route.name}`);
-    report.mobile.push({ ...route, diagnostics: diag });
+    report.mobile.push({ ...route, rendered, diagnostics: diag });
   }
 
   // The switcher on a phone is a bottom sheet, not a dropdown: this reads its geometry, because
