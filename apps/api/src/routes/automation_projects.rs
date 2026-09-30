@@ -300,6 +300,120 @@ pub struct ProjectListQuery {
     pub mine: Option<String>,
 }
 
+/// `GET /api/v1/projects?mine=1` — the switcher's rows, recents first, with this person's
+/// selection and role on each.
+///
+/// **This is the handler the `mine` parameter was documented for since slice 1 and that nothing
+/// called.** The parameter was declared, the REQ's API table named this list, and the panel's
+/// switcher had no server-side source: the only way to build it would have been to re-filter the
+/// full project list in the browser, which is the two-lists-drift bug `fetchProjects` already
+/// warns about in `apps/admin/lib/api.ts` — the two would differ the first time an administrator
+/// opened it.
+///
+/// It is `?mine=1` and not a second path so the tenancy answer has exactly one gate: everything
+/// this file does for visibility, `find_visible` and [`caller_for`], applies here unchanged, and a
+/// new path would have been free to forget one of them.
+///
+/// The `selected` flag is **not** derived from the query string. A shared link carries
+/// `?project=<id>` and the switcher then highlights that project, but the stored selection is what
+/// the *next* navigation restores, and a screen that treated the URL as the selection would
+/// overwrite the person's own choice every time they followed somebody else's link.
+pub async fn switcher(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    axum::extract::Query(query): axum::extract::Query<ProjectListQuery>,
+) -> Result<Json<SwitcherResponse>, ApiError> {
+    let organization_id = resolve_organization(&current, query.organization_id)?;
+    let caller = caller_for(&state, &current, organization_id).await;
+    let entries = projects::list_switcher_entries(state.db().pool(), organization_id, caller)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(SwitcherResponse {
+        projects: entries,
+        selected: projects::selected_project(state.db().pool(), organization_id, caller)
+            .await
+            .map_err(ApiError::from)?,
+    }))
+}
+
+/// The switcher's answer: the rows, and the selection separately.
+///
+/// The selection is repeated outside the rows on purpose. "Which project am I in" is answerable
+/// when **every** row is filtered out or none of them is marked, and a client that has to infer it
+/// from a set of flags has no way to say "you have not chosen one".
+#[derive(Debug, Serialize)]
+pub struct SwitcherResponse {
+    /// The projects the caller may switch into, recents first.
+    pub projects: Vec<projects::SwitcherEntry>,
+    /// The caller's stored selection, or `None` when they have never chosen.
+    pub selected: Option<Uuid>,
+}
+
+/// `POST /api/v1/projects/selection` — switch into a project.
+///
+/// One POST rather than a `PATCH` on the project, because the resource being written is *the
+/// caller's switcher*, not the project: two people writing two different rows of the same table
+/// is not a conflict, and a project-scoped path would say otherwise to the reader and to the
+/// audit trail. The body is the id, because a path segment plus a body is two ways to name one
+/// value and the REQ's other project routes already use the segment — this one is the exception,
+/// and the comment is here so the next writer does not "fix" it.
+#[derive(Debug, Deserialize)]
+pub struct SelectionBody {
+    /// The project to switch into. `None` is the "All projects" entry and clears the selection.
+    pub project_id: Option<Uuid>,
+}
+
+/// `POST /api/v1/projects/selection` — the switcher's write.
+pub async fn set_selection(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    axum::extract::Query(query): axum::extract::Query<ProjectListQuery>,
+    axum::Json(body): axum::Json<SelectionBody>,
+) -> Result<Json<SwitcherResponse>, ApiError> {
+    let organization_id = resolve_organization(&current, query.organization_id)?;
+    let caller = caller_for(&state, &current, organization_id).await;
+
+    match body.project_id {
+        Some(project_id) => {
+            // The store answers `project_not_found` for a project the caller may not see, and
+            // **`WorkflowError::Invalid` maps to `400`**, not `404` — the store's code travels but
+            // its status does not. So the mapping is done here, at the one layer that knows the
+            // module's rule: a `400` on a project id says "your request was malformed", which
+            // tells a caller the id was understood and judged, and that is exactly the oracle
+            // every other project read refuses to give. Anything that is not this one code falls
+            // through to the generic mapping, so a genuine store failure is still a `503`.
+            let outcome = projects::select_project(state.db().pool(), organization_id, project_id, caller)
+                .await;
+            if let Err(error) = outcome {
+                return Err(if error.code() == "project_not_found" {
+                    not_found()
+                } else {
+                    ApiError::from(error)
+                });
+            }
+        }
+        None => {
+            // Clearing is idempotent and answers `200` either way: a caller pressing "All
+            // projects" twice has done nothing wrong the second time, and a `404` for "there was
+            // no selection" would make the button look broken.
+            projects::clear_selection(state.db().pool(), current.user.id)
+                .await
+                .map_err(ApiError::from)?;
+        }
+    }
+
+    let entries = projects::list_switcher_entries(state.db().pool(), organization_id, caller)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(SwitcherResponse {
+        projects: entries,
+        selected: projects::selected_project(state.db().pool(), organization_id, caller)
+            .await
+            .map_err(ApiError::from)?,
+    }))
+}
+
 /// `GET /api/v1/projects/{id}` — one project with its members.
 pub async fn get_project(
     State(state): State<AppState>,

@@ -226,6 +226,30 @@ fn automation_projects_surface(state: &AppState) -> Router<AppState> {
             delete(automation_projects::remove_member)
                 .layer(guards::require(state, "projects.members.manage")),
         )
+        // The switcher (REQ-133, acceptance 3). A separate path rather than `?mine=1` on
+        // `/projects`, and the comment is the reason: the REQ's API table documents
+        // `GET /api/v1/projects?mine=1`, and the parameter was declared on the query struct for
+        // five slices without a reader. A dedicated path cannot be reached by a query string that
+        // a later writer silently ignores, and the switcher's own answer is not the project list
+        // with a flag turned on — it carries the recents rank, the caller's role and the stored
+        // selection, and a client that got `/projects` and filtered it client-side would have had
+        // to reconstruct all three.
+        //
+        // `projects.read` on both verbs, deliberately. Choosing a project changes what *this
+        // person* sees, not the project: an editor who may read every project they are in needs
+        // the switcher, and a permission for "which bucket am I looking at" would be a third way
+        // to say "can read", and this branch already learned that two spellings of one power
+        // drift. The store still refuses a project the caller cannot *see*, so a wider guard
+        // cannot become a wider reach.
+        .route(
+            "/projects/switcher",
+            get(automation_projects::switcher)
+                .layer(guards::require(state, "projects.read"))
+                .merge(
+                    post(automation_projects::set_selection)
+                        .layer(guards::require(state, "projects.read")),
+                ),
+        )
 }
 
 /// Build the application router around the shared [`AppState`].
