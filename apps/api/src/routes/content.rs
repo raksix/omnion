@@ -664,6 +664,50 @@ pub async fn preview_page(
     let visible = omnion_content::filter_for_viewport(&parsed, read_on);
     let report = omnion_content::validate(&draft.blocks);
 
+    // Which of the tree's files exist, resolved once and used for both halves of this payload:
+    // the media report the frame shows, and the degradation the frame draws.
+    //
+    // Resolved against the **stored** tree rather than the filtered one, so a desktop-only image
+    // is reported even when this frame is the phone render. The opposite would make the warning
+    // disappear exactly when the author is checking the page they are about to publish on a
+    // different device, and the block's own `visible_on` is what tells the two apart — a warning
+    // that is present but says which viewport it belongs to is information; a warning that is
+    // simply absent is a different story each time the author resizes.
+    let simulated = omnion_content::parse_media_filter(query.media.as_deref())?;
+    let (real_states, media_report) = omnion_content::BlockMediaStore::new(pool.clone())
+        .states(&parsed)
+        .await
+        .unwrap_or_else(|_| {
+            (
+                std::collections::HashMap::new(),
+                omnion_content::TreeMediaReport::default(),
+            )
+        });
+    let states = omnion_content::states_for_render(&real_states, &simulated);
+    let degraded = omnion_content::degrade_tree(&visible, &states);
+    // The simulation is reported as its own count so the frame can say "simulating 1 deleted
+    // file" instead of pretending the page is broken. A frame that claimed a real file was
+    // deleted when nothing was deleted would send an author to fix their own media library.
+    //
+    // The broken count the frame reports is the *drawn* one: a file that is really gone and a
+    // file this frame is pretending is gone are the same thing to somebody reading the page, and
+    // the two are added rather than merged so `simulated_media` can still say how many of them
+    // are the author's own experiment. An id that names no file on this page is counted in
+    // neither — a filter for some other page's image has nothing to say about this one.
+    let on_this_page = omnion_content::media_ids(&parsed);
+    let simulated_broken = simulated.iter().filter(|id| on_this_page.contains(id)).count();
+    let already: std::collections::HashSet<_> = media_report
+        .refs
+        .iter()
+        .filter(|entry| entry.is_broken())
+        .map(|entry| entry.media_id)
+        .collect();
+    let broken_count = media_report.broken_count
+        + simulated
+            .iter()
+            .filter(|id| on_this_page.contains(id) && !already.contains(id))
+            .count();
+
     Ok(Json(PagePreviewBody {
         page_id: page.id,
         slug: page.slug.clone(),
@@ -673,9 +717,13 @@ pub async fn preview_page(
         // not equal whenever the author hid something. Rendering only the filtered tree would
         // make a "hidden on phones" block indistinguishable from a deleted one.
         blocks: omnion_content::blocks_to_value(&parsed),
-        visible_blocks: omnion_content::blocks_to_value(&visible),
+        visible_blocks: omnion_content::blocks_to_value(&degraded),
         block_count: parsed.len() as i32,
-        visible_count: visible.len() as i32,
+        // The count of what THIS viewport draws, after the degradation — so a phone frame whose
+        // gallery lost every file reports zero visible blocks, which is what the author is
+        // looking at. Reporting the pre-degradation number beside a tree that no longer has the
+        // block is the disagreement the previous pass's `previewDrawnBlocks` keys were reading.
+        visible_count: degraded.len() as i32,
         body: draft.body.clone(),
         revision_id: draft.id,
         revision_no: draft.revision_no,
@@ -685,6 +733,14 @@ pub async fn preview_page(
         // into the response: they are a read-only report, and a struct field would freeze the
         // validator's shape into the wire format the first time a code appeared on an issue.
         issues: serde_json::to_value(&report.issues).unwrap_or_else(|_| json!([])),
+        // The media report travels the same way for the same reason: it is a report about the
+        // page, and typing it into this response would make every field of `FileState` a wire
+        // contract the day somebody wanted to add a fourth state.
+        media: serde_json::to_value(&media_report).unwrap_or_else(|_| json!({ "refs": [] })),
+        media_file_count: i32::try_from(media_report.file_count).unwrap_or(i32::MAX),
+        media_broken_count: i32::try_from(broken_count).unwrap_or(i32::MAX),
+        media_warning: media_report.summary(),
+        simulated_media: i32::try_from(simulated_broken).unwrap_or(i32::MAX),
     }))
 }
 
@@ -695,6 +751,19 @@ pub struct PreviewQuery {
     /// wide one, so a typo in a link cannot produce a frame that draws nothing.
     #[serde(default)]
     pub viewport: Option<String>,
+    /// Comma-separated media ids the frame should pretend are **deleted** (REQ-063, slice 4).
+    ///
+    /// The frame is how an author finds out what a broken image does to their page, and the
+    /// obvious way to find out is to trash a real file — which changes the page for every
+    /// visitor and cannot be undone from the frame. Naming the ids instead means the
+    /// simulation touches nothing: the store is read exactly as it is for a normal frame and the
+    /// only difference is which map the degradation is given.
+    ///
+    /// Parsed by [`omnion_content::parse_media_filter`], so a word that is not an id and a list
+    /// longer than `MAX_MEDIA_FILTER` are both refused with a message that says which — a
+    /// silently truncated filter would answer "this file was checked" for a gallery it skipped.
+    #[serde(default)]
+    pub media: Option<String>,
 }
 
 fn preview_viewport(value: Option<&str>) -> &'static str {
@@ -737,6 +806,25 @@ pub struct PagePreviewBody {
     /// Validation issues of the stored tree, so the frame can show the same badges the editor
     /// does rather than a second opinion.
     pub issues: Value,
+    /// The files this page's blocks name, and what can be done with each (REQ-063, slice 4).
+    ///
+    /// The frame shows this so a missing picture is a *named* thing on screen rather than a gap
+    /// the author has to infer — the whole point of the degradation is that the page still
+    /// renders, which also makes it silent unless something says why.
+    pub media: Value,
+    /// Files the tree names that cannot be served.
+    pub media_file_count: i32,
+    /// How many of those cannot be served.
+    pub media_broken_count: i32,
+    /// The one-line summary the frame's status bar prints, or an empty string when nothing is
+    /// broken — the server's wording, so the editor bar and the frame cannot disagree about it.
+    pub media_warning: String,
+    /// Ids this frame is *pretending* are deleted, and how many of them name a file on this page.
+    ///
+    /// Separate from `media_broken_count` because a simulation is the author's own experiment,
+    /// not a fact about their library, and a frame that blended the two would report a working
+    /// page as broken.
+    pub simulated_media: i32,
 }
 
 /// Read one revision of a page.

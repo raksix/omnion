@@ -192,10 +192,29 @@ pub async fn get_published_page(
     // The viewport filter runs on the stored payload before it is handed out. A page that
     // carries blocks the author hid from phones is a different page for a phone, and the only
     // honest way to serve that is to never build the other one.
+    //
+    // The order is filter, then degrade, and the reason is that a *hidden* block's broken file is
+    // not this reader's problem: a desktop-only image must not be reported to a phone, and the
+    // degradation of a block nobody on this viewport would see is markup they never download. One
+    // order and both questions have one answer.
     let read_on = read_on_from(query.viewport.as_deref());
     let blocks = match omnion_content::parse_blocks(&revision.blocks) {
         Ok(parsed) => {
-            omnion_content::blocks_to_value(&omnion_content::filter_for_viewport(&parsed, read_on))
+            let shown = omnion_content::filter_for_viewport(&parsed, read_on);
+            // A file somebody trashed must not become a broken-image icon on a page that is
+            // otherwise working. The degradation is the platform's, not the theme's: a theme that
+            // forgot to check would serve the dead id to every visitor, and there are ten themes.
+            let degraded = match omnion_content::BlockMediaStore::new(pool.clone())
+                .states(&shown)
+                .await
+            {
+                Ok((states, _)) => omnion_content::degrade_tree(&shown, &states),
+                // A media table that cannot be read must not take a page off the site — the same
+                // rule the block parse above follows. The tree is served as stored, so a reader
+                // sees the dead image and nothing is silently dropped from a working page.
+                Err(_) => shown,
+            };
+            omnion_content::blocks_to_value(&degraded)
         }
         // A payload the registry cannot read is served exactly as stored: the renderer's own
         // fallback is what a visitor gets, and refusing the page over a bad block would take a
