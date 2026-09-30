@@ -10527,3 +10527,59 @@ were before this tick, and the new `waitForSelector` is the honest way to see it
 **Next.** The CRM gates green, the module is at 169 tests, and the dead-export sweep is down to
 five, all in other waves. REQ-117's remaining blocker is unchanged and is not mine to resolve: the
 REQ-064 form-editor card needs a forms module that exists on no branch.
+
+## 2026-09-30 — wave8 tick 49 — REQ-117 slice 19: the per-address ceiling, and a lead nobody could delete
+
+**What.** `Submission.ip` had carried the doc comment "the submitter's IP, for the per-IP rate
+limit and the audit trail" since the capture struct shipped. The audit half was real; the rate
+limit had never been built — `submissions_this_hour` is the only ceiling in the capture path and
+it counts by `source_id`, so one address could spend a whole source's hourly budget and the
+operator's only dial moved the flood and their real traffic together. Migration `0192` adds the
+address as a column with a partial index, `MAX_SUBMISSIONS_PER_ADDRESS_PER_HOUR = 10` is the new
+ceiling, and `capture` checks it after the source's own.
+
+The slice's delete assertion then walked into a second, older defect: **deleting any lead whose
+submission wrote a claim raised `23514`.** `capture` finishes a claim writing both `lead_id` and
+`completed_at`; the FK was `on delete set null`; so the delete produced `lead_id null` with
+`completed_at` set, and `crm_lead_submissions_completion` — `(lead_id is null) = (completed_at is
+null)` — refused it. A check and a referential action that can never both hold. `0193` moves the
+action to `on delete cascade`: a claim cannot outlive the lead it deduplicates against.
+
+**Proof.**
+- `bash scripts/qa/run-crm-address-ceiling.sh` — 3 schema checks green, `crm_address_ceiling`
+  **10/10**, `crm_lead_delete` **4/4**.
+- **Proven to fail.** With `0193` reverted to `set null`: the ceiling suite is **9/10** (only the
+  delete assertion red) and the deletion suite **1/4** (three red, the *unclaimed* lead's
+  deletion green). Both directions were measured against the real migration, not a comment.
+- `cargo test -p omnion-module-crm-intake --lib` **170 passed** (was 169; the new one is the
+  derived policy column list). `cargo build -p omnion-api` green. Admin `tsc --noEmit` exit 0.
+
+**What the gate caught in me, which is the part worth keeping.** The migration created the index
+*before* the column it indexes — a hard failure on a fresh database, caught by the schema check
+before any test ran. The insert bound a `String` into an `inet` column (`42804`), and its fix was
+written at `$35` when the column is `$34`, whose error names a *type* rather than a column. So
+`placeholder_of` now parses the statement and asserts the cast sits on the right placeholder. And
+**three of the gate's own schema checks were wrong about a healthy schema before they were
+right**: a `case` glob in which `\ ` is an escape and matched a literal backslash;
+`pg_get_expr(indexprs, …)`, the wrong catalog column (`indexprs` is expression trees, a partial
+predicate is `indpred`), which returned an empty predicate for every partial index in the schema;
+and a pattern that matched a whole expression including PostgreSQL's own parentheses. A gate that
+reports good as broken teaches its reader to skip the line, so each of the three is written up
+where the next reader will hit it.
+
+**Also fixed, in passing.** `cargo build` named `POLICY_COLUMNS_SCALAR` as dead: a previous fix
+inlined the joined policy query's column list and left the constant behind with 27 lines of
+comment describing a query that no longer exists. It was the *third* copy of the same eleven
+names, and it compiled and passed clippy. `qualified_columns` derives it from `POLICY_COLUMNS`
+now, with a test that asserts the derived list names every field the struct decodes.
+
+**Not done, deliberately.** No browser pass — the QA slot is held by a live w3 pass and
+`/mnt/apopic` hit 100% mid-tick, which crashed the shared Postgres backend once (the gate's
+disposable database, recovered on its own). The REQ stays open: REQ-064's form-editor card is
+still slice 3's one missing screen and REQ-064's forms module is on no branch.
+
+**Next.** The capture handler reads `ClientAddress` from the socket only, while
+`rate_limit_middleware` prefers `X-Forwarded-For` when the peer is loopback — so behind the
+platform's own proxy the ceiling counts the *proxy's* address for every visitor. That is a
+deployment-dependent defect in the address's provenance, and the honest fix belongs with the
+`ClientAddress` type rather than in the CRM.
