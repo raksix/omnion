@@ -8745,3 +8745,54 @@ its `csrf_unavailable` rows are history, not this pass.
 across the media screens and the retention tab's own states. Run `bash scripts/qa/run.sh` with
 `QA_ONLY=media,media-retention` on a quieter box, then close REQ-010 and move to REQ-014 (system
 health, still `pending`).
+
+## tick 41 — REQ-133 slice 12: the shared link nobody could follow
+
+**What shipped.** `projects::resolve_linked_project` (`crates/workflows/src/projects.rs`),
+`SwitcherResponse.linked` + `LinkedProject` on both switcher handlers, `?project=` on
+`ProjectListQuery`, the `project-switcher.tsx` refusal strip and its "Unavailable" label, the
+`linked` field on the admin `ProjectSwitcher` type, and `scripts/qa/run-project-link.sh`.
+Commit `77162c61`.
+
+**The defect.** Acceptance 3 says the selection "is encoded in URLs so a shared link reproduces
+the view". The switcher set `?project=<id>` inside `choose` and read it in exactly one place — the
+button's own label. A colleague opening your link saw **their** stored selection while the address
+bar named yours, and nothing on the screen said which of the two was in force.
+
+**The twelfth instance of this branch's signature defect, and the first whose dead half was the
+READER.** The previous eleven were a missing caller, a missing table, a missing state, a missing
+claim — things a `grep` for a symbol or a column name finds. What hid this one is the opposite
+shape: the *write* had shipped many ticks earlier, was typechecked, was walked by the harness and
+was the subject of a passing gate. A parameter that is written, named in the REQ, round-tripped
+by the client and read by nothing is the shape of a feature missing exactly one line — and nobody
+goes looking for the line nobody needed. **When auditing for this class, grep the READERS of a
+parameter, not only the writers; a write with no read is green everywhere.**
+
+**Proof.**
+- `bash scripts/qa/run-project-link.sh` — **7/7**, and **PROVEN TO FAIL at 4/7** with the
+  visibility check replaced by a constant `true`. The three refusals fail (own-org foreign project,
+  cross-tenant project, deleted project) and the **four negative controls stay green**: no link is
+  not a refusal · a visible link resolves · reading a link does not change the caller's own stored
+  selection · an instance administrator reaches every project. Those survivors are the evidence
+  that the gate names this defect and not its neighbourhood.
+- `run-project-switcher.sh` **8/8** and `run-project-isolation.sh` **14/14** — unchanged.
+- `apps/admin`: `tsc --noEmit` clean. `cargo build -p omnion-api` green.
+
+**Design note worth keeping.** The return type is `(id, visible)`, not a bare id and not `None`.
+`None` is indistinguishable from "no link", so the panel would silently drop the reader on their own
+selection — the one outcome a shared link must never have, since the sender asked them to look at
+something specific. Returning the id with `visible: false` is what lets the screen say "you are not
+a member of this project" and offer a remedy, and that remedy (drop the parameter) **deliberately
+does not touch the stored selection** — asserted, because a reader who adopts the sender's project
+as their own would satisfy "reproduces the view" and destroy the next page they open.
+
+**Not proved, and stated.** No browser pass ran: load was 51–83 for the whole tick across ten
+writers and the QA slot was held by a live w3 pass (holder pid alive, cwd `/mnt/apopic/omnion-w3`).
+No pass was started rather than starting an unreliable one, and none is claimed. The screen carries
+`data-testid="project-switcher-link-refused"` and `project-switcher-current` for the pass that will
+see it. The filter half of criterion 3 stays unticked: there is no `credentials`,
+`workflow_folders` or `workflow_schedules` table on this branch.
+
+**Next.** The 390px criterion and the transfer-ownership confirmation dialog both wait on a pass
+that finishes. The move-dependency refusals and the usage-counter/CSV half have no substrate on this
+branch and are named rather than ticked.
