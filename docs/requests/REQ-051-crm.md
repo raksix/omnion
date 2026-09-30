@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress — the **board was unreachable on every organization created after `0022_crm.sql`**: the seed function was written there and called once, in the statement that created it, so a tenant born since owns no pipeline and `GET /crm/deals?view=board` answered `404 NotFound("pipeline")` (`4aca09e` a trigger plus a backfill, and a read that repairs the state through the same seed). The CRM suite could not see it because its fixture seeds the pipeline by hand and calls that "the same path a new tenant takes" — it was not, which is why the new test seeds nothing. The ambiguous tenant refusal also still named `organization_id`, advice a platform account cannot follow (`01d0a8a`). The board's per-column body and the activities filter bar now both draw `EmptyState` (the column body with a per-stage sentence and its own action). What is left is the 390×844 pass and the keyboard sheet — and the harness can no longer reach the sign-in screen, which is why both have been unobtainable: `runWizard` decided 'installation already exists' by reading the URL instead of asking `GET /api/v1/onboarding`, and a `null` step read ended the wizard on step 1 of 5, so four passes died before they signed in (`3cbdb0c`). Tick 34 got the wizard past the owner account and onto the organization step; the pass then ran into load 171–224 and every screenshot timing out, so nothing is ticked on the strength of it. · `cargo test -p omnion-api --lib routes::crm` **27/27** · `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force` **2/2** — slice 4: the state sweep was racing four concurrent reads, and the race pointed at a company picker that said nothing when its read failed (`fa6181c`)
+> **Status:** in-progress — tick 44 closed the **keyboard** contract for the two screens that had none of it (the bindings were written inside `CrmShell`, so `/crm/activities` and `/crm/leads` — which draw their own rows — listened for none of the keys the module's shared sheet advertises; the contract is now `useCrmKeyboard`, both screens call it and draw the cursor, and the pass has a new behavioural leg that is **written but unrun** because the box is at load 86-93 with `/mnt/apopic` at 100%). What remains is the 390×844 pass and the browser reading of the keyboard leg; the harness can no longer reach the sign-in screen, which is why both have been unobtainable: `runWizard` decided 'installation already exists' by reading the URL instead of asking `GET /api/v1/onboarding`, and a `null` step read ended the wizard on step 1 of 5, so four passes died before they signed in (`3cbdb0c`). Tick 34 got the wizard past the owner account and onto the organization step; the pass then ran into load 171–224 and every screenshot timing out, so nothing is ticked on the strength of it. · `cargo test -p omnion-module-crm --lib` **172/172** · `turbo run typecheck` **2/2** (tick 44; the earlier legs stand) — slice 4: the state sweep was racing four concurrent reads, and the race pointed at a company picker that said nothing when its read failed (`fa6181c`) on every organization created after `0022_crm.sql`**: the seed function was written there and called once, in the statement that created it, so a tenant born since owns no pipeline and `GET /crm/deals?view=board` answered `404 NotFound("pipeline")` (`4aca09e` a trigger plus a backfill, and a read that repairs the state through the same seed). The CRM suite could not see it because its fixture seeds the pipeline by hand and calls that "the same path a new tenant takes" — it was not, which is why the new test seeds nothing. The ambiguous tenant refusal also still named `organization_id`, advice a platform account cannot follow (`01d0a8a`). The board's per-column body and the activities filter bar now both draw `EmptyState` (the column body with a per-stage sentence and its own action). What is left is the 390×844 pass and the keyboard sheet — and the harness can no longer reach the sign-in screen, which is why both have been unobtainable: `runWizard` decided 'installation already exists' by reading the URL instead of asking `GET /api/v1/onboarding`, and a `null` step read ended the wizard on step 1 of 5, so four passes died before they signed in (`3cbdb0c`). Tick 34 got the wizard past the owner account and onto the organization step; the pass then ran into load 171–224 and every screenshot timing out, so nothing is ticked on the strength of it. · `cargo test -p omnion-api --lib routes::crm` **27/27** · `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck --force` **2/2** — slice 4: the state sweep was racing four concurrent reads, and the race pointed at a company picker that said nothing when its read failed (`fa6181c`)
 
   *Re-run against a database this branch's migration set has seen.* The suite pointed at the shared
   dev database answered 56 × `Migration(VersionMissing(19))`: 19 is a **shared-number collision**
@@ -245,6 +245,37 @@ Payloads carry ids and the changed field list only — never a rendered document
   distinct `left` offsets is the assertion, because "single column" is a claim about geometry and
   a class name cannot make it.*
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
+  *Half of the module never listened for any of it, and the sheet is shared. `/crm/activities` and
+  `/crm/leads` draw their own rows instead of rendering `CrmShell`, so the bindings — which were
+  written out **inside** the shell — were unreachable from both, while `crm-parts.tsx` kept
+  printing `/`, `j`, `k`, `Enter`, `e` and `?` for the section. The sheet is a claim about the
+  module, so two of its six screens were advertising controls they could not deliver.*
+
+  *Fixed by making the contract a hook rather than a body (`a38ff972`), so the shell and a
+  screen with its own frame call the same code and cannot drift: `useCrmKeyboard` owns the
+  bindings, `CrmShortcutSheet` the sheet, and `j`/`k` plus the toolbar's "move by N" share one
+  wrapping helper — two callers re-deriving the wrap rule is how a list and its own keyboard
+  disagree about where the cursor ends up.*
+
+  *Both screens now draw the cursor on their `<li>` rows with `crmListItemCursor` (`656aa8e2`),
+  and a click moves it to the same place `j` would: clicking and pressing `j` are the same act,
+  and a click that leaves the cursor elsewhere makes the two disagree about which row `Enter`
+  opens. `Enter` and `e` open the record the row is about — the activity's contact, company or
+  deal; the submission's contact, deal or company. Where there is no record, the screen says so in
+  a sentence rather than navigating somewhere unrelated, because a free-standing note and a
+  submission that became **nothing** are precisely the rows this inbox exists to explain.*
+
+  *The leads inbox loses its local `/` binding, which is now the module's, and keeps Escape, which
+  the hook deliberately does not own — two owners of one key is how a shortcut sometimes works.*
+
+  *Proved in code, not yet in a browser. The pass has a new per-screen leg (`19ae394b`) that reads
+  no source: the sheet opens, `/` reaches that screen's own field, `j` moves a cursor the page
+  renders, and `Enter` moves the URL. Each stays **unset** rather than false with no rows, because
+  an empty database is not a broken keyboard. **It has not run** — the box sits at load 86-93 with
+  `/mnt/apopic` at 100% (92 MB free), which is what ended the queued accounting pass; reclaiming my
+  own cold build cache recovered 2.0 GB (97%), and the slot is still held by a sibling writer's pass.
+  Gates this tick: `cargo test -p omnion-module-crm --lib` **172/172**, `turbo run typecheck`
+  **2/2**, `node --check scripts/qa/walkthrough.cjs` OK.*
 
 ### QA plan
 
