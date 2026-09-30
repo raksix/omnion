@@ -1,6 +1,6 @@
 # REQ-019 — Headless CMS
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core API (`crates/content` + `apps/api`)
+> **Status:** in-progress (slice 1 BUILT — `b2077454` store, `711ee8e1` routes, `07ad279d` the shapes those two got wrong. Migration `0186_content_api_tokens.sql` (high-water 0185 + 1, scanned across every worktree), the `api_tokens` + `api_token_usage_daily` tables, two catalogue keys (`content.api.read` / `content.api.manage`, manager gets read only), six routes and the `/content-api` Tokens tab. Gates: `cargo test -p omnion-content --lib` **285/0** (274 before, 11 new), `cargo check -p omnion-api` **exit 0**, `apps/admin` `tsc --noEmit` **exit 0**. **The slice's done line is half-proven and the half is named.** A created token authenticates and a revoked one is refused — proved against the store the route will call, because the HTTP read surface arrives in slice 2 and there is nothing to authenticate *through* yet. The 10-walk integration suite for the routes is written and building; nothing is ticked until it runs. `content:write` is stored but never honoured, and that is deliberate: a reserved scope the store refuses needs a migration later, while one it accepts costs a route check now. Next: the integration suite, then slice 2 (the `/api/v1/content/*` read surface, which is what makes a token mean anything).)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request

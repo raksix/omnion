@@ -8003,3 +8003,72 @@ not by a missing cleanup, and the next run found zero of them.
 as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
 this box until then** — treat a `53100` as environmental and read the assertion line above it for
 the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
+
+
+## 2026-09-30 · tick 40 · wave 2 · REQ-019 slice 1 — the credential that leaves the building
+
+**What.** The merge of `origin/main` came first (8 commits: the notification delivery runner and the
+media retention audit), and it produced the same three conflicts this branch has seen before — two
+module lists and the append-only log. All three resolved as "keep both", and the log was spliced by
+`scripts/qa/merge-build-log.py` with the `Counter` multiset check green. Then REQ-019 slice 1, the
+headless content API's token half.
+
+**The decision that shaped the store: a content token is not a service account.** The platform
+already has one (`service_accounts.rs`), with a prefix, a hash and a `constant_time_eq` — and the
+obvious move was to reuse it. That would have been wrong: a service account authenticates the
+panel's *write* APIs, so a headless integration holding one could delete files. Separate table,
+separate halves, separate permissions. The reuse that is genuinely safe is the *discipline*, not the
+code, and the discipline is now written down in the module header rather than left implicit.
+
+**Four things this slice refuses to do**, each because the obvious version works and is wrong:
+
+- **Show the plaintext twice.** Not policy — construction. `create_token` is the only function that
+  can see the secret string, and the row stores only its SHA-256. A "show again" button cannot be
+  built from this state without a schema change. The digest is read in exactly one function, through
+  a row type that cannot be constructed anywhere else, so no list, no error path and no log line
+  can reach it.
+- **Answer one 401 for three different problems.** Invalid, expired and revoked are separate
+  outcomes with separate codes, because the integrator's next action differs for all three and
+  collapsing them teaches people to rotate a credential that was fine.
+- **Say `forbidden` about another tenant's token.** It is `invalid_token`, and the organization
+  check runs before the row is returned. A code meaning "this exists but is not yours" is a
+  cross-tenant oracle; the walk proves the outsider's own panel answers with an *empty* list.
+- **Accept a wildcard origin.** `https://app.example.com/*` reads like a prefix match, and a check
+  that took it would either silently not match or silently match every path. An allow-list that does
+  not mean what it says is worse than no allow-list, so the parser is exact and the test says so.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-content --lib` | **285 passed, 0 failed** (274 before: 11 new) |
+| `cargo check -p omnion-api` | **exit 0** |
+| `apps/admin` `tsc --noEmit` | **exit 0** |
+| `merge origin/main` | `695c8c88` — 3 conflicts, multiset check green, 0 unmerged paths |
+
+**Four compile errors were mine and all four are the same mistake: writing against an API I had not
+read.** `CurrentSession` has no `organization_id` (it is on `current.user.organization_id`); there
+is no `ApiError::with_param` (the convention is `.with_details(json!({ "field": … }))`); there is no
+`ApiError::from(ContentError)`; and `plaintext_shown_once: true` is a *type*, not a constant. The
+cost was 11 errors in one check and about twenty minutes of box time to find them — and the lesson
+is not "read more carefully", it is that **a guessed API is not a fast failure, it is a slow one.**
+The store's unit tests passed throughout, because the store's own types are the ones I got right.
+
+**The box, again.** Load 94–106 with ten writers, `free -g` showing 1 GB. The `cargo check -p
+omnion-api` that took 30 minutes was not slow code, it was 4 concurrent `rustc` processes on six
+cores, queued behind w5's cargo slot at one point. `/mnt/apopic` sat at 97–98% for the whole tick
+and I reclaimed **1.6 GB from my own target** by grouping `deps/*` by crate stem and keeping only
+the newest of each duplicate — the same recipe as tick 39's `/root/w2target`, and the reason the
+box was able to keep building at all.
+
+**Not ticked, and the tick is explicit about which half is missing.** The slice's done line is "a
+created token authenticates and a revoked one is refused". That is proved **against the store**,
+because the HTTP read surface is slice 2 and there is nothing to authenticate *through* yet. The
+ten-walk integration suite for the routes is written and compiling as this entry is written; the
+token list, the copy-once gate, rotation and revocation are proved in the same suite. **No
+acceptance box is ticked by this tick** — the box measures a *request*, and no request has been
+made.
+
+**Next.** (a) Read the `content_api_tokens` suite result and tick what it actually proves.
+(b) REQ-019 slice 2 — the `/api/v1/content/*` read surface, which is what makes a token mean
+anything: pagination, `fields`, `updated_since`, the OpenAPI document.
