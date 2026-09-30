@@ -3,14 +3,15 @@
 > **Status:** in-progress (slices 1, 2 and 3 shipped: probes + overview, `/health` +
 > `/health/services/{key}` with its own 24 h trend column, `/health/metrics` with named ranges and a
 > server-rendered CSV export, and the incident timeline + threshold policy with
-> `/health/incidents` and `/health/settings`. **Slice 4 shipped its two writers** (`a87ee01a`,
-> `c3c22e3f`, `83209cab`): `worker_heartbeats` had a reader and no writer, so the `n/m` card could
-> only ever have said "no worker has registered a heartbeat", and `run_and_record` was reached from
-> the four route handlers and nowhere else, so samples existed only while somebody watched the panel.
-> Slice 4's events half — the five `health.*` names the request lists — is **not** started. The
+> `/health/incidents` and `/health/settings`. **Slice 4 is now code-complete.** Its two writers shipped
+> in `a87ee01a`, `c3c22e3f`, `83209cab`: `worker_heartbeats` had a reader and no writer, and
+> `run_and_record` was reached from the route handlers and nowhere else, so samples existed only while
+> somebody watched the panel. Its **events half** shipped in `f57144f9`, `ec56f87d`, `1df104af`,
+> `53273719`: the catalogue now has a `health` area with the five names, `apply_policy` returns what
+> it decided instead of discarding it, and both runners announce it — to organizations that have an
+> endpoint subscribed to `health`, because an event with no organization is delivered to nobody. The
 > `health_history`/`health_incidents`/`health_workers` walks run on live PostgreSQL and pass; the
-> browser pass (`scripts/qa/run.sh`) has still not run on this box) · **Captured:** 2026-09-25 ·
-> **Layer:** core + admin UI
+> browser pass (`scripts/qa/run.sh`) has still not run on this box) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -102,6 +103,14 @@ Migration: `database/migrations/0014_system_health.sql`, append-only, commented 
 
 Webhook relevance: `health.service.degraded` and `health.service.recovered` are the two an operations endpoint subscribes to; `health.threshold.breached` fires at most once per metric per window so a flapping disk does not flood an endpoint. Audit entries use the `health.*` namespace, written only for manual actions (run checks, settings change, acknowledge, maintenance window).
 
+**Proven against a real receiver** (`05cd11b3`): the fan-out ships per organization that has an *enabled*
+endpoint subscribed to `health`, and the walk creates exactly that — a real organization, a real
+endpoint, a real stop/restart transition — then reads `webhook_deliveries`, not the `events` row. That
+distinction is the whole point: `enqueue_fanout` returns `0` for an event with no organization, so a
+naive `select count(*) from events` assertion would have passed an emitter that recorded five names
+and delivered them to nobody. The walk also asserts the negative both ways — a tenant subscribed to
+`content.published` receives nothing, and with no endpoint at all nothing is recorded.
+
 ### Acceptance criteria
 
 - [x] `crates/health` exists with a probe registry and one probe per dependency, unit-tested.
@@ -109,12 +118,18 @@ Webhook relevance: `health.service.degraded` and `health.service.recovered` are 
       → shipped as `0188_system_health.sql`: the number is a shared namespace and 0188 is the
       union high-water across every worktree, not the next free slot on this branch.
 - [x] `/health` shows all seven services from the request sketch with real states, not constants.
-- [ ] Stopping Redis flips its row to `down` within one interval and restores on recovery.
-      → the interval half is now real for the first time: `health_runner` runs the registry on a
-        timer, so "within one interval" is a claim about a scheduler that exists rather than about
-        a button. The recovery leg still needs a container this tick did not stop.
-      → the `down` leg is proven by walk (an unreachable Redis is `down`, and the row survives);
-      the "restores on recovery" leg needs a container this tick did not stop. Slice 3.
+- [x] Stopping Redis flips its row to `down` within one interval and restores on recovery.
+      → **Both legs now run against a real dependency** (`05cd11b3`), which is what the criterion
+        actually asks and what four slices of walks could not reach. The old fixture pointed the
+        probe at `redis://127.0.0.1:1` — a port that was never open — so "restores on recovery"
+        was unreachable *by construction* while the down leg passed honestly. `health_recovery`
+        starts a throwaway `redis-server` on a reserved port of its own, stops it, and starts it
+        again **through the same client handle**: `RedisClient::connection()` caches a
+        `ConnectionManager`, and a cached manager to a server that went away is precisely how a
+        panel says `down` for ever after the server returns. The walk asserts the *stored*
+        samples, the incident that opened, that a steady outage opens no second one, that the
+        recovery resolves **that** incident, and that nothing is left open. Proof: 2 walks,
+        live PostgreSQL and a real server.
 - [x] Worker counts come from heartbeat rows; stopping a worker changes `4/4` to `3/4` and names it.
       → **re-proved against the writer this slice adds** (`83209cab`). The box was already ticked and
       the proof was weaker than it looked: `probe_workers` counted rows that the *walk itself* had

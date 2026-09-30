@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use crate::auth::CurrentSession;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -321,7 +322,11 @@ pub async fn overview(
     State(state): State<AppState>,
 ) -> Result<Json<OverviewBody>, ApiError> {
     let ctx = probe_context(&state).await;
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
+    let (overview, policy) =
+        omnion_health::run_and_record(state.db().pool(), &ctx)
+            .await
+            .map_err(map_store)?;
+    crate::health_events::announce_changes(state.db().pool(), &policy).await;
     let sample_count = omnion_health::sample_count(state.db().pool())
         .await
         .map_err(map_store)?;
@@ -341,10 +346,29 @@ pub async fn overview(
 /// states into the old rows would keep showing the last stored `healthy` for a
 /// service that has just gone down — which is the one thing the request's
 /// "reports per-probe failures instead of failing whole" line is protecting.
+///
+/// It runs the registry itself rather than calling [`overview`], and the one
+/// difference is the announcement: this is a **deliberate** run, so it emits
+/// `health.checks.completed` with the operator on it, which a live read must not
+/// do. Delegating would have been one line shorter and would have meant the button
+/// produced no event at all — the panel auto-refreshes every 15 s, so
+/// `checks.completed` from a read would be four facts a minute for as long as
+/// anybody had the screen open.
 pub async fn run_checks(
     State(state): State<AppState>,
+    session: CurrentSession,
 ) -> Result<Json<OverviewBody>, ApiError> {
-    overview(State(state)).await
+    let ctx = probe_context(&state).await;
+    let (overview, policy) =
+        omnion_health::run_and_record(state.db().pool(), &ctx)
+            .await
+            .map_err(map_store)?;
+    crate::health_events::announce_changes(state.db().pool(), &policy).await;
+    crate::health_events::announce_run(state.db().pool(), &overview, Some(session.user.id)).await;
+    let sample_count = omnion_health::sample_count(state.db().pool())
+        .await
+        .map_err(map_store)?;
+    Ok(Json(overview_body(&overview, sample_count)))
 }
 
 /// `GET /health/services/{key}` — one service, with its checks and metrics.
@@ -365,7 +389,11 @@ pub async fn service(
         ));
     }
     let ctx = probe_context(&state).await;
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
+    let (overview, policy) =
+        omnion_health::run_and_record(state.db().pool(), &ctx)
+            .await
+            .map_err(map_store)?;
+    crate::health_events::announce_changes(state.db().pool(), &policy).await;
     let report = overview
         .services
         .iter()
@@ -436,7 +464,11 @@ pub async fn service(
 /// and a badge that says otherwise is the exact claim this screen must not make.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<SummaryBody>, ApiError> {
     let ctx = probe_context(&state).await;
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
+    let (overview, policy) =
+        omnion_health::run_and_record(state.db().pool(), &ctx)
+            .await
+            .map_err(map_store)?;
+    crate::health_events::announce_changes(state.db().pool(), &policy).await;
     Ok(Json(summary_of(&overview)))
 }
 
@@ -464,7 +496,11 @@ pub async fn host_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     let ctx = probe_context(&state).await;
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
+    let (overview, policy) =
+        omnion_health::run_and_record(state.db().pool(), &ctx)
+            .await
+            .map_err(map_store)?;
+    crate::health_events::announce_changes(state.db().pool(), &policy).await;
     let host = overview
         .services
         .iter()

@@ -454,9 +454,36 @@ async fn a_run_records_samples_that_agree_with_the_rows() {
     let storage = directory_storage();
     let ctx = context(harness.pool(), &redis, &storage);
 
-    let overview = omnion_health::run_and_record(harness.pool(), &ctx)
+    let (overview, policy) = omnion_health::run_and_record(harness.pool(), &ctx)
         .await
         .expect("a run must not fail because a dependency is down");
+    // The run's outcome is what slice 4's emitters announce from, so it has to agree with the
+    // overview rather than be a second, independent reading. The reachable services here are
+    // `healthy` or `unknown`; an `unknown` is a gap in our knowledge and deliberately opens no
+    // incident, so on a fresh database with one unreachable dependency the honest answer is
+    // that nothing was announced — and a policy that announced something would mean the
+    // emitter is about to page somebody for a probe that simply could not run.
+    assert_eq!(
+        policy.announcements(),
+        policy
+            .transitions
+            .iter()
+            .filter(|entry| entry.outcome.incident().is_some())
+            .count()
+            + policy
+                .breaches
+                .iter()
+                .filter(|(_, check)| check.should_announce())
+                .count(),
+        "announcements() must be the count the store already decided, not a second opinion"
+    );
+    for entry in &policy.transitions {
+        assert!(
+            entry.outcome.incident().is_some(),
+            "a transition the store did not act on must not reach an emitter"
+        );
+        assert_eq!(entry.service, entry.transition.service);
+    }
 
     assert_eq!(overview.services.len(), 8);
     let stored = omnion_health::latest_samples(harness.pool())
@@ -702,7 +729,14 @@ async fn a_series_comes_back_oldest_first() {
         .await
         .expect("the series must be readable");
     let values: Vec<f64> = series.iter().map(|sample| sample.value).collect();
-    assert_eq!(values, vec![10.0, 20.0, 30.0], "oldest first, not insertion order");
+    // `[(3, 30), (1, 10), (2, 20)]` means: **30** is 3 minutes ago, **10** is 1 minute ago,
+    // **20** is 2 minutes ago. Oldest first is therefore `[30, 20, 10]` — the *reverse* of both
+    // the insertion order (`30, 10, 20`) and the ascending value order. This walk asserted
+    // `[10, 20, 30]`, which is newest-first: it would have passed an implementation that ordered
+    // by `id desc`, and the name, the comment above it, and the query's own `order by sampled_at
+    // asc` all say the opposite. It had been red since it was committed; a disk failure in the
+    // same run was reported instead.
+    assert_eq!(values, vec![30.0, 20.0, 10.0], "oldest first, not insertion order");
 
     // A window that excludes everything is an empty series, not an error.
     let outside = omnion_health::samples_in_window(

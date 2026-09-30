@@ -477,6 +477,37 @@ catalogue! {
     "Somebody changed how or whether they are notified.",
     [("user_id", Uuid, req), ("field", String, opt)];
 
+    // ---- System health --------------------------------------------------------------------------
+    // The five names REQ-014's Events section names, and the reason this area exists at all is
+    // the sentence "an operations endpoint subscribes to degraded and recovered" — which was,
+    // until the emitters shipped, a sentence with no name behind it: the table had no `health`
+    // area, so there was nothing to subscribe to and nothing for a receiver to wait on.
+    //
+    // `degraded` and `recovered` are a **pair on purpose**, and they are what the request calls
+    // the two an operations endpoint listens for. A receiver that gets only `degraded` cannot
+    // tell a resolved outage from a deleted endpoint, and one that gets only `recovered` has no
+    // idea what came back.
+    "health.service.degraded", "health", Live,
+    "A dependency stopped answering, or answered too slowly.",
+    [("service", String, req), ("from_state", String, req), ("to_state", String, req),
+     ("message", String, opt), ("incident_id", Uuid, opt), ("suppressed", Boolean, opt)];
+    "health.service.recovered", "health", Live,
+        "A dependency that had been unhealthy is answering again.",
+        [("service", String, req), ("from_state", String, req), ("to_state", String, req),
+         ("duration_seconds", Integer, opt), ("incident_id", Uuid, opt)];
+    "health.threshold.breached", "health", Live,
+    "A metric went past its configured critical limit. Fires once per metric per window.",
+    [("metric", String, req), ("value", Integer, opt), ("crit_limit", Integer, opt),
+     ("window_start", Timestamp, opt)];
+    "health.incident.acknowledged", "health", Live,
+    "An operator claimed an incident.",
+    [("incident_id", Uuid, req), ("service", String, req), ("actor", Uuid, req),
+     ("note", String, opt)];
+    "health.checks.completed", "health", Live,
+    "A probe run finished; the worst state it concluded is on the payload.",
+    [("state", String, req), ("services", Integer, req), ("worst_service", String, opt),
+     ("samples", Integer, opt)];
+
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
     "An order was placed. Listed now; the commerce module records it when it ships.",
@@ -933,6 +964,65 @@ mod tests {
         let live = live_names();
         assert!(live.contains(&"page.published"));
         assert!(!live.contains(&"order.created"));
+    }
+
+    #[test]
+    fn the_health_area_carries_the_five_names_the_request_names() {
+        // REQ-014's Events section lists exactly these five, and the reason this test exists is
+        // that for four of the REQ's slices the sentence "an operations endpoint subscribes to
+        // degraded and recovered" had nothing behind it. A name that is emitted but not listed
+        // is refused by the drift test; a name that is listed but never emitted is invisible to
+        // every green gate in the workspace, so it needs an assertion of its own.
+        let in_health = in_area("health");
+        let health = names_of(&in_health);
+        assert_eq!(
+            health.len(),
+            5,
+            "the health area is {:?}; the request names five",
+            health
+        );
+        for name in [
+            "health.service.degraded",
+            "health.service.recovered",
+            "health.threshold.breached",
+            "health.incident.acknowledged",
+            "health.checks.completed",
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be listed"));
+            assert_eq!(entry.area, "health");
+            assert_eq!(entry.status, Status::Live, "{name} is emitted today");
+            // All five share one group, so a single `health.*` subscription reaches all of them.
+            // That is the subscription the request describes an operations endpoint making, and
+            // it only works if every name sits behind the same first segment.
+            assert_eq!(entry.group(), "health", "{name} is not behind health.*");
+        }
+        // The pair the request calls out, stated as a pair.
+        assert!(subscribed_to(&["health.*".to_owned()], "health.service.degraded"));
+        assert!(subscribed_to(&["health.*".to_owned()], "health.service.recovered"));
+    }
+
+    #[test]
+    fn the_health_names_carry_the_fields_a_receiver_needs() {
+        // What makes an operations subscription usable rather than decorative: a receiver that
+        // gets `health.service.degraded` with only a name cannot decide anything, and the
+        // required fields are the promise in the picker that it can.
+        for (name, field) in [
+            ("health.service.degraded", "service"),
+            ("health.service.degraded", "to_state"),
+            ("health.service.recovered", "service"),
+            ("health.service.recovered", "from_state"),
+            ("health.threshold.breached", "metric"),
+            ("health.incident.acknowledged", "actor"),
+            ("health.checks.completed", "state"),
+        ] {
+            let entry = lookup(name).expect("listed");
+            let found = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == field)
+                .unwrap_or_else(|| panic!("{name} must declare {field}"));
+            assert!(found.required, "{name}.{field} is required in the test");
+        }
     }
 
     #[test]
