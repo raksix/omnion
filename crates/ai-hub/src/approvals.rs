@@ -41,6 +41,10 @@
 
 pub mod io;
 pub mod plan;
+// Slice 2b: the reader and the applier. `plan` is the pure half (what the operation would
+// write); `target` is the half that reads the row and turns the plan into a write the content
+// crate accepts.
+pub mod target;
 
 use std::collections::BTreeMap;
 
