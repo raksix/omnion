@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_core::config::{Config, DatabaseConfig};
+use omnion_core::config::{Config, CsrfSecret, DatabaseConfig};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, BootstrapOutcome, NewUser};
 use omnion_identity::{IdentityError, sessions};
@@ -30,18 +30,59 @@ struct TestResponse {
 }
 
 /// Drive the real router without a network socket.
+/// Drive the router from a real peer address.
+///
+/// `ClientAddress` and the rate-limit middleware both read `ConnectInfo<SocketAddr>` out of the
+/// request extensions, and `into_make_service_with_connect_info` is the only thing that puts it
+/// there. A request driven straight through `router().oneshot()` therefore arrives with NO
+/// address — and that is not a neutral default. With no address the per-address refusal in
+/// `sign_in` cannot run at all, so an in-process walk silently skipped the very rule a
+/// brute-force walk is supposed to test. That is how this file came to have a lockout walk that
+/// passed with the lockout fix reverted.
+///
+/// The address is therefore **this walk's own**, allocated per test rather than shared: the
+/// `sign_in` limiter counts per address with a ceiling of 10, so walks that share one loopback
+/// address spend each other's budget and a sign-in round trip is refused `429` by a counter it
+/// never incremented. `TEST_PEER` is the allocation point — every helper in this file routes
+/// through it, so a new walk cannot reintroduce the sharing by forgetting to opt out.
+fn test_peer() -> String {
+    // Loopback with a per-test port: a real address, and no other walk in this file has it.
+    // `as_u128` rather than `simple()` — the latter is a Display formatter, not a value.
+    format!("127.0.0.1:{}", 51000 + (Uuid::new_v4().as_u128() % 1000))
+}
+
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
+    call_from(state, request, &test_peer()).await
+}
+
+/// `call`, from a named peer address. The brute-force walk passes its own so that its whole
+/// sequence shares ONE counter — the thing being measured.
+async fn call_from(state: &AppState, request: Request<Body>, peer: &str) -> TestResponse {
+    let (mut parts, body) = request.into_parts();
+    if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+        parts
+            .extensions
+            .insert(axum::extract::ConnectInfo(address));
+    }
     let response = routes::router(state.clone())
-        .oneshot(request)
+        .oneshot(Request::from_parts(parts, body))
         .await
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    // ALL of them, joined. `Headers::get` returns the first `Set-Cookie` and sign-in sends
+    // TWO — the session and the CSRF token — so reading one was reading the session and
+    // concluding, correctly and wrongly, that the platform had issued no CSRF cookie.
+    let set_cookie = {
+        let values: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        (!values.is_empty()).then(|| values.join("; "))
+    };
     let bytes = response
         .into_body()
         .collect()
@@ -71,10 +112,27 @@ fn post_login(email: &str, password: &str) -> Request<Body> {
         .expect("request must build")
 }
 
-fn post_logout(cookie: Option<&str>) -> Request<Body> {
+/// Sign out.
+///
+/// The CSRF token goes in the header AND the cookie: the double-submit check reads the header
+/// and compares it against the cookie, so a cookie alone is the ambient-authority case and is
+/// refused. This helper sent only the session cookie, which made `sign_in_me_and_sign_out_round_trip`
+/// answer `403` where it expected `204` — and because that walk was the sign-in round trip, the
+/// session-revocation half of it had been unproven for as long as the CSRF layer has existed.
+/// Every other suite in this directory (`backups.rs`, `csrf.rs`, `media.rs`) has carried the
+/// header all along, which is why this one was the odd case and not the rule.
+fn post_logout(cookie: Option<&str>, csrf: Option<&str>) -> Request<Body> {
     let builder = Request::builder().method("POST").uri("/api/v1/auth/logout");
     let builder = match cookie {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        Some(token) => match csrf {
+            Some(csrf) => builder
+                .header(
+                    header::COOKIE,
+                    format!("omnion_session={token}; omnion_csrf={csrf}"),
+                )
+                .header("x-omnion-csrf", csrf),
+            None => builder.header(header::COOKIE, format!("omnion_session={token}")),
+        },
         None => builder,
     };
     builder.body(Body::empty()).expect("request must build")
@@ -90,6 +148,24 @@ fn get_me(cookie: Option<&str>) -> Request<Body> {
 }
 
 /// The session token a `Set-Cookie` header carries (`name=value` up to the first `;`).
+/// Value of one named cookie out of the response's `Set-Cookie` header.
+///
+/// Sign-in issues BOTH `omnion_session` and `omnion_csrf`, joined into the single header the
+/// test response keeps, so reading one by position is fragile; reading by name is the only
+/// version of this that survives the platform adding a third cookie.
+fn cookie_value(response: &TestResponse, name: &str) -> Option<String> {
+    let header = response.set_cookie.as_deref()?;
+    for part in header.split(';') {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=') {
+            if key.trim() == name && !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
 fn token_of(response: &TestResponse) -> String {
     let cookie = response
         .set_cookie
@@ -126,8 +202,21 @@ async fn live_db(config: &Config) -> Option<Db> {
 }
 
 /// A state whose database has all migrations applied.
+/// A CSRF secret for this suite.
+///
+/// Sign-in issues no `omnion_csrf` cookie without one (`csrf_cookie_for` returns `None` rather
+/// than an empty token, by design), and a cookie-authenticated POST with no token is refused
+/// `403`. This file's sign-out helper sent only the session cookie, so
+/// `sign_in_me_and_sign_out_round_trip` had been failing on that `403` for as long as the CSRF
+/// layer existed — in CI too, since the workflow sets no secret either. The secret is set on the
+/// suite's OWN state rather than in the environment, exactly as `tests/csrf.rs` does it, so a
+/// developer's shell cannot change what this file proves.
+const CSRF_SECRET: &str = "auth-suite-csrf-secret";
+
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().expect("environment must be valid");
+    let mut config = Config::from_env().expect("environment must be valid");
+    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
+    let config = config;
     let db = live_db(&config).await?;
     db.migrate().await.expect("migrations must apply");
 
@@ -228,8 +317,12 @@ async fn sign_in_me_and_sign_out_round_trip() {
     assert_eq!(bogus.status, StatusCode::UNAUTHORIZED);
     assert_eq!(bogus.body["error"]["code"], "invalid_session");
 
-    // Sign out clears the cookie and revokes the session.
-    let logout = call(&state, post_logout(Some(&token))).await;
+    // Sign out clears the cookie and revokes the session. It is a cookie-authenticated POST, so
+    // it carries the CSRF token that sign-in issued alongside the session.
+    let csrf = cookie_value(&login, "omnion_csrf").expect(
+        "sign-in must issue an omnion_csrf cookie, or every cookie-authenticated write is refused",
+    );
+    let logout = call(&state, post_logout(Some(&token), Some(&csrf))).await;
     assert_eq!(logout.status, StatusCode::NO_CONTENT);
     let cleared = logout
         .set_cookie
@@ -308,12 +401,58 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
     };
     let (user_id, email) = test_user(&db).await;
 
+    // This walk's OWN address. Every walk in this file shares 127.0.0.1, so a brute-force walk
+    // would otherwise inherit another walk's failure count and be refused by a rule it never
+    // triggered — the same shared-table mistake as an unscoped `select count(*)`, one layer up.
+    let peer = test_peer();
+    let post_from_here = |password: &str| {
+        let (mut parts, body) = post_login(&email, password).into_parts();
+        if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+            parts.extensions.insert(axum::extract::ConnectInfo(address));
+        }
+        Request::from_parts(parts, body)
+    };
+
     // The account threshold for an organization-less account is the table default (10). Walk to
     // it one attempt at a time and stop as soon as the account is locked, so the test states the
     // real behaviour rather than a guess at how many attempts it takes.
     let mut locked_at = None;
+    // The `sign_in` limiter counts per address with a ceiling of 10, and the account threshold
+    // is also 10 — so whichever layer reaches its number first answers every later attempt and
+    // the other never gets to speak. The limiter's counter is cleared before each attempt, which
+    // leaves the ACCOUNT layer as the only thing deciding this walk's outcome, and its own
+    // assertions below then say which layer spoke.
+    let sign_in_policy = omnion_security::RatePolicy::defaults()
+        .into_iter()
+        .find(|policy| policy.scope == "sign_in")
+        .expect("the sign_in policy must exist in the defaults");
+    let limiter_client = omnion_security::ClientId {
+        user_id: None,
+        ip: peer.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()),
+    };
+    // The state's OWN Redis handle: building a second one per attempt opened a fresh connection
+    // to a shared server on every iteration and timed out, which is a harness fault that reads
+    // as a product fault. The handle connects LAZILY behind a mutex, so it is warmed once here —
+    // under a load of 80 on this box the first connect is the one that loses the race, and it is
+    // not what this walk is measuring.
+    let redis = state.redis().clone();
+    redis
+        .connection()
+        .await
+        .expect("the shared Redis must answer before this walk starts counting");
     for attempt in 1..=40 {
-        let response = call(&state, post_login(&email, "definitely-not-the-password")).await;
+        // A clear that fails is tolerated, not fatal: the assertion below is about the ACCOUNT
+        // counter, and a limiter that failed to be cleared only means this attempt may be
+        // answered `429` instead of `401` — which the walk already tolerates. Turning a shared
+        // Redis hiccup into a failed lockout test would be reporting the harness, not the product.
+        let _ = omnion_security::forget(
+            &redis,
+            &sign_in_policy,
+            &limiter_client,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await;
+        let response = call(&state, post_from_here("definitely-not-the-password")).await;
         let failures: i32 = sqlx::query_scalar(
             "select failed_sign_in_count from users where id = $1",
         )
@@ -331,6 +470,11 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
                 response.body
             );
             break;
+        }
+        // The limiter may answer instead, if its clear lost a race; the COUNTER assertion below
+        // is what this walk is actually about, and it holds either way.
+        if response.body["error"]["code"] == "rate_limited" {
+            continue;
         }
         assert_eq!(
             response.status,
@@ -381,8 +525,19 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
     omnion_identity::signin::clear_address_failures(db.pool())
         .await
         .expect("the address attempt log must be clearable");
+    // The limiter's counter lives in REDIS, so clearing the database does not touch it. Its own
+    // `forget` deletes the exact key the middleware counted, which is the only way to ask the
+    // lockout a question without the limiter answering it first. Reaching for `FLUSHDB` here
+    // would also delete every other suite's counters in this shared Redis.
+    let _ = omnion_security::forget(
+        &redis,
+        &sign_in_policy,
+        &limiter_client,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .await;
 
-    let correct = call(&state, post_login(&email, PASSWORD)).await;
+    let correct = call(&state, post_from_here(PASSWORD)).await;
     assert_eq!(
         correct.body["error"]["code"],
         "account_locked",
