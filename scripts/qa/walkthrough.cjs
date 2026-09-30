@@ -11095,6 +11095,79 @@ async function runCrmKeyboardAndMobile(page, report) {
     (entry) => !entry.checked || entry.form || entry.selected,
   );
 
+  // ---- the two screens that draw their own rows ---------------------------------------------
+  //
+  // `/crm/activities` and `/crm/leads` used to be the module's un-keyboardable half: neither renders
+  // `CrmShell`, so neither had the bindings, and the sheet — which is shared — still promised them
+  // `/`, `j`, `k`, `Enter`, `e` and `?`. Both now call `useCrmKeyboard` directly.
+  //
+  // A screen drawing `<li>` rows rather than table rows is where this is easiest to get wrong in a
+  // new way, so the assertions are per screen and behavioural rather than "the hook is imported":
+  // the sheet must open, `j` must move a cursor the page can see, and `Enter` must move the URL to
+  // the record the row is about. Reading the module's source would prove none of that.
+  //
+  // Each is left **unset** rather than `false` when the screen has no rows: a fresh database is not
+  // a broken keyboard, and a step that cannot run must not report that the contract failed.
+  const listFrameScreens = {};
+  for (const route of [
+    { path: "/crm/activities", name: "activities", searchId: "crm-leads-search" },
+    { path: "/crm/leads", name: "leads", searchId: "crm-leads-search" },
+  ]) {
+    await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+
+    // `?` opens the same sheet the shell draws.
+    await page.keyboard.press("?");
+    await page.waitForTimeout(350);
+    const sheet = (await page.locator("[data-qa='crm-shortcut-sheet']").count()) > 0;
+    await page.keyboard.press("?");
+    await page.waitForTimeout(250);
+
+    // `/` reaches this screen's own search field.
+    await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+    await page.keyboard.press("/");
+    await page.waitForTimeout(250);
+    const focused = await page.evaluate(() => document.activeElement?.id ?? "");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+
+    const rows = await page.locator("[data-qa-crm-cursor]").count();
+    const entry = {
+      sheet,
+      slashFocusedSearch: focused === route.searchId || focused === "activity-search",
+      rows,
+      checked: false,
+    };
+
+    if (rows > 0) {
+      entry.checked = true;
+      entry.cursorVisible = (await page.locator('[data-qa-crm-cursor="true"]').count()) === 1;
+
+      // `j` must move a cursor the page actually shows, not a number nothing renders.
+      if (rows > 1) {
+        await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+        await page.keyboard.press("j");
+        await page.waitForTimeout(300);
+        const moved = await page.locator('[data-qa-crm-cursor="true"]').getAttribute("data-qa-activity-row").catch(() => null);
+        entry.jMovesTheVisibleCursor = moved !== null;
+      }
+
+      // `Enter` opens the row's record. Both screens answer it by routing to the record the row is
+      // about, so the URL is the assertion.
+      await page.locator("body").click({ position: { x: 5, y: 5 } }).catch(() => {});
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(1100);
+      entry.enterMovedSomewhereReal = !new URL(page.url()).pathname.startsWith(route.path);
+      entry.enterLandedOn = new URL(page.url()).pathname;
+    }
+
+    listFrameScreens[route.name] = entry;
+  }
+  steps.theNonShellScreensAnswerTheSheet = listFrameScreens;
+  steps.everyNonShellScreenIsKeyboardable = Object.values(listFrameScreens).every(
+    (entry) => entry.sheet && entry.slashFocusedSearch && (!entry.checked || (entry.cursorVisible && entry.enterMovedSomewhereReal)),
+  );
+
   // ---- 390×844 -------------------------------------------------------------------------------
   //
   // The board is switched on deliberately: the box asks that the board *scroll* horizontally on a
