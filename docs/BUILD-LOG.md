@@ -7468,3 +7468,32 @@ block), `b6c9bdfe` + `f611569f` (the gate fix and the four new legs).
 
 **Still open.** The keyboard and mobile boxes want a browser pass; the QA slot was held by a
 live w3 pass for 24 minutes of this tick, so that instrument was not available here.
+
+## 2026-09-30 · wave7 tick 40 · REQ-101 slice 2c — re-preview, and the banner that clears it
+
+- **What.** `Plan::arguments` / `Plan::operation` (the inverse of the mapping), `io::re_preview`
+  returning a `RePreview::{Refreshed, Unchanged}` rather than a bool, the
+  `POST /ai/approvals/{id}/preview` route under `ai.approvals.read`, and the review screen's
+  stale banner plus its Re-preview control.
+- **Proof.** `cargo test -p omnion-ai-hub --lib --quiet` → 491 passed (487 before, +4);
+  `cargo test -p omnion-api --test ai_approvals` → 29 passed (24 before, +5) against real
+  PostgreSQL on :5433; `cargo build -p omnion-api` clean; `pnpm typecheck` clean.
+- **The bug the new unit test caught.** `arguments()` first mapped a cleared field by
+  `unwrap_or_else("")`, which fires only for `None`. `coerce` spells a clear as
+  `Some(Value::Null)`, so a cleared summary came back as the JSON argument `null` and
+  `coerce` refused it with "expected text, got null" — every re-preview of a cleared field
+  would have failed for a reason that had nothing to do with the field. `None | Some(Null)` is
+  now matched explicitly. The unit test is the description of that failure, not a mock of it.
+- **The bug the walks caught in themselves.** The first run of the five new walks failed, and
+  the reason was the fixture, not the product: `preview_request` inherits `publish_request`,
+  whose `ClassPolicy::default()` demands the typed phrase, and `decide()` checks the phrase
+  *before* the revision — so an `io::approve` with no phrase returned `ConfirmationRequired`
+  and the walks were asserting about a decision refused for an unrelated reason.
+- **Why `read` and not `act`.** Re-preview decides nothing, resumes nothing and overwrites no
+  decision; what it writes is a newer description of a proposal nobody has decided. Gating it
+  on `act` would make the stale banner's own remedy unavailable to exactly the readers who can
+  see the row.
+- **Next.** The QA pass on the w7 stack (queued behind a live w3 holder, 973982). When it
+  reports `staleBannerAppears`, `rePreviewClearsTheBanner` and
+  `theFrozenHashActuallyChanged`, the stale-screen criterion can be ticked; slice 3 (change
+  sets, the editor sheet, all-or-nothing) follows.
