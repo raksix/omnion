@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 // The `@/` alias, not a relative path: `keyboard-path.ts` imports it that way and a test that
@@ -7,11 +8,14 @@ import type { GraphEdge, GraphNodeType } from "@/lib/api";
 import {
   KEYBOARD_PASS,
   KEYMAP,
+  SHORTCUT_GROUPS,
+  SHORTCUT_ROWS,
   beginConnect,
   cancelConnect,
   commitConnect,
   defaultPortFor,
   isTypingTarget,
+  lockedShortcutCount,
   readKey,
   type KeyboardConnectState,
   type PortTable,
@@ -218,4 +222,118 @@ test("the documented pass is the five verbs in the criterion's order", () => {
     assert.notEqual(step.keys, "", `${step.step} must name its keys`);
     assert.notEqual(step.expects, "", `${step.step} must name what it proves`);
   }
+});
+
+// ---- ⌘/ and the shortcut list -----------------------------------------------------------------
+
+test("⌘/ asks for the list, and a bare / is a character", () => {
+  // The chord is the only form. A bare `/` is a character an author types, and a shortcut that
+  // fires while someone is naming a rule is worse than no shortcut at all.
+  //
+  // `key: "/"` and not `key: "Slash"`: `KeyboardEvent.key` for the slash key is the character
+  // itself, and `"Slash"` is `event.code`. Reading `code` here would bind a shortcut that only
+  // works on the physical key and not on a layout where the same key prints something else.
+  assert.deepEqual(readKey({ key: "/", metaKey: true }), { kind: "help" });
+  assert.deepEqual(readKey({ key: "/", ctrlKey: true }), { kind: "help" });
+  assert.deepEqual(readKey({ key: "?" }), { kind: "unhandled" });
+  assert.deepEqual(readKey({ key: "/" }), { kind: "unhandled" });
+});
+
+test("⌘/ is read before the meta guard that swallows every other chord", () => {
+  // The guard order IS the bug this guards: `readKey` returns `unhandled` for any modifier
+  // key, so a help check placed after it is a shortcut nobody can press. Reverting the two
+  // blocks turns this red.
+  const chord = readKey({ key: "/", metaKey: true });
+  assert.deepEqual(chord, { kind: "help" });
+  // And a chord that is not the help chord is still refused — the guard was widened, not moved.
+  assert.deepEqual(readKey({ key: "k", metaKey: true }), { kind: "unhandled" });
+});
+
+test("⌘/ does not fire while a field is being typed into", () => {
+  // `isTypingTarget` runs first on purpose. A rule named with a slash is a rule being written.
+  assert.deepEqual(
+    readKey({ key: "/", metaKey: true, target: { tagName: "INPUT" } }),
+    { kind: "unhandled" },
+  );
+});
+
+test("the list carries a row for every key the canvas binds", () => {
+  // The drift guard, and the reason it reads the source rather than the KEYMAP: a list written
+  // next to the handler goes stale the day a shortcut is added, and the one place an author
+  // looks to find out what is possible is where the truth stops being told.
+  const source = readFileSync(
+    new URL("./builder-view.tsx", import.meta.url),
+    "utf8",
+  );
+  const bound = new Set(
+    [...source.matchAll(/event\.key\.toLowerCase\(\) === "([a-z])"/g)].map((m) => m[1]),
+  );
+  // The chords the handler owns. A key here with no row is a shortcut that works and is not
+  // documented — the defect this test exists to make impossible to merge.
+  const documented = new Set(
+    SHORTCUT_ROWS.flatMap((row) => [...row.keys.matchAll(/⌘([A-Z])/g)].map((m) => m[1].toLowerCase())),
+  );
+  for (const key of bound) {
+    assert.ok(
+      documented.has(key),
+      `the canvas binds ⌘${key.toUpperCase()} and the shortcut list has no row for it`,
+    );
+  }
+  // The single-key path too: every `KEYMAP` case must have a row, or the keyboard-only
+  // criterion is met by keys nobody can find. The row writes the key as an author reads it
+  // ("Enter", "Esc"), so the comparison goes through an alias table — a test that demanded
+  // `KEYMAP.cancel`'s raw `"escape"` would fail on correct help text, and one that matched
+  // loosely would let a row for a *different* key pass. Each key lists the names it may be
+  // written under, and one of them has to be there.
+  const LABELS: Record<string, string[]> = {
+    escape: ["escape", "esc"],
+    enter: ["enter", "return"],
+  };
+  const labels = SHORTCUT_ROWS.map((row) => row.keys.toLowerCase());
+  for (const name of [
+    "palette",
+    "connect",
+    "commit",
+    "cancel",
+    "inspect",
+    "validate",
+    "run",
+    "save",
+    "help",
+  ] as const) {
+    const accepted = LABELS[KEYMAP[name]] ?? [KEYMAP[name].toLowerCase()];
+    assert.ok(
+      labels.some((label) => accepted.some((name) => label.includes(name))),
+      `KEYMAP.${name} ("${KEYMAP[name]}") has no row in the shortcut list`,
+    );
+  }
+});
+
+test("every row says what it does and which keys it needs", () => {
+  for (const group of SHORTCUT_GROUPS) {
+    assert.notEqual(group.title, "");
+    assert.ok(group.rows.length > 0, `${group.title} has no rows`);
+  }
+  for (const row of SHORTCUT_ROWS) {
+    assert.notEqual(row.keys.trim(), "", "a row with no key is a row nobody can press");
+    assert.notEqual(row.label.trim(), "", `the ${row.keys} row does not say what it does`);
+  }
+});
+
+test("the list marks the keys the narrow-screen gate refuses", () => {
+  // `isReadingKey` is a WHITELIST, so a shortcut added next year is refused by default. The
+  // list has to say so on the row, or a phone author reads a keyboard map of keys that do
+  // nothing — the exact "dead button" the criterion refuses.
+  const lockedRows = SHORTCUT_ROWS.filter((row) => row.locked).map((row) => row.keys);
+  for (const key of ["⌘Z", "⌘S", "⌘D", "C", "V", "R", "I"]) {
+    assert.ok(lockedRows.includes(key), `${key} is refused by the lock and is not marked as such`);
+  }
+  // The reading keys survive the lock, so they are the rows that must NOT be marked.
+  for (const key of ["Arrows", "Tab", "Esc"]) {
+    const row = SHORTCUT_ROWS.find((r) => r.keys === key);
+    assert.ok(row, `${key} is missing from the list`);
+    assert.equal(row.locked, false, `${key} is a reading key and must not be marked locked`);
+  }
+  assert.ok(lockedShortcutCount() > 0);
+  assert.ok(lockedShortcutCount() < SHORTCUT_ROWS.length, "everything is marked locked");
 });

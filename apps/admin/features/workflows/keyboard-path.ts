@@ -52,6 +52,8 @@ export const KEYMAP = {
   run: "r",
   /** Save now. */
   save: "s",
+  /** Open the shortcut list. A chord, not a bare key, so it never eats a letter. */
+  help: "/",
 } as const;
 
 /** What a key press means, given what the path is waiting for. */
@@ -66,6 +68,8 @@ export type KeyIntent =
   | { kind: "validate" }
   | { kind: "run" }
   | { kind: "save" }
+  /** `⌘/` — the shortcut list. Only ever produced for the chord, never for a bare `/`. */
+  | { kind: "help" }
   | { kind: "unhandled" };
 
 /**
@@ -129,6 +133,17 @@ export function readKey(
 ): KeyIntent {
   if (event.target && isTypingTarget(event.target)) {
     return { kind: "unhandled" };
+  }
+  // `⌘/` (Ctrl+/) is the only chord this function answers, and it is read BEFORE the
+  // meta/ctrl guard below — a guard placed first would swallow it and the shortcut list would
+  // be a key nobody can press. It is still a chord: a bare `/` is a character, and binding one
+  // turns the shortcut list into something that fires while an author types.
+  if (
+    (event.metaKey || event.ctrlKey) &&
+    !event.altKey &&
+    event.key.toLowerCase() === KEYMAP.help
+  ) {
+    return { kind: "help" };
   }
   if (event.metaKey || event.ctrlKey || event.altKey) {
     return { kind: "unhandled" };
@@ -291,3 +306,78 @@ export const KEYBOARD_PASS: readonly { step: string; keys: string; expects: stri
   { step: "validate", keys: "V", expects: "the problems panel answers" },
   { step: "run", keys: "R", expects: "a run exists" },
 ];
+
+/**
+ * The shortcut list `⌘/` opens — **one row per key the canvas actually binds**.
+ *
+ * This is a catalogue, not a copy of the `KEYMAP` object, and the reason is the failure the
+ * criterion is really about: a help list written next to the handler drifts. Every shortcut
+ * added next year appears in the code and not on screen, and the one place an author goes to
+ * *find out what is possible* is where the truth stops being told. The groups below are
+ * therefore transcribed from the handler itself — the `⌘` chords in `onCanvasKeyDown` and the
+ * single-key path in `readKey` — and a test walks both and fails on a chord the list omits.
+ *
+ * `locked` marks the keys the narrow-screen gate refuses. It is a **whitelist of reading keys**
+ * (`isReadingKey`), so a shortcut added next year is refused by default and the row has to say
+ * so deliberately — which is exactly the state a help list should be in when the builder is
+ * read-only, rather than a second list to keep in step with the first.
+ */
+export interface ShortcutRow {
+  /** The chord, as an author would type it. */
+  keys: string;
+  /** What it does. */
+  label: string;
+  /** True when the narrow-screen read-only gate refuses this key. */
+  locked: boolean;
+}
+
+export const SHORTCUT_GROUPS: readonly {
+  title: string;
+  rows: readonly ShortcutRow[];
+}[] = [
+  {
+    title: "Building",
+    rows: [
+      { keys: "⌘P", label: "Focus the palette, then Enter to add a node", locked: true },
+      { keys: "C", label: "Connect from the selected node's first output port", locked: true },
+      { keys: "Enter", label: "Commit the connection onto the selected target", locked: true },
+      { keys: "Esc", label: "Abandon the connection, or clear the selection", locked: false },
+      { keys: "I", label: "Focus the inspector's first field", locked: true },
+      { keys: "Del", label: "Delete the selected node or connection", locked: true },
+    ],
+  },
+  {
+    title: "Moving",
+    rows: [
+      { keys: "Arrows", label: "Nudge the selection one grid step (⇧ for five)", locked: false },
+      { keys: "Tab", label: "Walk to the next card", locked: false },
+      { keys: "⌘A", label: "Select every node", locked: true },
+    ],
+  },
+  {
+    title: "History and clipboard",
+    rows: [
+      { keys: "⌘Z", label: "Undo (the history is 50 steps deep)", locked: true },
+      { keys: "⇧⌘Z or ⌘Y", label: "Redo", locked: true },
+      { keys: "⌘C / ⌘V", label: "Copy and paste the selection", locked: true },
+      { keys: "⌘D", label: "Duplicate the selection", locked: true },
+    ],
+  },
+  {
+    title: "Running",
+    rows: [
+      { keys: "⌘S", label: "Save now (the autosave is a debounce, this is not)", locked: true },
+      { keys: "V", label: "Validate the graph", locked: true },
+      { keys: "R", label: "Run the rule once", locked: true },
+      { keys: "⌘/", label: "Open or close this list", locked: false },
+    ],
+  },
+];
+
+/** Every row, flattened. A test counts the chords in the handler against this. */
+export const SHORTCUT_ROWS: readonly ShortcutRow[] = SHORTCUT_GROUPS.flatMap((group) => group.rows);
+
+/** How many rows the narrow-screen gate would refuse, for the overlay's own footnote. */
+export function lockedShortcutCount(rows: readonly ShortcutRow[] = SHORTCUT_ROWS): number {
+  return rows.filter((row) => row.locked).length;
+}

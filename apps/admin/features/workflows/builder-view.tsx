@@ -117,9 +117,11 @@ import {
   type CanvasSelection,
 } from "./selection";
 import {
+  SHORTCUT_GROUPS,
   beginConnect,
   cancelConnect,
   commitConnect,
+  lockedShortcutCount,
   readKey,
   type KeyboardConnectState,
 } from "./keyboard-path";
@@ -229,6 +231,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [paletteQuery, setPaletteQuery] = useState("");
   const [problemsOpen, setProblemsOpen] = useState(true);
+  // The ⌘/ shortcut list. Kept out of the problems panel on purpose: that panel is the rule's
+  // own state and is open by default, so a help overlay parked there would be the first thing
+  // an author sees and the last thing they could dismiss. It is a `dialog` and it traps
+  // nothing — Escape closes it, and the canvas keeps its own state behind it.
+  const [helpOpen, setHelpOpen] = useState(false);
   const [running, setRunning] = useState(false);
   const [runMessage, setRunMessage] = useState<string | null>(null);
   // The most recent run's steps, keyed by the node each came from — this is what paints
@@ -1404,6 +1411,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         }
         return;
       }
+      // ⌘/ — the shortcut list. It sits with the other chords rather than in the single-key
+      // path below, because that path is entered only when NO modifier is held, and a chord
+      // read there can never fire: the guard that skips it is the same guard `readKey`
+      // applies to the intent. The one key that must not open the browser's own quick-find
+      // dialog (Firefox) and must not trigger a comment on a code review, both of which own
+      // `/` — hence the chord rather than the bare key.
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key === "/") {
+        event.preventDefault();
+        setHelpOpen((open) => !open);
+        return;
+      }
 
       // ---- the single-key path (REQ-004: a keyboard-only pass) --------------------------
       //
@@ -1473,6 +1491,17 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         }
       }
       if (event.key === "Escape") {
+        // The shortcut list is the FIRST thing Escape closes, before the canvas's own
+        // three-step ladder below. A modal that does not answer Escape is a modal the only way
+        // out of which is the mouse — and the criterion that asks for a keyboard-only pass
+        // would be satisfied on a screen with a dialog no keyboard can dismiss. It sits above
+        // the ladder deliberately: Escape in a dialog belongs to the dialog, which is the same
+        // rule the pointer handler follows when a refusal needs dismissing.
+        if (helpOpen) {
+          event.preventDefault();
+          setHelpOpen(false);
+          return;
+        }
         // One rule for the whole key, and it answers in priority order: a connection in
         // progress, then a selected edge, then the nodes. Escape is the gesture that says
         // "I did not mean that", and it has to reach the thing the user is actually holding
@@ -1774,7 +1803,11 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 
   return (
     <div
-      className={`flex h-[calc(100vh-2rem)] flex-col ${builderLayoutClass(viewportWidth ?? EDITOR_MIN_WIDTH * 2)}`}
+      // `relative` is load-bearing for the ⌘/ overlay: it positions `absolute inset-0` against
+      // the builder rather than the viewport, so the backdrop covers the canvas and not the
+      // whole page — and a shortcut list that dims the admin's own sidebar is a modal about a
+      // modal.
+      className={`relative flex h-[calc(100vh-2rem)] flex-col ${builderLayoutClass(viewportWidth ?? EDITOR_MIN_WIDTH * 2)}`}
       data-builder
       data-builder-locked={locked ? "true" : "false"}
     >
@@ -1966,6 +1999,71 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         >
           {runMessage}
         </p>
+      ) : null}
+
+      {helpOpen ? (
+        <div
+          className="absolute inset-0 z-40 flex items-start justify-center bg-black/40 p-6"
+          onClick={() => setHelpOpen(false)}
+          data-builder-help-backdrop
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Keyboard shortcuts"
+            className="mt-10 max-h-[70vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-line bg-surface shadow-xl"
+            onClick={(click) => click.stopPropagation()}
+            data-builder-help
+          >
+            <div className="flex items-center justify-between border-b border-line px-4 py-3">
+              <h2 className="text-[13px] font-semibold">Keyboard shortcuts</h2>
+              <button
+                type="button"
+                onClick={() => setHelpOpen(false)}
+                className="rounded-md border border-line px-2 py-1 text-[12px] hover:bg-quiet-soft"
+                data-builder-help-close
+              >
+                Close
+              </button>
+            </div>
+            <div className="px-4 py-3">
+              {SHORTCUT_GROUPS.map((group) => (
+                <section key={group.title} className="mb-4 last:mb-0">
+                  <h3 className="mb-1.5 text-[11.5px] font-medium uppercase tracking-wide text-muted">
+                    {group.title}
+                  </h3>
+                  <ul>
+                    {group.rows.map((row) => (
+                      <li
+                        key={`${group.title}-${row.keys}`}
+                        className="flex items-baseline gap-3 py-0.5 text-[12.5px]"
+                        data-help-row={row.keys}
+                        data-help-locked={row.locked ? "true" : "false"}
+                      >
+                        <kbd className="w-32 shrink-0 rounded border border-line bg-quiet-soft px-1.5 py-0.5 font-mono text-[11.5px]">
+                          {row.keys}
+                        </kbd>
+                        <span className="flex-1">{row.label}</span>
+                        {row.locked ? (
+                          // Said on the row rather than in a footnote: a phone author reading a
+                          // keyboard map needs to know *which* of these will not work for them,
+                          // and a single sentence at the bottom makes them check every row.
+                          <span className="shrink-0 text-[11px] text-muted">
+                            read-only below 1024px
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ))}
+              <p className="mt-3 text-[11.5px] text-muted">
+                {lockedShortcutCount()} of these are refused while the builder is read-only on a
+                narrow screen. Table mode stays editable there.
+              </p>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       <div className="flex min-h-0 flex-1">

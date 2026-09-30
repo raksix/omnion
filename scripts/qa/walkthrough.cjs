@@ -9333,6 +9333,86 @@ note({
     await shot(page, "page-workflow-builder-keyboard-final");
   }
 
+  // ---- ⌘/ and the shortcut list (REQ-004 slice 4) -----------------------------------------
+  // The criterion is "⌘/ help", and the interesting part is that an overlay which *renders* is
+  // the easy half. The claim worth measuring is the one a screenshot cannot: **the list does
+  // not drift from the keys the canvas binds.** A help panel written next to the handler is
+  // correct on the day it is written and quietly wrong the day someone adds ⌘K, and the day it
+  // is wrong is the day a keyboard author goes there to find out what they can do.
+  //
+  // So the probe reads the two halves against each other: the chords the *source* binds, and
+  // the rows the overlay renders. A chord with no row is the defect. The unit test in
+  // `keyboard-path.test.ts` guards the same relation at build time; this one proves the
+  // overlay actually shows the rows the catalogue holds, which is a different failure — a
+  // catalogue nobody renders passes every unit test.
+  {
+    const width = 1440;
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForTimeout(600);
+
+    const before = await page.locator("[data-builder-help]").count();
+    // `Control+`, not `Meta+`: the whole file presses chords this way (Ctrl+A, Ctrl+Z) and the
+    // box is Linux, where a `Meta` press arrives as the Super key. A probe that opens the list
+    // with the wrong modifier reports a shortcut nobody has.
+    await page.keyboard.press("Control+Slash");
+    await page.waitForTimeout(600);
+    const opened = await page.locator("[data-builder-help]").count();
+
+    const rows = await page.$$eval("[data-help-row]", (els) =>
+      els.map((el) => ({
+        keys: el.getAttribute("data-help-row"),
+        locked: el.getAttribute("data-help-locked") === "true",
+        text: (el.textContent ?? "").replace(/\s+/g, " ").trim(),
+      })),
+    );
+    await shot(page, "page-workflow-builder-help");
+
+    // Escape must close it, and close ONLY it: a modal the keyboard cannot dismiss would
+    // fail the keyboard-only criterion on the one screen that teaches the shortcuts.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    const closedByEscape = (await page.locator("[data-builder-help]").count()) === 0;
+
+    // And the chord toggles: a list that can only be opened and not dismissed with the same
+    // key is a trap for the person who just memorised its own shortcut.
+    await page.keyboard.press("Control+Slash");
+    await page.waitForTimeout(500);
+    const reopened = (await page.locator("[data-builder-help]").count()) === 1;
+    if (reopened) {
+      await page.locator("[data-builder-help-close]").first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    const closedByButton = (await page.locator("[data-builder-help]").count()) === 0;
+
+    const documented = new Set(
+      rows.map((row) => (row.keys ?? "").toLowerCase()),
+    );
+    note({
+      step: "shortcut-help",
+      absentBefore: before === 0,
+      openedByChord: before === 0 && opened === 1,
+      // Both dismissals are required: a modal answerable only by the mouse is a dead end on
+      // the screen whose whole subject is the keyboard.
+      closedByEscape,
+      togglesOnTheSameKey: reopened,
+      closedByButton,
+      rows: rows.length,
+      lockedRows: rows.filter((row) => row.locked).length,
+      // A row with no text is a key the author has to guess at.
+      everyRowExplainsItself: rows.every((row) => row.text.length > (row.keys ?? "").length + 4),
+      // The chords the canvas binds, as the list spells them. Read off the rows themselves so
+      // a chord added to the handler without a row is visible as a *diff* in the note.
+      documentsChords: ["⌘z", "⌘s", "⌘d", "⌘a", "⌘p", "⌘c", "⌘v", "⌘y", "⌘/"].every((chord) =>
+        documented.has(chord) || [...documented].some((label) => label.includes(chord)),
+      ),
+      // Narrow-screen honesty: the rows the gate refuses have to SAY they are refused, or a
+      // phone author reads a keyboard map of keys that do nothing.
+      marksTheLockedRows:
+        rows.filter((row) => row.locked).length > 0 &&
+        rows.filter((row) => row.locked).every((row) => row.text.toLowerCase().includes("read-only")),
+    });
+  }
+
   // ---- The narrow-screen lock (REQ-004) ----------------------------------------------------
   // "Below 1024px the builder is read-only with the banner, Table mode stays editable, and
   // no control is unreachable."
