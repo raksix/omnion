@@ -61,7 +61,15 @@ wait_http() { # url, seconds
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
-  QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
+  # QA_SLOT_OWNER is this script's own pid: the reaper has to be able to tell a pass that is
+  # still walking from a place its owner walked away from, and the holder it holds the place
+  # with cannot answer that — the holder is a background job of qa-slot.sh and is reparented
+  # the moment that script exits, which is the *successful* case. On a host with a subreaper
+  # (systemd --user here) an abandoned holder and a live one report the same ppid, so a
+  # ppid test is not merely unreliable here, it never fires at all. The pass is the only
+  # party that knows whether its own EXIT trap will still run, so it says so.
+  QA_SLOT_PID="$(QA_SLOT_OWNER="$$" QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" \
+    bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
 # Free the place whenever this pass ends, however it ends.
