@@ -477,3 +477,41 @@ never touched, and neither is anything under `/mnt/apopic` (83%).
 
 **Next.** (1) Take the QA slot and run the browser pass on the limits screen. (2) Slice 2's
 middleware and screen. (3) Slices 3 and 4.
+
+### Slices — progress, fifth pass: the previous tick's diagnosis, read against the log
+
+**The 1,477 findings were never one lost session, and the log says so in one line.**
+Two ticks have now explained that pass away as "the walk lost its session after the sign-out step".
+The pass's own `pm2` log contradicts that on its face: `auth: session created` appears at 15:41:44
+and again at 15:41:49, and `auth: session revoked` twice at 15:49 — the sign-out happened at the END
+of the pass and the 403 storm was already over by then. The order in `netFailures` is the other half:
+the first two entries are the wizard's `POST /api/v1/onboarding/owner` answering **400**, and the
+403 storm begins on the very next request (`/api/v1/sites`). A session that dies at the end cannot
+refuse requests that were issued before it.
+
+**What actually happened, measured on the database rather than inferred.** `omnion_qa_w6` holds
+**1 user and 0 organizations** after the pass. The owner row is platform-level by design
+(`organization_id = null` — "an Owner runs the platform, not one tenant"), and the wizard's
+organization step is the only thing that creates the tenant. So every org-scoped read — `/sites`,
+`/notifications`, `/organizations`, `/search`, `/reliability/intake` — was answered 403 by the scope
+guard for a tenant that does not exist, and the screen still rendered its shell, its title and its
+`h1`, which is exactly why the page-level diagnostics looked clean. **A screen whose data layer is
+refused renders like a healthy empty screen**, and 717 identical 403s is the shape of one missing
+row rather than 717 defects.
+
+**So the honest state of the two unmeasured screens is that they were measured against a
+half-built installation, and their results are worthless in both directions** — not "clean", and
+certainly not "failed". The intake screen's clean diagnostics (10/10 labelled fields, one `h1`, 3 px
+of mobile overflow, a real empty state) are properties of the *component*, and those still hold; but
+its `rows: 0` empty state was produced by a 403 rather than by an empty table, so the one claim that
+distinguishes "empty because there is nothing" from "empty because it was refused" is the claim this
+pass cannot make.
+
+**The harness gap this exposes, which is the same one in every wave's report.** `run.sh` resets the
+database and then immediately boots three servers, and the *browser* is what has to discover that
+first-run onboarding happened at all. Nothing checks the precondition the rest of the pass depends
+on: **an organization exists**. A pass that ran against zero organizations produced a complete,
+internally consistent report — 76 clicks, 81 screenshots, a per-page diagnostics block, a vision
+review — every field populated and every one of them answering about an installation with no tenant.
+The missing check would have failed the pass in its first thirty seconds, before the hour of walking
+was spent, and it costs one query.

@@ -98,7 +98,7 @@ QA_KEEP_NEXT=1 stop_stack
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
 
-step "API on :$API_PORT (database omnion_qa)"
+step "API on :$API_PORT (database $QA_DB)"
 # A stale binary replays the *old* SQL: sqlx embeds `database/migrations/*.sql` at compile time, so
 # a migration edited after the last build is silently the previous version — and a syntax error in
 # it looks like a duplicate table on the next attempt. Build when the binary is missing OR older
@@ -133,6 +133,30 @@ else
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
+
+# The precondition every org-scoped screen in this report depends on, checked BEFORE the walk
+# rather than inferred from it afterwards. A pass that runs with no organization answers every
+# `/sites`, `/notifications`, `/organizations` and `/reliability/*` read with 403, and still
+# produces a complete report: per-page diagnostics, a vision review, a high-finding count. The
+# screens render their shell, their title and their `h1` regardless, so each page looks healthy
+# while every number under it was refused — which is how a pass can measure three new screens and
+# report "clean" about a tenant that does not exist.
+#
+# It is one query, and it is the difference between failing in the first thirty seconds and
+# spending an hour measuring an installation that has no tenant.
+qa_scalar() {
+  docker exec "${QA_PG_CONTAINER:-omnion-postgres}" psql -U omnion -d "$QA_DB" -t -A -c "$1" 2>/dev/null || echo ""
+}
+QA_ORGS="$(qa_scalar 'select count(*) from organizations')"
+QA_USERS="$(qa_scalar 'select count(*) from users')"
+if [ "$QA_ORGS" = "0" ] || [ -z "$QA_ORGS" ]; then
+  echo "[qa] FATAL: ${QA_DB} has ${QA_USERS:-0} user(s) and ${QA_ORGS:-no} organization(s)."
+  echo "[qa] The browser creates the organization through the first-run wizard; if it did not run,"
+  echo "[qa] every org-scoped screen below is answered 403 and the report describes nothing."
+  echo "[qa] Check the wizard's POST /api/v1/onboarding/organization in the API log."
+  exit 1
+fi
+step "precondition ok: ${QA_USERS} user(s), ${QA_ORGS} organization(s) in ${QA_DB}"
 
 step "admin panel on :$ADMIN_PORT"
 NEXT_ADMIN="$ROOT/apps/admin/node_modules/next/dist/bin/next"

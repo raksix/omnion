@@ -7634,3 +7634,57 @@ shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for t
 which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
+
+## Tick 32 — REQ-127: the pass that ran for an hour and measured nothing
+
+**Merged main, and the merge was the work.** 15 commits came in, and four files conflicted. Every
+one resolved to a union rather than a side, because both writers had added to the same list:
+the walkthrough keeps wave 6's five reliability routes *and* main's three health routes, the shell
+icon import is the sorted union of both (31 icons — `BellRing`/`Gauge`/`Radio`/`Route` from here,
+`HeartPulse` from main), and `api.ts` takes both blocks. The append-only BUILD-LOG is spliced with
+`scripts/qa/merge-build-log.py`: `base=5297 ours=7432 theirs=5501 merged=7636`, **0 lines dropped,
+0 headings lost**.
+
+**A blind union merge produces silently spliced functions, and it did — four of them.** Concatenating
+both sides of a conflict mid-function leaves a `request<T>(url, {` with no argument and the next
+side's doc comment underneath it. The file still had *every line of both sides* — the multiset check
+passed, `0 lost from ours, 0 lost from theirs` — so nothing was deleted and nothing was duplicated,
+and the file was still not valid TypeScript. **The line-multiset invariant is necessary and not
+sufficient: it cannot see a line that survived in the wrong place.** What caught it was `tsc`, and
+what would have caught it sooner is a check on *function* boundaries rather than on lines. Three of
+the four splices are the same shape (`fetchReliabilityRetryPolicies`, `fetchReliabilityAttempts`,
+`fetchIdempotencyKeys` all truncated at their `cache: "no-store"`).
+
+**Then the finding: two ticks of this loop reported the wrong cause for the 1,477 findings.**
+Tick 30 said the pass lost its session after the sign-out step, and tick 31 repeated it. The pass's
+own `pm2` log contradicts that: `session created` at 15:41:44 and 15:41:49, `session revoked` at
+15:49 — the sign-out is the *last* thing the walk does. `netFailures` is ordered, and its first two
+entries are the wizard's `POST /api/v1/onboarding/owner` answering **400**; the 403 storm starts on
+the request right after. A session that dies at the end cannot refuse requests issued before it.
+
+**Measured on the database rather than inferred from the report: `omnion_qa_w6` ended with 1 user
+and 0 organizations.** The owner row is platform-level by design (`organization_id = null`), and the
+wizard's organization step is the only thing that creates the tenant. So every org-scoped read —
+`/sites`, `/notifications`, `/organizations`, `/reliability/intake` — was refused for a tenant that
+does not exist, while each page still rendered its shell, title and `h1`. That is why the
+per-page diagnostics read clean and why `rows: 0` looked like an honest empty state. **A screen
+whose data layer is refused renders exactly like a healthy empty screen**, and 717 identical 403s is
+the shape of one missing row.
+
+**The intake screen's "clean" is therefore half valid and half void, and the split matters.** The
+component-level claims hold — 10/10 labelled dialog fields, one `h1`, 3 px of overflow at 390 px,
+no duplicate ids — because those are properties of the rendered component, not of the data. The one
+claim that this pass cannot make is the one that distinguishes *empty because there is nothing* from
+*empty because it was refused*, which is precisely the claim its empty state exists to make.
+
+**`run.sh` now asserts the precondition before the walk** — one query, `select count(*) from
+organizations`, and a FATAL exit naming the wizard's POST. A pass in this state used to burn an hour
+producing a complete, internally consistent, meaningless report; it now fails in thirty seconds.
+`qa-artifacts/20260930-151345/report.md` carries a banner withdrawing the earlier reading at the
+top of the file, because the number is the thing a reader looks at.
+
+**Gates:** `cargo test -p omnion-reliability --lib` 116/0 · `cargo test -p omnion-api --lib` 298/0 ·
+`pnpm typecheck` 2/2 · `bash -n scripts/qa/run.sh` clean. **Commit** `a33dbe44` (merge) pushed.
+**Close box for REQ-127 stays UNTICKED** — the focused re-run is in flight and the two unmeasured
+screens still have no valid measurement. **Next:** read that pass; if the wizard's owner POST is
+refused again with 400, the defect is in the *wizard's* step, not in this request.
