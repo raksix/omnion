@@ -691,6 +691,70 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "crm",
         description: "Configure form → lead routing and run the ingress drain",
     },
+    // HR (docs/requests/REQ-055). People are read, written and **exported** under separate keys,
+    // and the sensitive block is a power of its own — the request's leading risk note is that a
+    // role which can see the directory must not automatically be able to read a colleague's home
+    // address or emergency contact.
+    //
+    // The two keys that are *not* a stricter version of editing:
+    //
+    // * **`hr.employees.sensitive.read`** opens the personal block. It decides what a response
+    //   carries rather than whether the request is allowed, so the routes resolve it inside the
+    //   handler — the same split `crm.fields.sensitive.read` has.
+    // * **`hr.employees.terminate`** is separated from `.delete` because termination is not a
+    //   delete at all: the record stays, the status becomes `terminated` and the end date is
+    //   recorded. A role that may end an employment is making a statement about a person, which
+    //   is a different decision from editing their job title.
+    PermissionDef {
+        key: "hr.employees.read",
+        category: "hr",
+        description: "Read the employee directory, its departments and the org chart",
+    },
+    PermissionDef {
+        key: "hr.employees.create",
+        category: "hr",
+        description: "Add an employee record",
+    },
+    PermissionDef {
+        key: "hr.employees.update",
+        category: "hr",
+        description: "Edit an employee's own fields",
+    },
+    PermissionDef {
+        key: "hr.employees.terminate",
+        category: "hr",
+        description: "Terminate an employment: a status and an end date, never a delete",
+    },
+    PermissionDef {
+        key: "hr.employees.export",
+        category: "hr",
+        description: "Download the employee list as a file",
+    },
+    PermissionDef {
+        key: "hr.employees.sensitive.read",
+        category: "hr",
+        description: "Read the personal contact block: home address, personal phone, emergency contact",
+    },
+    PermissionDef {
+        key: "hr.departments.read",
+        category: "hr",
+        description: "Read the department tree",
+    },
+    PermissionDef {
+        key: "hr.departments.manage",
+        category: "hr",
+        description: "Create, move, merge and delete departments",
+    },
+    PermissionDef {
+        key: "hr.documents.read",
+        category: "hr",
+        description: "Read employee documents",
+    },
+    PermissionDef {
+        key: "hr.documents.manage",
+        category: "hr",
+        description: "Attach and remove employee documents",
+    },
     // Sales (docs/requests/REQ-052). The selling side splits the way the relationship layer
     // does — read, create, edit, archive — and adds the two powers that are genuinely different
     // acts rather than a stricter version of editing:
@@ -1233,6 +1297,42 @@ mod tests {
                 "{key} belongs to the crm category"
             );
         }
+    }
+
+    #[test]
+    fn the_hr_family_is_catalogued() {
+        // REQ-055. Ten keys: the directory's read/create/update/terminate/export, the sensitive
+        // block, the department pair and the document pair.
+        //
+        // The reason this test is worth writing by hand rather than trusting the entries above:
+        // a `guards::require()` with a key that is **not** in the catalogue does not fall open —
+        // it 403s *everyone*, including the instance owner. So a typo in a route is a module that
+        // looks installed and answers 403 on every screen, and the tripwire is the catalogue, not
+        // the route.
+        for key in [
+            "hr.employees.read",
+            "hr.employees.create",
+            "hr.employees.update",
+            "hr.employees.terminate",
+            "hr.employees.export",
+            "hr.employees.sensitive.read",
+            "hr.departments.read",
+            "hr.departments.manage",
+            "hr.documents.read",
+            "hr.documents.manage",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("hr"),
+                "{key} belongs to the hr category"
+            );
+        }
+
+        // The separation that matters: reading the directory is not reading the personal block.
+        assert_ne!(
+            get("hr.employees.read").map(|entry| entry.key),
+            get("hr.employees.sensitive.read").map(|entry| entry.key)
+        );
     }
 
     #[test]

@@ -129,6 +129,26 @@ const BASE_ROLES: &[BaseRole] = &[
             "crm.copilot.use",
             "crm.leads.read",
             "crm.leads.manage",
+            // HR (REQ-055), the whole people core, and the two keys that are a **different act**
+            // rather than a stricter version of editing are in here for the same reason
+            // `sales.quotes.send` is discussed below rather than left out: an administrator is
+            // exactly the person who hires somebody and who reads the file an HR officer keeps.
+            //
+            // The sensitive block IS included, because the base `admin` role is the
+            // installation's own operator and an operator who cannot read an employee's emergency
+            // contact cannot do the job. Organizations that want a narrower split hand the key
+            // out themselves; the point of a separate key is that they can, not that nobody holds
+            // it.
+            "hr.employees.read",
+            "hr.employees.create",
+            "hr.employees.update",
+            "hr.employees.terminate",
+            "hr.employees.export",
+            "hr.employees.sensitive.read",
+            "hr.departments.read",
+            "hr.departments.manage",
+            "hr.documents.read",
+            "hr.documents.manage",
             // Sales (REQ-052), the full seller loop except the two releases. A manager
             // prepares and reviews; who may *send* a quote to a customer and *confirm* an
             // order that reserves stock is granted separately in the installation's own roles,

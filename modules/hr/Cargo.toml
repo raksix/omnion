@@ -1,0 +1,16 @@
+[package]
+name = "omnion-module-hr"
+description = "Omnion HR: employees, departments, the org chart and the visibility rules behind them (docs/requests/REQ-055)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+tracing.workspace = true
