@@ -423,11 +423,11 @@ async fn a_permitted_call_runs_and_writes_exactly_one_row() {
         .await;
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -471,11 +471,11 @@ async fn a_row_carries_the_size_of_its_arguments_and_never_the_arguments() {
         .await;
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity.clone()),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -530,11 +530,11 @@ async fn an_explicit_deny_beats_the_agent_allow_list_and_touches_nothing() {
     let before = store.touched().await;
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.create".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -578,11 +578,11 @@ async fn a_tool_the_caller_may_not_perform_is_refused_with_the_key_named() {
     // criteria left open for the execution path, with the 403's key named in the message.
     let gate = gate_without("content.create");
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.create".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -623,11 +623,11 @@ async fn a_run_with_no_identity_executes_nothing_at_all() {
     // nothing" — and the check happens *before* the registry is consulted, so this call cannot
     // even confirm the tool exists.
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         None,
         vec!["content.create".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -683,11 +683,11 @@ async fn a_tool_disabled_by_an_operator_is_still_callable_inside_the_run_that_st
 
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
     let outcome = pipe
@@ -712,11 +712,11 @@ async fn an_unknown_field_is_refused_before_the_tool_runs() {
         .await;
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -773,18 +773,26 @@ async fn one_call_past_the_cap_is_refused_and_the_cap_survives_a_resume() {
     .await
     .expect("the cap must be patchable");
 
-    let gate = allow_all();
+    // The registry and the gate live in `Arc`s for the whole walk, not one `Arc::new` per
+    // pipeline. The pipeline is built once per *call* here because each round is a resume, and
+    // an `Arc::new(registry)` inside the loop moved the registry on round 1 — which is exactly
+    // the shape a two-round loop looks like it should not have.
+    let registry = std::sync::Arc::new(registry);
+    // Annotated as the trait object at the binding, so both the loop's `clone` and the final
+    // move are `Arc<dyn PermissionGate>`. Leaving it concrete gives the loop's `clone` an
+    // `E0308` while the final move — the one that has no `&` to infer from — compiles fine.
+    let gate: std::sync::Arc<dyn PermissionGate> = std::sync::Arc::new(allow_all());
     let call = ToolCall::new("content.search", json!({"q": "report"}));
 
     // Two calls, then the third — all on the SAME run id, which is the resume: a pipeline that
     // counted in the loop's stack would answer differently for the second pair.
     for round in 1..=2 {
         let pipe = Pipeline::new(
-            &registry,
+            std::sync::Arc::clone(&registry),
             Some(identity.clone()),
             vec!["content.search".to_owned()],
             Vec::new(),
-            &gate,
+            std::sync::Arc::clone(&gate),
             store.caller(agent_id, run_id),
         );
         let outcome = pipe.call(&store.pool, &call).await.expect("the pipeline must answer");
@@ -795,11 +803,11 @@ async fn one_call_past_the_cap_is_refused_and_the_cap_survives_a_resume() {
     }
 
     let pipe = Pipeline::new(
-        &registry,
+        registry,
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        gate,
         store.caller(agent_id, run_id),
     );
     let third = pipe.call(&store.pool, &call).await.expect("the pipeline must answer");
@@ -851,11 +859,11 @@ async fn a_slow_tool_is_cut_off_with_status_timeout() {
 
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -935,11 +943,11 @@ async fn the_payload_hides_a_denied_tool_and_the_call_still_refuses_it() {
         .await;
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned(), "content.create".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -982,13 +990,14 @@ async fn the_payload_carries_the_registry_row_schema_the_call_validates_against(
     let identity = store
         .identity("editor", &[("content.search", GrantEffect::Allow)])
         .await;
+    let tool = registry.get("content.search").expect("registered");
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
 
@@ -1001,7 +1010,6 @@ async fn the_payload_carries_the_registry_row_schema_the_call_validates_against(
         .into_iter()
         .find(|summary| summary.key == "content.search")
         .expect("the granted tool is shown");
-    let tool = registry.get("content.search").expect("registered");
     assert_eq!(
         payload.schema,
         tool.schema(),
@@ -1047,11 +1055,11 @@ async fn a_run_another_organization_cannot_read_the_calls_for() {
         .await;
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.search".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
     pipe.call(&store.pool, &ToolCall::new("content.search", json!({"q": "a"})))
@@ -1186,11 +1194,11 @@ async fn a_control_proves_the_fixture_tool_really_writes() {
 
     let gate = allow_all();
     let pipe = Pipeline::new(
-        &registry,
+        std::sync::Arc::new(registry),
         Some(identity),
         vec!["content.create".to_owned()],
         Vec::new(),
-        &gate,
+        std::sync::Arc::new(gate),
         store.caller(agent_id, run_id),
     );
     let outcome = pipe
@@ -1206,6 +1214,112 @@ async fn a_control_proves_the_fixture_tool_really_writes() {
         before + 1,
         "the fixture tool's body must really write, or every 'a denied call leaves no side \
          effect' assertion in this file is comparing 0 with 0"
+    );
+    store.dispose().await;
+}
+
+// -------------------------------------------------------------------------------------------
+// The pruner is called by something
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_daily_log_tick_reaches_the_tool_call_pruner() {
+    // `tool_calls::prune` had a walk and **no caller**: a store function nothing calls is a
+    // function whose retention is a wish. The runner is what calls it now, so the walk is on the
+    // runner — an assertion on `prune` itself would have passed before the wiring landed and
+    // would pass again the day someone deleted the call.
+    //
+    // The `tick` needs an `AppState`, which needs more wiring than a bare pool, so this asserts
+    // the thing a caller could get wrong without a state: **the runner's `tick` is the only
+    // caller and it is the same function the timer runs.** It reads `ai_log_runner`'s own source
+    // and fails if the call or the `spawn` that runs the tick is gone.
+    let source = include_str!("../src/ai_log_runner.rs");
+
+    assert!(
+        source.contains("omnion_ai_hub::tool_calls::prune(pool)"),
+        "the daily tick must call the tool-call pruner; without it ai_tool_calls grows forever"
+    );
+    assert!(
+        source.contains("omnion_ai_hub::decision_store::prune(pool, RETENTION_DAYS)"),
+        "the tick still prunes the decision log — the tool-call call must not have replaced it"
+    );
+    assert!(
+        source.contains("let report = tick(&state).await;"),
+        "the timer must run the same tick the test reads, not a second one"
+    );
+    // The failure mode worth forbidding: an early `return` on the first pruner's error, which
+    // makes the second pruner unreachable whenever the first one hiccups.
+    let tick_body = source
+        .split("pub async fn tick")
+        .nth(1)
+        .and_then(|rest| rest.split("pub fn spawn").next())
+        .expect("the tick function must exist");
+    let after_decision_error = tick_body.find("the decision pruner could not run");
+    let tool_call_prune = tick_body.find("tool_calls::prune");
+    assert!(
+        after_decision_error.is_some() && tool_call_prune.is_some(),
+        "both pruners must be present in the tick"
+    );
+    let decision_error_arm = &tick_body
+        [after_decision_error.expect("checked")..tool_call_prune.expect("checked")];
+    assert!(
+        !decision_error_arm.contains("return TickReport::default()"),
+        "a decision-pruner error must not skip the tool-call pruner — an early return here is \
+         how the tool-call log silently stopped being pruned"
+    );
+}
+
+#[tokio::test]
+async fn the_pruner_drops_only_rows_past_the_window() {
+    // A pruner that returns the right *number* while deleting the wrong *rows* satisfies a test
+    // that only counted. The retention walk next door covers the 400-day-vs-now boundary; this
+    // one covers the other edge that matters for the panel — a row the registry's own 30-day
+    // usage column is computed from. A pruner that dropped a 10-day row would make "Calls 30 d"
+    // quietly under-report, and no counting assertion would see it.
+    let store = pipe!();
+    let agent_id = store.agent("logt", &["content.search"]).await;
+    let run_id = store.run(agent_id, "log a call").await;
+
+    let mut ids = Vec::new();
+    for age in ["400 days", "10 days", "0 days"] {
+        let id: i64 = sqlx::query_scalar(
+            "insert into ai_tool_calls (organization_id, run_id, agent_id, tool_key, status) \
+             values ($1, $2, $3, 'content.search', 'ok') returning id",
+        )
+        .bind(store.organization_id)
+        .bind(run_id)
+        .bind(agent_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("the fixture call must be written");
+        // Backdated **by id**, never with a bare `update … set created_at`: an update without a
+        // `where` ages every row, which is how the retention walk first came to return 2.
+        sqlx::query("update ai_tool_calls set created_at = now() - $2::interval where id = $1")
+            .bind(id)
+            .bind(age)
+            .execute(&store.pool)
+            .await
+            .expect("the backdating must apply");
+        ids.push(id);
+    }
+    assert_eq!(store.total_rows(run_id).await, 3, "three rows before the sweep");
+
+    let dropped = omnion_ai_hub::tool_calls::prune(&store.pool)
+        .await
+        .expect("the pruner must answer");
+    assert_eq!(dropped, 1, "only the 400-day row is past the 180-day window");
+    let survivors: Vec<i64> = sqlx::query_scalar(
+        "select id from ai_tool_calls where run_id = $1 order by id",
+    )
+    .bind(run_id)
+    .fetch_all(&store.pool)
+    .await
+    .expect("the survivors must be readable");
+    assert_eq!(
+        survivors,
+        vec![ids[1], ids[2]],
+        "the 10-day row feeds the registry's 30-day usage column; a pruner that dropped it would \
+         make the panel under-report with nothing in the log to say why"
     );
     store.dispose().await;
 }

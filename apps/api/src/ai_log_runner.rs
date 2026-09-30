@@ -28,18 +28,25 @@ use crate::state::AppState;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TickReport {
     /// Decision rows dropped.
-    pub pruned: u64,
+    pub decisions: u64,
+    /// Tool-call rows dropped.
+    pub tool_calls: u64,
 }
 
 impl TickReport {
     /// `true` when the tick had nothing to do, so the loop can stay silent.
     #[must_use]
     pub fn is_idle(self) -> bool {
-        self.pruned == 0
+        self.decisions == 0 && self.tool_calls == 0
     }
 }
 
-/// Run one tick: drop the decisions that fell out of the retention window.
+/// Run one tick: drop the rows that fell out of their retention window.
+///
+/// **Two pruners, one timer.** The route decisions and the tool calls are both append-only logs
+/// with a stated retention, and each store owns its own `prune`. This tick calls both rather than
+/// spawning a second timer: a second interval means a second number to tune, and a box where one
+/// runs and the other silently stopped is a box that quietly stops keeping its promises.
 ///
 /// Exposed separately from [`spawn`] so the tick can be exercised against a real database
 /// without starting a timer — the same split the health runner uses, for the same reason: a
@@ -51,24 +58,57 @@ pub async fn tick(state: &AppState) -> TickReport {
     // nothing to print and the failure ends up as a compile error or a silent `Debug`. The
     // store returns the crate's own error, which is what a log line wants.
     let pool = state.db().pool();
-    let pruned = match omnion_ai_hub::decision_store::prune(pool, RETENTION_DAYS).await {
+    let decisions = match omnion_ai_hub::decision_store::prune(pool, RETENTION_DAYS).await {
         Ok(pruned) => pruned,
         Err(error) => {
+            // **No early return — and the walk says so.** The first version of this tick returned
+            // `TickReport::default()` here, because there was only one pruner. The moment a second
+            // one was added below, that return silently became "a decision-log hiccup stops the
+            // tool-call log from ever being pruned", and the only symptom is a table that grows.
+            // A pruner failing is its own zero; the other one still runs.
             tracing::warn!(error = %error, "the decision pruner could not run");
-            return TickReport::default();
+            0
+        }
+    };
+
+    // The tool-call log keeps 180 days, not 90, and the constant is the store's own. It lives
+    // next door in `tool_calls`, so reading it rather than restating it is what keeps the two
+    // from drifting apart when one of them is retuned.
+    let tool_calls = match omnion_ai_hub::tool_calls::prune(pool).await {
+        Ok(pruned) => pruned,
+        Err(error) => {
+            // **Not** an early return. One pruner failing is not a reason to skip the other: the
+            // first version of this tick returned early on a decision error, which meant a
+            // decision-log hiccup silently stopped the tool-call log from ever being pruned
+            // again — the failure was visible only as a table that grew.
+            tracing::warn!(error = %error, "the tool-call pruner could not run");
+            0
         }
     };
 
     // A background delete with no record is indistinguishable from a bug that is eating rows.
-    if pruned > 0 {
-        let entry = omnion_audit::NewAuditEntry::system("ai.route.decisions_pruned")
-            .metadata(serde_json::json!({ "pruned": pruned, "retention_days": RETENTION_DAYS }));
+    for (action, pruned, retention_days) in [
+        ("ai.route.decisions_pruned", decisions, RETENTION_DAYS),
+        (
+            "ai.tool.calls_pruned",
+            tool_calls,
+            omnion_ai_hub::tool_calls::RETENTION_DAYS,
+        ),
+    ] {
+        if pruned == 0 {
+            continue;
+        }
+        let entry = omnion_audit::NewAuditEntry::system(action)
+            .metadata(serde_json::json!({ "pruned": pruned, "retention_days": retention_days }));
         if let Err(error) = omnion_audit::record(pool, entry).await {
-            tracing::warn!(error = %error, pruned, "a decision prune could not be recorded");
+            tracing::warn!(error = %error, pruned, action, "an AI log prune could not be recorded");
         }
     }
 
-    TickReport { pruned }
+    TickReport {
+        decisions,
+        tool_calls,
+    }
 }
 
 /// Start the pruner; the handle is kept by the binary and ends with the process.
@@ -104,9 +144,14 @@ mod tests {
     #[test]
     fn a_tick_that_pruned_nothing_is_idle() {
         // The fresh-install case: an installation that has served no AI request must not log a
-        // line every day. A row count of zero is not an event.
+        // line every day. A row count of zero is not an event. **Both** pruners have to be quiet
+        // for that: the second one was added late, and an `is_idle` that only read the first
+        // would call a tick that dropped 40 000 tool calls idle — which is exactly the silence a
+        // runaway table needs.
         assert!(TickReport::default().is_idle());
-        assert!(!TickReport { pruned: 1 }.is_idle());
+        assert!(!TickReport { decisions: 1, tool_calls: 0 }.is_idle());
+        assert!(!TickReport { decisions: 0, tool_calls: 1 }.is_idle());
+        assert!(!TickReport { decisions: 1, tool_calls: 1 }.is_idle());
     }
 
     #[test]
@@ -116,5 +161,19 @@ mod tests {
         // the "reused the health runner's constant" mistake, which is the obvious way to get
         // this wrong: `retention_days` there is also 30 and lives one module away.
         assert_eq!(RETENTION_DAYS, 90);
+    }
+
+    #[test]
+    fn the_two_logs_keep_different_windows() {
+        // If these were the same number, the two pruners would be one pruner called twice and
+        // the second call would always be a no-op — which is a bug that reports success. The
+        // tool-call log is the registry's usage source and the spec asks for 180 days; the
+        // decision log is a diagnostic and 90 is REQ-098's number.
+        assert_eq!(omnion_ai_hub::tool_calls::RETENTION_DAYS, 180);
+        assert_ne!(
+            omnion_ai_hub::tool_calls::RETENTION_DAYS,
+            RETENTION_DAYS,
+            "two pruners that share a window are one pruner with a duplicate call"
+        );
     }
 }
