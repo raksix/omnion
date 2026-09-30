@@ -2529,4 +2529,97 @@ mod tests {
         assert_eq!(error.code(), "invalid_parameter");
         assert!(error.to_string().contains("not-a-uuid"), "{error}");
     }
+
+    /// The QA walkthrough's `validate-classes` table builds its graphs in JavaScript, from
+    /// node types and port names typed out by hand in `scripts/qa/walkthrough.cjs`. Nothing
+    /// connected those literals to this registry, so two of its rows had been measuring a
+    /// case the server never sees:
+    ///
+    /// * `cycle_on_a_branch` built `condition.if`. The key is `condition` and
+    ///   `find_node_type` is exact, so the row answered `unknown_node_type` and reported
+    ///   that sentence as the cycle's `names` — while `found: true` stayed green off the
+    ///   codes, which did contain `graph_cycle`.
+    /// * `cycle` closed its ring from the node that already carried the spine's `success`
+    ///   edge, leaving TWO edges on one walked port. `ambiguous_branch` sorted ahead of
+    ///   `graph_cycle`, and the row reported the wrong class for three ticks.
+    ///
+    /// So the graphs themselves are built here, from the same literals the probe uses, and
+    /// asserted to carry **exactly one** defect class. A probe row that measures a graph no
+    /// author can draw is a green test of a fiction, and the row that nobody re-reads is the
+    /// one that rots — so the assertion is on the SET of codes, not on "is my code in there".
+    #[test]
+    fn the_qa_validation_class_graphs_each_carry_exactly_one_defect() {
+        // `cycle`: t1 → a1 → a2 → e1, with a2's `error` port closing the ring back to t1.
+        // The ring leaves a SECOND node, so `a1` keeps the spine's single `success` edge.
+        // The trigger carries its required `event` parameter. Without it the graph has a
+        // SECOND defect (`missing_parameter`), which is the failure this test caught on its
+        // first run -- and the same rule the walkthrough's own trigger helper follows.
+        let mut trigger_node = node("t1", "trigger.event");
+        trigger_node.params = json!({ "event": "qa.cycle.probe" });
+        let cycle = Graph {
+            nodes: vec![
+                trigger_node,
+                action("a1"),
+                action("a2"),
+                node("e1", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e1".into(), source: "t1".into(), source_port: "out".into(), target: "a1".into() },
+                Edge { id: "e2".into(), source: "a1".into(), source_port: "success".into(), target: "a2".into() },
+                Edge { id: "e3".into(), source: "a2".into(), source_port: "success".into(), target: "e1".into() },
+                Edge { id: "e4".into(), source: "a2".into(), source_port: "error".into(), target: "t1".into() },
+            ],
+        };
+        // Owned strings: `Finding::code` is a `&'static str` reached through the Vec, and
+        // binding the vector of references to the temporary keeps the whole thing borrowed.
+        let codes: Vec<String> = validate(&cycle)
+            .iter()
+            .map(|f| f.code.to_string())
+            .collect();
+        assert!(
+            codes.iter().any(|c| c == "graph_cycle"),
+            "the ring is found: {codes:?}"
+        );
+        assert_eq!(
+            codes, vec!["graph_cycle".to_string()],
+            "a cycle case that also carries another defect measures whichever class sorts \
+             first -- that is how this row reported `found: true` off an ambiguous_branch"
+        );
+
+        // `cycle_on_a_branch`: the same loop closing on a condition's `false` port — the port
+        // the walk never follows, which is why the old traversal missed it.
+        let mut trigger_node = node("t1", "trigger.event");
+        trigger_node.params = json!({ "event": "qa.cycle.on_branch.probe" });
+        // The condition carries the three fields its own schema requires. `node()` starts
+        // with empty params, which is a third defect — `missing_parameter` — and the first
+        // run of this test caught exactly that, which is why it is written against the real
+        // registry instead of a hand-drawn sketch of it.
+        let mut condition = node("c1", "condition");
+        condition.params = json!({ "field": "user.role", "operator": "equals", "value": "admin" });
+        let on_a_branch = Graph {
+            nodes: vec![
+                trigger_node,
+                condition,
+                action("a1"),
+                node("e1", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e1".into(), source: "t1".into(), source_port: "out".into(), target: "c1".into() },
+                Edge { id: "e2".into(), source: "c1".into(), source_port: "true".into(), target: "a1".into() },
+                Edge { id: "e3".into(), source: "a1".into(), source_port: "success".into(), target: "e1".into() },
+                Edge { id: "e4".into(), source: "c1".into(), source_port: "false".into(), target: "t1".into() },
+            ],
+        };
+        let codes: Vec<String> = validate(&on_a_branch)
+            .iter()
+            .map(|f| f.code.to_string())
+            .collect();
+        // The condition is spelled `condition`. Asserted here rather than in a comment, because
+        // `condition.if` compiles and validates happily as an unknown type: the only evidence
+        // it was wrong is the sentence the panel then showed the author.
+        assert_eq!(
+            codes, vec!["graph_cycle".to_string()],
+            "the branch-closing ring is found and the node type is real: {codes:?}"
+        );
+    }
 }
