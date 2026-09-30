@@ -59,7 +59,8 @@
 //!     .allow(AllowList::new(vec!["page.read".into()], vec![]))
 //!     .system_prompt("You answer questions about the published site.")
 //!     .limits(RunLimits { max_steps: 4, ..RunLimits::default() })
-//!     .build();
+//!     .build()
+//!     .expect("a builder chain that names a model and a tool always assembles");
 //!
 //! let answer = sdk
 //!     .run("What plans do you publish?", |event| {
@@ -306,9 +307,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_documented_example_runs() {
-        // The doc comment at the top of this file is the example, and this is it. If the two
-        // ever diverge the doc is wrong — which is why they are one function called twice
-        // rather than a copy that has to be kept in step by hand.
+        // The doc comment at the top of this file is the example, and the *doctest* above is
+        // what executes it — this test is the half a doctest cannot do: it counts the events
+        // the callback saw. The two are the same chain, kept in step by the doctest failing the
+        // moment the doc drifts, and the count lives here because an assertion inside the
+        // document is an assertion nobody reads when the document is quoted in a README.
         let model = two_turn("page.read", "The pricing page lists three plans.");
         let sdk = AgentSdk::builder()
             .model(model)
