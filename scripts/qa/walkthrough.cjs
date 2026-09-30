@@ -91,6 +91,26 @@ const wants = (name) => ONLY_ALL || ONLY.includes(name);
 const matchedOnly = new Set();
 /** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
 const MOBILE_NAMES = new Set();
+
+/**
+ * The floor for a control a thumb has to hit, in CSS pixels.
+ *
+ * One constant, because this file already contained the same drift twice in two shapes: a
+ * comment above the CDN rules measurement said "the 44px floor" while the code asserted 32,
+ * and the organization switcher's finding message tells the reader "44 is the floor for a touch
+ * target" while the branch fires at `< 40`. Both are the same failure — a sentence that states a
+ * number nothing derives from, so the two drift apart the first time either is edited and the
+ * next reader trusts the prose. The fix is not to be more careful writing the number twice; it
+ * is to have one place a number can be written, and to interpolate it into every message that
+ * mentions it.
+ *
+ * Why 32 and not 44: 44px is the Material/Apple guideline for a comfortable target, and the
+ * panel's dense table rows genuinely cannot reach it without changing the desktop design. 32px
+ * is the WCAG 2.2 AAA target floor and is what the CDN rules affordances are held to, so it is
+ * what the harness asserts. The message says 32 because that is the number the reader has to
+ * act on — "fix it to 44" would be advice the codebase does not take.
+ */
+const TOUCH_TARGET_MIN_PX = 32;
 const CREDS = {
   name: "QA Owner",
   email: "qa-owner@omnion.test",
@@ -6488,10 +6508,10 @@ async function runCdnRulesDepth(page, report) {
   steps.mobileNoTableScroll = await page.evaluate(
     () => document.documentElement.scrollWidth <= window.innerWidth + 1,
   );
-  // A card is a control a thumb can hit. The floor is the 32px the rest of the panel's mobile
-  // affordances are held to, and the assertion says 32 — the comment in the first version of
-  // this block said 44 while the code checked 32, which is a comment nobody reads against a
-  // number nobody re-checks.
+  // A card is a control a thumb can hit. The floor is `TOUCH_TARGET_MIN_PX`, defined once at the
+  // top of this file — the comment in the first version of this block said 44 while the code
+  // checked 32, which is a comment nobody reads against a number nobody re-checks, and the
+  // organization switcher's finding message still repeated the stale 44 for the switcher rows.
   //
   // Disabled buttons count. A rank-1 row's "Up" is correctly disabled, and excluding disabled
   // controls would measure a screen that is easier to use than it is.
@@ -6502,7 +6522,14 @@ async function runCdnRulesDepth(page, report) {
   // buttons the guess is the expensive way to find out that only "Delete" is at the floor. Each
   // entry carries its `data-cdn-rule-*` hook, its label and its height, so a report line points
   // at one line of `cdn-rules-view.tsx` instead of at a component.
-  const touch = await page.evaluate(() => {
+  //
+  // The floor is passed IN rather than closed over: `page.evaluate` serialises this function and
+  // runs it in the page, where `TOUCH_TARGET_MIN_PX` does not exist. Referencing it here is a
+  // `ReferenceError` at runtime — which `evaluate` reports as a rejected promise and this step's
+  // caller catches, so the measurement silently vanishes instead of failing. Node scope is not
+  // page scope, and a constant that reads as though it is shared is a trap that only fires in a
+  // browser.
+  const touch = await page.evaluate((minPx) => {
     const buttons = Array.from(document.querySelectorAll("[data-cdn-rule-row] button"));
     const measured = buttons
       .map((button) => ({
@@ -6511,14 +6538,15 @@ async function runCdnRulesDepth(page, report) {
         height: Math.round(button.getBoundingClientRect().height * 10) / 10,
       }))
       .filter((button) => button.height > 0);
-    const short = measured.filter((button) => button.height < 32);
+    const short = measured.filter((button) => button.height < minPx);
     return {
       total: measured.length,
       short: short.length,
+      floor: minPx,
       smallest: measured.length ? Math.min(...measured.map((button) => button.height)) : 0,
       shortControls: short,
     };
-  });
+  }, TOUCH_TARGET_MIN_PX);
   steps.mobileTouchTargets = touch.total > 0 && touch.short === 0;
   steps.mobileTouchTargetDetail = touch;
   await shot(page, "page-cdn-rules-mobile");
@@ -9955,7 +9983,8 @@ async function main() {
     log(`mobile switcher: ${JSON.stringify(sheet)}`);
   }
 
-  // The palette on a phone: a full-screen sheet with 44px rows and a reachable close control.
+  // The palette on a phone: a full-screen sheet with rows above the touch floor and a reachable
+  // close control.
   // Overlay shots are viewport-only: a full-page screenshot of a fixed sheet shows the page
   // below the fold as well, which reads as an overlay that fails to cover the screen.
   await mpage.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -10099,8 +10128,12 @@ async function main() {
   // account has no membership to switch between, which is a correct absence, not a failure.
   if (report.mobileSwitcher) {
     const sheet = report.mobileSwitcher;
-    if (sheet.minRow > 0 && sheet.minRow < 40) {
-      pushFindings("high", "tiny-target", `mobile organization switcher: rows are ${sheet.minRow}px tall (44 is the floor for a touch target)`);
+    // `TOUCH_TARGET_MIN_PX`, the same floor the CDN rules affordances are held to. The message
+    // used to say "44 is the floor for a touch target" while the branch fired below 40 — the
+    // reader was told to fix a number the assertion never used, which is advice that cannot be
+    // acted on and hides the real line when a row genuinely is short.
+    if (sheet.minRow > 0 && sheet.minRow < TOUCH_TARGET_MIN_PX) {
+      pushFindings("high", "tiny-target", `mobile organization switcher: rows are ${sheet.minRow}px tall (${TOUCH_TARGET_MIN_PX}px is the floor for a touch target)`);
     }
     // Only the *sheet* is anchored to the bottom edge; the panel that replaces it from `sm` up
     // is meant to hang beside its button. Asserting the sheet's anchoring on the panel reports
