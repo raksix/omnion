@@ -43,6 +43,35 @@ const CHROME = process.env.QA_CHROME || "/root/.cache/ms-playwright/chromium-123
 const MAX_PER_PAGE = Number(arg("max-per-page", "40"));
 const STEP_MS = Number(arg("step-ms", "380"));
 /**
+ * `--only=a,b` narrows the pass to the named routes and depth passes.
+ *
+ * The route list plus thirty depth passes is more work than one pass can finish inside the
+ * ceiling a browser pass is given, so a full pass started getting cut off partway through —
+ * and a pass that is cut off has proven nothing about the screens after the cut, while still
+ * looking like a pass in the log. Three requests (REQ-010, REQ-012, REQ-013) sat unverified
+ * for exactly that reason: the harness that was supposed to accept them could not reach their
+ * screens inside its own budget.
+ *
+ * A timeout is therefore the wrong instrument: the honest instrument is the budget. `--only`
+ * lets a loop spend one pass on the screens it just built, and every focused pass still walks
+ * its own routes, runs its own depth passes and writes the same report — it just does not
+ * pretend to cover the rest. The default (`--only=all`) walks everything, unchanged.
+ *
+ * A name that matches nothing is a finding rather than a silent no-op: a typo in a filter would
+ * otherwise produce an empty, entirely green report, which is the worst output this file can
+ * emit.
+ */
+const ONLY = (arg("only", "all") || "all")
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
+const ONLY_ALL = ONLY.includes("all");
+const wants = (name) => ONLY_ALL || ONLY.includes(name);
+/** Every route/depth-pass name this pass actually walked, so an unmatched filter is visible. */
+const matchedOnly = new Set();
+/** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
+const MOBILE_NAMES = new Set();
+/**
  * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
  * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
  * rows over the last thirty days, so the report screens have a multi-day shape to draw. It is the
@@ -5677,6 +5706,201 @@ async function runSecurityDepth(page, report) {
     await shot(page, "security-headers-restored");
   }
 
+  // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
+  //
+  // This screen and the sign-in one below had a rule engine, a policy editor, a live counter
+  // and a test console behind them, and no walk had ever opened either of them. A screen that
+  // is never rendered is not "mostly tested"; it is untested, and the two that ship first are
+  // the two whose failure is silent — a limit nobody can read is a limit nobody knows is set.
+  //
+  // The console is the interesting half: it answers "would THIS request be refused", which no
+  // screenshot of a form can show. So the pass asks a question the tester can see the answer
+  // to, and then edits a limit and asks it again — the policy must answer differently, or the
+  // editor is a text box with a save button.
+  await page.goto(`${URL_ADMIN}/security/rate-limits`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-rate-limits="ready"]', { timeout: 15000 }).catch(() => {});
+  const limitsReady = (await page.locator('[data-rate-limits="ready"]').count()) > 0;
+  note({ step: "rate-limits-loaded", rendered: limitsReady });
+  if (!limitsReady) {
+    note({ step: "rate-limits-missing", reason: "/security/rate-limits did not render its ready state" });
+  } else {
+    const limitRows = await page.locator("[data-rate-limit-row]").count();
+    note({ step: "rate-limit-rows", rows: limitRows });
+    if (limitRows < 1) {
+      note({ step: "rate-limit-registry-empty", reason: "no scope rendered a limit row" });
+    }
+    await shot(page, "security-rate-limits");
+
+    // Every row must say what its scope is allowed, not just how much: a number without a
+    // window is a number nobody can compare against anything.
+    const rowLabels = await page.$$eval("[data-rate-limit-row]", (nodes) =>
+      nodes.map((node) => ({
+        scope: node.getAttribute("data-rate-limit-row"),
+        inputs: node.querySelectorAll("input").length,
+      })),
+    );
+    note({ step: "rate-limit-row-shape", rows: rowLabels });
+    const inputless = rowLabels.filter((row) => row.inputs === 0);
+    if (inputless.length) {
+      note({ step: "rate-limit-row-not-editable", rows: inputless.map((r) => r.scope) });
+    }
+
+    // The tester: the screen's whole claim is "would THIS request be refused", and the answer
+    // comes from the server's own `decide` — the same function the middleware runs. So the pass
+    // asks a question through the real endpoint, with a counter no sane ceiling allows, and
+    // requires a verdict of `limited` plus the key it counted and the retry it would send.
+    //
+    // The endpoint is `POST /security/rate-limits/test` (`security.read`), the body is
+    // `{ method, path, client_ip, count, machine_key }` and the verdict is NESTED under
+    // `verdict`, beside `counter_identity`/`counter_key`. Guessing any of those — an invented
+    // `/probe` path, a flat `limited` boolean — produces a request that 404s or a read of
+    // `undefined` that compares false, and the step is then a green line that proves nothing.
+    //
+    // The CSRF header is the fourth thing a hand-written fetch gets wrong, and it is the one
+    // that fails *green*. A cookie-authenticated mutation with no `x-omnion-csrf` is refused
+    // with `csrf_unavailable` before the handler ever runs, so a pass that skipped it would
+    // record "the tester refused this request" about a screen that works perfectly in the hand
+    // above it. The token is the readable `omnion_csrf` cookie the panel's own client echoes.
+    const probe = await page.evaluate(async () => {
+      const csrf = document.cookie
+        .split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith("omnion_csrf="))
+        ?.slice("omnion_csrf=".length);
+      const answer = await fetch("/api/v1/security/rate-limits/test", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": decodeURIComponent(csrf) } : {}),
+        },
+        body: JSON.stringify({
+          method: "POST",
+          path: "/api/v1/auth/login",
+          client_ip: "203.0.113.7",
+          count: 400,
+          machine_key: false,
+        }),
+      });
+      return {
+        status: answer.status,
+        body: await answer.json().catch(() => null),
+        hadCsrf: Boolean(csrf),
+      };
+    });
+    note({
+      step: "rate-limit-test-endpoint",
+      status: probe?.status,
+      hadCsrf: probe?.hadCsrf,
+      scope: probe?.body?.verdict?.scope,
+      limited: probe?.body?.verdict?.limited,
+      ceiling: probe?.body?.verdict?.ceiling,
+      counterKey: probe?.body?.counter_key,
+      retryAfter: probe?.body?.verdict?.retry_after,
+    });
+    if (probe?.status !== 200) {
+      note({
+        step: "rate-limit-test-unreachable",
+        status: probe?.status,
+        code: probe?.body?.error?.code,
+        reason: "the tester endpoint did not answer 200",
+      });
+    } else if (probe.body?.verdict?.limited !== true) {
+      note({ step: "rate-limit-test-not-limited", reason: "a counter of 400 was not reported as limited" });
+    }
+
+    // Now the tester button on the screen itself, which is what a human uses: the same request
+    // has to survive the form, the client and the render.
+    await page.locator("[data-rate-limit-probe-count]").fill("400").catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-rate-limit-probe-run]").click({ timeout: 8000 }).catch(() => {});
+    await page
+      .waitForSelector('[data-rate-limit-probe-result]:not([data-rate-limit-probe-result="none"])', {
+        timeout: 20000,
+      })
+      .catch(() => {});
+    const probeVerdict = await page
+      .locator("[data-rate-limit-probe-result]")
+      .getAttribute("data-rate-limit-probe-result")
+      .catch(() => null);
+    note({ step: "rate-limit-console-verdict", verdict: probeVerdict });
+    if (!probeVerdict || probeVerdict === "none") {
+      note({ step: "rate-limit-console-silent", reason: "the tester ran and reported no verdict" });
+    }
+    await shot(page, "security-rate-limits-probe");
+
+    // An out-of-range limit must be refused by the FORM before it reaches the server — the
+    // field message is the whole point of validating here rather than on save.
+    const firstInput = page.locator("[data-rate-limit-input]").first();
+    const hadInput = (await firstInput.count()) > 0;
+    if (hadInput) {
+      await firstInput.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-rate-limits-local-error]").count()) > 0;
+      note({ step: "rate-limit-zero-refused", refused: localError });
+      if (!localError) {
+        note({ step: "rate-limit-zero-accepted", reason: "a limit of 0 was accepted by the form" });
+      }
+      await shot(page, "security-rate-limits-invalid");
+      // Put the field back so this pass cannot leave the policy disabled for a sibling's pass.
+      await firstInput.fill("");
+      await page.waitForTimeout(300);
+    }
+  }
+
+  // ---- The sign-in protection policy (REQ-012, slice 2) -------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/security/sign-in-protection`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector('[data-sign-in-protection="ready"]', { timeout: 15000 }).catch(() => {});
+  const protectionReady = (await page.locator('[data-sign-in-protection="ready"]').count()) > 0;
+  note({ step: "sign-in-protection-loaded", rendered: protectionReady });
+  if (!protectionReady) {
+    note({ step: "sign-in-protection-missing", reason: "the screen did not render its ready state" });
+  } else {
+    const lockedCount = await page
+      .locator("[data-locked-count]")
+      .first()
+      .innerText()
+      .catch(() => null);
+    note({ step: "locked-accounts", count: lockedCount });
+    await shot(page, "security-sign-in-protection");
+
+    // The policy has five fields; each must be editable and each must survive a save. A
+    // policy editor that renders read-only inputs still LOOKS like the security centre.
+    const fields = ["window_seconds", "attempts", "lockout_minutes", "base_delay_seconds", "progressive_delay"];
+    const present = [];
+    for (const field of fields) {
+      present.push([field, (await page.locator(`[data-lockout-field="${field}"]`).count()) > 0]);
+    }
+    note({ step: "lockout-fields", fields: present });
+    const missingFields = present.filter(([, ok]) => !ok).map(([name]) => name);
+    if (missingFields.length) {
+      note({ step: "lockout-field-missing", fields: missingFields });
+    }
+
+    // The reset_on_success switch is a boolean where every other field is a number: a form
+    // that validates all five the same way will either refuse a checkbox or accept nonsense.
+    const resetSwitch = await page.locator('[data-lockout-field="reset_on_success"]').count();
+    note({ step: "lockout-reset-switch", present: resetSwitch > 0 });
+
+    // An out-of-range attempts value must be refused with a field message, not saved.
+    const attempts = page.locator('[data-lockout-field="attempts"]').first();
+    if ((await attempts.count()) > 0) {
+      const before = await attempts.inputValue().catch(() => "");
+      await attempts.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-sign-in-protection-local-error]").count()) > 0;
+      note({ step: "lockout-zero-refused", refused: localError, before });
+      if (!localError) {
+        note({ step: "lockout-zero-accepted", reason: "attempts = 0 was accepted by the form" });
+      }
+      await shot(page, "security-sign-in-protection-invalid");
+      await attempts.fill(before);
+      await page.waitForTimeout(300);
+    }
+  }
+
   return { ok: true, steps };
 }
 
@@ -6130,13 +6354,29 @@ async function main() {
     { path: "/analytics/goals", name: "analytics-goals" },
     { path: "/analytics/realtime", name: "analytics-realtime" },
     { path: "/analytics/settings", name: "analytics-settings" },
+    // The security centre's five screens (REQ-012, slices 1–3). `runSecurityDepth` drives the
+    // overview, the findings store and the header policy, but it never opened the last two —
+    // and the same is true of the route list, so two screens that ship with rules, a policy
+    // editor and a live counter had never been rendered by anything. "No untested screen"
+    // means no untested screen: both are walked here and clicked by the depth pass below.
+    { path: "/security", name: "security-overview" },
+    { path: "/security/findings", name: "security-findings" },
+    { path: "/security/headers", name: "security-headers" },
+    { path: "/security/rate-limits", name: "security-rate-limits" },
+    { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
   ];
+  // `--only` narrows the route list; the default walks every entry above, unchanged.
+  const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
+  for (const route of walkedRoutes) matchedOnly.add(route.name);
+  if (!ONLY_ALL) {
+    log(`focused pass: ${walkedRoutes.length}/${routes.length} routes — ${ONLY.join(", ")}`);
+  }
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
   // memory) used to end the entire run, so every route after the crash and every depth pass
   // were skipped and no report was written at all. A page that dies is a finding about that
   // page; the pages after it still have to be looked at.
-  for (const route of routes) {
+  for (const route of walkedRoutes) {
     log(`page: ${route.name}`);
     try {
       await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -6163,139 +6403,201 @@ async function main() {
   // Each depth pass is isolated: one throwing must not skip the ones after it. A pass that
   // cannot run is a finding of its own ("this screen did not answer"), not a reason to end the
   // whole run before the remaining screens have been looked at.
-  report.mediaFiles = await runDepthPass("media-file-manager", () =>
-    runMediaFileManager(page, report),
-  );
+  if (wants("media-file-manager")) {
+    matchedOnly.add("media-file-manager");
+    report.mediaFiles = await runDepthPass("media-file-manager", () =>
+      runMediaFileManager(page, report),
+    );
+  }
 
   // The file detail screen (REQ-010, slice 2): a real file is opened, its preview renders, the
   // metadata saves, and the version history is read. This is the pass that proves the screen is
   // a screen — a route walked only by id would render its error state and look visited.
-  report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
-    runMediaFileDetail(page, report),
-  );
-  log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
+  if (wants("media-file-detail")) {
+    matchedOnly.add("media-file-detail");
+    report.mediaFileDetail = await runDepthPass("media-file-detail", () =>
+      runMediaFileDetail(page, report),
+    );
+    log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
+  }
 
-  report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
-  log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+  if (wants("media-presets")) {
+    matchedOnly.add("media-presets");
+    report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
+    log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
+  }
 
   // The storage tab (REQ-010, slice 3): the range refused by the form, a connection test that
   // says what it proved, and a save that leaves the untouched fields alone.
-  report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
-  log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
+  if (wants("media-storage")) {
+    matchedOnly.add("media-storage");
+    report.mediaStorage = await runDepthPass("media-storage", () => runMediaStorage(page, report));
+    log(`media storage: ${JSON.stringify(report.mediaStorage)}`);
+  }
 
   // The share tab (REQ-010, slice 3): the link is shown once and never again, the public URL
   // actually serves the bytes, and a revoke stops it on the very next request.
-  report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
-  log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+  if (wants("media-shares")) {
+    matchedOnly.add("media-shares");
+    report.mediaShares = await runDepthPass("media-shares", () => runMediaShares(page, report));
+    log(`media shares: ${JSON.stringify(report.mediaShares)}`);
+  }
 
   // The permissions tab (REQ-010, slice 4): the narrowing rule stated on the screen, the
   // chain a file inherits from, a deny refused when it names nothing, and a real deny that
   // names its subject by name rather than by uuid.
-  report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
-  log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
+  if (wants("media-grants")) {
+    matchedOnly.add("media-grants");
+    report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
+    log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
+  }
 
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
   // is dead until a keeper is chosen, the merge keeps the *chosen* file, and the result says the
   // bytes are pending rather than reclaimed.
-  report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
-    runMediaDuplicates(page, report),
-  );
-  log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
+  if (wants("media-duplicates")) {
+    matchedOnly.add("media-duplicates");
+    report.mediaDuplicates = await runDepthPass("media-duplicates", () =>
+      runMediaDuplicates(page, report),
+    );
+    log(`media duplicates: ${JSON.stringify(report.mediaDuplicates)}`);
+  }
 
   // The retention tab (REQ-010, slice 4): the policies state their consequence in a sentence,
   // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
   // sentence and writes a log row even when it found nothing, and the file's hold switch is on
   // the tab where the file's other facts are.
-  report.backups = await runDepthPass("backups", () => runBackups(page, report));
-  report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
-  log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
+  if (wants("backups")) {
+    matchedOnly.add("backups");
+    report.backups = await runDepthPass("backups", () => runBackups(page, report));
+  }
+  if (wants("media-retention")) {
+    matchedOnly.add("media-retention");
+    report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
+    log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
+  }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
+  if (wants("palette")) {
+    matchedOnly.add("palette");
   await runPalette(page, report);
-
+  }
   // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
+  if (wants("command-center")) {
+    matchedOnly.add("command-center");
   await runCommandCenter(page, report);
-
+  }
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
+  if (wants("search-depth")) {
+    matchedOnly.add("search-depth");
   await runSearchDepth(page, report);
-
+  }
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
   // settings screen with slice 4 — this pass visits what exists today.
+  if (wants("analytics-depth")) {
+    matchedOnly.add("analytics-depth");
   report.analyticsDepth = await runAnalyticsDepth(page, report);
-
+  }
   // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
   // completes it after it exists, and the funnel and the live counters are read back.
+  if (wants("analytics-goals-depth")) {
+    matchedOnly.add("analytics-goals-depth");
   report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
-  log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
+  }  log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
   // retention value, the exclusions' preview, a purge and an erasure proven against the QA
   // database.
+  if (wants("analytics-settings-depth")) {
+    matchedOnly.add("analytics-settings-depth");
   report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
-
+  }
   // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
   // path, and the three states. It runs after the analytics passes because it emits into the
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
+  if (wants("notifications-depth")) {
+    matchedOnly.add("notifications-depth");
   report.notifications = await runNotificationsDepth(page, report);
-  log(`notifications: ${JSON.stringify(report.notifications)}`);
+  }  log(`notifications: ${JSON.stringify(report.notifications)}`);
 
   // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
   // catalogue. It runs after the notification passes because it publishes a page, and the
   // content screens' own passes are ordered after it in the file.
+  if (wants("events-console")) {
+    matchedOnly.add("events-console");
   report.events = await runDepthPass("events-console", () => runEventsDepth(page, report));
-  log(`events: ${JSON.stringify(report.events)}`);
+  }  log(`events: ${JSON.stringify(report.events)}`);
 
   // The webhook endpoints and their delivery operations (REQ-016, slice 2). It runs right after
   // the events pass because it points an endpoint at a real receiver and reads what the
   // receiver actually accepted, which is the one claim on this screen no API status code can
   // make on its own.
+  if (wants("webhooks")) {
+    matchedOnly.add("webhooks");
   report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
-  log(`webhooks: ${JSON.stringify(report.webhooks)}`);
+  }  log(`webhooks: ${JSON.stringify(report.webhooks)}`);
 
   // The bus's own retention (REQ-016, slice 3). It runs after the events and webhook passes —
   // both of which count rows on the bus — because a sweep deletes, and a pass that deleted
   // first would make their numbers wrong for a reason that has nothing to do with them.
+  if (wants("event-retention")) {
+    matchedOnly.add("event-retention");
   report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
-  log(`retention: ${JSON.stringify(report.retention)}`);
+  }  log(`retention: ${JSON.stringify(report.retention)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
   // first would report a posture that the rest of the pass then invalidates.
-  report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
-  log(`security: ${JSON.stringify(report.security)}`);
+  if (wants("security")) {
+    matchedOnly.add("security");
+    report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
+    log(`security: ${JSON.stringify(report.security)}`);
+  }
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.
+  if (wants("notification-settings-depth")) {
+    matchedOnly.add("notification-settings-depth");
   report.notificationSettings = await runNotificationSettingsDepth(page, report);
-  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
+  }  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
 
   // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
   // passes because it emits into the same inbox, and it cleans up every row it creates — a QA
   // database that grows a notification per pass is one whose counts stop meaning anything.
+  if (wants("notification-outbox-depth")) {
+    matchedOnly.add("notification-outbox-depth");
   report.notificationOutbox = await runNotificationOutboxDepth(page, report);
-  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
+  }  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
   // preview and save, reopen, and read the history tab back.
+  if (wants("iam-roles-depth")) {
+    matchedOnly.add("iam-roles-depth");
   report.iamRoles = await runIamRolesDepth(page, report);
-
+  }
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
+  if (wants("iam-subjects-depth")) {
+    matchedOnly.add("iam-subjects-depth");
   await runIamSubjectsDepth(page, report);
-
+  }
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
+  if (wants("iam-policies-depth")) {
+    matchedOnly.add("iam-policies-depth");
   report.iamPolicies = await runIamPoliciesDepth(page, report);
-  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
+  }  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
   // and a diff on save, the session list with a real revoke, the device registry and the MFA
   // enrolment dialog.
+  if (wants("iam-security-depth")) {
+    matchedOnly.add("iam-security-depth");
   await runIamSecurityDepth(page, report);
-  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
+  }  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
   const signOut = page.locator('button:has-text("Sign out")').first();
@@ -6311,27 +6613,35 @@ async function main() {
   // The passkey pass (REQ-006, slice 3b): a virtual authenticator enrols a passkey on the
   // owner's own account, the panel lists it, the sign-in asks for it and completes with it, and
   // the pass is removed again so the account is back to its password.
+  if (wants("passkeys-depth")) {
+    matchedOnly.add("passkeys-depth");
   await runPasskeysDepth(page, report);
-  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
+  }  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
   // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
   // refusals of the ask form. It runs after the count-sensitive passes because an approval adds a
   // time-boxed binding (and the generated grant role) to the organization.
+  if (wants("iam-approvals-depth")) {
+    matchedOnly.add("iam-approvals-depth");
   await runIamApprovalsDepth(page, report);
-  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
+  }  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
 
   // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
   // round trip through the real endpoint from this browser, read the sync log back, revoke the
   // token and prove it is refused afterwards.
+  if (wants("iam-provisioning-depth")) {
+    matchedOnly.add("iam-provisioning-depth");
   await runIamProvisioningDepth(page, report);
-  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
+  }  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
   // read the "secret is a name, not a value" chip, run the discovery test and require it to
   // report a *result* (a provider that is not configured yet answers "failed", not a 500), then
   // remove the provider and see the list go back to its empty state.
+  if (wants("iam-authentication-depth")) {
+    matchedOnly.add("iam-authentication-depth");
   await runIamAuthenticationDepth(page, report);
-  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
+  }  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
 
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
   // mobile screenshot would be the sign-in screen and no mobile layout would really be measured.
@@ -6342,7 +6652,16 @@ async function main() {
   if (!report.mobileLogin) {
     log("mobile pass: the sign-in did not land — the mobile screenshots will show the login form");
   }
-  for (const route of [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }]) {
+  // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
+  // as a known name instead of reporting it as unmatched.
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }];
+  for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
+  // The phone pass follows `--only` for the same reason the route loop does, and the five
+  // security screens join it: a layout that has never been measured at 390px has not been
+  // tested on a phone, and the security centre is where an administrator reads a verdict.
+  for (const route of (ONLY_ALL
+    ? mobileRoutes
+    : mobileRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(800);
     const diag = await diagnostics(mpage);
@@ -6439,6 +6758,28 @@ async function main() {
   const clicks = clickLines.filter((e) => e.action === "click");
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
+
+  // A `--only` filter that matches nothing is a finding, not an empty green report.
+  //
+  // The failure this prevents is specific: a typo in the filter walks zero routes and zero
+  // depth passes, writes a complete-looking summary with zero high findings, and is then read
+  // as "the screens passed". The one thing a focused pass must not be is indistinguishable
+  // from a pass that proved nothing because it was pointed at nothing. The count is also
+  // printed in the log line above, so a reader can tell how much of the panel was covered.
+  if (!ONLY_ALL) {
+    const unmatched = ONLY.filter((name) => !matchedOnly.has(name) && !MOBILE_NAMES.has(name));
+    if (matchedOnly.size === 0) {
+      pushFindings(
+        "high",
+        "empty-pass",
+        `--only=${ONLY.join(",")} matched no route and no depth pass: this pass proved nothing`,
+      );
+    }
+    for (const name of unmatched) {
+      pushFindings("high", "unknown-pass-name", `--only=${name} matches no route and no depth pass`);
+    }
+    log(`focused pass coverage: ${matchedOnly.size} route/pass name(s) walked, ${unmatched.length} unmatched`);
+  }
 
   for (const p of report.pages) {
     const d = p.diagnostics;

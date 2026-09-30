@@ -100,13 +100,25 @@ if [ ! -x target/debug/omnion-api ] \
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
+# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
+# handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
+# walkthrough that saves a header policy, uploads a file or takes a backup would record screens
+# that "work" while the API answered 403 the whole time -- and because that refusal is the
+# documented behaviour of a deployment *without* a secret, it reads as the product being correct
+# rather than the harness being under-configured. It is a throwaway value: the process points at
+# a database that was dropped two lines above and listens on loopback.
+#
+# The comment sits here rather than inside the command because a `#` line between two backslash
+# continuations is not a comment: bash keeps reading the command, `#` and the words after it
+# become its arguments, and `pm2 start` is handed a stray name it never recovers from.
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+  OMNION_DATABASE_URL="postgres://omnion:***@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
+  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
