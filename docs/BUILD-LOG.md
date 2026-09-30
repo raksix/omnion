@@ -7176,3 +7176,51 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
+
+## 2026-09-30 · wave8 tick 34 — the merge, and what the merge tool got wrong five times
+
+**What.** `main` had moved (seven backup-restore commits), so this tick began with
+`git merge origin/main`. Eleven files auto-merged; **`docs/BUILD-LOG.md` conflicted**, because
+nine writers append to one file and everybody was appending. Commit `ba883230`.
+
+**Why the interesting part is the tool, not the conflict.** A line-level three-way merge of an
+append-only log is not a small problem. Five attempts, each one caught by a check rather than by
+reading:
+
+1. **Line-level diffing drops the base.** `SequenceMatcher` matched the tail of one side against
+   an unrelated region of the other and the 444 lines between them vanished. Diffing *entries*
+   instead of lines is the fix.
+2. **A heading is not a unique key.** Two writers can title two different entries the same way —
+   there are nine duplicate headings in this log — so keying by heading silently deletes a whole
+   body. An append-only log's only legal change is a new entry at the end, so the merge subtracts
+   content and **appends**; it never diffs for a position.
+3. **A shared depletion counter is not two counters.** One `Counter(base)` consumed by *ours* left
+   main's 70 base entries looking new, and a 6783-line log came out at 11335. Each side gets its
+   own copy.
+4. **"Both sides wrote it, so keep one" is data loss.** Deduplicating identical entries read like
+   hygiene and deleted a legitimately repeated entry; the subset check named it immediately.
+5. **The final gate was itself wrong, and it was the one that blocked the write.** Summing both
+   sides into a multiset wants every *shared* line twice, so the merged file — which has it once —
+   read as missing. It is a per-side **subset** check, not a sum.
+
+**What the checks are worth, separately.** The "73 lost lines" that sent me looking was a **split
+rule artifact**: entries were split on `## ` only, so the `# Tick 60` h1 entry was absorbed into
+the previous block. Split on `# ` and `## ` and the "loss" is a trailing `---` separator. Two of my
+own alarms were formatting, one was a real duplicated entry, and **none was lost history** — the
+independent verifier agrees every entry from all three stages survives with its prose in order.
+An append-only log's four invariants are cheap to state and worth more than the diff: no base entry
+lost, base order unchanged, every appended entry present verbatim, no entry that lost a prose line.
+
+**Gates this tick (no browser needed, which is why they were worth running while queued).**
+`omnion-audit --lib` **2/2**; `omnion-workflows --lib` **56/56**; `pnpm typecheck` in `apps/admin`
+**exit 0**.
+
+**Blocked, and the block is a sibling's legitimate claim.** The w8 pass is queued for the QA slot.
+`/tmp/omnion-qa-slot-holders/2077528-1790724821` names place 2077528, which is dead — **and the
+place file is named after `qa-slot.sh`'s own `$$`, which exits the moment it takes the place.** The
+live holder is the pid *inside* that file, 3355724, and its cwd is `/mnt/apopic/omnion-w3`. A
+holder that is alive and working is not stale, and taking it would be the one genuinely damaging
+thing this tick could do. Not taken; not worked around.
+
+**Next.** The w8 pass the moment w3's pass ends — it is what slice 5's three screens are waiting on,
+and acceptance 9, 10 and 12 all turn on it. Then the switcher and its URL state (acceptance 3).
