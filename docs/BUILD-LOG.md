@@ -4933,3 +4933,70 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
+
+## 2026-09-30 — REQ-100 slice 1 (the registry) and the missing write behind 620 "high findings"
+
+**What.** The tool registry: four tables (`ai_tools`, `ai_identities`, `ai_tool_grants`,
+`ai_tool_calls` — migration 0173), the store and its seeder, five routes, both screens, four
+permission keys, ten event names and the walkthrough that drives them. `fc9fe79a` …
+`938dea7d`, pushed to `wave7`.
+
+**The other half of this tick, and the more valuable one.** The AI-scoped pass landed, and the
+wizard completed **all eight steps** for the first time — the CSRF fix from last tick worked.
+The report still said "740 high findings", so I read it instead of counting it again.
+
+`summary.json` says 456 console errors, 271 failed requests, 13 click errors. Collapsed to URLs:
+`/api/v1/ai/agents` 136 times, `/ai/runs?limit=200` 66, `/ai/skills` 65 — all 400. And
+`diagnostics.json` says the only real UI finding is 15 tiny targets; three of them are a
+**Retry** button, which is the error banner on exactly those three screens.
+
+The database said `orgs=1 users=1 sites=1` and `qa-owner@omnion.test | NULL`. **The setup
+wizard created the first organization and never put the owner inside it.**
+`onboarding::create_organization` writes `onboarding_state.organization_id` and stops; the API's
+tenancy scope does not read the onboarding state, it reads `users.organization_id`. So a fresh
+installation reported a complete setup and then answered every org-scoped route with
+`organization_required` behind a Retry button that could never succeed.
+
+**Why it survived three ticks and looked like a product defect.** A number near 700 reads as a
+broad, systemic problem, so it invited "the AI hub is broken" rather than "one write is missing".
+The two screens that showed it (agents, skills) are precisely the ones a reader assumes are new,
+so each tick's note said the blocker was "the QA slot" or "the CSRF secret" and moved on. What
+finally broke it was not a bigger number but a **740 that stopped changing after a fix that
+should have moved it**: the CSRF fix was real, the wizard really did complete, and the number
+barely moved. A fix that works and a number that does not move are two facts, and only one of
+them was true.
+
+`fc9fe79a` adds `users::set_user_organization` to the identity crate and calls it from the step
+that creates the organization. The regression test reads `create_organization`'s own body out of
+the file, so deleting the line fails the build rather than re-shipping the silence.
+
+**Proof this tick.** `cargo test -p omnion-ai-hub -p omnion-onboarding -p omnion-identity --lib`
+→ **384 + 6 + 112 passed, 0 failed**. `cargo build -p omnion-api` → **rc=0**.
+`tsc -p apps/admin/tsconfig.json --noEmit` → **clean**. `node --check scripts/qa/walkthrough.cjs`
+→ OK.
+
+**Two decisions in the migration that a reader should be able to argue with.** `ai_tool_grants
+.effect` is a boolean, not a nullable tri-state, because the request's third state is *inherit* and
+inherit is the **absence of a row** — a nullable column would carry it in the database too, and
+then every read would have to remember to filter it. And there is deliberately **no** `risk <>
+'high' or requires_approval` check: the screen spec asks for a warning stripe on exactly that
+combination, and a database that refuses to store it makes the warning unreachable.
+
+**Also fixed before committing: a QA assertion that could not fail.** The first draft of
+`runAiToolsDepth` contained `? true : true` written to look like a property, and a call to
+`POST /ai/tools/__reseed` — an endpoint that does not exist and always answered 404. Both were
+green. A tautology in a QA pass reports coverage nobody has, and it is worse than a missing
+check because it looks like the check. The re-seed criterion is now honestly *unclaimed*, with a
+comment saying the only way to prove it is a Rust test.
+
+**Disk.** `/mnt/apopic` hit **100% (0 bytes)** mid-tick, which made `patch` fail with `No space
+left on device` and left a 0-byte `apps/api/src/routes/.hermes-tmp.*` behind. Reclaimed my own
+`.tmp-target` (3.3 GB): no cargo holder, no open fds, zero files written in 30 minutes. The
+/tmp/w7 build target is on `/root/w7target` because `/dev/shm` is 100% full from eight sibling
+writers.
+
+**Next.** Re-run the AI-scoped pass. If the onboarding fix holds, the 400s and the three Retry
+banners go and `runAiAgentsDepth` executes for the first time, which is REQ-099's close gate.
+Then REQ-100 slice 2: `ai_identities` and `ai_tool_grants` CRUD, `/ai/identities`,
+`/ai/permissions`, and the tri-state matrix where a disabled cell writes no grant row and a
+deny writes `effect = false`.
