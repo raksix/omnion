@@ -114,6 +114,7 @@ pub mod public;
 pub mod readyz;
 pub mod reliability_idempotency;
 pub mod reliability_limits;
+pub mod reliability_retries;
 pub mod scim;
 pub mod search;
 pub mod security;
@@ -1185,6 +1186,58 @@ pub fn router(state: AppState) -> Router {
                     delete(reliability_idempotency::release_key)
                         .layer(guards::require(&state, "reliability.manage")),
                 ),
+        )
+        // Retries and breakers (REQ-127 slice 3). The two screens a worker is read through at
+        // 03:00: what is the policy, what has been tried, what is dead-lettered, and which
+        // providers the platform is refusing to call right now.
+        .route(
+            "/reliability/retry-policies",
+            get(reliability_retries::list_policies)
+                .layer(guards::require(&state, "reliability.read")),
+        )
+        .route(
+            "/reliability/retry-policies/{subsystem}",
+            put(reliability_retries::save_policy)
+                .layer(guards::require(&state, "reliability.manage")),
+        )
+        .route(
+            "/reliability/retry-attempts",
+            get(reliability_retries::list_attempts)
+                .layer(guards::require(&state, "reliability.read")),
+        )
+        .route(
+            "/reliability/retry-attempts/{id}/retry-now",
+            post(reliability_retries::retry_now)
+                .layer(guards::require(&state, "reliability.manage")),
+        )
+        .route(
+            "/reliability/breakers",
+            get(reliability_retries::list_breakers)
+                .layer(guards::require(&state, "reliability.read")),
+        )
+        .route(
+            "/reliability/breakers/{key}",
+            patch(reliability_retries::update_breaker)
+                .layer(guards::require(&state, "reliability.manage")),
+        )
+        .route(
+            "/reliability/breakers/{key}/reset",
+            post(reliability_retries::reset_breaker)
+                .layer(guards::require(&state, "reliability.manage")),
+        )
+        .route(
+            "/reliability/breakers/{key}/force-open",
+            post(reliability_retries::force_open_breaker)
+                .layer(guards::require(&state, "reliability.manage")),
+        )
+        // The gate every outbound subsystem's client calls. `reliability.read` rather than
+        // `manage` because observing a breaker is what a caller DOES, not what an operator
+        // edits — and gating it behind `manage` would mean the AI hub's runtime token cannot
+        // record that a provider is down.
+        .route(
+            "/reliability/breakers/{key}/observe",
+            post(reliability_retries::observe_breaker)
+                .layer(guards::require(&state, "reliability.read")),
         )
         .route(
             "/security/sign-in-protection",
