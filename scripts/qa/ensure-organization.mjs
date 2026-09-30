@@ -32,8 +32,18 @@ const URL_API = arg("url", "http://127.0.0.1:18080");
 const URL_ADMIN = arg("admin", "http://127.0.0.1:3100");
 const NAME = arg("name", "QA Organization");
 const SLUG = arg("slug", "qa-org");
-const EMAIL = arg("email", "qa-owner@omnion.test");
-const PASSWORD = arg("password", "OmnionQa-Passw0rd-2026!");
+// These must be the SAME constants the pass itself uses (`CREDS` in walkthrough.cjs), and they
+// were not: this file signed in as `qa-owner@omnion.test` while the walkthrough's form filler
+// writes `qa-sample@omnion.test` into any email field it finds, so the wizard CREATED
+// `qa-sample@omnion.test` and every API sign-in as `qa-owner@` answered 401 -- silently, because a
+// 401 here prints one line and leaves the run going. The database held a platform account and an
+// empty organizations table, and every rule screen reported an empty tenant.
+//
+// The two spellings are a single constant, not a convention: one owner, one address, written once
+// and read by both. `CREDS` is the source; this file is told, and the environment overrides it for
+// a stack with a different owner.
+const EMAIL = arg("email", process.env.QA_OWNER_EMAIL || "qa-owner@omnion.test");
+const PASSWORD = arg("password", process.env.QA_OWNER_PASSWORD || "OmnionQa-Passw0rd-2026!");
 
 // The panel's `/api/v1/*` routes are the ones the browser uses, so the cookie the CSRF guard
 // reads is minted by the same origin the walkthrough signs in against. Talking to the API

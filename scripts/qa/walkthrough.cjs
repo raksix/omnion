@@ -80,6 +80,11 @@ const MOBILE_NAMES = new Set();
 const QA_PG_CONTAINER = arg("db-container", process.env.QA_PG_CONTAINER || "omnion-postgres");
 const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
 
+// One owner, one address, written once. The form fillers below used to answer an email field with
+// a hardcoded `qa-sample@omnion.test` while this object said `qa-owner@omnion.test`, so the wizard
+// created one account and every API sign-in in the harness addressed a different one -- a 401 on
+// every call, printed as one line and never raised. The QA database ended up with a platform
+// account, no organization, and every rule screen reporting an empty tenant.
 const CREDS = {
   name: "QA Owner",
   email: "qa-owner@omnion.test",
@@ -661,8 +666,13 @@ async function ensureSignedIn(page, report) {
 
 function sampleValueFor(meta) {
   const key = `${meta.type} ${meta.name} ${meta.label} ${meta.placeholder}`.toLowerCase();
-  if (meta.type === "email" || /e-?mail/.test(key)) return "qa-sample@omnion.test";
-  if (meta.type === "password") return "Sample-Passw0rd!";
+  // Email and password come from `CREDS`, because this function fills the first-run wizard's OWN
+  // account form. It used to answer with its own literals -- `qa-sample@…` and
+  // `Sample-Passw0rd!` -- while `CREDS` said `qa-owner@…` and `OmnionQa-Passw0rd-2026!`, so the
+  // wizard created an account the harness could not sign in to, and every later API call answered
+  // 401 for the rest of the pass. Two spellings of one account, and the pass could not see it.
+  if (meta.type === "email" || /e-?mail/.test(key)) return CREDS.email;
+  if (meta.type === "password") return CREDS.password;
   if (/model/.test(key)) return "gpt-4o-mini\ntext-embedding-3-small";
   if (/api.?key|secret|token/.test(key)) return "sk-qa-sample-key";
   if (/^https?:\/\//.test(meta.label) || /example\.com|\.test\/|\/v1/.test(meta.label)) return "https://api.openai.com/v1";
@@ -679,7 +689,10 @@ function sampleValueFor(meta) {
 }
 
 async function fillSubtree(page, selector) {
-  return page.evaluate((sel) => {
+  // The callback below runs INSIDE the page: `page.evaluate` serialises it, so it closes over
+  // nothing. Reading `CREDS.email` from inside it is a ReferenceError in the browser, not in Node --
+  // which is why the two constants are passed in as an argument instead of captured.
+  return page.evaluate(({ sel, email, password }) => {
     const root = document.querySelector(sel);
     if (!root) return [];
     const filled = [];
@@ -704,8 +717,8 @@ async function fillSubtree(page, selector) {
       }
       const key = `${el.type} ${el.name} ${el.id} ${el.placeholder}`.toLowerCase();
       let value = "QA sample";
-      if (el.type === "email" || /e-?mail/.test(key)) value = "qa-sample@omnion.test";
-      else if (el.type === "password") value = "Sample-Passw0rd!";
+      if (el.type === "email" || /e-?mail/.test(key)) value = email;
+      else if (el.type === "password") value = password;
       else if (el.type === "url" || /url|endpoint/.test(key)) value = "https://api.omnion.test/v1";
       else if (el.type === "number") value = "42";
       else if (/slug|key/.test(key)) value = SAMPLE_SLUG;
@@ -718,7 +731,7 @@ async function fillSubtree(page, selector) {
       filled.push({ field: (el.id || el.name || el.type || "input").slice(0, 40), value });
     }
     return filled;
-  }, selector);
+  }, { sel: selector, email: CREDS.email, password: CREDS.password });
 }
 
 async function clickPrimaryIn(page, selector) {
