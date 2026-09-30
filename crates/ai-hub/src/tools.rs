@@ -195,12 +195,27 @@ pub enum DenyReason {
     BadArguments,
     /// The tool started and was cut off by its own `timeout_ms`.
     ///
-    /// Added with the execution pipeline (REQ-100 slice 3). A timeout used to reach the loop as
-    /// `ToolDenied`, which is a lie the trace could not recover from: the reader saw a *denial*
-    /// for a tool that was permitted, ran, and ran out of time. The variant exists so
+    /// Added with the execution pipeline (REQ-100 slice 3). A timeout used to reach
+    /// the loop as `ToolDenied`, which is a lie the trace could not recover from: the reader saw
+    /// a *denial* for a tool that was permitted, ran, and ran out of time. The variant exists so
     /// `as_execution` has something truthful to map to, and `tool_timeout` is the code the model
     /// reads back.
     ToolTimeout,
+    /// An operator switched this tool off for the whole installation.
+    ///
+    /// **Not the same fact as [`Self::ToolDenied`], which is why it is its own variant.** A denial
+    /// is about this agent's allow-list and this identity's grants, and the fix is a grant. A
+    /// disable is a global operator decision on `/ai/tools`, the tool is not in the run's payload
+    /// at all, and the fix is for a person to switch it back on. A model told `tool_denied` here
+    /// draws the wrong lesson and retries — the run's transcript would show a tool nobody is
+    /// allowed to switch back on for that agent.
+    ToolDisabled,
+    /// The run exhausted this agent's per-run tool-call budget.
+    ///
+    /// Also a limit rather than a permission, and it collided with `ToolDenied` the same way: a
+    /// run that had simply used its allowance read as a policy refusal. The model can act on this
+    /// one — it has done what it was allowed to do.
+    ToolLimited,
 }
 
 impl DenyReason {
@@ -213,6 +228,8 @@ impl DenyReason {
             Self::ApprovalRequired => "approval_required",
             Self::BadArguments => "tool_bad_arguments",
             Self::ToolTimeout => "tool_timeout",
+            Self::ToolDisabled => "tool_disabled",
+            Self::ToolLimited => "tool_limited",
         }
     }
 
@@ -225,6 +242,24 @@ impl DenyReason {
             "approval_required" => Some(Self::ApprovalRequired),
             "tool_bad_arguments" => Some(Self::BadArguments),
             "tool_timeout" => Some(Self::ToolTimeout),
+            // **Added because the table above is what the doc comment on the caller promises.**
+            // `tool_disabled` is one of the codes `CallOutcome::Refused` documents, and it was
+            // missing here, so `from_code` returned `None` and the caller fell back to
+            // `ToolDenied`. The consequence is not cosmetic: an operator switching a tool off on
+            // `/ai/tools` is a different fact from an agent lacking a permission, and the loop
+            // feeds `reason.code()` to the model and to the guardrail, so a model that called a
+            // globally-disabled tool was told its *allow-list* refused it — and would sensibly
+            // retry the same call for the rest of the run, because the lesson it drew ("ask the
+            // operator for the permission") is the wrong one.
+            //
+            // The same hazard already cost this enum one variant: `tool_timeout` used to reach
+            // the loop as `ToolDenied`, which is why `ToolTimeout` exists above. This is the same
+            // bug wearing a different code.
+            "tool_disabled" => Some(Self::ToolDisabled),
+            // A cap breach is a refusal too, and it collides the same way. `tool_limited` used to
+            // arrive at the loop as `ToolDenied`, so a run that exhausted its per-agent tool budget
+            // read as a permissions problem.
+            "tool_limited" => Some(Self::ToolLimited),
             _ => None,
         }
     }
