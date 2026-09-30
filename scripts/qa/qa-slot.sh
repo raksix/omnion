@@ -50,11 +50,24 @@ reap() {
   for f in "$LOCKDIR"/*; do
     [ -e "$f" ] || continue
     pid="$(basename "$f")"
-    # "<holder> <owner>" — the holder so run.sh can kill it, the owner so the next pass
-    # can tell a real pass from a corpse. An entry with no owner predates this and is
-    # treated as unknown rather than as live.
-    holder="$(cut -d' ' -f1 "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
-    owner_pid="$(cut -d' ' -f2 "${HOLDERDIR}/${pid}" 2>/dev/null || echo '')"
+    # "<holder> <owner>" — field ONE is the holder, so `run.sh` can kill it; field TWO is the
+    # pass, so the next waiter can tell a real pass from a corpse. Both fields are addressed by
+    # POSITION and never by "the last field", which is the tempting one-liner and is wrong here:
+    # `$NF` on a two-field line is the *owner*, so the reaper would test the pass's liveness
+    # while calling it the holder and then `kill` the live pass whose place it was asked to
+    # inspect — the one operation in this file that destroys a running pass instead of a corpse.
+    #
+    # A file with a single field is the older format (holder only, no owner recorded). It is
+    # still parsed, and the missing owner is left empty so the owner test below is skipped
+    # rather than run against the holder's own pid.
+    holder="$(awk '{print $1}' "${HOLDERDIR}/${pid}" 2>/dev/null || true)"
+    owner_pid="$(awk '{print $2}' "${HOLDERDIR}/${pid}" 2>/dev/null || true)"
+    # A field that is not a number is a truncated write or a file somebody edited by hand. `kill -0`
+    # rejects it, and a rejected probe would otherwise be read as "the process is gone" — so a
+    # malformed line is treated as an unparseable record and falls into the stale branch below,
+    # which is the only branch that removes things.
+    case "$holder" in (''|*[!0-9]*) holder='' ;; esac
+    case "$owner_pid" in (''|*[!0-9]*) owner_pid='' ;; esac
     age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
     [ "$age" -gt "$grace" ] || continue
     # No holder file at all, this long after the place appeared, means the pass died between

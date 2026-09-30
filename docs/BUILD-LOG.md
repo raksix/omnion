@@ -7298,3 +7298,227 @@ about the box.
 writers' rustc, so the build target was moved to `/root/w5target` — `/mnt/apopic` sat at 98% with
 1.6 G free and `/dev/shm` at 99% with eight siblings' targets on it. Reclaim only your own
 artifacts, and check an open fd, a recent write and a live cwd before deleting anything.
+
+---
+
+## Tick 74 — the check that had been red since the request was written
+
+**What.** A criterion left open since tick 1 — *the status card's age is consumed by the security
+overview check* — turned out to be hiding a defect that had been in the platform since the
+request was written, and the reading of it is the whole tick. `backup_age` in
+`apps/api/src/routes/security.rs` asked **`backup_runs`** for the last successful run. **No
+migration in this repository has ever created `backup_runs`.** The table is `backups`
+(`0157`); the name was guessed when the request predated the schema and never revisited when the
+schema landed. A missing table makes `fetch_optional` answer `Err`, `Err` was flattened into "no
+backup", and `backup_healthy` answered **`fail` on every installation, for ever** — the one
+check in the registry that could never go green, on a platform that had taken a backup every night
+for a year, with a detail that named the right rule for entirely the wrong reason.
+
+**Why nothing caught it, and why that is the interesting half.** `backup_healthy` is a pure
+function of a hand-built `Environment`, so no unit test ever executed the query. An integration
+test asserting "no backup → `fail`" would have stayed green for ever, because **the broken reader
+*is* a permanent no-backup.** The two worlds are indistinguishable from inside the code and only
+distinguishable from outside it: the walk has to take a real backup and then read the screen.
+This is the second time in two features that the missing thing was a caller — `next_due_schedules`
+shipped with a column and a query and no writer, and `prune_candidates` shipped with four
+documented exemptions and nothing calling it. A predicate nothing evaluates is a comment.
+
+**The second defect surfaced only because the walk signed in as a restricted account.** Every walk
+that had ever read the posture screen signed in as an account holding *both* keys — the platform
+owner's role is granted everything, and a walk that also touches analytics needs them. So the
+security centre had been written **inside the `analytics_reports` router builder**, whose
+`route_layer(require("analytics.read"))` reaches every route declared on it. `/security/overview`
+carried its own, correct `security.read` guard on the handler *and* an `analytics.read` guard it
+never declared: an account holding `security.read` and nothing else was refused with `403 this
+action requires the "analytics.read" permission` — on the screen whose entire purpose is to be
+readable by the person doing the diagnosing. A deployment granting the least would have found the
+security centre unreadable, and the natural response to that is to grant more. **A guard that is
+only ever satisfied is not a guard that was checked.** The group now has its own `Router::new()`
+and its own `merge`, and the comment states the rule for the next group added there.
+
+**A third defect, in a test, of the family this suite keeps finding.** The cancel walk asserted
+`select count(*) from backup_restore_jobs` — no `where` — in a database every suite in
+`apps/api/tests` shares. A row any other walk had left behind (a killed run, a concurrent suite)
+failed it with *"a refused queue wrote a row"*: a sentence about this tenant's refusals, read off
+the whole platform's table. It is now scoped to its own tenant. Same shape as the media-part leak
+one feature ago — a test that creates fixtures for exactly one organization cannot tell "the whole
+deployment" from "my own" apart.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| `omnion-backup --lib` | **153/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/api --test backups` | **26/26** over a live database, each walk run in its own process |
+| `apps/admin` `tsc --noEmit` | clean |
+| Load-bearing | the posture walk is **red** when the reader is reverted to counting any finished row, **green** on the fix |
+
+**The suite cannot be run as one process, and the reason is the suite's own design.**
+`cargo test -p omnion-api --test backups` in parallel gave **18 passed / 8 failed**; the same eight
+walks pass individually, and `--test-threads=1` hung in the ninth with a live process, no query
+outstanding, `not granted` locks 0 and a main thread in `futex`. Every walk builds a `Fixture`
+that **opens a scratch database per test**, and 26 of them at once exhaust the shared pool's
+`max_connections = 100` — the same finding the w5 loop recorded, one suite over. A contention
+failure that reports itself as `FAILED` with no panic message is the expensive kind: it reads as a
+product regression and sends the next tick hunting a defect that is not there. The pass that
+counts is 26 walks in 26 processes, and the number worth reporting is that, not the parallel one.
+
+**Next.** (a) The browser pass — the QA slot was held by a sibling for the whole tick, and the
+route list is longer than the 25 minutes the harness's own ceiling allows, so it needs the
+trimmed-route variant rather than a longer `timeout`. (b) The `partial`-run UI. (c) Slice 4,
+encryption.
+
+## Tick 75 — 2026-09-30 — REQ-012 slice 3 (rate limiting + lockout), plus the harness that had to be fixed to run it
+
+**What.** The security centre's two limiter screens (`/security/rate-limits`,
+`/security/sign-in-protection`) had never been opened by anything. Four commits:
+
+| Commit | Change |
+|---|---|
+| `1ded0b5c` | `--only` narrows a pass to named routes/depth passes; both screens walked on desktop and at 390px; the QA API now gets an `OMNION_CSRF_SECRET` |
+| `5ca68087` | a QA-slot holder file with two pids on one line deadlocked the pass queue |
+| `9e91f2c9` | the QA API could not reach its own database — a masked `***` password |
+| `669d584d` | the account lockout was unreachable behind the address lockout |
+| `25dddf5c` | a pass died when its click stream could not be written |
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| The lockout, measured | before: `403 address_blocked` x10, `429 rate_limited` x2, `users.failed_sign_in_count` = **0**, `locked_until` = never |
+| The slot deadlock | `reap` resolved `2332198 2332152` -> `2332152`, found it dead, freed the place |
+| The database credential | `psql` over TCP with the exact string `run.sh` hands the process returns `1` |
+| The click stream | `record()` against a missing directory warns once, keeps all 3 clicks |
+
+**The finding worth the tick.** The account lock and the address lock were compared against the
+**same number** (`lockout_attempts`). From one address the address rule therefore fired on the
+exact attempt that would have incremented the account counter, so the counter never moved, no
+account was ever locked, and the "currently locked accounts" table had no possible content. The
+module doc above `sign_in` states that the two dimensions exist for different reasons; the code
+gave them one value. The address threshold is now `lockout_attempts * 3`.
+
+**Three harness defects the pass had been hiding behind.**
+
+1. *The QA API had no `OMNION_CSRF_SECRET`.* Every cookie-authenticated write was refused with
+   `csrf_unavailable` before its handler ran — so every save, upload and backup in every pass
+   was recorded as a screen that "works" while the API answered 403 throughout. The refusal is
+   the documented behaviour of a deployment *without* a secret, which is why it read as the
+   product being correct.
+2. *The QA API's database password was `***`* — a masking artifact, committed long enough to
+   look deliberate. It survived a previous check because that check ran `docker exec psql`, which
+   uses the container's unix socket and never authenticates; the path that actually uses it (TCP
+   to `127.0.0.1:5433`) had never worked. Two paths, one of which nobody exercised.
+3. *The pass queue could not drain.* `reap()` handed a whole holder line to `kill -0`, which
+   wants one pid; a two-pid line answers false, so the place is judged ownerless -- reclaimed
+   while its owner walks, and unreclaimable by the owner whose trap then kills a string.
+
+**Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
+naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+## Tick 76 · wave 5 — origin/main moved thirteen commits, and both branches had already built the same tool
+
+This tick merged `origin/main` (`bebbaff7`, 13 commits) and found four conflicts, three of them
+in the QA harness — the same three files the last three ticks changed. Nothing here is a wave-5
+product change, and that is the tick's finding: **the instrument had two authors and no owner.**
+
+**`walkthrough.cjs`: two independent `--only` implementations, one on each branch.** wave5
+wrote a substring scope (`name.includes(word)`) with a guard inside `runDepthPass`; main wrote an
+exact-name scope (`ONLY.includes(name)`) with `matchedOnly` recording what was walked and a roll-up
+that raises a finding for an unmatched filter. Taking either wholesale loses something real:
+
+- main's exact matching is the stronger instrument. A substring scope cannot be aimed at
+  `security-rate-limits` without also pulling in `security-rate-limits-mobile`, and the roll-up
+  cannot tell a typo from a name that merely resembles another — so main's version won.
+- wave5's guard location is the stronger instrument. main wraps **forty** call sites in
+  `if (wants(...)) { matchedOnly.add(...); ... }`; a depth pass added next month is unscoped
+  until somebody remembers the wrapper. wave5 checks inside `runDepthPass`, so a new pass is
+  scoped by construction and `matchedOnly` is recorded by the only code that can answer "did this
+  pass really walk the thing the scope named". That won too.
+
+The union is 1,115 lines longer than either side, keeps all seven of my depth passes and all
+five of main's security routes, and the one thing I did **not** take was main's `runSecurityDepth`
+rewrite: the auto-merge had silently kept my shorter version, and main's is a superset — it adds
+the rate-limit console probe, the sign-in-protection walk and the local-validation check.
+
+**`qa-slot.sh`: the merge could have made the box kill a running pass.** The two branches had
+independently changed the holder file's contract — wave5 to `"<holder> <owner>"` so a waiter can
+tell a live pass from a corpse, main to a single pid with a hardened reader. Main's reader is
+`awk '{print $NF}'`, and its comment argues the last field is the right answer "whatever the file
+happens to contain". On wave5's two-field line `$NF` is the **owner**. The reaper would test the
+pass's liveness while believing it had tested the holder's, and the abandoned-place branch would
+`kill` the live pass it was asked to inspect — the one operation in that file that destroys a
+running pass rather than a corpse. Taking main's line verbatim is a real regression that no test
+on either branch would have caught, because neither branch had a test for reading a holder file
+written by the other.
+
+So the reader is addressed by **position** (`$1` holder, `$2` owner), a single-field legacy file
+leaves the owner empty so the owner test is *skipped* rather than run against the holder's own
+pid, and a non-numeric field is treated as an unparseable record — because `kill -0` rejects a
+non-pid, and a rejected probe otherwise reads as "the process is gone".
+
+**`run.sh`: the CSRF secret was about to be dropped.** My side deletes the pm2 entry and
+re-registers unconditionally (which supersedes main's `pm2 restart` branch *and* its stale-path
+re-registration check — both existed only to work around a registration that no longer survives
+to the next line). But main's `OMNION_CSRF_SECRET` was on the branch being removed, and the
+unconditional start did not carry it. Taken as-is, the merge would have left every cookie-authenticated
+mutation in every future pass answered `csrf_unavailable` — and because that is the *documented*
+behaviour of a deployment with no secret, each of those passes would have filed a green report
+about a screen that works perfectly by hand. The secret is now on the command that actually
+starts the API.
+
+**And the `--only` argument was being passed the wrong way.** wave5's invocation was
+`${QA_ONLY:+--only "$QA_ONLY"}`; main's is an array. Both are right for one name, and both are
+wrong for two: walkthrough's parser is `split(",")` on a single value, so `--only a b` makes `a`
+the value and leaves `b` as an unknown argv entry the parser ignores. A two-name scope would run
+as a one-name scope and the artifact would carry a coverage claim nobody checked.
+
+| Gate | Result |
+| --- | --- |
+| `bash scripts/qa/qa-slot-test.sh` | **13/13** — the guard suite, unchanged, still green |
+| `bash scripts/qa/qa-slot-parse-test.sh` | **8/8**, six consecutive runs |
+| The same suite against main's `$NF` reader | **FAILED 2 of 8** — the defect it exists for |
+| The same suite against a holder-only reaper | **FAILED 3 of 8** |
+| `node --check scripts/qa/walkthrough.cjs` | clean; `bash -n` clean on both shell files |
+| `python3 scripts/qa/merge-build-log.py` | OK — 0 entries lost, both sides' `## ` entries present |
+
+**`qa-slot-parse-test.sh` is new, and three of its four defects were the test rather than the
+product** — which is the same shape as tick 75's finding, so it is now a rule rather than a
+coincidence: *a test for a reaper that runs the reaper is itself a client of the reaper.*
+
+1. `$(live)` inherited the command substitution's pipe, so the suite hung at the assignment. Fourth
+   time this harness has been bitten by it; the redirection is now in the helper.
+2. `reap()` volunteered a **live** owner, so the script claimed a place and waited out the
+   queue's timeout. A probe of a script whose job is *taking* a place must volunteer a
+   certainly-dead owner: the reaper runs unconditionally and only then tests the asker, so a dead
+   owner still gets the reap and leaves holding nothing. (This is tick 75's lesson 3, re-learned
+   in a new file.)
+3. `QA_SLOT_REAP_GRACE=0` does not mean "reap anything": the reaper needs `age > grace`, a place
+   written in the same second has age 0, and `0 > 0` is false. Two cases failed reporting "the
+   abandoned place is not reclaimed" — the defect the file exists to prevent, reported by a test
+   that had not made itself eligible. `touch -d` backdates it without a sleep.
+4. **The flake that mattered: `kill -0` on a zombie returns success.** Every "definitely dead"
+   pid the suite produced was a child of the test shell that had exited but not been reaped, so
+   the reaper's own liveness test said *alive* and correctly declined to reclaim the place. The
+   suite read 8/8, then 6/8, then 5/8 on consecutive runs — a flaky test is worse than no test,
+   because the next reader cannot tell which number meant anything. Two fixes, in order: `dead()`
+   now returns `pid_max - 1`, a pid that cannot exist; and the directory-count case now knows
+   that. The **real** cause was different and is worth more than the flake: the suite named its
+   places `probe-<pid>` while the reaper derives the holder filename from the place's *basename*,
+   so every lookup missed and the reaper reported `holder none` — taking the stale branch without
+   ever testing the owner field the case exists to test. The suite now writes production's
+   `<pid>-<timestamp>` shape. A diagnostic that names the file it is reading is worth more than
+   an assertion about it.
+
+**Disk.** `/` was at **100%** (608 M free) and 1.2 G of that was mine: `/root/w5target`'s
+`incremental` + `build`, 0 open fds, 0 writes in 30 minutes, binary preserved. `/dev/shm` at 82%
+and `/mnt/apopic` at 81% are a sibling's target and this writer's checkout respectively — not
+mine to clear.
+
+**Next.** (a) REQ-017's browser gate, now that the merge no longer holds it up. (b) The narrow
+question tick 75 left: `GET /api/v1/environments` through the panel with the walkthrough's own
+session cookie — a `000` answers "wrong origin", a `401` answers "the request arrived and was
+refused" and moves the question to the session.

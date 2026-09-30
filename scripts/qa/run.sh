@@ -83,6 +83,13 @@ fi
 # begins from a clean set and the box is not carrying yesterday's processes.
 stop_stack() {
   pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+  # Turbopack leaves a build cache behind when the server is killed, and the cache is
+  # the largest thing any worktree holds: ten stacks held 13 GB of it and filled the
+  # disk twice. The next pass rebuilds what it needs, so this is pure waste — but only
+  # drop it when the pass actually ran, so a stack that failed to start keeps its cache.
+  if [ "${QA_KEEP_NEXT:-0}" != "1" ]; then
+    rm -rf "$ROOT/apps/admin/.next" "$ROOT/apps/web/.next" 2>/dev/null || true
+  fi
 }
 # One trap, both cleanups: a second trap would replace the first and leave the slot held.
 release() {
@@ -91,7 +98,10 @@ release() {
   return 0
 }
 trap release EXIT INT TERM
-stop_stack
+# Only the exit path drops the build cache: the pre-pass call below is here to clear
+# stale servers, and deleting .next there would throw away a warm cache every tick and
+# turn each QA pass into a cold Turbopack build.
+QA_KEEP_NEXT=1 stop_stack
 
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
@@ -120,28 +130,22 @@ if [ ! -x "$API_BIN" ] \
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
-# A pm2 entry that exists but points at a binary which is no longer there is *worse* than no
-# entry: `pm2 restart` succeeds, nothing listens, and the pass dies at `wait_http` blaming the
-# product. This is the second half of the same bug as the hardcoded path above — once a pass has
-# started the API from `$CARGO_TARGET_DIR`, the registered script path is the tmpfs copy, and a
-# later pass that builds somewhere else inherits an entry that can only fail. Compare the
-# registered path to the one this pass just built and re-register when they differ.
-# pm2 draws its table with a box character followed by a NON-BREAKING space (U+00A0), so a sed
-# pattern that matches an ordinary space extracts nothing at all. Strip the non-breaking spaces
-# and the box characters first, then cut the field.
-# `pm2 describe` exits non-zero for a process that does not exist, and under `set -e` a
-# failing command inside `$( )` aborts the *whole script* — so the very first pass on a
-# fresh stack (nothing registered yet, which is exactly when this runs) died here with no
-# message and no pass. The `|| true` is not a workaround: the exit code carries nothing
-# this block needs, and the value it produces is the empty string that the `if` below
-# already handles.
-RUNNING_BIN="$(pm2 describe "$API_NAME" 2>/dev/null \
-  | tr -d '\302\240\342\224\202' \
-  | sed -n 's/^.*script path *//p' | head -1 | sed 's/[[:space:]]*$//' || true)"
-if [ -n "$RUNNING_BIN" ] && [ "$RUNNING_BIN" != "$API_BIN" ]; then
-  step "the pm2 entry runs $RUNNING_BIN, not $API_BIN — re-registering"
-  pm2 delete "$API_NAME" >/dev/null 2>&1 || true
-fi
+# Nothing is restarted in place: the block further down deletes the entry and re-registers it, so
+# a `pm2 restart` here could only ever be a worse version of what happens anyway. Two earlier
+# versions of this script did restart, and both had a way to keep a *dead* registration alive --
+# one because a pass had started the API from `$CARGO_TARGET_DIR` and a later pass that built
+# somewhere else inherited an entry pointing at a path that no longer exists, and one because
+# `pm2 restart` succeeds on an entry whose script is gone, so the pass died at `wait_http`
+# blaming the product for a harness that had already lost the binary.
+#
+# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
+# handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
+# walkthrough that saves a header policy, uploads a file or takes a backup would record screens
+# that "work" while the API answered 403 the whole time -- and because that refusal is the
+# documented behaviour of a deployment *without* a secret, it reads as the product being correct
+# rather than the harness being under-configured. It is a throwaway value: the process points at
+# a database that was dropped two lines above and listens on loopback.
+#
 # The admin account is seeded from the environment on *every* boot, not only when the database is
 # empty. The DB reset above drops every account, so a pass that restarts an already-registered
 # process boots an API with no user at all: the panel then serves `/login` instead of `/setup`,
@@ -160,6 +164,7 @@ OMNION_ENV=development \
 OMNION_ADMIN_EMAIL="$QA_ADMIN_EMAIL" \
 OMNION_ADMIN_PASSWORD="$QA_ADMIN_PASSWORD" \
 OMNION_ADMIN_NAME="$QA_ADMIN_NAME" \
+OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
   pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
@@ -219,21 +224,31 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough"
-# `QA_ONLY` narrows the pass to the routes and depth passes whose name contains one of the
-# comma-separated words. It is a narrowing, not a weaker gate: what it walks is walked, clicked
-# and measured as usual, and both the summary and the report are stamped with the scope. Set it
-# when the box cannot afford a full pass — seven writers on one 32 GB host cannot each run one.
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" ${QA_ONLY:+--only "$QA_ONLY"}
+# `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
+# them, which is the right thing for a full acceptance run and the wrong thing for a loop that
+# has just built two screens and needs them proven before the tick ends. It is a filter on the
+# walk, never on the harness around it: the stack, the reset, the vision review and the report
+# all run exactly as they do for a full pass.
+#
+# The filter is passed as ONE `--only=` argument however many names it holds, because
+# walkthrough.cjs's parser is `split(",")` on a single value. Handed the words separately the
+# first becomes the flag's value and the rest are unknown argv entries the parser silently
+# ignores -- so a two-name scope would run as a one-name scope, or as none, and the artifact
+# would carry a coverage claim nobody checked.
+QA_ONLY_ARGS=()
+[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
+
+step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 WALK_RC=$?
 
 # A walkthrough that died still leaves a `summary.json` behind, and that file is the most
 # dangerous artifact in this harness: `{"fatal": "could not sign in"}` is a *pass* to anything
 # that only checks whether the file exists or whether it has findings, and this script used to
 # go on to write a clean QA-LATEST report and exit 0. Absence of evidence was being filed as
-# evidence. Treat a dead run — or a scope that walked no pages — as a failed gate, loudly.
+# evidence. Treat a dead run -- or a scope that walked no pages -- as a failed gate, loudly.
 if [ "$WALK_RC" -ne 0 ]; then
-  echo "[qa] the walkthrough exited $WALK_RC — see $OUT/summary.json" >&2
+  echo "[qa] the walkthrough exited $WALK_RC -- see $OUT/summary.json" >&2
   exit "$WALK_RC"
 fi
 if node -e '
@@ -243,7 +258,7 @@ const scope = process.argv[2] || "";
 const s = JSON.parse(fs.readFileSync(out + "/summary.json", "utf8"));
 if (s.fatal) { console.error("[qa] the walkthrough was fatal: " + s.fatal); process.exit(1); }
 const pages = (s.pages || []).length;
-if (pages === 0) { console.error("[qa] the walkthrough recorded no pages" + (scope ? " for scope " + scope : "") + " — a scope that matches nothing is a finding, not a pass"); process.exit(1); }
+if (pages === 0) { console.error("[qa] the walkthrough recorded no pages" + (scope ? " for scope " + scope : "") + " -- a scope that matches nothing is a finding, not a pass"); process.exit(1); }
 ' "$OUT" "${QA_ONLY:-}" ; then :; else
   exit 1
 fi

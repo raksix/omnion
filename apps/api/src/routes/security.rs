@@ -946,7 +946,7 @@ async fn gather(
         Ok(count) => Some(count),
         Err(_) => None,
     };
-    env.last_backup_hours = backup_age(state).await;
+    env.last_backup_hours = backup_age(state, organization).await;
     Ok(env)
 }
 
@@ -1056,19 +1056,29 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
 /// a screen that says "we could not ask" where the truth is "there are no backups" is the
 /// over-claim this crate exists to prevent, and the reverse — a green row on a platform with
 /// no backup — is the failure that costs somebody their data.
-async fn backup_age(state: &AppState) -> Option<i64> {
-    // The backup subsystem's own table, read only if it exists. This is REQ-013's table, and
-    // the probe answers `None` before that request lands rather than failing the whole run.
-    let completed: Result<Option<(time::OffsetDateTime,)>, sqlx::Error> = sqlx::query_as(
-        "select completed_at from backup_runs where status = 'succeeded' \
-         order by completed_at desc limit 1",
-    )
-    .fetch_optional(state.db().pool())
-    .await;
-    let Some((completed_at,)) = completed.ok().flatten() else {
-        return None;
-    };
-    let hours = (time::OffsetDateTime::now_utc() - completed_at).whole_hours();
+///
+/// **This reads `backups`, the table migration `0157` creates, and nothing ever read
+/// `backup_runs`.** The first version of this function queried a table that no migration has
+/// ever created — the request that asked for the backup subsystem was written before its
+/// schema existed, and the table name was never revisited when it did. A missing table makes
+/// `fetch_optional` answer `Err`, `Err` was flattened into "no backup", and the
+/// `backup_healthy` row sat at **`fail` on every installation, for ever** — the one check in
+/// this registry that could never go green, on a platform that had taken a backup every night
+/// for a year. A test could not have caught it: the row *was* red, exactly as the fallback
+/// says it should be for a platform with no backup, and the message named the right rule for
+/// the wrong reason. The read is now a call into the backup crate, so a rename of the table
+/// is a compile error rather than a permanent red.
+///
+/// The scope is the caller's tenant, for the same reason every other read in this file is: an
+/// unscoped read answers "fresh backup" from a *stranger's* run, which is a false green on
+/// the one check whose false green is the expensive direction. `is not distinct from` keeps
+/// the platform row a real tenant, because on a single-tenant installation it is the tenant.
+async fn backup_age(state: &AppState, organization: Option<Uuid>) -> Option<i64> {
+    let finished_at = omnion_backup::last_succeeded_at(state.db().pool(), organization)
+        .await
+        .ok()
+        .flatten()?;
+    let hours = (time::OffsetDateTime::now_utc() - finished_at).whole_hours();
     // A clock skew that puts the last backup in the future means we do not know when it ran,
     // and clamping to 0 would turn "we cannot tell" into "the backup is fresh".
     (hours >= 0).then_some(hours)

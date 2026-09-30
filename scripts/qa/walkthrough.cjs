@@ -52,39 +52,34 @@ const QA_PG_CONTAINER = arg("db-container", process.env.QA_PG_CONTAINER || "omni
 const QA_DB = arg("db", process.env.QA_DB || "omnion_qa");
 
 /**
- * A scoped pass: walk only the routes and depth passes whose name matches.
+ * `--only=a,b` narrows the pass to the named routes and depth passes.
  *
- * A full pass on a contended box costs eight to ten minutes of wall clock and a browser that
- * several sibling passes are already fighting over; the pass that survives that is a pass whose
- * tab dies halfway and whose `summary.json` carries only a `fatal` key. Seven writers on one
- * 32 GB box cannot each afford a full pass every close tick, and "we could not run it" is what
- * seven ticks of deferral produces — which is how an untested screen gets closed.
+ * The route list plus thirty depth passes is more work than one pass can finish inside the
+ * ceiling a browser pass is given, so a full pass started getting cut off partway through —
+ * and a pass that is cut off has proven nothing about the screens after the cut, while still
+ * looking like a pass in the log. Three requests (REQ-010, REQ-012, REQ-013) sat unverified
+ * for exactly that reason: the harness that was supposed to accept them could not reach their
+ * screens inside its own budget.
  *
- * The scope is a *narrowing*, never a weakening: the routes it keeps are walked, clicked and
- * measured exactly as a full pass walks them, the depth passes it keeps drive their real
- * fixtures, and the summary is stamped with the scope so a scoped artifact can never be read as
- * a whole-repository pass. A scoped run that covers nothing is a mistake and says so loudly.
+ * A timeout is therefore the wrong instrument: the honest instrument is the budget. `--only`
+ * lets a loop spend one pass on the screens it just built, and every focused pass still walks
+ * its own routes, runs its own depth passes and writes the same report — it just does not
+ * pretend to cover the rest. The default (`--only=all`) walks everything, unchanged.
+ *
+ * A name that matches nothing is a finding rather than a silent no-op: a typo in a filter would
+ * otherwise produce an empty, entirely green report, which is the worst output this file can
+ * emit.
  */
-const ONLY = (arg("only", process.env.QA_ONLY || "") || "").trim();
-const inScope = (name) => !ONLY || ONLY.split(",").some((w) => w.trim() && name.includes(w.trim()));
-// A scope is a claim about what the pass covered, and a claim that quietly degrades into "I
-// walked everything" is worse than no claim: every artifact then carries the narrower label while
-// holding the wider evidence, and the next tick reads the label. A scoped run therefore has to
-// *demonstrate* that it narrowed — at the first place the route table exists — and stop rather
-// than continue under a label it has already failed to honour. Without this, a typo'd or
-// mis-parsed scope walks the whole product and files it as a targeted result.
-if (ONLY && ONLY.length >= 1) {
-  const sample = ["overview", "pages", "media", "sites"];
-  const leaked = sample.filter((n) => inScope(n));
-  if (leaked.length) {
-    console.error(
-      `[walk] the scope "${ONLY}" does not narrow anything — it matches ${leaked.join(", ")}, ` +
-        "which are core routes. A scope word that appears inside unrelated names is not a scope.",
-    );
-    process.exit(4);
-  }
-}
-
+const ONLY = (arg("only", "all") || "all")
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
+const ONLY_ALL = ONLY.includes("all");
+const wants = (name) => ONLY_ALL || ONLY.includes(name);
+/** Every route/depth-pass name this pass actually walked, so an unmatched filter is visible. */
+const matchedOnly = new Set();
+/** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
+const MOBILE_NAMES = new Set();
 const CREDS = {
   name: "QA Owner",
   email: "qa-owner@omnion.test",
@@ -236,7 +231,22 @@ function log(...a) {
 }
 function record(entry) {
   clickLines.push(entry);
-  fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  // The event stream is written for durability -- a killed pass should leave its clicks behind
+  // -- but it is a SECONDARY record: `clickLines` is the one the report is built from. So a
+  // write that fails must not end the pass. It used to: this box runs a disk guard that trims
+  // QA artifacts, and when the guard's window landed mid-pass the output directory was gone,
+  // `appendFileSync` threw ENOENT, and the exception unwound the whole run. The pass had already
+  // walked seven screens and every one of them was thrown away because a cache file could not be
+  // appended to. A report written from memory and a report written from disk are the same report;
+  // only the forensic stream is lost, and it says so rather than pretending.
+  try {
+    fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  } catch (error) {
+    if (!warnedAboutStream) {
+      warnedAboutStream = true;
+      console.error(`[walk] the click stream is unwritable (${error.code || error.message}); the report continues without it`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- browser
@@ -1146,10 +1156,16 @@ async function uploadMediaSample(page, source) {
  * never written. The error is recorded under the pass's own name so it is counted, not hidden.
  */
 async function runDepthPass(name, pass) {
-  if (!inScope(name)) {
+  // The scope is honoured HERE rather than at forty call sites, so a new depth pass is scoped by
+  // construction rather than by remembering to wrap it. A call site that forgets the guard walks
+  // a screen the pass was never asked to cover, and the artifact then claims a coverage it does
+  // not have. `matchedOnly` is recorded from inside the guard, which is the only place that can
+  // answer "did this pass really walk the thing the scope named".
+  if (!wants(name)) {
     log(`depth pass ${name} skipped (out of scope)`);
     return { ok: true, steps: 0, skipped: true, reason: "out of scope" };
   }
+  matchedOnly.add(name);
   try {
     return await pass();
   } catch (cause) {
@@ -7802,6 +7818,201 @@ async function runSecurityDepth(page, report) {
     await shot(page, "security-headers-restored");
   }
 
+  // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
+  //
+  // This screen and the sign-in one below had a rule engine, a policy editor, a live counter
+  // and a test console behind them, and no walk had ever opened either of them. A screen that
+  // is never rendered is not "mostly tested"; it is untested, and the two that ship first are
+  // the two whose failure is silent — a limit nobody can read is a limit nobody knows is set.
+  //
+  // The console is the interesting half: it answers "would THIS request be refused", which no
+  // screenshot of a form can show. So the pass asks a question the tester can see the answer
+  // to, and then edits a limit and asks it again — the policy must answer differently, or the
+  // editor is a text box with a save button.
+  await page.goto(`${URL_ADMIN}/security/rate-limits`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-rate-limits="ready"]', { timeout: 15000 }).catch(() => {});
+  const limitsReady = (await page.locator('[data-rate-limits="ready"]').count()) > 0;
+  note({ step: "rate-limits-loaded", rendered: limitsReady });
+  if (!limitsReady) {
+    note({ step: "rate-limits-missing", reason: "/security/rate-limits did not render its ready state" });
+  } else {
+    const limitRows = await page.locator("[data-rate-limit-row]").count();
+    note({ step: "rate-limit-rows", rows: limitRows });
+    if (limitRows < 1) {
+      note({ step: "rate-limit-registry-empty", reason: "no scope rendered a limit row" });
+    }
+    await shot(page, "security-rate-limits");
+
+    // Every row must say what its scope is allowed, not just how much: a number without a
+    // window is a number nobody can compare against anything.
+    const rowLabels = await page.$$eval("[data-rate-limit-row]", (nodes) =>
+      nodes.map((node) => ({
+        scope: node.getAttribute("data-rate-limit-row"),
+        inputs: node.querySelectorAll("input").length,
+      })),
+    );
+    note({ step: "rate-limit-row-shape", rows: rowLabels });
+    const inputless = rowLabels.filter((row) => row.inputs === 0);
+    if (inputless.length) {
+      note({ step: "rate-limit-row-not-editable", rows: inputless.map((r) => r.scope) });
+    }
+
+    // The tester: the screen's whole claim is "would THIS request be refused", and the answer
+    // comes from the server's own `decide` — the same function the middleware runs. So the pass
+    // asks a question through the real endpoint, with a counter no sane ceiling allows, and
+    // requires a verdict of `limited` plus the key it counted and the retry it would send.
+    //
+    // The endpoint is `POST /security/rate-limits/test` (`security.read`), the body is
+    // `{ method, path, client_ip, count, machine_key }` and the verdict is NESTED under
+    // `verdict`, beside `counter_identity`/`counter_key`. Guessing any of those — an invented
+    // `/probe` path, a flat `limited` boolean — produces a request that 404s or a read of
+    // `undefined` that compares false, and the step is then a green line that proves nothing.
+    //
+    // The CSRF header is the fourth thing a hand-written fetch gets wrong, and it is the one
+    // that fails *green*. A cookie-authenticated mutation with no `x-omnion-csrf` is refused
+    // with `csrf_unavailable` before the handler ever runs, so a pass that skipped it would
+    // record "the tester refused this request" about a screen that works perfectly in the hand
+    // above it. The token is the readable `omnion_csrf` cookie the panel's own client echoes.
+    const probe = await page.evaluate(async () => {
+      const csrf = document.cookie
+        .split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith("omnion_csrf="))
+        ?.slice("omnion_csrf=".length);
+      const answer = await fetch("/api/v1/security/rate-limits/test", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": decodeURIComponent(csrf) } : {}),
+        },
+        body: JSON.stringify({
+          method: "POST",
+          path: "/api/v1/auth/login",
+          client_ip: "203.0.113.7",
+          count: 400,
+          machine_key: false,
+        }),
+      });
+      return {
+        status: answer.status,
+        body: await answer.json().catch(() => null),
+        hadCsrf: Boolean(csrf),
+      };
+    });
+    note({
+      step: "rate-limit-test-endpoint",
+      status: probe?.status,
+      hadCsrf: probe?.hadCsrf,
+      scope: probe?.body?.verdict?.scope,
+      limited: probe?.body?.verdict?.limited,
+      ceiling: probe?.body?.verdict?.ceiling,
+      counterKey: probe?.body?.counter_key,
+      retryAfter: probe?.body?.verdict?.retry_after,
+    });
+    if (probe?.status !== 200) {
+      note({
+        step: "rate-limit-test-unreachable",
+        status: probe?.status,
+        code: probe?.body?.error?.code,
+        reason: "the tester endpoint did not answer 200",
+      });
+    } else if (probe.body?.verdict?.limited !== true) {
+      note({ step: "rate-limit-test-not-limited", reason: "a counter of 400 was not reported as limited" });
+    }
+
+    // Now the tester button on the screen itself, which is what a human uses: the same request
+    // has to survive the form, the client and the render.
+    await page.locator("[data-rate-limit-probe-count]").fill("400").catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-rate-limit-probe-run]").click({ timeout: 8000 }).catch(() => {});
+    await page
+      .waitForSelector('[data-rate-limit-probe-result]:not([data-rate-limit-probe-result="none"])', {
+        timeout: 20000,
+      })
+      .catch(() => {});
+    const probeVerdict = await page
+      .locator("[data-rate-limit-probe-result]")
+      .getAttribute("data-rate-limit-probe-result")
+      .catch(() => null);
+    note({ step: "rate-limit-console-verdict", verdict: probeVerdict });
+    if (!probeVerdict || probeVerdict === "none") {
+      note({ step: "rate-limit-console-silent", reason: "the tester ran and reported no verdict" });
+    }
+    await shot(page, "security-rate-limits-probe");
+
+    // An out-of-range limit must be refused by the FORM before it reaches the server — the
+    // field message is the whole point of validating here rather than on save.
+    const firstInput = page.locator("[data-rate-limit-input]").first();
+    const hadInput = (await firstInput.count()) > 0;
+    if (hadInput) {
+      await firstInput.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-rate-limits-local-error]").count()) > 0;
+      note({ step: "rate-limit-zero-refused", refused: localError });
+      if (!localError) {
+        note({ step: "rate-limit-zero-accepted", reason: "a limit of 0 was accepted by the form" });
+      }
+      await shot(page, "security-rate-limits-invalid");
+      // Put the field back so this pass cannot leave the policy disabled for a sibling's pass.
+      await firstInput.fill("");
+      await page.waitForTimeout(300);
+    }
+  }
+
+  // ---- The sign-in protection policy (REQ-012, slice 2) -------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/security/sign-in-protection`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector('[data-sign-in-protection="ready"]', { timeout: 15000 }).catch(() => {});
+  const protectionReady = (await page.locator('[data-sign-in-protection="ready"]').count()) > 0;
+  note({ step: "sign-in-protection-loaded", rendered: protectionReady });
+  if (!protectionReady) {
+    note({ step: "sign-in-protection-missing", reason: "the screen did not render its ready state" });
+  } else {
+    const lockedCount = await page
+      .locator("[data-locked-count]")
+      .first()
+      .innerText()
+      .catch(() => null);
+    note({ step: "locked-accounts", count: lockedCount });
+    await shot(page, "security-sign-in-protection");
+
+    // The policy has five fields; each must be editable and each must survive a save. A
+    // policy editor that renders read-only inputs still LOOKS like the security centre.
+    const fields = ["window_seconds", "attempts", "lockout_minutes", "base_delay_seconds", "progressive_delay"];
+    const present = [];
+    for (const field of fields) {
+      present.push([field, (await page.locator(`[data-lockout-field="${field}"]`).count()) > 0]);
+    }
+    note({ step: "lockout-fields", fields: present });
+    const missingFields = present.filter(([, ok]) => !ok).map(([name]) => name);
+    if (missingFields.length) {
+      note({ step: "lockout-field-missing", fields: missingFields });
+    }
+
+    // The reset_on_success switch is a boolean where every other field is a number: a form
+    // that validates all five the same way will either refuse a checkbox or accept nonsense.
+    const resetSwitch = await page.locator('[data-lockout-field="reset_on_success"]').count();
+    note({ step: "lockout-reset-switch", present: resetSwitch > 0 });
+
+    // An out-of-range attempts value must be refused with a field message, not saved.
+    const attempts = page.locator('[data-lockout-field="attempts"]').first();
+    if ((await attempts.count()) > 0) {
+      const before = await attempts.inputValue().catch(() => "");
+      await attempts.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-sign-in-protection-local-error]").count()) > 0;
+      note({ step: "lockout-zero-refused", refused: localError, before });
+      if (!localError) {
+        note({ step: "lockout-zero-accepted", reason: "attempts = 0 was accepted by the form" });
+      }
+      await shot(page, "security-sign-in-protection-invalid");
+      await attempts.fill(before);
+      await page.waitForTimeout(300);
+    }
+  }
+
   return { ok: true, steps };
 }
 
@@ -8281,6 +8492,16 @@ async function main() {
     // the webhook detail is not walked by id: a route opened with a placeholder id only proves
     // the not-found state renders.
     { path: "/environments", name: "environments" },
+    // The security centre's five screens (REQ-012, slices 1-3). `runSecurityDepth` drives the
+    // overview, the findings store and the header policy, but it never opened the last two --
+    // and the same is true of the route list, so two screens that ship with rules, a policy
+    // editor and a live counter had never been rendered by anything. "No untested screen"
+    // means no untested screen: both are walked here and clicked by the depth pass below.
+    { path: "/security", name: "security-overview" },
+    { path: "/security/findings", name: "security-findings" },
+    { path: "/security/headers", name: "security-headers" },
+    { path: "/security/rate-limits", name: "security-rate-limits" },
+    { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
   ];
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
@@ -8292,9 +8513,12 @@ async function main() {
   // under a scope label, and every artifact it writes — screenshots, clicks, the summary's
   // `scope` field — then claims the narrower coverage. That is the same failure as a dead run
   // writing a clean report, one level down, and the only witness is this line.
-  if (ONLY) log(`scope: "${ONLY}" keeps ${routes.filter((r) => inScope(r.name)).length} of ${routes.length} routes`);
-  for (const route of routes) {
-    if (!inScope(route.name)) continue;
+  const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
+  for (const route of walkedRoutes) matchedOnly.add(route.name);
+  if (!ONLY_ALL) {
+    log(`focused pass: ${walkedRoutes.length}/${routes.length} routes -- ${ONLY.join(", ")}`);
+  }
+  for (const route of walkedRoutes) {
     log(`page: ${route.name}`);
     try {
       await page.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -8487,7 +8711,7 @@ async function main() {
   // The Departments tab (REQ-005, slice 2): create a department through the real dialog, refuse
   // an unusable key, open the drawer, bind and revoke a role, try the move the API refuses and
   // clean up again. It needs the organization the pass above just opened.
-  if (!inScope("organizationDepartments")) {
+  if (!wants("organizationDepartments")) {
     log(`depth pass organizationDepartments skipped (out of scope)`);
   } else if (tenantMissing("organizationDepartments")) {
     /* recorded above */
@@ -8499,7 +8723,7 @@ async function main() {
   // The member drawer (REQ-005, slice 4): open a member, grant a role, extend a temporary grant
   // and revoke one. It runs after the departments pass because that pass leaves the organization
   // with its members, its roles and a live tab to open the drawer from.
-  if (!inScope("organizationMemberDrawer")) {
+  if (!wants("organizationMemberDrawer")) {
     log(`depth pass organizationMemberDrawer skipped (out of scope)`);
   } else if (tenantMissing("organizationMemberDrawer")) {
     /* recorded above */
@@ -8511,7 +8735,7 @@ async function main() {
   // read it back after a reload, change the locale and accent and prove both persisted, and
   // check that every usage bar names its metric and its number. Same organization, so it runs
   // straight after the departments pass rather than opening a second one.
-  if (!inScope("organizationTenantTabs")) {
+  if (!wants("organizationTenantTabs")) {
     log(`depth pass organizationTenantTabs skipped (out of scope)`);
   } else if (tenantMissing("organizationTenantTabs")) {
     /* recorded above */
@@ -8523,7 +8747,7 @@ async function main() {
   // The invite policy, the owner-approval queue and the Audit tab (REQ-005, slice 3 remainder):
   // the two screens that change what the API does. Runs straight after the tenant tabs because
   // it edits the same organization's policy and has to put it back.
-  if (!inScope("organizationInvitePolicy")) {
+  if (!wants("organizationInvitePolicy")) {
     log(`depth pass organizationInvitePolicy skipped (out of scope)`);
   } else if (tenantMissing("organizationInvitePolicy")) {
     /* recorded above */
@@ -8533,7 +8757,7 @@ async function main() {
 
   // The suspend/archive pass (REQ-005, slice 3's last part): the banner on a frozen tenant,
   // a refused write with the reason on screen, and the reactivation that clears both.
-  if (!inScope("organizationSuspend")) {
+  if (!wants("organizationSuspend")) {
     log(`depth pass organizationSuspend skipped (out of scope)`);
   } else if (tenantMissing("organizationSuspend")) {
     /* recorded above */
@@ -8614,6 +8838,23 @@ async function main() {
     report.mobile.push({ ...route, diagnostics: diag });
   }
 
+  // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
+  // as a known name instead of reporting it as unmatched.
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }];
+  for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
+  // The phone pass follows `--only` for the same reason the route loop does, and the five
+  // security screens join it: a layout that has never been measured at 390px has not been
+  // tested on a phone, and the security centre is where an administrator reads a verdict.
+  for (const route of (ONLY_ALL
+    ? mobileRoutes
+    : mobileRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
+    await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await mpage.waitForTimeout(800);
+    const diag = await diagnostics(mpage);
+    await shot(mpage, `mobile-${route.name}`);
+    report.mobile.push({ ...route, diagnostics: diag });
+  }
+
   // The tenant screens (REQ-005, slice 4's mobile pass). They are walked here for the same
   // reason the palette is: the layouts that only exist under `md` — the members table as cards,
   // the department tree as cards, the trail as cards, the switcher as a sheet — are the *only*
@@ -8632,7 +8873,10 @@ async function main() {
         ]
       : []),
   ];
-  for (const route of mobileTenantRoutes) {
+  for (const r of mobileTenantRoutes) MOBILE_NAMES.add(r.name);
+  for (const route of (ONLY_ALL
+    ? mobileTenantRoutes
+    : mobileTenantRoutes.filter((r) => wants(`mobile:${r.name}`) || wants(r.name)))) {
     await mpage.goto(`${URL_ADMIN}${route.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await mpage.waitForTimeout(1200);
     const diag = await diagnostics(mpage);
@@ -8773,6 +9017,28 @@ async function main() {
   const clicks = clickLines.filter((e) => e.action === "click");
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
+
+  // A `--only` filter that matches nothing is a finding, not an empty green report.
+  //
+  // The failure this prevents is specific: a typo in the filter walks zero routes and zero
+  // depth passes, writes a complete-looking summary with zero high findings, and is then read
+  // as "the screens passed". The one thing a focused pass must not be is indistinguishable
+  // from a pass that proved nothing because it was pointed at nothing. The count is also
+  // printed in the log line above, so a reader can tell how much of the panel was covered.
+  if (!ONLY_ALL) {
+    const unmatched = ONLY.filter((name) => !matchedOnly.has(name) && !MOBILE_NAMES.has(name));
+    if (matchedOnly.size === 0) {
+      pushFindings(
+        "high",
+        "empty-pass",
+        `--only=${ONLY.join(",")} matched no route and no depth pass: this pass proved nothing`,
+      );
+    }
+    for (const name of unmatched) {
+      pushFindings("high", "unknown-pass-name", `--only=${name} matches no route and no depth pass`);
+    }
+    log(`focused pass coverage: ${matchedOnly.size} route/pass name(s) walked, ${unmatched.length} unmatched`);
+  }
 
   // A route that threw is recorded WITHOUT `diagnostics` (see the `route-failed` push above), and
   // the roll-up used to dereference it directly — so one page that failed on a dead tab, a
