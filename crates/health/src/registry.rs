@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 
 use crate::error::Result;
-use crate::incidents;
+use crate::incidents::{self, BreachCheck, IncidentOutcome, Transition};
 use crate::model::{HealthOverview, NewSample, ServiceReport};
 use crate::probes::{
     Observation, ProbeContext, ProbeResult, probe_api, probe_host, probe_postgres, probe_queue,
@@ -147,7 +147,7 @@ pub async fn run_all(ctx: &ProbeContext<'_>) -> Vec<ProbeResult> {
 /// only a reading nobody can chart — and answering `500` there would tell an
 /// operator that Redis is fine and the platform is broken, which is a worse
 /// answer than a fresh row with no history behind it.
-pub async fn run_and_record(pool: &PgPool, ctx: &ProbeContext<'_>) -> Result<HealthOverview> {
+pub async fn run_and_record(pool: &PgPool, ctx: &ProbeContext<'_>) -> Result<(HealthOverview, PolicyOutcome)> {
     let results = run_all(ctx).await;
     let mut reports: Vec<ServiceReport> = Vec::with_capacity(results.len());
     let mut samples: Vec<NewSample> = Vec::new();
@@ -172,12 +172,20 @@ pub async fn run_and_record(pool: &PgPool, ctx: &ProbeContext<'_>) -> Result<Hea
     // readings are still true, and an `incident` table that cannot be written must not turn a
     // probe report into a `500`. The cost of that choice is bounded and paid in the open: an
     // outage during a database blip is visible in the samples and absent from the timeline.
-    match apply_policy(pool, &reports, &samples).await {
-        Ok(()) => {}
-        Err(error) => tracing::warn!(error = %error, "health incident policy could not be applied"),
-    }
+    //
+    // The **default** is what the failure path announces, and it is empty on purpose. When the
+    // policy could not run we do not know whether anything moved, so the honest outcome is "no
+    // transitions, no breaches" — an emitter that guessed here would announce an outage that
+    // the database never recorded.
+    let policy = match apply_policy(pool, &reports, &samples).await {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(error = %error, "health incident policy could not be applied");
+            PolicyOutcome::default()
+        }
+    };
 
-    Ok(build_overview(reports))
+    Ok((build_overview(reports), policy))
 }
 
 /// Open, resolve and de-duplicate everything this run implies.
@@ -196,12 +204,81 @@ pub async fn run_and_record(pool: &PgPool, ctx: &ProbeContext<'_>) -> Result<Hea
 ///
 /// Every service is visited even when its policy is a no-op, because "nothing happened" is the
 /// outcome most runs produce and the outcome that has to be cheap.
+///
+/// **What this run decided is returned, not discarded.** That return value is the whole reason
+/// slice 4's second half could not be written as a listener: the five `health.*` events have to
+/// announce a *transition* and a *breach*, and this function is the only place either is known —
+/// `incidents::detect` returns `None` for an unchanged service precisely so that a steady
+/// platform writes nothing, which means "nothing happened" is indistinguishable from "the
+/// function was never called" by the time control returns to the runner. An emitter that
+/// re-derived the transition here would have to re-read `health_incidents` and re-apply the
+/// same rules, and the two would disagree the first time a rule was edited in one place.
+#[must_use]
+pub fn policy_outcome(
+    transitions: Vec<ServiceTransition>,
+    breaches: Vec<(String, BreachCheck)>,
+    samples: i64,
+) -> PolicyOutcome {
+    PolicyOutcome {
+        transitions,
+        breaches,
+        samples,
+    }
+}
+
+/// One service's transition, with what the database did about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceTransition {
+    /// Which service moved.
+    pub service: String,
+    /// The transition that was decided.
+    pub transition: Transition,
+    /// What the store did: opened, resolved, or nothing (a concurrent run won).
+    pub outcome: IncidentOutcome,
+    /// Whether a maintenance window suppressed the incident row.
+    pub suppressed: bool,
+}
+
+/// Everything one probe run implied, for the layer that announces it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PolicyOutcome {
+    /// Services whose state moved, in the order the registry probed them.
+    pub transitions: Vec<ServiceTransition>,
+    /// Metrics that were over their critical line this run, in the order they were sampled.
+    pub breaches: Vec<(String, BreachCheck)>,
+    /// How many sample rows the run wrote.
+    pub samples: i64,
+}
+
+impl PolicyOutcome {
+    /// The number of facts worth announcing.
+    ///
+    /// One per transition **that the store acted on**, plus the breaches that are first in
+    /// their window. The `acted on` filter is not a detail: `IncidentOutcome::Nothing` means a
+    /// concurrent run already opened the row, so announcing it would tell every operations
+    /// endpoint about the same outage twice — and "fires at most once per metric per window so
+    /// a flapping disk does not flood an endpoint" is the request's own sentence.
+    #[must_use]
+    pub fn announcements(&self) -> usize {
+        self.transitions
+            .iter()
+            .filter(|entry| entry.outcome.incident().is_some())
+            .count()
+            + self
+                .breaches
+                .iter()
+                .filter(|(_, check)| check.should_announce())
+                .count()
+    }
+}
+
 async fn apply_policy(
     pool: &PgPool,
     reports: &[ServiceReport],
     samples: &[NewSample],
-) -> Result<()> {
+) -> Result<PolicyOutcome> {
     let now = OffsetDateTime::now_utc();
+    let mut transitions = Vec::new();
 
     for report in reports {
         // The host row is a metric aggregate, not a dependency: it has no incident lifecycle
@@ -214,7 +291,13 @@ async fn apply_policy(
             continue;
         };
         let suppressed = incidents::is_suppressed(pool, &report.service, now).await?;
-        incidents::apply(pool, &transition, suppressed).await?;
+        let outcome = incidents::apply(pool, &transition, suppressed).await?;
+        transitions.push(ServiceTransition {
+            service: transition.service.clone(),
+            transition,
+            outcome,
+            suppressed,
+        });
     }
 
     // `THRESHOLD_METRICS` is read once and turned into a lookup: the stored document wins over
@@ -223,13 +306,19 @@ async fn apply_policy(
     // the request's "thresholds start empty" promise, and defaulting to the suggestion here
     // would open incidents on a deployment nobody configured.
     let stored = incidents::thresholds(pool).await?;
+    let mut breaches = Vec::new();
     for sample in samples {
         let Some(threshold) = stored.get(sample.metric.as_str()) else {
             continue;
         };
         match threshold.classify(sample.value) {
             Some("down") => {
-                incidents::record_breach(pool, &sample.metric, sample.value, now).await?;
+                // The returned `BreachCheck` carries the window's observation count, and it is
+                // kept rather than dropped for the same reason the transitions are: whether this
+                // crossing is the *first* in its window is only knowable here, and
+                // `should_announce` is what keeps a flapping disk from flooding an endpoint.
+                let check = incidents::record_breach(pool, &sample.metric, sample.value, now).await?;
+                breaches.push((sample.service.clone(), check));
             }
             Some(_) => {
                 // Over the warn line but not the critical one: the ledger row for a previous
@@ -242,7 +331,7 @@ async fn apply_policy(
             }
         }
     }
-    Ok(())
+    Ok(policy_outcome(transitions, breaches, samples.len() as i64))
 }
 
 /// The overview, from a set of fresh reports and whatever the store remembers.
