@@ -1124,6 +1124,22 @@ impl From<AiHubError> for ApiError {
                 "tool_not_found",
                 format!("no tool `{key}` in the registry"),
             ),
+            // AI identities (REQ-100 slice 2). The same three-way split the tools use, and it is
+            // a split rather than a single catch because the three answers mean different things
+            // to the panel: `invalid_identity` lands on a form field, `identity_not_found` is a
+            // deleted row or another tenant's (never confirmable, per the variant's own docs),
+            // and `identity_conflict` is a taken key the operator resolves by choosing another.
+            AiHubError::InvalidIdentity(message) => {
+                Self::bad_request("invalid_identity", message)
+            }
+            AiHubError::IdentityNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "identity_not_found",
+                format!("no identity `{id}` in this organization"),
+            ),
+            AiHubError::IdentityConflict(message) => {
+                Self::new(StatusCode::CONFLICT, "identity_conflict", message)
+            }
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code

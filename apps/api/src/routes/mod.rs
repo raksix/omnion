@@ -73,6 +73,7 @@ pub mod ai;
 pub mod ai_agents;
 pub mod ai_agent_workspace;
 pub mod ai_decisions;
+pub mod ai_identities;
 pub mod ai_routing;
 pub mod ai_skills;
 pub mod ai_tools;
@@ -925,6 +926,50 @@ pub fn router(state: AppState) -> Router {
     // routes that caused it.
     let ai_tool_registry_usage =
         get(ai_tools::tool_usage_route).layer(guards::require(&state, "ai.tools.read"));
+
+    // AI identities and the permission matrix (REQ-100 slice 2). The read/manage split is the
+    // point: seeing which tools an installation's AI may take is a *fact about the platform*,
+    // while changing what a run may do is a decision somebody has to be accountable for. The
+    // matrix is `ai.tools.read` rather than `ai.identities.read` on purpose — it renders the
+    // registry (rows) and the grants (columns) in one view, and a viewer who can read the tools
+    // can see the whole picture; a viewer who cannot still gets the rows' descriptions from
+    // `/ai/tools` alone.
+    let ai_identities = get(ai_identities::list_identities_route)
+        .layer(guards::require(&state, "ai.identities.read"))
+        .merge(
+            post(ai_identities::create_identity_route)
+                .layer(guards::require(&state, "ai.identities.manage")),
+        );
+    let ai_identity = get(ai_identities::get_identity_route)
+        .layer(guards::require(&state, "ai.identities.read"))
+        .merge(
+            axum::routing::patch(ai_identities::patch_identity_route)
+                .layer(guards::require(&state, "ai.identities.manage"))
+                .merge(
+                    axum::routing::delete(ai_identities::delete_identity_route)
+                        .layer(guards::require(&state, "ai.identities.manage")),
+                ),
+        );
+    // The grant map is a *replace*, so it is guarded as a manage and not as a read: a PUT that
+    // swaps twenty cells is exactly as consequential as editing twenty fields of a form.
+    let ai_identity_tools = get(ai_identities::get_identity_tools_route)
+        .layer(guards::require(&state, "ai.identities.read"))
+        .merge(
+            axum::routing::put(ai_identities::put_identity_tools_route)
+                .layer(guards::require(&state, "ai.identities.manage")),
+        );
+    // An agent's own allow-list. Reading it is reading the agent (`ai.agents.read`); replacing it
+    // is managing the agent, which is where the risk lives — an allow-list is the only thing
+    // between an agent and `deployment.deploy`.
+    let ai_agent_tool_set = get(ai_identities::get_agent_tools_route)
+        .layer(guards::require(&state, "ai.agents.read"))
+        .merge(
+            axum::routing::put(ai_identities::put_agent_tools_route)
+                .layer(guards::require(&state, "ai.agents.manage")),
+        );
+    let ai_permissions_matrix =
+        get(ai_identities::permission_matrix_route).layer(guards::require(&state, "ai.tools.read"));
+
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
@@ -1700,6 +1745,16 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/tools/{key}/usage", ai_tool_registry_usage)
         .route("/ai/tools", ai_tools)
         .route("/ai/tools/{key}", ai_tool)
+        // The identities and the matrix (REQ-100 slice 2). `/ai/permissions/matrix` is
+        // registered under its own literal prefix rather than as `/ai/permissions/{key}`: axum
+        // prefers a literal segment over a capture, and a capture here would read "matrix" as a
+        // permission name — the same collision the `/ai/tools/classes` comment above describes,
+        // reproduced because the shape is easy to reach for a second time.
+        .route("/ai/permissions/matrix", ai_permissions_matrix)
+        .route("/ai/identities", ai_identities)
+        .route("/ai/identities/{id}", ai_identity)
+        .route("/ai/identities/{id}/tools", ai_identity_tools)
+        .route("/ai/agents/{id}/tools", ai_agent_tool_set)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)
         .route("/ai/runs", ai_runs)
