@@ -112,11 +112,19 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .expect("router must answer");
 
     let status = response.status();
-    let set_cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+    // ALL of the `Set-Cookie` headers, joined. `Headers::get` returns only the first, and sign-in
+    // sends TWO — the session and the CSRF token — so reading one made the platform look like it
+    // had issued no CSRF cookie at all.
+    let set_cookie = {
+        let values: Vec<String> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect();
+        (!values.is_empty()).then(|| values.join("; "))
+    };
     let headers = response
         .headers()
         .iter()
@@ -150,11 +158,66 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-/// Build a request; `token` becomes the session cookie and `body` the JSON payload.
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+/// What one sign-in issued: the session cookie **and** the CSRF token set beside it.
+///
+/// This suite returned a bare `String` read with `.split(';').next()` — the *session* — and dropped
+/// the second cookie. The CSRF layer refuses a cookie-authenticated write carrying no
+/// `x-omnion-csrf`, so every mutation here was answered `403 csrf_failed` at the security layer,
+/// before reaching the handler the walk was written to exercise. That is why the limit and
+/// ceiling walks read as "the enforcement does not work" rather than "the harness sent no token".
+///
+/// `Deref<Target = str>` keeps the type usable everywhere the plain session token was — `Some(&admin)`
+/// at ~110 call sites and a `&str` parameter on the helpers below — while carrying the cookie that
+/// has to travel with it.
+struct Credentials {
+    session: String,
+    /// `None` only where the platform configured no CSRF secret, in which case the layer refuses
+    /// writes with `csrf_unavailable` and there is nothing to send.
+    csrf: Option<String>,
+}
+
+impl std::ops::Deref for Credentials {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.session
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    /// Never prints the tokens: a failing assertion would otherwise write a live credential into
+    /// every CI log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("session", &"<redacted>")
+            .field("csrf", &self.csrf.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Build a request; `credentials` becomes the cookie jar and `body` the JSON payload.
+///
+/// Both cookies go out, plus the matching `x-omnion-csrf` header — which is exactly what a browser
+/// does, and what this suite did not.
+fn request(
+    method: Method,
+    uri: &str,
+    credentials: Option<&Credentials>,
+    body: Option<Value>,
+) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+    let builder = match credentials {
+        Some(credentials) => {
+            let mut cookies = format!("omnion_session={}", credentials.session);
+            let builder = match &credentials.csrf {
+                Some(csrf) => {
+                    cookies.push_str(&format!("; omnion_csrf={csrf}"));
+                    builder.header("x-omnion-csrf", csrf.as_str())
+                }
+                None => builder,
+            };
+            builder.header(header::COOKIE, cookies)
+        }
         None => builder,
     };
 
@@ -321,11 +384,11 @@ impl Fixture {
         })
     }
 
-    async fn admin_token(&self) -> String {
+    async fn admin_token(&self) -> Credentials {
         login(&self.state, &self.admin_email).await
     }
 
-    async fn other_admin_token(&self) -> String {
+    async fn other_admin_token(&self) -> Credentials {
         login(&self.state, &self.other_admin_email).await
     }
 
@@ -503,13 +566,13 @@ async fn set_invite_policy(db: &Db, organization_id: Uuid, policy: &str) {
 ///
 /// Several walks assert *how* a create ended — `201` with a link, `202` queued, `403` closed —
 /// and a helper that panicked on the wrong status would hide which one it was.
-async fn invite(fixture: &Fixture, token: &str, email: &str) -> TestResponse {
+async fn invite(fixture: &Fixture, credentials: &Credentials, email: &str) -> TestResponse {
     call(
         &fixture.state,
         request(
             Method::POST,
             &format!("/api/v1/organizations/{}/invitations", fixture.org_a),
-            Some(token),
+            Some(credentials),
             Some(json!({ "email": email })),
         ),
     )
@@ -517,7 +580,7 @@ async fn invite(fixture: &Fixture, token: &str, email: &str) -> TestResponse {
 }
 
 /// Sign an account in and return the raw session token.
-async fn login(state: &AppState, email: &str) -> String {
+async fn login(state: &AppState, email: &str) -> Credentials {
     let response = call(
         state,
         request(
@@ -535,17 +598,30 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
+    let set_cookie = response
         .set_cookie
         .clone()
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("cookie has a value")
-        .split_once('=')
-        .expect("cookie is name=value")
-        .1
-        .to_owned()
+        .expect("login must set the session cookie");
+
+    // Name each cookie: a missing one must be visible HERE, naming which cookie the platform did
+    // not send, instead of the failure surfacing three layers away as a 403.
+    let cookie_value = |name: &str| -> Option<String> {
+        set_cookie
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(cookie, _)| *cookie == name)
+            .map(|(_, value)| value.to_owned())
+    };
+
+    let session = cookie_value("omnion_session")
+        .unwrap_or_else(|| panic!("login must set the omnion_session cookie; sent: {set_cookie}"));
+    let csrf = cookie_value("omnion_csrf");
+    assert!(
+        csrf.is_some(),
+        "login must set the omnion_csrf cookie beside the session one; sent: {set_cookie}"
+    );
+
+    Credentials { session, csrf }
 }
 
 /// The `code` of an error body.
@@ -2212,13 +2288,13 @@ fn settings_body(locale: &str) -> Value {
 }
 
 /// Suspend or re-activate one organization through the route the panel's button uses.
-async fn set_status(fixture: &Fixture, token: &str, status: &str) -> TestResponse {
+async fn set_status(fixture: &Fixture, credentials: &Credentials, status: &str) -> TestResponse {
     call(
         &fixture.state,
         request(
             Method::PATCH,
             &format!("/api/v1/organizations/{}", fixture.org_a),
-            Some(token),
+            Some(credentials),
             Some(json!({ "status": status })),
         ),
     )
