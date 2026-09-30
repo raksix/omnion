@@ -5114,6 +5114,187 @@ it does not fit inside a foreground call and is run as a background process.
 
 **What.** The state/empty/loading/error box. The next hint named two places still drawing a bare
 paragraph instead of `EmptyState` (the board's per-column body, the activities filter bar) — both
+
+## Tick 77 — REQ-021 slice 4: the delivery queue that never existed
+
+**What.** The acceptance criterion "Delivery runner retries a failing channel per backoff and
+marks it `failed` after the cap" had been open since the request was written, and the reason is
+worth stating plainly: **it described a runner that did not exist.** `notification_deliveries`
+shipped in migration `0050` and every later slice *read* it — the outbox lists it, the retry
+button re-queues it, the channel filter joins it, the per-channel counts group by it — and not
+one line of code anywhere wrote a row or claimed one. It was the only table in the platform with
+readers and no writer, which is precisely the shape a queue must never have: the outbox screen
+rendered a permanently empty table and called it the truth.
+
+Three pieces, in three commits:
+
+| Commit | What | Why it is where it is |
+|---|---|---|
+| `d6b74a52` | `0185_notification_delivery_lease.sql` — the `claimed_at` lease | A claim has to say "somebody is on this row" and "nobody is any more" after a process dies mid-send. With no column for the second half, a crashed runner either strands the row or re-sends it forever, and there is nowhere to record which. |
+| `f2772386` | `crates/notifications/src/delivery.rs` — enqueue, claim, backoff, cap | The queue is infrastructure, so it belongs in the crate. It is also the first code in this crate that *writes* the table every other file reads. |
+| `fac577a2` | `apps/api/src/notification_runner.rs` — the transports, spawned from `main.rs` | A transport is an SMTP conversation and an HTTP POST, and `omnion-automation` already owns the mail sender. Putting one in the crate would make infrastructure depend on a mail stack and an HTTP client to satisfy a trait it defined itself. The crate publishes the trait; the binary, which already depends on both, supplies the implementations. |
+
+**The walk found two real defects, and both were silent.** That is the argument for writing
+walks rather than reading code, so they are recorded in full rather than as a changelog line.
+
+**1. `enqueue` contradicted its own contract.** The function's doc comment promised that the
+in-app row is written unconditionally — "a reader who turned in-app off would have no inbox at
+all" — and three paragraphs below it, a guard that returned early when both channel lists were
+empty. So a caller with no remote channel to ask about (a fresh install; a reader who has
+everything switched off) got **no rows at all**: the notification existed, the panel showed it,
+and the outbox had nothing to say about any channel. The guard is gone, and
+`the_in_app_transport_needs_no_configuration_and_always_succeeds` enqueues with two empty lists
+specifically to hold the contract down.
+
+**2. `settle_not_ready`'s `not exists` was uncorrelated.** The statement reads "settle every
+pending row whose channel nobody has switched on", and the obvious SQL for that —
+`not exists (select 1 from notification_channels c where c.channel = d.channel and c.enabled)` —
+asks "does *anybody* have this channel on". On a single-tenant install those are the same
+question. On this platform they are not: `notification_channels` is per organization, so one
+customer configuring e-mail would have silently marked **every other customer's** e-mail
+deliveries as "not configured" and stopped them from ever being sent. The correlation on
+`notifications.organization_id` is in the statement, and
+`a_tenant_that_switched_a_channel_on_keeps_its_own_deliveries_queued` builds two organizations,
+configures one, and asserts `settled == 1` — the bare tenant's row and not the other's.
+
+**It was watched going red, in both directions.** The early return was reintroduced into
+`delivery.rs` with the tests untouched:
+
+```
+test the_in_app_transport_needs_no_configuration_and_always_succeeds ... FAILED
+  the in-app row must exist even with no channels requested: RowNotFound
+test result: FAILED. 1 passed; 1 failed
+```
+
+`RowNotFound`, not a wrong status and not a wrong count — **no row at all**, which is the exact
+shape the defect had. Restored from the copy taken before the edit and byte-compared with
+`diff` before the suite was re-run.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `apps/api --test notification_delivery` | **8 passed / 0 failed** (88.18s, live PostgreSQL, 8 scratch databases) |
+| the same, with the `enqueue` guard reintroduced | **FAILED** — `RowNotFound` |
+| `omnion-notifications --lib` | **90 passed / 0 failed** (was 79; +11) |
+| `omnion-api --lib` | **226 passed / 0 failed** (was 219; +7) |
+| `pnpm typecheck` | 2/2 successful |
+| `rustfmt --check` on all three new files | clean |
+
+**The eight walks, and what each one is for.** The criterion is a sentence about *time*, and a
+sentence about time cannot be proved by a unit test, so all eight drive a real database:
+
+1. `a_failing_channel_is_retried_and_then_marked_failed_after_the_cap` — the criterion itself.
+   Attempts 1 and 2 leave the row `pending` with a reason on it; attempt 3 writes `failed`; a
+   fourth tick claims nothing. Between the attempts it asserts the row is **not** due, which is
+   what makes "the cap is reached in three attempts" mean three attempts over the backoff window
+   rather than three in three ticks. The backoff is real, not merely scheduled: a row retried
+   with `next_attempt_at = now()` is due on the very next tick, so the cap would be reached in
+   milliseconds and every tick would hammer a broken mail server.
+2. `a_claim_makes_the_row_exclusive_until_the_lease_expires` — a second runner finds nothing
+   inside the lease, and the row comes back once the lease ages. That second half is what keeps
+   a crash from stranding a notification.
+3. `enqueueing_the_same_notification_twice_does_not_double_its_deliveries` — the unique
+   constraint makes a re-run of the same emit idempotent, so a reader does not get two copies.
+4. `a_channel_nobody_configured_is_skipped_rather_than_left_queued_forever` — a channel nobody
+   configured is settled with a reason, never left pending, and the settlement is idempotent.
+5. `a_tenant_that_switched_a_channel_on_keeps_its_own_deliveries_queued` — the tenancy defect
+   above.
+6. `the_outbox_reads_back_what_the_queue_wrote` — the read the outbox page performs agrees with
+   the queue's own state (one of each state, failed-first ordering, and the admin retry button
+   still works on a row the queue gave up on). A queue whose rows nobody can read is a queue
+   whose failures are invisible, which is the whole reason the table exists.
+7. `the_in_app_transport_needs_no_configuration_and_always_succeeds` — the defect-1 guard.
+8. `the_email_transport_refuses_a_reader_with_no_address_instead_of_pretending` — a reader with
+   no address is a failure with a reason. The alternative, a silent success, writes a `sent` row
+   for a message that was never sent: the one lie this table must not tell.
+
+**Three of the eight failed before the code was right, and two of those were the test's fault
+rather than the code's — recorded because the direction matters.** The walks asserted
+`claimed == 1` on a fixture that queues two rows, and they asserted a *delivered* e-mail on a
+database where no channel was configured — where the settlement is right to skip it, so the
+fixture had to describe an installation (`configure_channel`) instead of inheriting an empty one.
+A walk that forgets that reads as a queue bug and is a fixture gap; the difference is worth
+knowing before somebody spends a tick on it.
+
+**The browser pass did not run, for the fourth tick running, and the measurement is in the
+ledger.** The QA slot queue is one deep but held by a live `omnion-w3` walkthrough, and the box
+sat at load 60–102 with 5–8 concurrent `rustc` from sibling writers; one cargo run of this
+suite's binary alone took 11 minutes to link. A browser pass was queued behind a live slot and
+this tick spent itself on a defect a walk could find instead.
+
+**Pre-existing red, not mine, and named.** `git status crates/` is clean apart from this tick's
+own file. `cargo test -p omnion-api --lib` compiles the workspace's pre-existing warnings
+(unused imports in `headers_middleware.rs`, `rate_limit_middleware.rs`, `routes/backups.rs`,
+`routes/notifications.rs`, `routes/notifications_admin.rs`; a `PartialEq` derive on a function
+pointer in `crates/security/src/posture.rs`), and `cargo fmt --all -- --check` still fails on the
+files listed in tick 76 — none of which this tick touched. Reformatting the workspace to green
+would rewrite files nine sibling writers are actively editing, so it is reported rather than
+done.
+
+**Next.** REQ-021 has four boxes left, all naming the same missing browser pass: the keyboard
+path, the mobile sheet, the per-channel delivery rows in the drawer, and the test-delivery
+inline result. The drawer rows are now *provable by a walk* rather than by a browser — the
+deliveries exist — so the next quiet-box tick should run `bash scripts/qa/run.sh` with
+`QA_ONLY=notifications,notifications-outbox,notifications-settings`, then close REQ-021 and move
+to REQ-014 (system health, still `pending`).
+
+## Tick 77 addendum — the box ran out of disk mid-verification (named, not worked around)
+
+The 8/8 green run above is real and was measured. Everything red *after* it, in this tick and
+across two re-runs, is the same environmental failure and no product defect:
+
+```
+could not create directory "base/12250615": No space left on device
+code 53100, could not extend file "base/12245557/12250419"
+```
+
+`df` at that moment:
+
+| Filesystem | Size | Avail | Use% |
+|---|---|---|---|
+| `/` (PostgreSQL's `data_directory` = `/var/lib/postgresql/16/main`) | 123G | 3.0G | **98%** |
+| `/mnt/apopic` (all ten writers' worktrees and `target`s) | 60G | **0** | **100%** |
+
+**This is shared, so it is reported and not worked around.** Reclaiming it means deleting build
+output that nine sibling writers are compiling *right now* — the loop discipline is explicit that
+a writer may only reclaim its own `target`, and my own `target/debug/incremental` is 58M, which
+would not change a 3.0G/0-byte situation. The 14 orphaned `omnion_notifdel_*` scratch databases
+that earlier walks left behind when a run was interrupted mid-`dispose` are already gone (the
+walks do drop them; the ones that leaked were killed by the box, not by a missing cleanup).
+
+**What this costs the next tick, stated plainly:** `notification_delivery` is green on the code
+as committed and re-runs will stay red until the disk recovers, so *the walk is not a usable gate
+on this box unt
+## Tick 77 addendum — the box ran out of disk mid-verification (named, not worked around)
+
+The 8/8 green run above is real and was measured. Everything red *after* it, in this tick and
+across two re-runs, is the same environmental failure and no product defect:
+
+```
+could not create directory "base/12250615": No space left on device
+code 53100, could not extend file "base/12245557/12250419"
+```
+
+`df` at that moment:
+
+| Filesystem | Size | Avail | Use% |
+|---|---|---|---|
+| `/` (PostgreSQL's `data_directory` = `/var/lib/postgresql/16/main`) | 123G | 3.0G | **98%** |
+| `/mnt/apopic` (all ten writers' worktrees and `target`s) | 60G | **0** | **100%** |
+
+**This is shared, so it is reported and not worked around.** Reclaiming it means deleting build
+output that nine sibling writers are compiling *right now*; the loop discipline is explicit that
+a writer may only reclaim its own `target`, and this tick reclaimed only its own
+`target/debug/incremental` (58M, after the three checks: no open file descriptors, no write in
+the last 20 minutes, its own directory). The 14 orphaned `omnion_notifdel_*` scratch databases
+are already gone — the walks do drop them; the ones that leaked were killed by the box mid-run,
+not by a missing cleanup, and the next run found zero of them.
+
+**What this costs the next tick, stated plainly:** `notification_delivery` is green on the code
+as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
+this box until then** — treat a `53100` as environmental and read the assertion line above it for
+the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
 were already done by an earlier tick, so the remaining work came from auditing the six screens.
 That audit found a worse defect: **`deals-view.tsx` had the only body in the module that did not
 gate on its read.** A refused board read set `error`, and the body went on taking the
