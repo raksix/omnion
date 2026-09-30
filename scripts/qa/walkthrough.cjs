@@ -9806,6 +9806,14 @@ async function main() {
           { path: `/organizations/${mobileOrganizationId}?tab=audit`, name: "organization-audit" },
         ]
       : []),
+    // The staging surfaces (REQ-017). `/environments` carries the detail route's id and so is
+    // walked by `runEnvironmentsDepth`, but the CREATE WIZARD has no id and was walked by
+    // nothing at any width — while the spec names its phone layout explicitly ("below `lg` the
+    // wizard becomes a single scrolling form"). A three-step wizard that overflows sideways on a
+    // phone is exactly the failure that clause exists to prevent, and no desktop screenshot and
+    // no depth-pass step can show it: the depth pass drives the wizard at 1280px and only ever
+    // opens step one, because submitting is what creates a row.
+    { path: "/environments/new", name: "environments-wizard" },
   ];
   for (const r of mobileTenantRoutes) MOBILE_NAMES.add(r.name);
   for (const route of (ONLY_ALL
