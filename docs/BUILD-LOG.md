@@ -7888,3 +7888,50 @@ stay unticked rather than barging in.
 **Next.** Carry the `tenancy.rs` fix into the three remaining suites one file at a time, each
 verified by compiling and by one walk passing on its own database; then take the QA slot for the
 CDN scope `04bc7e73` instrumented.
+
+## Tick 80 — the last three suites carried the same defect, and the fix was a type, not a script
+
+**What.** `ed845eb2` carries the `tenancy.rs` fix (`42dfa290`) into `tenancy_members` (1,292
+lines), `tenancy_departments` (1,155) and `tenancy_limits` (4,025) — 6,472 lines, ~180 request
+sites, **0** of which carried an `x-omnion-csrf` header. Same defect: sign-in issues two cookies,
+`Headers::get` returns the first, `.split(';').next()` keeps the session, and the security layer
+refuses the write before the handler sees it.
+
+**The design, because last tick reverted a scripted rewrite of these same files.** `login()` now
+returns `Credentials { session, csrf }` with `Deref<Target = str>`. That single type makes ~180
+`Some(&admin)` call sites, a `&str` parameter on `create_department`/`invite`/`set_status`, and
+every `format!("{token}")` compile **unchanged** while the second cookie travels with the first —
+the diff is one function per file instead of one edit per call site, and the type system now makes
+"a session without its token" unrepresentable. `Debug` is hand-written to print `<redacted>`;
+deriving it would put a live session token into every failing assertion and every CI log.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-api --test tenancy_{members,departments,limits} --no-run` | `COMPILE2_EXIT=0`, 0 errors |
+| `tenancy_departments` | **7 passed, 0 failed, 198.64 s** |
+| `tenancy_limits` | 25 passed / 4 failed, 337.78 s — `grep -c csrf_failed` over the log is **0** |
+| `pnpm typecheck` | 2/2 packages |
+
+**Two signals worth not misreading.** The 4 `tenancy_limits` failures are `PoolTimedOut` at
+fixture setup (lines 272/358/503), not assertions — a PostgreSQL shared by seven writer loops at
+`max_connections=100`. Re-run alone, the first of them passes, which is the same subtraction that
+identified the cross-test wedge last tick. And `grep -c csrf_failed = 0` across the whole run is
+the stronger claim than any individual pass: the failure **class** is gone, not four symptoms of
+it.
+
+**A build failure that was not a build failure.** The first `--no-run` died with
+`failed to write .../.fingerprint/atoi-.../lib-atoi — No such file or directory (os error 2)` on a
+path that existed seconds earlier. `os error 28` is a full disk; **os error 2 is deletion** — another
+writer's pass wiped `target/` mid-compile. Rebuilt under `CARGO_TARGET_DIR=/dev/shm/w5-target`
+inside `scripts/qa/cargo-slot.sh`, the documented isolation path.
+
+**The QA slot queue.** Six orphaned `qa-slot.sh` waiters of *mine* were holding the shared place:
+each pass requests one, a SIGKILLed pass never runs its EXIT trap, and the waiter survives
+reparented to PID 1 while the next tick adds another. TERMed my own five by matching
+`/proc/<pid>/cwd` — never another writer's. REQ-005's walkthrough box and REQ-011's two CDN boxes
+remain unticked for want of a slot, which is the honest state to record.
+
+**Next.** Take the QA slot instrumented and close REQ-005's last box; then REQ-011 (CDN/edge),
+whose two CDN boxes are blocked on the same slot.
