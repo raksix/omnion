@@ -7166,8 +7166,9 @@ place in `/tmp/omnion-qa-slot` has dead holder pids and belongs to a reaper.
 | Gate | Result |
 |---|---|
 | `cargo check -p omnion-api -p omnion-backup` (merged tree, cold target) | **exit 0**, 25 m 55 s, warnings only |
-| `omnion-backup --lib` | see the run below |
-| `omnion-api --lib` | see the run below |
+| `omnion-backup --lib` | **153 passed / 0 failed** |
+| `omnion-api --lib` | **224 passed / 0 failed** |
+| `pnpm typecheck` (14 packages, incl. the nine themes) | **exit 0** |
 
 **Next.** (a) REQ-062 acceptance 15's **render** half — the scaffolder is proven to compile a
 theme but has never been watched *drawing* one, and a theme that compiles while its layout is
