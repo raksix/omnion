@@ -1,6 +1,15 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 1 BUILT — `b2077454` store, `711ee8e1` routes, `07ad279d` the shapes those two got wrong. Migration `0186_content_api_tokens.sql` (high-water 0185 + 1, scanned across every worktree), the `api_tokens` + `api_token_usage_daily` tables, two catalogue keys (`content.api.read` / `content.api.manage`, manager gets read only), six routes and the `/content-api` Tokens tab. Gates: `cargo test -p omnion-content --lib` **285/0** (274 before, 11 new), `cargo check -p omnion-api` **exit 0**, `apps/admin` `tsc --noEmit` **exit 0**. **The slice's done line is half-proven and the half is named.** A created token authenticates and a revoked one is refused — proved against the store the route will call, because the HTTP read surface arrives in slice 2 and there is nothing to authenticate *through* yet. The 10-walk integration suite for the routes is written and building; nothing is ticked until it runs. `content:write` is stored but never honoured, and that is deliberate: a reserved scope the store refuses needs a migration later, while one it accepts costs a route check now. Next: the integration suite, then slice 2 (the `/api/v1/content/*` read surface, which is what makes a token mean anything).)
+> **Status:** in-progress (slice 1 shipped; slice 2 BUILT and COMMITTED as `9011e9d5` — the read
+> surface `/api/v1/content/*` plus the served OpenAPI 3.1 document. Slice 1's done line is now
+> provable *through HTTP* rather than against the store, because slice 2 is what a token
+> authenticates through. New in slice 2: signed keyset cursors over `(sort, id)`, a field
+> projection that cannot orphan a response, ETags over what a reader can observe, a `ContentToken`
+> extractor (the only token-authenticated routes in the v1 tree — a panel session is refused), site
+> scope as a *filter* rather than a `403`, and a 13-walk integration suite. **No acceptance box is
+> ticked yet: the two suites were still compiling at the time of writing, under a box at load ~90
+> with `/mnt/apopic` at 99%.** Next: the suites' numbers, then the `/content-api/docs` tab, then
+> slice 3 (explorer + metering).)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
