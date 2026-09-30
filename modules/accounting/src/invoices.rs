@@ -216,6 +216,8 @@ pub struct InvoiceLineView {
     pub line_total: String,
     /// The share of that total which is tax, for the totals block's breakdown.
     pub tax_amount: String,
+    /// The line's share of it before the tax — the figure `subtotal` sums.
+    pub net_amount: String,
 }
 
 /// An invoice with its lines, as the detail screen shows it.
@@ -488,6 +490,8 @@ impl NewInvoiceLine {
             tax_percent: percent_text(tax_percent),
             line_total: line_total.to_text(),
             tax_amount: tax.to_text(),
+            net_amount: net.to_text(),
+            discount_amount: discount.to_text(),
         })
     }
 }
@@ -501,6 +505,8 @@ struct PricedLine {
     tax_percent: String,
     line_total: String,
     tax_amount: String,
+    net_amount: String,
+    discount_amount: String,
 }
 
 /// The body of `POST /accounting/invoices` and the `PATCH` that replaces a draft's lines.
@@ -649,7 +655,7 @@ pub async fn create_invoice(
     }
     let grand_total = subtotal.minus(discount_total).plus(tax_total);
 
-    let customer_name = resolve_customer_name(pool, new, from_order.as_ref()).await?;
+    let customer_name = resolve_customer_name(pool, new).await?;
     let currency = normalize_currency(new.currency.as_deref())?;
 
     // The three free-text fields are normalised **before** the statement is built, not inside the
@@ -699,9 +705,10 @@ pub async fn create_invoice(
         sqlx::query(
             "insert into accounting_invoice_lines \
                  (invoice_id, organization_id, position, product_id, description, qty, \
-                  unit_price, discount_percent, tax_percent, line_total) \
+                  unit_price, discount_percent, tax_percent, line_total, tax_amount, \
+                  net_amount) \
              values ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9::numeric, \
-                     $10::numeric)",
+                     $10::numeric, $11::numeric, $12::numeric)",
         )
         .bind(invoice_id)
         .bind(organization_id)
@@ -713,6 +720,8 @@ pub async fn create_invoice(
         .bind(&priced_line.discount_percent)
         .bind(&priced_line.tax_percent)
         .bind(&priced_line.line_total)
+        .bind(&priced_line.tax_amount)
+        .bind(&priced_line.net_amount)
         .execute(&mut *tx)
         .await?;
     }
@@ -747,7 +756,8 @@ pub async fn get_invoice(
     let row = sqlx::query(
         "select i.id, i.organization_id, i.number, i.order_id, o.number as order_number, \
                 i.company_id, i.contact_id, \
-                coalesce(c.name, ct.full_name, i.customer_name) as customer_name, \
+                coalesce(c.name, nullif(btrim(ct.first_name || ' ' || ct.last_name), ''), \
+                         i.customer_name) as customer_name, \
                 i.invoice_status, i.currency, i.issue_date, i.due_date, i.payment_terms, \
                 i.reference, i.notes, i.subtotal::text as subtotal, \
                 i.discount_total::text as discount_total, i.tax_total::text as tax_total, \
@@ -834,7 +844,8 @@ pub async fn list_invoices(
 
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
         "select i.id, i.number, \
-                coalesce(c.name, ct.full_name, i.customer_name) as customer_name, \
+                coalesce(c.name, nullif(btrim(ct.first_name || ' ' || ct.last_name), ''), \
+                         i.customer_name) as customer_name, \
                 i.invoice_status, i.currency, i.issue_date, i.due_date, \
                 i.grand_total::text as grand_total, i.paid_total::text as paid_total, \
                 (i.grand_total - i.paid_total)::text as outstanding, \
@@ -889,7 +900,10 @@ pub async fn list_invoices(
         }
         builder.push(" and (i.number ilike ");
         builder.push_bind(format!("%{term}%"));
-        builder.push(" or coalesce(c.name, ct.full_name, i.customer_name) ilike ");
+        builder.push(
+            " or coalesce(c.name, nullif(btrim(ct.first_name || ' ' || ct.last_name), ''), \
+                  i.customer_name) ilike ",
+        );
         builder.push_bind(format!("%{term}%"));
         builder.push(")");
     }
@@ -1232,11 +1246,7 @@ fn resolve_due_date(raw: Option<&str>, issue_date: Date) -> Result<Option<Date>>
 ///
 /// `async` because it reads the CRM's name when the caller named a company or a contact rather
 /// than spelling the customer out.
-async fn resolve_customer_name(
-    pool: &PgPool,
-    new: &NewInvoice,
-    order: Option<&OrderForInvoice>,
-) -> Result<String> {
+async fn resolve_customer_name(pool: &PgPool, new: &NewInvoice) -> Result<String> {
     if let Some(name) = new
         .customer_name
         .as_deref()
@@ -1254,8 +1264,28 @@ async fn resolve_customer_name(
         }
     }
     if let Some(contact_id) = new.contact_id {
-        if let Some(name) = fetch_name(pool, "crm_contacts", "full_name", contact_id).await {
-            return Ok(name);
+        // `crm_contacts` stores `first_name` and `last_name`, not a combined column, and either
+        // may be NULL. The two are joined here rather than in SQL so a contact with only a surname
+        // prints the surname — `concat_ws` would too, but a screen that has to trim a leading space
+        // is a screen with a different name from this one.
+        let parts: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("select first_name, last_name from crm_contacts where id = $1")
+                .bind(contact_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        if let Some((first, last)) = parts {
+            let name = [first, last]
+                .into_iter()
+                .flatten()
+                .map(|part| part.trim().to_owned())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<String>>()
+                .join(" ");
+            if !name.is_empty() {
+                return Ok(truncate(&name, MAX_DESCRIPTION_LENGTH));
+            }
         }
     }
     Err(AccountingError::invalid(
@@ -1307,21 +1337,20 @@ fn days_past_due(status: InvoiceStatus, due_date: Option<Date>) -> i32 {
     }
 }
 
-/// The gross of a priced line — `line_total` plus its tax, which is the pre-discount, pre-tax
-/// figure the `subtotal` column holds.
+/// The gross of a priced line — the pre-discount amount the `subtotal` column sums.
+///
+/// `net + tax + discount`, from the three figures the writer already produced, rather than
+/// `line_total - tax`: the first is a sum of stored values and the second is a subtraction that
+/// has to be right, and the two differ whenever a discount makes the tax not a round figure.
 fn gross_of(line: &PricedLine) -> Amount {
-    let total = Amount::parse(&line.line_total).unwrap_or(Amount::ZERO);
-    let tax = Amount::parse(&line.tax_amount).unwrap_or(Amount::ZERO);
-    total.minus(tax)
+    Amount::parse(&line.net_amount).unwrap_or(Amount::ZERO)
+        .plus(Amount::parse(&line.tax_amount).unwrap_or(Amount::ZERO))
+        .plus(Amount::parse(&line.discount_amount).unwrap_or(Amount::ZERO))
 }
 
-/// The discount of a priced line — the gross less the pre-tax net.
+/// The discount of a priced line, as the writer computed it.
 fn discount_of(line: &PricedLine) -> Amount {
-    let net = Amount::parse(&line.line_total)
-        .unwrap_or(Amount::ZERO)
-        .minus(Amount::parse(&line.tax_amount).unwrap_or(Amount::ZERO));
-    let gross = gross_of(line);
-    gross.minus(net)
+    Amount::parse(&line.discount_amount).unwrap_or(Amount::ZERO)
 }
 
 /// A currency code, upper-cased and checked.
@@ -1506,13 +1535,18 @@ fn format_qty(thousandths: i64) -> String {
 
 /// The lines of an invoice, in order.
 async fn load_lines(pool: &PgPool, invoice_id: Uuid) -> Result<Vec<InvoiceLineView>> {
+    // The tax and the net are **read back from the row**, not recomputed here. The first
+    // implementation derived the tax by back-solving `line_total / (1 + tax%)`, and that is a
+    // second definition of the same arithmetic the writer used: it agrees on a round number and
+    // disagrees by a cent on a discounted one, which is precisely the case the REQ's "the panel,
+    // the PDF and the reports must print identical totals" is about. The writer stores both, so
+    // the reader reads both and there is nothing left to disagree.
     let rows = sqlx::query(
         "select l.id, l.invoice_id, l.position, l.product_id, l.description, \
                 l.qty::text as qty, l.unit_price::text as unit_price, \
                 l.discount_percent::text as discount_percent, \
                 l.tax_percent::text as tax_percent, l.line_total::text as line_total, \
-                round(l.line_total - l.line_total / (1 + l.tax_percent / 100), 2)::text \
-                    as tax_amount \
+                l.tax_amount::text as tax_amount, l.net_amount::text as net_amount \
          from accounting_invoice_lines l where l.invoice_id = $1 order by l.position",
     )
     .bind(invoice_id)
@@ -1533,6 +1567,7 @@ async fn load_lines(pool: &PgPool, invoice_id: Uuid) -> Result<Vec<InvoiceLineVi
             tax_percent: row.get("tax_percent"),
             line_total: row.get("line_total"),
             tax_amount: row.get("tax_amount"),
+            net_amount: row.get("net_amount"),
         })
         .collect())
 }

@@ -23,7 +23,8 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use omnion_api::state::AppState;
-use omnion_api::{routes, BuildInfo, Db, RedisClient};
+use omnion_api::routes;
+use omnion_core::{BuildInfo, Db, RedisClient};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -513,7 +514,7 @@ async fn a_line_without_a_description_or_a_product_is_refused() {
         refused.body
     );
     assert_eq!(
-        refused.body.pointer("/details/field"),
+        refused.body.pointer("/error/details/field"),
         Some(&json!("description")),
         "{}",
         refused.body
@@ -540,7 +541,7 @@ async fn a_zero_quantity_is_refused_as_a_heading_not_a_line() {
     .await;
 
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
-    assert_eq!(refused.body.pointer("/details/field"), Some(&json!("qty")), "{}", refused.body);
+    assert_eq!(refused.body.pointer("/error/details/field"), Some(&json!("qty")), "{}", refused.body);
 }
 
 #[tokio::test]
@@ -565,7 +566,7 @@ async fn a_due_date_before_the_issue_date_is_refused_naming_both_dates() {
     .await;
 
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
-    let message = refused.body.get("message").and_then(Value::as_str).unwrap_or_default();
+    let message = refused.body.pointer("/error/message").and_then(Value::as_str).unwrap_or_default();
     assert!(message.contains("2026-03-01"), "{message}");
     assert!(message.contains("2026-03-10"), "{message}");
 }
@@ -648,7 +649,7 @@ async fn sending_stamps_the_date_moves_the_status_and_refuses_a_second_send() {
     .await;
     assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
     assert!(
-        again.body.get("message").and_then(Value::as_str).unwrap_or_default().contains("void"),
+        again.body.pointer("/error/message").and_then(Value::as_str).unwrap_or_default().contains("void"),
         "the refusal names the way out: {}",
         again.body
     );
@@ -686,7 +687,7 @@ async fn voiding_keeps_the_number_requires_a_reason_and_takes_it_out_of_the_rece
     .await;
     assert_eq!(no_reason.status, StatusCode::BAD_REQUEST, "{}", no_reason.body);
     assert_eq!(
-        no_reason.body.pointer("/details/field"),
+        no_reason.body.pointer("/error/details/field"),
         Some(&json!("reason")),
         "{}",
         no_reason.body
@@ -785,7 +786,7 @@ async fn a_sales_order_becomes_a_draft_with_its_lines_and_is_not_converted_twice
     .await;
     assert_eq!(twice.status, StatusCode::CONFLICT, "{}", twice.body);
     assert!(
-        twice.body.get("message").and_then(Value::as_str).unwrap_or_default().contains("already"),
+        twice.body.pointer("/error/message").and_then(Value::as_str).unwrap_or_default().contains("already"),
         "{}",
         twice.body
     );
@@ -813,7 +814,7 @@ async fn a_draft_cannot_carry_its_own_lines_when_it_is_converted_from_an_order()
     )
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
-    assert_eq!(refused.body.pointer("/details/field"), Some(&json!("lines")), "{}", refused.body);
+    assert_eq!(refused.body.pointer("/error/details/field"), Some(&json!("lines")), "{}", refused.body);
 }
 
 #[tokio::test]
@@ -1030,7 +1031,7 @@ async fn a_misspelled_status_is_refused_with_the_ones_that_exist() {
     .await;
 
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
-    let message = refused.body.get("message").and_then(Value::as_str).unwrap_or_default();
+    let message = refused.body.pointer("/error/message").and_then(Value::as_str).unwrap_or_default();
     for status in ["draft", "sent", "partial", "paid", "overdue", "void"] {
         assert!(message.contains(status), "the refusal names {status}: {message}");
     }
