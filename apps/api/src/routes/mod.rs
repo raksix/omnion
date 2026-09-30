@@ -99,6 +99,7 @@ pub mod crm_copilot;
 pub mod crm_deals;
 pub mod crm_leads;
 pub mod crm_views;
+pub mod hr;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1407,6 +1408,57 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "crm.pipelines.manage"));
 
+    // The HR surface (docs/requests/REQ-055, slice 1): the people core — employees, the
+    // department tree and the org chart. The family splits the way CRM's does, with two keys that
+    // are a **different act** rather than a stricter version of editing:
+    //
+    // * `hr.employees.terminate` is not `.delete`. Termination keeps the record and writes a
+    //   status plus an end date, and there is no delete route at all: leave, attendance and
+    //   onboarding all reference an employee, so a hard delete would take a person's history
+    //   with it. Giving it a key of its own also says what it is — a statement about an
+    //   employment, not an edit to a job title.
+    // * `hr.employees.sensitive.read` is deliberately **not** a `require()` here. It decides what
+    //   a response *carries* (four personal fields), not whether the request is allowed, so the
+    //   handlers resolve it with the authorizer. A guard would 403 the whole employee screen for
+    //   exactly the roles the request says should still see the directory.
+    let hr_employees_read = Router::new()
+        .route("/hr/employees", get(hr::list_employees))
+        .route("/hr/employees/suggest-number", get(hr::suggest_employee_number))
+        .route("/hr/employees/{id}", get(hr::get_employee))
+        // The chart is the directory drawn as a tree, so it reads with the directory rather than
+        // with the department tree below: a role that may see the org chart must see it whole.
+        .route("/hr/org-chart", get(hr::org_chart))
+        .route_layer(guards::require(&state, "hr.employees.read"));
+
+    let hr_employees_create = Router::new()
+        .route("/hr/employees", post(hr::create_employee))
+        .route_layer(guards::require(&state, "hr.employees.create"));
+
+    let hr_employees_update = Router::new()
+        .route("/hr/employees/{id}", patch(hr::update_employee))
+        .route_layer(guards::require(&state, "hr.employees.update"));
+
+    let hr_employees_terminate = Router::new()
+        .route(
+            "/hr/employees/{id}/terminate",
+            post(hr::terminate_employee),
+        )
+        .route_layer(guards::require(&state, "hr.employees.terminate"));
+
+    // The department tree and the org chart are the same rows, so the tree gets its own read key
+    // rather than borrowing the directory's: an organization may well let a manager see the shape
+    // of the company without opening the directory.
+    let hr_departments_read = Router::new()
+        .route("/hr/departments", get(hr::list_departments))
+        .route_layer(guards::require(&state, "hr.departments.read"));
+
+    let hr_departments_manage = Router::new()
+        .route("/hr/departments", post(hr::create_department))
+        .route("/hr/departments/{id}", patch(hr::update_department))
+        .route("/hr/departments/{id}", delete(hr::delete_department))
+        .route("/hr/departments/merge", post(hr::merge_departments))
+        .route_layer(guards::require(&state, "hr.departments.manage"));
+
     // Activities and the merged timeline. Reading the feed and reading one record's history are
     // the same exposure, so they share `crm.activities.read` — a separate "timeline" key would
     // let a caller read a contact's history through a deal screen while being refused on the
@@ -1474,6 +1526,12 @@ pub fn router(state: AppState) -> Router {
         .merge(crm_activities_read)
         .merge(crm_activities_create)
         .merge(crm_copilot)
+        .merge(hr_employees_read)
+        .merge(hr_employees_create)
+        .merge(hr_employees_update)
+        .merge(hr_employees_terminate)
+        .merge(hr_departments_read)
+        .merge(hr_departments_manage)
         .merge(crm_create)
         .merge(crm_update)
         .merge(crm_archive)
