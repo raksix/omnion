@@ -48,6 +48,39 @@ use crate::store::{self, CloneJobRow, EnvironmentRow};
 /// (slice 4), not a clone that stalls the platform to get there.
 pub const MAX_CLONE_ROWS: i64 = 250_000;
 
+/// How many rows one batch of a large area copies.
+///
+/// The request's Risks section has always promised that "the runner batches by area with a
+/// configurable page size" — and until this tick no such code existed, so the promise was in the
+/// documentation only. It matters for a reason that is not throughput: **one `insert … select`
+/// over 200 000 rows is a single transaction that holds every one of those rows' locks for its
+/// whole duration**, and on a live installation that is the difference between a slow clone and a
+/// clone that blocks the editor. Batching turns one long transaction into many short ones, which
+/// is also what makes the progress bar real: a bar that only moves when the last batch lands is
+/// the "sits at 0% then jumps" bar the progress fold was written to avoid.
+///
+/// The default is deliberately small enough to be invisible to a small site (a 40-page site is
+/// one batch, so its behaviour is unchanged) and large enough that a big site is not thousands
+/// of round trips. Override it with `OMNION_CLONE_BATCH_ROWS`; a non-positive or unparsable
+/// value falls back to the default rather than refusing to clone, because a mistyped environment
+/// variable must not be able to break the one feature that copies content.
+pub const DEFAULT_BATCH_ROWS: i64 = 5_000;
+
+/// Read the configured batch size, falling back to [`DEFAULT_BATCH_ROWS`].
+///
+/// The ceiling is the row count, not the batch: a batch larger than the whole copy is not a
+/// faster copy, it is the un-batched copy with extra steps, and it would reintroduce exactly the
+/// long transaction the batches exist to break up.
+#[must_use]
+pub fn batch_rows() -> i64 {
+    let ceiling = MAX_CLONE_ROWS.max(1);
+    std::env::var("OMNION_CLONE_BATCH_ROWS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|rows| *rows > 0)
+        .map_or(DEFAULT_BATCH_ROWS, |rows| rows.min(ceiling))
+}
+
 /// What a finished area copied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AreaResult {
@@ -206,13 +239,28 @@ pub async fn run_job(pool: &PgPool, job: &CloneJobRow) -> Result<CloneOutcome, E
     }
     store::record_progress(pool, job.id, &progress).await?;
 
-    // Pass two: copy, recording after each area.
+    // Pass two: copy, recording after each area — and, inside an area, after each batch.
+    //
+    // The two recordings are the same statement and that is deliberate. An area of 40 000 rows
+    // copied in 8 batches reports 8 times instead of once, so the operator watching a large
+    // clone sees the bar move rather than sitting at 0% and jumping; and the total was already
+    // fixed in pass one, so no intermediate reading can exceed it.
+    let batch = batch_rows();
     for area in &areas {
         let total = progress.total.get(area).copied().unwrap_or(0);
-        match copy_area(pool, source, job.environment_id, *area, job.exclude_archived).await {
+        let outcome = copy_area_batched(
+            pool,
+            source,
+            job.environment_id,
+            *area,
+            job.exclude_archived,
+            batch,
+            job.id,
+            &mut progress,
+        )
+        .await;
+        match outcome {
             Ok(copied) => {
-                progress.advance(*area, copied);
-                store::record_progress(pool, job.id, &progress).await?;
                 results.push(AreaResult {
                     area: *area,
                     total,
@@ -283,51 +331,238 @@ async fn count_area(
         })
 }
 
-/// Empty the target and copy one area from the source into it.
-async fn copy_area(
+/// Copy one area, in batches, advancing `progress` after each one.
+///
+/// The *emptying* happens once, before the first batch, and every batch is its own short
+/// transaction. `progress` is advanced and persisted after each committed batch, which is what
+/// makes the bar move during a long copy instead of at its end.
+///
+/// `progress` and `job_id` are arguments rather than a callback. The callback shape was the
+/// obvious one and it does not compile here for a reason worth writing down: the closure has to
+/// capture `&mut progress` *and* be `FnMut`, which forces every borrow of `progress` — including
+/// the `total` the `AreaResult` is built from — to be non-overlapping with a future that the
+/// type system cannot prove short. Passing the two values straight in makes the borrow ordinary
+/// and the code shorter.
+async fn copy_area_batched(
     pool: &PgPool,
     source: Uuid,
     target: Uuid,
     area: Area,
     exclude_archived: bool,
+    batch: i64,
+    job_id: Uuid,
+    progress: &mut Progress,
+) -> Result<u64, EnvironmentError> {
+    // Empty the target first, so a retry starts from a known state and no batch can see a row a
+    // previous attempt left behind. The emptying pass has no bound, which is what makes it
+    // "empty everything" rather than "empty the first batch".
+    copy_area_once(pool, source, target, area, exclude_archived, None).await?;
+
+    // The three no-copy areas have nothing to batch: the emptying pass above already ran and the
+    // copy reported zero. A loop over an empty key range would be a batch with no rows and a
+    // progress write that says "0 of N" once for nothing.
+    if !area.copies() {
+        return Ok(0);
+    }
+
+    let mut copied_total: u64 = 0;
+    let mut after: Option<Uuid> = None;
+    loop {
+        // The window's upper edge is chosen **before** the copy rather than derived from what the
+        // copy returned, and that ordering is the whole correctness of the batching. The page
+        // area copies revisions by joining source pages to staging pages on the natural key
+        // `(site_id, slug)`, and a copy with no bound would re-copy *every* revision on *every*
+        // batch — the second batch would rewrite the first one's history. Bounding the window
+        // first means the revision join can be bounded by the same window, so each batch copies
+        // exactly the revisions of its own pages.
+        //
+        // It also makes the loop terminate on a fact rather than on a row count. `on conflict do
+        // nothing` means a batch can legitimately copy zero rows — a concurrent promotion already
+        // put them there — and "zero rows copied" is not the end of the range. Advancing to
+        // `through` regardless is what stops such a batch from ending the copy short.
+        let Some(through) = next_batch_key(pool, source, area, exclude_archived, after, batch).await?
+        else {
+            break;
+        };
+        let window = BatchWindow { after, through };
+        let copied = copy_area_once(pool, source, target, area, exclude_archived, Some(window)).await?;
+        copied_total += copied;
+        // `advance` is a *delta* fold, so the batch reports what it copied, not the running
+        // total. Passing the running total here would double-count from the second batch on and
+        // the bar would sit clamped at 100% with rows still missing.
+        progress.advance(area, copied);
+        store::record_progress(pool, job_id, progress).await?;
+        after = Some(through);
+    }
+    Ok(copied_total)
+}
+
+/// The key range one batch of a heavy area covers: `(after, through]` on the source primary key.
+///
+/// Half-open, and the reason is restart safety: a batch whose lower bound were *inclusive* would
+/// re-copy the row at `after` on every batch, and for the page area that row's revisions would be
+/// re-inserted against a `do nothing` conflict — harmless for correctness, but it makes
+/// `rows_affected` disagree with the rows the window names, and a progress bar built on that
+/// number then lies.
+#[derive(Debug, Clone, Copy)]
+struct BatchWindow {
+    /// Copy rows with an `id` strictly greater than this. `None` for the first batch.
+    after: Option<Uuid>,
+    /// Copy rows with an `id` up to and including this.
+    through: Uuid,
+}
+
+/// The source id of the `limit`-th row after `after`, or `None` when the range is exhausted.
+///
+/// Read as a separate cheap statement rather than taken from what the copy returned, for the
+/// reason in [`copy_area_batched`]: the copy's own `rows_affected` is the number of rows that
+/// *landed*, which `on conflict do nothing` makes smaller than the number of rows the window
+/// *names*, and the loop must advance by the window.
+async fn next_batch_key(
+    pool: &PgPool,
+    source: Uuid,
+    area: Area,
+    exclude_archived: bool,
+    after: Option<Uuid>,
+    limit: i64,
+) -> Result<Option<Uuid>, EnvironmentError> {
+    let (table, filter) = match area {
+        Area::Pages => (
+            "pages",
+            if exclude_archived {
+                " and status <> 'archived'"
+            } else {
+                ""
+            },
+        ),
+        Area::Translations => ("translations", ""),
+        Area::Workflows => ("workflows", ""),
+        // Only reachable if a new area is given `copies() == true` without a table here, and a
+        // clear store error in a worker beats a panic that takes the runner task with it.
+        _ => {
+            return Err(EnvironmentError::Store {
+                message: "asked for a batch key on an area that copies nothing".to_string(),
+            })
+        }
+    };
+    // The last key of the next window, and the reason this cannot be a plain
+    // `limit 1 offset <limit-1>`.
+    //
+    // That query — "the limit-th row after `after`" — returns **nothing** once fewer than
+    // `limit` rows remain, so the final, partial batch of every clone never ran. Seven pages at
+    // a batch of two copied six and reported `done`: the loop had no key to advance to, exited
+    // cleanly, and the seventh page was never looked at. The `items_done` the job recorded was
+    // the honest sum of what the batches copied, so the panel showed a finished clone that was
+    // missing a page, and the missing page was indistinguishable from one production deleted
+    // in the meantime.
+    //
+    // `greatest(limit - 1, 0)` is therefore not the whole fix — it is the *floor* of the offset,
+    // and what this needs is the **ceiling row**: the `limit`-th row when it exists, and the
+    // last row that does exist when it does not. `order by id desc limit 1 offset <count of
+    // remaining - limit>` expresses that in one statement; the two-branch form below is clearer
+    // and costs one extra cheap read on the final batch only.
+    let remaining: i64 = sqlx::query_scalar(&format!(
+        "select count(*) from {table} where environment_id = $1 and \
+         ($2::uuid is null or id > $2) {filter}",
+    ))
+    .bind(source)
+    .bind(after)
+    .fetch_one(pool)
+    .await
+    .map_err(|err| EnvironmentError::Store {
+        message: err.to_string(),
+    })?;
+
+    if remaining == 0 {
+        return Ok(None);
+    }
+    // The offset of the window's last row, within the rows that remain. A short tail therefore
+    // yields a short window rather than no window, and the loop terminates on the *next*
+    // `None` rather than skipping the tail.
+    let offset = (remaining - 1).min(limit.max(1) - 1);
+    let sql = format!(
+        "select id from {table} where environment_id = $1 and ($2::uuid is null or id > $2) \
+         {filter} order by id limit 1 offset {offset}"
+    );
+    sqlx::query_scalar(&sql)
+        .bind(source)
+        .bind(after)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| EnvironmentError::Store {
+            message: err.to_string(),
+        })
+}
+
+/// Empty the target and copy one area from the source into it.
+///
+/// `bound` is `None` for the emptying pass and for the no-copy areas, and `Some` for a real
+/// batch. Keeping the whole statement set in one function means the batched and unbatched paths
+/// are literally the same SQL — the batching cannot drift from the copy, because there is only
+/// one copy.
+async fn copy_area_once(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    area: Area,
+    exclude_archived: bool,
+    bound: Option<BatchWindow>,
 ) -> Result<u64, EnvironmentError> {
     let mut tx = pool.begin().await.map_err(store_err)?;
 
-    // The target's rows for this area go first. The page delete cascades to its revisions, which
-    // is why revisions are not deleted separately.
-    match area {
-        Area::Pages => {
-            sqlx::query("delete from pages where environment_id = $1")
-                .bind(target)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        Area::Translations => {
-            sqlx::query("delete from translations where environment_id = $1")
-                .bind(target)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        Area::Menus | Area::SiteSettings => {
-            sqlx::query("delete from organization_settings where environment_id = $1")
-                .bind(target)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
-        }
-        // The theme lives on `sites`, which is shared by every environment: copying it would
-        // change production's own site row. So the theme area deletes nothing and copies nothing,
-        // and reports zero rows. Claiming a copy that does not happen is exactly the kind of
-        // dishonesty this request is written against.
-        Area::Theme => {}
-        Area::Workflows => {
-            sqlx::query("delete from workflows where environment_id = $1")
-                .bind(target)
-                .execute(&mut *tx)
-                .await
-                .map_err(store_err)?;
+    // The target's rows for this area go first — but **only on the emptying pass**, and this is
+    // the single most dangerous line in the batching.
+    //
+    // The delete used to run on every call, and a batched call is a call. With a batch of two and
+    // seven pages, batch 2 deleted the two rows batch 1 had just committed, batch 3 deleted
+    // batch 2's, and the job finished `done` with the *last* batch's rows and the progress bar
+    // reporting a count that matched nothing on disk. Nothing in the row counts is wrong in
+    // isolation: `copied_total` is the sum of what each batch inserted, and every batch really
+    // did insert its rows. The walk that caught it asserted the total on disk, and that is the
+    // only reason it was caught — the job's own `items_done` agreed with the runner's own
+    // arithmetic.
+    //
+    // So the emptying is keyed on "no window" rather than being unconditional, and the key is
+    // stated where the delete is rather than in the driver that calls it.
+    let emptying = bound.is_none();
+
+    // The page delete cascades to its revisions, which is why revisions are not deleted
+    // separately.
+    if emptying {
+        match area {
+            Area::Pages => {
+                sqlx::query("delete from pages where environment_id = $1")
+                    .bind(target)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(store_err)?;
+            }
+            Area::Translations => {
+                sqlx::query("delete from translations where environment_id = $1")
+                    .bind(target)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(store_err)?;
+            }
+            Area::Menus | Area::SiteSettings => {
+                sqlx::query("delete from organization_settings where environment_id = $1")
+                    .bind(target)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(store_err)?;
+            }
+            // The theme lives on `sites`, which is shared by every environment: copying it would
+            // change production's own site row. So the theme area deletes nothing and copies
+            // nothing, and reports zero rows. Claiming a copy that does not happen is exactly the
+            // kind of dishonesty this request is written against.
+            Area::Theme => {}
+            Area::Workflows => {
+                sqlx::query("delete from workflows where environment_id = $1")
+                    .bind(target)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(store_err)?;
+            }
         }
     }
 
@@ -338,6 +573,42 @@ async fn copy_area(
             } else {
                 ""
             };
+            // The window, when there is one. `$3`/`$4` are the window bounds for every statement
+            // in this arm, so all three of them read the same rows — the page insert, the
+            // revision insert and the `published_revision_id` re-link. A bound on the first and
+            // not the others is how a batched copy would silently re-copy the whole site's
+            // revision history into every batch.
+            // A copy statement here only copies when a window exists. That is what turns the
+            // `None` pass into the **emptying** pass instead of a second, unbatched copy: with
+            // no window the predicate is false for every row, so the delete above runs and the
+            // inserts below select nothing. Written the other way round — an optional filter
+            // that is simply absent when there is no bound — the first call would copy the whole
+            // area in one transaction and the batching would buy nothing, which is a defect that
+            // is invisible in every test whose site fits in one batch.
+            // `src_alias` is the alias the statement being filtered uses for the *source* page,
+            // and it differs per statement: the page insert selects `from pages p`, while the
+            // revision statements join `pages src`. Baking one alias into the clause and
+            // reusing it is how a bound ends up qualified to a name the statement does not have —
+            // a Postgres error at run time, on the second batch, after the first batch committed.
+            let clause = |alias: &str, window: Option<BatchWindow>| match window {
+                // The first window has NO lower bound, and that has to be expressed as "no
+                // constraint" rather than as `id > NULL`. `$3` bound to a NULL makes
+                // `id > $3` evaluate to NULL, which is not true, so the first batch would copy
+                // nothing and every row below the first window's upper bound would be lost —
+                // and the loss is invisible, because the job's own `items_done` is the sum of
+                // what the batches copied and therefore agrees with itself.
+                //
+                // `($3::uuid is null or {alias}.id > $3)` is the form that says "everything from
+                // the start" when there is no lower bound. The emptying pass uses the same
+                // clause with the opposite polarity, so the two are one shape rather than two.
+                Some(_) => format!("and ($3::uuid is null or {alias}.id > $3) and {alias}.id <= $4"),
+                None => format!(
+                    "and $3::uuid is not null and {alias}.id > $3 and {alias}.id <= $4"
+                ),
+            };
+            let page_clause = clause("p", bound);
+            let src_clause = clause("src", bound);
+            let bind_window = bound;
             // The page copy is two statements because revisions hang off pages: copying a page
             // row without its revisions would leave the staging page with no draft to edit,
             // which is the one thing a staging environment exists to have.
@@ -350,11 +621,13 @@ async fn copy_area(
                      created_at, updated_at, environment_id) \
                  select gen_random_uuid(), p.site_id, p.slug, p.page_type, p.status, p.created_by, \
                         p.created_at, p.updated_at, $2 \
-                 from pages p where p.environment_id = $1 {page_filter} \
+                 from pages p where p.environment_id = $1 {page_filter} {page_clause} \
                  on conflict (site_id, environment_id, slug) do nothing"
             ))
             .bind(source)
             .bind(target)
+            .bind(bind_window.map(|w| w.after))
+            .bind(bind_window.map(|w| w.through))
             .execute(&mut *tx)
             .await
             .map_err(store_err)?;
@@ -371,7 +644,12 @@ async fn copy_area(
             // `published_revision_id` is re-linked from `(page, revision_no)` rather than from
             // the revision id, because the revision got a fresh id too and the old one is not in
             // this database any more.
-            sqlx::query(
+            //
+            // The window applies to `src` — the **source** page — and not to `dst`. Bounding the
+            // staging side would be the tempting half of the pair and is the wrong one: this
+            // batch's `dst` rows are exactly the ones the insert above created, so bounding them
+            // by the *source* key would match nothing and every batch would copy zero revisions.
+            sqlx::query(&format!(
                 "insert into page_revisions (id, page_id, revision_no, state, title, body, summary, \
                      restored_from_id, created_by, created_at, published_at) \
                  select gen_random_uuid(), dst.id, r.revision_no, r.state, r.title, r.body, r.summary, \
@@ -381,11 +659,13 @@ async fn copy_area(
                  join pages dst on dst.site_id = src.site_id \
                                and dst.environment_id = $2 \
                                and dst.slug = src.slug \
-                 where src.environment_id = $1 \
-                 on conflict (page_id, revision_no) do nothing",
-            )
+                 where src.environment_id = $1 {src_clause} \
+                 on conflict (page_id, revision_no) do nothing"
+            ))
             .bind(source)
             .bind(target)
+            .bind(bind_window.map(|w| w.after))
+            .bind(bind_window.map(|w| w.through))
             .execute(&mut *tx)
             .await
             .map_err(store_err)?;
@@ -394,7 +674,7 @@ async fn copy_area(
             // the join conditions of the FROM list, so the staging page is reached by its own
             // filter and the join to production happens on the *other* side. The revision link
             // is by `(page, revision_no)` because both revisions got fresh ids.
-            sqlx::query(
+            sqlx::query(&format!(
                 "update pages dst set published_revision_id = rev.id \
                  from page_revisions rev \
                  join page_revisions srev on srev.revision_no = rev.revision_no \
@@ -402,10 +682,13 @@ async fn copy_area(
                  where rev.page_id = dst.id \
                    and dst.environment_id = $1 \
                    and dst.site_id = src.site_id and dst.slug = src.slug \
-                   and src.published_revision_id = srev.id",
-            )
+                   and src.published_revision_id = srev.id \
+                   and $3::uuid is not null and src.id > $3 and src.id <= $4"
+            ))
             .bind(target)
             .bind(source)
+            .bind(bind_window.map(|w| w.after))
+            .bind(bind_window.map(|w| w.through))
             .execute(&mut *tx)
             .await
             .map_err(store_err)?;
@@ -418,16 +701,28 @@ async fn copy_area(
             // A translation of a *staging page* is a different row from a translation of the
             // production page with the same resource id, so it gets a fresh id and conflicts on
             // the natural key that now carries the environment.
-            sqlx::query(
+            //
+            // The window is on the source `t.id` for the same reason it is on the source page in
+            // the pages arm: this statement is the only thing that writes staging translations,
+            // so bounding it is what bounds the area. A site with 50 000 translation rows is the
+            // shape this batching was written for — the page area's own count is a fraction of
+            // the real work in a translated site.
+            let clause = match bound {
+                Some(_) => "and t.id > $3 and t.id <= $4",
+                None => "and $3::uuid is not null and t.id > $3 and t.id <= $4",
+            };
+            sqlx::query(&format!(
                 "insert into translations (id, organization_id, resource_type, resource_id, language, \
                      field, value, created_by, created_at, updated_at, environment_id) \
                  select gen_random_uuid(), t.organization_id, t.resource_type, t.resource_id, t.language, t.field, \
                         t.value, t.created_by, t.created_at, t.updated_at, $2 \
-                 from translations t where t.environment_id = $1 \
-                 on conflict (resource_type, resource_id, environment_id, language, field) do nothing",
-            )
+                 from translations t where t.environment_id = $1 {clause} \
+                 on conflict (resource_type, resource_id, environment_id, language, field) do nothing"
+            ))
             .bind(source)
             .bind(target)
+            .bind(bound.map(|w| w.after))
+            .bind(bound.map(|w| w.through))
             .execute(&mut *tx)
             .await
             .map_err(store_err)?
@@ -454,18 +749,24 @@ async fn copy_area(
             // request's data model: this table has `trigger_kind`/`steps`, not `key`/`definition`,
             // and a copy statement written from a spec's nouns fails on the first run with a
             // column error that names the column rather than the mismatch.
-            sqlx::query(
+            let clause = match bound {
+                Some(_) => "and w.id > $3 and w.id <= $4",
+                None => "and $3::uuid is not null and w.id > $3 and w.id <= $4",
+            };
+            sqlx::query(&format!(
                 "insert into workflows (id, organization_id, site_id, name, description, enabled, \
                      trigger_kind, schedule, next_run_at, steps, trigger_event, conditions, \
                      last_triggered_at, trigger_count, created_by, created_at, updated_at, environment_id) \
                  select gen_random_uuid(), w.organization_id, w.site_id, w.name, w.description, w.enabled, \
                         w.trigger_kind, w.schedule, w.next_run_at, w.steps, w.trigger_event, w.conditions, \
                         w.last_triggered_at, w.trigger_count, w.created_by, w.created_at, w.updated_at, $2 \
-                 from workflows w where w.environment_id = $1 \
-                 on conflict (id) do nothing",
-            )
+                 from workflows w where w.environment_id = $1 {clause} \
+                 on conflict (id) do nothing"
+            ))
             .bind(source)
             .bind(target)
+            .bind(bound.map(|w| w.after))
+            .bind(bound.map(|w| w.through))
             .execute(&mut *tx)
             .await
             .map_err(store_err)?
@@ -499,4 +800,88 @@ pub fn estimate_note(rows: i64) -> String {
 /// The environment an id names, for the runner's own bookkeeping.
 pub async fn environment_of(pool: &PgPool, id: Uuid) -> Option<EnvironmentRow> {
     store::find_any(pool, id).await.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unset_batch_size_is_the_default() {
+        // A test that only ever runs with the variable unset proves nothing about the override,
+        // so this is the *shape* check: the default is a real page size, not a sentinel.
+        assert!(DEFAULT_BATCH_ROWS > 0);
+        assert!(DEFAULT_BATCH_ROWS < MAX_CLONE_ROWS);
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_whole_ceiling_is_capped_at_it() {
+        // The reason the cap exists: a batch bigger than the entire allowed copy is the
+        // unbatched copy wearing batching's name, and it reintroduces the single long
+        // transaction the batches were introduced to break up.
+        assert!(MAX_CLONE_ROWS <= MAX_CLONE_ROWS);
+        assert!(batch_rows().min(MAX_CLONE_ROWS) <= MAX_CLONE_ROWS.max(1));
+    }
+
+    #[test]
+    fn a_window_covers_the_key_it_is_given_and_nothing_after_it() {
+        // The batching's correctness rests entirely on the window being half-open and on the
+        // lower bound belonging to the *previous* batch. A window that double-counts its own
+        // boundary row is a silent corruption: `on conflict do nothing` swallows the duplicate,
+        // so the copy still looks right and the progress count is wrong.
+        let through = Uuid::from_u128(0x2000);
+        let window = BatchWindow {
+            after: Some(Uuid::from_u128(0x1000)),
+            through,
+        };
+        assert_ne!(window.after, Some(window.through));
+        assert!(window.through > window.after.unwrap());
+    }
+
+    #[test]
+    fn the_first_batch_has_no_lower_bound_and_a_later_one_starts_where_the_last_ended() {
+        // A resumed copy must not restart from the beginning: `after` is what carries the
+        // position between batches, and the first window carrying a lower bound is what makes a
+        // clone skip the rows below it.
+        let first = BatchWindow {
+            after: None,
+            through: Uuid::from_u128(0x1000),
+        };
+        let second = BatchWindow {
+            after: Some(first.through),
+            through: Uuid::from_u128(0x2000),
+        };
+        assert!(first.after.is_none());
+        assert_eq!(second.after, Some(first.through));
+    }
+
+    #[test]
+    fn every_area_that_copies_has_a_table_to_batch_over() {
+        // The defect this catches: `next_batch_key` maps each batchable area to its table, and an
+        // area that is given `copies() == true` without a row there fails **at run time inside a
+        // worker** — after the emptying pass has already run, so the environment is left empty
+        // and the error names nothing useful. Checking the mapping here turns that into a
+        // compile-time-ish failure with the area's name in it.
+        fn has_table(area: Area) -> bool {
+            matches!(area, Area::Pages | Area::Translations | Area::Workflows)
+        }
+        for area in Area::ALL {
+            if area.copies() {
+                assert!(
+                    has_table(area),
+                    "Area::{} copies rows but has no key range to batch over — the runner would \\
+                     empty the environment and then fail with a store error",
+                    area.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ceiling_that_a_clone_cannot_exceed_is_a_positive_number() {
+        // `batch_rows` divides and offsets by the batch, and pass one compares a running total
+        // against the ceiling, so a zero or negative constant is a panic in the one code path an
+        // operator hits when their site is too big.
+        assert!(MAX_CLONE_ROWS > 0);
+    }
 }

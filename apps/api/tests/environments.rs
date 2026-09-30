@@ -611,6 +611,183 @@ async fn insert_production_page(db: &Db, site_id: Uuid, slug: &str, title: &str)
     page
 }
 
+
+async fn add_published_revision(db: &Db, page: Uuid, revision_no: i32, title: &str) {
+    sqlx::query(
+        "insert into page_revisions (page_id, revision_no, state, title, body) \
+         values ($1, $2, 'published', $3, 'body') \
+         on conflict (page_id, revision_no) do nothing",
+    )
+    .bind(page)
+    .bind(revision_no)
+    .bind(title)
+    .execute(db.pool())
+    .await
+    .expect("a second, non-draft revision must insert");
+}
+
+#[tokio::test]
+async fn a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // The batch size is read from the environment by `runner::batch_rows`, and this walk needs it
+    // to be *small* — so the copy has to span several batches to mean anything. `std::env::set_var`
+    // is process-global and `#[tokio::test]` is multithreaded, so this is the suite's one
+    // env-mutating walk and it is marked so: a second env-mutating walk added later would race
+    // this one, and the failure would read as a flaky clone rather than as two tests sharing a
+    // variable. Seven pages at a batch of two is four batches — enough that a boundary is crossed
+    // in the middle, not just at the end.
+    const PAGES: usize = 7;
+    const BATCH: i64 = 2;
+
+    for index in 0..PAGES {
+        let slug = format!("batched-{index}");
+        let page = insert_production_page(&fixture.db, fixture.site, &slug, "Batched").await;
+        // A second revision on some pages and not others: the defect being hunted is a batch
+        // re-copying *other* pages' history, which needs the histories to be distinguishable.
+        if index % 2 == 0 {
+            add_published_revision(&fixture.db, page, 2, "Batched second").await;
+        }
+    }
+
+    // SAFETY: no other walk mutates this variable, and this walk restores it before it returns —
+    // including on the panic path, because the restore is in a guard rather than at the end.
+    // A test that leaks a batch size of 2 into the twenty walks that follow would make every one
+    // of them exercise a code path none of them claims to, and the suite would still be green.
+    let previous = std::env::var("OMNION_CLONE_BATCH_ROWS").ok();
+    // SAFETY: same guard as above — the value is process-global for the duration of this walk and
+    // restored by `BATCH_GUARD` on the way out, panic or not.
+    let _guard = BatchSizeGuard {
+        previous: previous.clone(),
+        armed: true,
+    };
+    // SAFETY: no other walk in this suite mutates the variable (this is the only one), and the
+    // guard below restores it on every exit path.
+    unsafe { std::env::set_var("OMNION_CLONE_BATCH_ROWS", BATCH.to_string()) };
+    assert_eq!(
+        omnion_environment::runner::batch_rows(),
+        BATCH,
+        "the walk must actually be running with a batch size that forces a boundary"
+    );
+
+    let created = fixture.create_staging("Staging", "staging-batched").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // The job itself, first. A batching defect often shows up as the *job* failing rather than
+    // as a row count being wrong, and the row-count assertion then reports "2 of 7" without
+    // saying that the copy stopped at the second batch. Reading the job makes the failure name
+    // itself — the mutation run that proved this walk actually bites reported exactly that, and
+    // only this line is what turns it into a readable diagnosis.
+    // `items_done` is `int4` in the migration, so the Rust side is `i32` — a `i64` here
+    // fails at decode, not at compile, and the error names a type mismatch rather than the walk.
+    let job: (String, Option<String>, i32) = sqlx::query_as(
+        "select status, error, items_done from environment_clone_jobs \
+         where environment_id = $1 order by created_at desc limit 1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the clone job row must be readable");
+    assert_eq!(
+        job.0, "done",
+        "the clone job did not finish: status {} with error {:?} after {} rows",
+        job.0,
+        job.1,
+        job.2
+    );
+
+    // Per-area counts, so a failure here names the area rather than leaving "2 of 7" to be
+    // interpreted. `item_counts` is the runner's own record of what it copied; comparing it with
+    // what is on disk is the check that catches a batched copy whose arithmetic is self-
+    // consistent and whose rows are not there.
+    let recorded: String = sqlx::query_scalar(
+        "select area_counts::text from environment_clone_jobs where environment_id = $1 \
+         order by created_at desc limit 1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the job's own per-area record must be readable");
+    let staged_pages: i64 = sqlx::query_scalar(
+        "select count(*) from pages where environment_id = $1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        staged_pages, PAGES as i64,
+        "every source page reached staging, so no batch boundary dropped one (the job recorded \
+         {recorded})"
+    );
+
+    // ...and each page's history is its own, complete and not another page's. The per-page count
+    // is the assertion that matters: a revision insert with no window copies the *whole* site's
+    // history into *every* batch, and `on conflict do nothing` hides the duplicates completely.
+    // The row count would then read as the maximum history length on the site rather than each
+    // page's own, so the walk checks the distribution and not just the total.
+    let per_page: Vec<(String, i64)> = sqlx::query_as(
+        "select p.slug, (select count(*) from page_revisions r where r.page_id = p.id) \
+         from pages p where p.environment_id = $1 order by p.slug",
+    )
+    .bind(environment_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(per_page.len(), PAGES, "one staging page per source page");
+    for (slug, revisions) in &per_page {
+        // The even-indexed source pages carry two revisions, the odd ones one — and the copy has
+        // to keep that shape. A batched copy that re-copied other pages' history would give
+        // *every* page the maximum.
+        let index: usize = slug
+            .trim_start_matches("batched-")
+            .parse()
+            .expect("the slug carries the source index");
+        let want = if index % 2 == 0 { 2 } else { 1 };
+        assert_eq!(
+            *revisions, want,
+            "{slug} in staging has {revisions} revisions, expected its own {want} — a batch copied \
+             another page's history"
+        );
+    }
+
+    // Production is untouched, which is the guarantee batching must not cost.
+    let production_pages: i64 = sqlx::query_scalar(
+        "select count(*) from pages where environment_id = $1",
+    )
+    .bind(fixture.production_id().await)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        production_pages, PAGES as i64,
+        "batching writes only to the target; production keeps exactly its own rows"
+    );
+}
+
+/// Restores a process-global batch size on drop, panic or not.
+struct BatchSizeGuard {
+    previous: Option<String>,
+    armed: bool,
+}
+
+impl Drop for BatchSizeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match &self.previous {
+            // SAFETY: the walk that armed this guard is the only writer of the variable, and a
+            // drop runs on exactly one thread.
+            Some(value) => unsafe { std::env::set_var("OMNION_CLONE_BATCH_ROWS", value) },
+            None => unsafe { std::env::remove_var("OMNION_CLONE_BATCH_ROWS") },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The walks
 // ---------------------------------------------------------------------------------------------
