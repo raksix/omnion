@@ -58,6 +58,10 @@ const NAV = [
   { href: "/ai/tools", label: "Tool registry", icon: Wrench },
   { href: "/ai/identities", label: "AI identities", icon: ShieldCheck },
   { href: "/ai/permissions", label: "AI permissions", icon: Grid3x3 },
+  // The review inbox (REQ-101). It sits right after the permission matrix because it answers the
+  // question the matrix raises: knowing who may act still leaves "what is waiting for them" — and
+  // an approval gate with no inbox is a gate nobody ever opens.
+  { href: "/ai/approvals", label: "AI approvals", icon: ClipboardCheck },
   { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },

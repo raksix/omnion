@@ -4479,6 +4479,241 @@ export async function fetchAiRouting(scope: AiRoutingScope): Promise<AiRouting> 
   );
 }
 
+// -------------------------------------------------------------------------------------------
+// AI approvals (REQ-101 slice 1 — the review inbox, the review screen and the class policy)
+// -------------------------------------------------------------------------------------------
+
+/**
+ * One approval row as the inbox and the review screen render it.
+ *
+ * `decidable`, `requires_confirmation` and `confirmation_phrase` are the server's answers, not
+ * something the panel re-derives. A client that computed "may this be approved" from `status`
+ * and `expires_at` would disagree with the server the moment a clock rounded differently — and a
+ * reviewer who is told a row is decidable and then gets `expired` has been told a lie by the
+ * screen rather than by the race.
+ */
+export type AiApproval = {
+  id: string;
+  organization_id: string;
+  site_id: string | null;
+  run_id: string | null;
+  step_id: string | null;
+  agent_id: string | null;
+  identity_id: string | null;
+  change_set_id: string | null;
+  tool_key: string;
+  tool_class: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  resource_label: string | null;
+  risk: string;
+  title: string;
+  summary: string;
+  operation_count: number;
+  irreversible: boolean;
+  preview: unknown;
+  preview_hash: string;
+  base_revision: string | null;
+  status: string;
+  requested_by: string | null;
+  model_id: string | null;
+  expires_at: string;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  applied_at: string | null;
+  error: string | null;
+  created_at: string;
+  /** Whether the row is still pending AND unexpired. */
+  decidable: boolean;
+  /** Whether the decision demands a typed phrase, and what it is. */
+  requires_confirmation: boolean;
+  confirmation_phrase: string | null;
+};
+
+/** The inbox filters, exactly the query the API accepts. */
+export type AiApprovalQuery = {
+  status?: string;
+  tool?: string;
+  toolClass?: string;
+  q?: string;
+  limit?: number;
+};
+
+/**
+ * The inbox body.
+ *
+ * `viewer_missing` is the whole reason the row actions can be disabled *and named* rather than
+ * enabled-then-refused: the API enforces the same keys with a 403 naming them, so the disabled
+ * state is a promise it keeps.
+ */
+export type AiApprovalInbox = {
+  approvals: AiApproval[];
+  counts: Record<string, number>;
+  viewer_permissions: string[];
+  viewer_missing: string[];
+};
+
+/** One audit row of a request's trail. */
+export type AiApprovalAuditRow = {
+  id: number;
+  actor_type: string;
+  actor_user_id: string | null;
+  action: string;
+  target_type: string | null;
+  target_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+/** What a decision answers, whatever it decided. */
+export type AiDecisionResult = {
+  changed: boolean;
+  code: string | null;
+  approval: AiApproval;
+  current_revision?: string;
+};
+
+/** The effective policy of one dangerous class, as the policy screen renders it. */
+export type AiApprovalPolicy = {
+  tool_class: string;
+  label: string;
+  /** `organization` when an organization row overrides the platform default. */
+  source: string;
+  mode: string;
+  typed_confirmation: boolean;
+  expires_minutes: number;
+  /** True when the class is `allow` — the row stripes. */
+  permissive: boolean;
+  irreversible: boolean;
+  updated_at: string;
+  updated_by: string | null;
+};
+
+/** The six dangerous classes, served so the form never hard-codes their names a second time. */
+export type AiApprovalClass = {
+  key: string;
+  label: string;
+  irreversible: boolean;
+};
+
+/** The review inbox. */
+export async function fetchAiApprovals(
+  query: AiApprovalQuery = {},
+): Promise<AiApprovalInbox> {
+  const params = new URLSearchParams();
+  if (query.status && query.status !== "all") params.set("status", query.status);
+  if (query.tool?.trim()) params.set("tool", query.tool.trim());
+  if (query.toolClass && query.toolClass !== "all") params.set("tool_class", query.toolClass);
+  if (query.q?.trim()) params.set("q", query.q.trim());
+  if (query.limit) params.set("limit", String(query.limit));
+
+  const suffix = params.toString();
+  return request<AiApprovalInbox>(
+    suffix ? `/api/v1/ai/approvals?${suffix}` : "/api/v1/ai/approvals",
+  );
+}
+
+/**
+ * One request with its audit trail.
+ *
+ * The trail arrives in the same response as the row on purpose: a reviewer reading a decided
+ * request asks "who did this and why" as part of the same screen, and a second request could be
+ * answered from a different moment.
+ */
+export async function fetchAiApproval(id: string): Promise<{
+  approval: AiApproval;
+  audit: AiApprovalAuditRow[];
+}> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}`);
+}
+
+/**
+ * Approve one request.
+ *
+ * `confirmation` is sent ONLY when it is non-empty. Sending `"yes"` — or sending the field's
+ * placeholder — is exactly how a checkbox becomes a confirmation, and the API answers
+ * `confirmation_mismatch` to a wrong phrase rather than accepting any non-empty string, so an
+ * unconditional field would turn every irreversible class into a dead button.
+ */
+export function approveAiApproval(
+  id: string,
+  body: { confirmation?: string; currentRevision?: string } = {},
+): Promise<AiDecisionResult> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(body.confirmation?.trim() ? { confirmation: body.confirmation.trim() } : {}),
+      ...(body.currentRevision ? { current_revision: body.currentRevision } : {}),
+    }),
+  });
+}
+
+/** Reject one request. The reason is mandatory server-side; a blank one is refused there. */
+export function rejectAiApproval(
+  id: string,
+  reason: string,
+): Promise<AiDecisionResult> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/reject`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/** The class policy table, with the six classes' labels. */
+export async function fetchAiApprovalPolicies(): Promise<{
+  policies: AiApprovalPolicy[];
+  classes: AiApprovalClass[];
+}> {
+  return request("/api/v1/ai/approvals/policies");
+}
+
+/**
+ * Set one class's organization policy.
+ *
+ * `confirmation` carries the typed phrase the API demands for `mode: "allow"` — the exact text
+ * `set <class> to allow`. It is sent only when the caller typed it, for the same reason the
+ * approve path withholds an empty phrase.
+ */
+export function putAiApprovalPolicy(
+  toolClass: string,
+  body: {
+    mode: string;
+    typedConfirmation?: boolean;
+    expiresMinutes?: number;
+    confirmation?: string;
+  },
+): Promise<{ policies: AiApprovalPolicy[] }> {
+  return request(`/api/v1/ai/approvals/policies/${encodeURIComponent(toolClass)}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      mode: body.mode,
+      ...(body.typedConfirmation === undefined
+        ? {}
+        : { typed_confirmation: body.typedConfirmation }),
+      ...(body.expiresMinutes === undefined ? {} : { expires_minutes: body.expiresMinutes }),
+      ...(body.confirmation?.trim() ? { confirmation: body.confirmation.trim() } : {}),
+    }),
+  });
+}
+
+/**
+ * Drop one class's override, back to the platform default.
+ *
+ * A reset needs no phrase: removing an override can only tighten towards the fail-closed
+ * default, so it carries no risk worth a typed confirmation — and the API enforces that too.
+ */
+export function resetAiApprovalPolicy(toolClass: string): Promise<{ policies: AiApprovalPolicy[] }> {
+  return request(`/api/v1/ai/approvals/policies/${encodeURIComponent(toolClass)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Expire what is due, now. */
+export function sweepAiApprovals(): Promise<{ expired: number }> {
+  return request("/api/v1/ai/approvals/sweep", { method: "POST", body: JSON.stringify({}) });
+}
+
 /** Replace one task's candidate list at a scope. */
 export async function putAiTaskMap(
   scope: AiRoutingScope,
