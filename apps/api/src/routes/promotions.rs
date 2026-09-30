@@ -68,10 +68,7 @@ async fn may_deploy(state: &AppState, current: &CurrentSession) -> Result<bool, 
         "deployment.deploy",
     )
     .await?;
-    Ok(matches!(
-        decision,
-        omnion_permissions::Decision::Allowed(_)
-    ))
+    Ok(matches!(decision, omnion_permissions::Decision::Allowed(_)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -162,7 +159,8 @@ impl PromotionBody {
     /// dialog's whole job is to tell the operator what they are about to publish.
     pub fn build(row: &PromotionRow) -> Result<PromotionBody, ApiError> {
         let change_set = row.change_set()?;
-        let conflicts: Vec<Uuid> = serde_json::from_value(row.conflicts.clone()).unwrap_or_default();
+        let conflicts: Vec<Uuid> =
+            serde_json::from_value(row.conflicts.clone()).unwrap_or_default();
         Ok(PromotionBody {
             id: row.id,
             environment_id: row.environment_id,
@@ -263,8 +261,8 @@ pub async fn request_promotion(
     })?;
     store::find(pool, organization_id, production_id).await?;
 
-    let change_set = omnion_environment::changes::diff_against_production(pool, id, production_id)
-        .await?;
+    let change_set =
+        omnion_environment::changes::diff_against_production(pool, id, production_id).await?;
 
     // An empty selection is refused in words. Silently freezing nothing would create a promotion
     // that is permanently `done` with 0 items, and the Promotions tab would fill with rows that
@@ -366,7 +364,11 @@ async fn freeze(
     };
 
     let mut items = Vec::with_capacity(selected.len());
-    for row in change_set.items.iter().filter(|row| selected.contains(&row.page_id)) {
+    for row in change_set
+        .items
+        .iter()
+        .filter(|row| selected.contains(&row.page_id))
+    {
         let (base_updated_at, base_digest) = production_baseline(pool, production_id, row).await?;
         items.push(FrozenItem::freeze(row, base_updated_at, base_digest));
     }
@@ -463,8 +465,7 @@ pub async fn approve_promotion(
     // the row was ever claimed as `running`, and a caller-side `fail()` was leaving a failed apply
     // stuck in `running` whenever the failure happened before the route saw it — which then made
     // `promotions_single_running` refuse every later promotion of that environment.
-    let outcome = promotion_store::approve_and_apply(pool, &row, current.user.id)
-        .await?;
+    let outcome = promotion_store::approve_and_apply(pool, &row, current.user.id).await?;
 
     promotion_store::finish(pool, row.id).await?;
 
@@ -530,4 +531,3 @@ pub async fn cancel_promotion(
     let cancelled = promotion_store::cancel(pool, &row).await?;
     Ok(Json(PromotionBody::build(&cancelled)?))
 }
-

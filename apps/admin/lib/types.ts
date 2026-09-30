@@ -872,6 +872,37 @@ export type NotificationRow = {
   read_at: string | null;
   archived_at: string | null;
   created_at: string;
+  /**
+   * One row per channel the notification was tried on, oldest first. Empty means nothing has
+   * been attempted yet — which is a real state, not a failure to load.
+   *
+   * **Only the detail route fills this.** The list is a page of rows the reader has not opened,
+   * so carrying deliveries there would cost one query per row to say "nothing was sent" about
+   * notifications nobody has clicked.
+   */
+  deliveries: NotificationDeliveryRow[];
+};
+
+/**
+ * What became of one channel, as the reader is shown it.
+ *
+ * The drawer exists so that "it is in my panel but the e-mail never arrived" is a row somebody
+ * can read rather than an absence they have to interpret. `attempts`/`max_attempts` are carried
+ * together for that reason: "failed" on its own does not say whether the platform tried once or
+ * gave up.
+ */
+export type NotificationDeliveryRow = {
+  channel: NotificationChannel;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  max_attempts: number;
+  /** The transport's own status code, when it answered with one. */
+  response_status: number | null;
+  /** Why it did not go out, in the platform's words. */
+  error: string | null;
+  sent_at: string | null;
+  /** When the next attempt is due; `null` once the row is no longer retryable. */
+  next_attempt_at: string | null;
 };
 
 /** One grouped line of the bell. */
@@ -931,6 +962,16 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
+
+/**
+ * One of the five channels, as a type.
+ *
+ * Derived from the const rather than written out, so a channel added to the list is a channel
+ * the delivery rows can be typed with. A hand-written union is one more list to keep in step,
+ * and a channel in the database that the union does not name is a `type` error rather than a
+ * runtime surprise — which is the direction that catches it.
+ */
+export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
 
 // ---------------------------------------------------------------------------------------------
 // Slice 2: the reader's own channel configuration
@@ -2609,3 +2650,138 @@ export interface BackupSchedule {
   /** What the screen says the frequency means, in one sentence. */
   cadence: string;
 }
+
+// -------------------------------------------------------------------------------------------
+// System health (REQ-014).
+//
+// The four states are a closed set on the server and here, and the reason the client
+// repeats the list instead of typing `state: string` is the same one the server closes it
+// for: a colour map keyed by a string is a map that renders `undefined` in a class
+// attribute the first time a probe learns a fifth word. The badge, the label and the icon
+// all come out of one record, so a state can never have a colour and no label.
+// -------------------------------------------------------------------------------------------
+
+/** The four words a service state can be. `unknown` is NOT "fine". */
+export type HealthState = "healthy" | "degraded" | "down" | "unknown";
+
+/** One check inside a service row. */
+export type HealthCheck = {
+  check: string;
+  state: string;
+  message: string;
+  latency_ms: number;
+};
+
+/** One service row. Always present for every registered service, probed or not. */
+export type HealthService = {
+  service: string;
+  state: HealthState;
+  description: string;
+  latency_ms: number | null;
+  checked_at: string | null;
+  message: string;
+  detail: Record<string, unknown>;
+  checks: HealthCheck[];
+  href: string;
+};
+
+/** One host metric card. `threshold: null` means no opinion is configured. */
+export type HealthHostMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  state: string;
+  threshold: number | null;
+};
+
+/** The overview's verdict, as a word and as a sentence. */
+export type HealthBanner = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+};
+
+/** `GET /api/v1/health/overview`. */
+export type HealthOverview = {
+  services: HealthService[];
+  host: HealthHostMetric[];
+  banner: HealthBanner;
+  counts: Record<HealthState, number>;
+  last_checked_at: string | null;
+  registry: string[];
+  sample_count: number;
+};
+
+/** One metric of one service, with the newest value it published and its 24 h trend. */
+export type HealthServiceMetric = {
+  metric: string;
+  value: number;
+  unit: string;
+  sampled_at: string;
+  /**
+   * The metric's values over the last 24 h, oldest first.
+   *
+   * Empty when the window holds no samples — and empty is a real answer here, because
+   * a platform whose history was pruned or never recorded is genuinely unknown, not zero.
+   * The screen draws a dot for one point and a line for two or more, so this array is the
+   * only thing separating a real trend from an empty box.
+   */
+  series: number[];
+};
+
+/** `GET /api/v1/health/services/{key}`. */
+export type HealthServiceDetail = HealthService & { metrics: HealthServiceMetric[] };
+
+/** `GET /api/v1/health/summary` — the one line other centres embed. */
+export type HealthSummary = {
+  state: HealthState;
+  headline: string;
+  worst_service: string | null;
+  /** `true` only when every registered service is healthy. Never true while any is unprobed. */
+  operational: boolean;
+  counts: Record<HealthState, number>;
+};
+
+/** One point of a metric's series, oldest first. */
+export type HealthSamplePoint = {
+  value: number;
+  unit: string;
+  state: string;
+  sampled_at: string;
+};
+
+/** What the retention prune deleted. */
+export type HealthPruneResult = { deleted: number; retention_days: number };
+
+/**
+ * The three windows the metric table offers.
+ *
+ * A name rather than an hour count, so the label on screen, the label in the CSV filename and
+ * the window the server queried are the same string. Anything else is refused server-side.
+ */
+export type HealthRangeKey = "1h" | "24h" | "7d";
+
+/** One row of `GET /api/v1/health/metrics`. */
+export type HealthMetricRow = {
+  service: string;
+  metric: string;
+  unit: string;
+  samples: number;
+  /** `null` on a window with no samples — never `0`, which is a value. */
+  current: number | null;
+  min: number | null;
+  avg: number | null;
+  max: number | null;
+  state: string;
+  last_sample_at: string | null;
+  /** The window's values, oldest first. Empty when there are no samples. */
+  series: number[];
+};
+
+/** `GET /api/v1/health/metrics` — the aggregated table for one range. */
+export type HealthMetricsReport = {
+  range: string;
+  ranges: string[];
+  metrics: HealthMetricRow[];
+  total_samples: number;
+};

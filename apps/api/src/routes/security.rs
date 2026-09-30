@@ -1150,7 +1150,9 @@ mod tests {
                 "an already-redacted marker must not be treated as a secret: {redacted}"
             );
             assert!(
-                read_report(&redacted, "dependency").expect("a redacted report still parses").len()
+                read_report(&redacted, "dependency")
+                    .expect("a redacted report still parses")
+                    .len()
                     == 1,
                 "redaction markers are not a reason to refuse the import"
             );

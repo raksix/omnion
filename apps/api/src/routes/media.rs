@@ -502,7 +502,7 @@ pub async fn public_media(
     // unauthenticated reader must not reach. The two halves are separate functions for this
     // reason, and conflating them is the mistake this comment is here to stop.
     ensure_scan_allows(&state, &file).await?;
-let request_path = format!("/api/v1/public/media/{media_id}");
+    let request_path = format!("/api/v1/public/media/{media_id}");
     let shape = cdn_cache::request_shape(&request_path, None, &headers);
     let policy = cdn_cache::policy_for(state.db().pool(), file.site_id, &shape).await;
 
@@ -510,13 +510,7 @@ let request_path = format!("/api/v1/public/media/{media_id}");
     // bytes travel, the cache layer decides what the visitor's browser does with them
     // (REQ-011). Reverse the two and the cache headers report the wrong length for the
     // window that was actually sent.
-    let response = serve_file(
-        &state,
-        &file,
-        "no-store",
-        range_header(&headers),
-    )
-    .await?;
+    let response = serve_file(&state, &file, "no-store", range_header(&headers)).await?;
     Ok(cdn_cache::apply(
         response,
         &policy,

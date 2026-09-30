@@ -60,9 +60,7 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
 async fn call_from(state: &AppState, request: Request<Body>, peer: &str) -> TestResponse {
     let (mut parts, body) = request.into_parts();
     if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-        parts
-            .extensions
-            .insert(axum::extract::ConnectInfo(address));
+        parts.extensions.insert(axum::extract::ConnectInfo(address));
     }
     let response = routes::router(state.clone())
         .oneshot(Request::from_parts(parts, body))
@@ -453,13 +451,12 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
         )
         .await;
         let response = call(&state, post_from_here("definitely-not-the-password")).await;
-        let failures: i32 = sqlx::query_scalar(
-            "select failed_sign_in_count from users where id = $1",
-        )
-        .bind(user_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("the failure counter must be readable");
+        let failures: i32 =
+            sqlx::query_scalar("select failed_sign_in_count from users where id = $1")
+                .bind(user_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("the failure counter must be readable");
 
         if response.body["error"]["code"] == "account_locked" {
             locked_at = Some(attempt);
@@ -488,13 +485,12 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
         );
     }
 
-    let (failures, locked_until): (i32, Option<OffsetDateTime>) = sqlx::query_as(
-        "select failed_sign_in_count, locked_until from users where id = $1",
-    )
-    .bind(user_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("the account row must be readable");
+    let (failures, locked_until): (i32, Option<OffsetDateTime>) =
+        sqlx::query_as("select failed_sign_in_count, locked_until from users where id = $1")
+            .bind(user_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("the account row must be readable");
 
     assert!(
         locked_at.is_some(),
@@ -539,8 +535,7 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
 
     let correct = call(&state, post_from_here(PASSWORD)).await;
     assert_eq!(
-        correct.body["error"]["code"],
-        "account_locked",
+        correct.body["error"]["code"], "account_locked",
         "a locked account must refuse the CORRECT password too, got {}",
         correct.body
     );

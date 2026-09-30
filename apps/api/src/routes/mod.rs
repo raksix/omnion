@@ -77,12 +77,11 @@ pub mod backups;
 pub mod cdn;
 pub mod cdn_cache;
 pub mod cdn_purge;
-pub mod restore_jobs;
 pub mod commands;
 pub mod content;
 pub mod environments;
-pub mod promotions;
 pub mod health;
+pub mod health_panel;
 pub mod iam;
 pub mod iam_approvals;
 pub mod iam_policy;
@@ -105,8 +104,10 @@ pub mod media_versions;
 pub mod notifications;
 pub mod notifications_admin;
 pub mod onboarding;
+pub mod promotions;
 pub mod public;
 pub mod readyz;
+pub mod restore_jobs;
 pub mod scim;
 pub mod search;
 pub mod security;
@@ -878,11 +879,10 @@ pub fn router(state: AppState) -> Router {
     // (REQ-017 slice 4). A handler marks its own `200` and forgets the `404`; a layer marks
     // whatever leaves, so a staging host is never indexable at one path and indexable at
     // another.
-    let public_pages = get(public::get_published_page)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            public::noindex_staging_hosts,
-        ));
+    let public_pages = get(public::get_published_page).layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        public::noindex_staging_hosts,
+    ));
 
     // A published page points at its own assets, so the library's read side is public too.
     let public_media = get(media::public_media);
@@ -1066,20 +1066,15 @@ pub fn router(state: AppState) -> Router {
     let cdn_status = get(cdn_purge::status).layer(guards::require(&state, "cdn.read"));
     let cdn_purges = get(cdn_purge::list_purges)
         .layer(guards::require(&state, "cdn.read"))
-        .merge(
-            post(cdn_purge::create_purge).layer(guards::require(&state, "cdn.purge")),
-        );
+        .merge(post(cdn_purge::create_purge).layer(guards::require(&state, "cdn.purge")));
     let cdn_purge_one = get(cdn_purge::get_purge).layer(guards::require(&state, "cdn.read"));
-    let cdn_purge_retry =
-        post(cdn_purge::retry_purge).layer(guards::require(&state, "cdn.manage"));
+    let cdn_purge_retry = post(cdn_purge::retry_purge).layer(guards::require(&state, "cdn.manage"));
     // Settings and the adapter catalogue. These are read by the provider screen that
     // shipped with slice 1, so leaving them unregistered would have made two of its three
     // fetches 404 — a screen that loads, renders an error and has no way to say so.
     let cdn_settings = get(cdn_purge::get_settings)
         .layer(guards::require(&state, "cdn.read"))
-        .merge(
-            put(cdn_purge::put_settings).layer(guards::require(&state, "cdn.manage")),
-        );
+        .merge(put(cdn_purge::put_settings).layer(guards::require(&state, "cdn.manage")));
     let cdn_settings_test =
         post(cdn_purge::test_settings).layer(guards::require(&state, "cdn.manage"));
     let cdn_adapters = get(cdn_purge::adapters).layer(guards::require(&state, "cdn.read"));
@@ -1102,21 +1097,21 @@ pub fn router(state: AppState) -> Router {
         );
     // Re-clone is its own path (the request's own API table puts it at `/clone`), so it gets a
     // POST-only router rather than being merged onto `/environments/{id}`.
-    let environment_one_clone = post(environments::start_clone)
-        .layer(guards::require(&state, "deployment.preview"));
-    let environment_jobs = get(environments::list_clone_jobs)
-        .layer(guards::require(&state, "deployment.read"));
+    let environment_one_clone =
+        post(environments::start_clone).layer(guards::require(&state, "deployment.preview"));
+    let environment_jobs =
+        get(environments::list_clone_jobs).layer(guards::require(&state, "deployment.read"));
     // Cancel is its own path rather than a merged `POST` on the job collection: it acts on one
     // job and is destructive, and a collection-level POST that cancels "the current one" is a
     // route whose meaning depends on state the caller cannot see.
-    let environment_job_cancel = post(environments::cancel_clone)
-        .layer(guards::require(&state, "deployment.preview"));
+    let environment_job_cancel =
+        post(environments::cancel_clone).layer(guards::require(&state, "deployment.preview"));
     // The change set is a *read*: it says what staging holds that production does not, and every
     // row in it is a row the same caller can already open in the editor. Slice 3's promotion is
     // what writes, and it is guarded separately as `deployment.promote` — so the tab can be read
     // by somebody who can look at a staging copy without being able to push it to production.
-    let environment_changes = get(environments::list_changes)
-        .layer(guards::require(&state, "deployment.read"));
+    let environment_changes =
+        get(environments::list_changes).layer(guards::require(&state, "deployment.read"));
 
     // Promotions (REQ-017 slice 3). Reading a promotion is `deployment.read`; *requesting* one
     // and withdrawing it is `deployment.preview`, because a request records an intent and changes
@@ -1129,12 +1124,12 @@ pub fn router(state: AppState) -> Router {
             post(promotions::request_promotion)
                 .layer(guards::require(&state, "deployment.preview")),
         );
-    let promotion_one = get(promotions::get_promotion)
-        .layer(guards::require(&state, "deployment.read"));
-    let promotion_approve = post(promotions::approve_promotion)
-        .layer(guards::require(&state, "deployment.deploy"));
-    let promotion_cancel = post(promotions::cancel_promotion)
-        .layer(guards::require(&state, "deployment.preview"));
+    let promotion_one =
+        get(promotions::get_promotion).layer(guards::require(&state, "deployment.read"));
+    let promotion_approve =
+        post(promotions::approve_promotion).layer(guards::require(&state, "deployment.deploy"));
+    let promotion_cancel =
+        post(promotions::cancel_promotion).layer(guards::require(&state, "deployment.preview"));
 
     // Search (docs/requests/REQ-002): the one search box and its index. Searching is
     // `search.read` — the box every signed-in account holds — and the handler narrows the
@@ -1207,7 +1202,6 @@ pub fn router(state: AppState) -> Router {
             put(notifications::put_preferences)
                 .layer(guards::require(&state, "notifications.manage")),
         );
-
 
     // Slice 3 splits by *scope* rather than by action, and the split is the whole point of the
     // slice:
@@ -1314,6 +1308,58 @@ pub fn router(state: AppState) -> Router {
         // deployment that grants both lets an account that can only look also dismiss what it
         // saw. The static segments come first so axum ranks them ahead of
         // `/security/findings/{id}`.
+        // System health (REQ-014, slice 1). Two keys, and the split is the one the request
+        // draws: seeing that a dependency is unhappy is `health.read`, and everything that
+        // *writes* is `health.manage`.
+        //
+        // `POST /health/checks/run` rides `health.manage` rather than `health.read` even
+        // though it "only runs probes", because it is a mutation: it records a sample per
+        // metric. An account that could trigger a run on demand could fill the retention
+        // window with rows of its own choosing, one press at a time, and the trends would
+        // become a fiction nobody could audit. Reading a status screen and *causing* the
+        // platform to record something are different powers.
+        //
+        // `/healthz` and `/readyz` are NOT here and must not be: they stay unversioned and
+        // unguarded so an orchestrator's probe never depends on a session or a permission
+        // (see `crate::routes::health` and `crate::routes::readyz`).
+        .route(
+            "/health/overview",
+            get(health_panel::overview).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/checks/run",
+            post(health_panel::run_checks).layer(guards::require(&state, "health.manage")),
+        )
+        .route(
+            "/health/services/{key}",
+            get(health_panel::service).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/samples",
+            get(health_panel::samples).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/host",
+            get(health_panel::host_metrics).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/summary",
+            get(health_panel::summary).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/metrics",
+            get(health_panel::metrics).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/metrics.csv",
+            get(health_panel::metrics_csv).layer(guards::require(&state, "health.read")),
+        )
+        // Pruning is destructive and irreversible, so it is a POST behind the managing key
+        // and not a side effect of a settings save.
+        .route(
+            "/health/maintenance/prune",
+            post(health_panel::prune).layer(guards::require(&state, "health.manage")),
+        )
         .route(
             "/security/overview",
             get(security::overview).layer(guards::require(&state, "security.read")),
@@ -1406,7 +1452,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(
                     patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
-    );
+        );
     let analytics_reports = Router::new()
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))

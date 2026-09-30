@@ -323,7 +323,9 @@ pub async fn list_environments(
         kind: query.r#type.as_deref().and_then(EnvironmentType::parse),
         status: query.status.as_deref().and_then(EnvironmentStatus::parse),
         search: query.search.clone().filter(|raw| !raw.trim().is_empty()),
-        limit: query.limit.unwrap_or(store::EnvironmentFilter::DEFAULT_LIMIT),
+        limit: query
+            .limit
+            .unwrap_or(store::EnvironmentFilter::DEFAULT_LIMIT),
         offset: query.offset.unwrap_or(0),
     };
 
@@ -382,7 +384,9 @@ pub async fn create_environment(
     let checked_key = key::check_key(&requested_key).map_err(|err| field_error(err, "key"))?;
 
     let staging_host = match input.staging_host.as_deref().map(str::trim) {
-        Some(host) if !host.is_empty() => Some(key::check_staging_host(host).map_err(|err| field_error(err, "staging_host"))?),
+        Some(host) if !host.is_empty() => {
+            Some(key::check_staging_host(host).map_err(|err| field_error(err, "staging_host"))?)
+        }
         _ => None,
     };
 
@@ -523,7 +527,12 @@ pub async fn start_clone(
         let previous = store::list_jobs(pool, id, 1).await?;
         previous
             .first()
-            .map(|job| job.areas.iter().filter_map(|raw| Area::parse(raw)).collect())
+            .map(|job| {
+                job.areas
+                    .iter()
+                    .filter_map(|raw| Area::parse(raw))
+                    .collect()
+            })
             .unwrap_or_else(|| Area::ALL.to_vec())
     } else {
         parse_areas(&input.areas)?
@@ -738,10 +747,7 @@ pub async fn list_changes(
     let change_set =
         omnion_environment::changes::diff_against_production(pool, id, production_id).await?;
 
-    Ok(Json(ChangeSetBody::build(
-        &environment,
-        &change_set,
-    )))
+    Ok(Json(ChangeSetBody::build(&environment, &change_set)))
 }
 
 /// The change set, in the shape the Changes tab reads.
@@ -771,10 +777,7 @@ pub struct ChangeSetBody {
 
 impl ChangeSetBody {
     /// Flatten the store's change set into the wire shape.
-    pub fn build(
-        environment: &store::EnvironmentRow,
-        change_set: &ChangeSet,
-    ) -> ChangeSetBody {
+    pub fn build(environment: &store::EnvironmentRow, change_set: &ChangeSet) -> ChangeSetBody {
         ChangeSetBody {
             environment_id: change_set.environment_id,
             environment_key: environment.key.clone(),
@@ -908,9 +911,11 @@ impl From<EnvironmentError> for ApiError {
                 Self::new(StatusCode::CONFLICT, "promotion_conflict", message)
                     .with_details(json!({ "items": items }))
             }
-            EnvironmentError::SelfApprovalRefused => {
-                Self::new(StatusCode::FORBIDDEN, error.code(), Self::message_of(&error))
-            }
+            EnvironmentError::SelfApprovalRefused => Self::new(
+                StatusCode::FORBIDDEN,
+                error.code(),
+                Self::message_of(&error),
+            ),
             EnvironmentError::Store { message } => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

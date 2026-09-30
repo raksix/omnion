@@ -180,8 +180,9 @@ fn tightened() -> Vec<omnion_security::RatePolicy> {
 /// constraint working: "nobody" is a value the column may hold, "user zero is not present" is a
 /// value it may not. `who` is the fixture this suite creates and removes.
 async fn write_document(db: &Db, who: Uuid, policies: &[omnion_security::RatePolicy]) {
-    let expected =
-        omnion_security::load_rate_limits(db.pool()).await.expect("the document must be readable");
+    let expected = omnion_security::load_rate_limits(db.pool())
+        .await
+        .expect("the document must be readable");
     omnion_security::save_rate_limits(
         db.pool(),
         &omnion_security::rate_limits_to_document(policies),
@@ -290,8 +291,7 @@ async fn a_burst_over_the_ceiling_is_refused_with_a_retry_after() {
         statuses
             .iter()
             .filter(|status| **status == StatusCode::UNAUTHORIZED)
-            .count()
-            as i64,
+            .count() as i64,
         ceiling(),
         "every request inside the ceiling must reach its own guard (401: signed out) and none \
          may be refused by the limiter: {statuses:?}"

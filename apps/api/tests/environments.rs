@@ -26,12 +26,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post as route_post;
-use axum::Router;
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
@@ -125,7 +125,10 @@ fn request(
     let builder = match caller {
         Some(caller) => builder.header(
             header::COOKIE,
-            format!("omnion_session={}; omnion_csrf={}", caller.session, caller.csrf),
+            format!(
+                "omnion_session={}; omnion_csrf={}",
+                caller.session, caller.csrf
+            ),
         ),
         None => builder,
     };
@@ -171,12 +174,12 @@ const CSRF_SECRET: &str = "environment-suite-csrf-key-material";
 static HARNESS: tokio::sync::OnceCell<Option<(AppState, Db)>> = tokio::sync::OnceCell::const_new();
 
 async fn live_state() -> Option<(AppState, Db)> {
-    let shared = HARNESS
-        .get_or_init(|| Box::pin(open_harness()))
-        .await;
+    let shared = HARNESS.get_or_init(|| Box::pin(open_harness())).await;
     // Cloned, not shared: `AppState` is cheap to clone and the walks each get their own handle,
     // while the *database* underneath is the one thing they must share.
-    shared.as_ref().map(|(state, db)| (state.clone(), db.clone()))
+    shared
+        .as_ref()
+        .map(|(state, db)| (state.clone(), db.clone()))
 }
 
 /// Create the database, apply the migrations and build the router. `None` means "skip".
@@ -239,16 +242,21 @@ async fn open_harness() -> Option<(AppState, Db)> {
     // than disabling it: the limiter stays real, and the suite still exercises the layer on the
     // way through — it simply is not measured by the production policy. `ensure_installed` keeps
     // whatever is already installed, so installing first is what wins.
-    let _ = omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
-        &state,
-        vec![
-            omnion_security::RatePolicy::new("global", 60, 600, 100, true).expect("a valid row"),
-            omnion_security::RatePolicy::new("sign_in", 300, 100_000, 0, true).expect("a valid row"),
-            omnion_security::RatePolicy::new("public_api", 60, 100_000, 0, true).expect("a valid row"),
-            omnion_security::RatePolicy::new("authenticated_api", 60, 100_000, 0, true)
-                .expect("a valid row"),
-        ],
-    ));
+    let _ = omnion_api::rate_limit_middleware::install(
+        omnion_api::rate_limit_middleware::RateLimiter::new(
+            &state,
+            vec![
+                omnion_security::RatePolicy::new("global", 60, 600, 100, true)
+                    .expect("a valid row"),
+                omnion_security::RatePolicy::new("sign_in", 300, 100_000, 0, true)
+                    .expect("a valid row"),
+                omnion_security::RatePolicy::new("public_api", 60, 100_000, 0, true)
+                    .expect("a valid row"),
+                omnion_security::RatePolicy::new("authenticated_api", 60, 100_000, 0, true)
+                    .expect("a valid row"),
+            ],
+        ),
+    );
 
     Some((state, db))
 }
@@ -369,7 +377,11 @@ impl Drop for Receiver {
 }
 
 /// `POST /deploy-hook` — capture the delivery and accept it.
-async fn receive(State(seen): State<Arc<Mutex<Vec<Captured>>>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn receive(
+    State(seen): State<Arc<Mutex<Vec<Captured>>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let read = |name: &str| -> String {
         headers
             .get(name)
@@ -563,9 +575,8 @@ struct Caller {
 /// Sessions outlive a suite run, so one sign-in per account is both cheaper and closer to how a
 /// browser behaves. The address is part of the key, so two walks that happen to share an address
 /// still get the right session rather than each other's.
-static CALLERS: tokio::sync::OnceCell<
-    std::sync::Mutex<std::collections::HashMap<String, Caller>>,
-> = tokio::sync::OnceCell::const_new();
+static CALLERS: tokio::sync::OnceCell<std::sync::Mutex<std::collections::HashMap<String, Caller>>> =
+    tokio::sync::OnceCell::const_new();
 
 async fn login(state: &AppState, email: &str) -> Caller {
     let cache = CALLERS
@@ -686,7 +697,9 @@ const ALL_PERMISSIONS: [&str; 10] = [
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
         let organization = create_organization_row(&db, "main").await;
         let site = create_site(&db, organization, "main").await;
         let (caller_user_id, caller) =
@@ -773,7 +786,6 @@ async fn insert_production_page(db: &Db, site_id: Uuid, slug: &str, title: &str)
     page
 }
 
-
 async fn add_published_revision(db: &Db, page: Uuid, revision_no: i32, title: &str) {
     sqlx::query(
         "insert into page_revisions (page_id, revision_no, state, title, body) \
@@ -856,9 +868,7 @@ async fn a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once() {
     assert_eq!(
         job.0, "done",
         "the clone job did not finish: status {} with error {:?} after {} rows",
-        job.0,
-        job.1,
-        job.2
+        job.0, job.1, job.2
     );
 
     // Per-area counts, so a failure here names the area rather than leaving "2 of 7" to be
@@ -873,13 +883,12 @@ async fn a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the job's own per-area record must be readable");
-    let staged_pages: i64 = sqlx::query_scalar(
-        "select count(*) from pages where environment_id = $1",
-    )
-    .bind(environment_id)
-    .fetch_one(fixture.db.pool())
-    .await
-    .unwrap();
+    let staged_pages: i64 =
+        sqlx::query_scalar("select count(*) from pages where environment_id = $1")
+            .bind(environment_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
     assert_eq!(
         staged_pages, PAGES as i64,
         "every source page reached staging, so no batch boundary dropped one (the job recorded \
@@ -917,13 +926,12 @@ async fn a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once() {
     }
 
     // Production is untouched, which is the guarantee batching must not cost.
-    let production_pages: i64 = sqlx::query_scalar(
-        "select count(*) from pages where environment_id = $1",
-    )
-    .bind(fixture.production_id().await)
-    .fetch_one(fixture.db.pool())
-    .await
-    .unwrap();
+    let production_pages: i64 =
+        sqlx::query_scalar("select count(*) from pages where environment_id = $1")
+            .bind(fixture.production_id().await)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
     assert_eq!(
         production_pages, PAGES as i64,
         "batching writes only to the target; production keeps exactly its own rows"
@@ -993,12 +1001,11 @@ async fn a_page_written_without_naming_an_environment_lands_in_production() {
     // This is the regression 0147 exists for: the content crate inserts no environment, and a
     // NOT NULL column with no resolution would break every page creation in the platform.
     let page = insert_production_page(&fixture.db, fixture.site, "no-env", "No env").await;
-    let environment: Uuid =
-        sqlx::query_scalar("select environment_id from pages where id = $1")
-            .bind(page)
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the page must carry an environment");
+    let environment: Uuid = sqlx::query_scalar("select environment_id from pages where id = $1")
+        .bind(page)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the page must carry an environment");
     assert_eq!(
         environment,
         fixture.production_id().await,
@@ -1023,7 +1030,10 @@ async fn creating_a_staging_environment_returns_immediately_and_starts_a_clone()
     assert_eq!(clone["percent"], 0);
     // A job at 0/0 says it is counting rather than reporting a bar stuck at zero forever.
     assert!(
-        clone["summary"].as_str().unwrap_or_default().contains("Counting"),
+        clone["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Counting"),
         "summary was {}",
         clone["summary"]
     );
@@ -1064,7 +1074,10 @@ async fn the_list_carries_real_per_area_counts_after_the_clone_finishes() {
         .expect("the staging environment is in the list")
         .clone();
 
-    assert_eq!(staging["status"], "active", "a finished clone leaves it active");
+    assert_eq!(
+        staging["status"], "active",
+        "a finished clone leaves it active"
+    );
     assert_eq!(
         staging["content"]["pages"], 2,
         "the two production pages were copied: {}",
@@ -1080,7 +1093,12 @@ async fn the_list_carries_real_per_area_counts_after_the_clone_finishes() {
 /// Used by the public-read walk below: a page that is `published` in the column but has no
 /// published revision answers `404` on the public surface, so the walk has to go through the
 /// publish route rather than setting a status by hand.
-async fn publish_page_via_api(state: &AppState, caller: &Caller, site_id: Uuid, slug: &str) -> Uuid {
+async fn publish_page_via_api(
+    state: &AppState,
+    caller: &Caller,
+    site_id: Uuid,
+    slug: &str,
+) -> Uuid {
     let created = call(
         state,
         request(
@@ -1091,7 +1109,12 @@ async fn publish_page_via_api(state: &AppState, caller: &Caller, site_id: Uuid, 
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "create: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "create: {}",
+        created.body
+    );
     let page_id = Uuid::parse_str(created.body["id"].as_str().unwrap()).unwrap();
 
     let published = call(
@@ -1104,7 +1127,12 @@ async fn publish_page_via_api(state: &AppState, caller: &Caller, site_id: Uuid, 
         ),
     )
     .await;
-    assert_eq!(published.status, StatusCode::OK, "publish: {}", published.body);
+    assert_eq!(
+        published.status,
+        StatusCode::OK,
+        "publish: {}",
+        published.body
+    );
     page_id
 }
 
@@ -1142,12 +1170,11 @@ async fn a_staging_copy_must_not_break_or_leak_into_the_public_read() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let site_key: String =
-        sqlx::query_scalar("select key from sites where id = $1")
-            .bind(fixture.site)
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the site carries a key");
+    let site_key: String = sqlx::query_scalar("select key from sites where id = $1")
+        .bind(fixture.site)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the site carries a key");
 
     let page = publish_page_via_api(&fixture.state, &fixture.caller, fixture.site, "shared").await;
 
@@ -1165,13 +1192,12 @@ async fn a_staging_copy_must_not_break_or_leak_into_the_public_read() {
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
     drain_clone_for(&fixture.db, environment_id).await;
 
-    let copies: i64 = sqlx::query_scalar(
-        "select count(*) from pages where site_id = $1 and slug = 'shared'",
-    )
-    .bind(fixture.site)
-    .fetch_one(fixture.db.pool())
-    .await
-    .unwrap();
+    let copies: i64 =
+        sqlx::query_scalar("select count(*) from pages where site_id = $1 and slug = 'shared'")
+            .bind(fixture.site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
     assert_eq!(
         copies, 2,
         "this walk is only meaningful while the site really holds two environments' copies"
@@ -1202,7 +1228,12 @@ async fn a_staging_copy_must_not_break_or_leak_into_the_public_read() {
         .unwrap();
 
     let after_edit = public_read(&fixture.state, &site_key, "shared").await;
-    assert_eq!(after_edit.status, StatusCode::OK, "body: {}", after_edit.body);
+    assert_eq!(
+        after_edit.status,
+        StatusCode::OK,
+        "body: {}",
+        after_edit.body
+    );
     assert_ne!(
         after_edit.body["revision"]["title"], "Staging only",
         "the public read must serve the production revision, never the staging copy"
@@ -1287,12 +1318,11 @@ async fn a_staging_host_answers_noindex_and_a_production_one_does_not() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let site_key: String =
-        sqlx::query_scalar("select key from sites where id = $1")
-            .bind(fixture.site)
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the site carries a key");
+    let site_key: String = sqlx::query_scalar("select key from sites where id = $1")
+        .bind(fixture.site)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the site carries a key");
 
     publish_page_via_api(&fixture.state, &fixture.caller, fixture.site, "indexed").await;
 
@@ -1325,9 +1355,14 @@ async fn a_staging_host_answers_noindex_and_a_production_one_does_not() {
 
     // The 404 leg: an address nobody published, on the same staging host. The mark is a property
     // of the address, so it holds here too.
-    let missing = public_read_at_host(&fixture.state, &site_key, &staging_host, "never-published")
-        .await;
-    assert_eq!(missing.status, StatusCode::NOT_FOUND, "body: {}", missing.body);
+    let missing =
+        public_read_at_host(&fixture.state, &site_key, &staging_host, "never-published").await;
+    assert_eq!(
+        missing.status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        missing.body
+    );
     assert_eq!(
         missing.header("x-robots-tag").as_deref(),
         Some("noindex, nofollow"),
@@ -1337,7 +1372,12 @@ async fn a_staging_host_answers_noindex_and_a_production_one_does_not() {
 
     // Production, again, by the site's own key address: unchanged.
     let production = public_read(&fixture.state, &site_key, "indexed").await;
-    assert_eq!(production.status, StatusCode::OK, "body: {}", production.body);
+    assert_eq!(
+        production.status,
+        StatusCode::OK,
+        "body: {}",
+        production.body
+    );
     assert_eq!(
         production.header("x-robots-tag"),
         None,
@@ -1355,10 +1395,21 @@ async fn a_staging_host_answers_noindex_and_a_production_one_does_not() {
         ),
     )
     .await;
-    assert_eq!(archived.status, StatusCode::OK, "archive: {}", archived.body);
+    assert_eq!(
+        archived.status,
+        StatusCode::OK,
+        "archive: {}",
+        archived.body
+    );
 
-    let after_archive = public_read_at_host(&fixture.state, &site_key, &staging_host, "indexed").await;
-    assert_eq!(after_archive.status, StatusCode::OK, "body: {}", after_archive.body);
+    let after_archive =
+        public_read_at_host(&fixture.state, &site_key, &staging_host, "indexed").await;
+    assert_eq!(
+        after_archive.status,
+        StatusCode::OK,
+        "body: {}",
+        after_archive.body
+    );
     assert_eq!(
         after_archive.header("x-robots-tag"),
         None,
@@ -1401,13 +1452,12 @@ async fn a_clone_copies_content_and_leaves_production_byte_identical() {
         "a staging page is its own row, not a second environment id on the production one"
     );
     // Its revision came with it, re-linked to the copy rather than to the source.
-    let revisions: i64 = sqlx::query_scalar(
-        "select count(*) from page_revisions where page_id = $1",
-    )
-    .bind(staging_id)
-    .fetch_one(fixture.db.pool())
-    .await
-    .unwrap();
+    let revisions: i64 =
+        sqlx::query_scalar("select count(*) from page_revisions where page_id = $1")
+            .bind(staging_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
     assert_eq!(revisions, 1, "the copy carries its own revision history");
 
     // ...and editing it does not touch production. The production row is found by its own id,
@@ -1462,7 +1512,12 @@ async fn a_clone_is_idempotent() {
         ),
     )
     .await;
-    assert_eq!(reclone.status, StatusCode::ACCEPTED, "body: {}", reclone.body);
+    assert_eq!(
+        reclone.status,
+        StatusCode::ACCEPTED,
+        "body: {}",
+        reclone.body
+    );
 
     drain_clone_for(&fixture.db, environment_id).await;
 
@@ -1575,7 +1630,12 @@ async fn production_cannot_be_archived_or_recloned() {
         ),
     )
     .await;
-    assert_eq!(archived.status, StatusCode::CONFLICT, "body: {}", archived.body);
+    assert_eq!(
+        archived.status,
+        StatusCode::CONFLICT,
+        "body: {}",
+        archived.body
+    );
     assert_eq!(archived.body["error"]["code"], "environment_not_staging");
 
     let recloned = call(
@@ -1614,7 +1674,12 @@ async fn archiving_releases_the_host_and_keeps_the_content() {
         ),
     )
     .await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let environment_id = Uuid::parse_str(created.body["id"].as_str().unwrap()).unwrap();
     let host = created.body["staging_host"].as_str().unwrap().to_string();
     assert!(!host.is_empty());
@@ -1738,7 +1803,8 @@ async fn a_reserved_or_malformed_key_is_refused_naming_the_field() {
         // A malformed or reserved key is a `400` naming its field, not a `409`: the request
         // itself has to change, and there is no existing row in conflict.
         assert_eq!(
-            response.status, StatusCode::BAD_REQUEST,
+            response.status,
+            StatusCode::BAD_REQUEST,
             "key {key} should be refused: {}",
             response.body
         );
@@ -1752,11 +1818,12 @@ async fn an_empty_area_selection_is_refused_before_anything_is_created() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let before: i64 = sqlx::query_scalar("select count(*) from environments where organization_id = $1")
-        .bind(fixture.organization)
-        .fetch_one(fixture.db.pool())
-        .await
-        .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("select count(*) from environments where organization_id = $1")
+            .bind(fixture.organization)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
 
     let response = call(
         &fixture.state,
@@ -1768,15 +1835,24 @@ async fn an_empty_area_selection_is_refused_before_anything_is_created() {
         ),
     )
     .await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        response.body
+    );
     assert_eq!(response.body["error"]["code"], "clone_areas_required");
 
-    let after: i64 = sqlx::query_scalar("select count(*) from environments where organization_id = $1")
-        .bind(fixture.organization)
-        .fetch_one(fixture.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(after, before, "a refused create leaves no environment behind");
+    let after: i64 =
+        sqlx::query_scalar("select count(*) from environments where organization_id = $1")
+            .bind(fixture.organization)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        after, before,
+        "a refused create leaves no environment behind"
+    );
 }
 
 #[tokio::test]
@@ -1806,7 +1882,10 @@ async fn an_unknown_area_is_refused_and_the_legal_ones_are_named() {
     assert!(legal.contains(&"pages"), "{legal:?}");
     assert!(!legal.contains(&"media"), "{legal:?}");
     for area in Area::ALL {
-        assert!(legal.contains(&area.as_str()), "{area:?} missing from {legal:?}");
+        assert!(
+            legal.contains(&area.as_str()),
+            "{area:?} missing from {legal:?}"
+        );
     }
 }
 
@@ -1820,8 +1899,14 @@ async fn another_organizations_environment_is_a_404_not_a_403() {
 
     let other_org = create_organization_row(&fixture.db, "other").await;
     create_site(&fixture.db, other_org, "other").await;
-    let (_, other_caller) =
-        create_admin(&fixture.db, other_org, "other", &fixture.state, &ALL_PERMISSIONS).await;
+    let (_, other_caller) = create_admin(
+        &fixture.db,
+        other_org,
+        "other",
+        &fixture.state,
+        &ALL_PERMISSIONS,
+    )
+    .await;
 
     let response = call(
         &fixture.state,
@@ -1835,7 +1920,12 @@ async fn another_organizations_environment_is_a_404_not_a_403() {
     .await;
     // The caller *is* allowed to read environments — of their own. Answering 403 would tell them
     // to ask for a permission they already hold.
-    assert_eq!(response.status, StatusCode::NOT_FOUND, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        response.body
+    );
     assert_eq!(response.body["error"]["code"], "environment_not_found");
 }
 
@@ -1859,12 +1949,7 @@ async fn the_permission_split_is_real() {
 
     let list = call(
         &fixture.state,
-        request(
-            Method::GET,
-            "/api/v1/environments",
-            Some(&reader),
-            None,
-        ),
+        request(Method::GET, "/api/v1/environments", Some(&reader), None),
     )
     .await;
     assert_eq!(list.status, StatusCode::OK, "body: {}", list.body);
@@ -1879,7 +1964,12 @@ async fn the_permission_split_is_real() {
         ),
     )
     .await;
-    assert_eq!(create.status, StatusCode::FORBIDDEN, "body: {}", create.body);
+    assert_eq!(
+        create.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        create.body
+    );
 
     let archive = call(
         &fixture.state,
@@ -1930,7 +2020,10 @@ async fn the_detail_screen_carries_the_history_and_the_estimate() {
     // The estimate is a range in words, not a fake byte count.
     let estimate = response.body["estimate"].as_str().unwrap_or_default();
     assert!(estimate.contains("rows"), "{estimate}");
-    assert!(estimate.contains("Media files are referenced"), "{estimate}");
+    assert!(
+        estimate.contains("Media files are referenced"),
+        "{estimate}"
+    );
 
     let per_area = jobs[0]["areas"].as_array().expect("areas is an array");
     let pages = per_area
@@ -1961,7 +2054,9 @@ async fn the_list_offers_the_wizard_its_areas_and_its_source() {
         response.body["source_key"], "production",
         "the wizard's 'clone from' line reads the organization's real production key"
     );
-    let areas = response.body["areas"].as_array().expect("areas is an array");
+    let areas = response.body["areas"]
+        .as_array()
+        .expect("areas is an array");
     assert_eq!(areas.len(), Area::ALL.len());
     // Every checkbox has a label a person can read and a cost in words.
     for area in areas {
@@ -2055,13 +2150,12 @@ async fn the_event_bus_records_what_a_subscribed_endpoint_would_see() {
     };
     fixture.create_staging("Staging", "staging-2").await;
 
-    let names: Vec<String> = sqlx::query_scalar(
-        "select name from events where organization_id = $1 order by id asc",
-    )
-    .bind(fixture.organization)
-    .fetch_all(fixture.db.pool())
-    .await
-    .unwrap();
+    let names: Vec<String> =
+        sqlx::query_scalar("select name from events where organization_id = $1 order by id asc")
+            .bind(fixture.organization)
+            .fetch_all(fixture.db.pool())
+            .await
+            .unwrap();
     assert!(
         names.iter().any(|n| n == "environment.created"),
         "{names:?}"
@@ -2188,7 +2282,13 @@ fn slugs_and_kinds(body: &Value) -> Vec<String> {
         .as_array()
         .expect("items must be an array")
         .iter()
-        .map(|item| format!("{}:{}", item["slug"].as_str().unwrap(), item["kind"].as_str().unwrap()))
+        .map(|item| {
+            format!(
+                "{}:{}",
+                item["slug"].as_str().unwrap(),
+                item["kind"].as_str().unwrap()
+            )
+        })
         .collect();
     pairs.sort();
     pairs
@@ -2260,12 +2360,14 @@ async fn the_change_set_names_what_staging_holds_that_production_does_not() {
     // The delete: a staging row that simply stops existing. This is the case the SQL's outer join
     // exists for, and it is the one a `where staging.environment_id = $1` filter silently drops —
     // the tab would then report "nothing deleted" for an environment that removed a page.
-    sqlx::query("delete from pages where site_id = $1 and slug = 'removed' and environment_id = $2")
-        .bind(fixture.site)
-        .bind(environment_id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "delete from pages where site_id = $1 and slug = 'removed' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
 
     let diff = changes_for(&fixture, environment_id).await;
     assert_eq!(diff.status, StatusCode::OK, "body: {}", diff.body);
@@ -2283,7 +2385,8 @@ async fn the_change_set_names_what_staging_holds_that_production_does_not() {
     assert_eq!(diff.body["deleted"], 1);
     assert_eq!(diff.body["empty"], false);
     assert_eq!(
-        diff.body["production_id"], fixture.production_id().await.to_string(),
+        diff.body["production_id"],
+        fixture.production_id().await.to_string(),
         "the comparison names the environment it compared against"
     );
 
@@ -2317,16 +2420,21 @@ async fn the_change_set_names_what_staging_holds_that_production_does_not() {
     );
 
     // And the staging edits changed no production row.
-    let production_slugs: Vec<String> =
-        sqlx::query_scalar("select slug from pages where environment_id = $1 and site_id = $2 order by slug")
-            .bind(fixture.production_id().await)
-            .bind(fixture.site)
-            .fetch_all(fixture.db.pool())
-            .await
-            .unwrap();
+    let production_slugs: Vec<String> = sqlx::query_scalar(
+        "select slug from pages where environment_id = $1 and site_id = $2 order by slug",
+    )
+    .bind(fixture.production_id().await)
+    .bind(fixture.site)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
     assert_eq!(
         production_slugs,
-        vec!["edited".to_owned(), "quiet".to_owned(), "removed".to_owned()],
+        vec![
+            "edited".to_owned(),
+            "quiet".to_owned(),
+            "removed".to_owned()
+        ],
         "production still holds every page it held before the staging edits"
     );
     let _ = (edited, untouched);
@@ -2345,18 +2453,17 @@ async fn the_change_set_is_404_for_another_organization_and_403_without_the_key(
 
     // 403: an account that may not deploy cannot read the diff.
     let stranger_organization = create_organization_row(&fixture.db, "gate").await;
-    let (_, stranger) =
-        create_admin(
-            &fixture.db,
-            stranger_organization,
-            "gate",
-            &fixture.state,
-            // A real key that is the *wrong* one. `content.pages.read` is the honest choice: it
-            // exists in the catalogue, so the refusal is the guard answering rather than the
-            // seed rejecting a name it has never heard of.
-            &["content.pages.read"],
-        )
-        .await;
+    let (_, stranger) = create_admin(
+        &fixture.db,
+        stranger_organization,
+        "gate",
+        &fixture.state,
+        // A real key that is the *wrong* one. `content.pages.read` is the honest choice: it
+        // exists in the catalogue, so the refusal is the guard answering rather than the
+        // seed rejecting a name it has never heard of.
+        &["content.pages.read"],
+    )
+    .await;
     let refused = call(
         &fixture.state,
         request(
@@ -2439,7 +2546,6 @@ async fn a_derived_environment_without_a_clone_source_refuses_to_be_compared() {
 //   4. self-approval is refused without the deploy key and allowed with it;
 //   5. history, detail and the tenancy/permission gates;
 //   6. a promotion with no changes, and one that was withdrawn.
-
 
 /// Request a promotion through the API and return the answer.
 async fn request_promotion(
@@ -2553,12 +2659,14 @@ async fn promoting_a_clean_change_set_applies_every_item_and_says_how_many() {
     .execute(fixture.db.pool())
     .await
     .unwrap();
-    sqlx::query("delete from pages where site_id = $1 and slug = 'removed' and environment_id = $2")
-        .bind(fixture.site)
-        .bind(environment_id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "delete from pages where site_id = $1 and slug = 'removed' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
 
     // The request. It must come back immediately with a frozen set, not with production already
     // changed: a request is an intent, and an intent that writes is a deploy nobody approved.
@@ -2579,7 +2687,10 @@ async fn promoting_a_clean_change_set_applies_every_item_and_says_how_many() {
     assert_eq!(asked.body["promotion"]["updated"], 1);
     assert_eq!(asked.body["promotion"]["deleted"], 1);
     assert_eq!(
-        asked.body["promotion"]["conflicts"].as_array().unwrap().len(),
+        asked.body["promotion"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
         0,
         "nothing has moved in production yet"
     );
@@ -2587,8 +2698,7 @@ async fn promoting_a_clean_change_set_applies_every_item_and_says_how_many() {
         asked.body["promotion"]["requires_typed_confirmation"], false,
         "three items is under the threshold"
     );
-    let promotion_id =
-        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+    let promotion_id = Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
 
     // Production is untouched by the request.
     let before: Vec<String> = sqlx::query_scalar(
@@ -2700,9 +2810,15 @@ async fn a_production_edit_after_the_request_is_refused_with_the_item_id() {
     .await
     .unwrap();
 
-    let refused = approve(&fixture, Uuid::parse_str(&promotion_id).unwrap(), &fixture.caller).await;
+    let refused = approve(
+        &fixture,
+        Uuid::parse_str(&promotion_id).unwrap(),
+        &fixture.caller,
+    )
+    .await;
     assert_eq!(
-        refused.status, StatusCode::CONFLICT,
+        refused.status,
+        StatusCode::CONFLICT,
         "a conflicted promotion is refused: {}",
         refused.body
     );
@@ -2710,7 +2826,11 @@ async fn a_production_edit_after_the_request_is_refused_with_the_item_id() {
     let items = refused.body["error"]["details"]["items"]
         .as_array()
         .unwrap_or_else(|| panic!("the conflict must list item ids: {}", refused.body));
-    assert_eq!(items, &vec![json!(item_id)], "the refusal names the item, not just a count");
+    assert_eq!(
+        items,
+        &vec![json!(item_id)],
+        "the refusal names the item, not just a count"
+    );
 
     // Production keeps the edit the promotion would have overwritten.
     let production_updated: OffsetDateTime = sqlx::query_scalar(
@@ -2744,7 +2864,10 @@ async fn a_production_edit_after_the_request_is_refused_with_the_item_id() {
         stored.body
     );
     assert_eq!(
-        stored.body["promotion"]["conflicts"].as_array().unwrap().len(),
+        stored.body["promotion"]["conflicts"]
+            .as_array()
+            .unwrap()
+            .len(),
         1,
         "the refreshed conflict list is on the row, so the dialog can lead with it"
     );
@@ -2836,7 +2959,8 @@ async fn a_failure_midway_through_the_apply_leaves_production_unchanged() {
 
     // Nothing has moved, so the re-check passes — which is the whole reason this reaches apply.
     let conflicts =
-        omnion_environment::promotion_store::find_conflicts(fixture.db.pool(), &change_set).await
+        omnion_environment::promotion_store::find_conflicts(fixture.db.pool(), &change_set)
+            .await
             .unwrap();
     assert!(
         conflicts.is_empty(),
@@ -2855,9 +2979,12 @@ async fn a_failure_midway_through_the_apply_leaves_production_unchanged() {
     .await
     .unwrap();
 
-    let outcome =
-        omnion_environment::promotion_store::approve_and_apply(fixture.db.pool(), &row, fixture.caller_user_id)
-            .await;
+    let outcome = omnion_environment::promotion_store::approve_and_apply(
+        fixture.db.pool(),
+        &row,
+        fixture.caller_user_id,
+    )
+    .await;
     assert!(
         outcome.is_err(),
         "the second insert cannot succeed, so the apply must fail"
@@ -2941,14 +3068,14 @@ async fn self_approval_is_refused_without_the_deploy_key_and_allowed_with_it() {
         requester_id.to_string(),
         "the record names who asked"
     );
-    let promotion_id =
-        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+    let promotion_id = Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
 
     // Path A: the requester, who cannot deploy, cannot approve — and cannot even reach the route,
     // because the guard refuses on the missing key before the self-approval rule is consulted.
     let blocked = approve(&fixture, promotion_id, &requester).await;
     assert_eq!(
-        blocked.status, StatusCode::FORBIDDEN,
+        blocked.status,
+        StatusCode::FORBIDDEN,
         "without `deployment.deploy` the route is refused whatever the self-approval rule says: {}",
         blocked.body
     );
@@ -2959,8 +3086,7 @@ async fn self_approval_is_refused_without_the_deploy_key_and_allowed_with_it() {
     assert_eq!(approved.status, StatusCode::OK, "body: {}", approved.body);
     assert_eq!(approved.body["status"], "done");
     assert_ne!(
-        approved.body["approved_by"],
-        approved.body["requested_by"],
+        approved.body["approved_by"], approved.body["requested_by"],
         "a history row keeps the requester and the approver apart"
     );
     assert!(approved.body["approved_at"].is_array());
@@ -2971,17 +3097,20 @@ async fn self_approval_is_refused_without_the_deploy_key_and_allowed_with_it() {
     // rather than the route, because the guard answers first and that is correct behaviour.
     let self_approved = request_promotion(&fixture, environment_id, &[]).await;
     assert_eq!(
-        self_approved.status, StatusCode::CREATED,
+        self_approved.status,
+        StatusCode::CREATED,
         "with nothing left to promote the request is refused in words, not silently: {}",
         self_approved.body
     );
     assert_eq!(
-        self_approved.body["promotion"]["status"], "pending_approval"
+        self_approved.body["promotion"]["status"],
+        "pending_approval"
     );
     let own = Uuid::parse_str(self_approved.body["promotion"]["id"].as_str().unwrap()).unwrap();
     let own_approved = approve(&fixture, own, &fixture.caller).await;
     assert_eq!(
-        own_approved.status, StatusCode::OK,
+        own_approved.status,
+        StatusCode::OK,
         "the single-tenant case must not be deadlocked by a rule meant for teams: {}",
         own_approved.body
     );
@@ -3009,8 +3138,7 @@ async fn promotion_history_detail_and_the_gates() {
 
     let asked = request_promotion(&fixture, environment_id, &[]).await;
     assert_eq!(asked.status, StatusCode::CREATED);
-    let promotion_id =
-        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+    let promotion_id = Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
 
     // The history answers newest first and carries the frozen set's counts, not a recount.
     let history = call(
@@ -3087,7 +3215,8 @@ async fn promotion_history_detail_and_the_gates() {
     )
     .await;
     assert_eq!(
-        hidden.status, StatusCode::NOT_FOUND,
+        hidden.status,
+        StatusCode::NOT_FOUND,
         "another organization's promotion is a 404, not a 403: {}",
         hidden.body
     );
@@ -3153,8 +3282,7 @@ async fn an_empty_change_set_and_a_withdrawn_request() {
     .unwrap();
     let asked = request_promotion(&fixture, environment_id, &[]).await;
     assert_eq!(asked.status, StatusCode::CREATED);
-    let promotion_id =
-        Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+    let promotion_id = Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
 
     let cancelled = call(
         &fixture.state,
@@ -3172,7 +3300,8 @@ async fn an_empty_change_set_and_a_withdrawn_request() {
     // A cancelled promotion cannot then be approved — the state is the guard, not the caller.
     let after = approve(&fixture, promotion_id, &fixture.caller).await;
     assert_eq!(
-        after.status, StatusCode::CONFLICT,
+        after.status,
+        StatusCode::CONFLICT,
         "approving a withdrawn promotion is refused: {}",
         after.body
     );
@@ -3191,7 +3320,10 @@ async fn an_empty_change_set_and_a_withdrawn_request() {
     .unwrap();
     let bogus = request_promotion(&fixture, environment_id, &[Uuid::new_v4()]).await;
     assert_eq!(bogus.status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(bogus.body["error"]["code"], "promotion_item_not_in_change_set");
+    assert_eq!(
+        bogus.body["error"]["code"],
+        "promotion_item_not_in_change_set"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3246,8 +3378,7 @@ async fn a_promotion_reaches_a_subscribed_endpoint_over_a_signed_delivery() {
     .await
     .expect("the bystander endpoint must be created");
 
-    let _edited = insert_production_page(&fixture.db, fixture.site, "delivered", "Delivered")
-        .await;
+    let _edited = insert_production_page(&fixture.db, fixture.site, "delivered", "Delivered").await;
     let created = fixture.create_staging("Staging", "staging-delivery").await;
     let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
     drain_clone_for(&fixture.db, environment_id).await;
@@ -3305,7 +3436,8 @@ async fn a_promotion_reaches_a_subscribed_endpoint_over_a_signed_delivery() {
         "the envelope names the event: {body:?}"
     );
     assert_eq!(
-        body["payload"]["promotion_id"], promotion_id.to_string(),
+        body["payload"]["promotion_id"],
+        promotion_id.to_string(),
         "the delivery names the promotion that caused it"
     );
     assert_eq!(body["payload"]["written"], 1, "{body:?}");
@@ -3357,11 +3489,15 @@ async fn a_promotion_reaches_a_subscribed_endpoint_over_a_signed_delivery() {
     // promotion. This is the leg that would catch a runner posting to every endpoint.
     let bystander_events = bystander.events();
     assert!(
-        bystander_events.iter().all(|event| event.starts_with("environment.")),
+        bystander_events
+            .iter()
+            .all(|event| event.starts_with("environment.")),
         "the bystander received only what it subscribed to: {bystander_events:?}"
     );
     assert!(
-        !bystander_events.iter().any(|event| event.starts_with("promotion.")),
+        !bystander_events
+            .iter()
+            .any(|event| event.starts_with("promotion.")),
         "a promotion reached an endpoint that did not subscribe to it: {bystander_events:?}"
     );
     assert!(
@@ -3460,7 +3596,11 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
         .await
         .expect("the object inventory must be readable");
     let total_before: i64 = objects_before.iter().map(|object| object.size_bytes).sum();
-    assert_eq!(objects_before.len(), 1, "the fixture owns exactly one object");
+    assert_eq!(
+        objects_before.len(),
+        1,
+        "the fixture owns exactly one object"
+    );
 
     // ---- The clone -------------------------------------------------------------------------
     let created = fixture.create_staging("Staging", "staging-media").await;
@@ -3494,16 +3634,27 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
         .get(&key)
         .await
         .expect("the original object must still be readable after a clone");
-    assert_eq!(still_there.len(), bytes, "the object's bytes were altered by a clone");
+    assert_eq!(
+        still_there.len(),
+        bytes,
+        "the object's bytes were altered by a clone"
+    );
 
     // Every object production owns is still the one it owned, by key: the inventory is compared
     // as a set rather than a length, so a clone that swapped one blob for another would not pass
     // on the strength of an unchanged count.
-    let keys_before: Vec<String> =
-        objects_before.iter().map(|object| object.storage_key.clone()).collect();
-    let keys_after: Vec<String> =
-        objects_after.iter().map(|object| object.storage_key.clone()).collect();
-    assert_eq!(keys_after, keys_before, "the set of storage keys changed across a clone");
+    let keys_before: Vec<String> = objects_before
+        .iter()
+        .map(|object| object.storage_key.clone())
+        .collect();
+    let keys_after: Vec<String> = objects_after
+        .iter()
+        .map(|object| object.storage_key.clone())
+        .collect();
+    assert_eq!(
+        keys_after, keys_before,
+        "the set of storage keys changed across a clone"
+    );
 
     // ---- What the clone DID copy, so the count is not the only thing being claimed ---------
     let pages: i64 = sqlx::query_scalar("select count(*) from pages where environment_id = $1")
@@ -3549,11 +3700,12 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
         "the staging translation must hang off a staging page, not a production one"
     );
 
-    let workflows: i64 = sqlx::query_scalar("select count(*) from workflows where environment_id = $1")
-        .bind(environment_id)
-        .fetch_one(fixture.db.pool())
-        .await
-        .unwrap();
+    let workflows: i64 =
+        sqlx::query_scalar("select count(*) from workflows where environment_id = $1")
+            .bind(environment_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
     assert_eq!(workflows, 1, "the workflow definition was copied");
 
     // The theme selection is a column on `sites`, not a row, so "copied" for it is a fact about
@@ -3581,7 +3733,10 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
     // closed: an area priced like a promise and copying nothing. This walk asserted the opposite
     // and had never run, so nothing contradicted it.
     assert!(
-        !job.1.as_object().expect("area_counts is a map").contains_key("theme"),
+        !job.1
+            .as_object()
+            .expect("area_counts is a map")
+            .contains_key("theme"),
         "the theme was priced as a copy, but it copies nothing: {}",
         job.1
     );
@@ -3589,11 +3744,17 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
     // through the API with exactly those ticked, so each is present with a count of at least one.
     for area in ["pages", "translations", "workflows"] {
         let count = job.1[area].as_i64().unwrap_or_default();
-        assert!(count >= 1, "the {} area was asked for and copies nothing: {}", area, job.1);
+        assert!(
+            count >= 1,
+            "the {} area was asked for and copies nothing: {}",
+            area,
+            job.1
+        );
     }
     // And the job's own total agrees with the counts it is a total of — a self-consistent
     // runner that reported 3 of 3 while having copied nothing is the shape this catches.
-    let summed: i64 = job.1
+    let summed: i64 = job
+        .1
         .as_object()
         .expect("area_counts is a map of area name to a count")
         .values()
@@ -3618,7 +3779,9 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
     .await
     .unwrap();
     assert!(
-        !media_columns.iter().any(|column| column == "environment_id"),
+        !media_columns
+            .iter()
+            .any(|column| column == "environment_id"),
         "media grew an environment_id, so a clone could own blobs of its own: {media_columns:?}"
     );
 }

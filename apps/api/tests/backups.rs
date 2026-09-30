@@ -32,15 +32,15 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use http_body_util::BodyExt;
+use omnion_api::rate_limit_middleware::RateLimiter;
 use omnion_api::routes;
 use omnion_api::state::AppState;
-use omnion_backup as omnion_backup;
+use omnion_backup;
 use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
-use omnion_api::rate_limit_middleware::RateLimiter;
 use omnion_security::RatePolicy;
 use omnion_storage::Storage;
 use serde_json::{Value, json};
@@ -159,7 +159,12 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         }
         _ => Value::Null,
     };
-    TestResponse { status, set_cookies, body, raw }
+    TestResponse {
+        status,
+        set_cookies,
+        body,
+        raw,
+    }
 }
 
 /// Build a request. `token` and `csrf` become the session cookie and the CSRF header, which is
@@ -256,13 +261,13 @@ impl Fixture {
             }
         };
         db.migrate().await.expect("migrations must apply");
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
         let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
         let storage = Storage::Fs(
-            omnion_storage::FsStorage::new(
-                std::env::temp_dir().join("omnion-backup-suite-store"),
-            )
-            .expect("the object store must open"),
+            omnion_storage::FsStorage::new(std::env::temp_dir().join("omnion-backup-suite-store"))
+                .expect("the object store must open"),
         );
         let state = AppState::new(
             BuildInfo::new("omnion-api", "0.0.0-test"),
@@ -366,12 +371,15 @@ impl Fixture {
             ),
         )
         .await;
-        assert_eq!(response.status, StatusCode::OK, "login body: {}", response.body);
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "login body: {}",
+            response.body
+        );
         (
             response.cookie("omnion_session").expect("a session cookie"),
-            response
-                .cookie("omnion_csrf")
-                .unwrap_or_default(),
+            response.cookie("omnion_csrf").unwrap_or_default(),
         )
     }
 
@@ -400,7 +408,11 @@ async fn organization(db: &Db, name: &str) -> Uuid {
         "insert into organizations (name, slug) values ($1, $2) returning id",
     )
     .bind(name)
-    .bind(format!("backup-{}-{}", name.to_lowercase().replace(' ', "-"), Uuid::new_v4().simple()))
+    .bind(format!(
+        "backup-{}-{}",
+        name.to_lowercase().replace(' ', "-"),
+        Uuid::new_v4().simple()
+    ))
     .fetch_one(db.pool())
     .await
     .expect("the organization must be created")
@@ -463,7 +475,9 @@ async fn bind_role(
         NewBinding {
             role_id: role.id,
             user_id: id,
-            scope: Scope::Organization { organization_id: org },
+            scope: Scope::Organization {
+                organization_id: org,
+            },
             granted_by: Some(granted_by),
             expires_at: None,
         },
@@ -495,12 +509,7 @@ fn give_the_suite_its_own_rate_limit(state: &AppState) {
 }
 
 /// Take a backup through the real route and return the parsed body.
-async fn take_backup(
-    state: &AppState,
-    token: &str,
-    csrf: &str,
-    scopes: &[&str],
-) -> TestResponse {
+async fn take_backup(state: &AppState, token: &str, csrf: &str, scopes: &[&str]) -> TestResponse {
     call(
         state,
         request(
@@ -532,7 +541,12 @@ async fn a_backup_of_all_five_parts_writes_five_artifacts_and_lands_on_succeeded
         &["database", "media", "configuration", "themes", "plugins"],
     )
     .await;
-    assert_eq!(response.status, StatusCode::CREATED, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "body: {}",
+        response.body
+    );
     let run = &response.body["backup"];
     assert_eq!(run["status"], "succeeded", "body: {}", response.body);
     let id = Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid");
@@ -594,7 +608,8 @@ async fn a_backup_of_all_five_parts_writes_five_artifacts_and_lands_on_succeeded
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|err| panic!("{} must exist at {}: {err}", name, path.display()));
         assert_eq!(
-            bytes.len() as i64, *recorded,
+            bytes.len() as i64,
+            *recorded,
             "{name}: the file on disk is {} bytes, the row says {recorded}",
             bytes.len()
         );
@@ -645,7 +660,12 @@ async fn a_corrupted_artifact_turns_the_verification_red_by_name() {
     };
     let (token, csrf) = fixture.session(&fixture.operator_email).await;
     let created = take_backup(&fixture.state, &token, &csrf, &["database", "media"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
     let prefix = created.body["backup"]["storage_prefix"]
         .as_str()
@@ -656,7 +676,13 @@ async fn a_corrupted_artifact_turns_the_verification_red_by_name() {
     // operator to ignore it, and then it is useless on the day it matters.
     let clean = call(
         &fixture.state,
-        request(Method::POST, &verify_uri(id), Some(&token), Some(&csrf), None),
+        request(
+            Method::POST,
+            &verify_uri(id),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(clean.status, StatusCode::OK);
@@ -666,7 +692,10 @@ async fn a_corrupted_artifact_turns_the_verification_red_by_name() {
     // unscoped equality here is asserting what the other suites left behind, not what this
     // backup proved. The assertion that matters is that both of ITS parts matched, and that
     // the response is clean.
-    let matched = clean.body["matched"].as_array().cloned().unwrap_or_default();
+    let matched = clean.body["matched"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         matched.iter().any(|part| part == "database") && matched.iter().any(|part| part == "media"),
         "both of this run's parts must be named as matched: {matched:?}"
@@ -688,10 +717,20 @@ async fn a_corrupted_artifact_turns_the_verification_red_by_name() {
 
     let dirty = call(
         &fixture.state,
-        request(Method::POST, &verify_uri(id), Some(&token), Some(&csrf), None),
+        request(
+            Method::POST,
+            &verify_uri(id),
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
     )
     .await;
-    assert_eq!(dirty.status, StatusCode::OK, "a mismatch is a verdict, not an error");
+    assert_eq!(
+        dirty.status,
+        StatusCode::OK,
+        "a mismatch is a verdict, not an error"
+    );
     assert_eq!(dirty.body["clean"], json!(false), "body: {}", dirty.body);
     assert_eq!(
         dirty.body["mismatched"],
@@ -716,7 +755,10 @@ async fn a_corrupted_artifact_turns_the_verification_red_by_name() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the audit rows must read");
-    assert!(audited >= 2, "both verifications must be audited, got {audited}");
+    assert!(
+        audited >= 2,
+        "both verifications must be audited, got {audited}"
+    );
 }
 
 #[tokio::test]
@@ -750,14 +792,23 @@ async fn the_settings_response_never_carries_a_credential_and_an_unwritable_root
     // serialiser did, and a field named `credential_ref` is a reference while a field named
     // `credential` would be a value.
     let text = good.text().to_lowercase();
-    for forbidden in ["access_key", "secret_key", "passphrase_value", "password", "token"] {
+    for forbidden in [
+        "access_key",
+        "secret_key",
+        "passphrase_value",
+        "password",
+        "token",
+    ] {
         assert!(
             !text.contains(forbidden),
             "the settings response must not carry `{forbidden}`: {}",
             good.text()
         );
     }
-    assert!(text.contains("credential_ref"), "the reference field is the honest one");
+    assert!(
+        text.contains("credential_ref"),
+        "the reference field is the honest one"
+    );
 
     // A root that cannot be written is refused, and the reason is the operating system's own
     // words rather than "unwritable". A settings screen that stores this and reports success
@@ -779,15 +830,27 @@ async fn the_settings_response_never_carries_a_credential_and_an_unwritable_root
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
-    assert!(!refused.message().is_empty(), "a refusal must say why: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        refused.body
+    );
+    assert!(
+        !refused.message().is_empty(),
+        "a refusal must say why: {}",
+        refused.body
+    );
 
     // The refused save wrote nothing: the stored root is still the writable one.
     let stored: String = sqlx::query_scalar("select local_root from backup_settings where id = 1")
         .fetch_one(fixture.db.pool())
         .await
         .expect("the settings row must read");
-    assert!(!stored.is_empty(), "a refused save must not have stored the empty root");
+    assert!(
+        !stored.is_empty(),
+        "a refused save must not have stored the empty root"
+    );
 }
 
 #[tokio::test]
@@ -802,13 +865,23 @@ async fn a_reader_may_look_and_take_and_may_not_delete_or_reconfigure() {
     let (reader, reader_csrf) = fixture.session(&fixture.reader_email).await;
 
     // Reads.
-    for uri in [backups_uri(), status_uri(), backup_uri(id), manifest_uri(id)] {
+    for uri in [
+        backups_uri(),
+        status_uri(),
+        backup_uri(id),
+        manifest_uri(id),
+    ] {
         let response = call(
             &fixture.state,
             request(Method::GET, &uri, Some(&reader), None, None),
         )
         .await;
-        assert_eq!(response.status, StatusCode::OK, "{uri} must be readable: {}", response.body);
+        assert_eq!(
+            response.status,
+            StatusCode::OK,
+            "{uri} must be readable: {}",
+            response.body
+        );
     }
 
     // Taking a backup is `backup.create`, which the reader holds — asking for a restore point
@@ -829,7 +902,12 @@ async fn a_reader_may_look_and_take_and_may_not_delete_or_reconfigure() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::FORBIDDEN, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        refused.body
+    );
     let still_there: i64 = sqlx::query_scalar("select count(*) from backups where id = $1")
         .bind(id)
         .fetch_one(fixture.db.pool())
@@ -855,21 +933,25 @@ async fn a_reader_may_look_and_take_and_may_not_delete_or_reconfigure() {
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::FORBIDDEN, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "body: {}",
+        refused.body
+    );
     let retention: i32 =
         sqlx::query_scalar("select default_retention from backup_settings where id = 1")
             .fetch_one(fixture.db.pool())
             .await
             .expect("the settings row must read");
-    assert_eq!(retention, 7, "a refused save must not have written the retention");
+    assert_eq!(
+        retention, 7,
+        "a refused save must not have written the retention"
+    );
 
     // Anonymous is refused everywhere.
     for uri in [backups_uri(), status_uri(), settings_uri()] {
-        let response = call(
-            &fixture.state,
-            request(Method::GET, &uri, None, None, None),
-        )
-        .await;
+        let response = call(&fixture.state, request(Method::GET, &uri, None, None, None)).await;
         assert_eq!(
             response.status,
             StatusCode::UNAUTHORIZED,
@@ -914,7 +996,13 @@ async fn another_tenants_backup_is_a_404_and_its_existence_is_not_confirmed() {
     ] {
         let response = call(
             &fixture.state,
-            request(method.clone(), &uri, Some(&stranger), Some(&stranger_csrf), None),
+            request(
+                method.clone(),
+                &uri,
+                Some(&stranger),
+                Some(&stranger_csrf),
+                None,
+            ),
         )
         .await;
         assert_eq!(
@@ -931,7 +1019,10 @@ async fn another_tenants_backup_is_a_404_and_its_existence_is_not_confirmed() {
         .fetch_one(fixture.db.pool())
         .await
         .expect("the row must read");
-    assert_eq!(still_there, 1, "a refused delete must not remove another tenant's row");
+    assert_eq!(
+        still_there, 1,
+        "a refused delete must not remove another tenant's row"
+    );
 }
 
 #[tokio::test]
@@ -954,7 +1045,12 @@ async fn a_duplicate_scope_is_refused_by_name_and_a_bad_label_names_its_own_fiel
         ),
     )
     .await;
-    assert_eq!(duplicated.status, StatusCode::BAD_REQUEST, "body: {}", duplicated.body);
+    assert_eq!(
+        duplicated.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        duplicated.body
+    );
     assert!(
         duplicated.message().contains("listed twice"),
         "the message must name the rule: {}",
@@ -993,7 +1089,12 @@ async fn a_duplicate_scope_is_refused_by_name_and_a_bad_label_names_its_own_fiel
         ),
     )
     .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        refused.body
+    );
     assert!(
         refused.message().contains("label"),
         "the refusal must name its field: {}",
@@ -1033,8 +1134,14 @@ async fn a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful
             ),
         )
         .await;
-        assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
-        let id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "body: {}",
+            created.body
+        );
+        let id =
+            Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
         ids.push(id);
     }
     // Everything is past its window; only the last one is protected.
@@ -1122,7 +1229,12 @@ async fn the_retention_sweep_takes_the_bytes_and_spares_what_it_promised() {
             ),
         )
         .await;
-        assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "body: {}",
+            created.body
+        );
         let id =
             Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
         let prefix = created.body["backup"]["storage_prefix"]
@@ -1154,7 +1266,12 @@ async fn the_retention_sweep_takes_the_bytes_and_spares_what_it_promised() {
             ),
         )
         .await;
-        assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "body: {}",
+            created.body
+        );
         let id =
             Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
         let prefix = created.body["backup"]["storage_prefix"]
@@ -1184,7 +1301,13 @@ async fn the_retention_sweep_takes_the_bytes_and_spares_what_it_promised() {
 
     let response = call(
         &fixture.state,
-        request(Method::POST, "/api/v1/backups/sweep", Some(&token), Some(&csrf), None),
+        request(
+            Method::POST,
+            "/api/v1/backups/sweep",
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(response.status, StatusCode::OK, "body: {}", response.body);
@@ -1194,8 +1317,18 @@ async fn the_retention_sweep_takes_the_bytes_and_spares_what_it_promised() {
         "exactly one of this tenant's runs is a candidate: {}",
         response.body
     );
-    assert_eq!(response.body["removed"].as_i64(), Some(1), "body: {}", response.body);
-    assert_eq!(response.body["partial"].as_i64(), Some(0), "body: {}", response.body);
+    assert_eq!(
+        response.body["removed"].as_i64(),
+        Some(1),
+        "body: {}",
+        response.body
+    );
+    assert_eq!(
+        response.body["partial"].as_i64(),
+        Some(0),
+        "body: {}",
+        response.body
+    );
 
     // 1. The bytes. Not the row — the directory.
     assert!(
@@ -1237,13 +1370,15 @@ async fn the_retention_sweep_takes_the_bytes_and_spares_what_it_promised() {
 
     // 4. An audit entry, because a button that deletes restore points with no record of who
     // asked is a button nobody can reconcile at 02:00.
-    let audited: i64 = sqlx::query_scalar(
-        "select count(*) from audit_log where action = 'backup.sweep'",
-    )
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the audit must read");
-    assert!(audited >= 1, "a destructive sweep must leave an audit entry");
+    let audited: i64 =
+        sqlx::query_scalar("select count(*) from audit_log where action = 'backup.sweep'")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the audit must read");
+    assert!(
+        audited >= 1,
+        "a destructive sweep must leave an audit entry"
+    );
 }
 
 #[tokio::test]
@@ -1301,7 +1436,12 @@ async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the
     }
 
     let response = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
-    assert_eq!(response.status, StatusCode::CREATED, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "body: {}",
+        response.body
+    );
     let run = &response.body["backup"];
     let id = Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid");
     let prefix = run["storage_prefix"].as_str().expect("a prefix");
@@ -1334,7 +1474,11 @@ async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the
     // Taking the path from the artifact means the two halves can actually disagree.
     let index_path = fixture.artifact(
         prefix,
-        &format!("{}{}", prefix.trim_start_matches('/'), omnion_backup::INDEX_FILENAME),
+        &format!(
+            "{}{}",
+            prefix.trim_start_matches('/'),
+            omnion_backup::INDEX_FILENAME
+        ),
     );
     let objects_root = fixture.artifact(
         prefix,
@@ -1344,11 +1488,12 @@ async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the
             omnion_backup::OBJECTS_DIR
         ),
     );
-    let index: Value = serde_json::from_slice(
-        &std::fs::read(&index_path).unwrap_or_else(|err| {
-            panic!("the media index must exist at {}: {err}", index_path.display())
-        }),
-    )
+    let index: Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap_or_else(|err| {
+        panic!(
+            "the media index must exist at {}: {err}",
+            index_path.display()
+        )
+    }))
     .expect("the index must be JSON");
     assert_eq!(index["version"], omnion_backup::INDEX_VERSION);
     let listed = index["objects"].as_array().expect("an object list");
@@ -1358,7 +1503,10 @@ async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the
     let mut actual: Vec<Vec<u8>> = Vec::new();
     for entry in listed {
         assert!(
-            entry["storage_key"].as_str().unwrap_or_default().starts_with("suite/"),
+            entry["storage_key"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("suite/"),
             "the index carries the live key: {entry}"
         );
         assert_eq!(
@@ -1408,7 +1556,10 @@ async fn the_media_part_copies_the_librarys_bytes_and_a_missing_object_fails_the
     // second time a walk runs against the same database — and it fails as a constraint
     // violation that reads like a product defect rather than a fixture collision. Every
     // storage key this suite writes is namespaced by something unique.
-    .bind(format!("suite/never-uploaded/gone-{}.png", Uuid::new_v4().simple()))
+    .bind(format!(
+        "suite/never-uploaded/gone-{}.png",
+        Uuid::new_v4().simple()
+    ))
     .bind("gone.png")
     .bind("image/png")
     .bind(11i64)
@@ -1519,10 +1670,7 @@ async fn deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_th
     assert_eq!(second.status, StatusCode::CREATED, "body: {}", second.body);
 
     let id_of = |response: &TestResponse| -> Uuid {
-        Uuid::parse_str(
-            response.body["backup"]["id"].as_str().expect("an id"),
-        )
-        .expect("a uuid")
+        Uuid::parse_str(response.body["backup"]["id"].as_str().expect("an id")).expect("a uuid")
     };
     let (first_id, second_id) = (id_of(&first), id_of(&second));
     let first_prefix = first.body["backup"]["storage_prefix"]
@@ -1533,16 +1681,16 @@ async fn deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_th
         .as_str()
         .expect("a prefix")
         .to_owned();
-    assert_ne!(first_prefix, second_prefix, "each run has its own directory");
+    assert_ne!(
+        first_prefix, second_prefix,
+        "each run has its own directory"
+    );
 
     // The path is read out of the run's own manifest, not recomputed — the same rule the
     // media walk uses. A helper here that agreed with a wrong production path would make
     // the two halves consistent and wrong.
     let run_directory = |prefix: &str| -> std::path::PathBuf {
-        fixture.artifact(
-            prefix,
-            &format!("{}/", prefix.trim_start_matches('/')),
-        )
+        fixture.artifact(prefix, &format!("{}/", prefix.trim_start_matches('/')))
     };
     let doomed = run_directory(&first_prefix);
     let survivor = run_directory(&second_prefix);
@@ -1552,7 +1700,9 @@ async fn deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_th
         doomed.display()
     );
     let objects_before = std::fs::read_dir(
-        doomed.join(omnion_backup::OBJECTS_DIR).join(&site.to_string()),
+        doomed
+            .join(omnion_backup::OBJECTS_DIR)
+            .join(&site.to_string()),
     )
     .unwrap_or_else(|err| {
         panic!(
@@ -1609,24 +1759,20 @@ async fn deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_th
         doomed.display()
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "select count(*) from backups where id = $1",
-        )
-        .bind(first_id)
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("the count must answer"),
+        sqlx::query_scalar::<_, i64>("select count(*) from backups where id = $1",)
+            .bind(first_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must answer"),
         0,
         "the row is gone too"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "select count(*) from backup_parts where backup_id = $1",
-        )
-        .bind(first_id)
-        .fetch_one(fixture.db.pool())
-        .await
-        .expect("the count must answer"),
+        sqlx::query_scalar::<_, i64>("select count(*) from backup_parts where backup_id = $1",)
+            .bind(first_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the count must answer"),
         0,
         "and its parts with it"
     );
@@ -1667,7 +1813,8 @@ async fn deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_th
     )
     .await;
     assert_eq!(
-        repeat.status, StatusCode::NOT_FOUND,
+        repeat.status,
+        StatusCode::NOT_FOUND,
         "a deleted run is a 404, never a second delete: {}",
         repeat.body
     );
@@ -1721,7 +1868,11 @@ async fn a_backups_media_part_holds_only_the_runs_own_organizations_files() {
     let mut keys = Vec::new();
     for (site, name, payload) in [
         (own_site, "mine.png", &b"the operator's own file"[..]),
-        (stranger_site, "theirs.png", &b"another tenant's file, which must not be here"[..]),
+        (
+            stranger_site,
+            "theirs.png",
+            &b"another tenant's file, which must not be here"[..],
+        ),
     ] {
         let key = format!("suite/{site}/{name}");
         fixture
@@ -1747,7 +1898,12 @@ async fn a_backups_media_part_holds_only_the_runs_own_organizations_files() {
     }
 
     let response = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
-    assert_eq!(response.status, StatusCode::CREATED, "body: {}", response.body);
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "body: {}",
+        response.body
+    );
     let run = &response.body["backup"];
     assert_eq!(
         run["status"], "succeeded",
@@ -1757,9 +1913,7 @@ async fn a_backups_media_part_holds_only_the_runs_own_organizations_files() {
     let (item_count,) = sqlx::query_as::<_, (i32,)>(
         "select item_count from backup_parts where backup_id = $1 and part = 'media'",
     )
-    .bind(
-        Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid"),
-    )
+    .bind(Uuid::parse_str(run["id"].as_str().expect("an id")).expect("a uuid"))
     .fetch_one(fixture.db.pool())
     .await
     .expect("a media row must exist");
@@ -1772,13 +1926,18 @@ async fn a_backups_media_part_holds_only_the_runs_own_organizations_files() {
     // the stranger's name — and the absence of it is the assertion.
     let index_path = fixture.artifact(
         prefix,
-        &format!("{}{}", prefix.trim_start_matches('/'), omnion_backup::INDEX_FILENAME),
+        &format!(
+            "{}{}",
+            prefix.trim_start_matches('/'),
+            omnion_backup::INDEX_FILENAME
+        ),
     );
-    let index: Value = serde_json::from_slice(
-        &std::fs::read(&index_path).unwrap_or_else(|err| {
-            panic!("the media index must exist at {}: {err}", index_path.display())
-        }),
-    )
+    let index: Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap_or_else(|err| {
+        panic!(
+            "the media index must exist at {}: {err}",
+            index_path.display()
+        )
+    }))
     .expect("the index must be JSON");
     let body = serde_json::to_string(&index).expect("the index must serialise");
     assert!(
@@ -1880,7 +2039,6 @@ async fn run_snapshot(
 // The restore preview (slice 2)
 // ----------------------------------------------------------------------------------------
 
-
 /// The preview prices a restore against LIVE data, and changes nothing while doing it.
 ///
 /// The unit tests in `omnion_backup` can prove what the model does with the numbers it is
@@ -1927,7 +2085,12 @@ async fn the_restore_preview_prices_the_loss_and_touches_nothing() {
     .expect("the media row must be written");
 
     let created = take_backup(&fixture.state, &token, &csrf, &["media", "database"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
     let prefix = created.body["backup"]["storage_prefix"]
@@ -1974,7 +2137,12 @@ async fn the_restore_preview_prices_the_loss_and_touches_nothing() {
     assert_eq!(preview.status, StatusCode::OK, "body: {}", preview.body);
 
     // 1. It is offered, with a phrase bound to this run and to nothing else.
-    assert_eq!(preview.body["restorable"], json!(true), "body: {}", preview.body);
+    assert_eq!(
+        preview.body["restorable"],
+        json!(true),
+        "body: {}",
+        preview.body
+    );
     let phrase = preview.body["confirm_phrase"]
         .as_str()
         .expect("a confirm phrase")
@@ -2011,12 +2179,14 @@ async fn the_restore_preview_prices_the_loss_and_touches_nothing() {
     // scoped to this organization's own site — the suite database is shared with every other
     // integration walk, and a total would be asserting what the other suites left behind.
     assert_eq!(
-        media["live_matches"], json!(1),
+        media["live_matches"],
+        json!(1),
         "the archived object is what the media part overwrites: {}",
         media
     );
     assert_eq!(
-        media["live_dropped"], json!(1),
+        media["live_dropped"],
+        json!(1),
         "the file uploaded after the run is what the media part costs: {}",
         media
     );
@@ -2053,8 +2223,14 @@ async fn the_restore_preview_prices_the_loss_and_touches_nothing() {
         before.0, after.0,
         "a preview must not change a single part row"
     );
-    assert_eq!(before.1, after.1, "a preview must not change the run's status");
-    assert_eq!(before.2, after.2, "a preview must not change the run's prefix");
+    assert_eq!(
+        before.1, after.1,
+        "a preview must not change the run's status"
+    );
+    assert_eq!(
+        before.2, after.2,
+        "a preview must not change the run's prefix"
+    );
     assert_eq!(
         before.3, after.3,
         "a preview must not stamp a second finish time"
@@ -2105,7 +2281,12 @@ async fn a_truncated_artifact_is_not_offered_as_a_restore_point() {
     // like a product bug and was actually a test asking the right question of a broken
     // producer.
     let created = take_backup(&fixture.state, &token, &csrf, &["database"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let parts = created.body["parts"].as_array().expect("parts");
     assert_eq!(
         parts.len(),
@@ -2131,8 +2312,7 @@ async fn a_truncated_artifact_is_not_offered_as_a_restore_point() {
     .expect("the database part must be recorded");
     let path = fixture.artifact(&prefix, &relative);
 
-    std::fs::write(&path, b"{\"tables\":[]}")
-        .expect("the artifact must be overwritable");
+    std::fs::write(&path, b"{\"tables\":[]}").expect("the artifact must be overwritable");
     assert_ne!(
         std::fs::metadata(&path).expect("the file").len() as i64,
         sqlx::query_scalar::<_, i64>(
@@ -2158,12 +2338,14 @@ async fn a_truncated_artifact_is_not_offered_as_a_restore_point() {
     .await;
     assert_eq!(preview.status, StatusCode::OK, "body: {}", preview.body);
     assert_eq!(
-        preview.body["restorable"], json!(false),
+        preview.body["restorable"],
+        json!(false),
         "a truncated archive is not a restore point: {}",
         preview.body
     );
     assert_eq!(
-        preview.body["confirm_phrase"], json!(""),
+        preview.body["confirm_phrase"],
+        json!(""),
         "nothing to confirm means no phrase, and a phrase would be a guard that guards nothing"
     );
     let database = preview.body["parts"]
@@ -2199,8 +2381,19 @@ async fn another_tenants_backup_has_no_preview_and_the_404_says_nothing() {
     };
     let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
 
-    let created = take_backup(&fixture.state, &stranger_token, &stranger_csrf, &["database"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let created = take_backup(
+        &fixture.state,
+        &stranger_token,
+        &stranger_csrf,
+        &["database"],
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
 
@@ -2217,11 +2410,15 @@ async fn another_tenants_backup_has_no_preview_and_the_404_says_nothing() {
     )
     .await;
     assert_eq!(
-        refused.status, StatusCode::NOT_FOUND,
+        refused.status,
+        StatusCode::NOT_FOUND,
         "a stranger's backup must be a 404, never a 403 that confirms the id: {}",
         refused.body
     );
-    let message = refused.body["message"].as_str().unwrap_or_default().to_lowercase();
+    let message = refused.body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
     assert!(
         !message.contains("cross_organization") && !message.contains("organization"),
         "the 404 must not name the tenancy rule — that is the oracle: {message}"
@@ -2266,25 +2463,25 @@ async fn a_run_produces_only_the_scopes_it_was_asked_for() {
         )
         .await;
         assert_eq!(
-            created.status, StatusCode::CREATED,
+            created.status,
+            StatusCode::CREATED,
             "{label}: body: {}",
             created.body
         );
-        let run_id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id"))
-            .expect("a uuid");
+        let run_id =
+            Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
         let prefix = created.body["backup"]["storage_prefix"]
             .as_str()
             .expect("a prefix")
             .to_owned();
 
         // From the database, not the response.
-        let stored: Vec<String> = sqlx::query_scalar(
-            "select part from backup_parts where backup_id = $1 order by part",
-        )
-        .bind(run_id)
-        .fetch_all(fixture.db.pool())
-        .await
-        .expect("the parts must read");
+        let stored: Vec<String> =
+            sqlx::query_scalar("select part from backup_parts where backup_id = $1 order by part")
+                .bind(run_id)
+                .fetch_all(fixture.db.pool())
+                .await
+                .expect("the parts must read");
         let mut expected: Vec<String> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
         expected.sort();
         assert_eq!(
@@ -2305,7 +2502,10 @@ async fn a_run_produces_only_the_scopes_it_was_asked_for() {
                     assert!(
                         !artifact.exists(),
                         "{label}: `{name}` was never asked for but {} exists: {}",
-                        artifact.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                        artifact
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
                         artifact.display()
                     );
                 }
@@ -2369,7 +2569,13 @@ async fn restore_now(
 }
 
 /// Upload one real object into this organization's site and return `(site, storage_key)`.
-async fn put_object(state: &AppState, pool: &sqlx::PgPool, site: Uuid, name: &str, bytes: &[u8]) -> String {
+async fn put_object(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    site: Uuid,
+    name: &str,
+    bytes: &[u8],
+) -> String {
     let key = format!("restore/{site}/{name}");
     state
         .storage()
@@ -2424,10 +2630,22 @@ async fn a_restore_writes_the_objects_back_and_leaves_a_protected_safety_run() {
     let restorer_email = fixture.restorer_email.clone();
 
     let site = create_site(fixture.db.pool(), fixture.org, "Restore Site").await;
-    let archived = put_object(&fixture.state, fixture.db.pool(), site, "archived.png", b"in the archive").await;
+    let archived = put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "archived.png",
+        b"in the archive",
+    )
+    .await;
 
     let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
 
@@ -2436,7 +2654,14 @@ async fn a_restore_writes_the_objects_back_and_leaves_a_protected_safety_run() {
     // writes back what the archive holds rather than deleting what it does not. (The live
     // comparison still reports it as dropped; the *media* restore does not delete it, and
     // the panel says so rather than pretending the two numbers are the same statement.)
-    let newer = put_object(&fixture.state, fixture.db.pool(), site, "newer.png", b"after the run").await;
+    let newer = put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "newer.png",
+        b"after the run",
+    )
+    .await;
 
     let before: i64 = sqlx::query_scalar("select count(*) from media where site_id = $1")
         .bind(site)
@@ -2452,7 +2677,11 @@ async fn a_restore_writes_the_objects_back_and_leaves_a_protected_safety_run() {
         .as_str()
         .expect("a phrase")
         .to_owned();
-    assert!(!phrase.is_empty(), "a run with objects must be offered: {}", preview.body);
+    assert!(
+        !phrase.is_empty(),
+        "a run with objects must be offered: {}",
+        preview.body
+    );
 
     let outcome = restore_now(
         &fixture.state,
@@ -2494,7 +2723,10 @@ async fn a_restore_writes_the_objects_back_and_leaves_a_protected_safety_run() {
             .expect("a safety backup id"),
     )
     .expect("a uuid");
-    assert_ne!(safety_id, run_id, "the safety run must not be the run being restored");
+    assert_ne!(
+        safety_id, run_id,
+        "the safety run must not be the run being restored"
+    );
     let (label, protected): (String, bool) =
         sqlx::query_as("select label, protected from backups where id = $1")
             .bind(safety_id)
@@ -2551,14 +2783,22 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
     };
     let (token, csrf) = fixture.session(&fixture.operator_email).await;
     let site = create_site(fixture.db.pool(), fixture.org, "Refused Site").await;
-    put_object(&fixture.state, fixture.db.pool(), site, "only.png", b"the only object").await;
+    put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "only.png",
+        b"the only object",
+    )
+    .await;
 
     let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
     let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
-    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await.body
-        ["confirm_phrase"]
+    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id)
+        .await
+        .body["confirm_phrase"]
         .as_str()
         .expect("a phrase")
         .to_owned();
@@ -2582,7 +2822,12 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
         "RESTORE 00000000",
     )
     .await;
-    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "body: {}", wrong.body);
+    assert_eq!(
+        wrong.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        wrong.body
+    );
     assert_eq!(wrong.body["error"]["code"], "confirmation_mismatch");
     assert!(
         wrong.message().contains(&phrase),
@@ -2601,7 +2846,12 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
         &phrase,
     )
     .await;
-    assert_eq!(absent.status, StatusCode::BAD_REQUEST, "body: {}", absent.body);
+    assert_eq!(
+        absent.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        absent.body
+    );
     assert_eq!(absent.body["error"]["code"], "part_not_in_archive");
     assert!(
         absent.message().contains("media"),
@@ -2619,7 +2869,12 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
         &phrase,
     )
     .await;
-    assert_eq!(unknown.status, StatusCode::BAD_REQUEST, "body: {}", unknown.body);
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        unknown.body
+    );
     assert_eq!(unknown.body["error"]["code"], "unknown_part");
 
     // (d) An empty selection is a refusal, not "restore everything". A form that posted
@@ -2634,7 +2889,12 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
         &phrase,
     )
     .await;
-    assert_eq!(empty.status, StatusCode::BAD_REQUEST, "body: {}", empty.body);
+    assert_eq!(
+        empty.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        empty.body
+    );
     assert_eq!(empty.body["error"]["code"], "empty_selection");
 
     // **Nothing happened.** No run, no audit entry, no object, no row.
@@ -2649,7 +2909,10 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
         .fetch_one(fixture.db.pool())
         .await
         .expect("the library must read");
-    assert_eq!(object_after, object_before, "a refused restore writes no rows");
+    assert_eq!(
+        object_after, object_before,
+        "a refused restore writes no rows"
+    );
     let audited: i64 = sqlx::query_scalar(
         "select count(*) from audit_log where action = 'backup.restored' and target_id = $1",
     )
@@ -2657,7 +2920,10 @@ async fn a_refused_restore_writes_no_backup_no_audit_and_no_object() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the audit must read");
-    assert_eq!(audited, 0, "a refusal is not a restore and must not say it was one");
+    assert_eq!(
+        audited, 0,
+        "a refusal is not a restore and must not say it was one"
+    );
 }
 
 /// A run holding `database` is refused by name, and the refusal says why.
@@ -2673,7 +2939,12 @@ async fn the_database_part_is_refused_by_name_because_it_is_an_inventory_not_a_d
     };
     let (token, csrf) = fixture.session(&fixture.operator_email).await;
     let created = take_backup(&fixture.state, &token, &csrf, &["database"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
 
@@ -2698,7 +2969,12 @@ async fn the_database_part_is_refused_by_name_because_it_is_an_inventory_not_a_d
         &phrase,
     )
     .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        refused.body
+    );
     assert_eq!(refused.body["error"]["code"], "part_not_restorable");
     let message = refused.message();
     assert!(
@@ -2728,7 +3004,14 @@ async fn the_restore_button_needs_its_own_key_and_a_strangers_run_is_still_a_404
     };
     let (token, csrf) = fixture.session(&fixture.operator_email).await;
     let site = create_site(fixture.db.pool(), fixture.org, "Keyed Site").await;
-    put_object(&fixture.state, fixture.db.pool(), site, "keyed.png", b"bytes").await;
+    put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "keyed.png",
+        b"bytes",
+    )
+    .await;
     let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
@@ -2745,7 +3028,8 @@ async fn the_restore_button_needs_its_own_key_and_a_strangers_run_is_still_a_404
     )
     .await;
     assert_eq!(
-        refused.status, StatusCode::FORBIDDEN,
+        refused.status,
+        StatusCode::FORBIDDEN,
         "a platform where the schedule editor can overwrite content is one where the nightly \
          job and an operator's button are the same authority: body: {}",
         refused.body
@@ -2764,7 +3048,12 @@ async fn the_restore_button_needs_its_own_key_and_a_strangers_run_is_still_a_404
         ),
     )
     .await;
-    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "body: {}", anonymous.body);
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "body: {}",
+        anonymous.body
+    );
 
     // A stranger holding the restore key still gets a 404, because the run is not theirs.
     let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
@@ -2779,7 +3068,12 @@ async fn the_restore_button_needs_its_own_key_and_a_strangers_run_is_still_a_404
         ),
     )
     .await;
-    assert_eq!(stranger.status, StatusCode::NOT_FOUND, "body: {}", stranger.body);
+    assert_eq!(
+        stranger.status,
+        StatusCode::NOT_FOUND,
+        "body: {}",
+        stranger.body
+    );
     assert!(
         !stranger.message().to_lowercase().contains("organization"),
         "a 403 confirms the id exists; the message must not name the tenancy rule: {}",
@@ -2799,7 +3093,14 @@ async fn a_corrupt_archived_object_is_refused_and_the_live_store_keeps_its_own_b
     };
     let (token, csrf) = fixture.session(&fixture.operator_email).await;
     let site = create_site(fixture.db.pool(), fixture.org, "Corrupt Site").await;
-    let key = put_object(&fixture.state, fixture.db.pool(), site, "corrupt.png", b"the original bytes").await;
+    let key = put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "corrupt.png",
+        b"the original bytes",
+    )
+    .await;
 
     let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
     let run_id =
@@ -2811,7 +3112,14 @@ async fn a_corrupt_archived_object_is_refused_and_the_live_store_keeps_its_own_b
 
     // The live copy changes after the backup — this is the interesting half, because a
     // restore that wrote the corrupt archive over it would destroy a good object.
-    let current = put_object(&fixture.state, fixture.db.pool(), site, "corrupt.png", b"the live bytes").await;
+    let current = put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "corrupt.png",
+        b"the live bytes",
+    )
+    .await;
     assert_eq!(
         current, key,
         "the fixture writes the same key on purpose: the restore is about the same storage key"
@@ -2825,10 +3133,9 @@ async fn a_corrupt_archived_object_is_refused_and_the_live_store_keeps_its_own_b
     // never written.
     let index_relative = omnion_backup::index_key(&prefix);
     let index_path = fixture.artifact(&prefix, &index_relative);
-    let index: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&index_path).expect("the index must be readable"),
-    )
-    .expect("the index must be json");
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index_path).expect("the index must be readable"))
+            .expect("the index must be json");
     let archive_key = index["objects"][0]["archive_key"]
         .as_str()
         .expect("an archive key")
@@ -2837,8 +3144,9 @@ async fn a_corrupt_archived_object_is_refused_and_the_live_store_keeps_its_own_b
     std::fs::write(&object_path, b"trunc").expect("the object must be overwritable");
 
     let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
-    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await.body
-        ["confirm_phrase"]
+    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id)
+        .await
+        .body["confirm_phrase"]
         .as_str()
         .expect("a phrase")
         .to_owned();
@@ -2907,7 +3215,14 @@ async fn a_media_index_this_build_cannot_read_is_refused_not_treated_as_empty() 
     };
     let (token, csrf) = fixture.session(&fixture.operator_email).await;
     let site = create_site(fixture.db.pool(), fixture.org, "Index Site").await;
-    put_object(&fixture.state, fixture.db.pool(), site, "indexed.png", b"bytes").await;
+    put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "indexed.png",
+        b"bytes",
+    )
+    .await;
     let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
@@ -2940,7 +3255,8 @@ async fn a_media_index_this_build_cannot_read_is_refused_not_treated_as_empty() 
     let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
 
     // ---- Phase one: an edited index is not a restore point -------------------------------
-    let mut value: serde_json::Value = serde_json::from_slice(&original).expect("the index is json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&original).expect("the index is json");
     value["version"] = json!(99);
     let edited = serde_json::to_vec(&value).expect("json");
     std::fs::write(&index_path, &edited).expect("the index must be overwritable");
@@ -2980,7 +3296,11 @@ async fn a_media_index_this_build_cannot_read_is_refused_not_treated_as_empty() 
         next["_pad"] = json!("x".repeat(pad));
         padded = serde_json::to_vec(&next).expect("json");
     }
-    assert_eq!(padded.len(), target, "the rewrite must be length-preserving");
+    assert_eq!(
+        padded.len(),
+        target,
+        "the rewrite must be length-preserving"
+    );
     std::fs::write(&index_path, &padded).expect("the index must be overwritable");
 
     let preview = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await;
@@ -3011,10 +3331,14 @@ async fn a_media_index_this_build_cannot_read_is_refused_not_treated_as_empty() 
         &phrase,
     )
     .await;
-    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "body: {}", refused.body);
     assert_eq!(
-        refused.body["error"]["code"],
-        "media_index_unreadable",
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "body: {}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["error"]["code"], "media_index_unreadable",
         "body: {}",
         refused.body
     );
@@ -3073,12 +3397,7 @@ async fn a_schedule_is_stored_with_a_next_run_and_the_worker_takes_the_backup() 
         ),
     )
     .await;
-    assert_eq!(
-        created.status,
-        StatusCode::OK,
-        "body: {}",
-        created.body
-    );
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
     let id: Uuid = created.body["id"].as_str().unwrap().parse().unwrap();
     assert!(
         created.body["next_run_at"].is_string(),
@@ -3088,13 +3407,12 @@ async fn a_schedule_is_stored_with_a_next_run_and_the_worker_takes_the_backup() 
 
     // Read it back OUT OF POSTGRESQL, not from the response. A response can carry a computed
     // value that was never stored, and the worker reads the column.
-    let stored: Option<time::OffsetDateTime> = sqlx::query_scalar(
-        "select next_run_at from backup_schedules where id = $1",
-    )
-    .bind(id)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the schedule must read");
+    let stored: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("select next_run_at from backup_schedules where id = $1")
+            .bind(id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the schedule must read");
     assert!(
         stored.is_some(),
         "the column the worker reads was left null — the schedule would never fire"
@@ -3121,11 +3439,13 @@ async fn a_schedule_is_stored_with_a_next_run_and_the_worker_takes_the_backup() 
     // Backdate the column rather than waiting for 02:30: the walk has to be about the worker
     // finding a due schedule, and a walk that sleeps until half past two is a walk nobody
     // runs. This is the only time travel in the suite and it touches one column.
-    sqlx::query("update backup_schedules set next_run_at = now() - interval '1 second' where id = $1")
-        .bind(id)
-        .execute(fixture.db.pool())
-        .await
-        .expect("the schedule must be backdated");
+    sqlx::query(
+        "update backup_schedules set next_run_at = now() - interval '1 second' where id = $1",
+    )
+    .bind(id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the schedule must be backdated");
 
     let before = run_count(&fixture, fixture.org).await;
     let started = omnion_api::backup_schedule_runner::tick(&fixture.state)
@@ -3288,9 +3608,19 @@ async fn a_strangers_schedule_is_a_404_and_running_one_needs_the_take_a_backup_k
     let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
 
     for (label, method, uri, body) in [
-        ("update", Method::PUT, schedule_uri(id), json!({ "name": "hijacked", "frequency": "daily", "at_time": "04:00", "timezone": "UTC", "scopes": ["database"] })),
+        (
+            "update",
+            Method::PUT,
+            schedule_uri(id),
+            json!({ "name": "hijacked", "frequency": "daily", "at_time": "04:00", "timezone": "UTC", "scopes": ["database"] }),
+        ),
         ("delete", Method::DELETE, schedule_uri(id), json!({})),
-        ("run", Method::POST, format!("{}/run", schedule_uri(id)), json!({})),
+        (
+            "run",
+            Method::POST,
+            format!("{}/run", schedule_uri(id)),
+            json!({}),
+        ),
     ] {
         let answer = call(
             &fixture.state,
@@ -3398,12 +3728,17 @@ async fn cancel_restore(state: &AppState, token: &str, csrf: &str, job: Uuid) ->
 /// A response can carry a state the row is not in, and the whole feature is a claim about
 /// what the row says: the schema's check constraint refuses an `aborted` job that started, and
 /// that refusal is only meaningful against the stored value.
-async fn job_status(pool: &sqlx::PgPool, job: Uuid) -> (String, bool, Option<time::OffsetDateTime>) {
-    sqlx::query_as("select status, cancel_requested, started_at from backup_restore_jobs where id = $1")
-        .bind(job)
-        .fetch_one(pool)
-        .await
-        .expect("the job row must read")
+async fn job_status(
+    pool: &sqlx::PgPool,
+    job: Uuid,
+) -> (String, bool, Option<time::OffsetDateTime>) {
+    sqlx::query_as(
+        "select status, cancel_requested, started_at from backup_restore_jobs where id = $1",
+    )
+    .bind(job)
+    .fetch_one(pool)
+    .await
+    .expect("the job row must read")
 }
 
 /// A queued restore can be stopped before it writes anything, and the stop leaves the
@@ -3447,7 +3782,14 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
 
     // The live copy changes after the run, so a restore that half-happened would be visible.
-    put_object(&fixture.state, fixture.db.pool(), site, "queued.png", b"the live bytes").await;
+    put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "queued.png",
+        b"the live bytes",
+    )
+    .await;
 
     let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
     let preview = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await;
@@ -3461,15 +3803,40 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     // undeletable, protected row every time somebody fat-fingered a phrase would be its own
     // denial of service, and the refusal would still be correct.
     for (label, parts, confirmation, expected) in [
-        ("wrong phrase", vec!["media"], "RESTORE 00000000", "confirmation_mismatch"),
-        ("empty selection", vec![], phrase.as_str(), "nothing_selected"),
-        ("unknown part", vec!["media", "typo"], phrase.as_str(), "unknown_part"),
-        ("a part the run never produced", vec!["configuration"], phrase.as_str(), "part_not_in_run"),
+        (
+            "wrong phrase",
+            vec!["media"],
+            "RESTORE 00000000",
+            "confirmation_mismatch",
+        ),
+        (
+            "empty selection",
+            vec![],
+            phrase.as_str(),
+            "nothing_selected",
+        ),
+        (
+            "unknown part",
+            vec!["media", "typo"],
+            phrase.as_str(),
+            "unknown_part",
+        ),
+        (
+            "a part the run never produced",
+            vec!["configuration"],
+            phrase.as_str(),
+            "part_not_in_run",
+        ),
         // The fixture's run is a **media-only** one, so `database` is refused as "this run
         // does not offer it" — the run-check comes first, and it is the better answer: it
         // names what the run *can* offer. The deeper "that part is not restorable at all"
         // rule needs a run that really produced it, and the walk below builds one.
-        ("a part this run never produced", vec!["database"], phrase.as_str(), "part_not_in_run"),
+        (
+            "a part this run never produced",
+            vec!["database"],
+            phrase.as_str(),
+            "part_not_in_run",
+        ),
     ] {
         let answer = queue_restore(
             &fixture.state,
@@ -3501,8 +3868,9 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     let db_run = take_backup(&fixture.state, &token, &csrf, &["database"]).await;
     let db_run_id =
         Uuid::parse_str(db_run.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
-    let db_phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, db_run_id).await.body
-        ["confirm_phrase"]
+    let db_phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, db_run_id)
+        .await
+        .body["confirm_phrase"]
         .as_str()
         .expect("a phrase")
         .to_owned();
@@ -3535,13 +3903,12 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     // refused queue wrote a row", naming the wrong writer. The first version of this walk was
     // a statement about the whole platform's job table wearing the sentence about this
     // tenant's refusals; the sentence is only true of rows this walk could have written.
-    let queued_after_refusals: i64 = sqlx::query_scalar(
-        "select count(*) from backup_restore_jobs where organization_id = $1",
-    )
-    .bind(fixture.org)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the job table must read");
+    let queued_after_refusals: i64 =
+        sqlx::query_scalar("select count(*) from backup_restore_jobs where organization_id = $1")
+            .bind(fixture.org)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the job table must read");
     assert_eq!(
         queued_after_refusals, 0,
         "a refused queue wrote a row: the operator would see a restore that never happens"
@@ -3560,12 +3927,14 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     assert_eq!(queued.status, StatusCode::ACCEPTED, "body: {}", queued.body);
     let job_id = Uuid::parse_str(queued.body["id"].as_str().expect("a job id")).expect("a uuid");
     assert_eq!(
-        queued.body["status"], json!("queued"),
+        queued.body["status"],
+        json!("queued"),
         "body: {}",
         queued.body
     );
     assert_eq!(
-        queued.body["cancellable"], json!(true),
+        queued.body["cancellable"],
+        json!(true),
         "a queued job IS the cancellable window; body: {}",
         queued.body
     );
@@ -3594,8 +3963,7 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     // The agreed price is CARRIED, not recomputed: a job re-priced at execution time would
     // restore against today's library while the operator agreed to yesterday's number.
     assert_eq!(
-        queued.body["live_dropped"],
-        preview.body["total_live_dropped"],
+        queued.body["live_dropped"], preview.body["total_live_dropped"],
         "the queued job must carry the price the operator read"
     );
 
@@ -3623,23 +3991,23 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
 
     // --- 4. The cancel, and the counts that make it a real abort -----------------------------
     let runs_before = run_count(&fixture, fixture.org).await;
-    let media_before: i64 = sqlx::query_scalar(
-        "select count(*) from media where site_id = $1",
-    )
-    .bind(site)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the library must read");
+    let media_before: i64 = sqlx::query_scalar("select count(*) from media where site_id = $1")
+        .bind(site)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the library must read");
 
     let cancelled = cancel_restore(&fixture.state, &restorer_token, &restorer_csrf, job_id).await;
     assert_eq!(cancelled.status, StatusCode::OK, "body: {}", cancelled.body);
     assert_eq!(
-        cancelled.body["status"], json!("aborted"),
+        cancelled.body["status"],
+        json!("aborted"),
         "an operator who pressed stop must be told it stopped: {}",
         cancelled.body
     );
     assert_eq!(
-        cancelled.body["cancellable"], json!(false),
+        cancelled.body["cancellable"],
+        json!(false),
         "a finished job must not offer another stop"
     );
 
@@ -3647,7 +4015,10 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     // refuses an `aborted` job that started, and that refusal is the feature: an abort is a
     // statement that nothing was written.
     let (status, cancel_requested, started_at) = job_status(fixture.db.pool(), job_id).await;
-    assert_eq!(status, "aborted", "the stored status is the claim being made");
+    assert_eq!(
+        status, "aborted",
+        "the stored status is the claim being made"
+    );
     assert!(
         started_at.is_none(),
         "an aborted restore must never have started: {started_at:?}"
@@ -3678,12 +4049,11 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
 
     // The audit entry exists, naming the job — a restore that was authorised and then stopped
     // is exactly the event an operator needs to find a month later.
-    let audited: i64 = sqlx::query_scalar(
-        "select count(*) from audit_log where action = 'backup.restore.queued'",
-    )
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("the audit log must read");
+    let audited: i64 =
+        sqlx::query_scalar("select count(*) from audit_log where action = 'backup.restore.queued'")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the audit log must read");
     assert!(audited >= 1, "queueing a restore left no audit entry");
 
     // --- 5. Cancelling it twice, and cancelling a stranger's job --------------------------------
@@ -3697,7 +4067,8 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
     assert_eq!(twice.body["error"]["code"], "restore_not_cancellable");
 
     let (stranger_token, stranger_csrf) = fixture.session(&fixture.stranger_email).await;
-    let stranger_cancel = cancel_restore(&fixture.state, &stranger_token, &stranger_csrf, job_id).await;
+    let stranger_cancel =
+        cancel_restore(&fixture.state, &stranger_token, &stranger_csrf, job_id).await;
     assert_eq!(
         stranger_cancel.status,
         StatusCode::NOT_FOUND,
@@ -3764,7 +4135,10 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
         listed.body
     );
     assert_eq!(listed.body[0]["status"], json!("aborted"));
-    assert!(listed.body[0]["error"].is_string(), "the reason must be readable");
+    assert!(
+        listed.body[0]["error"].is_string(),
+        "the reason must be readable"
+    );
 
     // An operator holding read/create/manage but NOT `backup.restore` may **list** the jobs
     // and may not **stop** one. The separation has to be provable, and the account that
@@ -3829,11 +4203,19 @@ async fn the_worker_restores_a_queued_job_and_skips_one_that_was_cancelled() {
     let created = take_backup(&fixture.state, &token, &csrf, &["media"]).await;
     let run_id =
         Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("a uuid");
-    put_object(&fixture.state, fixture.db.pool(), site, "worker.png", b"worker live bytes").await;
+    put_object(
+        &fixture.state,
+        fixture.db.pool(),
+        site,
+        "worker.png",
+        b"worker live bytes",
+    )
+    .await;
 
     let (restorer_token, restorer_csrf) = fixture.session(&fixture.restorer_email).await;
-    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id).await.body
-        ["confirm_phrase"]
+    let phrase = preview_of(&fixture.state, &restorer_token, &restorer_csrf, run_id)
+        .await
+        .body["confirm_phrase"]
         .as_str()
         .expect("a phrase")
         .to_owned();
@@ -3852,13 +4234,11 @@ async fn the_worker_restores_a_queued_job_and_skips_one_that_was_cancelled() {
     // The row is cancelled WITHOUT going through the route, so the job is `queued` **and**
     // flagged — the exact state a cancel that lost the race to the worker leaves behind, and
     // the one the worker's own flag check exists for.
-    sqlx::query(
-        "update backup_restore_jobs set cancel_requested = true where id = $1",
-    )
-    .bind(doomed_id)
-    .execute(fixture.db.pool())
-    .await
-    .expect("the flag must be settable");
+    sqlx::query("update backup_restore_jobs set cancel_requested = true where id = $1")
+        .bind(doomed_id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the flag must be settable");
 
     let runs_before = run_count(&fixture, fixture.org).await;
     let tick = omnion_api::restore_job_runner::tick(&fixture.state)
@@ -3927,14 +4307,20 @@ async fn the_worker_restores_a_queued_job_and_skips_one_that_was_cancelled() {
     .fetch_one(fixture.db.pool())
     .await
     .expect("the job must read");
-    assert_eq!(objects, 1, "one object was archived and one must be restored");
+    assert_eq!(
+        objects, 1,
+        "one object was archived and one must be restored"
+    );
     let safety = safety.expect("a succeeded restore must name the run to go back to");
     let protected: bool = sqlx::query_scalar("select protected from backups where id = $1")
         .bind(safety)
         .fetch_one(fixture.db.pool())
         .await
         .expect("the safety run must exist");
-    assert!(protected, "the safety run of a queued restore must be protected like any other");
+    assert!(
+        protected,
+        "the safety run of a queued restore must be protected like any other"
+    );
 
     // --- 3. A job nothing claims is stopped rather than left to spin ------------------------
     // The panel draws a queued job as a spinner for ever. A worker that crashed and restarted
@@ -4119,7 +4505,13 @@ async fn backup_check(state: &AppState, email: &str, fixture: &Fixture) -> (Stri
     let (token, csrf) = fixture.session(email).await;
     let response = call(
         state,
-        request(Method::GET, "/api/v1/security/overview", Some(&token), Some(&csrf), None),
+        request(
+            Method::GET,
+            "/api/v1/security/overview",
+            Some(&token),
+            Some(&csrf),
+            None,
+        ),
     )
     .await;
     assert_eq!(
@@ -4153,8 +4545,8 @@ async fn age_a_run_back(pool: &sqlx::PgPool, id: Uuid, hours: i64) {
     .bind(id)
     .bind(hours as i32)
     .execute(pool)
-        .await
-        .expect("the run must be aged");
+    .await
+    .expect("the run must be aged");
 }
 
 /// REQ-013's status-card criterion, proved from the other end.
@@ -4193,7 +4585,10 @@ async fn the_security_posture_check_sees_a_real_backup_and_only_this_tenants() {
         "an installation with no backup must fail the check, and say so: {detail}"
     );
     assert!(
-        detail["summary"].as_str().unwrap_or_default().contains("ever"),
+        detail["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ever"),
         "the no-backup verdict must name the absence, not the age of nothing: {detail}"
     );
 
@@ -4208,7 +4603,12 @@ async fn the_security_posture_check_sees_a_real_backup_and_only_this_tenants() {
         &["database", "configuration"],
     )
     .await;
-    assert_eq!(stranger_run.status, StatusCode::CREATED, "body: {}", stranger_run.body);
+    assert_eq!(
+        stranger_run.status,
+        StatusCode::CREATED,
+        "body: {}",
+        stranger_run.body
+    );
     let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
     assert_eq!(
         verdict, "fail",
@@ -4216,8 +4616,19 @@ async fn the_security_posture_check_sees_a_real_backup_and_only_this_tenants() {
     );
 
     // This tenant takes one. The row has to move, and it has to move for the *stated* reason.
-    let created = take_backup(&fixture.state, &token, &csrf, &["database", "configuration"]).await;
-    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let created = take_backup(
+        &fixture.state,
+        &token,
+        &csrf,
+        &["database", "configuration"],
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "body: {}",
+        created.body
+    );
     let id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
     let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
     assert_eq!(
