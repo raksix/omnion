@@ -1619,12 +1619,23 @@ pub fn router(state: AppState) -> Router {
         .route("/accounting/payments", post(accounting_payments::record_payment))
         .route_layer(guards::require(&state, "accounting.payments.record"));
 
-    let accounting_payments_reverse = Router::new()
-        .route(
-            "/accounting/payments/{id}/reverse",
-            post(accounting_payments::reverse_payment),
-        )
-        .route_layer(guards::require(&state, "accounting.payments.reverse"));
+    // **No `.reverse` route layer, and the absence is deliberate.** Every other payment route is
+    // guarded by a layer, which reads as the safe default — and it is, for the routes whose
+    // refusal says nothing about a specific row. This one is different: the path carries an id, and
+    // a layer answers `403 permission_denied` *before* the handler can ask whether that id is in
+    // the caller's organization. A 403 on a named id confirms the row exists somewhere, which is
+    // the one thing a tenant boundary must never leak — the walk
+    // `another_organizations_payment_is_404_and_never_403` exists for exactly this. The handler
+    // therefore does it in the right order: read the row (404 for another tenant), *then* check
+    // the key. A 403 that survives is always about a payment the caller can already see.
+    //
+    // The layer's other job — refusing an anonymous caller — is unchanged: `CurrentSession` in the
+    // handler extractor still answers 401 before any of this runs, and
+    // `every_payment_route_refuses_an_anonymous_caller` proves it.
+    let accounting_payments_reverse = Router::new().route(
+        "/accounting/payments/{id}/reverse",
+        post(accounting_payments::reverse_payment),
+    );
 
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed

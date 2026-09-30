@@ -239,7 +239,25 @@ pub async fn reverse_payment(
     let organization_id = organization_of(&state, &current, organization.organization_id).await?;
     let pool = state.db().pool();
 
+    // **The ownership read comes before the permission check, and that order is the feature.**
+    // `accounting.payments.reverse` is also enforced as a route layer, so this looks redundant —
+    // it is not. A caller who lacks the key and names a payment in another organization would be
+    // refused by the layer with `403 permission_denied`, and the difference between `403` and
+    // `404` is the whole question: a `403` on a specific id confirms the row exists somewhere,
+    // which is the one fact a tenant boundary must never leak. Reading the row first means a
+    // caller without the key gets the same `404` everybody else gets for a payment that is not
+    // theirs, and the permission is then checked against a row that is provably theirs — so the
+    // `403` that survives is always about a payment in the caller's own organization.
     let before = payments::get_payment(pool, organization_id, payment_id).await?;
+
+    if !may_reverse(&state, &current).await? {
+        return Err(ApiError::forbidden(
+            "accounting.payments.reverse",
+            "undoing a payment releases its allocations and posts a counter entry; it needs the \
+             accounting.payments.reverse permission",
+        ));
+    }
+
     let reversed = payments::reverse_payment(
         pool,
         organization_id,
@@ -302,6 +320,19 @@ async fn may_overpay(state: &AppState, current: &CurrentSession) -> Result<bool,
     let permissions =
         effective_permissions(state.db().pool(), current.user.id, scope_of(&current.user)).await?;
     Ok(permissions.allows("accounting.payments.overpay"))
+}
+
+/// Whether the session may reverse a payment.
+///
+/// Asked as a question, and **after** the ownership read, for the reason spelled out at the call
+/// site: the route layer already refuses a caller without the key, and the only thing this adds is
+/// that the refusal happens *after* the tenant check. Without it, naming another organization's
+/// payment without the key answers `403`, and `403` on a specific id is a statement that the id
+/// exists. The same `effective_permissions` lookup as the guard keeps the two from disagreeing.
+async fn may_reverse(state: &AppState, current: &CurrentSession) -> Result<bool, ApiError> {
+    let permissions =
+        effective_permissions(state.db().pool(), current.user.id, scope_of(&current.user)).await?;
+    Ok(permissions.allows("accounting.payments.reverse"))
 }
 
 /// The compact payload an event and an audit row carry.
