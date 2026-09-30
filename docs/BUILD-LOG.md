@@ -8967,3 +8967,63 @@ shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for t
 which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
+
+## 2026-09-30 — QA harness: a pass that cannot be believed must not be able to look like one that can (`e8d26476`)
+
+fix(qa): the null pass gets the exit code it should have had
+
+The tick-46 pass walked all six CRM screens, reported `165 findings (high 160)` and exited 0. It
+was a null. `/mnt/apopic` was at 100%, so every one of its 47 captures failed on ENOSPC; the same
+full disk had taken Postgres out, so the API answered a real `503 "database is unavailable"` on
+every read. Four ticks went into diagnosing passes that could not be diagnosed, and the tick-46
+entry was careful — it called the number a null, named the cause, ticked nothing — but only after
+a reader had to work out that "160 high" meant nothing at all. The harness should have said so.
+
+**Three defects, one root cause: the pass had no way to say "I proved nothing".**
+
+`shot()` swallowed the failure. It logged one line and carried on, so a screen that was never
+photographed was indistinguishable from one that was and looked clean — and the interactor's
+`interact: 0 elements` was the *consequence*, not the bug. Failures are counted now
+(`counts.shotFailures`), carried in `summary.json`, and stated **above** the findings in both the
+walkthrough's own `report.md` and the roll-up `QA-LATEST-w4.md`. The number that decides whether
+the other number can be believed has to sit next to it; a verdict-shaped number under a footnote
+is how a null reads as careful triage.
+
+A dead backend was filed as a product defect. `probeApiLiveness()` asks `/readyz` **first**,
+because an API whose process is alive but whose database is gone answers `/healthz` 200 and
+`/readyz` 503 — precisely the state the pass was in, and precisely what an "is something
+listening" probe calls healthy. It is asked directly rather than inferred from the failure pile,
+because the pile is the symptom being classified and cannot be its own evidence. The answer
+raises one `qa-stack-down` finding naming the cause, and reads matching the server's own wording
+(`database is unavailable`) are downgraded to `low stack-failure` in **both** the network and the
+console arm — leaving them disagreeing with each other was the other half of the 26.
+
+The verdict was never the exit code. `passIsVoid()` withholds it: no evidence, no
+evidence-producing interactions, or no stack exits **4** after writing everything it saw.
+`run.sh` keeps the artifacts, rolls the summary up and re-exits non-zero, so the record of a
+broken pass survives while the command still fails. `set -e` is what would otherwise have eaten
+all three — which is exactly how the tick-46 null reached a BUILD-LOG in the first place.
+
+**The probe found two real defects in the change that introduced it.** `void-pass-classifier-probe.sh`
+extracts `passIsVoid` out of the walkthrough with `sed` and calls it, rather than re-typing the
+rule: a copy of a rule is a second rule, and both existing checkers in this directory had gone
+green against a correct predicate while the thing they checked stayed broken. `.length` on a
+number is `undefined`, so a roll-up *count* of `47` read as "no evidence" and voided every
+well-formed pass; the same mistake on `shotFailures` read a count of `3` as zero and voided
+nothing. Both are the same bug in two places and one measurement now serves both shapes. **12/12.**
+
+**Also this tick.** Merged `origin/main` (10 commits): `app-shell.tsx` icon union, the mobile
+route list (CRM entries + main's `/health`), and the append-only `BUILD-LOG.md` through
+`scripts/qa/merge-build-log.py` — `base=5297 ours=8850 theirs=5416 merged=8969`, **0 entries lost**
+on both sides. Reclaimed my own cold `target/` on the 97%-full mount after checking `/proc/*/cwd`
+for a live holder: **1.9 GB**, 97% → 94%.
+
+**Proof.** `bash scripts/qa/void-pass-classifier-probe.sh` → **12/12**, `node --check walkthrough.cjs`
+OK, `bash -n run.sh` OK, `turbo run typecheck` **2/2** (4m32s, 1 cached). The walk itself has NOT
+run: the QA slot is held by a sibling writer's live pass (`/proc/1896211/cwd` = `omnion-w6`, holder
+pid dead-or-waiter), and burning the tick waiting for it is the trap this writer hit four times.
+
+**Next.** Run the CRM pass alone on this stack and read the 390×844 and keyboard boxes off
+`summary.json` — the legs run, which has been true since tick 46 and is still unproven. No box is
+ticked by this commit, and `runCrmKeyboardAndMobile` is the one that matters: it is the pass whose
+exit code is now honest enough to be believed.
