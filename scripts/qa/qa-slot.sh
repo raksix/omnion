@@ -66,8 +66,16 @@ reap() {
 }
 reap
 
+# A holder can die WHILE the queue is waiting, and the reaper above already ran before
+# the loop started. So a place whose owner crashed mid-pass was never reclaimed: every
+# later waiter counted it, printed "waiting for a QA slot" and sat until its own
+# deadline — on this box twenty-two waiters behind one dead holder, each holding a
+# loop's tick open for the full hour. Reaping once more per poll makes the queue a
+# function of who is ALIVE rather than of who was alive when the waiter started, and
+# it costs one `kill -0` per place per fifteen seconds.
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
