@@ -9251,6 +9251,41 @@ on the probe.
 
 **Next.** Run the CRM-focused pass (`QA_ONLY=crm`) on the private stack and read the mobile and
 keyboard legs off it. The box stays unticked until the walk says so — the probe is not the walk.
+
+### The disk guard ate the build that would have proved the box (tick 49)
+
+The CRM-focused pass started, took the QA slot, reset its own database and began a cold build of
+`omnion-api` — twenty minutes of work — and then died on four errors that all read the same way:
+
+```
+error: could not write output to …/target/debug/deps/regex_syntax-….rcgu.o: No such file or directory
+error: could not write output to …/target/debug/deps/thiserror_impl-….rcgu.o: No such file or directory
+error: could not write output to …/target/debug/deps/regex_automata-….rcgu.o: No such file or directory
+```
+
+`/mnt/apopic` had **3.8 GB free**, so this is not the ENOSPC it looks like. `ls target` afterwards
+returned `No such file or directory` — the directory itself was gone, mid-build, on a path cargo
+had been writing to for twenty minutes. The cause is the box's own disk guard
+(`scripts/qa/disk-guard.sh`), which reclaims the fattest worktree `target/` once free space drops
+below its floor, and a plain `cargo build` in a worktree writes to the **default** `<cwd>/target`
+that the guard watches. The guard's own header documents this exact failure text as the reason it
+checks whether a compiler is writing into a target before touching it — and the check still lost
+the race, because the build had *chosen* that target eleven seconds before the guard looked.
+
+**The fix is the one every sibling on this box is already using.** Three worktrees build into
+`/dev/shm/<stack>-target` (tmpfs, 31 GB free, invisible to the disk guard); this pass now sets
+`CARGO_TARGET_DIR=/dev/shm/w4-target` and `CARGO_INCREMENTAL=0`, which is also the cheapest key
+when a build is running under memory pressure. `run.sh` reads the API binary's path out of
+`CARGO_TARGET_DIR` and inherits the same variable, so the binary the pass starts is the binary the
+pass just built — that part was already right, and this is what it is right *for*.
+
+**Cost of the lesson:** the tick paid a twenty-minute build twice. The general rule: **a pass that
+takes twenty minutes to compile should not be started until you have read `df`, `ls target` and
+the guard's threshold** — or, better, should start its build into tmpfs where the guard cannot
+reach it.
+
+**Next.** Re-run the same CRM-focused pass against `/dev/shm/w4-target` and read the mobile and
+keyboard legs off `summary.json` when it lands.
 ## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
 
 feat(health): the service detail page draws a 24 h trend. fix(health): the health
