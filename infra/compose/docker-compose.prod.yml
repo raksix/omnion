@@ -1,0 +1,283 @@
+# Omnion — small-company production stack (REQ-128, slice 1).
+#
+#   cp infra/compose/.env.example .env   # then edit it; the file ships with NO values
+#   docker compose -f infra/compose/docker-compose.prod.yml up -d
+#
+# This is the whole platform on one host: api, admin, web, PostgreSQL, Redis and S3-compatible
+# object storage. The enterprise topology (external services, worker replicas) is
+# `docker-compose.enterprise.yml`; the development stack stays `docker-compose.dev.yml`.
+#
+# **Migrations run before the API, not at its boot.** `db.migrate()` on API boot is convenient in
+# development and wrong in production: with two API replicas rolling, the one that wins the
+# migration race serves traffic against a schema the other replica is still moving. So the `migrate`
+# service is a one-shot job with its own image, `api` carries `depends_on: migrate: condition:
+# service_completed_successfully`, and the API container's boot path is unchanged. A failed
+# migration therefore stops the rollout instead of half-applying under live traffic.
+#
+# **No secret ever appears in this file.** Every credential is `${VAR:?set VAR in .env}` — the
+# `:?` form makes compose REFUSE TO START with a named error rather than substituting an empty
+# string, which is the difference between a loud failure and a database with an empty password.
+name: omnion
+
+x-restart: &restart
+  restart: unless-stopped
+
+# The anchor holds the logging VALUE, not a map containing one: `logging: *logging` has to
+# expand to the driver/options pair directly. Anchoring `logging:\n  driver: …` and then
+# merging it as a value produces `logging: {logging: {…}}`, which the compose schema refuses —
+# the same class of mistake as an anchor defined after its first use.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# -----------------------------------------------------------------------------------------------
+# Shared environment for the API and the migration job.
+#
+# Anchored rather than repeated, because the failure this prevents is silent: an API that boots
+# with a different `OMNION_DATABASE_URL` than the job that migrated the schema points at a
+# database the operator never prepared, and the error names a connection, not a mismatch.
+# -----------------------------------------------------------------------------------------------
+x-api-env: &api-env
+  OMNION_ENV: production
+  OMNION_HOST: 0.0.0.0
+  OMNION_PORT: "8080"
+  OMNION_DATABASE_URL: postgres://${OMNION_DB_USER}:${OMNION_DB_PASSWORD}@postgres:5432/${OMNION_DB_NAME:-omnion}
+  OMNION_DB_MAX_CONNECTIONS: "${OMNION_DB_MAX_CONNECTIONS:-20}"
+  OMNION_REDIS_URL: redis://redis:6379
+  OMNION_S3_ENDPOINT: http://minio:9000
+  OMNION_S3_ACCESS_KEY: ${OMNION_S3_ACCESS_KEY}
+  OMNION_S3_SECRET_KEY: ${OMNION_S3_SECRET_KEY}
+  OMNION_S3_BUCKET: ${OMNION_S3_BUCKET:-omnion-media}
+  OMNION_S3_REGION: ${OMNION_S3_REGION:-us-east-1}
+  OMNION_STORAGE_DRIVER: s3
+  # The public origin, used for absolute links in e-mail and OAuth callbacks.
+  OMNION_PUBLIC_URL: ${OMNION_PUBLIC_URL:?set OMNION_PUBLIC_URL in .env}
+  # Structured JSON logs (REQ-126): production default is JSON, the human-readable form is
+  # development-only and would be unreadable in a log aggregator.
+  OMNION_LOG_FORMAT: json
+  OMNION_LOG: info
+  # The CSRF secret and the first administrator's password are secrets, so they are `?:` required
+  # rather than given development defaults. An instance that boots with the development CSRF
+  # secret accepts a forged cross-site request from any origin.
+  OMNION_CSRF_SECRET: ${OMNION_CSRF_SECRET:?set OMNION_CSRF_SECRET in .env}
+  OMNION_ADMIN_EMAIL: ${OMNION_ADMIN_EMAIL:?set OMNION_ADMIN_EMAIL in .env}
+  OMNION_ADMIN_PASSWORD: ${OMNION_ADMIN_PASSWORD:?set OMNION_ADMIN_PASSWORD in .env}
+  # The drain deadline, which must fit inside `stop_grace_period` with room for the flush.
+  OMNION_DRAIN_TIMEOUT_MS: "${OMNION_DRAIN_TIMEOUT_MS:-10000}"
+
+networks:
+  omnion:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+
+services:
+  # -------------------------------------------------------------------------------------------
+  # Migrations — one-shot, must succeed before the API is allowed to start
+  # -------------------------------------------------------------------------------------------
+  migrate:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/api:${OMNION_VERSION:-0.1.0}
+    # The same image and the same binary as `api`, with a flag that applies the embedded
+    # migrations and exits. The two cannot drift because they are one build, and a migration
+    # failure exits non-zero, which makes `service_completed_successfully` fail and keeps the
+    # API down.
+    command: ["--migrate-only"]
+    environment:
+      <<: *api-env
+      # A migration is a write-heavy one-shot: it gets its own connection budget rather than
+      # competing with live traffic for the pool the API is about to open.
+      OMNION_DB_MAX_CONNECTIONS: "4"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [omnion]
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  # -------------------------------------------------------------------------------------------
+  # API
+  # -------------------------------------------------------------------------------------------
+  api:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/api:${OMNION_VERSION:-0.1.0}
+    environment:
+      <<: *api-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${OMNION_API_PORT:-8080}:8080"
+    networks: [omnion]
+    # A read-only root filesystem is the default, not an aspiration. `/tmp` is the one writable
+    # path, and it is a tmpfs so a restart starts from a clean slate.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    # SIGTERM → the drain sequence REQ-126's lifecycle contract defines: readiness flips to 503
+    # first, in-flight requests finish, telemetry flushes, exit 0. The grace period is the drain
+    # timeout plus room for the flush, and it is set HERE rather than as a comment because the
+    # number that is right for this host is not the number that is right for a Kubernetes pod.
+    stop_grace_period: ${OMNION_STOP_GRACE_PERIOD:-30s}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/omnion-api", "--healthcheck"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "${OMNION_API_CPUS:-2.0}"
+          memory: ${OMNION_API_MEMORY:-1g}
+    logging: *logging
+
+  # -------------------------------------------------------------------------------------------
+  # Admin panel and public renderer
+  # -------------------------------------------------------------------------------------------
+  admin:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/admin:${OMNION_VERSION:-0.1.0}
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      # Baked into the build's rewrites table, so this value is a BUILD argument in the image
+      # and only a routing hint here. The panel talks to the API over the compose network; the
+      # edge routes `/api/*` at the public host.
+      OMNION_API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${OMNION_ADMIN_PORT:-3000}:3000"
+    networks: [omnion]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "${OMNION_ADMIN_CPUS:-1.0}"
+          memory: ${OMNION_ADMIN_MEMORY:-768m}
+    logging: *logging
+
+  web:
+    <<: *restart
+    image: ${OMNION_IMAGE_REPO:-ghcr.io/raksix/omnion}/web:${OMNION_VERSION:-0.1.0}
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      OMNION_API_URL: http://api:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${OMNION_WEB_PORT:-3001}:3000"
+    networks: [omnion]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "${OMNION_WEB_CPUS:-1.0}"
+          memory: ${OMNION_WEB_MEMORY:-768m}
+    logging: *logging
+
+  # -------------------------------------------------------------------------------------------
+  # Datastores
+  # -------------------------------------------------------------------------------------------
+  postgres:
+    <<: *restart
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${OMNION_DB_USER:?set OMNION_DB_USER in .env}
+      POSTGRES_PASSWORD: ${OMNION_DB_PASSWORD:?set OMNION_DB_PASSWORD in .env}
+      POSTGRES_DB: ${OMNION_DB_NAME:-omnion}
+      # Checksums and an explicit collation order: a database that silently uses whatever the
+      # host's locale happens to be produces an index that is only fast on the machine that
+      # created it.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [omnion]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${OMNION_DB_USER} -d ${OMNION_DB_NAME:-omnion}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Not published to the host. The API reaches it over the compose network; an operator who
+    # wants psql gets it through `docker compose exec postgres psql`, and a database port on a
+    # public interface is a database port on the internet.
+    expose:
+      - "5432"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    logging: *logging
+
+  redis:
+    <<: *restart
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    networks: [omnion]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    expose:
+      - "6379"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+    logging: *logging
+
+  minio:
+    <<: *restart
+    image: pgsty/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${OMNION_S3_ACCESS_KEY:?set OMNION_S3_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${OMNION_S3_SECRET_KEY:?set OMNION_S3_SECRET_KEY in .env}
+    volumes:
+      - minio-data:/data
+    networks: [omnion]
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    expose:
+      - "9000"
+      - "9001"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+    logging: *logging
