@@ -4539,3 +4539,100 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
+
+## Tick 71 — REQ-013 slice 3: the schedule that could never fire
+
+**What.** `backup_schedules` shipped in slice 1 with a `next_run_at` column, and
+`next_due_schedules` shipped with it. Nothing wrote the column. Nothing called the query. A
+schedule could be created, listed, and rendered with a cadence sentence — "Every day at 02:00" —
+beside an empty next-run cell, for ever. It is the uncalled `prune_candidates` defect one
+table over, and the shape deserves a name: **a table with a column, a query that reads it, and
+no writer is a feature that looks complete in every screenshot and does nothing.**
+
+Three pieces closed it.
+
+**1. `crates/backup/src/cadence.rs` — `Cadence::next_after`, pure, 18 unit tests.**
+
+The wall clock is local and the stored instant is UTC. Istanbul 02:00 is `23:00Z` the day
+before; New York 02:00 is `07:00Z` the same day. The next run is strictly *after* now, so a
+schedule created at 02:00:30 with a time of day of 02:00 does not answer a moment in the past
+and get claimed on every tick. An unknown zone is refused by name, not defaulted to UTC.
+
+**2. Daylight saving, decided by round-tripping rather than by asking the zone table.**
+`get_offset_local` answers `Some` for `02:30` on a spring-forward morning — a reading that
+never happened — and never answers `Ambiguous` for the hour that happens twice in autumn.
+Both were found by three zone tests failing against a version that trusted it. So each
+candidate offset is proposed and re-checked: an offset that survives its own trip back to the
+wall clock is real. A gap moves the run forward by the gap; a fold runs **once, at the
+earlier** of its two readings, because running on both gives two runs an hour apart for one
+instruction and `retention_count` would hold two of the same backup.
+
+**3. `apps/api/src/backup_schedule_runner.rs` + four write routes + the panel.** Polls every
+minute — the sweep's six hours comes from the feature (retention is measured in days) while a
+schedule's is measured in minutes. The worker calls the same `produce_all` the create route
+calls. The key split is the interesting half: editing is `backup.manage`, **"run now" is
+`backup.create`** — it produces a backup and changes nothing else, so an operator who may take
+a backup must be able to test that their schedule works. A manual run does not advance
+`next_run_at`: testing a 03:00 schedule at 09:00 must not consume tomorrow's slot.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **150/0** (was 132: +18 cadence) |
+| `omnion-core --lib` | **39/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `cargo build -p omnion-api` | Finished, 0 errors |
+| `scripts/qa/walkthrough.cjs` | `node --check` OK |
+| QA browser pass | **deferred** — see below |
+
+**Three of my own bugs, all the shortcut that reads well and does not run.**
+
+*Hourly truncated after adding instead of before.* `(after + 1h).replace_minute(0)` takes
+15:30 to 16:30 and truncates that back to 16:00 — right by coincidence — but I had written a
+test asserting 14:59:30 lands on **16:00**, which it must not. Truncating first is correct by
+construction; the test was wrong and the fix is in both.
+
+*Two DST expectations written from memory, and both were wrong while the code was right.*
+London's clocks move at **01:00 UTC**, so the reading that does not exist in spring is
+01:00–01:59 *local*, not 02:30 as I had it. I then "fixed" the test to 01:30 and the spring
+case still disagreed by an hour, because after the transition London is **on BST for the
+quarter** — 01:30 local on 30 March is 00:30 UTC, not 01:30 UTC. The resolution was to stop
+reasoning from memory and print the table: London's 2026 transitions are 29 March and
+25 October, and New York's are 8 March and 1 November. A DST test written from a
+half-remembered rule is a test of the author's memory, and it fails for the wrong reason,
+which is the worst kind of red.
+
+*`to_offset` is not the conversion.* `OffsetDateTime::new_utc(date, 02:00).to_offset(+03:00)`
+is `02:00+03:00` — the **same instant** as `02:00Z`. A scheduler that does this stores 02:00 UTC
+and runs every backup nine hours late, while every test that only checks "the hour field is
+02:00" passes. The instant is moved by *subtracting* the offset. The three zone tests exist
+because that was the first version.
+
+**`time-tz` turned out to be the wrong tool for the question, and that is the finding.** Its
+`OffsetResult` has an `Ambiguous` arm and a `None` arm for exactly these two cases, and it
+returns `Some` for both. Round-tripping the candidates is more code than calling the API and
+is the version that is actually right. Worth remembering before reaching for a library's
+convenience arm.
+
+**Toolchain.** A sibling deleted the shared `target/` mid-build and the api build died with
+`failed to move dependency graph ... No such file or directory (os error 2)` — the sibling
+signature, not a disk-full error; the two look identical in the log and are not.
+`CARGO_TARGET_DIR=/dev/shm/omnion-build-target` plus `CARGO_INCREMENTAL=0` makes the build
+immune. `cargo fmt -p omnion-backup` rewrote **seven** files I had not touched this time
+(78 lines in `apply.rs` alone); reverted on exactly the foreign seven with `git checkout --`,
+and `lib.rs` re-derived from `git show HEAD:` so the reordering did not ride along.
+`time::macros::format_description!` is the only way to get a const format — the older
+`format_description::parse` returns a `Result` and does not satisfy `Parsable`.
+
+**QA pass: deferred, and reported as deferred.** The single slot is held by a live sibling
+(pid 3355724) and the box is at load 26 with three other stacks compiling `omnion-api`
+simultaneously. `runBackupSchedules` is written and committed, and its load-bearing assertion
+is aimed straight at this tick's defect — the next-run **cell** must carry a real date and the
+zone, not a dash. A deferred pass with nothing written would be a screen nobody has looked
+at; a pass that barges into a live sibling's slot steals rather than fixes.
+
+**Next.** (a) The browser pass, when the slot is free. (b) The four-frequency form needs a
+walkthrough leg for each — the panel branches the conditional fields and only the shape
+assertions are written. (c) Slice 2c, the queued/abortable worker, is still the honest home
+for a real abort: a cancel that cannot undo a half-written library is a dead control.
