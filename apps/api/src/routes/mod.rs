@@ -75,6 +75,7 @@ pub mod ai_agent_workspace;
 pub mod ai_decisions;
 pub mod ai_routing;
 pub mod ai_skills;
+pub mod ai_tools;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
@@ -895,6 +896,30 @@ pub fn router(state: AppState) -> Router {
     let ai_agent_skill =
         axum::routing::delete(ai_skills::detach_skill_route)
             .layer(guards::require(&state, "ai.skills.manage"));
+    // The tool registry (REQ-100 slice 1). Read and write are separate keys because they are
+    // separate acts: *seeing* the registry is knowing which actions the installation's AI can
+    // take, and *changing* it is changing what a model will be allowed to do. Collapsing them
+    // would give every reader of a schema the power to un-gate `deployment.deploy`.
+    let ai_tools =
+        get(ai_tools::list_tools_route).layer(guards::require(&state, "ai.tools.read"));
+    // `/ai/tools/classes` is a STATIC table, not a parameterised path, and axum panics at router
+    // construction when two routes on one prefix disagree about arity — the failure surfaces as
+    // "the API did not answer" with `Overlapping method route` naming a line in a 1700-line
+    // file. A distinct prefix is the shape that cannot collide, and it is also honest: the class
+    // list is not a tool.
+    let ai_tool_classes =
+        get(ai_tools::tool_classes_route).layer(guards::require(&state, "ai.tools.read"));
+    let ai_tool = get(ai_tools::get_tool_route)
+        .layer(guards::require(&state, "ai.tools.read"))
+        .merge(
+            axum::routing::patch(ai_tools::patch_tool_route)
+                .layer(guards::require(&state, "ai.tools.manage")),
+        );
+    // The usage chart is a read of the same call log the detail screen lists, so it stays
+    // `ai.tools.read` — a separate key would be a permission an operator has to remember for a
+    // sum of columns they could add up themselves.
+    let ai_tool_usage =
+        get(ai_tools::tool_usage_route).layer(guards::require(&state, "ai.tools.read"));
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
@@ -1662,6 +1687,14 @@ pub fn router(state: AppState) -> Router {
         // Registered before `/ai/agents/{id}/skills/{key}` for the same reason the other AI
         // routes are: a literal segment outranks a capture, so this keeps its own path.
         .route("/ai/skills/{key}/validate", ai_skill_validate)
+        // The tool registry (REQ-100 slice 1). `/ai/tools/classes` is registered BEFORE
+        // `/ai/tools/{key}` for the same reason the skills routes are: axum prefers a literal
+        // segment over a capture, so the static path keeps its own handler instead of being
+        // read as a tool whose key is "classes".
+        .route("/ai/tools/classes", ai_tool_classes)
+        .route("/ai/tools/{key}/usage", ai_tool_usage)
+        .route("/ai/tools", ai_tools)
+        .route("/ai/tools/{key}", ai_tool)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)
         .route("/ai/runs", ai_runs)

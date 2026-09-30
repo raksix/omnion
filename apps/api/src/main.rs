@@ -53,6 +53,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     bootstrap_admin(&config, &db).await?;
     seed_iam(&db).await?;
+    seed_ai_tools(&db).await?;
 
     let redis = RedisClient::new(&config.redis.url)?;
     if let Err(err) = redis.ping().await {
@@ -280,6 +281,39 @@ async fn seed_iam(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync
         tracing::info!(%user_id, "owner role assigned to the earliest active account");
     }
 
+    Ok(())
+}
+
+/// Seed the AI tool registry from the compiled catalogue (REQ-100 slice 1).
+///
+/// **A seeding failure is logged, not fatal.** The registry is a screen an operator configures;
+/// refusing to boot the whole platform because a row could not be written would mean one failed
+/// upsert takes down publishing, media and the public renderer with it. The registry screen
+/// answers `seeded: false` and shows its banner, which is the diagnosis the spec asks for, and the
+/// next boot retries.
+///
+/// The log line carries `decisions_preserved` deliberately: it is the number that makes "seeding
+/// does not overwrite operator edits" visible in production rather than only in a test, because a
+/// pass that refreshed 23 rows and preserved 23 decisions is the expected line, and one that
+/// reports 0 preserved is the one somebody needs to look at.
+async fn seed_ai_tools(db: &Db) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match omnion_ai_hub::registry::seed(db.pool()).await {
+        Ok(outcome) => {
+            tracing::info!(
+                tools_inserted = outcome.inserted,
+                tools_refreshed = outcome.refreshed,
+                tools_retired = outcome.retired,
+                decisions_preserved = outcome.decisions_preserved,
+                "AI tool registry seeded from the compiled catalogue"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "the AI tool registry could not be seeded; /ai/tools will show its banner"
+            );
+        }
+    }
     Ok(())
 }
 
