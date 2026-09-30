@@ -40,6 +40,22 @@ impl Db {
         Ok(Self { pool })
     }
 
+    /// Wrap a pool this process already built.
+    ///
+    /// `connect` and `connect_lazy` both read the URL and the pool options out of
+    /// [`DatabaseConfig`], which is right for a running service and useless for a test that needs
+    /// a database which **cannot answer** — a reserved port, a closed socket, a two-connection
+    /// ceiling. Building the pool by hand and handing it over keeps the timeouts under the
+    /// caller's control, and a test that must fail fast cannot use a five-second acquire timeout
+    /// and still call itself quick.
+    ///
+    /// No verification happens here, which is the whole difference from `connect`: a pool built
+    /// this way may point at nothing at all, and the first query is what discovers it.
+    #[must_use]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     /// Apply every pending migration.
     ///
     /// Idempotent and safe to run from several instances at once: SQLx takes an advisory

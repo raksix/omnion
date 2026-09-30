@@ -368,10 +368,26 @@ pub(crate) async fn decide_request(
     // Dropping the user rather than the address is the same choice REQ-012 makes.
     let machine_key = crate::guards::bearer_token(headers).is_some();
     let address = peer.or_else(|| peer_from_headers(headers));
-    let user_id = if machine_key {
-        None
+    // A machine key is not a person, so it spends no user budget. A session the database COULD
+    // NOT be asked about is a different case, and it is kept apart from both of those: the
+    // limiter logs it and falls back to the address budget, so a saturated pool can no longer
+    // quietly hand a signed-in caller an unlimited request. The failure is `warn`, not `error`,
+    // because the request itself is served correctly — it is the *attribution* that was lost,
+    // and a deployment that rate-limits by address is degraded, not down.
+    let (user_id, unresolved) = if machine_key {
+        (None, false)
     } else {
-        resolve_user_id(limiter, headers).await
+        match resolve_user_id(limiter, headers).await {
+            Ok(user_id) => (user_id, false),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "a signed-in request's session could not be resolved; it spends the IP budget \
+                     only and its user budget is not counted this request"
+                );
+                (None, true)
+            }
+        }
     };
 
     let subject = Subject {
@@ -388,6 +404,26 @@ pub(crate) async fn decide_request(
     let now = OffsetDateTime::now_utc();
     let (verdict, counted, policy) =
         limiter_redis::enforce(&limiter.state.redis(), &policies, &subject, now, limiter.fail_mode).await;
+
+    // The refusal is decided FIRST and unconditionally: an unresolvable caller is still a caller
+    // and the address budget is the one budget that is still attributable. Only the ALLOWED path
+    // is downgraded, and only to a verdict that says what happened.
+    //
+    // This is the shape `Uncounted` exists for — "a policy applies, but this request was not
+    // counted" — and using it here rather than `Unlimited` is the whole fix. `Unlimited` means
+    // "no budget is written for this scope", which is a statement about the deployment;
+    // `Uncounted` means "this specific request was not counted", which is the truth. The
+    // difference is visible on the wire: `Unlimited` publishes no headers because there is no
+    // ceiling to publish, and a caller watching `X-RateLimit-Remaining` sees the same silence
+    // either way — which is precisely why the anomaly has to be logged here and not only here.
+    if verdict.is_allowed() && unresolved && policy_is_user_scoped(&policies) {
+        return Decision::Allowed {
+            verdict: Verdict::Uncounted {
+                scope: verdict.scope().unwrap_or("user").to_owned(),
+            },
+            policy: None,
+        };
+    }
 
     if verdict.is_allowed() {
         // The verdict travels with the decision. Dropping it here is what made the allowed path
@@ -533,18 +569,60 @@ pub fn apply_headers(mut response: Response<Body>, verdict: &Verdict, policy: Op
     response
 }
 
+/// Whether any enabled policy would have governed this request by USER.
+///
+/// Asked before the downgrade rather than inferred from `verdict.scope()`, because by the time
+/// the verdict exists a `user`-scoped policy has already lost the resolution to something else —
+/// and the case that matters is precisely the one where it LOST. A deployment with no user policy
+/// at all is unaffected by a slow pool, so the downgrade must only fire when a user budget was
+/// the one being skipped.
+fn policy_is_user_scoped(policies: &[LimitPolicy]) -> bool {
+    policies
+        .iter()
+        .any(|policy| policy.enabled && policy.scope == "user")
+}
+
 /// Resolve the session's user id for the user-scoped budget.
 ///
-/// `None` on any failure, deliberately: a request whose session cannot be resolved is about to be
-/// refused by its own guard, and it spends the **IP** budget in the meantime — which is the
-/// correct accounting for a request the platform cannot attribute to a person.
-async fn resolve_user_id(limiter: &PlatformLimiter, headers: &HeaderMap) -> Option<uuid::Uuid> {
-    let token = crate::cookies::session_token(headers)?;
-    let resolved = omnion_identity::sessions::resolve_session(limiter.state.db().pool(), &token)
-        .await
-        .ok()
-        .flatten()?;
-    Some(resolved.user.id)
+/// **Three answers, not two**, and the third one is what this slice's measurement forced.
+///
+/// The previous signature returned `Option<Uuid>` and reached it with
+/// `resolve_session(...).await.ok().flatten()?`, which maps a session that does not exist and a
+/// session the database **could not be asked about** onto the same `None`. Under load the pool's
+/// 5 s `acquire_timeout` fires, `.ok()` swallows it, and the signed-in caller is handed to the
+/// limiter as a subject with no `user_id`. The winning `user`-scoped policy then has no key for
+/// it, `enforce` answers `Unlimited`, and the request is served **uncounted** — which is exactly
+/// the failure the budget exists to prevent, arriving from a saturated pool instead of an
+/// outage. Measured, not inferred: the walk printed `COULD NOT ASK (pool timed out)` and the
+/// served response carried no `X-RateLimit-*` at all.
+///
+/// So the error is kept and travels. `Err` means *the platform does not know who this is*, and
+/// the caller decides what to do with that; `Ok(None)` means *nobody is signed in*, which is a
+/// fact rather than a failure. Collapsing them again is the defect, so it is written down here.
+///
+/// The IP budget is still spent either way, and that part of the old comment was right: a
+/// request the platform cannot attribute to a person is still traffic from an address. What
+/// changed is that a caller who could not be resolved is no longer **silently** unlimited — the
+/// limiter logs it and counts the address, so an operator sees the anomaly instead of finding it
+/// from a client that was never limited.
+async fn resolve_user_id(
+    limiter: &PlatformLimiter,
+    headers: &HeaderMap,
+) -> std::result::Result<Option<uuid::Uuid>, omnion_identity::error::IdentityError> {
+    let Some(token) = crate::cookies::session_token(headers) else {
+        // Nothing was presented, so there is nothing to ask about: an anonymous request is not a
+        // lookup that failed. This is the whole difference between the three answers and it is
+        // decided BEFORE the database is touched.
+        return Ok(None);
+    };
+    // The `?` is the fix. `.ok()` was what made every database failure indistinguishable from an
+    // anonymous request, and no amount of logging above the call site can recover an answer the
+    // function already threw away — the caller cannot tell the two apart because the function has
+    // already merged them. Written this way, a saturated pool reaches `decide_request` as an
+    // `Err` and the anomaly is logged and the response is marked `Uncounted`.
+    Ok(omnion_identity::sessions::resolve_session(limiter.state.db().pool(), &token)
+        .await?
+        .map(|session| session.user.id))
 }
 
 /// The client address when the request came through a reverse proxy.
@@ -601,6 +679,177 @@ mod tests {
             organization_id: None,
             ip: ip.parse().ok(),
             route: None,
+        }
+    }
+
+    /// The defect this slice fixed, reproduced on purpose.
+    ///
+    /// Every other test here exercises the resolver or the headers. This one exercises the
+    /// **call site**, because that is where the defect was: `resolve_user_id` used to collapse
+    /// "the database could not be asked" into "nobody is signed in", so a saturated pool silently
+    /// turned a signed-in caller into an anonymous one and their user budget simply stopped being
+    /// spent — served, uncounted, and with no header to say so. A test on the helper could not
+    /// have caught it: the helper was right and its CALLER threw the answer away.
+    ///
+    /// The failure is reproduced without a network round trip, which matters because a
+    /// reproduction that needs a real outage is a reproduction that only runs during one. The
+    /// pool is built directly against a port nothing can bind and handed to `resolve_session`,
+    /// so the `Err` under test is the SAME `Err` a saturated pool produces — a `sqlx::Error`
+    /// from failing to acquire — arrived at deterministically.
+    #[tokio::test]
+    async fn a_session_the_database_cannot_answer_is_not_an_anonymous_request() {
+        use axum::http::header;
+
+        // A lazy pool against a port that is reserved and unbound. `max_connections(1)` plus a
+        // short acquire timeout means the first query fails immediately rather than retrying
+        // behind a live socket.
+        // A lazy pool against a reserved, unbound port, wrapped in the same `PlatformLimiter`
+        // the middleware builds. Building the limiter rather than calling `resolve_session`
+        // directly is the whole point: the previous version of this test called
+        // `resolve_session` and passed with the fix reverted, because `resolve_session` was
+        // ALWAYS right — it is this module's wrapper that used to throw the answer away. A test
+        // has to exercise the code that was wrong.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://omnion:omnion@127.0.0.1:1/omnion_unreachable")
+            .expect("a lazy pool needs no reachable server");
+
+        let limiter = PlatformLimiter {
+            state: AppState::with_pool(pool),
+            policies: limiter_redis::empty_cache(),
+            fail_mode: FailMode::Open,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("omnion_session=not-a-real-token"),
+        );
+
+        // The assertion is on what the WRAPPER says, which is the code under test.
+        assert!(
+            resolve_user_id(&limiter, &headers).await.is_err(),
+            "a session lookup that could not be PERFORMED must come back as an error. Returning \
+             `Ok(None)` here is the defect: the caller cannot then tell this signed-in request \
+             from an anonymous one, the user budget is skipped, and the request is served \
+             uncounted with no header to say so"
+        );
+
+        // The error underneath is the pool failing to acquire, which is what production printed
+        // (`pool timed out while waiting for an open connection`) and not a rejected token.
+        let error = resolve_user_id(&limiter, &headers)
+            .await
+            .expect_err("already asserted to be an error");
+        assert!(
+            matches!(error, omnion_identity::error::IdentityError::Database(_)),
+            "the failure must be the DATABASE being unreachable; a token the function rejects \
+             outright would make this test pass for the wrong reason. Got {error:?}"
+        );
+
+        // And the three answers are still distinguishable: nothing presented is `Ok(None)`, which
+        // is a fact about the request rather than a failure to find anything out.
+        let anonymous = resolve_user_id(&limiter, &HeaderMap::new()).await;
+        assert!(
+            anonymous
+                .expect("no cookie is not a lookup that failed")
+                .is_none(),
+            "no cookie presented means nobody is signed in"
+        );
+    }
+
+    /// The downgrade only fires when a USER budget was actually the one being skipped.
+    ///
+    /// Asking this about the policies rather than about the verdict is deliberate. By the time
+    /// the verdict exists, a user-scoped policy has already LOST the resolution — that is why
+    /// the subject had no user key to spend — so `verdict.scope()` can only ever report the
+    /// scope that won instead. Inferring from it would report "ip" on the exact request whose
+    /// user budget went unspent, which is the one case the check exists to catch.
+    ///
+    /// Both halves are asserted, because both were ways to make the fix a no-op: a deployment
+    /// with only an address budget must NOT be downgraded (nothing was lost), and a disabled
+    /// user row is not a budget that could have been spent.
+    #[test]
+    fn an_unresolved_caller_is_only_downgraded_when_a_user_budget_existed() {
+        let user = policy("user", 600, 0, 60);
+        let ip = policy("ip", 100, 0, 60);
+
+        assert!(
+            policy_is_user_scoped(std::slice::from_ref(&user)),
+            "a deployment with a user budget can lose it to a slow pool, so it must be reported"
+        );
+        assert!(
+            !policy_is_user_scoped(std::slice::from_ref(&ip)),
+            "an address-only deployment has no user budget to lose; downgrading it would report \
+             an anomaly that cannot have happened"
+        );
+        assert!(
+            policy_is_user_scoped(&[ip.clone(), user.clone()]),
+            "the user budget still counts when an address budget is present — the address one \
+             wins the resolution, and that is the situation the downgrade exists for"
+        );
+
+        let mut disabled = user.clone();
+        disabled.enabled = false;
+        assert!(
+            !policy_is_user_scoped(&[disabled, ip]),
+            "a disabled row is not a budget: it can never have been spent"
+        );
+    }
+
+    /// The downgraded verdict is `Uncounted`, never `Unlimited`.
+    ///
+    /// The two read completely differently, and picking the wrong one is how the defect would
+    /// return wearing a fix. `Unlimited` means "no policy governs this scope" — a statement about
+    /// the deployment — and the caller reads it as "I have no budget, nothing is wrong".
+    /// `Uncounted` means "a policy applied to this request and it was NOT counted", which is
+    /// the truth, and it is also non-authoritative, so `apply_headers` withholds the numbers
+    /// rather than publishing a measurement nobody took.
+    #[test]
+    fn an_unresolved_caller_publishes_no_numbers_because_none_were_taken() {
+        let unresolved = Verdict::Uncounted {
+            scope: "user".into(),
+        };
+        assert!(
+            !unresolved.is_authoritative(),
+            "no counter was read, so there is no remaining to publish"
+        );
+        // `is_allowed()` is TRUE for `Uncounted`, and that is correct rather than surprising: the
+        // request is served, and the limiter did decide to serve it. What it must NOT claim is
+        // that it decided against a ceiling — which is what `is_authoritative()` answers, and
+        // why the downgrade cannot be confused with `Limited` by anything downstream.
+        assert!(
+            unresolved.is_allowed(),
+            "the request IS served; `Uncounted` is an allowed verdict that withholds its numbers"
+        );
+        assert!(
+            !matches!(unresolved, Verdict::Limited { .. }),
+            "an uncounted request must never read as a refusal — the client would back off for \
+             no measured reason"
+        );
+        assert_eq!(unresolved.scope(), Some("user"));
+        assert!(
+            unresolved.ceiling().is_none() && unresolved.remaining().is_none(),
+            "an uncounted request publishes neither a ceiling nor a remainder"
+        );
+        assert!(
+            unresolved.retry_after().is_none(),
+            "and no Retry-After: there is no window to wait for"
+        );
+
+        // The headers really are absent, asserted through the function that writes them rather
+        // than by reading the enum — the two can disagree, and the wire is what the client sees.
+        let response = apply_headers(
+            Response::new(Body::empty()),
+            &unresolved,
+            Some(&policy("user", 600, 0, 60)),
+            OffsetDateTime::now_utc(),
+        );
+        for header in [X_LIMIT, X_REMAINING, X_RESET, X_POLICY] {
+            assert!(
+                !response.headers().contains_key(&header),
+                "{header} must not be published for a request that was never counted"
+            );
         }
     }
 

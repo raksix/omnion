@@ -226,6 +226,34 @@ fn json_post(path: &str, body: Value) -> Request<Body> {
 /// hypothetical here — `omnion_w6_*` databases each carried a stale checksum once and the whole
 /// observability suite was a no-op for two ticks while reporting `ok`.
 async fn live_state() -> Option<AppState> {
+    // ONE pool for the whole suite, not one per walk.
+    //
+    // This is a harness defect with a product-shaped symptom, and it is the second half of what
+    // made this suite order-dependent. `state_or_fail()` connects a FRESH pool per call, and this
+    // file calls it from eight walks: eight pools of ten connections is eighty backends against a
+    // PostgreSQL shared with six other writers, whose own `max_connections` is 100. The pool then
+    // hits its 5 s `acquire_timeout`, `resolve_session` fails, and the limiter — correctly, after
+    // this tick's fix — reports the request as `Uncounted` rather than serving it silently. The
+    // walk then fails on an assertion about attribution, three ticks after the product defect it
+    // was blamed on had already been found.
+    //
+    // The pool is a `OnceLock`, so the eight walks share ONE set of connections exactly as they
+    // already share the process-wide limiter. Each walk still clears its own counters and installs
+    // its own policy, so nothing is carried between them except the pool itself — which is what a
+    // production process does too.
+    static SHARED: std::sync::OnceLock<AppState> = std::sync::OnceLock::new();
+    if let Some(state) = SHARED.get() {
+        let state = state.clone();
+        if let Err(error) = state.redis().ping().await {
+            eprintln!(
+                "SKIP: Redis is not reachable ({error}) — a limiter cannot be proved without its \
+                 counter"
+            );
+            return None;
+        }
+        purge_suite_leftovers(&state).await;
+        return Some(state);
+    }
     let state = support::walk_state::state_or_fail().await;
     // The one thing `state_or_fail` does not check, because it is not its business: this suite's
     // entire subject is a counter, and a walk that skipped on a missing Redis would report the
@@ -241,6 +269,7 @@ async fn live_state() -> Option<AppState> {
     // Clearing them here — before any test installs its own — is what makes the suite
     // re-runnable rather than only re-runnable-once.
     purge_suite_leftovers(&state).await;
+    let _ = SHARED.set(state.clone());
     Some(state)
 }
 
@@ -896,11 +925,52 @@ async fn a_saved_policy_takes_effect_on_the_next_request_without_a_restart() {
     };
     let first = call_from(&state, signed_in(), "198.51.100.108").await;
     assert_ne!(first.status, StatusCode::TOO_MANY_REQUESTS);
+
+    // The SERVED request's own budget is asserted, not only the second request's refusal — and
+    // that assertion is what located the defect this walk was rewritten for.
+    //
+    // Asserting only "the second request is refused" cannot see an uncounted FIRST request: the
+    // second one is refused either way, by the old ceiling or by the new one, so the test goes
+    // green while the caller that should have spent its budget never did. Asserting the served
+    // request asks the question that actually matters — was THIS request counted? — and reads
+    // the answer off the wire: the headers are published only on an authoritative reading, so
+    // their ABSENCE on a served response is a positive signal, not cosmetic.
+    assert_eq!(
+        first.header("x-ratelimit-policy").as_deref(),
+        Some(saved_id.to_string().as_str()),
+        "the SERVED request must already be decided by the policy this walk saved, under its \
+         ceiling of {}; a served response carrying no X-RateLimit-Policy means it was not \
+         counted at all (status {}, limit {:?}, remaining {:?})",
+        saved.limit_count,
+        first.status,
+        first.header("x-ratelimit-limit"),
+        first.header("x-ratelimit-remaining"),
+    );
+    // Under a ceiling of one the first request spends the whole window, so zero left is the only
+    // correct reading and the only one that proves a count happened.
+    assert_eq!(
+        first.header("x-ratelimit-remaining").as_deref(),
+        Some("0"),
+        "the first request must spend its budget of {} and publish the remainder; got {:?}",
+        saved.limit_count,
+        first.header("x-ratelimit-remaining"),
+    );
     let second = call_from(&state, signed_in(), "198.51.100.108").await;
+    // The message carries WHAT CAME BACK, not only what was wanted. The first version of this
+    // assertion said only "the saved policy must decide the very next request", and the failure
+    // that motivated it — which passes alone and fails beside another walk — could not be told
+    // apart from a hundred others by that sentence alone. A served `200` with no `X-RateLimit-*`
+    // at all, a `401`, and a `429` under the OLD ceiling are three different defects.
     assert_eq!(
         second.status,
         StatusCode::TOO_MANY_REQUESTS,
-        "the saved policy must decide the very next request, not the one after the next boot"
+        "the saved policy must decide the very next request, not the one after the next boot; got \
+         {} with limit {:?} remaining {:?} policy {:?} and body {}",
+        second.status,
+        second.header("x-ratelimit-limit"),
+        second.header("x-ratelimit-remaining"),
+        second.header("x-ratelimit-policy"),
+        second.text
     );
     assert_eq!(
         second.body["error"]["details"]["limit"],
