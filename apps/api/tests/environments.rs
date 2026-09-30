@@ -23,8 +23,15 @@
 //! Runs against the development stack and skips with a printed reason when PostgreSQL is not
 //! reachable, like every other suite here.
 
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
+
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post as route_post;
+use axum::Router;
 use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
@@ -32,12 +39,15 @@ use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_environment::clone::Area;
 use omnion_environment::model::CloneStatus;
+use omnion_events::{engine, sender, signature};
 use omnion_identity::sites;
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -271,6 +281,158 @@ async fn reclaim_scratch_databases(pool: &sqlx::PgPool) {
             eprintln!("reclaimed a stale scratch database: {name}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The receiver: a real HTTP server the delivery runner posts to
+// ---------------------------------------------------------------------------------------------
+
+/// One delivery the receiver captured.
+#[derive(Debug, Clone)]
+struct Captured {
+    /// `X-Omnion-Event`.
+    event: String,
+    /// `X-Omnion-Delivery`.
+    delivery: String,
+    /// `X-Omnion-Timestamp`.
+    timestamp: i64,
+    /// `X-Omnion-Signature`.
+    signature: String,
+    /// The raw bytes the signature covers.
+    body: Vec<u8>,
+}
+
+impl Captured {
+    /// The body as JSON.
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).expect("a delivery body must be JSON")
+    }
+}
+
+/// A running receiver: its URL, the secret it verifies with, and the task serving it.
+///
+/// **A real socket, not a mock.** The claim this walk proves is that `promotion.*` *reaches an
+/// endpoint*, and the two halves of that claim live in different processes: the route emits and
+/// fans out, and the runner signs and posts. A fake client proves the row was written; only a
+/// listener proves the body left the building, so the suite borrows the shape
+/// `tests/events.rs` already runs rather than inventing a second one.
+struct Receiver {
+    url: String,
+    secret: String,
+    seen: Arc<Mutex<Vec<Captured>>>,
+    task: JoinHandle<()>,
+}
+
+impl Receiver {
+    /// Start a receiver on an ephemeral loopback port.
+    async fn start() -> Self {
+        let seen: Arc<Mutex<Vec<Captured>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the receiver must bind a port");
+        let address = listener.local_addr().expect("the receiver has an address");
+
+        let app = Router::new()
+            .route("/deploy-hook", route_post(receive))
+            .with_state(seen.clone());
+
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Self {
+            url: format!("http://{address}/deploy-hook"),
+            secret: "w5-promotion-delivery-secret".to_owned(),
+            seen,
+            task,
+        }
+    }
+
+    /// Everything the receiver captured so far.
+    fn captured(&self) -> Vec<Captured> {
+        self.seen.lock().expect("the receiver lock").clone()
+    }
+
+    /// The events the receiver was actually handed, in arrival order.
+    fn events(&self) -> Vec<String> {
+        self.captured()
+            .into_iter()
+            .map(|delivery| delivery.event)
+            .collect()
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// `POST /deploy-hook` — capture the delivery and accept it.
+async fn receive(State(seen): State<Arc<Mutex<Vec<Captured>>>>, headers: HeaderMap, body: Bytes) -> Response {
+    let read = |name: &str| -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    seen.lock().expect("the receiver lock").push(Captured {
+        event: read(signature::EVENT_HEADER),
+        delivery: read(signature::DELIVERY_HEADER),
+        timestamp: read(signature::TIMESTAMP_HEADER)
+            .parse()
+            .unwrap_or_default(),
+        signature: read(signature::SIGNATURE_HEADER),
+        body: body.to_vec(),
+    });
+
+    (StatusCode::OK, "accepted").into_response()
+}
+
+/// The delivery configuration this suite runs the runner with: one batch, a short timeout, and a
+/// backoff far past the length of a walk so a refusal is not retried underneath it.
+fn delivery_config() -> engine::RunnerConfig {
+    engine::RunnerConfig {
+        batch: 50,
+        lease_seconds: 30,
+        request_timeout: StdDuration::from_secs(5),
+        retry_base: Duration::milliseconds(60_000),
+        retry_max: Duration::milliseconds(60_000),
+    }
+}
+
+/// One delivery tick against the throwaway database.
+async fn deliver_due(fixture: &Fixture) -> engine::RunReport {
+    let client = sender::client(StdDuration::from_secs(5)).expect("the delivery client must build");
+    engine::run_due(fixture.db.pool(), &client, &delivery_config())
+        .await
+        .expect("the delivery tick must run")
+}
+
+/// Subscribe an endpoint to `promotion.*` for the fixture's organization, through the store.
+///
+/// The store rather than the route on purpose: this walk is about the *delivery* half, and the
+/// route's own contract — that a subscription list is reconciled against the catalogue and that
+/// an unknown name is refused — is what `tests/events.rs` covers. What has to be true here is
+/// narrower and is exactly the request's sentence: a group subscription `promotion.*` matches the
+/// two events the promotion routes emit, and the receiver sees them.
+async fn subscribe_to_promotions(fixture: &Fixture, url: &str) -> Uuid {
+    let endpoint = omnion_events::store::insert_endpoint(
+        fixture.db.pool(),
+        omnion_events::NewEndpoint {
+            organization_id: fixture.organization,
+            name: format!("deploy-{}", Uuid::new_v4().simple()),
+            url: url.to_owned(),
+            secret: "w5-promotion-delivery-secret".to_owned(),
+            events: vec!["promotion.*".to_owned()],
+            created_by: Some(fixture.caller_user_id),
+        },
+    )
+    .await
+    .expect("the endpoint must be created");
+    endpoint.id
 }
 
 /// Replace the database name in a PostgreSQL connection string.
@@ -3030,4 +3192,180 @@ async fn an_empty_change_set_and_a_withdrawn_request() {
     let bogus = request_promotion(&fixture, environment_id, &[Uuid::new_v4()]).await;
     assert_eq!(bogus.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(bogus.body["error"]["code"], "promotion_item_not_in_change_set");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The delivery half of a promotion
+// ---------------------------------------------------------------------------------------------
+
+/// A subscribed endpoint receives the promotion lifecycle over a real socket, signed with the
+/// secret it was given, and only the events it asked for.
+///
+/// This is the criterion "`promotion.*` events arrive at an endpoint subscribed to
+/// `promotion.*` within the delivery window", and the walk is deliberately built so that the
+/// parts which could pass *vacuously* cannot:
+///
+///   * **The receiver is a socket, not a stub.** Asserting the `webhook_deliveries` row would
+///     prove the fan-out wrote something; only an HTTP answer proves the request left the
+///     process and arrived somewhere a stranger could have written.
+///   * **The signature is verified over the received bytes.** A body that arrives unsigned, or
+///     signed with the wrong secret, is a webhook any third party could have forged — and a
+///     receiver that only checked the event *name* would call that a pass.
+///   * **A second, unrelated endpoint is not called.** The claim is "delivered to the
+///     subscriber", not "delivered". A runner that posted to every endpoint would satisfy the
+///     first and break this, and the isolation is the only place that shows up.
+///   * **The `environment.*` events are NOT delivered.** The endpoint is subscribed to
+///     `promotion.*` alone, and the create and clone below emit `environment.created` and
+///     `environment.clone.started` on the way past. If group matching were "match anything that
+///     has a dot", they would arrive and the walk would be measuring a bug, not a delivery.
+#[tokio::test]
+async fn a_promotion_reaches_a_subscribed_endpoint_over_a_signed_delivery() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // Two receivers. The first is the subscriber; the second exists so the walk can prove it was
+    // not called, which is only a claim if there is somewhere it could have gone.
+    let receiver = Receiver::start().await;
+    let bystander = Receiver::start().await;
+    let endpoint_id = subscribe_to_promotions(&fixture, &receiver.url).await;
+    omnion_events::store::insert_endpoint(
+        fixture.db.pool(),
+        omnion_events::NewEndpoint {
+            organization_id: fixture.organization,
+            name: format!("bystander-{}", Uuid::new_v4().simple()),
+            url: bystander.url.clone(),
+            secret: "w5-promotion-delivery-secret".to_owned(),
+            // Deliberately a group it is not asked for: this endpoint is subscribed to the
+            // environment lifecycle, so a runner that ignored subscriptions entirely would call
+            // it and fail the walk.
+            events: vec!["environment.*".to_owned()],
+            created_by: Some(fixture.caller_user_id),
+        },
+    )
+    .await
+    .expect("the bystander endpoint must be created");
+
+    let _edited = insert_production_page(&fixture.db, fixture.site, "delivered", "Delivered")
+        .await;
+    let created = fixture.create_staging("Staging", "staging-delivery").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // Staging now holds one edit, so the change set is not empty and the promotion is a real
+    // deploy rather than a request over nothing.
+    sqlx::query(
+        "update pages set updated_at = now() + interval '1 second' \
+         where site_id = $1 and slug = 'delivered' and environment_id = $2",
+    )
+    .bind(fixture.site)
+    .bind(environment_id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    // Drain the deliveries the create and the clone queued, so what is left at the end is the
+    // promotion's own and nothing else. They are addressed to the bystander, which is why that
+    // endpoint exists in the first place.
+    deliver_due(&fixture).await;
+
+    let asked = request_promotion(&fixture, environment_id, &[]).await;
+    assert_eq!(asked.status, StatusCode::CREATED, "body: {}", asked.body);
+    let promotion_id = Uuid::parse_str(asked.body["promotion"]["id"].as_str().unwrap()).unwrap();
+    let approved = approve(&fixture, promotion_id, &fixture.caller).await;
+    assert_eq!(approved.status, StatusCode::OK, "body: {}", approved.body);
+    assert_eq!(approved.body["status"], "done");
+
+    let report = deliver_due(&fixture).await;
+    assert_eq!(
+        report.delivered, 2,
+        "both promotion events were delivered: {report:?}"
+    );
+    assert_eq!(report.failed, 0, "{report:?}");
+
+    // What the receiver was actually handed: the two events it subscribed to, in order, and
+    // nothing from the environment lifecycle that passed through on the way.
+    let events = receiver.events();
+    assert_eq!(
+        events,
+        vec!["promotion.requested", "promotion.completed"],
+        "the receiver saw the promotion lifecycle and nothing else: {events:?}"
+    );
+
+    // The completed event carries the affected ids, which is what the request says replaces
+    // re-emitting `page.published` for every copied row.
+    let completed = receiver
+        .captured()
+        .into_iter()
+        .find(|delivery| delivery.event == "promotion.completed")
+        .expect("the completed delivery");
+    let body = completed.json();
+    assert_eq!(
+        body["name"], "promotion.completed",
+        "the envelope names the event: {body:?}"
+    );
+    assert_eq!(
+        body["payload"]["promotion_id"], promotion_id.to_string(),
+        "the delivery names the promotion that caused it"
+    );
+    assert_eq!(body["payload"]["written"], 1, "{body:?}");
+    assert_eq!(
+        body["payload"]["items"].as_array().map(Vec::len),
+        Some(1),
+        "the affected ids travel in the one event: {body:?}"
+    );
+
+    // Every delivery carried a signature the receiver can verify over exactly the bytes it got.
+    // The secret is the one the endpoint was created with, so this is the receiver's own check —
+    // a forged or unsigned body fails here rather than being accepted on the strength of its
+    // event name.
+    for delivery in receiver.captured() {
+        assert!(
+            signature::verify(
+                &receiver.secret,
+                delivery.timestamp,
+                &delivery.body,
+                &delivery.signature
+            ),
+            "the {} delivery must verify against the endpoint's own secret",
+            delivery.event
+        );
+        assert!(
+            Uuid::parse_str(&delivery.delivery).is_ok(),
+            "the delivery header carries an id: {:?}",
+            delivery.delivery
+        );
+    }
+
+    // The delivery rows the panel lists agree with what the socket saw, so the "Redeliver" and
+    // "deliveries" screens are not describing a history that did not happen.
+    let delivered_rows: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries \
+         where endpoint_id = $1 and status = 'delivered'",
+    )
+    .bind(endpoint_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        delivered_rows, 2,
+        "the two events are on the endpoint's own delivery history"
+    );
+
+    // The bystander was subscribed to the environment lifecycle, which the create and the clone
+    // emitted. It was therefore *delivered to* — and it must have received only those, never a
+    // promotion. This is the leg that would catch a runner posting to every endpoint.
+    let bystander_events = bystander.events();
+    assert!(
+        bystander_events.iter().all(|event| event.starts_with("environment.")),
+        "the bystander received only what it subscribed to: {bystander_events:?}"
+    );
+    assert!(
+        !bystander_events.iter().any(|event| event.starts_with("promotion.")),
+        "a promotion reached an endpoint that did not subscribe to it: {bystander_events:?}"
+    );
+    assert!(
+        !bystander_events.is_empty(),
+        "the bystander was queued a delivery at all, so the isolation above is not vacuous"
+    );
 }
