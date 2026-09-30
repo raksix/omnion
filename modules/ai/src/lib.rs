@@ -34,7 +34,7 @@ pub use generate::{
 };
 pub use model::{
     AiWorkflowDraft, DraftFilter, DraftPage, DraftTokens, MAX_PROMPT_LEN, MAX_TITLE_LEN,
-    NEW_DRAFT_STATUS, OPEN_STATUSES, STATUSES, draft_status_is_known,
+    NEW_DRAFT_STATUS, NewDraft, OPEN_STATUSES, STATUSES, draft_status_is_known,
 };
 pub use store::{
     apply_answer, apply_decision, apply_failure, apply_revision, attach_workflow, delete_draft,

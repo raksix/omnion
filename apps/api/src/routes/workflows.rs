@@ -1056,7 +1056,7 @@ async fn site_of(state: &AppState, site_id: Uuid) -> Result<Site, ApiError> {
 }
 
 /// Load a site and refuse it when it lives outside the caller's organization.
-async fn site_in_scope(
+pub async fn site_in_scope(
     state: &AppState,
     current: &CurrentSession,
     site_id: Uuid,
