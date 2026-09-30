@@ -7293,3 +7293,94 @@ catalogue entries, `6b5aa935` the config, `2d96f286` the gate.
 **Next.** The switcher and its URL state (acceptance 3), then the member-role-next-request proof
 (15) and the 390 px pass (16) — all three of which need a pass that finishes, so the w8 QA stack the
 moment the slot frees.
+
+## Tick 36 — REQ-133 slice 7: the project switcher (acceptance 3's "persists per user")
+
+**What.** The switcher had a parameter, a documented endpoint and no caller, and its persistence
+half had no table at all. `ProjectListQuery.mine` has sat on the API's query struct since slice 1,
+the REQ's API table names `GET /api/v1/projects?mine=1` as "the switcher's list", and nothing on
+this branch read the parameter. Migration `0176` carries the state that was missing —
+`automation_project_recent` (a dense, ranked, eight-deep window) and `automation_project_selection`
+(one row per user) — plus the store, the route pair, the client functions and the control.
+
+This is the ninth instance of this branch's signature defect and the first where the missing thing
+is a **table** rather than a caller. The distinction is worth keeping: a caller is found by reading
+the function's callers, but *state* is found by asking what the sentence promises that no column
+can hold. "Persists per user" is such a sentence, and a browser-only selection would have satisfied
+the neighbouring clause ("survives navigation") while failing this one on a second device.
+
+**Proof.** `scripts/qa/run-project-switcher.sh` **8/8, PROVEN TO FAIL at 6/8** — neutering the
+shift's `rank >= 0` to `rank > 0` and the window's `>= 8` to `>= 7` fails exactly the ranking test
+and the window test, while the tenancy and per-user tests stay green because neither touches the
+shift. `omnion-workflows --lib` 56, `omnion-api --lib` **254** (unchanged from tick 35 — nothing in
+this slice is a lib-level change to the API), 0 clippy in the files touched, admin
+`tsc --noEmit` exit 0.
+
+**Three decisions, each of which the obvious version gets wrong, and all three found by the gate's
+first run rather than by reading.**
+
+* **The demotion is a `rank + 1` shift, not a `rank - 1` one.** Written as
+  `case when rank = 0 then null else rank - 1 end where rank > 0` it never touches the row at rank
+  0 — the very row it means to demote — so the head survives and the claim below hits the unique
+  index with `23505`. Every second switch on a user's second project raised, and only the *first*
+  switch per user ever worked. The lesson is narrow and reusable: **a predicate and the branch it
+  guards must name the same row.** `rank > 0` and `rank = 0` cannot both be true, and the SQL was
+  perfectly valid.
+* **The eviction runs before the shift, and only when the window is full.** Both halves are gate
+  findings. Doing it after left the head in place; making it unconditional then removed the *oldest
+  of three* recents and promoted the second-oldest, so selecting a fourth project silently erased the
+  reader's history. The threshold is `>= 8`, and the `>= 7` I wrote first caps a window that says
+  eight at seven — an off-by-one that is invisible until a reader's ninth project is the one lost.
+* **A project in *this person's recents* is listed whatever their membership.** The filter is
+  membership, because the REQ refuses an administrator's forty projects as a list ("a switcher that
+  lists forty projects is a list"). But an administrator who switched into a project they are not a
+  member of — the case delegated administration exists for — got a header naming a project its own
+  dropdown refused to list, and a reload as the only way out. The clause is
+  `exists (select 1 from automation_project_recent …)`, **not** `or $2`; the admin flag would be the
+  same forty-project list reached by a different route.
+
+A fourth, smaller one, and a repeat of a class this branch has now hit twice: `recent_rank` is a
+`smallint`, and the `Option<i32>` decoder I first wrote raised `mismatched types; Rust type
+Option<i32> (as SQL type INT4) is not compatible with SQL type INT2` on *every* switcher load while
+three tests that never reached the decode stayed green. **The decoder's type is a fact about the
+column, not about the range you wish it had** — the third time this branch has been bitten by a
+decode that compiles and then fails at runtime on a shape no unit test reaches.
+
+**A test of mine was wrong before the product was, and it is worth the space.** The administrator
+case first asserted that an admin's rows list *every* project — the exact opposite of the REQ's own
+sentence — and the gate "passed" it, because the test and the implementation had been written from
+the same misreading. **A gate and a test written together measure the shared assumption, not the
+product**; that is the same lesson as tick 33's `? true : true`, and the second time on this branch.
+It now asserts what must be true instead of what I first assumed: the admin's *reach* is real (they
+can select a project they are not a member of, and it then appears marked manageable with
+`caller_role` still `None`, because reporting `owner` would put a membership in the audit trail that
+does not exist).
+
+**Not done, and stated rather than implied.** The filter half of acceptance 3 names credentials,
+folders and schedules, and **none of those three exists on this branch** — a schedule is a column on
+`workflows`, not a table. The line is `[~]` for that reason and not because the switcher is
+incomplete: `list_automations` and `list_workflows` are project-scoped and that is the whole of what
+this branch can honestly say. The REQ-064 form-editor card is still REQ-117's one missing screen.
+**No full `scripts/qa/run.sh` pass completed this tick.** The QA slot is held by the main writer's
+live pass (holder pid alive, cwd `/mnt/apopic/omnion`, load 16); I neither took it nor used
+`QA_SLOTS=0`, so the switcher is typechecked and harness-driven but **un-observed**, and no line
+above claims otherwise.
+
+**Two box conditions worth the next writer's time, because both cost this tick real minutes.**
+`/mnt/apopic` hit 100% mid-build again, and reclaiming my own target (the three checks first: no
+open fds, no writes in 13 minutes, build genuinely dead) freed 4.8G — but the follow-up failed on
+`/tmp`, which lives on the **root** filesystem, and that one was also at 100%: `ring`'s C build step
+died with `fatal error: error writing to /tmp/ccJzYoLs.s: No space left on device`, which reads as
+a compile failure of the product and is not one. `export TMPDIR=/mnt/apopic/w8build/tmp` fixes it,
+and `scripts/qa/one.sh` now does it for every gate it runs. Second, the tool shell's `docker exec
+omnion-postgres psql` failed with `exec: "redis-cli": executable file not found in $PATH` while the
+same command worked from `env -i` — a polluted inherited PATH, not a broken container. **When a
+command fails in a way its output cannot explain, re-run it under `env -i` before theorising about
+the product.**
+
+**Commits.** `ab624d0b` the migration, `b5763c7b` the store, `f2a8159c` the route pair,
+`261c8239` the control and the sidebar entry, `3378f776` the gate and the runner.
+
+**Next.** The credential cross-project refusal (acceptance 5) and the delegated-administration
+`403` sweep (acceptance 11) — both answerable against a real database and neither needs a browser,
+so they survive a busy slot. The 390 px pass (16) and the switcher's own observation need the slot.
