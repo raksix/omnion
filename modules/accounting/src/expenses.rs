@@ -308,6 +308,9 @@ pub struct ExpenseSummary {
     /// Whether a receipt is attached. The media row is resolved by the screen, which has the file
     /// route and the thumbnail rules; the list only answers "is there one".
     pub has_receipt: bool,
+    /// Who spent it, for the organizations that reimburse their staff. `None` for an expense paid
+    /// straight to a supplier, which is a real case rather than missing data.
+    pub employee_user_id: Option<Uuid>,
     /// The entry the approval wrote, when it wrote one.
     pub journal_entry_id: Option<Uuid>,
     /// Who filed it.
@@ -356,6 +359,7 @@ impl ExpenseSummary {
             has_receipt: row
                 .get::<Option<Uuid>, _>("receipt_media_id")
                 .is_some(),
+            employee_user_id: row.get("employee_user_id"),
             journal_entry_id: row.get("journal_entry_id"),
             created_by: row.get("created_by"),
             created_at: row.get("created_at"),
@@ -466,7 +470,13 @@ pub struct NewExpense {
     /// financial document learning about it.
     #[serde(default)]
     pub receipt_media_id: Option<Uuid>,
-    /// A free-text note.
+    /// Who spent it. `None` means **the person filing it**, which is right far more often than
+    /// not — the expense screen is used by the person who paid, and making them look themselves
+    /// up in a picker to file their own taxi receipt is a field that exists to be ignored.
+    #[serde(default)]
+    pub employee_user_id: Option<Uuid>,
+    /// A free-text note. Distinct from the approver's `decision_reason`: the filer does not know
+    /// the decision when they write, and a column that is both loses whichever was there first.
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -495,8 +505,8 @@ pub struct DecisionBody {
 /// Create an expense as a draft.
 ///
 /// Nothing posts: a draft is a claim, and the entry appears when somebody approves it. The one
-/// number this writes is `expense_number`, allocated `max + 1` the same way a journal entry does —
-/// and, like the entry's, read `for update` so two requests cannot claim the same one.
+/// number this writes is `expense_number`, allocated `max + 1` under a table lock — see the note
+/// at that lock for why an aggregate and `FOR UPDATE` cannot be combined.
 pub async fn create_expense(
     pool: &PgPool,
     organization_id: Uuid,
@@ -518,6 +528,7 @@ pub async fn create_expense(
     };
     let vendor = normalize_optional(new.vendor.as_deref(), MAX_VENDOR_LENGTH);
     let note = normalize_optional(new.note.as_deref(), MAX_NOTE_LENGTH);
+    let employee_user_id = new.employee_user_id.or(created_by);
     let expense_date = parse_expense_date(new.expense_date.as_deref())?;
     let amount = parse_amount(new.amount.as_str(), "amount")?;
 
@@ -568,13 +579,25 @@ pub async fn create_expense(
 
     let mut tx = pool.begin().await?;
 
-    // `for update` on the aggregate, not on the table: two expenses created in the same
-    // millisecond both read `max(expense_number)` and one of them claims a number the other is
-    // about to write. The unique index turns that into a constraint error naming nothing, so the
-    // lock is what turns it into a retry that succeeds.
+    // **Two statements, because `for update` and an aggregate do not go together.** The obvious
+    // `select coalesce(max(expense_number), 0) + 1 ... for update` is a 500 on every single
+    // create: PostgreSQL refuses `FOR UPDATE` with aggregate functions, and `coalesce(max(..))`
+    // is an aggregate. The error surfaces as `FOR UPDATE is not allowed with aggregate
+    // functions`, which reads like a permissions problem rather than a syntax one.
+    //
+    // The sequence a table lock provides and a row lock does not: `LOCK TABLE ... IN SHARE ROW
+    // EXCLUSIVE MODE` is what actually serializes the read-then-insert pair here, and it is taken
+    // **before** the read so the two statements are one critical section. A row-level `for update`
+    // over `max()` is not an option at all — there is no row to lock — so the alternative is a
+    // dedicated counter row, which is one more table and one more thing to migrate. The table lock
+    // is short (one aggregate read plus one insert) and only this route takes it.
+    sqlx::query("lock table accounting_expenses in share row exclusive mode")
+        .execute(&mut *tx)
+        .await?;
+
     let next_number: i64 = sqlx::query_scalar(
         "select coalesce(max(expense_number), 0) + 1 from accounting_expenses \
-         where organization_id = $1 for update",
+         where organization_id = $1",
     )
     .bind(organization_id)
     .fetch_one(&mut *tx)
@@ -583,8 +606,9 @@ pub async fn create_expense(
     let id: Uuid = sqlx::query_scalar(
         "insert into accounting_expenses \
              (organization_id, expense_number, description, category, vendor, expense_date, \
-              amount, tax_amount, currency, receipt_media_id, note, expense_status, created_by) \
-         values ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9, $10, $11, 'draft', $12) \
+              amount, tax_amount, currency, receipt_media_id, note, expense_status, created_by, \
+              employee_user_id) \
+         values ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9, $10, $11, 'draft', $12, $13) \
          returning id",
     )
     .bind(organization_id)
@@ -599,6 +623,7 @@ pub async fn create_expense(
     .bind(new.receipt_media_id)
     .bind(&note)
     .bind(created_by)
+    .bind(employee_user_id)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -644,6 +669,10 @@ pub async fn update_expense(
     };
     let vendor = normalize_optional(patch.vendor.as_deref(), MAX_VENDOR_LENGTH);
     let note = normalize_optional(patch.note.as_deref(), MAX_NOTE_LENGTH);
+    let employee_user_id = patch
+        .employee_user_id
+        .or(existing.summary.employee_user_id)
+        .or(actor);
     let expense_date = parse_expense_date(patch.expense_date.as_deref())?;
     let amount = parse_amount(patch.amount.as_str(), "amount")?;
     let tax_amount = match patch.tax_amount.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -690,7 +719,7 @@ pub async fn update_expense(
     sqlx::query(
         "update accounting_expenses set description = $3, category = $4, vendor = $5, \
               expense_date = $6, amount = $7::numeric, tax_amount = $8::numeric, currency = $9, \
-              receipt_media_id = $10, note = $11, updated_at = now() \
+              receipt_media_id = $10, note = $11, employee_user_id = $12, updated_at = now() \
          where id = $1 and organization_id = $2",
     )
     .bind(expense_id)
@@ -704,11 +733,11 @@ pub async fn update_expense(
     .bind(&currency)
     .bind(patch.receipt_media_id)
     .bind(&note)
+    .bind(employee_user_id)
     .execute(&mut *tx)
     .await?;
 
     tx.commit().await?;
-    let _ = actor;
 
     get_expense(pool, organization_id, expense_id).await
 }
@@ -841,9 +870,16 @@ async fn post_expense_entry(
     let expense_account = expense_account_for(tx, organization_id).await?;
     let payable_account = reimbursable_account_for(tx, organization_id).await?;
 
+    // Same aggregate-and-`FOR UPDATE` refusal as the expense number above. The journal's own
+    // `post_entry` takes the same aggregate **without** a lock and relies on
+    // `unique (organization_id, entry_number)` to fail the loser — so this takes the weaker,
+    // already-proven route rather than a second locking scheme that would have to be its own
+    // thing to reason about. Two approvals in the same millisecond collide, the second one's
+    // insert is refused by the index, and the caller retries: a rare, visible, recoverable error
+    // beats a lock nobody has measured.
     let entry_number: i64 = sqlx::query_scalar(
         "select coalesce(max(entry_number), 0) + 1 from accounting_journal_entries \
-         where organization_id = $1 for update",
+         where organization_id = $1",
     )
     .bind(organization_id)
     .fetch_one(&mut **tx)
@@ -947,6 +983,12 @@ pub async fn get_expense(
 
 /// The columns the detail read and the list read agree on.
 ///
+/// **Every `numeric` is cast to `text` in the SELECT.** A `numeric` column has no `String`
+/// representation in sqlx without the cast, and the failure is a `ColumnDecode` panic on the read
+/// rather than a compile error — which is why the module compiles, every unit test passes, and
+/// only a walk that actually lists an expense finds it. `numeric` has no Rust type here for the
+/// same reason the money crosses as text: `Amount` parses it back.
+///
 /// **A static string, no interpolation.** The first version of this formatted the organization's
 /// uuid into the SQL to keep the bind count down, which is the one thing a query must never do
 /// with caller-supplied text — and it was also *pointless*, because the tenant check belongs on a
@@ -955,8 +997,9 @@ pub async fn get_expense(
 /// that names a column its reader does not expect compiles, passes every unit test in this crate
 /// and answers 500 on the one route nobody read the body of.
 const DETAIL_QUERY: &str = "select e.id, e.expense_number, e.description, e.category, e.vendor, \
-                             e.expense_date, e.amount, e.tax_amount, e.currency, \
-                             e.receipt_media_id, e.expense_status, e.note, e.decision_reason, \
+                             e.expense_date, e.amount::text, e.tax_amount::text, e.currency, \
+                             e.receipt_media_id, e.expense_status, e.employee_user_id, \
+                             e.note, e.decision_reason, \
                              e.rejection_comment, e.decided_by, e.decided_at, e.reimbursed_at, \
                              e.approval_request_id, e.journal_entry_id, e.created_by, e.created_at \
                       from accounting_expenses e \
@@ -976,66 +1019,82 @@ pub async fn list_expenses(
 ) -> Result<Page<ExpenseSummary>> {
     let limit = limit.clamp(1, crate::store::MAX_PER_PAGE);
 
-    let mut sql = String::from(
+    // **`QueryBuilder`, not a hand-numbered string.** The first version wrote `and e.expense_status
+    // = $2`, `and e.category = $3`, … `limit $8` and then bound the values conditionally — so a
+    // query that filtered by `search` alone bound three values against a `$4` placeholder and
+    // answered `500 could not determine data type of parameter $4`. Placeholder numbers are the
+    // query's own bookkeeping and must not be written by hand beside optional filters; the builder
+    // assigns them as the clauses are pushed, so a clause that is not pushed has no number.
+    //
+    // The conditionals test the **same** predicates the binds do (`status.is_some()` rather than
+    // "is the value usable"), because a builder that pushed a clause without its bind — or bound
+    // without its clause — is the same arithmetic in the other direction.
+    // `QueryBuilder::new`, not `sqlx::query_builder::<Postgres>(..)` — in this sqlx version
+    // `query_builder` is a **module**, and calling it is a compiler error that reads like a typo
+    // rather than a version difference. `new` is also the form the sibling modules use, so the
+    // `<Postgres>` parameter is inferred from `push_bind` and never has to be named.
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
         "select e.id, e.expense_number, e.description, e.category, e.vendor, e.expense_date, \
-                e.amount, e.tax_amount, e.currency, e.receipt_media_id, e.expense_status, \
-                e.journal_entry_id, e.created_by, e.created_at \
+                e.amount::text, e.tax_amount::text, e.currency, e.receipt_media_id, \
+                e.expense_status, e.employee_user_id, e.journal_entry_id, e.created_by, e.created_at \
          from accounting_expenses e \
-         where e.organization_id = $1",
+         where e.organization_id = ",
     );
-    if status.is_some() {
-        sql.push_str(" and e.expense_status = $2");
-    }
-    if category.is_some() {
-        sql.push_str(" and e.category = $3");
-    }
-    if search.is_some() {
-        sql.push_str(
-            " and (e.description ilike $4 or e.vendor ilike $4 or e.note ilike $4 \
-               or coalesce('EXP-' || lpad(e.expense_number::text, 6, '0'), '') ilike $4)",
-        );
-    }
-    if from.is_some() {
-        sql.push_str(" and e.expense_date >= $5");
-    }
-    if to.is_some() {
-        sql.push_str(" and e.expense_date <= $6");
-    }
-    if cursor.is_some() {
-        sql.push_str(
-            " and (e.expense_date, coalesce(e.expense_number, 0), e.id) < \
-             (select expense_date, coalesce(expense_number, 0), id from accounting_expenses \
-              where id = $7)",
-        );
-    }
-    // **The second key is load-bearing.** `expense_date` alone ties for every expense spent on the
-    // same day — which is most of a week's receipts — and the tiebreak would fall to
-    // `gen_random_uuid()`, so the list would reshuffle on every load. `now()` is
-    // transaction-stable, which is the same fact slice 3's allocation ordering tripped over.
-    sql.push_str(
-        " order by e.expense_date desc, coalesce(e.expense_number, 0) desc, e.id desc limit $8",
-    );
+    query.push_bind(organization_id);
 
-    let mut query = sqlx::query(&sql).bind(organization_id);
     if let Some(status) = status {
-        query = query.bind(status.as_str());
+        query.push(" and e.expense_status = ").push_bind(status.as_str());
     }
     if let Some(category) = category {
-        query = query.bind(category);
+        query.push(" and e.category = ").push_bind(category);
     }
     if let Some(term) = search.map(str::trim).filter(|s| !s.is_empty()) {
-        query = query.bind(format!("%{}%", escape_like(term)));
+        if term.chars().count() > crate::store::MAX_SEARCH_LENGTH {
+            return Err(AccountingError::InvalidQuery(format!(
+                "a search term is at most {} characters",
+                crate::store::MAX_SEARCH_LENGTH
+            )));
+        }
+        // LIKE on a substring of the four things a person knows: what it was, who was paid, what
+        // the filer wrote, and the number they were given. Parameters on both sides, so a term
+        // containing `%` is a literal rather than a wildcard that matches the whole table.
+        let pattern = format!("%{}%", escape_like(term));
+        query
+            .push(" and (e.description ilike ")
+            .push_bind(pattern.clone())
+            .push(" or e.vendor ilike ")
+            .push_bind(pattern.clone())
+            .push(" or e.note ilike ")
+            .push_bind(pattern.clone())
+            .push(
+                " or coalesce('EXP-' || lpad(e.expense_number::text, 6, '0'), '') ilike ",
+            )
+            .push_bind(pattern)
+            .push(")");
     }
     if let Some(from) = from {
-        query = query.bind(from);
+        query.push(" and e.expense_date >= ").push_bind(from);
     }
     if let Some(to) = to {
-        query = query.bind(to);
+        query.push(" and e.expense_date <= ").push_bind(to);
     }
     if let Some(cursor) = cursor {
-        query = query.bind(cursor);
+        // A row-comparison keyset rather than an offset: an offset skips or repeats rows while the
+        // table is being written to, which on an expense list is every day somebody files one.
+        query
+            .push(" and (e.expense_date, coalesce(e.expense_number, 0), e.id) < (select expense_date, coalesce(expense_number, 0), id from accounting_expenses where id = ")
+            .push_bind(cursor)
+            .push(")");
     }
-    let rows = query.bind(limit + 1).fetch_all(pool).await?;
+    // **The second sort key is load-bearing.** `expense_date` alone ties for every expense spent on
+    // the same day — which is most of a week's receipts — and the tiebreak would fall to
+    // `gen_random_uuid()`, so the list would reshuffle on every load. `now()` is
+    // transaction-stable, which is the same fact slice 3's allocation ordering tripped over.
+    query.push(
+        " order by e.expense_date desc, coalesce(e.expense_number, 0) desc, e.id desc limit ",
+    );
+
+    let rows = query.push_bind(limit + 1).build().fetch_all(pool).await?;
 
     // The extra row is how "there is more" is decided without a count query, which on an expense
     // table a reporting screen scans anyway is the wrong thing to pay for on every page load.

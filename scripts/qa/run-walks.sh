@@ -31,7 +31,12 @@ for name in $("$BINARY" --list 2>/dev/null | grep ': test$' | sed 's/: test//');
     PGPASSWORD=omnion createdb -h 127.0.0.1 -p 5433 -U omnion "$database" 2>/dev/null || true
 
     export OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/${database}"
-    output="$(timeout 120 "$BINARY" --exact "$name" --test-threads=1 2>&1)"
+    # **300 seconds, and the reason is stated here rather than discovered.** Under the box's
+    # normal load (a dozen writers, load average 100+) a walk that migrates a fresh database takes
+    # well over two minutes, and `timeout 120` killed all eleven at once — which the runner
+    # reported as eleven "NO RESULT LINE"s. A timeout that fires under load is indistinguishable
+    # from a hang, so the budget has to cover the slow case rather than the average one.
+    output="$(timeout 300 "$BINARY" --exact "$name" --test-threads=1 2>&1)"
     # **Parse on `result: ok` / `result: FAILED`**, which are the two words libtest actually prints
     # — not on a pattern that happens to match one of them. The first version of this script grepped
     # for `test result: [a-z]*\.` and therefore matched neither `ok.` nor `FAILED.`, so eleven real

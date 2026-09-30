@@ -25,7 +25,18 @@
 alter table accounting_expenses
     add column if not exists expense_number bigint,
     add column if not exists decided_by uuid,
-    add column if not exists rejection_comment text not null default '';
+    add column if not exists rejection_comment text not null default '',
+    -- `0167` never created these two, although its own spec lists them. `note` is the filer's free
+    -- text; `decision_reason` is what the *approver* wrote, and one column cannot be both — the
+    -- filer does not know the decision when they write, and overwriting one with the other loses
+    -- whichever was there first. Every write that named `note` failed with
+    -- `column "note" of relation "accounting_expenses" does not exist`, which is a 500 on the
+    -- create route and therefore on the whole module.
+    add column if not exists note text not null default '',
+    -- Who spent it, for an organization that reimburses its staff. Nullable: an expense paid
+    -- directly to a supplier has no employee behind it, and a NOT NULL here would force a
+    -- placeholder row that reads like a person.
+    add column if not exists employee_user_id uuid references users (id) on delete set null;
 
 comment on column accounting_expenses.expense_number is
   'Per-organization sequence number, allocated the same way as a journal entry (max + 1 for '

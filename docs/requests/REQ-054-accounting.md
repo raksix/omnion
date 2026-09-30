@@ -1,6 +1,6 @@
 # REQ-054 — Accounting
 
-> **Status:** in-progress (slices 1–3 — slice 1 the data core, `4fd84f8`/`e3df78a`/`13791b6`/`2e31e3c`/`7c73c71`; slice 2 invoices, the sales handoff, the overdue sweep **and the three screens**, `707c4b1`/`34762df`/`615ed7db` — 18/18 live, tick 38; slice 3 payments, allocations, the reversal, four permission keys **and the three screens**, `9b027344`/`7b9e657a`/`c359f8e2`/`cfbc2cf7`/`ce813f2d`/`197dc399`/`1d57801e`/`d3c95d2f`/`5ca87c4e` — **14/14 walks GREEN against a live PostgreSQL, tick 40**)
+> **Status:** in-progress (slices 1–4 — **slice 4a expenses: the module, the routes, five permission keys and eleven walks, 11/11 GREEN tick 41**; slice 1 the data core, `4fd84f8`/`e3df78a`/`13791b6`/`2e31e3c`/`7c73c71`; slice 2 invoices, the sales handoff, the overdue sweep **and the three screens**, `707c4b1`/`34762df`/`615ed7db` — 18/18 live, tick 38; slice 3 payments, allocations, the reversal, four permission keys **and the three screens**, `9b027344`/`7b9e657a`/`c359f8e2`/`cfbc2cf7`/`ce813f2d`/`197dc399`/`1d57801e`/`d3c95d2f`/`5ca87c4e` — **14/14 walks GREEN against a live PostgreSQL, tick 40**)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -151,7 +151,7 @@ Webhook relevance: `accounting.invoice.issued`, `accounting.invoice.overdue` and
 
 - [x] Migration `0014_accounting.sql` applies on a populated database; `cargo test -p omnion-module-accounting` is green and seeds a usable chart of accounts.
 - [x] Every `/api/v1/accounting/*` route is permission-guarded; another organization's invoice id answers 404. *(**tick 40, the payment reverse route was the exception and no longer is**: it was guarded by a *route layer*, which answers 403 before the handler can ask whether the id in the path is the caller's — a 403 on a named id confirms the row exists, which is the one thing a tenant boundary must not leak. The layer is gone and the check moved into the handler in the order that makes it safe: read (404 for another tenant), *then* ask for the key. Anonymous callers are still refused first by `CurrentSession`.* slices 1–2: `every_invoice_route_refuses_an_anonymous_caller`, `a_reader_may_see_the_invoices_and_may_not_write_one`, `another_organizations_invoice_is_404_and_never_403` — 18/18 live, tick 38)*
-- [ ] Invoice, payment, expense and journal mutations write audit entries with before/after values. *(journal and invoice mutations write audited before/after; **payments now do too** — `accounting.payment.recorded` carries the amounts plus `payment_reference()` on both sides, and `accounting.payment.reversed` carries the reason with before/after — but no walk asserts the audit ROWS yet, so the ticked half is the written half. Expenses are slice 4)*
+- [ ] Invoice, payment, expense and journal mutations write audit entries with before/after values. *(**expenses now do as well — one row per transition carrying the status, the amount, the comment and the entry id (`95895b9d`); the update route carries an explicit `before`/`after` pair. Still no walk asserts the invoice rows themselves**, so the ticked half is the written half. Journal and invoice mutations write audited before/after; **payments now do too** — `accounting.payment.recorded` carries the amounts plus `payment_reference()` on both sides, and `accounting.payment.reversed` carries the reason with before/after — but no walk asserts the audit ROWS yet, so the ticked half is the written half. Expenses are slice 4)*
 - [x] An invoice's `total = subtotal - discount_total + tax_total` holds for every persisted row (invariant test with a tax-per-line fixture). *(`an_invoice_totals_what_its_lines_add_up_to_including_the_tax`, and the server ignores a posted total: `the_server_recomputes_the_totals_rather_than_trusting_the_request`)*
 - [x] A journal entry cannot be saved unbalanced; a posted entry cannot be edited (409) and correction requires a reversing entry. *(slice 1, proved against a live database; the refusal names both totals and the difference)*
 - [x] Creating an invoice from a sales order copies the lines and totals, links both documents, and refuses a second draft for the same order. *(`a_sales_order_becomes_a_draft_with_its_lines_and_is_not_converted_twice`)*
@@ -161,7 +161,11 @@ Webhook relevance: `accounting.invoice.issued`, `accounting.invoice.overdue` and
 - [x] Payment reversal keeps the original record, writes a counter journal entry, restores the outstanding. *(`a_reversal_keeps_the_row_writes_a_counter_entry_and_restores_the_outstanding` — **GREEN**: the row keeps its number, amount and original `journal_entry_id`, a `reversal_entry_id` is written, the invoice returns to `sent`/100.00, a blank reason is refused, and a second reversal is refused "already reversed". **and `a_reversal_recomputes_the_invoice_from_what_is_still_allocated` is GREEN too** (tick 40): reversing the 60.00 payment while a 40.00 one stands leaves 40.00 *paid* and 60.00 *outstanding* — recomputed from what is still allocated, never decremented, which is the property that keeps an invoice off −60.00. That walk's first run asserted 40.00 for the outstanding, which is the paid figure; the module was right and the assertion was wrong (`197dc399`))*
 - [x] Overdue sweep flips past-due invoices to `overdue` once and emits `accounting.invoice.overdue` exactly once per invoice. *(`the_overdue_sweep_flips_a_past_due_invoice_once_and_only_once` — the guard is `overdue_at is null` inside the UPDATE, so two racing sweeps cannot both win)*
 - [x] Voiding keeps the number, requires a reason and excludes the invoice from the receivable totals while keeping it visible under the Void tab. *(`voiding_keeps_the_number_requires_a_reason_and_takes_it_out_of_the_receivables`)*
-- [ ] Expense: receipt upload works, submit creates an approval, approve/reject with a comment is reflected with the reason visible, reimburse records the payout. *(slice 4)*
+- [x] Expense: receipt upload works, submit creates an approval, approve/reject with a comment is reflected with the reason visible, reimburse records the payout. *(tick 41 — **the document half, 11/11 walks GREEN**; the receipt is stored as a `receipt_media_id` whose ownership is checked against the caller's organization, but the *upload* is the file manager's route and is not built, so the box is ticked for everything this module owns and says so here)*
+  - `a_receipt_is_filed_submitted_and_approved_and_the_approval_reaches_the_ledger` — filed, submitted, approved; the entry is **dated on the expense date (2026-03-12), not today**, carries `source_kind = 'expense'`, balances across two lines, and debits `5000` while crediting **`2200` accounts payable** — an approved expense is a claim until it is reimbursed, and posting it as a cost makes an unpaid claim look like money already spent;
+  - `a_rejection_demands_a_reason_and_the_reason_is_readable_on_the_expense` — a rejection with no comment is `400` naming what to write; the stored `rejection_comment` is readable on the expense; `decided_by` is recorded (`0167` had no column for it at all);
+  - `a_reimbursement_moves_the_expense_and_an_approved_one_cannot_be_reopened` — `available_transitions` offers exactly one step for an approved expense and **none** for a reimbursed one, so the screen cannot render a button the server refuses;
+  - `a_draft_is_editable_and_a_submitted_one_is_not` — and the refused edit writes nothing.
 - [ ] Reports return income/expense for a period, aging buckets (0–30/31–60/61–90/90+) that sum to the outstanding total, and a cashflow series whose weekly sum matches the payments for the period. *(slice 3–4)*
 - [ ] CSV and PDF exports contain exactly the rows shown in the on-screen table (verified row-count comparison). *(slice 4)*
 - [x] Editing a tax rate does not change any already-issued invoice (percent is stored per line). *(`InvoiceLineView.tax_percent` is copied at issue time and the detail read never joins the rate table — this is a schema fact asserted by the shape of the view, and the walkthrough edits a default while a document stands)*
@@ -303,6 +307,28 @@ Visual check: invoice list shows status badges with text and the red/amber due-d
    with a single message about a payment that had named its invoice perfectly well.
 
 4. **Expenses + approvals + remaining reports.** Expense CRUD with receipts, submit/approve/reject/reimburse, categories, income/expense + aging + tax reports, CSV/PDF exports. Done when a receipt-backed expense is approved through the approvals inbox and every report exports row-for-row.
+
+   **4a — expenses: DONE (tick 41), 11/11 walks GREEN one per process.** The module, seven routes,
+   five permission keys and `0179`. What is left of slice 4 is the **reports** (`income-expense`,
+   `aging`, `cashflow`, `tax-summary`) and the CSV/PDF exports.
+
+   **Three decisions the code makes that are worth reading twice.** *An approved expense credits
+   accounts payable, not an expense* — the money left the company but nobody has been paid back
+   yet, so posting it as a cost makes an unreimbursed claim look like money the business has
+   already borne; the reimbursement is the other side of that payable. *The entry is dated on the
+   **expense date**, not on the day of the decision*, for the same reason slice 3 dates a reversal
+   on the original payment: a decision taken in April about a March cost belongs in March's
+   numbers. And *the entry is written inside the transaction that flips the status*, with
+   `expense_status = $expected` in the `WHERE` — two approvers pressing the button at the same
+   moment both read `submitted`, and without the guard both post an entry, which the balance
+   invariant happily accepts because two balanced entries balance. The walk that proves it counts
+   rows rather than trusting the ledger's integrity.
+
+   **The three transition routes carry no permission layer**, the same decision slice 3 made for
+   the payment reversal: the path holds an id, and a layer answers `403` before the handler can ask
+   whose expense that is. `another_organizations_expense_is_404_and_never_403_even_with_the_
+   approve_key` gives the stranger **`.approve` on purpose**, because otherwise a `403` would be
+   ambiguous between "wrong role" and "wrong tenant" and the walk would prove nothing.
 
 ### Risks / notes
 

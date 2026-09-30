@@ -309,15 +309,22 @@ impl Fixture {
 
     /// The audit trail's newest action for an expense.
     async fn last_audit(&self, expense: Uuid) -> Option<(String, String)> {
+        // **`audit_log`, not `audit_entries`.** The table is named after what it is; a query
+        // against the other name raises `relation does not exist`, the `?` swallows it into
+        // `None`, and the walk fails with "an audit row must exist" — which reads as *the audit
+        // trail is broken* rather than *this test names a table that is not there*. The trail was
+        // written correctly the whole time.
         sqlx::query_as::<_, (String, String)>(
-            "select action, metadata::text from audit_entries \
+            "select action, metadata::text from audit_log \
              where target_id = $1::text order by created_at desc limit 1",
         )
         .bind(expense)
         .fetch_optional(self.db.pool())
         .await
-        .ok()
-        .flatten()
+        // **An error here is a failure, not a `None`.** The `.ok().flatten()` this replaces turned
+        // a wrong table name into "no audit row exists", which reads as a broken audit trail —
+        // the one thing a walk like this exists to defend. `expect` names the table.
+        .expect("the audit_log read must succeed")
     }
 }
 
@@ -435,6 +442,20 @@ fn text(value: &Value, key: &str) -> String {
         .get(key)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("the response carries {key}: {value}"))
+        .to_owned()
+}
+
+/// The message out of an error envelope.
+///
+/// **Not `body["message"]`.** The envelope is `{"error":{"code","message","details","request_id"}}`,
+/// so a flat read yields `None` and `contains(...)` on it is `false` — which turns "the refusal
+/// does not explain itself" into a failure that looks like a product defect when the module is
+/// behaving perfectly. Every message assertion in this file goes through here, so the envelope's
+/// shape is written down once.
+fn message_of(body: &Value) -> String {
+    body.pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("the refusal carries a message: {body}"))
         .to_owned()
 }
 
@@ -657,7 +678,7 @@ async fn approving_twice_posts_one_entry_because_the_guard_is_in_the_update() {
     )
     .await;
     assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
-    let message = again.body["message"].as_str().unwrap_or_default();
+    let message = message_of(&again.body);
     assert!(
         message.contains("mark reimbursed"),
         "**the refusal names the way out** — \"already approved\" sends an operator to look at \
@@ -707,10 +728,7 @@ async fn a_rejection_demands_a_reason_and_the_reason_is_readable_on_the_expense(
     .await;
     assert_eq!(silent.status, StatusCode::BAD_REQUEST, "{}", silent.body);
     assert!(
-        silent.body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("needs a reason"),
+        message_of(&silent.body).contains("needs a reason"),
         "the refusal explains why: {}",
         silent.body
     );
@@ -828,9 +846,7 @@ async fn a_reimbursement_moves_the_expense_and_an_approved_one_cannot_be_reopene
     .await;
     assert_eq!(late.status, StatusCode::CONFLICT, "{}", late.body);
     assert!(
-        late.body["message"]
-            .as_str()
-            .unwrap_or_default()
+        message_of(&late.body)
             .contains("final"),
         "an empty transition list still produces a sentence: {}",
         late.body
@@ -881,9 +897,7 @@ async fn a_reader_may_see_an_expense_and_may_not_decide_one() {
     .await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
     assert!(
-        refused.body["message"]
-            .as_str()
-            .unwrap_or_default()
+        message_of(&refused.body)
             .contains("accounting.expenses.approve"),
         "**the refusal names the missing key**: {}",
         refused.body
@@ -1006,9 +1020,7 @@ async fn a_draft_is_editable_and_a_submitted_one_is_not() {
     .await;
     assert_eq!(late.status, StatusCode::CONFLICT, "{}", late.body);
     assert!(
-        late.body["message"]
-            .as_str()
-            .unwrap_or_default()
+        message_of(&late.body)
             .contains("not a draft"),
         "the refusal says which rule: {}",
         late.body
@@ -1120,9 +1132,7 @@ async fn the_list_filters_by_status_and_searches_the_number_and_the_vendor() {
     .await;
     assert_eq!(typo.status, StatusCode::BAD_REQUEST, "{}", typo.body);
     assert!(
-        typo.body["message"]
-            .as_str()
-            .unwrap_or_default()
+        message_of(&typo.body)
             .contains("approvedd"),
         "the refusal quotes what was typed: {}",
         typo.body
@@ -1284,9 +1294,7 @@ async fn an_amount_of_zero_is_refused_with_the_reason_and_nothing_is_written() {
     .await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
     assert!(
-        refused.body["message"]
-            .as_str()
-            .unwrap_or_default()
+        message_of(&refused.body)
             .contains("more than 0.00"),
         "the refusal explains the rule rather than naming a constraint: {}",
         refused.body

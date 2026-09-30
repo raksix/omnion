@@ -8110,3 +8110,73 @@ its own timeout has verified nothing about the pages after the cut.
 "the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
 UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
 rather than a test alone. (c) Slice 4, encryption.
+
+## 2026-09-30 · REQ-054 slice 4a — expenses, and the greenest eleven walks were the ones that ran nothing
+
+**What.** The expense half of slice 4: the module (`modules/accounting/src/expenses.rs`),
+seven routes, five permission keys, migration `0179`, eleven walks. The lifecycle is a **table**
+(`draft -> submitted -> approved -> reimbursed`, with `rejected` going back to draft), so "approve a
+rejected expense" is one lookup that names the way out rather than four `if`s in four routes.
+
+**The three decisions worth reading twice.**
+
+1. **An approved expense credits accounts payable (`2200`), not an expense.** The money left the
+   company but nobody has been paid back yet, so until the reimbursement this is a *claim*;
+   posting it as a cost makes an unpaid claim look like money the business has already spent.
+2. **The entry is dated on the expense date, not on the day of the decision** — the same reason
+   slice 3 dates a reversal on the original payment. A decision taken in April about a March cost
+   belongs in March's numbers, and dating it "now" moves every month-end by however long approval
+   takes.
+3. **The entry is written inside the transaction that flips the status**, with
+   `expense_status = $expected` in the `WHERE`. Two approvers pressing the button at the same
+   moment both read `submitted`; without the guard both post an entry, and the balance invariant
+   happily accepts that because **two balanced entries balance**. The walk counts rows instead.
+
+**Proof.**
+- the eleven walks, one per process against a fresh database: **11 passed, 0 failed**;
+- `cargo test -p omnion-module-accounting --lib` **53/53** (15 new);
+- `cargo test -p omnion-permissions --lib` **68/68** (five new);
+- `cargo build -p omnion-api` green.
+
+**Five real defects, and the first one is the tick.** Every one of the eleven walks reported `ok`
+at **0.00s** on the first run — because `live_state()` answers `None` when the database will not
+migrate, the test *returns*, and libtest counts a returning test as a pass. An entire suite was
+green because none of it ran.
+
+- `e67f0891` — **`0179` declared an index as a column** (`add column if not exists
+  expenses_decided_by_idx`), so *every database failed to migrate* with `42601`. It parses as
+  text, so `git diff` showed nothing wrong.
+- `95895b9d` — **`FOR UPDATE` cannot be applied to an aggregate.** `select coalesce(max(..), 0) + 1
+  ... for update` is a 500 on *every* create: there is no row to lock. The expense number now runs
+  under `LOCK TABLE ... IN SHARE ROW EXCLUSIVE MODE`; the journal entry number follows the weaker
+  route `journal::post_entry` already proves (no lock, unique index catches the loser).
+- **Two columns the REQ's own spec lists and `0167` never created**: `note` and
+  `employee_user_id`. Every write naming `note` was a 500.
+- **The list hand-numbered its placeholders** (`$2`, `$3`, … `$8`) and bound them conditionally, so
+  a query filtering by `search` alone bound three values against `$4` and answered `500 could not
+  determine data type of parameter $4`. Now a `QueryBuilder` — the second time this loop has paid
+  for that lesson, which is why it is written down in the ledger as a rule.
+- **`numeric` has no `String` representation in sqlx without a cast**, so every list read panicked
+  with `ColumnDecode` while the module compiled and every unit test passed.
+
+**Two of the eleven were the test being wrong, not the module.** The error envelope is
+`{"error":{"message"}}`, so a flat `body["message"]` read yields `None` and every
+"the refusal explains itself" assertion failed against a module that explains itself perfectly.
+And the audit table is **`audit_log`**, not `audit_entries` — the `?` swallowed the missing-relation
+error into `None` and the walk failed with "an audit row must exist", which reads as *the audit
+trail is broken* rather than *this test names a table that is not there*.
+
+**New: `scripts/qa/run-walks.sh`.** One walk per process against its own database, and — the part
+that mattered — **a pass is only a pass when the result line says `1 passed or more`**. The first
+version of its parser grepped for `test result: [a-z]*\.`, which matches neither `ok.` nor
+`FAILED.`, so eleven genuine failures printed as "NO RESULT" and the summary read `0 passed`. Its
+timeout is 300s because a 120s budget killed all eleven under load average 119, and a timeout that
+fires under load is indistinguishable from a hang.
+
+**Not proved, and it is the browser.** No `scripts/qa/run.sh` pass ran this tick: the box sat at
+load 100–119 across a dozen writers and a single cargo build took 24 minutes. The expenses
+**screens do not exist yet** — list, form and detail — so the empty/loading/error, 390px and
+keyboard boxes stay unticked, and no screen is in the walkthrough inventory.
+
+**Next.** The three expense screens, then a QA pass on the private stack, then the reports
+(`income-expense`, `aging`, `cashflow`) and the CSV/PDF exports that finish slice 4.
