@@ -412,6 +412,34 @@ struct BatchWindow {
     through: Uuid,
 }
 
+/// The `where` fragment every heavy area's copy statement filters its source on.
+///
+/// **One function, because this clause was written out three times and one of the three was
+/// wrong.** The `match` on `bound` has two cases and they need *opposite* answers: `None` is
+/// the emptying pass and must select nothing, `Some(_)` is the copy pass and must select
+/// everything from the start on its first batch. Writing the pair out per arm is what let the
+/// translations and workflows arms end up with the cases swapped — the null-tolerant clause
+/// landed on the emptying pass, where `$4` is NULL anyway so it was harmless, and the copy pass
+/// kept the unguarded comparison, which drops the first batch. Twenty-odd walks passed because
+/// none of them asserted that a translation row *arrived*; the one that does is what found it.
+///
+/// `alias` is the alias the calling statement uses for the source table, and it is an argument
+/// rather than a constant because the same arm filters different statements under different
+/// names (`from pages p` versus `join pages src`) — and a bound qualified to a name the
+/// statement does not have is a Postgres error on the second batch, after the first has
+/// committed.
+fn source_window_clause(alias: &str, bound: Option<BatchWindow>) -> String {
+    match bound {
+        // The first batch has `after: None` and so binds `$3` to NULL, which makes a bare
+        // `id > $3` NULL rather than true. "Everything from the start" has to be said
+        // explicitly, and this arm is the only place the first batch can be reached.
+        Some(_) => format!("and ($3::uuid is null or {alias}.id > $3) and {alias}.id <= $4"),
+        // The emptying pass wants false for every row, which `is not null` gives when `$3` is
+        // NULL. The null-tolerant form here would turn it into a second, unbatched copy.
+        None => format!("and $3::uuid is not null and {alias}.id > $3 and {alias}.id <= $4"),
+    }
+}
+
 /// The source id of the `limit`-th row after `after`, or `None` when the range is exhausted.
 ///
 /// Read as a separate cheap statement rather than taken from what the copy returned, for the
@@ -590,24 +618,12 @@ async fn copy_area_once(
             // revision statements join `pages src`. Baking one alias into the clause and
             // reusing it is how a bound ends up qualified to a name the statement does not have —
             // a Postgres error at run time, on the second batch, after the first batch committed.
-            let clause = |alias: &str, window: Option<BatchWindow>| match window {
-                // The first window has NO lower bound, and that has to be expressed as "no
-                // constraint" rather than as `id > NULL`. `$3` bound to a NULL makes
-                // `id > $3` evaluate to NULL, which is not true, so the first batch would copy
-                // nothing and every row below the first window's upper bound would be lost —
-                // and the loss is invisible, because the job's own `items_done` is the sum of
-                // what the batches copied and therefore agrees with itself.
-                //
-                // `($3::uuid is null or {alias}.id > $3)` is the form that says "everything from
-                // the start" when there is no lower bound. The emptying pass uses the same
-                // clause with the opposite polarity, so the two are one shape rather than two.
-                Some(_) => format!("and ($3::uuid is null or {alias}.id > $3) and {alias}.id <= $4"),
-                None => format!(
-                    "and $3::uuid is not null and {alias}.id > $3 and {alias}.id <= $4"
-                ),
-            };
-            let page_clause = clause("p", bound);
-            let src_clause = clause("src", bound);
+            // Both statements filter on the same window, under two different aliases — the page
+            // insert selects `from pages p` while the revision statements join `pages src`.
+            // The clause itself is [`source_window_clause`], shared with the other two heavy
+            // arms; the reasoning for its two cases lives there, in one place.
+            let page_clause = source_window_clause("p", bound);
+            let src_clause = source_window_clause("src", bound);
             let bind_window = bound;
             // The page copy is two statements because revisions hang off pages: copying a page
             // row without its revisions would leave the staging page with no draft to edit,
@@ -708,15 +724,24 @@ async fn copy_area_once(
             // shape this batching was written for — the page area's own count is a fraction of
             // the real work in a translated site.
             //
-            // The `is null or` in the window clause is the same fix the pages arm needed and the
-            // one this arm was missing: `t.id > $3` with a NULL `$3` is NULL — neither true nor
-            // false — so the first and only batch of a site with fewer translations than the
-            // batch size copied nothing and the job reported `done`. All three heavy areas are
-            // fixed together, or the fourth one becomes next week's bug report.
+            // The window, and the polarity here is the same one the pages arm uses — **in the
+            // same order**, which is the point. `Some(_)` is the copy pass and `None` is the
+            // emptying pass, and the two need *opposite* answers to the same question:
             //
-            // **And the `resource_id` is remapped, not copied.** That is a second, independent
-            // defect, and it is the one that kept the translation count at zero even after the
-            // window was right.
+            //   * `Some(_)`: the FIRST batch has `after: None`, so `$3` is bound to NULL even
+            //     though a window exists. A bare `t.id > $3` is then NULL — neither true nor
+            //     false — so the first batch copies nothing and the job reports `done`. It has
+            //     to be `($3::uuid is null or t.id > $3)`: "everything from the start" when
+            //     there is no lower bound, which is what the first window means.
+            //   * `None`: the emptying pass wants the predicate FALSE for every row, which
+            //     `$3::uuid is not null` says when `$3` is NULL. The null-tolerant form here
+            //     would make this pass a second, unbatched copy.
+            //
+            // **These two branches were the wrong way round** and twenty-odd walks passed: the
+            // null-tolerant clause was written into the emptying pass (harmless — `t.id <= $4`
+            // is NULL with no `$4`, so it still selected nothing) while the copy pass kept the
+            // unguarded form and therefore dropped the first batch. The one walk that asserts
+            // a translation actually landed is what found it: `left: 0, right: 1`.
             //
             // The page arm mints a **fresh id** per staging page (migration 0148: a shared id
             // would make a revision, a translation and an analytics row ambiguous across
@@ -730,10 +755,7 @@ async fn copy_area_once(
             // by being a genuinely new `(resource_id, environment_id)` pair, so nothing failed
             // and nothing warned. The row was simply attached to nothing — and the one walk in
             // the repo that ever asserted a translation landed found it.
-            let clause = match bound {
-                Some(_) => "and t.id > $3 and t.id <= $4",
-                None => "and ($3::uuid is null or t.id > $3) and t.id <= $4",
-            };
+            let clause = source_window_clause("t", bound);
             let copied = sqlx::query(&format!(
                 "insert into translations (id, organization_id, resource_type, resource_id, language, \
                      field, value, created_by, created_at, updated_at, environment_id) \
@@ -779,14 +801,13 @@ async fn copy_area_once(
             // request's data model: this table has `trigger_kind`/`steps`, not `key`/`definition`,
             // and a copy statement written from a spec's nouns fails on the first run with a
             // column error that names the column rather than the mismatch.
-            // Same shape as the translations arm above, and the same reason: this arm kept the
-            // `w.id > $3` form, so a site with fewer workflow definitions than the batch size
-            // copied none of them and the job reported `done`. The three heavy areas are fixed
-            // together or the fourth one is a bug report.
-            let clause = match bound {
-                Some(_) => "and w.id > $3 and w.id <= $4",
-                None => "and ($3::uuid is null or w.id > $3) and w.id <= $4",
-            };
+            // Same window, same polarity, same order as the translations arm above — and that
+            // is the second place these two branches were the wrong way round. `Some(_)` is the
+            // copy pass, and the FIRST batch arrives with `after: None`, so a bare `w.id > $3`
+            // there is a comparison against NULL and the first batch copies nothing while the
+            // job still reports `done`. A site with fewer workflow definitions than the batch
+            // size therefore cloned zero of them and said it had copied them all.
+            let clause = source_window_clause("w", bound);
             sqlx::query(&format!(
                 "insert into workflows (id, organization_id, site_id, name, description, enabled, \
                      trigger_kind, schedule, next_run_at, steps, trigger_event, conditions, \
@@ -887,6 +908,75 @@ mod tests {
         };
         assert!(first.after.is_none());
         assert_eq!(second.after, Some(first.through));
+    }
+
+    /// The regression the inverted match would pass.
+    ///
+    /// The defect was not in either clause — each one is correct on its own — it was in **which
+    /// case held which**. So asserting a clause's *content* proves nothing; what has to be
+    /// asserted is the *pair*, and specifically the asymmetry between the two passes:
+    ///
+    ///   * the copy pass (`Some`) must tolerate a NULL lower bound, because the first batch has
+    ///     `after: None`;
+    ///   * the emptying pass (`None`) must reject that same NULL, or it becomes a second copy.
+    ///
+    /// A test that checked each string in isolation would have been green for the broken code,
+    /// because both strings existed in it — in the wrong slots.
+    #[test]
+    fn the_copy_pass_tolerates_the_first_batchs_absent_lower_bound() {
+        let first = BatchWindow {
+            after: None,
+            through: Uuid::from_u128(0x2000),
+        };
+        let copy_pass = source_window_clause("t", Some(first));
+        assert!(
+            copy_pass.contains("is null or t.id > $3"),
+            "the copy pass dropped the first batch: a batch with no lower bound is a comparison \
+             against NULL, which is not true, so the batch copies nothing and the job still \
+             reports done. Clause was: {copy_pass}"
+        );
+        assert!(
+            copy_pass.contains("t.id <= $4"),
+            "the copy pass must carry the window's upper bound: {copy_pass}"
+        );
+
+        let emptying_pass = source_window_clause("t", None);
+        assert!(
+            emptying_pass.contains("is not null"),
+            "the emptying pass must select nothing when there is no window, or it is an \
+             unbatched second copy. Clause was: {emptying_pass}"
+        );
+        assert_ne!(
+            copy_pass, emptying_pass,
+            "the two passes must differ: one copies the window, the other empties the target"
+        );
+    }
+
+    /// Every heavy area filters on the same clause, so a copy statement cannot drift from the
+    /// window the batch loop computed.
+    #[test]
+    fn every_heavy_area_filters_through_the_same_window_clause() {
+        // The three arms take their alias from the statement they build, and an alias that does
+        // not exist in the statement is a Postgres error on the second batch, after the first has
+        // committed — so the alias is part of what is being asserted here, not an argument.
+        for (area, alias) in [
+            (Area::Pages, "p"),
+            (Area::Pages, "src"),
+            (Area::Translations, "t"),
+            (Area::Workflows, "w"),
+        ] {
+            let window = BatchWindow {
+                after: Some(Uuid::from_u128(0x1000)),
+                through: Uuid::from_u128(0x2000),
+            };
+            let clause = source_window_clause(alias, Some(window));
+            assert!(
+                clause.contains(&format!("{alias}.id > $3")) && clause.contains("$4"),
+                "{}/{} does not carry its own alias into the window: {clause}",
+                area.as_str(),
+                alias
+            );
+        }
     }
 
     #[test]
