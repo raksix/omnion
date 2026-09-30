@@ -2240,12 +2240,21 @@ export type HealthOverview = {
   sample_count: number;
 };
 
-/** One metric of one service, with the newest value it published. */
+/** One metric of one service, with the newest value it published and its 24 h trend. */
 export type HealthServiceMetric = {
   metric: string;
   value: number;
   unit: string;
   sampled_at: string;
+  /**
+   * The metric's values over the last 24 h, oldest first.
+   *
+   * Empty when the window holds no samples — and empty is a real answer here, because
+   * a platform whose history was pruned or never recorded is genuinely unknown, not zero.
+   * The screen draws a dot for one point and a line for two or more, so this array is the
+   * only thing separating a real trend from an empty box.
+   */
+  series: number[];
 };
 
 /** `GET /api/v1/health/services/{key}`. */
