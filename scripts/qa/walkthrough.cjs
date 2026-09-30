@@ -738,8 +738,14 @@ function signInValueFor(meta) {
 }
 
 async function fillSubtree(page, selector) {
-  return page.evaluate((sel) => {
-    const root = document.querySelector(sel);
+  // The slug is **passed in**, not closed over: a `page.evaluate` body runs in the browser, where
+  // this file's module-scope `SAMPLE_SLUG` does not exist. Referencing it from inside threw
+  // `ReferenceError: SAMPLE_SLUG is not defined` on every screen this filler reached — and the
+  // throw was swallowed by the caller's `.catch()`, so the fill silently did nothing and the
+  // screen reported a clean pass. `interact`'s own `sampleValueFor` is the Node-side twin of
+  // this and reads the constant legitimately; the two must be given their value the same way.
+  return page.evaluate(({ selector, slug }) => {
+    const root = document.querySelector(selector);
     if (!root) return [];
     const filled = [];
     const inputs = [...root.querySelectorAll("input, select, textarea")].filter((el) => el.type !== "hidden" && !el.disabled);
@@ -767,7 +773,7 @@ async function fillSubtree(page, selector) {
       else if (el.type === "password") value = "Sample-Passw0rd!";
       else if (el.type === "url" || /url|endpoint/.test(key)) value = "https://api.omnion.test/v1";
       else if (el.type === "number") value = "42";
-      else if (/slug|key/.test(key)) value = SAMPLE_SLUG;
+      else if (/slug|key/.test(key)) value = slug;
       else if (/title|name/.test(key)) value = "QA Sample";
       else if (el.tagName === "TEXTAREA") value = "QA sample text written by the automated walkthrough.";
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -777,7 +783,7 @@ async function fillSubtree(page, selector) {
       filled.push({ field: (el.id || el.name || el.type || "input").slice(0, 40), value });
     }
     return filled;
-  }, selector);
+  }, { selector, slug: SAMPLE_SLUG });
 }
 
 async function clickPrimaryIn(page, selector) {
