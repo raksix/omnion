@@ -51,7 +51,16 @@ const CATEGORY_LINE: Record<string, string> = {
   mention: "Mentions",
 };
 
-const CHANNEL_LINE: Record<string, string> = {
+/**
+ * How each channel is named in prose, wherever a channel is shown to a person.
+ *
+ * **One map for three screens** — the settings matrix, the preference form and the delivery
+ * rows in the detail drawer. "In-app" spelled three ways is one of them wrong within a month,
+ * and a reader who sees "In app" on one screen and "In-app" on the next reasonably concludes
+ * they are different channels. Exported rather than redeclared per screen, which is the whole
+ * point: this file is where the vocabulary lives.
+ */
+export const CHANNEL_LINE: Record<string, string> = {
   in_app: "In-app",
   email: "E-mail",
   web_push: "Web Push",

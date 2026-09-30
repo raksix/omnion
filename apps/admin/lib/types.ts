@@ -872,6 +872,37 @@ export type NotificationRow = {
   read_at: string | null;
   archived_at: string | null;
   created_at: string;
+  /**
+   * One row per channel the notification was tried on, oldest first. Empty means nothing has
+   * been attempted yet — which is a real state, not a failure to load.
+   *
+   * **Only the detail route fills this.** The list is a page of rows the reader has not opened,
+   * so carrying deliveries there would cost one query per row to say "nothing was sent" about
+   * notifications nobody has clicked.
+   */
+  deliveries: NotificationDeliveryRow[];
+};
+
+/**
+ * What became of one channel, as the reader is shown it.
+ *
+ * The drawer exists so that "it is in my panel but the e-mail never arrived" is a row somebody
+ * can read rather than an absence they have to interpret. `attempts`/`max_attempts` are carried
+ * together for that reason: "failed" on its own does not say whether the platform tried once or
+ * gave up.
+ */
+export type NotificationDeliveryRow = {
+  channel: NotificationChannel;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  max_attempts: number;
+  /** The transport's own status code, when it answered with one. */
+  response_status: number | null;
+  /** Why it did not go out, in the platform's words. */
+  error: string | null;
+  sent_at: string | null;
+  /** When the next attempt is due; `null` once the row is no longer retryable. */
+  next_attempt_at: string | null;
 };
 
 /** One grouped line of the bell. */
@@ -931,6 +962,16 @@ export const NOTIFICATION_CHANNELS = [
   "webhook",
   "chat",
 ] as const;
+
+/**
+ * One of the five channels, as a type.
+ *
+ * Derived from the const rather than written out, so a channel added to the list is a channel
+ * the delivery rows can be typed with. A hand-written union is one more list to keep in step,
+ * and a channel in the database that the union does not name is a `type` error rather than a
+ * runtime surprise — which is the direction that catches it.
+ */
+export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
 
 // ---------------------------------------------------------------------------------------------
 // Slice 2: the reader's own channel configuration
