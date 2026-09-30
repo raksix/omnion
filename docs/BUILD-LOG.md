@@ -6932,3 +6932,75 @@ next-run cell carries a date and the zone, and this tick explains why that cell 
 with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
 belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
 this tick looked at.
+
+## 2026-09-30 · tick 73 · five ticks of "the box" were three defects in the gate
+
+**What.** REQ-017's browser gate has been recorded as owed for five consecutive ticks, and every
+one of those entries gave the reason as the box: a sibling held the QA slot, `/mnt/apopic` was at
+100%, load was 13–20. This tick ran the pass four times and found that the box was never the
+reason. **The depth pass had never executed a single line of its own body.** Three defects in the
+harness sat between the route inventory and the first assertion, each of which ends in a message
+that names a resource rather than a cause.
+
+| # | Defect | How it presents | What it really was |
+| --- | --- | --- | --- |
+| 1 | `fillSubtree`'s `page.evaluate` body closed over the module-scope `SAMPLE_SLUG` | `ReferenceError: SAMPLE_SLUG is not defined` | The body runs **in the browser**; the constant is a Node binding. The throw was swallowed by the caller's `.catch()`, so the fill silently did nothing and the screen reported a clean pass. |
+| 2 | `runEnvironmentsDepth` pushed findings into `report.findings` | `TypeError: Cannot read properties of undefined (reading 'push')` | The findings list and its `pushFindings` helper are declared **inside `main()`** at the roll-up, so no depth pass can reach them and `report.findings` has never existed. Two sites, one at the wizard's area step and one just before the submit. |
+| 3 | `clickPrimaryIn` ignored `data-qa-guard` | the depth pass: "the wizard submitted but no environment with key `qa-staging-…` exists" | The guard was read in `interact`'s inventory and nowhere else. The generic pass fills the wizard with sample values and clicks the first button in the dialog, so it created a real staging environment under the key `qa-sample`; the depth pass then looked for its own key and correctly found nothing. |
+
+**The two that matter as a class.** Defects 1 and 3 are the same shape: **a promise the harness
+makes in one code path and keeps in another.** Defect 1 is a value that exists on one side of a
+`page.evaluate` boundary; defect 3 is a contract honoured in the inventory loop and bypassed in the
+click. In both cases the guarded path is the one that *looks* protected — the attribute is there,
+the mechanism is documented — and the unprotected path is the one that acts. A guard that is
+declared but not enforced at the point of action is worse than no guard, because the declaration
+is what a reader trusts.
+
+**The three-tick story that was wrong.** `qa-staging-1790738424541` did not exist, and the log's
+`environments:` line said so with no cause. The screenshot taken at that moment shows **step 4 of
+4, `Create and clone` enabled, a valid derived host, no error text** — the product was never the
+suspect. The gate could not tell a working button from a dead one, because the click was
+`page.click(...).catch(() => {})` followed by a database assertion: a refused host, a 403, a 500
+and a click that never fired are the same line. The submit is now a locator click raced against
+`waitForResponse`, and the status and body come back in the pass's own steps (`0675d05d`).
+
+**A fourth defect, in the slot itself, found by hand twice.** `qa-slot.sh` reaped stale places
+**once, before the first check**. A pass that then waited could not clear a place whose owner had
+been killed: killing a pass does not run `run.sh`'s EXIT trap, so the place and its holder file
+survive with a dead pid, and the only pass able to reap them is the one blocked on them. This tick
+cleared two such places manually — both left by this loop's own timed-out passes. The wait loop
+now reaps between checks (`e497dade`).
+
+**A fifth, and the reason the pass measured 10 migrations.** A stale `omnion-api` (pid 3467582)
+was still listening on `:18084` from a previous pass, so `run.sh`'s `wait_http` succeeded against
+a process whose database had just been dropped and recreated. The seed then failed on a column
+migration 0123 adds, and the failure named the *schema* rather than the orphan holding the port.
+`pm2 delete` does not reach a process that is not in pm2's table; `ss -tlpn | grep 18084` and
+`kill -9` did.
+
+| Gate | Result |
+| --- | --- |
+| `omnion-environment --lib` | **59/0** (57 + two new window-clause regression tests) |
+| `refactor(environments)` | `source_window_clause(alias, bound)` — the three heavy areas each spelled out the same `match`, and translations and workflows had the cases **the wrong way round**: the null-tolerant form sat on the emptying pass (harmless, `$3` is NULL anyway) while the copy pass kept `id > $3`, which is NULL rather than true. A site with fewer translations than the batch size cloned zero of them and the job reported `done`. `6a275197` |
+| `apps/admin` `tsc --noEmit` | clean |
+| QA browser pass, `QA_ONLY=environments` | **still red** — 4 runs, each one further than the last: `SAMPLE_SLUG` → `report.findings` → the guard bypass → the submit measurement. The fifth died at `page.goto: Target page, context or browser has been closed` before the first route, with load 3.7 and 16 GB free: a renderer that will not start is the box, and this entry is not claiming otherwise. |
+
+**What is not claimed.** No REQ criterion is ticked. The media-blob criterion still has an
+unexecuted walk (it was written last tick and has never been run), and `runEnvironmentsDepth` has
+still not reached a single one of its clone, detail, re-clone, promotion or archive claims. Four
+gates that could not run were repaired; what they will say is next tick's measurement.
+
+**Two mistakes of my own, both recorded in the ledger.** (1) I read "no walk measures a storage
+object count" and wrote a 130-line signed `ListObjects` walk — against a suite that has contained
+exactly that walk since the previous tick's commit. The box was unticked because the walk **had
+never been executed**, not because it did not exist; `grep -c` answers that in one call and I did
+not make it. (2) I appended lessons to `ledger.md` with `read_file` + `write_file` on a file I had
+only read the tail of — 1088 lines became 30 in one call. Recovered in full from
+`~/.hermes/state.db`'s `messages.tool_calls`, which holds the verbatim arguments of all 39
+historical appends: 166 bullets, replayed in timestamp order.
+
+**Next.** (a) The pass, when the box allows a renderer to start — the harness is now capable of
+reaching the assertions for the first time, so the next failure is a *product* finding and can be
+acted on. (b) Run `a_clone_copies_content_and_leaves_every_media_byte_where_it_was`, which has
+never executed; it closes the last unticked non-browser criterion on REQ-017. (c) Then the
+environment chip and the non-dismissible banner, which are the two remaining browser claims.
