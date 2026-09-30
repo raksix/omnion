@@ -9860,9 +9860,26 @@ async function runWorkflowBuilderDepth(page, report) {
         edges: spine(),
       },
       // A loop: a1 → t1 closes a ring back to the trigger.
+      //
+      // The second edge leaves the SAME port as `a1 → e1`, which is the point: a walk that
+      // follows only the first edge out of a node never reaches the second, so this ring was
+      // invisible to validation and the rule would have been stored as valid. The `false`
+      // branch below is the shape an author actually draws ("retry until it passes") and it
+      // closes the same way.
       cycle: {
         nodes: [trigger("t1"), act("a1"), finish("e1")],
         edges: [...spine(), edge("a1", "t1", "success")],
+      },
+      // The same loop closing on the port the walk never takes — the one the server's own
+      // traversal missed. A condition with a retry branch, which is the common shape.
+      cycle_on_a_branch: {
+        nodes: [trigger("t1"), { ...act("c1"), type: "condition.if" }, act("a1"), finish("e1")],
+        edges: [
+          edge("t1", "c1", "out"),
+          edge("c1", "a1", "true"),
+          edge("a1", "e1", "success"),
+          edge("c1", "t1", "false"),
+        ],
       },
       multiple_triggers: {
         nodes: [trigger("t1"), trigger("t2"), act("a1"), finish("e1")],
@@ -9923,6 +9940,14 @@ async function runWorkflowBuilderDepth(page, report) {
     cycle: {
       found: validationClasses.cycle?.codes?.includes("graph_cycle"),
       names: validationClasses.cycle?.firstMessage ?? "",
+    },
+    // The branch-closing ring. It is a separate row because it failed while the row above
+    // passed: the server's walk took only the first edge out of each node, so a loop drawn
+    // on a `false` branch was stored as valid. One row for both would have hidden it.
+    cycleOnABranch: {
+      found: validationClasses.cycle_on_a_branch?.codes?.includes("graph_cycle"),
+      codes: validationClasses.cycle_on_a_branch?.codes ?? [],
+      names: validationClasses.cycle_on_a_branch?.firstMessage ?? "",
     },
     twoTriggers: {
       found: validationClasses.multiple_triggers?.codes?.includes("multiple_triggers"),
@@ -10334,6 +10359,14 @@ note({
     // a button that was missing was less bad than a button that was a dead end.
     const keepMineOffered = (await page.locator("[data-save-keep-mine]").count()) > 0;
     let afterKeepMine = { state: "", version: null, nodeGone: null };
+    // Read the banner BEFORE the second exit is taken. "Keep mine" resolves the conflict and
+    // the banner leaves the tree, so a reading taken afterwards is the empty string — which
+    // says nothing about the banner and reads exactly like a banner that names no version.
+    // The criterion is about what the author is *shown*, and the only moment it is shown is
+    // the moment before they answer it.
+    const conflictText = (await page.locator("[data-save-state='conflict']").first().innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim();
     if (conflictState === "conflict" && keepMineOffered) {
       await page.locator("[data-save-keep-mine]").first().click({ timeout: 8000 }).catch(() => {});
       let keptState = "";
@@ -10352,9 +10385,6 @@ note({
         nodeGone: stored?.node_count ?? null,
       };
     }
-    const conflictText = (await page.locator("[data-save-state='conflict']").first().innerText().catch(() => ""))
-      .replace(/\s+/g, " ")
-      .trim();
     note({
       step: "two-tab-conflict",
       tabTwoStatus: tabTwoSave.status,
@@ -10367,7 +10397,7 @@ note({
       reloadOffered,
       localNodesKept,
       // The banner has to name the version — that is what lets a client offer a real Reload
-      // instead of a shrug.
+      // instead of a shrug. Read while the banner was still up (see above).
       namesVersion: /version/i.test(conflictText),
       text: conflictText.slice(0, 160),
     });
