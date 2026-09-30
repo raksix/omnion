@@ -396,9 +396,19 @@ impl ListRequest {
         })
     }
 
-    /// The `limit + 1` a keyset read fetches, so `Page::new` can tell "full" from "last".
+    /// How many rows the listing query must actually fetch.
+    ///
+    /// **`limit + 1`, not `limit`.** The extra row is the over-fetch the `next_cursor` decision
+    /// is made from, and it was missing: `fetch_limit` returned `self.limit`, so the query
+    /// returned exactly the page, `fetched > request.limit` was never true, and **every list
+    /// response claimed it was the last page**. A client paginating five rows received two rows
+    /// and `next_cursor: null` and concluded the site had two published pages.
+    ///
+    /// The tell is that the symptom looks like a *data* problem and is a *query* problem — and no
+    /// assertion on any single page can see it. Only a walk that expects more pages than the
+    /// first can, which is why the cursor test is a loop and not a `count == 2` check.
     fn fetch_limit(&self) -> i64 {
-        self.limit
+        self.limit + 1
     }
 }
 
