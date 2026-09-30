@@ -9236,3 +9236,77 @@ check, since both sides only add at the tail.
 **Next.** The CDN-scoped pass is running. Its numbers either tick the two open boxes on this
 REQ or name what is wrong with them. If it comes back green, REQ-011 closes and the queue
 moves to REQ-017's two unticked boxes, which are the same measurement on `/environments`.
+
+## Tick 82 (part 2) — the pass ran, and the first red it reported was a cross-tenant write
+
+**What.** `ad22f581` and `12be7008`. The scoped CDN pass finally executed (it took the shared
+slot about forty minutes after w3's pass finished, and its artifacts went to `/dev/shm` so the
+measurement could not be the reason a sibling's build failed). The rules screen reported
+`reorderSwapped: false` and `toggled: false`.
+
+**`toggled: false` was a real bug and the worst one this crate has had.**
+`POST /api/v1/cdn/rules/{id}/toggle` read a `site_id` from the request body, put only the path
+id in the `WHERE` clause, and *afterwards* compared the row it had already written against the
+caller's site to answer `403 permission_denied`. A caller in organization A naming a rule id
+belonging to B therefore got a refusal **and changed B's cache rules**. The refusal is the
+worst of the two orderings: the audit trail records the attempt and the other tenant's cache
+is off regardless.
+
+The site's predicate is in the statement now and the check is gone rather than moved, so a
+foreign id matches no row — the same `None`, and therefore the same `404`, as a nonexistent
+id. That is deliberate over the old shape's `403`-for-foreign / `404`-for-missing, which was
+an existence oracle for other tenants' rules. `update_rule` and `delete_rule` never had the
+bug; that is the argument for putting the scope in the statement rather than trusting every
+call site to remember it.
+
+**The test that should have caught it existed, passed, and could not have caught it.** The
+cross-tenant walk covered GET, DELETE and the list — and the buggy handler's answer to a
+cross-tenant toggle is exactly the answer a guarded endpoint should give, so there was nothing
+to see. The new half asserts the *state* through B's own list rather than the status, because
+"the caller was refused" passes against a build that refuses after writing. **Proven to
+fail**: with the old `WHERE` clause the walk returns B's rule body (`name: "cdn-b-rule-0"`,
+`enabled: false`) to caller A. Restored, it passes.
+
+**Two harness defects were hiding behind it, in the same file.**
+`live_state` configured no CSRF secret, so `refuse_if_needed` answered *every* mutation in
+`cdn.rs` with `403 csrf_unavailable` before the handler ran — the sixth file with that class,
+and the same shape as tick 81's credential field: a suite measuring a 403 looks exactly like a
+suite proving an endpoint is guarded. The file also signed two accounts in per walk against a
+budget of ten, so walks 6+ died `429 rate_limited` in the middle of an assertion about cache
+rules. Both fixed; the `Credentials { session, csrf }` + `Deref<Target = str>` type means the
+twenty-six `&token_a` sites compile unchanged while the second cookie travels with the first,
+and `Debug` is hand-written to print `<redacted>` so a failing assertion cannot write a live
+session token into CI. **Every mutation in `cdn.rs` now reaches its handler for the first
+time**, so its green is worth more than it was.
+
+**`reorderSwapped: false` was the pass.** It created its rule on an empty table, so that rule
+was rank 1, and the panel correctly disables "move up" there. The click hit a disabled button
+inside a `.catch(() => {})` and the step asserted on an order nothing had been asked to
+change. The target is now chosen by position (the last rule, where "up" always exists), the
+step records that the button exists and is enabled, and the assertion is tighter — the moved
+rule exactly one place up, length unchanged — because "the first id changed" is also satisfied
+by a table that reversed the whole list.
+
+`mobileTouchTargets: false` is **not established**: the comment claimed a 44px floor while the
+code asserted 32, and a screenshot review puts the row at about 32px. The step now records the
+per-button measurement so the next pass names *which* button was short.
+
+The pass also died at the end with `TypeError: Cannot read properties of undefined (reading
+'horizontalOverflow')` in shared code at walkthrough.cjs:10077 — a crash in the roll-up, not in
+a screen, and it belongs to whichever writer owns that block. The CDN depth passes had already
+reported by then.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-cdn --lib` | **116 passed, 0 failed** |
+| `cargo test -p omnion-api --test cdn` | **15/15 in 144.76 s** (was 8/15 with every mutation refused) |
+| proven-to-fail for the cross-tenant toggle | red with the old `WHERE`, green with the fix |
+| `pnpm typecheck` | 2/2 |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| QA pass | ran; `cdn rules` reported, `cdn purges` blocked by the fixture bug now fixed in `3d65942e` |
+
+**Next.** Re-run the CDN-scoped pass: the purge pass is now unblocked by `qaReturning`, the
+reorder step is honest, and the mobile measurement will name a button. If it comes back green,
+REQ-011 closes and the queue moves to REQ-017's two unticked boxes.

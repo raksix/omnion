@@ -239,6 +239,54 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   actionable. There is no catch on that interaction now and the control's tag name is recorded
   beside the outcome, so the two readings can never collapse into one number again.
 
+  **Tick 82: the first scoped pass over these screens ran, and it found a cross-tenant write.**
+  The pass reported (verbatim, from `qa-artifacts`, which is what the numbers below come from):
+  the count match `true` on both screens, the live tester answering both ways, the TTL refusal
+  naming its bound, `createdInTable: true`, `duplicated: true`, `errorState: true`, and
+  `mobileNoTableScroll: true` — against two reds: `reorderSwapped: false` and
+  `toggled: false`.
+
+  **`toggled: false` was a real bug, and a serious one.**
+  `POST /api/v1/cdn/rules/{id}/toggle` took a `site_id` from the request body, used only the
+  path id in its `WHERE` clause, and then compared the row it had **already written** against
+  the caller's site to answer `403 permission_denied`. So a caller in organization A naming a
+  rule id belonging to B got a refusal and changed B's cache rules anyway. The site's
+  predicate is in the statement now, and the check is gone rather than moved: a foreign id
+  matches no row, which is the same `404` a nonexistent id gives, instead of the old shape's
+  `403`-for-foreign / `404`-for-missing, which was an existence oracle for other tenants'
+  rules. `update_rule` and `delete_rule` never had it — the predicate belongs in the
+  statement because a predicate that can be forgotten will be.
+
+  The existing cross-tenant test covered GET, DELETE and the list and **passed**, because the
+  buggy handler's answer to a cross-tenant toggle is exactly the answer a guarded endpoint
+  should give. The new half asserts the *state* through B's own list rather than the status,
+  since "the caller was refused" passes against a build that refuses after writing. Proven
+  to fail: with the old `WHERE`, the test returns B's rule body (`cdn-b-rule-0`, `enabled:
+  false`) to caller A.
+
+  **That test could not run at all until this tick**, and getting it to run uncovered two
+  harness defects in the same file that had been hiding behind each other. `live_state` set no
+  CSRF secret, so every mutation in this suite was refused `403 csrf_unavailable` **before its
+  handler** — the sixth file with that class, and the same failure mode as tick 81's
+  credential field: a suite measuring a 403 reads as a suite proving a product is guarded.
+  And the file signed two accounts in per walk against a budget of ten. Both fixed; the
+  `Credentials { session, csrf }` + `Deref` type means the twenty-six `&token_a` sites compile
+  unchanged while the second cookie travels with the first. **Every mutation in this file is
+  now reaching its handler for the first time**, so its green is worth more than it was.
+
+  **`reorderSwapped: false` was the pass, not the panel.** The rule the pass created was rank
+  1 on an empty table, and the panel correctly disables "move up" there; the click hit a
+  disabled button inside a `.catch(() => {})` and the step asserted on an order nothing had
+  been asked to change. The move target is now chosen by position, the step records that the
+  button exists and is enabled, and the assertion is tighter — the moved rule exactly one
+  position up, length unchanged — because "the first id changed" is also satisfied by a table
+  that reversed the whole list.
+
+  `mobileTouchTargets: false` is **not yet established**. The step's comment said "the 44px
+  floor" while the code asserted 32, and a screenshot review puts the action row at about
+  32px, which is the threshold. The step now records the per-button detail so the next scoped
+  pass names which button was short rather than only that one was. The box stays open.
+
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
   _Blocked on the same missing run, and on the box rather than on the CDN code. `free -g` during
   the tick-77 pass: 32 G RAM with 0 free and 25 G of swap in use, six writers compiling at once,
