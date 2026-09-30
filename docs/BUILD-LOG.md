@@ -9394,3 +9394,61 @@ mine were dropped — w2 had a live cargo, so every sibling's database was left 
 **Still open:** the browser pass (`scripts/qa/run.sh`) has still not run on this box — the QA slot
 was held by a live w3 pass for the whole tick, so the only remaining box in this REQ's checklist is
 the one this loop cannot claim until a slot frees.
+
+## Tick 85 — the merge left two health blocks, and the wizard had no URL to be measured at
+
+**What.** Four commits. One fixes merge damage this branch inherited, three tighten the
+harness so its claims match what it can actually reach.
+
+**The merge duplicated a block and the duplicate ran.** `origin/main` (9 commits, the
+REQ-014 health work) and this branch had both added to the same region of
+`scripts/qa/walkthrough.cjs`, and the auto-merge kept BOTH copies of the health block —
+main has one `if (wants("health-overview"))` and this branch had two. A full pass therefore
+called `runHealthDepth` twice: the second run re-probed every service and overwrote the
+first run's report with its own. The wrapper was also the reason a pass scoped to
+`health-incidents` alone ran none of the four health passes — `runDepthPass` already tests
+`wants(name)` and records `matchedOnly` from inside that test, so the hand-written `if`
+could only ever narrow the scope, never widen it. One block, four `runDepthPass` calls, no
+wrapper. `node --check` clean; the duplicate-`report.X` and duplicate-`function` sweeps over
+the merged file find nothing else.
+
+**The touch-target measurement counted buttons and could not name one.** Tick 82's note
+says the step "records the per-button measurement so the next pass names *which* button was
+short". It did not: `smallest: Math.min(...)` is a number. On a row with six buttons that
+is the difference between knowing the row is short and knowing that only `Delete` is, and
+the second one points at a line of `cdn-rules-view.tsx`. Each entry now carries its label,
+its `data-cdn-rule-*` hook and its measured height. The comment/code mismatch is the same
+one tick 82 already found once in this block (a comment saying 44, code asserting 32) —
+**a comment describing a measurement is itself a measurement claim, and it goes stale
+exactly like the code it describes.**
+
+**The staging wizard is now deep-linkable, because a modal with no URL cannot be measured
+at 390px.** REQ-017's QA plan names the phone layout of the create wizard ("below `lg` the
+wizard becomes a single scrolling form") and nothing measured it at any width: the depth
+pass drives the wizard, but at 1280px. The first attempt here was to add
+`/environments/new` to the mobile route list — and **that route does not exist**; the wizard
+is a modal the list opens with `data-env-new`, so the entry would have photographed a 404
+and filed it as a form. The spec names a route the product does not have.
+
+Rather than build a second entry point for a form that already has one, the wizard's open
+state moved into the URL, where the filters already live (`?wizard=1`), and `setWizard`
+became a `router.replace`. Two consequences, both handled: `writeFilter` now carries
+`wizard` across a filter write, because a filter change that dropped the parameter would
+close the dialog out from under somebody typing in the list behind it; and the mobile route
+entry carries `expect: "[data-env-wizard]"`, so a deep link the view ignores is recorded as
+a `deep-link-render-failed` finding instead of a screenshot that silently duplicates the
+list. The `expect` key is general — any route can now declare what must be on the page for
+its own screenshot to mean anything.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-cdn --lib` | **116 passed, 0 failed** |
+| `pnpm typecheck` | **2/2** (admin cache miss, re-executed) |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| QA pass | queued behind w3's live slot holder, `QA_SLOT_WAIT=3600` |
+
+**Next.** The CDN-scoped pass takes the slot when w3's ends; it reports the count-match
+clause and the mobile touch-target measurement with names in it. Then the environments
+scoped pass, which now has a wizard URL to drive at 390px as well as the depth pass.
