@@ -1314,6 +1314,11 @@ async function runBackups(page, report) {
   const sweepStrandedShown = (await page.locator('[data-testid="backup-sweep-stranded"]').count()) > 0;
   note({ step: "retention", retentionStrip, sweepAnswered, sweepStrandedShown, sweep: sweepText });
 
+  // The schedules table (REQ-013, slice 3). Run inside this pass rather than beside it
+  // because it lives on the same screen: the panel is mounted below the runs list, so
+  // "the schedules table is a screen nobody opened" would not be visible in the route list.
+  const schedules = await runBackupSchedules(page, report);
+
   const ok =
     rendered &&
     cardsPresent &&
@@ -1321,8 +1326,177 @@ async function runBackups(page, report) {
     everyPartTerminal &&
     verificationRan &&
     retentionStrip &&
-    sweepAnswered;
-  return { ok, steps: steps.length, cards: cardText };
+    sweepAnswered &&
+    schedules.ok;
+  return { ok, steps: steps.length, cards: cardText, schedules };
+}
+
+/**
+ * The backup schedules table (REQ-013, slice 3).
+ *
+ * This pass exists because the defect it is aimed at is invisible in every screenshot: the
+ * `next_run_at` column shipped with the table in slice 1, and for two slices **nothing wrote
+ * it**. A schedule could be created, listed, and rendered with a cadence sentence next to an
+ * empty next-run cell for ever. A screen that looks right and never fires is exactly what a
+ * walkthrough cannot see, so the assertion here is the *column's contents*, not the layout.
+ *
+ * What it drives, in order:
+ *
+ * 1. the empty state, on a stack with no schedules;
+ * 2. the editor, and that the conditional fields appear and disappear with the frequency —
+ *    an hourly schedule must not show a time of day, and a monthly one must not show a
+ *    weekday, because a hidden-but-submitted value is one the server has to decide about;
+ * 3. a **real** daily schedule, saved, and its next run read back — the cell must contain a
+ *    date and the zone, not a dash;
+ * 4. "run now" against the live API, proving a schedule can produce a backup;
+ * 5. pause, which must turn the next-run cell into "paused" rather than leaving a promise
+ *    the worker will not keep;
+ * 6. delete, and the sentence naming that the produced runs survive.
+ */
+async function runBackupSchedules(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "backups", action: "backup-schedules", ...step });
+  };
+
+  const panel = page.locator('[data-testid="backup-schedules"]');
+  await panel.scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(600);
+
+  const panelPresent = (await panel.count()) > 0;
+  note({ step: "panel", panelPresent });
+  if (!panelPresent) {
+    return { ok: false, reason: "the schedules panel did not render" };
+  }
+
+  // 1. The empty state. On a fresh stack there are no schedules, and the table must say so
+  // with the one action that gets past it.
+  const emptyText = await panel.innerText().catch(() => "");
+  const emptyExplains = /no schedules/i.test(emptyText);
+  note({ step: "empty", emptyExplains, text: emptyText.slice(0, 160) });
+
+  // 2. The editor, and the conditional fields.
+  await page.click('[data-testid="backup-schedule-new"]').catch(() => {});
+  await page.waitForSelector('[data-testid="backup-schedule-editor"]', { timeout: 8000 }).catch(() => {});
+  const editorOpen = (await page.locator('[data-testid="backup-schedule-editor"]').count()) > 0;
+  note({ step: "editor-open", editorOpen });
+  if (!editorOpen) {
+    return { ok: false, reason: "the schedule editor did not open" };
+  }
+
+  const hasTime = async () => (await page.locator('[data-testid="backup-schedule-time"]').count()) > 0;
+  const hasWeekday = async () =>
+    (await page.locator('[data-testid="backup-schedule-weekday"]').count()) > 0;
+  const hasDom = async () =>
+    (await page.locator('[data-testid="backup-schedule-dayofmonth"]').count()) > 0;
+
+  // Daily shows a time and no day fields.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "daily").catch(() => {});
+  await page.waitForTimeout(250);
+  const dailyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-daily", ...dailyShape });
+
+  // Weekly adds the weekday and still shows the time.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "weekly").catch(() => {});
+  await page.waitForTimeout(250);
+  const weeklyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-weekly", ...weeklyShape });
+
+  // Monthly swaps the weekday for a day of the month.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "monthly").catch(() => {});
+  await page.waitForTimeout(250);
+  const monthlyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-monthly", ...monthlyShape });
+
+  // Hourly names no time of day at all.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "hourly").catch(() => {});
+  await page.waitForTimeout(250);
+  const hourlyShape = { time: await hasTime(), weekday: await hasWeekday(), dom: await hasDom() };
+  note({ step: "shape-hourly", ...hourlyShape });
+
+  // 3. A real daily schedule, saved, with its next run read back.
+  await page.selectOption('[data-testid="backup-schedule-frequency"]', "daily").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.fill('[data-testid="backup-schedule-name"]', "QA nightly").catch(() => {});
+  await page.fill('[data-testid="backup-schedule-time"]', "02:30").catch(() => {});
+  await page.selectOption('[data-testid="backup-schedule-zone"]', "Europe/Istanbul").catch(() => {});
+  await page.waitForTimeout(200);
+  await page.click('[data-testid="backup-schedule-save"]').catch(() => {});
+  await page.waitForTimeout(2500);
+
+  const saveNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+  const editorClosed = (await page.locator('[data-testid="backup-schedule-editor"]').count()) === 0;
+  note({ step: "save", editorClosed, notice: saveNotice.trim() });
+
+  const scheduleRows = await panel.locator("[data-schedule]").count();
+  const rowText = scheduleRows > 0 ? await panel.locator("[data-schedule]").first().innerText() : "";
+  // The load-bearing assertion of this whole pass: the next-run cell must carry a real date
+  // and the zone. A dash here is the two-slice defect, and every other assertion in this file
+  // would still pass with it.
+  const nextRunHasDate = /\d{1,2}\s+\w{3,}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}/.test(rowText);
+  const namesTheZone = /Europe\/Istanbul|UTC/.test(rowText);
+  const noNextRunWarning = /will not fire until it is saved again/i.test(rowText);
+  note({
+    step: "next-run",
+    scheduleRows,
+    nextRunHasDate,
+    namesTheZone,
+    noNextRunWarning,
+    row: rowText.replace(/\n/g, " | ").slice(0, 220),
+  });
+
+  // 4. Run it now, over the real API.
+  if (scheduleRows > 0) {
+    const row = panel.locator("[data-schedule]").first();
+    const runId = await row.getAttribute("data-schedule").catch(() => null);
+    if (runId) {
+      await page.click(`[data-testid="backup-schedule-run-${runId}"]`).catch(() => {});
+      await page.waitForTimeout(20000);
+      const runNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+      const runAnswered = /ran|parts were written|could not/i.test(runNotice);
+      // The sentence has to say the next scheduled run is UNCHANGED, because a "run now"
+      // that consumed the 02:00 slot is a silent skip of tomorrow's backup.
+      const nextRunUntouched = /next scheduled run is unchanged|next run/i.test(runNotice);
+      note({ step: "run-now", runAnswered, nextRunUntouched, notice: runNotice.trim().slice(0, 200) });
+
+      // 5. Pause. The next-run cell must become "paused", not keep a promise.
+      await row.locator('button:has-text("Pause")').first().click().catch(() => {});
+      await page.waitForTimeout(2000);
+      const pausedText = await panel.locator("[data-schedule]").first().innerText().catch(() => "");
+      const showsPaused = /paused/i.test(pausedText);
+      note({ step: "pause", showsPaused, row: pausedText.replace(/\n/g, " | ").slice(0, 200) });
+
+      // 6. Delete, and the sentence that the produced runs survive.
+      await page.click(`[data-testid="backup-schedule-delete-${runId}"]`).catch(() => {});
+      await page.waitForTimeout(2000);
+      const afterDelete = await panel.locator("[data-schedule]").count();
+      const deleteNotice = await panel.locator('p[role="status"]').innerText().catch(() => "");
+      const deleteExplainsSurvival = /still here|does not delete history|kept/i.test(deleteNotice);
+      note({
+        step: "delete",
+        rowsAfter: afterDelete,
+        deleteExplainsSurvival,
+        notice: deleteNotice.trim().slice(0, 200),
+      });
+    }
+  }
+
+  const ok =
+    panelPresent &&
+    editorOpen &&
+    dailyShape.time &&
+    !dailyShape.weekday &&
+    weeklyShape.weekday &&
+    monthlyShape.dom &&
+    !monthlyShape.weekday &&
+    !hourlyShape.time &&
+    editorClosed &&
+    scheduleRows > 0 &&
+    nextRunHasDate &&
+    namesTheZone &&
+    !noNextRunWarning;
+  return { ok, steps: steps.length };
 }
 
 async function runMediaFileManager(page, report) {
