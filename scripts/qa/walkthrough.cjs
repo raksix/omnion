@@ -1053,6 +1053,12 @@ async function uploadMediaSample(page, source) {
  * finding belongs in the report next to the other findings — not as the reason the report was
  * never written. The error is recorded under the pass's own name so it is counted, not hidden.
  */
+// EVERY pass goes through here, including the ones whose call site used to read `await
+// runSomething(page, report)` on its own. That shape meant a single thrown pass unwound the whole
+// walk: the box has eleven writers, and a pass that loses the memory race gets `Page crashed`, so
+// one of these is a coin flip on a loaded box, and the cost of losing it was every screen after it
+// plus the report. A guard applied to 12 of 23 call sites is not a guard -- it is a pattern that
+// reads as one, which is why the route loop has the same comment and the same try.
 async function runDepthPass(name, pass) {
   try {
     return await pass();
@@ -1461,7 +1467,7 @@ async function runBackups(page, report) {
   // The schedules table (REQ-013, slice 3). Run inside this pass rather than beside it
   // because it lives on the same screen: the panel is mounted below the runs list, so
   // "the schedules table is a screen nobody opened" would not be visible in the route list.
-  const schedules = await runBackupSchedules(page, report);
+  const schedules = await runDepthPass("schedules", () => runBackupSchedules(page, report));
 
   const ok =
     rendered &&
@@ -6613,7 +6619,7 @@ async function main() {
     }
   };
 
-  await runWizard(page, report);
+  await runDepthPass("onboarding-wizard", () => runWizard(page, report));
 
   // `--only=wizard` re-checks the first-run flow on its own (reset the database first): it drives
   // the steps, then reports what the onboarding endpoints answered. A full pass is minutes; this is
@@ -6933,30 +6939,30 @@ async function main() {
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
   if (wants("palette")) {
     matchedOnly.add("palette");
-  await runPalette(page, report);
+  await runDepthPass("palette", () => runPalette(page, report));
   }
   // The command centre's own pass (REQ-032): commands, prefixes, running one, and its history.
   if (wants("command-center")) {
     matchedOnly.add("command-center");
-  await runCommandCenter(page, report);
+  await runDepthPass("command-center", () => runCommandCenter(page, report));
   }
   // The depth pass: facets, selection, copy, export and the index's own settings screen.
   if (wants("search-depth")) {
     matchedOnly.add("search-depth");
-  await runSearchDepth(page, report);
+  await runDepthPass("search-depth", () => runSearchDepth(page, report));
   }
   // The analytics depth pass (REQ-007, slice 2): the range, the comparison, a page drawer and a
   // real CSV download. Goals, funnels and realtime arrive with slice 3; the privacy half of the
   // settings screen with slice 4 — this pass visits what exists today.
   if (wants("analytics-depth")) {
     matchedOnly.add("analytics-depth");
-  report.analyticsDepth = await runAnalyticsDepth(page, report);
+  report.analyticsDepth = await runDepthPass("analyticsDepth", () => runAnalyticsDepth(page, report));
   }
   // The goals + realtime pass (REQ-007, slice 3): a goal is created through the editor, a visitor
   // completes it after it exists, and the funnel and the live counters are read back.
   if (wants("analytics-goals-depth")) {
     matchedOnly.add("analytics-goals-depth");
-  report.analyticsGoals = await runGoalAndRealtimeDepth(page, report);
+  report.analyticsGoals = await runDepthPass("analyticsGoals", () => runGoalAndRealtimeDepth(page, report));
   }  log(`analytics goals: ${JSON.stringify(report.analyticsGoals)}`);
 
   // The settings and privacy pass (REQ-007, slice 4): tracking on/off persisted, a refused
@@ -6964,7 +6970,7 @@ async function main() {
   // database.
   if (wants("analytics-settings-depth")) {
     matchedOnly.add("analytics-settings-depth");
-  report.analyticsSettings = await runAnalyticsSettingsDepth(page, report);
+  report.analyticsSettings = await runDepthPass("analyticsSettings", () => runAnalyticsSettingsDepth(page, report));
   }
   // The notification pass (REQ-021, slice 1): the bell's badge against its own grouped lines,
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
@@ -6972,7 +6978,7 @@ async function main() {
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
   if (wants("notifications-depth")) {
     matchedOnly.add("notifications-depth");
-  report.notifications = await runNotificationsDepth(page, report);
+  report.notifications = await runDepthPass("notifications", () => runNotificationsDepth(page, report));
   }  log(`notifications: ${JSON.stringify(report.notifications)}`);
 
   // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
@@ -7014,7 +7020,7 @@ async function main() {
   // than whatever this one left behind.
   if (wants("notification-settings-depth")) {
     matchedOnly.add("notification-settings-depth");
-  report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  report.notificationSettings = await runDepthPass("notificationSettings", () => runNotificationSettingsDepth(page, report));
   }  log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
 
   // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
@@ -7022,7 +7028,7 @@ async function main() {
   // database that grows a notification per pass is one whose counts stop meaning anything.
   if (wants("notification-outbox-depth")) {
     matchedOnly.add("notification-outbox-depth");
-  report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  report.notificationOutbox = await runDepthPass("notificationOutbox", () => runNotificationOutboxDepth(page, report));
   }  log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
   log(`analytics settings: ${JSON.stringify(report.analyticsSettings)}`);
 
@@ -7030,18 +7036,18 @@ async function main() {
   // preview and save, reopen, and read the history tab back.
   if (wants("iam-roles-depth")) {
     matchedOnly.add("iam-roles-depth");
-  report.iamRoles = await runIamRolesDepth(page, report);
+  report.iamRoles = await runDepthPass("iamRoles", () => runIamRolesDepth(page, report));
   }
   // The subjects-and-scopes pass (REQ-006, slice 2): users, bindings at every scope, groups,
   // machine identities and the simulator.
   if (wants("iam-subjects-depth")) {
     matchedOnly.add("iam-subjects-depth");
-  await runIamSubjectsDepth(page, report);
+  await runDepthPass("iam-subjects-depth", () => runIamSubjectsDepth(page, report));
   }
   // The ABAC policies pass (REQ-006, slice 4a): the builder, the dry run and the history.
   if (wants("iam-policies-depth")) {
     matchedOnly.add("iam-policies-depth");
-  report.iamPolicies = await runIamPoliciesDepth(page, report);
+  report.iamPolicies = await runDepthPass("iamPolicies", () => runIamPoliciesDepth(page, report));
   }  log(`iam roles: ${JSON.stringify(report.iamRoles)}`);
 
   // The security-policy pass (REQ-006, slice 3): the policy screen with a refusal in the field
@@ -7049,7 +7055,7 @@ async function main() {
   // enrolment dialog.
   if (wants("iam-security-depth")) {
     matchedOnly.add("iam-security-depth");
-  await runIamSecurityDepth(page, report);
+  await runDepthPass("iam-security-depth", () => runIamSecurityDepth(page, report));
   }  log(`iam security: ${JSON.stringify(report.iamSecurity)}`);
 
   // Sign-out is exercised last so it cannot break the walk.
@@ -7068,7 +7074,7 @@ async function main() {
   // the pass is removed again so the account is back to its password.
   if (wants("passkeys-depth")) {
     matchedOnly.add("passkeys-depth");
-  await runPasskeysDepth(page, report);
+  await runDepthPass("passkeys-depth", () => runPasskeysDepth(page, report));
   }  log(`passkeys: ${JSON.stringify(report.passkeys)}`);
 
   // The permission-request pass (REQ-006, slice 4b): ask, approve with a window, refuse, and the
@@ -7076,7 +7082,7 @@ async function main() {
   // time-boxed binding (and the generated grant role) to the organization.
   if (wants("iam-approvals-depth")) {
     matchedOnly.add("iam-approvals-depth");
-  await runIamApprovalsDepth(page, report);
+  await runDepthPass("iam-approvals-depth", () => runIamApprovalsDepth(page, report));
   }  log(`iam approvals: ${JSON.stringify(report.iamApprovals)}`);
 
   // The SCIM provisioning pass (REQ-006, slice 4b): mint a token, drive a create → deactivate
@@ -7084,27 +7090,27 @@ async function main() {
   // token and prove it is refused afterwards.
   if (wants("iam-provisioning-depth")) {
     matchedOnly.add("iam-provisioning-depth");
-  await runIamProvisioningDepth(page, report);
+  await runDepthPass("iam-provisioning-depth", () => runIamProvisioningDepth(page, report));
   }  log(`iam provisioning: ${JSON.stringify(report.iamProvisioning)}`);
 
   // The automations pass (REQ-003, slice 1): the rule list, the editor with a nested
   // condition group, the dry run, the one-shot listener, the inbound-webhook URL and the
   // delete. It runs before the sign-out below and leaves the database as it found it.
-  await runAutomationsDepth(page, report);
+  await runDepthPass("automations", () => runAutomationsDepth(page, report));
   log(`automations: ${JSON.stringify(report.automations)}`);
 
   // The operations pass (REQ-003, slice 4): the run history, the run's own route with its
   // step trace, the Versions tab with a restore, the Audit tab and the templates gallery. It
   // runs next to the other automation passes because it creates, runs and deletes its own
   // rule, which the count-sensitive empty-state assertions above have already read.
-  await runAutomationsOperationsDepth(page, report);
+  await runDepthPass("automations-operations", () => runAutomationsOperationsDepth(page, report));
   log(`automations-operations: ${JSON.stringify(report.automationsOperations)}`);
 
   // The builder pass (REQ-004, slice 1): the visual builder on a real rule. It runs next to
   // the other automation passes for the same reason they do — it creates and deletes its own
   // rule, and the count-sensitive empty-state assertions have already been read by now.
-  await runWorkflowBuilderDepth(page, report);
-  await runWorkflowTableDepth(page, report);
+  await runDepthPass("workflow-builder", () => runWorkflowBuilderDepth(page, report));
+  await runDepthPass("workflow-table", () => runWorkflowTableDepth(page, report));
   log(`workflow-builder: ${JSON.stringify(report.workflowBuilder)}`);
 
   // The enterprise sign-in pass (REQ-006, slice 4b-2): connect a provider through the drawer,
@@ -7113,7 +7119,7 @@ async function main() {
   // remove the provider and see the list go back to its empty state.
   if (wants("iam-authentication-depth")) {
     matchedOnly.add("iam-authentication-depth");
-  await runIamAuthenticationDepth(page, report);
+  await runDepthPass("iam-authentication-depth", () => runIamAuthenticationDepth(page, report));
   }  log(`iam authentication: ${JSON.stringify(report.iamAuthentication)}`);
 
   // Mobile pass. The context is new, so it carries no session — without the sign-in below every
