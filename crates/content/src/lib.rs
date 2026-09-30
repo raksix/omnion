@@ -28,6 +28,7 @@ pub mod seo;
 pub mod seo_csv;
 pub mod templates;
 pub mod theme_settings;
+pub mod theme_layouts;
 pub mod themes;
 pub mod translations;
 pub mod validation;

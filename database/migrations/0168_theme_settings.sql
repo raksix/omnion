@@ -103,7 +103,6 @@ create table theme_layouts (
 -- The (site, theme, slot) triple is the identity. See note 4 for why the theme is in it.
 create unique index theme_layouts_site_theme_slot_idx
     on theme_layouts (site_id, theme_key, slot);
-
 -- No event catalogue rows here. That registry is seeded from `crates/events/src/catalogue.rs`
 -- and not from SQL, so `themes.settings.published` is declared THERE, and the catalogue's
 -- drift test fails if this migration's emitter uses a name it does not carry.
