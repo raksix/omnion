@@ -1,6 +1,6 @@
 # REQ-013 — Backup Center
 
-> **Status:** in-progress (slices 1, 3 (retention sweep), 2a (restore preview), 2b (the destructive restore) and **2c (the queued, abortable restore)** shipped — 2c closes the last of slice 2's acceptance criteria, so slice 2 is now whole and its **browser pass is the only thing still open on it**; the abort criterion was the last one that said "the window has closed by design". The remaining open items are the `partial`-run UI, the status-card age, slice 4 (encryption) and the walkthrough. **The date cells on this screen were empty for a second, unrelated reason, now fixed: every instant crossed the wire as a nine-element array rather than a timestamp** — see `8322d753` and the wire-format note in BUILD-LOG) **The date cells on this screen were empty for a second, unrelated reason, now fixed: every instant crossed the wire as a nine-element array rather than a timestamp** — see `8322d753` and the wire-format note in BUILD-LOG) · **Captured:** 2026-09-25 · **Layer:** core (`crates/backup`) + admin UI
+> **Status:** in-progress (slices 1, 3 (retention sweep), 2a (restore preview), 2b (the destructive restore) and **2c (the queued, abortable restore)** shipped — 2c closes the last of slice 2's acceptance criteria, so slice 2 is now whole; the browser pass is the only thing still open on it. **The status-card criterion closed this tick by finding that the `backup_healthy` row had been permanently red since the request was written: it read a table (`backup_runs`) that no migration has ever created, and the security centre was hidden behind an `analytics.read` guard it never declared** — see `b74c51e5`, `a8192b52`, `ac30aada`. Remaining open: the `partial`-run UI, the status-card browser tick, slice 4 (encryption) and the walkthrough. *(The date cells on this screen were empty for a second, unrelated reason, now fixed: every instant crossed the wire as a nine-element array rather than a timestamp — see `8322d753`.)* · **Captured:** 2026-09-25 · **Layer:** core (`crates/backup`) + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -159,7 +159,56 @@ Webhook relevance: `backup.completed` and `backup.failed` are prime subscriber e
 - [x] An unwritable destination is reported by the settings probe with the underlying reason. — **proved twice, over the filesystem.** `probe_local` writes a marker, reads it back, and removes it; every failure carries the operating system's own words (`permission denied (os error 13)`), never a bare "unwritable" — the errno names the syscall and the value names nothing. Three refusals are shape checks that happen *before* anything touches the disk: an empty root, a **relative** root (which means "somewhere under whatever this process's working directory happens to be" — the working directory of a systemd unit is not the working directory of the shell an operator tested in), and a root that is a file rather than a directory. The settings **save** runs the probe against the *candidate* and refuses with `400 destination_unusable` when it fails, and the walk then reads `backup_settings` back to prove the refused save wrote nothing. A settings screen that stores an unwritable root and reports success hands over a configuration whose first real backup fails at 02:00.
 - [x] Deleting a backup requires confirmation and removes its artifacts from the destination. — **the delete was a row delete and the panel said so, which is why it survived.** It removed the row, the parts and the audit entry, returned `204`, and left the database export, the objects tree, the index, the three JSON parts and the manifest on the destination byte for byte; the screen compensated with an honest sentence ("Its artifacts are still on the destination until the next prune") and a backup root costs money per byte forever, with prune on a schedule nobody chose in this story. `crates/backup/src/purge.rs` removes **the run's own directory** rather than walking the manifest — a run that died mid-write left files the manifest never mentioned, and an index-driven delete would leak them. The directory is a boundary because the prefix is derived from the run's **id**, so two runs never share one; that is what makes the delete safe to automate and it is pinned by a unit test. Three refusals happen before a byte is touched: an empty or **relative** root (`remove_dir_all` on a relative path resolves against a systemd unit's working directory, not the one an operator typed), a `..` segment in the prefix (rejected, never normalised — a normalised traversal is a traversal that passed), and an **empty prefix**, which would make "delete this backup" mean "delete every backup on the destination". The handler does **artifacts first, row second**: an interrupted delete leaves a row pointing at an archive that is still there, which can be retried, rather than a deleted row over an archive nobody can find. It refuses a `queued`/`running` run, because deleting one mid-write leaves orphans no later prune knows about, and it answers **`200` with a `PurgeReport` rather than `204`** — "the row is gone" and "the bytes are gone" are two facts and the API that collapsed them is what produced the defect. Proved by `deleting_a_backup_takes_its_artifacts_off_the_destination_and_spares_the_others`: two real runs with real objects, the delete, then the first run's directory **read off the destination and required to be gone**, the survivor's artifacts required to still be there, and a repeated delete required to be a `404` rather than a second purge. **The walk also caught a bug in the fix itself** — the report counted what was *left* after the removal, so a delete that had just taken ten entries reported "Removed 0 entries"; the count is taken before, and a unit test pins it.
 - [x] A backup's `media` part holds only its own organization's files. — **found by the delete walk's own fixture, and it is a data leak with a green tick next to it.** The part asked for `pending_objects(pool, None)`, which is every `media` row on the deployment, while every other read and write in the file is scoped by `organization_id`: a backup of tenant A contained tenant B's files, reported `succeeded`, and verified clean. The pre-existing media walk had been green for a tick because **every test in the suite creates media for one organization**, so "the whole deployment" and "this organization's library" are the same set — a leak is invisible inside its own blind spot. The stranger's rows even named themselves in an error message (`34 of 36 objects could not be copied — share-guarded.txt: ...`) before the cause was read. `pending_objects_for_organization` joins through `sites` and is a **separate function rather than an extra parameter**, so the unsafe form cannot be reached by forgetting an argument. `a_backups_media_part_holds_only_the_runs_own_organizations_files` gives each organization a site and a file and requires each archive to name only its own — the stranger's own run too, because a fix that scoped by *excluding* the other organization would pass the first half and still leak.
-- [ ] Status cards show a real last-successful age consumed by the security overview check.
+- [x] Status cards show a real last-successful age consumed by the security overview check. — **The card was always real; the
+  *consumption* was dead, and it had been dead since the request was written.** `backup_age` in
+  `apps/api/src/routes/security.rs` asked a table called **`backup_runs`** for the last successful
+  run — and **no migration in this repository has ever created `backup_runs`**. The table is
+  `backups` (migration `0157`); the name was guessed when the request predated the schema and was
+  never revisited when the schema landed. `fetch_optional` on a missing table answers `Err`,
+  `Err` was flattened into "no backup", and `backup_healthy` answered **`fail` on every
+  installation, for ever** — the one check in the security registry that could never go green, on
+  a platform that had taken a backup every night for a year, rendering a detail that named the
+  right rule for entirely the wrong reason. **No test could have caught this, and the reason is
+  worth keeping:** `backup_healthy` is a pure function of a hand-built `Environment`, so the query
+  was never executed by any unit test; and an integration test asserting "no backup → `fail`"
+  would have stayed green for ever, because the broken reader *is* a permanent no-backup. The two
+  worlds are indistinguishable from inside the code and only distinguishable from outside it.
+  Fixed in three atomic parts, each one small and each closing a different hole:
+  1. **`omnion_backup::last_succeeded_at`** (`crates/backup/src/store.rs`) reads `backups` through
+     the crate that owns it, so a rename of the table is now a **compile error** rather than a
+     permanent red. It filters on `status = 'succeeded'`, not on "finished": a run that wrote the
+     database export and lost the media copy is `partial`, and an operator told "your last backup
+     was 2 minutes ago" by a partial run discovers the truth from the panel only when the restore
+     fails.
+  2. **The read is tenant-scoped** (`a8192b52`). An unscoped read answers "fresh backup" from a
+     *stranger's* run, which is a false green on the one check whose false green is the expensive
+     direction. `is not distinct from` keeps the platform row a real tenant, because on a
+     single-tenant installation that row **is** the tenant.
+  3. **The security centre left the analytics router** (`ac30aada`) — the defect this criterion
+     was hiding, one layer out. `analytics_reports` ends in
+     `route_layer(require("analytics.read"))`, and a `route_layer` applies to every route declared
+     on that router; the security routes were written inside that builder, so `/security/overview`
+     required `analytics.read` **in addition to** its own correct `security.read` guard. An
+     account holding `security.read` and nothing else was refused with `403 this action requires
+     the "analytics.read" permission` — on the screen whose entire purpose is to be readable by
+     the person doing the diagnosing. A deployment granting the least would have found the
+     security centre unreadable, and the natural response to that is to grant more. It was
+     invisible because **every walk that read the posture screen signed in as an account holding
+     both keys**; a guard that is only ever satisfied is not a guard that was checked.
+  Proof — `the_security_posture_check_sees_a_real_backup_and_only_this_tenants`, a walk over the
+  real router that signs in as a **`security.read`-only account**: the operator who is told their
+  backups are stale and cannot take one. That shape is the whole point, because an account holding
+  both keys proves the screen works for an account nobody has. Six assertions, each a way the
+  previous code could have been wrong while everything else stayed green: no backup → `fail` naming
+  the *absence* rather than the age of nothing; a **stranger's** fresh backup must not turn it
+  green; a backup this tenant just took turns it `pass` under an hour; aged past the 48h line it
+  returns to `fail` **reporting the age it measured and the line it crossed** (so a reader keyed on
+  `created_at` instead of `finished_at` cannot pass); a fresh `partial` run neither resets that age
+  nor counts as a backup; a newer `succeeded` run then clears it, proving the partial did not
+  poison the read. **Load-bearing, proven rather than claimed:** reverting the reader to count any
+  finished row turns the walk red, and the fix turns it green again.
+  Gates: `omnion-backup --lib` **153/0**, `omnion-api --lib` **220/0**, `apps/api --test backups`
+  **26/26** over a live database, `apps/admin` `tsc --noEmit` clean.
 - [ ] Walkthrough passes with zero high findings.
 
 ### QA plan

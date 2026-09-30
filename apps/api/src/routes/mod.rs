@@ -1022,7 +1022,34 @@ pub fn router(state: AppState) -> Router {
     // one out as a file is the separate `analytics.export` — a screen that may read a report and
     // an account that may walk away with the data are two different powers. The page series rides
     // with the read key: it is one page's numbers, nothing more than the table already shows.
-    let analytics_reports = Router::new()
+    // The security centre (REQ-012, slice 1) is its OWN router, and it is no longer a child
+    // of the analytics reports router it was written inside.
+    //
+    // **What the nesting cost.** `analytics_reports` ends in
+    // `route_layer(guards::require(&state, "analytics.read"))`, and a `route_layer` applies to
+    // every route declared on that router *including the ones declared above it in the same
+    // builder*. So `/security/overview` — which declares its own, correct `security.read` guard
+    // on the handler — additionally required `analytics.read`. An account holding `security.read`
+    // and nothing else was refused with `403 this action requires the "analytics.read"
+    // permission`, on the screen whose entire purpose is to be readable by the person doing the
+    // diagnosing. A deployment that granted the least would have found the security centre
+    // unreadable, and the natural response to that is to grant more.
+    //
+    // **Why it is invisible.** Every walk that read the posture screen signed in as an account
+    // holding *both* keys — the platform owner's role is granted everything, and a walk that
+    // also touches analytics needs them. A guard that is only ever satisfied is not a guard that
+    // was checked. The only way to see it is an account that holds one key and refuses the
+    // other, which is the account the backup walk that found this signs in as: `security.read`
+    // and no backup key at all, being the operator who is told their backups are stale and
+    // cannot take one.
+    //
+    // **The rule this re-establishes, for the next group added here.** A `route_layer` is a
+    // property of the router it is written on, and it reaches every route that router declares —
+    // including routes a later commit appends above the analytics block by accident. A new group
+    // gets its own `let ... = Router::new()` and its own `merge`, or it inherits a key that has
+    // nothing to do with it. Nesting routers is how the security centre ended up behind a key
+    // named for a different feature.
+    let security_reports = Router::new()
         // Security centre (docs/requests/REQ-012, slice 1). The split is by *power*, not by
         // verb: `security.read` sees the posture and the findings, `security.scan` re-runs the
         // checks and ingests a report, and `security.manage` changes a finding's status.
@@ -1125,7 +1152,8 @@ pub fn router(state: AppState) -> Router {
                 .merge(
                     patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
-        )
+    );
+    let analytics_reports = Router::new()
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))
         .route("/analytics/pages/series", get(analytics::page_series))
@@ -2005,6 +2033,7 @@ pub fn router(state: AppState) -> Router {
             analytics_settings_read.merge(analytics_settings_write),
         )
         .route("/analytics/snippet", analytics_snippet)
+        .merge(security_reports)
         .merge(analytics_reports)
         .route("/analytics/export", analytics_export)
         .merge(analytics_goals_read)
