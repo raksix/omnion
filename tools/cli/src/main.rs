@@ -7,6 +7,8 @@
 //! omnion setup      create the owner account, organization, first site and theme
 //! omnion doctor     check the environment: config, database, migrations, redis, storage
 //! omnion migrate    apply pending database migrations
+//! omnion create-theme <key>
+//!                    scaffold a theme package (manifest, wiring, layout, stylesheet)
 //! ```
 //!
 //! The connection comes from the same typed configuration the API reads (`OMNION_DATABASE_URL`
@@ -17,6 +19,7 @@
 //! was wrong (usage).
 
 mod args;
+mod create_theme;
 mod doctor;
 mod migrate;
 mod output;
@@ -43,6 +46,7 @@ async fn main() -> ExitCode {
         Ok(Command::Doctor { json }) => doctor::run(json).await,
         Ok(Command::Migrate) => migrate::run().await,
         Ok(Command::Setup(options)) => setup::run(*options).await,
+        Ok(Command::CreateTheme(options)) => create_theme::main(options),
         Err(message) => {
             eprintln!("omnion: {message}");
             eprintln!();

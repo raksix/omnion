@@ -1448,6 +1448,7 @@ dependencies = [
 name = "omnion-cli"
 version = "0.1.0"
 dependencies = [
+ "omnion-content",
  "omnion-core",
  "omnion-identity",
  "omnion-onboarding",
