@@ -514,6 +514,31 @@ export function HealthOverviewScreen() {
                   <ChevronRight aria-hidden className="h-3.5 w-3.5" />
                 </Link>
               </p>
+              {/*
+                Slice 3's two screens hang off the same block, for the same reason: an
+                incident timeline nobody can reach from the product is a screen the
+                definition of done calls a hidden feature. The wording is deliberate —
+                "what broke" is the question an operator arrives with, and "policy"
+                would send them looking for a form rather than a history.
+              */}
+              <p className="flex flex-wrap gap-x-4 pt-1 text-[12.5px]">
+                <Link
+                  href="/health/incidents"
+                  data-health-incidents-link
+                  className="inline-flex items-center gap-1 text-muted hover:text-ink"
+                >
+                  Incidents — what broke, for how long, and who looked
+                  <ChevronRight aria-hidden className="h-3.5 w-3.5" />
+                </Link>
+                <Link
+                  href="/health/settings"
+                  data-health-settings-link
+                  className="inline-flex items-center gap-1 text-muted hover:text-ink"
+                >
+                  Thresholds and maintenance windows
+                  <ChevronRight aria-hidden className="h-3.5 w-3.5" />
+                </Link>
+              </p>
             </section>
           ) : null}
         </>

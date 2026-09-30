@@ -5606,6 +5606,159 @@ which need that pass. Move to **REQ-014 (system health, `pending`)** — it is t
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
 
+## Tick 82 — the constraint that made the incidents table unusable, and the one below it
+
+The tree arrived **dirty**: 2 080 uncommitted lines of slice 3 (`incidents.rs`, `health_incidents.rs`,
+`0190`) with two wiring lines and no test. Half-written work is the state this loop is worst at,
+because a tick that starts by writing something new leaves two half-written things. So the tick
+spent its first act finishing that.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `f572dbde` | `crates/health::incidents`, the routes, `/health/incidents` + `/health/settings`, the walks |
+| this tick | `0191` — two database constraints that were wrong, found by the walk |
+
+**The two bugs, and they are the same bug twice.**
+
+`0188` shipped `health_incidents` with
+
+```sql
+check ((resolved_at is null) = (to_state = 'healthy'))
+```
+
+under the comment *"A run that is still open has no end; a resolved one always does."* The comment
+is true and the expression is its **inverse**: read literally, an open row must have
+`to_state = 'healthy'` and a resolved row must have anything *but* `healthy`. Between them the
+constraint makes the table unable to store the one thing it exists to store — the first
+`insert` of an open incident fails `23514`.
+
+The second is `0190`'s `check (warn < crit)`, unconditional, while `Threshold::classify` reads a
+`below` pair as `value <= crit` / `value <= warn` — i.e. it *expects* `warn > crit`. Every valid
+`below` threshold in the product ("at least 2 healthy workers") is refused, and the inverted ones
+are accepted. `Threshold::new` had the same defect in Rust, with a message that said "must be
+below" regardless of direction.
+
+**Why four green gates could not see either one.** A `check` constraint is not a type error, so
+`cargo check` is blind to it by construction. And both tables had **no writer**: slices 1 and 2
+are probes and samples, and nothing had ever inserted a row here. A constraint on a table with no
+writer is a comment with `check` in front of it. The tick that writes the first row is the tick
+that finds out what the table allows — an argument for writing the row *earlier*, not for
+trusting the comment next to it.
+
+**A third bug the walk found, in the code rather than the schema.** `record_breach` took
+`crit_limit` from `(select crit from health_thresholds where metric = $1)`, which is `NULL` for an
+unconfigured metric, and the column is `not null` — so the call died on `23502` and the helpful
+"has no threshold pair" message in its own `.ok_or_else` **could never fire**, because the row was
+never coming back. The threshold is now read *before* the insert.
+
+**The fixtures were wrong too, and that is worth writing down.** `acknowledged_by` and
+`created_by` are foreign keys to `users`, and the walk passed `Uuid::new_v4()`. The failure is a
+`23503` naming a constraint nothing in the test is about, so the obvious reading — "the window
+insert is broken" — points away from the cause. A walk that invents an actor is also asserting
+something the product deliberately forbids: acknowledgement whose actor points at no row is the
+un-evidenced acknowledgement the request rules out.
+
+**Proof**
+
+```
+cargo check -p omnion-api --tests         clean
+tsc -p tsconfig.json --noEmit             exit 0
+node --check scripts/qa/walkthrough.cjs   syntax ok
+health_incidents                          8 walks, live PostgreSQL
+```
+
+**Next:** the browser pass (`bash scripts/qa/run.sh`) still has not run on this box, and it is now
+the only thing standing between REQ-014 and slice 4. Both new screens have depth passes written
+and registered; they have not been executed.
+
+
+---
+
+## Tick 83 — REQ-014 slice 4: the two writers (2026-09-30)
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `a87ee01a` | `crates/health::workers` — the heartbeat writer, plus the `n/m` summary the card renders |
+| `cddecee1` | `probe_context` reads the staleness limit it claimed to read; the defaults are named |
+| `c3c22e3f` | `apps/api::health_runner` — this process's heartbeat and the scheduled probe run |
+| `83209cab` | `health_workers` — six walks on live PostgreSQL |
+
+**The finding: two tables with readers and no writers, both of them ticked.**
+
+`worker_heartbeats` shipped in slice 1. `probe_workers` counts rows, groups them by kind and
+names the stale ones, and the acceptance criterion *"worker counts come from heartbeat rows;
+stopping a worker changes `4/4` to `3/4` and names it"* was ticked — by a walk that **inserted the
+rows it then read**. `grep -rn "insert into worker_heartbeats"` over `crates` and `apps` returns
+one hit, and it is a test file. In production the card would have rendered exactly one honest
+sentence for ever: "no worker has registered a heartbeat".
+
+The same shape, one table over, and this time the reader was the *probe* rather than a query:
+`run_and_record` was reached from four route handlers in `health_panel.rs` and nowhere else. Every
+sample in `health_samples` was written because somebody was looking at the panel. The
+`check_interval_seconds` setting (5–600, default 60) was stored, rendered, validated by a form and
+read by **nothing** — the default 24 h trend would have been an empty chart eight hours after the
+last visit.
+
+This is the third instance on this codebase of the same defect, after REQ-010's uncalled
+`prune_candidates` and REQ-013's unwritten `next_run_at`. It has a name now: *a table, a reader, a
+column nobody fills*. The green gates cannot see it — `cargo check` has nothing to complain about,
+the probe compiles, the reader is unit-tested — so the only instrument that finds it is reading
+the request's own claims against `grep`.
+
+**A comment describing a read that does not happen.**
+
+`context()` in `health_panel.rs` hard-coded `worker_stale_seconds: 120` under a doc comment that
+said the value "is read from the settings row, with the migration's default when the row is
+unreadable". It was not read. 120 *is* the migration's default, which is exactly why nothing
+looked wrong: an operator who saved 600 got a panel that silently decided to call their worker dead
+after two minutes, and the panel and the constant agreed whenever nobody had saved anything.
+
+**Two of my own assertions were wrong before the platform was.**
+
+The walks went red twice and both times the walk was at fault. One aged a worker to 400 seconds and
+asserted it had gone stale — against a limit the same test had just saved at **600**, so 400 is
+inside the window and the platform was correct. The other asserted `started_at` moves forward when a
+pid is reused, and the writer deliberately does not move it: a heartbeat loop that refreshed the
+column every 30 seconds would make a process that has run for three months look three seconds old,
+and a reused pid is indistinguishable from a worker still running. The tie breaks towards the
+claim that is safer to be wrong about — under-report the restart rather than invent one per tick.
+The walk now pins that decision instead of the tidier story, because an assertion that fails the
+moment somebody "fixes" the upsert is an assertion about the wrong thing.
+
+**Proof**
+
+```
+cargo test -p omnion-health --lib          68 passed
+cargo check -p omnion-api --tests          clean
+cargo test -p omnion-api --test health_workers -- --test-threads=1
+                                            6 passed, live PostgreSQL
+tsc -p apps/admin/tsconfig.json --noEmit   exit 0
+```
+
+**Also fixed, incidentally:** `the_breach_window_is_computed_not_derived_at_insert_time` had been
+failing for a week. Its comment said "14:30" and the input was 870 seconds — correct arithmetic,
+wrong expectation about which 15-minute window that falls in, since `div_euclid` floors 870 to 0
+and not to 900.
+
+**Blocker: the disk.** `/mnt/apopic` sat at **99% with 919 MB free** when this tick started, which
+is a build-hostile number and the reason `cargo` took 8 minutes to answer. `omnion-target-main`
+(1.9 GB) was an orphaned `CARGO_TARGET_DIR` from a process that no longer existed — proven by
+reading `/proc/*/cwd` and `/proc/*/environ` for every pid, not by its mtime — and 1.03 GB more came
+from duplicate `rlib`/`rmeta` pairs in my own `target/debug/deps`. 3.8 GB free now. **The repo's own
+`scripts/qa/disk-guard.sh` freed nothing** and did not say why; it reads `/proc/*/environ` and gets
+`Permission denied` for pids it does not own, and the resulting empty grep makes a held target look
+free.
+
+**Next:** slice 4's remaining half — the five `health.*` events. The events catalogue has no
+`health` area at all, so "an operations endpoint subscribes to degraded and recovered" is currently
+a sentence in a document. That is a catalogue addition plus five emitters. The browser pass is still
+outstanding: the QA slot was **legitimately held** by a live w3 pass when this tick checked (holder
+pid alive, log one minute old), so it was left alone rather than reclaimed.
+
 ## Tick 36 — REQ-004/REQ-046 harness: a guard on 12 of 23 call sites, and a dead tab that decided the run
 
 **What.** Merged six commits from `origin/main` and then made the QA pass survive the box it runs
