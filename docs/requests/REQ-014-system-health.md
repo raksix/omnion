@@ -2,10 +2,15 @@
 
 > **Status:** in-progress (slices 1, 2 and 3 shipped: probes + overview, `/health` +
 > `/health/services/{key}` with its own 24 h trend column, `/health/metrics` with named ranges and a
-> server-rendered CSV export, and now the incident timeline + threshold policy with
-> `/health/incidents` and `/health/settings`. The `health_history`/`health_incidents` walks run on
-> live PostgreSQL and pass; the browser pass (`scripts/qa/run.sh`) has still not run on this box,
-> and slice 4 is untouched) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> server-rendered CSV export, and the incident timeline + threshold policy with
+> `/health/incidents` and `/health/settings`. **Slice 4 shipped its two writers** (`a87ee01a`,
+> `c3c22e3f`, `83209cab`): `worker_heartbeats` had a reader and no writer, so the `n/m` card could
+> only ever have said "no worker has registered a heartbeat", and `run_and_record` was reached from
+> the four route handlers and nowhere else, so samples existed only while somebody watched the panel.
+> Slice 4's events half — the five `health.*` names the request lists — is **not** started. The
+> `health_history`/`health_incidents`/`health_workers` walks run on live PostgreSQL and pass; the
+> browser pass (`scripts/qa/run.sh`) has still not run on this box) · **Captured:** 2026-09-25 ·
+> **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -105,9 +110,19 @@ Webhook relevance: `health.service.degraded` and `health.service.recovered` are 
       union high-water across every worktree, not the next free slot on this branch.
 - [x] `/health` shows all seven services from the request sketch with real states, not constants.
 - [ ] Stopping Redis flips its row to `down` within one interval and restores on recovery.
+      → the interval half is now real for the first time: `health_runner` runs the registry on a
+        timer, so "within one interval" is a claim about a scheduler that exists rather than about
+        a button. The recovery leg still needs a container this tick did not stop.
       → the `down` leg is proven by walk (an unreachable Redis is `down`, and the row survives);
       the "restores on recovery" leg needs a container this tick did not stop. Slice 3.
 - [x] Worker counts come from heartbeat rows; stopping a worker changes `4/4` to `3/4` and names it.
+      → **re-proved against the writer this slice adds** (`83209cab`). The box was already ticked and
+      the proof was weaker than it looked: `probe_workers` counted rows that the *walk itself* had
+      inserted, and nothing in the platform wrote a heartbeat — so the criterion was proven against a
+        fixture. `one_silent_worker_is_named_and_the_limit_is_the_one_that_was_saved` now drives four
+        workers through `workers::beat`, ages one past a limit it saves at **600** (far enough from
+        the default 120 that a hard-coded constant passes nothing), and asserts `3/4`, the shrinking
+        count, and the worker's *id* in the stale list.
 - [x] CPU, memory and disk values match the host within a small tolerance and update on refresh.
 - [x] Auto-refresh (15 s) visibly updates timestamps and values without a manual reload.
 - [x] "Run all checks" records a new sample set and reports per-probe failures instead of failing whole.
@@ -184,6 +199,16 @@ The walkthrough must visit `/health`, `/health/metrics`, `/health/incidents`, `/
 2. **History + service detail** — sample aggregation, sparklines, ranges, per-service detail and CSV export, retention pruning. Done: 24 h trends render from stored samples and pruning keeps the configured retention. **Shipped** (`8c445f52`, `9e7382b0`): `crates/health::history` (named `Range`, `MetricSummary`, `RollupDay`, `summaries_to_csv`), `/health/metrics` + `/health/metrics.csv` behind `health.read`, and `/health/metrics` with range selector, sparklines, CSV export, empty state and mobile cards. **The service detail page's own 24 h chart closed this tick**: its metric table now has a `24 h trend` column fed by the series on each row, over a window read once per response so every line on the page ends at the same instant. *Still open in this slice:* only the browser pass — the trend column's rendering is asserted in code and walked, but `scripts/qa/run.sh` has still not run on this box.
 3. **Incidents + thresholds** — transition detection, incident store, acknowledge/resolve, threshold policy and breach events, `/health/incidents`. Done: a scripted outage produces one incident with a duration and an acknowledgement that persists. **Shipped** (`f572dbde`, `0191`): `crates/health::incidents`, the emitter wired into `run_and_record` (so the manual button and the schedule produce the same incidents), `/health/incidents` + `/health/settings`, and the `health_incidents` walks. **The walk found two constraints that were themselves wrong**, which is why it is worth recording rather than just ticking: `0188`'s `health_incidents_resolved_shape` was the *inverse* of its own comment and made every open non-healthy incident unrepresentable, and `0190`'s pair check demanded `warn < crit` unconditionally while `classify` reads a `below` pair with `warn > crit`. Both are fixed in `0191`; see that file for why neither a type checker nor four green gates could see them. *Still open in this slice:* only the browser pass.
 4. **Workers + maintenance + summary** — worker heartbeats, stale detection, maintenance windows, platform summary endpoint feeding the security overview, webhook for degraded/recovered. Done: a killed worker is reported as stale and the summary endpoint reflects the worst current state.
+   **Two of the four shipped this tick** (`a87ee01a`, `c3c22e3f`, `83209cab`): the heartbeat
+   **writer** (`crates/health::workers`) and the **scheduled probe run** (`apps/api::health_runner`),
+   which is what the maintenance windows and the summary endpoint both read to have anything to
+   show. Maintenance windows themselves shipped in slice 3 with `/health/settings`, and
+   `GET /health/summary` is live. *Still open in this slice:* the five `health.*` events the
+   request names (`health.service.degraded`, `health.service.recovered`, `health.threshold.breached`,
+   `health.incident.acknowledged`, `health.checks.completed`). None of them is emitted today — the
+   catalogue has no `health` area at all — so "an operations endpoint subscribes to degraded and
+   recovered" is currently a sentence in a document rather than a subscription somebody can make.
+   That half is a catalogue addition plus emitters, and it is the next slice.
 
 ### Risks / notes
 
