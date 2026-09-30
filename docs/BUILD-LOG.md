@@ -7224,3 +7224,72 @@ thing this tick could do. Not taken; not worked around.
 
 **Next.** The w8 pass the moment w3's pass ends — it is what slice 5's three screens are waiting on,
 and acceptance 9, 10 and 12 all turn on it. Then the switcher and its URL state (acceptance 3).
+
+## w8 · tick 35 · REQ-133 slice 6 — the limit notices, and the word "once"
+
+**What.** Acceptance 9's limits sentence had one clause that could not be true on this branch, and
+every other half of it shipped and stayed green: `Limits::warns` computed the 80 percent crossing,
+the limits screen drew the amber bar, `ensure_run_within_limits` refused the over-quota run by name
+and the owner's name. What did not exist was the word **once**. The warning was derived per read —
+reloading the screen re-warned for ever — and `automation.project.limit.warning` and
+`.limit_exceeded`, the pair the REQ calls out as its webhook-relevant events, were emitted by
+nothing at all. That is the eighth time this branch has shipped a correct, unit-tested, REQ-named
+function with no caller able to produce the state it describes, and the first time the *state* rather
+than the *predicate* is what was missing.
+
+**Proof.**
+`scripts/qa/run-project-limit-notices.sh` **6/6, PROVEN TO FAIL at 3/6** — replacing the claim with
+the read-then-write it exists to prevent gives `left: 8, right: 1` for eight barrier-released sweeps,
+while the two that stay green are the tenancy fixture and the no-caps one, neither of which touches
+the claim. `run-project-limits.sh` **14/14** unchanged. Module lib **56**, events lib **47** (two new
+catalogue entries), core lib **45**, api lib **254** (up from 251: three worker unit tests),
+`omnion-audit --lib` 2/2, 0 clippy in the files touched, admin `tsc --noEmit` exit 0.
+
+**Three decisions, each one the obvious version gets wrong.**
+
+* **The primary key IS the once.** `claim_due_notices_in` takes the slot with
+  `on conflict do nothing` and returns only what *this* caller won; a second API node sweeping the
+  same database cannot double-notify, which is why `OMNION_PROJECT_LIMIT_RUNNER` is a flag and not a
+  singleton decision. The emit is best-effort and the claim is not given back — un-claiming on a
+  failed emit reopens the window and turns a database blip into a storm.
+* **One `period_key` column, two shapes.** The day (`YYYY-MM-DD`) for the counters that reset at
+  midnight, the literal `ever` for the two object caps that do not. And `set_limits` clears the
+  `ever` notices *after* its write: without that, a project that hit its workflow cap could never
+  warn again for the rest of its life, including after the obvious remedy of raising the number — a
+  warning reporting history instead of the present. The daily notices are deliberately left alone;
+  yesterday's warning is a fact.
+* **`to_regclass($1) is not null`, not the name.** The gate found this in its first run, in the
+  very function written to survive a table another wave has not shipped: decoding
+  `to_regclass($1)::text` into `(String,)` inside `fetch_optional` asks sqlx for
+  `Option<Option<String>>` and raises `ColumnDecode: UnexpectedNullError` — the exact answer the
+  function exists to give, turned into an error. The same nullable-decode trap
+  `transfer_ownership`'s `owner_user_id` read hit two slices ago. Worth naming as a pair: **a
+  nullable column plus `fetch_optional` is `Option<Option<T>>`, and the question "is it there?"
+  should be asked in the database, not in the decoder.**
+
+**Two things the gate caught that were mine, before they were the product's.** The fixture wrote
+`trigger`/`definition` where `workflows` has `trigger_kind`/`steps` — the wrong-shape write is
+obvious on screen and invisible until a count reads it. And the gate's own `std::sync::Barrier`
+deadlocked the current-thread runtime at the release rather than racing; `tokio::sync::Barrier` is
+what `crm_claims.rs` uses, and now so is this.
+
+**Not done, and stated rather than implied.** The limits screen itself is typechecked and driven by
+the harness but **not observed**: no completed `scripts/qa/run.sh` pass has run on this branch
+because the QA slot is held by a live sibling (holder pid alive, cwd `/mnt/apopic/omnion-w3`, load
+21, free RAM ~2.1 G of 33 G). Acceptance 9 is ticked for the *sentence* — the warning fires, it
+refuses, it names the limit and the owner, and it fires once — and the screen's rendering of it
+waits on a pass that finishes. I did not take the slot and did not route around it with
+`QA_SLOTS=0`: a fifth Chromium on a box at load 21 is precisely what the semaphore exists to
+prevent.
+
+**Disk, because it will bite the next tick.** `/mnt/apopic` hit 100% mid-clippy
+(`No space left on device`, os error 28 — *not* a compile failure), so this tick's clippy ran in
+`/root/w8clippy` and `/dev/shm` was at 75% from other writers' targets. A sibling reclaims its own
+target and runs; it does not reclaim anyone else's.
+
+**Commits.** `e64b79a5` the migration, `48661604` the store, `c47d9519` the worker and the two
+catalogue entries, `6b5aa935` the config, `2d96f286` the gate.
+
+**Next.** The switcher and its URL state (acceptance 3), then the member-role-next-request proof
+(15) and the 390 px pass (16) — all three of which need a pass that finishes, so the w8 QA stack the
+moment the slot frees.
