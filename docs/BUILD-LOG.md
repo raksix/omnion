@@ -6086,7 +6086,6 @@ and reporting red for a missing table rather than for anything the screen did.
 QA_WEB_PORT=3204`) as the first thing the slot frees, and require the four new claims plus the six
 existing ones. Slice 4 is then `noindex` on staging hosts, the header environment chip and the
 `promotion.*` webhook delivery.
-=======
 
 ### Tick 66 — the media part was a manifest wearing a backup's name (2026-09-29)
 
@@ -7609,3 +7608,51 @@ cargo, no writes in 30 min outside this writer's own 07:48 fingerprint) with the
 `cargo test --workspace` box, which is the only one left on that request. (c) Box note for the
 curator: at 0 free RAM and 25 G swap, `QA_SLOTS` and per-writer cargo concurrency are now the
 binding constraint on every pass — above any single wave.
+
+### Tick 75, continued — what the lockout fix actually cost to prove
+
+`669d584d` shipped a fix and a walk, and the walk was **green with the fix reverted**. Reverting
+one line — `address_failure_limit` back to `lockout_attempts` — left the test passing. That is the
+outcome a regression test exists to prevent, and the reason was structural rather than accidental:
+
+`ClientAddress` and the rate-limit middleware both read `ConnectInfo<SocketAddr>` out of the request
+extensions, and `into_make_service_with_connect_info` is the only thing that puts it there. A request
+driven through `router().oneshot()` arrives with **no address**, and with no address the per-address
+refusal cannot run at all. The walk was skipping the very rule a brute-force walk is meant to test.
+Absence of input is not a neutral default; it is the branch that skips the code.
+
+Installing the extension (`7865076d`) then broke two walks that had been passing for the wrong
+reason, both the same mistake one layer up:
+
+- **The limiter counted walks against each other.** Every walk shared `127.0.0.1` and the `sign_in`
+  ceiling is 10, so the sign-in round trip was refused `429` by a counter it never incremented.
+  `test_peer()` now allocates a loopback address per walk — the same shared-state mistake as an
+  unscoped `select count(*)`, one layer up.
+- **The sign-out walk had never signed out.** `post_logout` sent no CSRF token and this file's state
+  carried no secret, so sign-in issued no `omnion_csrf` cookie and the POST was refused `403`. That
+  assertion had been failing in CI since the CSRF layer landed. It took three fixes: the suite's own
+  secret on its own state, the token read out of the sign-in response, and `get_all(SET_COOKIE)`
+  instead of `get(SET_COOKIE)` — sign-in sends TWO cookies, so "no CSRF cookie was issued" was
+  concluded about a platform that had issued one.
+
+**Gates, final state.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `omnion-identity --lib` | **113/0** (the new threshold-invariant test is in this number) |
+| `apps/api --test auth` | **7/7** in 8.8s, over a live PostgreSQL + Redis |
+| `apps/admin` `tsc --noEmit` | clean |
+
+**Not proved, and named.** The lockout walk could not be shown **red** with the fix reverted: the
+reverted run died on a Redis connect timeout before reaching its assertion, because the box ran at
+load 80–107 with four sibling writers. The walk is green with the fix and the walk demonstrably
+cannot see the address rule without `ConnectInfo` (which is why it passed with the fix reverted),
+so the two together are strong evidence — but "the revert was watched going red" is not something
+this tick can claim, and the next tick should watch it when the box is quieter.
+
+**The browser pass still has not reported.** It ran for twenty minutes, walked seven screens and then
+died with `clicks.jsonl ENOENT` when `/mnt/apopic` hit 100% and the artifact directory was trimmed out
+from under it. That is now survivable (`25dddf5c`), and the two limiter screens are walked on desktop
+and at 390px, so the next tick is where the boxes naming a screen can be ticked.
