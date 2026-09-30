@@ -673,15 +673,20 @@ pub async fn record_payment(
         };
         let status_before = invoice.status;
 
+        // `position` is the loop's own index, so the read-back can restore the order the sweep
+        // walked the invoices in. Sorting by `created_at` cannot: `now()` is transaction-stable,
+        // so every row this payment writes carries the identical timestamp and the tiebreak falls
+        // to a random `id`.
         sqlx::query(
             "insert into accounting_payment_allocations \
-                 (payment_id, organization_id, invoice_id, amount) \
-             values ($1, $2, $3, $4::numeric)",
+                 (payment_id, organization_id, invoice_id, amount, position) \
+             values ($1, $2, $3, $4::numeric, $5)",
         )
         .bind(payment_id)
         .bind(organization_id)
         .bind(invoice_id)
         .bind(value.to_text())
+        .bind(i16::try_from(settled.len()).unwrap_or(i16::MAX))
         .execute(&mut *tx)
         .await?;
 
@@ -1087,7 +1092,7 @@ pub async fn load_allocations(pool: &PgPool, payment_id: Uuid) -> Result<Vec<All
                 i.paid_total::text as paid_total \
          from accounting_payment_allocations a \
          join accounting_invoices i on i.id = a.invoice_id \
-         where a.payment_id = $1 order by a.created_at, a.id",
+         where a.payment_id = $1 order by a.position nulls last, a.id",
     )
     .bind(payment_id)
     .fetch_all(pool)
