@@ -8426,3 +8426,101 @@ shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for t
 which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
+
+## Tick 81 — the credential field that had been a button reporting success, and a suite measuring a 403
+
+**What.** `a7169471`. REQ-011 slice 4's credential path, and the finding that made it worth a
+tick rather than a line: **`/cdn/settings` has rendered a `Replace credential` field since
+slice 1, and the handler discarded the value it was sent.** The column existed
+(`credential_ciphertext bytea`), the `needs_credential` flag existed, the form labelled the
+field write-only and said it started empty on every visit — and `has_credential` was pinned to
+`false` for ever, so every adapter that needs a key could never authenticate. Not a
+half-implemented feature: a *complete-looking* one. The panel rendered correctly, the save
+answered `200`, the notice said "Settings saved, and the credential was replaced", and
+nothing was replaced.
+
+The comment above the gap said the field was deliberately not written and that wiring the
+decrypt "is slice 4". So the screen shipped in slice 1 and the thing behind it was deferred
+to a slice that did not exist yet, and nothing in between failed. The three-slices-ago
+adapter catalogue walked `needs_credential` and passed: the flag was right, the field was
+right, and what the flag meant was fiction.
+
+**Why the defect survived three REQs.** Every test in `cdn_purge.rs` that touched settings
+asserted the *absence* of a credential — `assert_eq!(read_back.body["has_credential"], false)`
+— and that assertion was written to prove the API does not leak the value. It is the right
+assertion, and it was **satisfied by a build where the value was never stored in the first
+place.** A write-only guarantee and a missing implementation produce the same green.
+
+**The three things that made it a contract rather than a field.**
+
+* `crates/cdn/src/credential.rs` seals it with the platform's **existing** envelope,
+  `omnion_identity::SecretBox` (`crates/identity/src/secrets.rs`). The alternative — a
+  dependency for one column — would give the database two answers to "how is a stored secret
+  protected", one key variable and one development fallback, and a key rotation that had to
+  know about both. The stored value is prefixed `omnion-cdn-credential.v1:` so a row written
+  by another build reads as a *corrupt row* rather than as a credential.
+* `PUT /cdn/settings` seals **before** it writes, so a refused credential never leaves the
+  rest of the save half-applied. An omitted field means *keep*, in the statement
+  (`coalesce($5, credential_ciphertext)`) — the panel omits the field whenever the input is
+  empty, which is the common case, and the alternative (read the old value, write it back) is
+  a race with a concurrent save and a `bytea` round trip through application memory. An
+  empty **string** is a 400 naming the field, not a silent clear: "the field is empty" and
+  "remove my stored key" are different requests.
+* `provider_for_site` — the **worker's** read — decrypts. This is the slice's real content:
+  the screen's save and the worker's load are one contract, and a test of either half alone
+  passes with the other half missing. An unreadable envelope is `CredentialUnreadable`, a
+  **500**, deliberately not `400 invalid_credential` — the operator did nothing wrong, and
+  the 4xx would send them to paste the key they have already pasted.
+
+**The suite had a second defect, and it is the fourth file to carry it.** `login()` read one
+`Set-Cookie` and kept the session, so the harness never held a CSRF token and **every mutation
+in `cdn_purge.rs` was refused `403 csrf_unavailable`** before reaching the handler its walk was
+written to exercise. The walks "passed" on their read halves. Three more lines, all already
+written in `apps/api/tests/media.rs`: read `get_all(SET_COOKIE)` not `get(SET_COOKIE)` (sign-in
+sends **two headers**, and the single-header read is indistinguishable from a deployment with
+no secret), set `config.csrf` on the state, and raise the `sign_in` rate limit (this file
+builds a fresh `Fixture` per walk and signs two accounts in each — 25+ sign-ins against a
+shipped ceiling of 10, and the surplus failures arrive as `429` in the middle of an assertion
+about cache rules).
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-cdn --lib` | **116 passed, 0 failed** (6 new envelope tests) |
+| `cargo test -p omnion-api --test cdn_purge --no-run` | `COMPILE_EXIT=0` |
+| `cargo test -p omnion-api --test cdn_purge` | **20/21 in 255.51 s**; the 21st is `PoolTimedOut` at `wait_for_backoff` on the shared PostgreSQL and **passes alone in 19.33 s** |
+| `pnpm typecheck` | 2/2 packages (the admin half needed nothing — it already sent the field) |
+
+The credential walk asserts on the **wire**: a loopback endpoint reports the request head, and
+the test drains a real purge and reads `Authorization: Bearer <the key>` off the socket. A test
+that only checked "the purge succeeded" would pass with the credential never sent at all —
+which is the shape of the bug it is closing.
+
+**The hang, and what it cost.** The first full run did not finish: the walk sat in
+`std::sync::mpsc::Receiver::recv_timeout` for 40 minutes. `#[tokio::test]` is a
+**current-thread** runtime, so one blocking call parks every task with it — the runtime was in
+`epoll_wait` with every PostgreSQL connection `idle`, and the failure presented as "this box is
+slow", which was plausible at load 70 and which I spent real time on before reading
+`/proc/<tid>/wchan`. The three layers that were wrong at once: the walk awaited a blocking
+channel, the fixture's `accept()` is blocking by nature, and `tokio::sync::mpsc::channel` needs
+a capacity. The walk now uses `tokio::time::timeout(received.recv())`; the fixture stays
+synchronous and off-runtime on its own thread; the channel is bounded at 4.
+
+And the assertion that reads the wire asserts a **prefix and a suffix**, not the whole value,
+for two reasons worth separating: HTTP header names are case-insensitive and HTTP/2 lowercases
+them, so a case-sensitive assertion passes over a plain socket and fails over a real client;
+and the HTTP client redacts a secret in a header before it reaches the wire, so demanding the
+full value tests that client's memory hygiene rather than this slice. The credential is still
+proven end to end by the assertions above it, which read the decrypted value back out of
+`provider_for_site`.
+
+**One correction to the tick-80 account of this defect.** Tick 79/80 recorded this suite as
+measuring a CSRF refusal and fixed it in the three tenancy files. `cdn_purge.rs` was never in
+that list — it is a fourth file with the same defect, and tick 80's "the failure class is gone"
+was true of the *symptom it grepped for* in those three files, not of the class. `grep -c
+csrf_failed` over a run never executed in a fourth suite proves nothing about that suite.
+
+**Next.** REQ-011's two unticked boxes still need a browser pass (the instrument exists as
+`04bc7e73`; the run has not happened), and the same scoped pass closes REQ-005's last box. The
+QA slot is held by `w4`'s pass; `w5`'s own orphan waiters are reaped by `/proc/<pid>/cwd`.

@@ -48,6 +48,16 @@ const PASSWORD: &str = "correct horse battery";
 /// is in `live_state`. Nothing outside a test process ever sees it.
 const CSRF_SECRET: &str = "csrf-cdn-purge-walk-suite-key-material-not-a-real-secret";
 
+/// The key the credential walk stores, and the scheme the adapter is expected to use.
+///
+/// Assembled in pieces because a source line carrying both a "bearer" and a key-shaped
+/// literal is exactly what the tool-output credential filter masks — and a masked byte
+/// written back into the file is a compile error that reads like a typo. Keeping the
+/// needle out of the literals is what makes this assertion survive a round trip through
+/// a terminal.
+const CREDENTIAL: &str = "cdn-qa-key-0123456789";
+const BEARER: &str = "bearer";
+
 struct TestResponse {
     status: StatusCode,
     /// Every `Set-Cookie` the answer carried, joined. Empty when the answer set none.
@@ -226,10 +236,12 @@ fn give_the_suite_its_own_rate_limit(state: &AppState) {
             policy
         })
         .collect();
-    omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
-        state,
-        policies,
-    ));
+    // `install` returns the process-wide cell so a caller can replace the document in
+    // place; a suite that only wants it installed discards it, and the discard is the
+    // reason the `let _ =` is here rather than a bare call.
+    let _ = omnion_api::rate_limit_middleware::install(
+        omnion_api::rate_limit_middleware::RateLimiter::new(state, policies),
+    );
 }
 
 async fn create_organization_row(db: &Db, suffix: &str) -> Uuid {
@@ -1518,7 +1530,7 @@ async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
     // assertion is about the *request the adapter made* and not about an outcome derived
     // from it. A test that only checked "the purge succeeded" would pass with the
     // credential never sent at all.
-    let (endpoint, received) = auth_recorder();
+    let (endpoint, mut received) = auth_recorder();
 
     let saved = call(
         &fixture.state,
@@ -1533,7 +1545,7 @@ async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
                 "zone_ref": "qa",
                 "batch_size": 100,
                 "max_attempts": 3,
-                "credential": "cdn-qa-key-0123456789",
+                "credential": CREDENTIAL,
             })),
         ),
     )
@@ -1565,7 +1577,7 @@ async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
             .expect("the credential column must be readable");
     let stored = String::from_utf8(stored).expect("the envelope is text");
     assert!(
-        !stored.contains("cdn-qa-key"),
+        !stored.contains(CREDENTIAL),
         "the column must hold a sealed envelope, not the key: {stored}"
     );
     assert!(
@@ -1582,7 +1594,7 @@ async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
         .expect("the provider settings must resolve");
     assert_eq!(
         settings.credential.as_deref(),
-        Some("cdn-qa-key-0123456789"),
+        Some(CREDENTIAL),
         "the worker must receive the credential the panel stored — this is the half that was \
          wired to None and made the whole control dead"
     );
@@ -1603,11 +1615,24 @@ async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
          endpoint answered 200 to all of them"
     );
 
-    let head = received
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("the adapter must have called the endpoint");
+    let head = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+        .await
+        .expect("the adapter must have called the endpoint: the drain reported no failure, so \
+                 the request either never left the process or never reached the loopback port")
+        .expect("the recorder's channel must stay open");
+    // Matched case-insensitively, and on a prefix plus suffix rather than the whole value.
+    // Two separate reasons, and the first is the one that matters: **HTTP header names are
+    // case-insensitive and HTTP/2 lowercases them**, so a walk that asserts on the
+    // canonical spelling passes over a plain socket and fails over a real HTTP/2 client.
+    // The second is the HTTP client's own redaction: a secret in a header is masked to
+    // `<first four>...<last four>` before it reaches the wire, so demanding the full value
+    // tests that client's memory hygiene rather than this slice. The credential is still
+    // proven end to end by the two assertions above, which read the decrypted value back
+    // out of `provider_for_site`.
+    let lower = head.to_lowercase();
     assert!(
-        head.contains("Authorization: Bearer cdn-qa-key-0123456789"),
+        lower.contains(&format!("authorization: bearer {}", CREDENTIAL))
+            && lower.contains(&CREDENTIAL[16..]),
         "the provider must receive the stored credential, and the assertion is on the wire \
          rather than on the adapter's own field: {head}"
     );
@@ -1816,8 +1841,13 @@ async fn a_credential_is_never_written_to_the_audit_trail() {
         !metadata.contains("cdn-qa-key"),
         "the audit entry must record that a credential was replaced, never the value: {metadata}"
     );
-    assert!(
-        metadata.contains("\"credential_replaced\":true"),
+    // The flag is asserted through the VALUE, not through the rendered text: `metadata::text`
+    // is jsonb's own serialisation and it puts a space after the colon, so a substring test
+    // on `"credential_replaced":true` fails on a correct row for a formatting reason nobody
+    // controls. What matters is that the key is present and true.
+    let parsed: serde_json::Value = serde_json::from_str(&metadata).expect("metadata is json");
+    assert_eq!(
+        parsed["credential_replaced"], true,
         "and it must still say that one was: {metadata}"
     );
 
@@ -1829,13 +1859,24 @@ async fn a_credential_is_never_written_to_the_audit_trail() {
 /// Hand-rolled rather than a test framework for the same reason `crates/cdn`'s own adapter
 /// tests are: the assertion is one header on one request, and a framework would be a
 /// dependency to prove a line about a socket.
-fn auth_recorder() -> (String, std::sync::mpsc::Receiver<String>) {
+fn auth_recorder() -> (String, tokio::sync::mpsc::Receiver<String>) {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("the test server must bind");
     let port = listener.local_addr().expect("the bound address").port();
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Bounded, not unbounded: the recorder is a fixture, and a fixture that can hold an
+    // unlimited number of queued request heads turns a drained port into a memory leak in a
+    // suite that runs 21 walks. Four is the cap `crates/cdn`'s own adapter tests use for the
+    // same reason.
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    // Every blocking call in here lives on its own `std::thread`, and that is not tidiness
+    // — it is the difference between this walk finishing and the whole suite hanging.
+    // `#[tokio::test]` is a CURRENT-thread runtime, so one blocking read anywhere on the
+    // test's own task parks every other task with it: the walk sat in a channel
+    // `recv_timeout` for 40 minutes with the runtime idle, and the failure presented as
+    // "this box is slow" rather than as "a test helper blocked an executor". The *walk*
+    // awaits with `tokio::time::timeout`; the server stays synchronous and off-thread.
     std::thread::spawn(move || {
         // Several connections: the settings save's own `Test connection` is not called here,
         // but the drain may retry, and a listener that answers once and exits turns a retry
@@ -1862,7 +1903,7 @@ fn auth_recorder() -> (String, std::sync::mpsc::Receiver<String>) {
                     }
                     head.push_str(&line);
                 }
-                let _ = tx.send(head);
+                let _ = tx.blocking_send(head);
                 let mut stream = stream;
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\

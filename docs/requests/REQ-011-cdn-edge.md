@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; **slice 4's credential path shipped this tick.** It was the one control on `/cdn/settings` that had been a button reporting success and storing nothing: the panel has rendered a `Replace credential` field since slice 1, sends it, and the handler dropped the value on the floor with a comment saying it would — so `has_credential` was pinned to `false` for ever and every adapter that needs a key could never authenticate. The column existed, the field existed, the `needs_credential` flag existed, and nothing connected them. Now: `crates/cdn/src/credential.rs` seals it with the platform's own envelope (`omnion_identity::SecretBox`, one key variable, one development fallback) and stamps a `omnion-cdn-credential.v1:` prefix so a value written by another build reads as a corrupt row rather than as a key; the `PUT` seals before it writes, so a refused credential never leaves the rest of the save half-applied; and `provider_for_site` — the *worker's* read, which is what makes the two halves one contract — decrypts instead of hardcoding `None`. An unreadable envelope is `CredentialUnreadable`, a `500`: the operator did nothing wrong, and answering `400 invalid_credential` would send them to paste the key they just pasted. The suite also had **no CSRF token at all** — `login()` read one `Set-Cookie` and kept the session — so every mutation in `cdn_purge.rs` was refused `csrf_unavailable` before its handler and the walks were measuring a 403. Same `Credentials { session, csrf }` + `Deref` type as tick 80, plus the `config.csrf = CsrfSecret::new(..)` line the media suite already carries and documents. `origin/main` merged in `TICK81MERGE` · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; **slice 4's credential path shipped this tick.** It was the one control on `/cdn/settings` that had been a button reporting success and storing nothing: the panel has rendered a `Replace credential` field since slice 1, sends it, and the handler dropped the value on the floor with a comment saying it would — so `has_credential` was pinned to `false` for ever and every adapter that needs a key could never authenticate. The column existed, the field existed, the `needs_credential` flag existed, and nothing connected them. Now: `crates/cdn/src/credential.rs` seals it with the platform's own envelope (`omnion_identity::SecretBox`, one key variable, one development fallback) and stamps a `omnion-cdn-credential.v1:` prefix so a value written by another build reads as a corrupt row rather than as a key; the `PUT` seals before it writes, so a refused credential never leaves the rest of the save half-applied; and `provider_for_site` — the *worker's* read, which is what makes the two halves one contract — decrypts instead of hardcoding `None`. An unreadable envelope is `CredentialUnreadable`, a `500`: the operator did nothing wrong, and answering `400 invalid_credential` would send them to paste the key they just pasted. The suite also had **no CSRF token at all** — `login()` read one `Set-Cookie` and kept the session — so every mutation in `cdn_purge.rs` was refused `csrf_unavailable` before its handler and the walks were measuring a 403. Same `Credentials { session, csrf }` + `Deref` type as tick 80, plus the `config.csrf = CsrfSecret::new(..)` line the media suite already carries and documents. `origin/main` merged in `9cc17473` · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -287,6 +287,28 @@ The walkthrough must visit `/cdn`, `/cdn/purges`, `/cdn/purge`, `/cdn/rules`, `/
    `generic_http` is a body no endpoint reads — the adapter answers `Succeeded` and the operator
    has a successful purge that invalidated nothing.
 4. **Provider + settings depth** — adapter catalogue, masked credentials, `generic_http` signed payload, `cdn.purge.failed` webhook, counters on the overview. Done: a test endpoint receives a correctly signed purge payload and the overview counters reflect it.
+   *Status:* **the credential half shipped this tick** (`a7169471`), and what it found is the
+   note worth keeping: the field had been a **button reporting success** since slice 1. The
+   panel rendered it, sent it, labelled it write-only — and the handler dropped the value with a
+   comment saying the decrypt "is slice 4". Every settings walk asserted
+   `has_credential == false` to prove the API does not leak a credential, and that assertion is
+   *satisfied by a build that never stored one*: a write-only guarantee and a missing
+   implementation produce the same green, which is why three REQs' worth of tests never
+   noticed. Four walks now (`a7169471`): the end-to-end one resolves the credential back out of
+   `provider_for_site` — the function the drain calls, not a copy — and reads
+   `authorization: bearer …` off a loopback socket after a real purge; the keep-and-replace one
+   covers the two other states a form can be in; the refusal one names the field and checks
+   nothing was written; the audit one asserts the trail says `credential_replaced: true` and
+   does not contain the value. Suite **20/21**, the 21st a shared-Postgres `PoolTimedOut` that
+   passes alone.
+
+   Two of the decisions are not the obvious ones. The envelope is the platform's existing
+   `SecretBox` rather than a dependency added for one column, because a second answer to "how
+   is a stored secret protected" means a key rotation that has to know about both. And an
+   **unreadable** envelope is a 500 named `CredentialUnreadable` rather than a 400
+   `invalid_credential`: the stored value is fine and this process holds the wrong key, and
+   telling the operator their credential is invalid would send them to paste the key they have
+   already pasted.
 
 ### Risks / notes
 
