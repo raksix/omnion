@@ -7667,3 +7667,53 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
+
+## Wave 4 · tick 38 · REQ-054 slice 2 — the three invoice screens, and the target that kept dying
+
+Slice 2 ended last tick with the module, the routes and eighteen walks committed, and the walks
+at 17/18 against a live PostgreSQL with the eighteenth assertion fixed but never re-run. This tick
+did the two things that were outstanding: **re-ran the eighteen**, and **built the screens the
+slice had been missing**.
+
+**The screens were missing because "routes wired" is not "feature delivered".** Slice 2's commit
+`34762df` put six routes behind the API and the accounting module kept the three screens slice 1
+built — chart, rates, journal. `/accounting/invoices` was a URL that answered `404` to a browser.
+A walkthrough that only exercises the API would never have noticed, which is the argument for
+walking the screen rather than the route, restated by a defect rather than a principle.
+
+Three screens and the client behind them:
+
+* **`/accounting/invoices`** — status tabs and the "Overdue only" switch both read the *server's*
+  `overdue_only` filter, so the tab and the red "37d late" on a row can never disagree. Each row
+  prints `total / paid / outstanding` together so `paid + outstanding = total` is checkable without
+  arithmetic. "Check overdue now" is a button because the sweep is normally the automation's job
+  and an operator who thinks a late invoice has not turned red needs a way to *ask*.
+* **`/accounting/invoices/new`** — the line grid, and the reason `NewInvoicePayload` has no
+  `subtotal` and no `grand_total` field: the server's `NewInvoice` has none either, so a total
+  posted from a browser would be rejected. The preview prices lines in the browser in the module's
+  own order (discount, then tax, rounded once) and the screen re-reads the server's figures after
+  saving. Save stays disabled until a line is actually usable.
+* **`/accounting/invoices/{id}`** — the document: lines, the right-aligned totals block, and send
+  and void **only while the status is draft**, because the server owns those preconditions. The
+  void dialog keeps its confirm button disabled until the reason has something in it; voiding
+  preserves the number, so the reason is the only record of why it was withdrawn.
+
+**Proof.** `apps/admin`: `tsc --noEmit` **0 errors** — run directly, because `pnpm turbo run
+typecheck` reported "cache miss, executing" in 2.3s, which is a cache that does not know a file
+was just created. `scripts/qa/walkthrough.cjs` parses (`bun build --external '*'`). The
+`accounting-depth` pass gains the list, the form (watching the live total reach `240.00` for
+2 × 100 at 20%, and the save button's disabled state on both sides of that) and a 390px pass over
+the invoice table. Commits `8520f9ac` (main merged, BUILD-LOG spliced and multiset-proved) and
+`615ed7db`.
+
+**A defect in the harness, found twice.** `disk-guard.sh` decides a target directory is in use by
+reading `CARGO_TARGET_DIR` out of `/proc/*/environ`, so a build launched *without* an explicit
+`CARGO_TARGET_DIR` is invisible to it and gets `rm -rf`'d mid-compile. It cost two builds tonight
+and produced `os error 2` on a `.rmeta` path, which reads exactly like a broken crate. Building
+into `/dev/shm/w4-target` with `CARGO_INCREMENTAL=0` survived two guard cycles the default target
+did not. **The next tick, and every tick after it: set `CARGO_TARGET_DIR` explicitly.**
+
+**The eighteen walks:** the result is in the tick's report. They are run, not committed-and-hoped.
+
+**Next.** Slice 3 — payments with allocation, partial and full states, reversal, the payments
+screen and the cashflow report.
