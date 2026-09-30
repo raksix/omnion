@@ -5625,11 +5625,40 @@ async function runCrmIntakeDepth(page, report) {
   steps.sourceRows = await page.locator("[data-source-row]").count();
   await shot(page, "page-crm-intake-source");
 
+  // The Edit click is ASYNC now: it reads one source from the server before the editor opens,
+  // so a fixed `waitForTimeout` is a race — on a loaded QA box the editor can arrive after it,
+  // and every step below would then measure an empty screen and read as a product failure
+  // invented by the harness. `waitForSelector` on the editor is the honest wait: it blocks on
+  // the thing being asserted and has a timeout that *can* fail.
   await page.locator(`[data-source-edit="${source.id}"]`).first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(900);
-  steps.editorRendered = (await page.locator("[data-source-editor]").count()) > 0;
+  const editorArrived = await page
+    .waitForSelector("[data-source-editor]", { timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+  steps.editorRendered = editorArrived;
   steps.mappingRows = await page.locator("[data-mapping-row]").count();
   steps.transformChips = await page.locator(`[data-source-editor="${source.id}"] span.rounded-full`).count();
+
+  // The editor must be showing what the SERVER holds, not the list row it was clicked from.
+  // The two bodies are identical today, so this cannot fail on today's data — it is here
+  // because the next field that lands in `SourceBody` and not in the table would make the save
+  // a whole-column patch over a stale copy, reverting a colleague's edit without a word.
+  // Asserting it while the bodies agree is what makes the *next* tick notice when they do not.
+  //
+  // The selector is `#source-name` because that is what the screen actually renders. The first
+  // draft of this line asserted on `[data-source-name]`, which does not exist — a gate written
+  // against a selector nobody shipped passes by measuring `null`, and `null` was then compared
+  // with `!== null` so it would have gone green on a *missing* control. The lesson is the one
+  // this gate already records for the walkthrough: an assertion that cannot fail is worse than
+  // no assertion, and a selector is part of the contract being asserted.
+  const editorName = await page
+    .locator("#source-name")
+    .first()
+    .inputValue()
+    .catch(() => null);
+  steps.editorNameIs = editorName;
+  steps.editorOpenedFromServer =
+    editorArrived && editorName !== null && editorName.trim() === (source.name ?? "").trim();
 
   // A required target with no source must refuse the save *in the screen*, before the round
   // trip: the button is disabled and the line names the field.
