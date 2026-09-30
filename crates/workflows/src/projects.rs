@@ -755,6 +755,314 @@ pub async fn workflow_count(pool: &PgPool, project_id: Uuid) -> Result<i64> {
     Ok(count)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The switcher (REQ-133, acceptance 3): what this person last worked in, and in what order.
+//
+// Four functions, and the split is the design rather than an accident. `list_switcher_entries` is
+// the read, `select_project` is the write, and they are separate because **a read that also wrote
+// the recents would make every page view reorder the list** — the entry you are looking at would
+// climb to rank 0 because you looked at it, which is the same ranking as "recently used" for
+// about four seconds and the opposite of it after that.
+
+/// One row of the switcher: the project plus this person's relationship to it.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwitcherEntry {
+    /// The project itself, flattened so the panel can render a row from one object.
+    #[serde(flatten)]
+    pub project: Project,
+    /// The caller's role, or `None` for an instance administrator who is not a member.
+    pub caller_role: Option<ProjectRole>,
+    /// `true` when this is the project the switcher has selected for this caller.
+    pub selected: bool,
+    /// The recents rank, or `None` for a project that is not in the recents yet.
+    ///
+    /// A nullable rank rather than a zero-filled one: rank 0 is a *fact* ("you were here a
+    /// minute ago") and an absent rank is a different fact ("this is a project you have never
+    /// opened"), and the switcher orders on it.
+    pub recent_rank: Option<i16>,
+    /// Whether this person may administer the project — the switcher marks it rather than hiding
+    /// the entry, because an entry you can see but cannot manage is a legitimate state.
+    pub can_manage: bool,
+}
+
+/// The switcher's list for one caller: the projects they are in, their recents first.
+///
+/// **This is the query the `?mine=1` parameter asked for and nothing read.** It differs from
+/// [`list_projects`] in three ways, and each difference is a decision the switcher needs rather
+/// than a variation:
+///
+/// 1. **`mine` means membership, not visibility.** An instance administrator sees every project
+///    in the organization through `list_projects`, and the switcher would then be a list — which
+///    is the thing the REQ explicitly refuses ("a switcher that lists forty projects is a list").
+///    So membership is the filter and the administrator's extra reach shows up as a single
+///    `All projects` entry in the UI, never as forty rows here.
+///
+///    **Membership is the filter, and the recents are the exception — and the gate found the
+///    exception missing.** The first version filtered on `p.is_default or <membership>`, which
+///    meant an administrator who switched into a project they are not a member of (the case
+///    delegated administration exists for) got a switcher that named a project it then refused to
+///    list: the header said "PAY", the dropdown did not contain it, and the only way to leave was
+///    to reload. So a project in *this person's recents* is listed whatever their membership,
+///    while the rest of the organization stays out. The clause is not `or $2` — that would be the
+///    forty-project list again, reached by a different route.
+/// 2. **Recents come first, and the rest is stable.** Ordering by rank with `nulls last` is what
+///    makes "recents first" true; ordering by creation would make it a coincidence.
+/// 3. **The organization's default is always present.** Exactly as in [`visible_project_ids`]: it
+///    is where an un-targeted resource lands, so a switcher without it cannot even show where
+///    the reader's own first workflow went.
+///
+/// `selected` is answered from the *stored* selection rather than from a query parameter, because
+/// "what does this person have chosen" and "what did the URL ask for" are different questions when
+/// the two disagree, and only one of them is durable.
+pub async fn list_switcher_entries(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Vec<SwitcherEntry>> {
+    // `ProjectRole` and `recent_rank` are decoded as their stored shapes and parsed here, rather
+    // than bound as the domain types. Two reasons, and both are the store's own conventions:
+    //
+    // * `ProjectRole` is not a sqlx type. A scalar subquery for the role returns NULL for a
+    //   project the caller is not a member of, so the decode target is `Option<String>` and the
+    //   parse is the *only* place that decides an unknown stored role is no role at all. Binding
+    //   `ProjectRole` directly would need a `Type` impl and would raise `UnexpectedNull` on
+    //   exactly the rows an instance administrator's switcher is made of.
+    // * `recent_rank` is nullable by design, and a nullable column bound to a non-optional `i16`
+    //   raises `ColumnDecode: UnexpectedNullError` — the third time this branch has hit that
+    //   shape (the claim table's `to_regclass` and `transfer_ownership`'s `owner_user_id` were the
+    //   first two). The rule learned then applies here: **ask "is it there?" in the database, or
+    //   declare the column optional.** `Option<i16>` is the declaration.
+    //
+    //   `i16` and not `i32`, and the gate found that: the column is a `smallint` (`INT2`) and a
+    //   `Rust i32` decodes as `INT4`, so the read raised `mismatched types; Rust type Option<i32>
+    //   (as SQL type INT4) is not compatible with SQL type INT2` — on every row of every
+    //   switcher load, while all three tests that never reach the decode stayed green. The
+    //   column's width is the *store's* choice and the decoder has to match it; `i32` is only
+    //   right for an `int`.
+    let rows: Vec<SwitcherRow> = sqlx::query_as(&format!(
+        "select {PROJECT_COLUMNS}, \
+           (select m.role from automation_project_members m \
+             where m.project_id = p.id and m.user_id = $3) as caller_role, \
+           (select r.rank from automation_project_recent r \
+             where r.user_id = $3 and r.project_id = p.id) as recent_rank \
+         from automation_projects p \
+         where p.organization_id = $1 \
+           and (p.is_default \
+                or exists (select 1 from automation_project_recent r \
+                           where r.user_id = $3 and r.project_id = p.id) \
+                or exists (select 1 from automation_project_members m \
+                           where m.project_id = p.id and m.user_id = $3)) \
+         order by (select r.rank from automation_project_recent r \
+                    where r.user_id = $3 and r.project_id = p.id) asc nulls last, \
+                  p.is_default desc, p.name",
+    ))
+    .bind(organization_id)
+    .bind(caller.is_instance_admin)
+    .bind(caller.user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let selected = selected_project(pool, organization_id, caller).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            // An unknown stored role reads as "no role", not as a panic and not as a default
+            // that would grant a power the database did not say. A `viewer` who somehow holds
+            // `ownerx` gets a switcher entry and no administration.
+            let caller_role = row.caller_role.as_deref().and_then(ProjectRole::parse);
+            let is_selected = selected == Some(row.project.id);
+            SwitcherEntry {
+                can_manage: caller.is_instance_admin
+                    || caller_role.is_some_and(ProjectRole::can_administer),
+                recent_rank: row.recent_rank,
+                project: row.project,
+                caller_role,
+                selected: is_selected,
+            }
+        })
+        .collect())
+}
+
+/// The switcher's query row, before the stored shapes are parsed into domain types.
+///
+/// A struct rather than a tuple for a plain mechanical reason — `sqlx` implements `FromRow` for
+/// tuples up to nine elements but a flat tuple of a *flattened* row plus two nullable scalars is
+/// the shape it refuses, and the error names a missing `Type` impl for `Project` rather than
+/// saying "too many columns". Two nullable columns in a row are also exactly the pair that needs
+/// named types to be readable at the call site.
+#[derive(sqlx::FromRow)]
+struct SwitcherRow {
+    #[sqlx(flatten)]
+    project: Project,
+    caller_role: Option<String>,
+    recent_rank: Option<i16>,
+}
+
+/// The project this caller has selected, or `None` when they have never chosen one.
+///
+/// `None` is a real state and the switcher has to be able to say it out loud: a caller who has
+/// not chosen is looking at everything, which is the correct default for an installation with one
+/// project and a confusing one for a caller with nine. Returning the default project here instead
+/// would make the two indistinguishable.
+pub async fn selected_project(
+    pool: &PgPool,
+    organization_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<Uuid>> {
+    let row: Option<Uuid> = sqlx::query_scalar(
+        "select p.id from automation_projects p \
+         join automation_project_selection s on s.project_id = p.id \
+         where s.user_id = $2 and p.organization_id = $1",
+    )
+    .bind(organization_id)
+    .bind(caller.user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Select a project for this caller, and move it to the front of their recents.
+///
+/// **One transaction, because the two halves are one event.** A selection that persisted but did
+/// not reorder is a switcher whose "most recent" is a fact about when the feature shipped, and a
+/// reorder that happened without the selection is a recents list that promotes projects the person
+/// did not choose. Doing them separately is also a read-then-write, and this branch has taken four
+/// such shapes away from callers already.
+///
+/// The shift is a single statement that moves *every* row up by one and pushes the previous rank 0
+/// out of the window:
+///
+/// ```sql
+/// update automation_project_recent \
+///    set rank = case when rank = 0 then null else rank - 1 end \
+///  where user_id = $1 and rank > 0
+/// ```
+///
+/// The `rank = null` on the old head is the demotion a plain `on conflict do nothing` upsert cannot
+/// express, and it is why the primary key is `(user_id, project_id)` while the unique index is on
+/// `(user_id, rank)`: re-selecting a project already at rank 3 must land it at 0 without a
+/// duplicate, and the update above has already freed the 0 it is about to claim.
+///
+/// A project the caller cannot see is refused **before** any write, and the refusal is the
+/// documented `404` rather than a `403`: the same rule every other project read obeys, and a
+/// switcher that answered "that project exists" would be the enumeration oracle slice 2 exists to
+/// remove. An instance administrator is not a member of most projects, and the switcher must still
+/// be able to switch *into* one they manage, so the check admits the instance administrator
+/// through the same [`find_visible`] every other read uses rather than through a membership test
+/// that would refuse it.
+pub async fn select_project(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Project> {
+    if !find_visible(pool, organization_id, project_id, caller).await?.is_some() {
+        return Err(WorkflowError::invalid(
+            "project_not_found",
+            "no such project",
+        ));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // 1. Evict the row the shift is about to push out of the window, BEFORE the shift -- and ONLY
+    //    when the window is full. Doing it after (as the first version did, by nulling the old
+    //    head) left the head in place and the claim below hit the unique index with 23505, so
+    //    every second switch on a user's second project raised and only the first ever worked.
+    //
+    //    The `count(*) >= 8` guard is the part the gate caught next, and it is not a detail: with
+    //    three recents the unconditional delete removed the *oldest of those three* and the shift
+    //    then promoted the second-oldest, so selecting a fourth project silently erased the reader's
+    //    history instead of keeping it. The window is eight, so a full one holds ranks 0..7 and the
+    //    shift would produce rank 8 -- which is exactly when one row has to go. The threshold is
+    //    8 and not 7, and the gate caught that too: a window capped at seven when it says eight
+    //    silently loses a project the reader can still see listed.
+    sqlx::query(
+        "delete from automation_project_recent \
+          where user_id = $1 \
+            and (select count(*) from automation_project_recent where user_id = $1) >= 8 \
+            and rank = (select max(rank) from automation_project_recent where user_id = $1)",
+    )
+    .bind(caller.user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // 2. Lift every remaining row one place, which frees rank 0. The `rank >= 0` rather than
+    //    `rank > 0` is the other half of the same correction: rank 0 is a real row that has to
+    //    move too, and a predicate that skips it is a head that never advances.
+    sqlx::query(
+        "update automation_project_recent set rank = rank + 1 where user_id = $1 and rank >= 0",
+    )
+    .bind(caller.user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // 3. The claim. `on conflict (user_id, project_id) do update set rank = 0` rather than
+    //    `do nothing`, and the difference is the whole re-selection case: the shift above moved the
+    //    project this call is about to claim UP one place if it was already in the list, so a plain
+    //    `do nothing` would leave it demoted and the switch would appear to do nothing. The row
+    //    count is not consulted -- nothing here branches on it, because "moved to the front" and
+    //    "already at the front" produce the same correct state.
+    sqlx::query(
+        "insert into automation_project_recent (user_id, project_id, rank) \
+         values ($1, $2, 0) \
+         on conflict (user_id, project_id) do update set rank = 0, used_at = now()",
+    )
+    .bind(caller.user_id)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "insert into automation_project_selection (user_id, project_id) values ($1, $2) \
+         on conflict (user_id) do update set project_id = excluded.project_id, updated_at = now()",
+    )
+    .bind(caller.user_id)
+    .bind(project_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let sql = format!("select {PROJECT_COLUMNS} from automation_projects p where p.id = $1");
+    let project = sqlx::query_as::<_, Project>(&sql)
+        .bind(project_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(project)
+}
+
+/// Forget the caller's selection — the switcher's "All projects" entry, which is a *choice* and
+/// not merely the absence of one.
+///
+/// It is a named function rather than a `DELETE` on the route because the alternative is ambiguous
+/// at the storage layer: a row that does not exist and a row that was cleared are the same absence,
+/// and only the second one means "this person decided to see everything". `set_selection` below
+/// carries the same reasoning for the direction that has a column to write.
+pub async fn clear_selection(pool: &PgPool, user_id: Uuid) -> Result<bool> {
+    let deleted = sqlx::query("delete from automation_project_selection where user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
+/// Read one caller's stored selection without the membership join, for the routes that only need
+/// the id.
+///
+/// Deliberately not reused by [`selected_project`]: that one answers *inside an organization*
+/// because a selection left behind by a member of a previous organization must not resolve here,
+/// and a "select the id, then check it" order would be a read the caller cannot be stopped from
+/// observing.
+pub async fn stored_selection(pool: &PgPool, user_id: Uuid) -> Result<Option<Uuid>> {
+    let row: Option<Uuid> =
+        sqlx::query_scalar("select project_id from automation_project_selection where user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
