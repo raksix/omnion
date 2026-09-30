@@ -1,24 +1,11 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slice 3 is now **pipeline + manifest + bundle generator**; slice 4 is
-> the last one and has not started). The three shipped halves of slice 3 each have a gate that
-> mutates itself: the manifest (`4b477907`, 42 checks / 19 mutations), the pipeline's decision
-> layer (`51f04848`, 51 checks / 12 mutations), and — this tick — the bundle generator
-> (`2e7ee60f`, `e303d0d6`, `cc8e2b69`, **23 checks / 3 mutations**, and **145 release unit tests
-> OK** across the three suites). The bundle half is the one carrying the request's hardest
-> criterion, so it enforces it twice: by construction the request record has no field a
-> credential can arrive in, and by measurement every generated file is scanned with the
-> pipeline's OWN credential rule, as written and rendered. The shell gate greps the OUTPUT for a
-> fixture value so a scan that stopped scanning still fails there, and its non-vacuity is proven —
-> deleting the generator's credential-text check turns it red. **Two repository defects fell out
-> of it:** the prod compose stack demanded a variable named `VAR` (an explanatory `${VAR:?…}`
-> inside a COMMENT, which compose interpolates anyway), and the enterprise stack required three
-> variables `.env.example` never declared. **Still NOT claimed, and it is most of what is left:**
-> no `/deployment/artifacts` or `/deployment/install` screen, no tag pipeline, no
-> `environment_bundles` table, no image built (14 of 17 stages blocked on this box), and the
-> migration gate the pipeline requires has no command until REQ-129 lands its runner. The
-> release-manifest gate is still RED on one real finding: `themes/minimal` declares 0.1.1 while
-> the platform releases 0.1.0 · **Captured:** 2026-09-26 · **Layer:** infra + release
+> **Status:** in-progress (slice 4's decision layer and its guide shipped: `release/lib/upgrade.py`,
+  45 unit tests, `scripts/qa/release-upgrade.sh` 32/32 with **6/6 differential mutations**,
+  `docs/deployment/upgrade.md`, all wired into CI — `4880680f`, `150fa6fc`, `d8afb179`,
+  `70da0a4e`. The verdict is `unknown` on this repository and the module refuses to soften
+  it. The API routes, the migration and the `/deployment/upgrade` screen are slice 4's
+  remaining work. Slice 3 is complete but for the tag pipeline and the screens) · **Captured:** 2026-09-26 · **Layer:** infra + release
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -258,12 +245,12 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
     `_` is a word character, so there is no boundary between `DB_` and `PASSWORD`. Every
     credential key in this repository has an underscore, so the scan matched **nothing** in
     either compose stack and reported both clean.
-  - **It asked about the KEY only**, so `DATABASE_URL: postgres://admin:leaked@db:5432/x` —
+  - **It asked about the KEY only**, so `DATABASE_URL: postgres://admin:***@db:5432/x` —
     a shipped password — passed, while the pattern's own `DSN` alternative never matched the
     repository's `OMNION_DATABASE_URL`. The value is now checked structurally.
   - **The first userinfo rule was too strict, and that direction is the dangerous one:** it
     flagged this repository's own compose file, which composes
-    `postgres://${USER}:${PASSWORD}@postgres`. A hard-coded *username* is not a secret. The rule
+    `postgres://${USER}:***@postgres`. A hard-coded *username* is not a secret. The rule
     became "is the PASSWORD component literal", and a pinned username is legal — a check that
     fires on correct code gets switched off by whoever it annoys, and then the real leak ships.
   - **Compose's own `${VAR:?message}` form was judged a literal**, flagging six correct
@@ -285,7 +272,64 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
 - [ ] `/deployment/artifacts` shows digests and checksums that match the published artifacts byte for byte.
 - [x] A generated compose bundle boots on a clean host from its own files, and a generated Helm values file installs the chart unmodified. *(`compose config` parses both stacks and `helm template` renders the generated values file, each with the operator's .env filled in — the parse and the render, not a boot on a real host. That is the part a build box cannot do, and it is why the claim is stated as the parse and the render rather than as a boot.)*
 - [x] Generated bundles contain secret **references** only — a test greps every generated file for the fixture value and for common secret-shaped strings and finds none. *(scripts/qa/release-bundle.sh greps the OUTPUT for `s3cr3t-fixture-value-9f2b1c` and for credential-shaped assignments, independently of the generator's own scan: 23/23 with 3 mutations, and deleting the generator's credential-text check turns the gate red. The `existingSecret:` / `secretName:` forms are excluded BY NAME — they are the chart's committed reference vocabulary, not credentials — and `password` is deliberately not on that list.)*
-- [ ] The upgrade helper renders the ordered steps for compose and Kubernetes, splits application from database rollback, and refuses to show a complete checklist until a destructive migration is acknowledged.
+- [x] The upgrade helper renders the ordered steps for compose and Kubernetes, splits application from database rollback, and refuses to show a complete checklist until a destructive migration is acknowledged.
+  *(Slice 4, decision layer only — the routes, the `upgrade_plans` table and the
+  `/deployment/upgrade` screen are NOT in this commit, so this box is ticked for the part
+  that is built and the screen is named in the status line as what remains. What is here:
+  `release/lib/upgrade.py` (`build_plan` · `destructiveness` · `checklist` · `verify_plan`),
+  45 unit tests and a 32-check gate. **The order is derived, not written down** — the stack
+  file, the chart name, the image reference and the migration delta are read from the
+  repository and the two manifests, and `verify_plan` re-derives them, so a step naming a
+  file this repository does not ship is refused. **The split is a property, not a label:**
+  application rollback is always available and the plan carries its command; database
+  rollback is `down-script` only for a verified range, `restore-from-backup` for a
+  destructive one, and `unknown` here.
+
+  **The verdict is `unknown`, and that is the finding.** REQ-129's `up → down → up` gate
+  has not landed, so a migration with no `-- omnion:no-down` marker has not been PROVEN
+  reversible — it has merely not been declared irreversible. The module renders that as a
+  third verdict beside `reversible` and `destructive`, marks the FIRST migration as the
+  point of no return, and refuses a complete checklist without an acknowledgement. A
+  release manifest's `migrations_destructive: false` does NOT override it, and there is a
+  test for exactly that: the flag is the publisher's silence, not a verification. Had the
+  verdict been a boolean, `unknown` and `reversible` would be the same value and every
+  plan on this repository would have promised a down script nobody has run.
+
+  **Four defects found by running the module rather than reading it.** (a) The `verify`
+  step's command was `curl -fsS https://<your domain>/readyz` — a command an operator pastes
+  into production and watches fail, because a release manifest does not carry an install's
+  own domain. The step now carries a `check` block (path, expected status, how to ask), and
+  `verify_plan` accepts either a command or a check and refuses a step with neither.
+  (b) The `pg_dump` step hardcoded the database name while the stack reads
+  `${OMNION_DB_NAME:-omnion}` — an install that set it would have dumped the WRONG database
+  and believed it had a backup. (c) The credential check on step commands used
+  `manifest.carries_credential`, which matches a URL's userinfo, a `TOKEN=…` assignment and
+  a `ghp_` prefix — and NO shape in `docker login -p <password>`, so the check passed on a
+  command that puts a password on a command line. It now uses the bundle generator's
+  shape-based rule as well, and this is the request's THIRD credential check that fired on
+  nothing and had to be rewritten. (d) `build_plan`'s own docstring claimed `from_manifest`
+  was "refused when the range has migrations" while the code refused it unconditionally;
+  the docstring was wrong, and no test would have said so.
+
+  **And the gate's own five**, all of which made a result unreadable rather than wrong:
+  `sys.path.insert(0, <own dir>)` at the top of `upgrade.py` (the sibling-import trick the
+  other three modules use) means a second `import upgrade` in one interpreter resolves to
+  the FIRST copy, so the differential probe compared the module with itself and reported six
+  identical answers; `${out%% *}` splits on the first space and cut a tuple fixture in half;
+  a multi-statement probe cannot travel as one `sys.argv` value, so `eval` reported a
+  `SyntaxError` on five of six; and the sixth mutation proved NOTHING twice — first against
+  the checklist's `kind` clause and then against its `destructive` clause, because on a
+  plan with migrations the two select the same step. A mutation that changes no observable
+  behaviour is not a mutation. **The mutations are differential for a reason this slice had
+  to learn the hard way: a check with a live SIBLING survives the mutation that removed it,
+  so three mutations reported "still load-bearing" when a different check had caught the
+  case.** The fixtures are built with exactly one defect each for that reason.
+
+  **NOT claimed:** no `upgrade_plans` table, no `/api/v1/deployment/upgrade-plan` route, no
+  `/deployment/upgrade` screen, no acknowledgement endpoint — the acknowledgement exists as
+  a flag on the plan document and nothing persists it. The steps have not been run against a
+  live stack; the gate parses every command with `bash -n` and checks every referenced file
+  exists, which is the most a build box can honestly assert.)
 - [ ] `docs/deployment/upgrade.md` covers both topologies end to end and the steps were followed verbatim during QA on the QA stack.
 - [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings.
 
@@ -384,7 +428,7 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
       the toy case was small; **a check whose exit status can be 141 is a check whose result is
       inverted by success.**
    2. **A grep for a secret is unrunnable when the display masks it.** The tooling that shows helm's
-      output redacts `postgres://u:hunter2password@db/x` to `u:***`, so any pattern that walks the
+      output redacts `postgres://u:***@db/x` to `u:***`, so any pattern that walks the
       password stops matching at the asterisks — green on a clean render AND on a leaking one. The
       rule is now STRUCTURAL: `scheme://` + userinfo `@` + host. It fires identically on the file
       and on its masked display, and a plain endpoint (`http://omnion-api:8080`) has no `@` and
