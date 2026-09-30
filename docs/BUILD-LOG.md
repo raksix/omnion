@@ -4721,6 +4721,7 @@ next-run cell carries a date and the zone, and this tick explains why that cell 
 with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
 belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
 this tick looked at.
+
 ## Tick 73 · REQ-013 slice 2c — the restore you can still stop
 
 **What.** The one acceptance criterion REQ-013 had been carrying since slice 2b is closed:
@@ -4915,81 +4916,6 @@ counts is 26 walks in 26 processes, and the number worth reporting is that, not 
 route list is longer than the 25 minutes the harness's own ceiling allows, so it needs the
 trimmed-route variant rather than a longer `timeout`. (b) The `partial`-run UI. (c) Slice 4,
 encryption.
-
-
-
-build media: retention policies, the run log, the hold, and the reference repair
-
-REQ-010 slice 4's remaining half, and the last piece of the slice. Slice 1 gave the
-library a trash whose countdown was always the *site's* fallback and that no worker
-ever enforced; what is here is the policy itself — scoped to a site or a folder —
-plus the sweeps that act on it, the log that records every run, and the refusal that
-stops a purge from deleting a hero image a live page still resolves to.
-
-**0049_media_retention.sql**, `crates/media/src/retention.rs`,
-`apps/api/src/routes/media_retention.rs`, `apps/api/src/retention_runner.rs`,
-`features/media/retention-view.tsx` (a **Retention** tab on `/media/settings`) and the
-file's `LegalHold` block on the detail screen.
-
-**Six decisions, each a shortcut that produces a plausible wrong answer.** The
-**current version is exempt from the version sweep by number, never by age** — the
-obvious query, "delete every version older than N days", deletes the version `media`
-is serving and leaves `storage_key` naming an object that no longer exists, and the
-current version is the highest number in `media_versions` (the same one `next_version`
-hands out under a row lock). The **hold is a column on `media` rather than a flag on
-the policy**: three destructive sweeps must respect it, a policy flag would have to be
-joined into all three, and the first one somebody edits forgets the others — the
-forgotten one is the one that deletes evidence. A **purge refuses a referenced file
-and names the referrers**, because `media_references` cascades away with the file, so
-a purge *can* silently delete a hero image a published page resolves to. **A run that
-found nothing writes a row**, because retention is the one library feature whose
-absence of activity is indistinguishable from being broken, and a run's `summary`
-separates *nothing was eligible* from *N held* from *N still referenced* from *the run
-stopped early*. The **folder policy wins and the site policy is the fallback, never
-the shortest window of everything that matches** — a campaign folder cannot be
-shortened by a site-wide rule that happens to be tighter. And the **repair scan drops
-the other kind of lie**: a reference to a page deleted during a migration refuses a
-purge for ever, and only a referent the platform can *prove* is gone is dropped, so a
-module that arrives tomorrow does not find its usage rows already deleted.
-
-The worker reaches the sweep through the **route's** `run_once`, not a second copy of
-it: two answers to "what may this file go" is how a nightly sweep and an operator's
-click start disagreeing about the same row, and the operator who reads the screen is
-the one who is misled. And the tick is **minutes, not days** — a sweep is idempotent,
-so an empty tick is a no-op, and a worker that only ran at 02:00 has exactly one
-failure mode with nothing in between to show it.
-
-**Three defects in my own crate code, all caught by the unit tests written beside it.**
-`describe()` printed "30 days day(s)" because the format string spelled the unit *and*
-`plural_days` appended it — and a `contains("30 days")` assertion passes over that
-happily, so both spellings now assert the *absence* of "day(s)". The cross-field check
-defaulted the other window to the **minimum** (1) rather than the **column default**
-(30), so a create sending `purge_after_days = 5` passed validation and was then refused
-by the database as a bare constraint name; the defaults are now named constants bound
-to the insert, so the check and the write cannot disagree about what "the default" is.
-
-**The third is serde rather than logic, and it is the one worth remembering.**
-`Option<Option<Uuid>>` with `#[serde(default)]` *looks* like it carries "absent" and
-"null" separately. It does not — and neither does `Option<Value>`, because serde's
-`Option` visitor maps a `null` to `None` whatever the inner type is. So the explicit
-`folder_id: null` — the one edit an operator most often wants, "this rule was for one
-folder, now it is for everything" — silently arrived as "leave the scope alone", and
-the screen would have reported **saved** over an unchanged scope, which is the worst
-shape a save can have. The scope is now read from the *key's presence* in the raw map,
-which is the only place the distinction exists. The walk proves the **write** happens,
-not just the decode: it clears the scope, reads `folder_id` back out of PostgreSQL, and
-then proves the other half by sending a body that omits the field and finding the scope
-untouched.
-
-**One defect no unit test could have found, and it was the trigger again.** The
-`sites` trigger inserted a policy row without a `name`, and `name` is `not null` with
-no default — so **every site creation failed** with `null value in column "name" of
-relation "media_retention_policies"`. That reads as neither a retention problem nor a
-migration problem but as *the site could not be created*, and it fires from a trigger
-two migrations away, so the only place the error names the cause is the function body.
-All five walks died on it identically before their first assertion. This is the third
-
----
 
 ## 2026-09-28 — REQ-125 slice 3 close · three defects a green test suite could not see
 - **What shipped.** `e4e97c7` — the repairs the slice-3 walkthrough found, committed after the
@@ -6873,3 +6799,52 @@ switch off.
 **Proof, final for the tick.** `cargo build -p omnion-reliability` exit 0 · `omnion-reliability
 --lib` **114 passed / 0 failed** · `omnion-api --lib` **276 passed / 0 failed** ·
 `reliability_retry_breaker_store` **10 passed / 0 failed** against a real database.
+## Tick 75 — 2026-09-30 — REQ-012 slice 3 (rate limiting + lockout), plus the harness that had to be fixed to run it
+
+**What.** The security centre's two limiter screens (`/security/rate-limits`,
+`/security/sign-in-protection`) had never been opened by anything. Four commits:
+
+| Commit | Change |
+|---|---|
+| `1ded0b5c` | `--only` narrows a pass to named routes/depth passes; both screens walked on desktop and at 390px; the QA API now gets an `OMNION_CSRF_SECRET` |
+| `5ca68087` | a QA-slot holder file with two pids on one line deadlocked the pass queue |
+| `9e91f2c9` | the QA API could not reach its own database — a masked `***` password |
+| `669d584d` | the account lockout was unreachable behind the address lockout |
+| `25dddf5c` | a pass died when its click stream could not be written |
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| The lockout, measured | before: `403 address_blocked` x10, `429 rate_limited` x2, `users.failed_sign_in_count` = **0**, `locked_until` = never |
+| The slot deadlock | `reap` resolved `2332198 2332152` -> `2332152`, found it dead, freed the place |
+| The database credential | `psql` over TCP with the exact string `run.sh` hands the process returns `1` |
+| The click stream | `record()` against a missing directory warns once, keeps all 3 clicks |
+
+**The finding worth the tick.** The account lock and the address lock were compared against the
+**same number** (`lockout_attempts`). From one address the address rule therefore fired on the
+exact attempt that would have incremented the account counter, so the counter never moved, no
+account was ever locked, and the "currently locked accounts" table had no possible content. The
+module doc above `sign_in` states that the two dimensions exist for different reasons; the code
+gave them one value. The address threshold is now `lockout_attempts * 3`.
+
+**Three harness defects the pass had been hiding behind.**
+
+1. *The QA API had no `OMNION_CSRF_SECRET`.* Every cookie-authenticated write was refused with
+   `csrf_unavailable` before its handler ran — so every save, upload and backup in every pass
+   was recorded as a screen that "works" while the API answered 403 throughout. The refusal is
+   the documented behaviour of a deployment *without* a secret, which is why it read as the
+   product being correct.
+2. *The QA API's database password was `***`* — a masking artifact, committed long enough to
+   look deliberate. It survived a previous check because that check ran `docker exec psql`, which
+   uses the container's unix socket and never authenticates; the path that actually uses it (TCP
+   to `127.0.0.1:5433`) had never worked. Two paths, one of which nobody exercised.
+3. *The pass queue could not drain.* `reap()` handed a whole holder line to `kill -0`, which
+   wants one pid; a two-pid line answers false, so the place is judged ownerless -- reclaimed
+   while its owner walks, and unreclaimable by the owner whose trap then kills a string.
+
+**Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
+naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).

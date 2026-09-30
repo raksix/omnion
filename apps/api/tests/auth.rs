@@ -30,9 +30,33 @@ struct TestResponse {
 }
 
 /// Drive the real router without a network socket.
+/// Drive the router from a real peer address.
+///
+/// `ClientAddress` and the rate-limit middleware both read `ConnectInfo<SocketAddr>` out of the
+/// request extensions, and `into_make_service_with_connect_info` is the only thing that puts it
+/// there. A request driven straight through `router().oneshot()` therefore arrives with NO
+/// address, which is not a neutral default: with no address the per-address refusal in
+/// `sign_in` cannot run at all, so an in-process walk silently skips the very rule a brute-force
+/// walk is supposed to be testing.
+///
+/// That is how this file came to have a lockout walk that passed with the lockout fix reverted.
+/// The walk now installs the extension the real server installs, from a distinct address per
+/// walk, so the address rule is in the picture — which is what makes the assertion mean
+/// something. A loopback address is used deliberately: it is what a test genuinely is.
 async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
+    call_from(state, request, "127.0.0.1:51000").await
+}
+
+/// `call`, from a named peer address.
+async fn call_from(state: &AppState, request: Request<Body>, peer: &str) -> TestResponse {
+    let (mut parts, body) = request.into_parts();
+    if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+        parts
+            .extensions
+            .insert(axum::extract::ConnectInfo(address));
+    }
     let response = routes::router(state.clone())
-        .oneshot(request)
+        .oneshot(Request::from_parts(parts, body))
         .await
         .expect("router must answer");
 
@@ -284,6 +308,150 @@ async fn wrong_password_and_unknown_address_get_the_same_401() {
         .await
         .expect("count must run");
     assert_eq!(sessions, 0, "failed sign-ins must not create sessions");
+
+    remove_user(&db, user_id).await;
+}
+
+/// The account lockout must actually lock an account.
+///
+/// This walk exists because the feature shipped looking complete and never firing. The
+/// per-address refusal and the per-account lockout were compared against **the same number**,
+/// so from any one address the address rule fired on the attempt that would have incremented
+/// the account counter. Every sign-in answered `403 address_blocked`, `users.failed_sign_in_count`
+/// stayed at 0, and the "currently locked accounts" table on `/security/sign-in-protection` could
+/// never have a row in it. Nothing above this test could see that: the account check ran, the
+/// password check ran, and the answer the caller got was a refusal either way.
+///
+/// So the assertion is the whole difference between the two features: the account must reach
+/// `locked_until` while the address is still being allowed, and a CORRECT password afterwards
+/// must still be refused — otherwise the lock is a label rather than a lock.
+#[tokio::test]
+async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
+    let Some((state, db)) = live_state().await else {
+        return;
+    };
+    let (user_id, email) = test_user(&db).await;
+
+    // This walk's OWN address. Every walk in this file shares 127.0.0.1, so a brute-force walk
+    // would otherwise inherit another walk's failure count and be refused by a rule it never
+    // triggered — the same shared-table mistake as an unscoped `select count(*)`, one layer up.
+    let peer = format!("127.0.0.1:{}", 51000 + (Uuid::new_v4().as_u128() % 900));
+    let post_from_here = |password: &str| {
+        let (mut parts, body) = post_login(&email, password).into_parts();
+        if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+            parts.extensions.insert(axum::extract::ConnectInfo(address));
+        }
+        Request::from_parts(parts, body)
+    };
+
+    // The account threshold for an organization-less account is the table default (10). Walk to
+    // it one attempt at a time and stop as soon as the account is locked, so the test states the
+    // real behaviour rather than a guess at how many attempts it takes.
+    let mut locked_at = None;
+    for attempt in 1..=40 {
+        let response = call(&state, post_from_here("definitely-not-the-password")).await;
+        let failures: i32 = sqlx::query_scalar(
+            "select failed_sign_in_count from users where id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("the failure counter must be readable");
+
+        if response.body["error"]["code"] == "account_locked" {
+            locked_at = Some(attempt);
+            assert_eq!(
+                response.status,
+                StatusCode::FORBIDDEN,
+                "a locked account answers 403, not 401: {}",
+                response.body
+            );
+            break;
+        }
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} must answer 401 until the account locks, got {}",
+            response.body
+        );
+        assert!(
+            failures >= attempt as i32,
+            "every wrong password increments the account counter; after {attempt} it read {failures}"
+        );
+    }
+
+    let (failures, locked_until): (i32, Option<OffsetDateTime>) = sqlx::query_as(
+        "select failed_sign_in_count, locked_until from users where id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the account row must be readable");
+
+    assert!(
+        locked_at.is_some(),
+        "no amount of wrong passwords locked the account: the counter reached {failures} and \
+         locked_until is {locked_until:?}. The address rule is refusing before the account \
+         counter can reach its own threshold."
+    );
+    assert!(
+        locked_until.is_some_and(|until| until > OffsetDateTime::now_utc()),
+        "the lock must be in the future, not a timestamp in the past"
+    );
+
+    // A lock that the correct password walks straight through is a label, not a lock.
+    //
+    // The limiter and the lockout are two independent layers and by now BOTH have refused this
+    // walk: the `sign_in` ceiling is 10 per window and the account threshold is 10 attempts, so
+    // the correct password is answered `429 rate_limited` before the account is ever consulted.
+    // That is the limiter working, not the lock failing -- but asserting on it here would test
+    // the wrong layer and pass for the wrong reason, so the counter is cleared first and the
+    // lockout is asked on its own.
+    let _: bool = sqlx::query_scalar(
+        "update users set failed_sign_in_count = 0 where id = $1 returning true",
+    )
+    .bind(user_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the counter must be resettable");
+    omnion_identity::signin::clear_address_failures(db.pool())
+        .await
+        .expect("the address attempt log must be clearable");
+    // The limiter's counter lives in REDIS, so clearing the database does not touch it. Its own
+    // `forget` deletes the exact key the middleware counted, which is the only way to ask the
+    // lockout a question without the limiter answering it first. Reaching for `FLUSHDB` here
+    // would also delete every other suite's counters in this shared Redis.
+    {
+        let redis = omnion_core::RedisClient::new(&state.config().redis.url)
+            .expect("redis URL must parse");
+        let policies = omnion_security::RatePolicy::defaults();
+        // The counter is keyed on the address THIS walk used, so clearing `None` would leave the
+        // real key in place and the limiter would answer the next request, exactly as before.
+        let client = omnion_security::ClientId {
+            user_id: None,
+            ip: peer.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()),
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        for policy in &policies {
+            if policy.scope == "sign_in" {
+                omnion_security::forget(&redis, policy, &client, now)
+                    .await
+                    .expect("the sign_in counter must be clearable");
+            }
+        }
+    }
+
+    let correct = call(&state, post_from_here(PASSWORD)).await;
+    assert_eq!(
+        correct.body["error"]["code"],
+        "account_locked",
+        "a locked account must refuse the CORRECT password too, got {}",
+        correct.body
+    );
+    assert!(
+        correct.set_cookie.is_none(),
+        "a locked account must not start a session"
+    );
 
     remove_user(&db, user_id).await;
 }

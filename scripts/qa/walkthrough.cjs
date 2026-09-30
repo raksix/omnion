@@ -229,9 +229,25 @@ const clickLines = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
+let warnedAboutStream = false;
 function record(entry) {
   clickLines.push(entry);
-  fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  // The event stream is written for durability -- a killed pass should leave its clicks behind
+  // -- but it is a SECONDARY record: `clickLines` above is the one the report is built from. So
+  // a write that fails must not end the pass. It used to: this box runs a disk guard that trims
+  // QA artifacts, and when the guard's window landed mid-pass the output directory was gone,
+  // `appendFileSync` threw ENOENT, and the exception unwound the whole run. The pass had already
+  // walked seven screens and every one of them was thrown away because a cache file could not be
+  // appended to. A report written from memory and a report written from disk are the same report;
+  // only the forensic stream is lost, and it says so rather than pretending.
+  try {
+    fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  } catch (error) {
+    if (!warnedAboutStream) {
+      warnedAboutStream = true;
+      console.error(`[walk] the click stream is unwritable (${error.code || error.message}); the report continues without it`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- browser
