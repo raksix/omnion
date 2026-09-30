@@ -2450,6 +2450,48 @@ export interface RestorePreview {
   restorable: boolean;
 }
 
+/** One object a media restore could not write back. */
+export interface RestoreFailure {
+  storage_key: string;
+  /** The key inside the archive, for a hand-check on the destination. */
+  archive_key: string;
+  /** What went wrong, in the store's own words. */
+  reason: string;
+}
+
+/**
+ * What the media half of a restore did.
+ *
+ * `objects_failed` is a separate field from `objects_restored` and not a derived state: a
+ * restore that wrote three of four objects is neither a success nor a failure, and the screen
+ * has to say which four.
+ */
+export interface MediaRestoreReport {
+  objects_restored: number;
+  rows_touched: number;
+  bytes_restored: number;
+  objects_failed: number;
+  /** The named failures; the list is capped and the count is not. */
+  failures: RestoreFailure[];
+  /** Live items the restore removed. Always zero — the preview priced that separately. */
+  dropped: number;
+}
+
+/** What a restore did, as the result panel renders it. */
+export interface RestoreOutcome {
+  backup_id: string;
+  /** The parts considered, in manifest order. */
+  parts: string[];
+  /** The parts actually performed. A part in `parts` and not here was recorded, not applied. */
+  restored: string[];
+  media: MediaRestoreReport;
+  /** The protected run to go back to. Always present. */
+  safety_backup_id: string;
+  live_dropped: number;
+  live_matches: number;
+  summary: string;
+}
+
 /**
  * What one retention sweep did.
  *

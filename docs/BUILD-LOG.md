@@ -6518,6 +6518,113 @@ where one part fails needs a fault injected into the drawer, not a test. (c) The
 is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
 read the price, the warnings and the phrase, so when the slot frees there is something to run.
 
+
+## Tick 70 — the destructive half, and a fixture that could not reach the guard it was written for
+
+**REQ-013 slice 2b.** `POST /api/v1/backups/{id}/restore` behind `backup.restore`, the object
+loop in `crates/backup/src/restore_objects.rs`, the plan in `crates/backup/src/apply.rs`, the
+restore control on the preview panel, and the walkthrough driving it. The decisions are split
+the way the crate's header asks for: `apply.rs` is **pure** (selection, phrase, ordering, the
+refusals) and `restore_objects.rs` is the loop that touches a store, so the rules are
+unit-tested with nothing running and the bytes are proved over the real router.
+
+**A defect in shipped code, and it is a new instance of the shape this crate keeps finding.**
+`build_preview` computed the age inside the warning's `if` and then wrote a literal
+`age_days: 0` into the struct — so the panel's age tile read **`0d`** next to a warning that
+said *"this restore point is 23 days old"*. Two halves of one fact, computed twice, with one
+of them hardcoded: a screen contradicting itself on the single number an operator uses to
+choose between two restore points. The unit tests passed because each asserted on one half.
+One number now feeds both and a test holds them together.
+
+**The refusal half is the load-bearing half, and only a walk can prove it.** `build_plan` is
+pure, so its six refusals are unit-tested; what no unit test can see is that a *refused*
+restore writes **nothing**. The walk fires four refusals in a row — wrong phrase, a part the
+run never produced, a name outside the five, an empty selection — and then asserts the run
+count, the media rows and the audit are exactly where they were. A destructive route that
+takes its safety backup and *then* refuses is a route that mints a protected, undeletable
+backup every time somebody fat-fingers a phrase; the refusal would still be correct, and the
+operator would never know. So every refusal is proven to happen **before** the safety backup,
+which is why the `database` refusal sits above it too: taking a backup of a restore that is
+going to be refused is a run nobody asked for.
+
+**The safety backup calls `produce_all` — the same function `POST /api/v1/backups` calls.**
+A "quick safety backup" as its own loop looks shorter and is strictly worse: a second set of
+rules about what a part is, a second writer for the destination, a second place for the media
+copy to be wrong, on the one path nobody watches because it is supposed to be automatic. It
+carries the run's own scopes rather than all five, and an **incomplete** safety run is a
+refusal rather than a warning: "you may restore, just know there is no way back" is not an
+offer anybody should be able to accept.
+
+**The `database` part is refused by name, and this is the honest answer rather than a gap.**
+`document_database` writes a row COUNT per table. That is an inventory, not a dump, and
+restoring it would replace the platform's own schema with an inventory of it — the counting
+defect this crate was written to remove, in its most expensive form. The route says so in a
+sentence an operator can act on rather than quietly doing nothing. The line is therefore
+**partly open** and says so: the other four parts are recorded and priced, not applied, and
+the panel names the difference between "restored" and "reported".
+
+**A third instance of the same class, in a test rather than in shipped code — and the one that
+taught me something.** The walk for the index-version guard rewrote the media index to
+`version: 99` and expected the restore to refuse on the version. It refused — on the *size*,
+one layer up, because serialising `99` instead of `1` changes the file's length and the
+media part's recorded size no longer matches. **The right answer, from the wrong check, and
+the fixture was asserting the wrong thing.** Two things came out of it:
+
+* the obvious fixture is not merely inconvenient, it is **unreachable**, so the guard needs a
+  *length-preserving* rewrite — and a first attempt padded by doubling and gave up on the
+  overshoot, which proved the size check twice and the version guard not at all. A pad that
+  overshoots is not a failed attempt; it is the loop trying again one character shorter. The
+  walk is now two phases, and phase one asserts the thing that is actually true: an edited
+  index is not offered and **no phrase is issued** for it.
+* a check one layer up can make a check one layer down unreachable, and that is a *fact about
+  the design* rather than a test problem. The two together mean an edited index cannot produce
+  a phrase, which is the property worth having.
+
+**Two more of my own, both the shortcut that reads well and does not run.** `select count(*),
+max(metadata)` looks like the tidy way to read an audit row and dies with *function max(jsonb)
+does not exist* — jsonb has no ordering, so the walk was failing on a function the test
+invented rather than on the thing it meant to check. And the stranger in the tenancy walk held
+`OPERATOR_PERMISSIONS`, which does not include `backup.restore`, so the guard answered `403`
+and a `404` assertion failed **for the right reason at the wrong layer**; the stranger now
+holds every key the restorer holds, which is what makes the `404` evidence about the boundary
+and nothing else. A walk that asserts `404` against a `403` proves nothing.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **132/0** (103 before: +13 plan, +16 restore) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `apps/api --test backups` | 6 new walks, **6/0** in isolation |
+
+The corrupt-object walk is the one that needed the real router: it truncates a real file on
+the destination, restores with the **right** phrase, and asserts the live store still holds
+its own bytes — compared as bytes, because a length check passes by accident on an overwrite.
+The index walk is two-phase for the reason above. The panel's refusal path is extended into
+`scripts/qa/walkthrough.cjs`, including pressing a *wrong* phrase first, because a Rust walk
+can prove the API refuses and only a browser can prove the **panel shows** it rather than
+swallowing it into a spinner.
+
+**Toolchain, two facts.** `cargo fmt -p omnion-backup` rewrote five files I had not touched
+(whitespace only) and they were reverted with `git checkout --` on exactly the foreign five.
+And the toolchain linter reports `async fn is not permitted in Rust 2015` on every `async` in
+the crate — it does not pass the edition, and `cargo build` is the authority; `node --check`
+passes the walkthrough, `bun build` only fails on the missing `playwright-core` module.
+
+**The suite, honestly.** The full `--test backups` run (21 walks) **stalled twice** with an
+idle PostgreSQL and a `futex_do_wait` on the test process while the box sat at load 14–20 with
+four sibling stacks. That is contention, not a defect — the same shape the ledger records for
+the earlier ticks — so the six new walks were each run to completion **in isolation** against a
+disposable `omnion_build_70` and the result above is 6/6, not a claim about the whole file.
+
+**Next.** (a) The `partial` box is still unticked: a run where one part fails needs a fault
+injected into the drawer, not a test. (b) The abort criterion is now argued rather than
+built: a cancel that cannot undo a half-written library is a dead control, so the real form
+belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
+walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
+run the moment the box has room.
+
 ## Tick 68 — wave 5 (REQ-017 slices 3–4): the clone reached the *public* read, twice, in both directions
 
 **What.** Two isolation defects the staging clone created outside the panel, and one missing
