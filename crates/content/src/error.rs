@@ -44,6 +44,9 @@ pub enum ContentError {
     /// A content API token name is already taken in this organization (REQ-019).
     #[error("a token named \"{0}\" already exists")]
     TokenNameTaken(String),
+    /// A content read query parameter is not one this surface accepts (REQ-019 slice 2).
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
     /// A lifecycle state is not one of the documented values.
     #[error("invalid status: {0}")]
     InvalidStatus(String),

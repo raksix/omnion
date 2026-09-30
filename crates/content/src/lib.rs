@@ -13,6 +13,7 @@ pub mod blockdiff;
 pub mod block_media;
 pub mod blocks;
 pub mod comments;
+pub mod content_read;
 pub mod error;
 pub mod featured;
 pub mod forms;

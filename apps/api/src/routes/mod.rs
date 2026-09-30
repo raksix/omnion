@@ -83,6 +83,8 @@ pub mod commands;
 pub mod comments;
 pub mod content;
 pub mod content_api;
+pub mod content_openapi;
+pub mod content_read;
 pub mod featured_media;
 pub mod forms;
 pub mod health;
@@ -1096,6 +1098,21 @@ pub fn router(state: AppState) -> Router {
         .route("/content-api/tokens/{id}", content_api_token_revoke)
         .route("/content-api/tokens/{id}/rotate", content_api_token_rotate);
 
+    // The headless content read surface (REQ-019, slice 2). No panel permission layer: these
+    // routes authenticate a *content token* through the `ContentToken` extractor instead, and
+    // they are the only routes in the v1 tree that do — a panel session must not be able to read
+    // them, because a session is a human inside the organization while this surface exists to
+    // hand published content to something outside it. Adding a session fallback here would make
+    // every integrator's token optional, which is the opposite of what the token is for.
+    let content_read = Router::new()
+        .route("/content/pages", get(content_read::list_pages))
+        .route("/content/pages/{slug}", get(content_read::get_page))
+        .route("/content/posts", get(content_read::list_posts))
+        .route("/content/posts/{slug}", get(content_read::get_post))
+        .route("/content/media", get(content_read::list_media))
+        .route("/content/sites", get(content_read::list_sites))
+        .route("/content/openapi.json", get(content_read::openapi_document));
+
     // Scheduled publishing (REQ-064, slice 1). One key for the whole queue: reading it, moving
     // an entry and cancelling one are the same power a publisher already has
     // (`content.pages.schedule`), and a second key would only answer "who may look at the
@@ -1741,6 +1758,7 @@ pub fn router(state: AppState) -> Router {
         // under a prefix, because the guard layers already carry the permissions and a second
         // nesting level would only add a place for a route to be declared and forgotten.
         .merge(content_api)
+        .merge(content_read)
 
         .route("/menus/{id}", menu_read.merge(menu_write))
         .route("/menus/{id}/items", menu_items_write)
