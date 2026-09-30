@@ -6376,3 +6376,65 @@ deleted, because the manager heals a socket transparently (14 accepts for 2 atte
 failed to resolve must not be answered `Unlimited` quietly. (2) Acquire `qa-slot.sh` and run the
 browser pass against `/settings/reliability/limits` — held by a sibling all tick, `uptime` 256.
 (3) Then REQ-127 slice 2 (idempotency).
+
+## Tick 26 · REQ-127: the straggler is fixed, and slice 2's store ships (fc83f204, c5d4a169, d167629a, 48eb6210)
+
+**What.** `resolve_user_id` now has three answers instead of two, and the idempotency KEY STORE —
+the persistence half of slice 2, with a claim that cannot be lost — plus the eleven-walk that
+proves it against a real database.
+
+**The straggler, fixed (`c5d4a169`).** `resolve_user_id` ended in `resolve_session(...).await.ok()
+.flatten()?`, which maps *a session that does not exist* and *a session the platform could not ask
+about* onto the same `None`. A saturated pool produces the second, so a signed-in caller reached
+the limiter with no `user_id`, the winning user-scoped policy had no key for it, `enforce` answered
+`Unlimited`, and the request was served **uncounted** with no `X-RateLimit-*` header to say so. It
+returns `Result<Option<Uuid>, IdentityError>` now; `decide_request` logs the anomaly, still spends
+the address budget (that part of the old reasoning was right) and downgrades the verdict to
+`Uncounted` rather than `Unlimited`, because only the first is a statement about this request. The
+mutation proof is in hand: the new test **failed against the previous body** and passes against this
+one. Gates: `omnion-api --lib` **270/270**, `reliability_limits` **8/8 sequential** (both stragglers
+green at once), `omnion-reliability` **113**, `apps/admin` `tsc --noEmit` clean.
+
+**Slice 2's store (`d167629a` + `48eb6210`), 11/11 walks.** The claim is one
+`INSERT … ON CONFLICT DO UPDATE … WHERE` and the answer is `rows_affected`; the concurrency walk
+asserts exactly one of eight simultaneous claims wins and exactly one row exists.
+
+**Proof.**
+
+- `cargo test -p omnion-reliability` → **114 passed** (was 113; +1 vocabulary test).
+- `cargo test -p omnion-api --test reliability_idempotency_store -- --test-threads=1` → **11 passed**.
+- `cargo test -p omnion-api --test reliability_limits --test reliability_idempotency_store` → **19 passed**.
+- `cargo test -p omnion-api --lib` → **270 passed**. `apps/admin` `tsc --noEmit` → clean.
+
+**Four defects the walks found, three of them in code I had just written.**
+
+1. **The takeover predicate compared the wrong bound.** `where idempotency_keys.expires_at <= $8`
+   where `$8` is the expiry the statement was about to *write* — every live row matches, so the
+   `do update` fired on every claim and **8 of 8 concurrent claims were granted**. The unique index
+   never arbitrated. "expires_at <= the value I am writing" reads as obviously true and is obviously
+   wrong; reading the code does not find it.
+2. **`jsonb` on both sides of the store.** `response_body` is `jsonb` in the migration and a
+   `String` in `KeyRecord`, so the write refused with `42804` and the read with a `ColumnDecode` —
+   meaning a replay of any row carrying a body failed, while every claim-only test was green.
+3. **`decide` mapped a `failed` key to `ReturnStored`**, replaying status 200 with a NULL body for a
+   write that never happened: a client told a write succeeded that did not. It returns `Proceed` now,
+   and the upsert takes a failed row over so the retry genuinely runs.
+4. **Two tests asserted states `seal` cannot produce.** Both were resolved by asking which side was
+   right rather than by editing the assertion to match: the release test expected a retry to *find*
+   the released row (the takeover makes it a fresh claim — product right, test wrong), and the cap
+   test hand-built an oversized inline body that `seal` always drops (test wrong).
+
+**Not done, and named.** The QA browser pass against `/settings/reliability/limits` **still has not
+run**: the single slot was held by the main writer's live pass for the whole tick (holder cwd
+`/mnt/apopic/omnion`, verified alive, 46 s old at first check). A screen nobody has opened in a
+browser is not finished, and that is unchanged. Slice 2's middleware and screen are also not
+written — the store is the slice's persistence half and the HTTP wiring is next.
+
+**Env.** `/` was at **100% (9.9 MB free)** on entry with `target/` on it; reclaiming this worktree's
+own stale walk binaries (5.7 GB, `debug/deps` only, the API binary kept) took it to **95%**. Load
+7.6. `/mnt/apopic` 83%.
+
+**Next.** (1) The QA pass on the limits screen — take the slot when it frees. (2) Slice 2's
+middleware: claim after permission, `Idempotent-Replay: true` on the served response, `409
+idempotency_conflict` on a changed body, `409` + `Retry-After` while in progress, the two events
+(`idempotency.conflict`, `keys.released`), and the screen.
