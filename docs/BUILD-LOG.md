@@ -6915,3 +6915,78 @@ gave them one value. The address threshold is now `lockout_attempts * 3`.
 
 **Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
 naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+## Tick 30 — the intake guard, and a refusal that was leaving no evidence
+
+**REQ-127 slice 4 · the inbound guard.** The store (`crates/reliability/src/intake_store.rs`),
+the replay window (`0185_reliability_intake_replay.sql`), the panel routes and the guarded
+ingress path at `POST /api/v1/public/intake/{id}`, the screen, and ten walks over the real
+router.
+
+**The walk found the slice's one real bug on its first run, and the shape of it is the tick.**
+
+Every STATUS assertion passed and every REJECTION-ROW assertion failed. `record_rejection` binds
+an `IpAddr` into a column that is `inet`; sqlx sends it as TEXT and PostgreSQL refuses the
+assignment with `42804`. The caller logged the failure at `warn` and answered the refusal anyway,
+so the guard was refusing correctly and leaving no evidence at all — and every acceptance
+criterion in this slice that says "and a rejection row" was red while the guard itself behaved
+perfectly.
+
+That is the third time this writer's walks have found a `persister` that looks healthy — the
+first two were `tracing::warn!` writes in w7's SQLX/JSONB work and REQ-133's half-open probe
+counter. The rule it keeps teaching is the same one each time: **a walk that asserts only the
+user-visible answer cannot see the answer's own bookkeeping, and bookkeeping that is
+best-effort is not evidence.** The walk now also writes through the store directly, with a
+DIFFERENT reason from the one under test, so the two counts cannot collide — otherwise the
+assertion would pass on the store's own row and localise the failure to the wrong layer.
+
+**Proof**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-reliability --lib` | **116 passed / 0 failed** |
+| `cargo test -p omnion-api --lib` | **285 passed / 0 failed** (four new route tests) |
+| `cargo test -p omnion-api --test reliability_intake` | **10 passed / 0 failed** against `omnion_w6_dev`, **run twice** |
+| `pnpm typecheck` | **2/2** |
+| browser pass | **NOT RUN** — queued, see below |
+
+The four documented variants, each with its own declaration: `200` on a valid signature (and
+the stored id read BACK, because a guard that verifies and forgets is not a replay guard),
+`401 signature_invalid`, `400 timestamp_stale`, `409 replay`, plus `413 payload_too_large`
+proved by ORDER — the oversized body carries a signature that is genuinely valid for a
+*different* body, so a guard that authenticated first would answer `401` there and the
+ordering claim would be untested.
+
+**Three of the seven codes are not `401`, and that is a design decision rather than an
+oversight.** A stale timestamp and a replayed signature are a bad time and an
+already-processed request; `401` tells the integrator to check a signing key that is fine.
+`signature_missing` and `signature_invalid` answer IDENTICALLY on purpose — distinguishing them
+is a free oracle for an attacker, and the operator gets the precise reason from the log behind
+`reliability.read`.
+
+**The replay window failing to read is the one place the guard fails CLOSED.** A size cap and a
+content type are cheap to re-send; an excluded replay defence means the same signed request is
+accepted twice, and that is the failure this subsystem exists to prevent.
+
+**Not ticked, and not hidden:** the sanitisation box's *header* half. `intake::sanitize` takes a
+`&str` and the guard's two headers are compared as parsed values, never written as text that
+reaches storage — so there is no call site to wire and inventing one to have something to test is
+how a guard grows a behaviour nobody asked for. The box records the split.
+
+**Env.** `/` was at 100% with 625 MB free on entry and this worktree's `target/` sits on it.
+Reclaiming only this worktree's own duplicate `rlib`/`rmeta` (newest of each pair, nothing
+written in the last 30 minutes) took it from 625 MB to 1.3 GB. `CARGO_INCREMENTAL=0` throughout:
+one `kill` of a `CARGO_INCREMENTAL=0` build left the dependency graph inconsistent and the next
+build recompiled 115 crates, which on six shared cores is a 12-minute cost for one mistake.
+
+**Also lost, and recorded because it cost the tick:** a scripted string splice duplicated a
+118-line block in `intake_store.rs` — a second `ENDPOINT_COLUMNS`, a second `list`, a second
+`from_row` — and the fix was a `E0428 defined multiple times` pointing at the second copy. The
+`patch` tool's own lesson applies: after any multi-target string surgery, `grep -c` the symbols
+you think you moved. Six of the errors in this slice came from that class and none of them from
+the design.
+
+**Next.** (1) The focused QA pass over `reliability-intake`, plus the previous tick's
+`reliability-retries` / `reliability-breakers` — both queued behind `qa-slot.sh`, whose live
+holder is another writer's own pass (verified from the holder pid's `/proc` cwd). (2) Then close
+REQ-127, which is the last slice. (3) REQ-128 deployment tooling.
