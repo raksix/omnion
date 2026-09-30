@@ -6850,3 +6850,15 @@ room at the moment the slot is GRANTED — then tick acceptance 10, 13 and 14's 
 the database reads rather than on the screen's own report. (b) Acceptance 11's remaining half is
 a *rendering* claim ("renders identically" on a second site) and needs two sites in a browser,
 not a validator round trip. (c) Slice 4, the ten themes and `omnion create-theme`.
+
+**The suite that looked broken and was not.** Re-running `cms_theme_layouts` gave 17 failures in
+0.10 s, all on `Migration(VersionMismatch(38))` — which reads as a migration ledger problem and
+is a connection problem. I reset `omnion_qa_w2` (the reset is real: `QA_DB=omnion_qa_w2` drops
+and recreates that database and nothing else) and the same 17 failed in the same 0.10 s, which
+ruled the database out. The cause is that the walk reads `OMNION_DATABASE_URL` and falls back to
+the default connection when it is unset — so the suite was migrating the shared `omnion`
+database, which holds a different `0038` (`media_duplicates` on main, `content_patterns` here).
+With the URL set: **17/17 in 143 s**. The discriminator is the DURATION: a suite that migrates,
+seeds and signs in takes minutes, and 0.10 s means it never got past the connect. Resetting the
+wrong database twice before reading the port would have been the expensive version of the same
+mistake.
