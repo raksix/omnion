@@ -32,10 +32,10 @@
 
 use omnion_ai_hub::approvals::io::{self, NewApproval, PolicyChange, Requested};
 use omnion_ai_hub::approvals::{
-    ClassPolicy, DecisionOutcome, DANGEROUS_CLASSES, Gate, PolicyRow, is_dangerous_class,
+    ClassPolicy, DANGEROUS_CLASSES, DecisionOutcome, PolicyRow, is_dangerous_class,
 };
-use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::Db;
+use omnion_core::config::{Config, DatabaseConfig};
 use serde_json::json;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -62,7 +62,10 @@ impl GateStore {
         })
         .await
         {
-            eprintln!("PostgreSQL is not reachable at {}: {err}", config.database.url);
+            eprintln!(
+                "PostgreSQL is not reachable at {}: {err}",
+                config.database.url
+            );
             return None;
         }
 
@@ -198,12 +201,11 @@ impl GateStore {
     }
 
     async fn run_status(&self, run_id: Uuid) -> String {
-        let status: String =
-            sqlx::query_scalar("select status from ai_runs where id = $1")
-                .bind(run_id)
-                .fetch_one(&self.pool)
-                .await
-                .expect("the run row must be readable");
+        let status: String = sqlx::query_scalar("select status from ai_runs where id = $1")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the run row must be readable");
         status
     }
 
@@ -231,10 +233,11 @@ impl GateStore {
     }
 
     async fn pending_total(&self) -> i64 {
-        let count: i64 = sqlx::query_scalar("select count(*) from ai_approvals where status = 'pending'")
-            .fetch_one(&self.pool)
-            .await
-            .expect("the approval count must be readable");
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from ai_approvals where status = 'pending'")
+                .fetch_one(&self.pool)
+                .await
+                .expect("the approval count must be readable");
         count
     }
 
@@ -242,14 +245,62 @@ impl GateStore {
         self.pool.close().await;
         let database = std::mem::take(&mut self.database);
         if let Some(maintenance) = self.maintenance.take() {
-            sqlx::query(&format!("drop database if exists \"{database}\" with (force)"))
-                .execute(maintenance.pool())
-                .await
-                .expect("the temporary database must be removed");
+            sqlx::query(&format!(
+                "drop database if exists \"{database}\" with (force)"
+            ))
+            .execute(maintenance.pool())
+            .await
+            .expect("the temporary database must be removed");
             maintenance.pool().close().await;
         }
     }
 }
+
+/// A revision reader that answers one fixed string, whatever it is asked about.
+///
+/// The scripted half of the [`RevisionReader`](omnion_ai_hub::approvals::io::RevisionReader)
+/// seam: it exists so a walk can *fire* the stale branch without arranging a page edit, and —
+/// more importantly — so the walks that are about a different rule (the phrase, the expiry,
+/// the second decider) are not silently coupled to whether a `pages` row happens to exist.
+/// Their fixtures name `resource_id = "7f1c"`, which is deliberately not a uuid, and a real
+/// reader would refuse them.
+struct FixedRevision(&'static str);
+
+impl omnion_ai_hub::approvals::io::RevisionReader for FixedRevision {
+    async fn read(
+        &self,
+        _pool: &PgPool,
+        _resource_type: &str,
+        _resource_id: &str,
+    ) -> omnion_ai_hub::error::Result<String> {
+        Ok(self.0.to_owned())
+    }
+}
+
+/// A reader that reports the target has not moved since the preview.
+///
+/// What a reviewer sees when nothing changed: the row's own base revision comes back. Used by
+/// the walks whose subject is another rule, so a rule's test does not also become a test of the
+/// reader's.
+struct AnyRevision;
+
+impl omnion_ai_hub::approvals::io::RevisionReader for AnyRevision {
+    async fn read(
+        &self,
+        _pool: &PgPool,
+        _resource_type: &str,
+        _resource_id: &str,
+    ) -> omnion_ai_hub::error::Result<String> {
+        Ok(ANY_REVISION.to_owned())
+    }
+}
+
+/// The revision every `AnyRevision` answers with.
+///
+/// The fixtures write `base_revision: None`, and a row with no base revision has nothing to be
+/// stale against — so the reader's answer is irrelevant for those walks, which is the point:
+/// they exercise their own rule, not the freshness check.
+const ANY_REVISION: &str = "unmoved";
 
 fn swap_database(url: &str, database: &str) -> String {
     let (base, _) = url.rsplit_once('/').expect("a database URL has a path");
@@ -312,7 +363,10 @@ async fn a_fresh_installation_gates_all_six_classes() {
     for (class, mode, typed, minutes) in &rows {
         assert_eq!(mode, "require", "{class} must gate on a fresh installation");
         assert!(typed, "{class} must demand a typed confirmation by default");
-        assert_eq!(*minutes, 60, "{class} must use the request's default expiry");
+        assert_eq!(
+            *minutes, 60,
+            "{class} must use the request's default expiry"
+        );
         assert!(is_dangerous_class(class), "{class} is not one of the six");
     }
     for class in DANGEROUS_CLASSES {
@@ -333,7 +387,10 @@ async fn the_gate_parks_a_publish_even_when_the_caller_holds_every_permission() 
     let verdict = io::gate(&store.pool, store.organization_id, "content.publish", true)
         .await
         .expect("the gate must answer");
-    assert!(verdict.parks(), "a publish must park whatever the caller may do");
+    assert!(
+        verdict.parks(),
+        "a publish must park whatever the caller may do"
+    );
     let policy = verdict.policy().expect("a park carries its policy");
     assert_eq!(policy.expires_minutes, 60);
 
@@ -365,9 +422,14 @@ async fn an_allow_policy_ungates_exactly_that_class_and_nothing_else() {
     .await
     .expect("the policy write must succeed");
 
-    let deploy = io::gate(&store.pool, store.organization_id, "deployment.deploy", false)
-        .await
-        .expect("the gate must answer");
+    let deploy = io::gate(
+        &store.pool,
+        store.organization_id,
+        "deployment.deploy",
+        false,
+    )
+    .await
+    .expect("the gate must answer");
     assert!(!deploy.parks(), "the class was set to allow");
     // The other five are untouched — a policy write is per class, and a walk that only checked
     // the class it changed would pass for a write that cleared the whole table.
@@ -397,9 +459,14 @@ async fn an_organization_policy_does_not_change_another_tenants_gate() {
     .await
     .expect("the policy write must succeed");
 
-    let mine = io::gate(&store.pool, store.organization_id, "content.rollback", false)
-        .await
-        .expect("the gate must answer");
+    let mine = io::gate(
+        &store.pool,
+        store.organization_id,
+        "content.rollback",
+        false,
+    )
+    .await
+    .expect("the gate must answer");
     assert!(!mine.parks());
     let theirs = io::gate(
         &store.pool,
@@ -482,7 +549,10 @@ async fn a_policy_change_is_audited_and_a_reset_removes_the_override() {
     .fetch_one(&store.pool)
     .await
     .expect("the audit rows must be readable");
-    assert_eq!(audited, 1, "a policy change rides audit_log with no webhook event");
+    assert_eq!(
+        audited, 1,
+        "a policy change rides audit_log with no webhook event"
+    );
 
     let view = io::policies(&store.pool, store.organization_id)
         .await
@@ -507,7 +577,10 @@ async fn a_policy_change_is_audited_and_a_reset_removes_the_override() {
         .iter()
         .find(|entry| entry.tool_class == "plugin_install")
         .expect("the class must still be listed");
-    assert_eq!(plugin.source, "platform", "a reset inherits the default again");
+    assert_eq!(
+        plugin.source, "platform",
+        "a reset inherits the default again"
+    );
     assert!(!plugin.permissive);
     store.dispose().await;
 }
@@ -532,7 +605,10 @@ async fn a_request_lands_pending_and_writes_an_agent_audit_row() {
     assert_eq!(approval.status, "pending");
     assert_eq!(approval.tool_class, "content_publish");
     assert_eq!(approval.requires_confirmation, true);
-    assert_eq!(approval.confirmation_phrase.as_deref(), Some("Autumn pricing"));
+    assert_eq!(
+        approval.confirmation_phrase.as_deref(),
+        Some("Autumn pricing")
+    );
     // The run stays parked: writing a request is not a decision, and a run that started
     // executing the moment somebody asked would make the whole gate advisory.
     assert_eq!(store.run_status(run_id).await, "awaiting_approval");
@@ -545,7 +621,11 @@ async fn a_request_lands_pending_and_writes_an_agent_audit_row() {
         .expect("the trail must be readable");
     assert_eq!(trail.len(), 1);
     assert_eq!(trail[0].actor_type, "agent", "the asker is an agent");
-    assert_eq!(trail[0].actor_user_id, Some(user), "the requester is the human");
+    assert_eq!(
+        trail[0].actor_user_id,
+        Some(user),
+        "the requester is the human"
+    );
     assert_eq!(
         trail[0].metadata["preview_hash"],
         json!("hash-of-the-frozen-preview"),
@@ -560,12 +640,18 @@ async fn a_second_request_for_the_same_step_returns_the_first_row() {
     let store = gate!();
     let run_id = store.parked_run().await;
     let step_id = store.step(run_id, 1).await;
-    let first = io::request(&store.pool, &store.publish_request(Some(run_id), Some(step_id)))
-        .await
-        .expect("the first request must be stored");
-    let second = io::request(&store.pool, &store.publish_request(Some(run_id), Some(step_id)))
-        .await
-        .expect("the second request must answer, not fail");
+    let first = io::request(
+        &store.pool,
+        &store.publish_request(Some(run_id), Some(step_id)),
+    )
+    .await
+    .expect("the first request must be stored");
+    let second = io::request(
+        &store.pool,
+        &store.publish_request(Some(run_id), Some(step_id)),
+    )
+    .await
+    .expect("the second request must answer, not fail");
 
     // "Notification volume is bounded: requesting the same tool in a loop produces one pending
     // approval and an `already_pending` refusal, not a flood." The refusal is a *return value*
@@ -597,13 +683,16 @@ async fn an_approval_cannot_be_decided_twice_and_the_second_writes_nothing() {
         id,
         first_decider,
         Some("Autumn pricing"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
     .expect("the first decision must be stored");
     assert!(approved.changed(), "{approved:?}");
-    let decided_at = approved.approval().expect("a decision carries the row").decided_at;
+    let decided_at = approved
+        .approval()
+        .expect("a decision carries the row")
+        .decided_at;
 
     let again = io::approve(
         &store.pool,
@@ -611,7 +700,7 @@ async fn an_approval_cannot_be_decided_twice_and_the_second_writes_nothing() {
         id,
         second_decider,
         Some("Autumn pricing"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -651,6 +740,7 @@ async fn a_rejection_needs_a_reason_and_records_it() {
         id,
         decider,
         "   ",
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -668,13 +758,18 @@ async fn a_rejection_needs_a_reason_and_records_it() {
         id,
         decider,
         "the agent invented a price nobody approved",
+        &AnyRevision,
         GateStore::now(),
     )
     .await
     .expect("the rejection must be stored");
     assert!(rejected.changed());
     assert_eq!(
-        rejected.approval().expect("a decision carries the row").decision_note.as_deref(),
+        rejected
+            .approval()
+            .expect("a decision carries the row")
+            .decision_note
+            .as_deref(),
         Some("the agent invented a price nobody approved")
     );
     assert_eq!(store.audit_count(id, "ai.approval.rejected").await, 1);
@@ -702,7 +797,7 @@ async fn a_typed_confirmation_cannot_be_skipped_or_guessed() {
         id,
         decider,
         None,
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -716,7 +811,7 @@ async fn a_typed_confirmation_cannot_be_skipped_or_guessed() {
         id,
         decider,
         Some("yes"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -736,7 +831,7 @@ async fn a_typed_confirmation_cannot_be_skipped_or_guessed() {
         id,
         decider,
         Some("Autumn pricing"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -781,7 +876,7 @@ async fn an_expired_request_cannot_be_decided_and_the_sweeper_hands_the_run_back
         id,
         decider,
         Some("Autumn pricing"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -813,7 +908,7 @@ async fn a_request_the_resource_outgrew_is_stale_and_names_the_current_revision(
         id,
         decider,
         Some("Autumn pricing"),
-        Some("revision-4"),
+        &FixedRevision("revision-4"),
         GateStore::now(),
     )
     .await
@@ -821,7 +916,10 @@ async fn a_request_the_resource_outgrew_is_stale_and_names_the_current_revision(
     assert_eq!(stale.code(), Some("stale"));
     match &stale {
         DecisionOutcome::Stale { current_revision } => {
-            assert_eq!(current_revision, "revision-4", "Re-preview needs a real target");
+            assert_eq!(
+                current_revision, "revision-4",
+                "Re-preview needs a real target"
+            );
         }
         other => panic!("expected a stale answer, got {other:?}"),
     }
@@ -840,12 +938,462 @@ async fn a_request_the_resource_outgrew_is_stale_and_names_the_current_revision(
         id,
         decider,
         Some("Autumn pricing"),
-        Some("revision-3"),
+        &FixedRevision("revision-3"),
         GateStore::now(),
     )
     .await
     .expect("the matching revision must be accepted");
     assert!(fresh.changed(), "the preview is still accurate");
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_client_cannot_forge_a_freshness_answer_the_server_did_not_ask_for() {
+    // Slice 1 compared `base_revision` against a `current_revision` the caller posted. This is
+    // the forgery that makes, and it is worth stating as an executable claim rather than a
+    // description: a caller who echoes the row's **own stored base revision** passes the check
+    // every single time, whatever the page actually says.
+    //
+    // With the reader behind a seam, the caller has no field left to put it in — so the walk
+    // cannot even be written against a passing store. That is the point: the forgery is now
+    // unrepresentable rather than merely refused, and what is left to prove is that the row
+    // really is decided against what the **reader** says.
+    let store = gate!();
+    let decider = store.user().await;
+    let mut request = store.publish_request(None, None);
+    request.base_revision = Some("revision-3".to_owned());
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .approval()
+        .id;
+
+    // The reader reports the page moved. There is no argument the caller can supply that would
+    // override it, because the decision path has no parameter for one.
+    let stale = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        decider,
+        Some("Autumn pricing"),
+        &FixedRevision("revision-4"),
+        GateStore::now(),
+    )
+    .await
+    .expect("a stale request is an answer, not an error");
+    assert_eq!(stale.code(), Some("stale"));
+    assert!(!stale.changed());
+
+    // And the refusal wrote nothing: no decision, no decider, no audit row.
+    let row = io::read(&store.pool, store.organization_id, id)
+        .await
+        .expect("readable")
+        .expect("present");
+    assert_eq!(row.status, "pending", "a forged approval must not decide");
+    assert_eq!(row.decided_by, None);
+    assert_eq!(store.audit_count(id, "ai.approval.approved").await, 0);
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn an_approval_that_names_no_resource_is_refused_rather_than_applied_unchecked() {
+    // The freshness check needs a target to read. A row with no resource cannot be checked,
+    // and the honest answer is a refusal -- not "skip the check", which is what an `if let
+    // Some(...)` around the comparison would quietly do.
+    let store = gate!();
+    let decider = store.user().await;
+    let mut request = store.publish_request(None, None);
+    request.resource_id = None;
+    request.resource_type = None;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .approval()
+        .id;
+
+    let error = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        decider,
+        Some("Autumn pricing"),
+        &AnyRevision,
+        GateStore::now(),
+    )
+    .await
+    .expect_err("an uncheckable approval must not be decided");
+    let message = error.to_string();
+    assert!(
+        message.contains("staleness") || message.contains("resource"),
+        "the refusal must say why, got: {message}"
+    );
+
+    let row = io::read(&store.pool, store.organization_id, id)
+        .await
+        .expect("readable")
+        .expect("present");
+    assert_eq!(row.status, "pending", "the refusal wrote nothing");
+    store.dispose().await;
+}
+
+/// A real page with one draft revision, the target slice 2b reads and applies.
+///
+/// This is the fixture that makes the apply walk mean anything: `resource_id = "7f1c"` in the
+/// other fixtures is not a uuid, so no reader can resolve it and no apply can run. Everything
+/// below is about a row that actually exists in `pages` and `page_revisions`.
+async fn seed_page(pool: &PgPool, organization_id: Uuid, slug: &str, title: &str) -> Uuid {
+    let site_id: Uuid = sqlx::query_scalar(
+        "insert into sites (organization_id, key, name) values ($1, $2, $3) returning id",
+    )
+    .bind(organization_id)
+    .bind(format!("s-{}", Uuid::new_v4().simple()))
+    .bind("Slice 2b")
+    .fetch_one(pool)
+    .await
+    .expect("the fixture site must be created");
+
+    let page_id: Uuid = sqlx::query_scalar(
+        "insert into pages (site_id, slug, status) values ($1, $2, 'draft') returning id",
+    )
+    .bind(site_id)
+    .bind(slug)
+    .fetch_one(pool)
+    .await
+    .expect("the fixture page must be created");
+
+    sqlx::query(
+        "insert into page_revisions (page_id, revision_no, state, title, body, summary) \
+         values ($1, 1, 'draft', $2, 'Original body', 'Original summary')",
+    )
+    .bind(page_id)
+    .bind(title)
+    .execute(pool)
+    .await
+    .expect("the fixture revision must be created");
+
+    page_id
+}
+
+/// A request whose preview was computed from a real page by the real reader.
+///
+/// Every step is the production path: `target::preview` builds the plan (which computes the
+/// base revision itself), and `Plan::to_preview` freezes it exactly as the request would store
+/// it. A fixture that hand-wrote the preview would test the applier against a shape the
+/// previewer does not produce.
+async fn preview_request(store: &GateStore, page_id: Uuid) -> NewApproval {
+    let op = omnion_ai_hub::approvals::plan::Operation {
+        kind: omnion_ai_hub::approvals::plan::OpKind::Update,
+        resource_type: "page".to_owned(),
+        resource_id: page_id.to_string(),
+        args: json!({ "title": "Renamed by the agent" }),
+    };
+    let mapping =
+        omnion_ai_hub::approvals::target::mapping_for("page").expect("page is a previewable type");
+    let plan = omnion_ai_hub::approvals::target::preview(&store.pool, mapping, &op)
+        .await
+        .expect("the preview must resolve against a real page");
+
+    let mut request = store.publish_request(None, None);
+    request.resource_id = Some(page_id.to_string());
+    request.base_revision = Some(plan.base_revision.clone());
+    request.preview_hash = plan.hash.clone();
+    request.preview = plan.to_preview(mapping);
+    request
+}
+
+#[tokio::test]
+async fn the_applied_value_is_the_previewed_value_read_back_from_the_page() {
+    // The criterion slice 2 proved as pure functions, now at the only place it can fail: the
+    // database. The preview says `title` becomes "Renamed by the agent"; after the decision
+    // and the apply, that string has to be in `page_revisions`.
+    let store = gate!();
+    let page_id = seed_page(
+        &store.pool,
+        store.organization_id,
+        "pricing",
+        "Autumn pricing",
+    )
+    .await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .approval()
+        .id;
+
+    // Decide against the real reader: nothing has moved, so the check passes on its own terms
+    // rather than by being skipped.
+    let decided = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        store.user().await,
+        Some("Autumn pricing"),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("an unchanged page must not be stale");
+    assert!(
+        decided.changed(),
+        "the decision must be recorded: {decided:?}"
+    );
+
+    // The apply, driven through the same plan the preview froze.
+    let approval = io::read(&store.pool, store.organization_id, id)
+        .await
+        .expect("readable")
+        .expect("present");
+    let plan = omnion_ai_hub::approvals::plan::Plan::from_preview(&approval.preview)
+        .expect("the stored preview must be readable back");
+    let change =
+        omnion_ai_hub::approvals::target::changes_for(&plan).expect("the change must resolve");
+    assert_eq!(change.title.as_deref(), Some("Renamed by the agent"));
+
+    let page = omnion_content::pages::update_page(
+        &store.pool,
+        page_id,
+        &omnion_content::model::PageChanges {
+            slug: change.slug,
+            title: change.title,
+            body: change.body,
+            summary: change.summary,
+        },
+        None,
+    )
+    .await
+    .expect("the content layer must accept the previewed write");
+
+    // Read the value back out of the database rather than out of the return value: the struct
+    // is built from the row it just wrote, so it would agree even if the write went elsewhere.
+    let stored: (String, String) = sqlx::query_as(
+        "select p.slug, r.title from pages p join lateral ( \
+           select title from page_revisions where page_id = p.id \
+           order by revision_no desc limit 1) r on true where p.id = $1",
+    )
+    .bind(page_id)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the page must be readable");
+    assert_eq!(
+        stored.1, "Renamed by the agent",
+        "the applied value is the previewed value"
+    );
+    assert_eq!(
+        stored.0, page.slug,
+        "a field the preview did not name is untouched"
+    );
+    assert_eq!(page.status, "draft", "an update does not publish");
+
+    // A content edit appends a revision; the original survives, which is the reason an AI edit
+    // is reviewable at all.
+    let revisions: i64 =
+        sqlx::query_scalar("select count(*) from page_revisions where page_id = $1")
+            .bind(page_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("countable");
+    assert_eq!(
+        revisions, 2,
+        "the apply appends a revision and keeps the first"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn an_edited_page_makes_the_decision_stale_without_any_client_argument() {
+    // The half of the stale criterion that is about *the server noticing*, not about comparing
+    // two strings. The walk edits the page through the content layer, then decides — and it
+    // passes `DbRevisionReader`, so nothing in the call carries an answer the caller chose.
+    let store = gate!();
+    let page_id = seed_page(
+        &store.pool,
+        store.organization_id,
+        "pricing",
+        "Autumn pricing",
+    )
+    .await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .approval()
+        .id;
+
+    // Somebody edits the page in the panel while the reviewer is reading the diff.
+    omnion_content::pages::update_page(
+        &store.pool,
+        page_id,
+        &omnion_content::model::PageChanges {
+            title: Some("Autumn pricing (corrected)".to_owned()),
+            slug: None,
+            body: None,
+            summary: None,
+        },
+        None,
+    )
+    .await
+    .expect("the competing edit must apply");
+
+    let outcome = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        store.user().await,
+        Some("Autumn pricing"),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("a stale request is an answer, not an error");
+    assert_eq!(outcome.code(), Some("stale"));
+    match outcome {
+        DecisionOutcome::Stale { current_revision } => assert!(
+            !current_revision.is_empty(),
+            "Re-preview needs the current revision to compute against"
+        ),
+        other => panic!("expected stale, got {other:?}"),
+    }
+
+    let row = io::read(&store.pool, store.organization_id, id)
+        .await
+        .expect("readable")
+        .expect("present");
+    assert_eq!(row.status, "pending", "a stale decision writes nothing");
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn applying_is_single_use_and_audited() {
+    // `mark_applied` runs after the write, so a second apply has to find nothing to mark. This
+    // is the retry story: a crash between the content write and the marker leaves the row
+    // approved-but-unapplied, which is safe, rather than marked-but-unwritten, which is not.
+    let store = gate!();
+    let page_id = seed_page(
+        &store.pool,
+        store.organization_id,
+        "pricing",
+        "Autumn pricing",
+    )
+    .await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .approval()
+        .id;
+    let decider = store.user().await;
+
+    let decided = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        decider,
+        Some("Autumn pricing"),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("decidable");
+    assert!(decided.changed());
+
+    let first = io::mark_applied(&store.pool, store.organization_id, id, Some(decider))
+        .await
+        .expect("the marker must write");
+    assert!(first.is_some(), "the first apply marks the row");
+    let second = io::mark_applied(&store.pool, store.organization_id, id, Some(decider))
+        .await
+        .expect("the second call is not an error");
+    assert!(
+        second.is_none(),
+        "a second apply must find nothing left to mark"
+    );
+
+    let row = io::read(&store.pool, store.organization_id, id)
+        .await
+        .expect("readable")
+        .expect("present");
+    assert_eq!(row.status, "applied");
+    assert!(row.applied_at.is_some());
+    assert_eq!(
+        store.audit_count(id, "ai.approval.applied").await,
+        1,
+        "one apply, one audit row — audit_log is append-only, so a duplicate is permanent"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_delete_preview_counts_the_revisions_it_would_take_with_it() {
+    // The request's cascade line ("1 page, 4 revisions") is counted once and frozen into the
+    // preview. This walk pins that the count is real: one page with three revisions and no
+    // translations reports exactly the three, and the reader does not invent a cascade for a
+    // dependent that is not there.
+    let store = gate!();
+    let page_id = seed_page(
+        &store.pool,
+        store.organization_id,
+        "pricing",
+        "Autumn pricing",
+    )
+    .await;
+    for body in ["Second", "Third"] {
+        omnion_content::pages::update_page(
+            &store.pool,
+            page_id,
+            &omnion_content::model::PageChanges {
+                body: Some(body.to_owned()),
+                slug: None,
+                title: None,
+                summary: None,
+            },
+            None,
+        )
+        .await
+        .expect("each fixture edit appends a revision");
+    }
+
+    let cascades =
+        omnion_ai_hub::approvals::target::cascades_for(&store.pool, "page", &page_id.to_string())
+            .await
+            .expect("the cascade read must resolve");
+    let revisions = cascades
+        .iter()
+        .find(|cascade| cascade.label == "page revisions")
+        .expect("a page always has revisions, so this cascade is always present");
+    assert_eq!(
+        revisions.count, 3,
+        "the count is the number of rows, not a guess"
+    );
+    assert!(
+        !cascades
+            .iter()
+            .any(|cascade| cascade.label == "translations"),
+        "a page with no translations must not report a cascade of zero"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_preview_for_a_page_that_does_not_exist_is_refused_rather_than_rendered_as_a_create() {
+    // The reader returns an empty snapshot for a missing page (the `left join` is what makes
+    // the absence observable), and an empty snapshot renders exactly like a create — every
+    // field "new". Approving that would authorise writing to a row that does not exist.
+    let store = gate!();
+    let op = omnion_ai_hub::approvals::plan::Operation {
+        kind: omnion_ai_hub::approvals::plan::OpKind::Update,
+        resource_type: "page".to_owned(),
+        resource_id: Uuid::new_v4().to_string(),
+        args: json!({ "title": "Ghost" }),
+    };
+    let mapping = omnion_ai_hub::approvals::target::mapping_for("page").expect("mapped");
+    let error = omnion_ai_hub::approvals::target::preview(&store.pool, mapping, &op)
+        .await
+        .expect_err("a missing target has nothing to diff against");
+    assert!(
+        error.to_string().contains("does not exist"),
+        "the refusal must say what is wrong, got: {error}"
+    );
     store.dispose().await;
 }
 
@@ -872,7 +1420,7 @@ async fn another_organizations_approval_is_not_found_and_cannot_be_decided() {
         id,
         decider,
         Some("Autumn pricing"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -958,6 +1506,7 @@ async fn the_inbox_filters_and_its_counts_come_from_the_same_table() {
         publish.id(),
         decider,
         "not this week",
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -972,7 +1521,9 @@ async fn the_inbox_filters_and_its_counts_come_from_the_same_table() {
     assert_eq!(after.counts.get("pending"), Some(&1));
     assert_eq!(after.counts.get("rejected"), Some(&1));
     assert_eq!(
-        io::pending_count(&store.pool, store.organization_id).await.expect("the count"),
+        io::pending_count(&store.pool, store.organization_id)
+            .await
+            .expect("the count"),
         1
     );
     store.dispose().await;
@@ -992,7 +1543,7 @@ async fn the_database_refuses_a_decided_row_that_claims_to_be_pending() {
         id,
         decider,
         Some("Autumn pricing"),
-        None,
+        &AnyRevision,
         GateStore::now(),
     )
     .await
@@ -1009,12 +1560,11 @@ async fn the_database_refuses_a_decided_row_that_claims_to_be_pending() {
     // being true is a satisfied constraint. A control that asserts the wrong violation is
     // worse than no control — it looks like coverage of the decision invariant while
     // covering nothing.
-    let decided_without_a_timestamp = sqlx::query(
-        "update ai_approvals set status = 'approved', decided_at = null where id = $1",
-    )
-    .bind(id)
-    .execute(&store.pool)
-    .await;
+    let decided_without_a_timestamp =
+        sqlx::query("update ai_approvals set status = 'approved', decided_at = null where id = $1")
+            .bind(id)
+            .execute(&store.pool)
+            .await;
     assert!(
         decided_without_a_timestamp.is_err(),
         "the pending_iff_undecided check must refuse an approved row with no decided_at"
@@ -1024,12 +1574,11 @@ async fn the_database_refuses_a_decided_row_that_claims_to_be_pending() {
     let second = io::request(&store.pool, &store.publish_request(None, None))
         .await
         .expect("a second, independent request must be stored");
-    let pending_with_a_timestamp = sqlx::query(
-        "update ai_approvals set decided_at = now() where id = $1",
-    )
-    .bind(second.approval().id)
-    .execute(&store.pool)
-    .await;
+    let pending_with_a_timestamp =
+        sqlx::query("update ai_approvals set decided_at = now() where id = $1")
+            .bind(second.approval().id)
+            .execute(&store.pool)
+            .await;
     assert!(
         pending_with_a_timestamp.is_err(),
         "the pending_iff_undecided check must refuse a pending row that carries decided_at"
@@ -1069,7 +1618,10 @@ async fn the_policy_rows_the_resolver_reads_are_the_ones_the_migration_wrote() {
             .get(class)
             .unwrap_or_else(|| panic!("{class} must resolve"));
         assert_eq!(view.source, "platform");
-        assert!(!view.permissive, "{class} must gate on a fresh installation");
+        assert!(
+            !view.permissive,
+            "{class} must gate on a fresh installation"
+        );
         assert_eq!(
             view.irreversible,
             omnion_ai_hub::approvals::is_irreversible_class(class)
@@ -1080,7 +1632,10 @@ async fn the_policy_rows_the_resolver_reads_are_the_ones_the_migration_wrote() {
         "a deployment is irreversible"
     );
     assert!(
-        !resolved.get("content_publish").expect("content_publish").irreversible,
+        !resolved
+            .get("content_publish")
+            .expect("content_publish")
+            .irreversible,
         "a publish can be undone by un-publishing"
     );
     store.dispose().await;

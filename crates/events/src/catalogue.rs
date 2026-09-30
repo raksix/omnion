@@ -291,6 +291,15 @@ catalogue! {
     "A model request could not be resolved to a usable model by any rule.",
     [("decision_id", Uuid, req), ("task", String, req), ("rule", String, opt),
      ("feature", String, opt), ("requested", String, opt), ("requirements", Json, opt)];
+    // The approval gate (REQ-101). `ai.approval.applied` is the one an operator subscribes to,
+    // because the approval events themselves only say what a *person decided* and this one is
+    // the only signal that the change actually reached the content table -- a missing name here
+    // would leave the whole "nothing dangerous happens without a human" claim verifiable only
+    // by reading the audit log.
+    "ai.approval.applied", "ai", Live,
+    "An approved preview was written through its gated pipeline.",
+    [("approval_id", Uuid, req), ("resource_type", String, req),
+     ("resource_id", String, req)];
     // The tool registry (REQ-100). `ai.tool.denied` is the one an operator subscribes to: it
     // is the signal that a model tried to reach something it was not granted, which is the
     // visible form of a probing agent. The rest are the panel's own audit trail — a registry

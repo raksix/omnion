@@ -35,9 +35,11 @@ use serde_json::json;
 
 use std::collections::BTreeSet;
 
-use omnion_ai_hub::approvals::io::{self, ApprovalFilter, AuditRow, PolicyChange};
-use omnion_ai_hub::approvals::PolicyView;
 use omnion_ai_hub::approvals::DecisionOutcome;
+use omnion_ai_hub::approvals::PolicyView;
+use omnion_ai_hub::approvals::io::{
+    self, ApprovalFilter, AuditRow, DbRevisionReader, PolicyChange,
+};
 use omnion_events::NewEvent;
 use omnion_events::bus;
 
@@ -300,13 +302,17 @@ pub async fn approve(
     let organization = resolve_organization(&current, scope.organization_id)?;
     let actor = current.user.id;
 
+    // The revision is read by the server, from the row, at decision time. The body's
+    // `current_revision` is what the screen *saw*; it is recorded but never trusted, because a
+    // client that echoed the stored base revision would otherwise pass the freshness check
+    // every time (slice 1's flaw).
     let outcome = io::approve(
         state.db().pool(),
         organization,
         id,
         actor,
         body.confirmation.as_deref(),
-        body.current_revision.as_deref(),
+        &DbRevisionReader,
         time::OffsetDateTime::now_utc(),
     )
     .await
@@ -352,6 +358,7 @@ pub async fn reject(
         id,
         actor,
         &body.reason,
+        &DbRevisionReader,
         time::OffsetDateTime::now_utc(),
     )
     .await
@@ -374,6 +381,121 @@ pub async fn reject(
     }
 
     Ok(Json(result))
+}
+
+/// `POST /ai/approvals/{id}/apply` — run the frozen preview.
+///
+/// This is the half that makes the request's "the apply reads the same module the preview
+/// did" claim true at the HTTP boundary. The route does not re-derive a diff and it does not
+/// trust the body's values: it reads the **stored** preview, hands it back to
+/// `approvals::plan` for its writes, and applies those. A caller that posts different values
+/// is ignored, because the reviewer approved the stored ones.
+///
+/// The write itself goes through `content::pages::update_page`, so the content crate's own
+/// validation runs — a preview can therefore never describe a write the content layer refuses.
+pub async fn apply(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<AppliedResult>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+    let actor = current.user.id;
+
+    let approval = io::read(state.db().pool(), organization, id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "approval_not_found",
+                format!("no approval `{id}` in this organization"),
+            )
+        })?;
+
+    // Only an **approved** row may be applied, and the check is here rather than in the
+    // applier because the applier is about writes. A decision that has not been taken is not a
+    // license to write, and re-deciding is `already_decided`'s job.
+    if approval.status != "approved" {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "not_approved",
+            "an approval must be approved before its preview can be applied",
+        ));
+    }
+    if approval.applied_at.is_some() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "already_applied",
+            "this approval was already applied",
+        ));
+    }
+
+    let plan = omnion_ai_hub::approvals::plan::Plan::from_preview(&approval.preview)
+        .map_err(ApiError::from)?;
+    let change = omnion_ai_hub::approvals::target::changes_for(&plan).map_err(ApiError::from)?;
+
+    let page_id: uuid::Uuid = plan.resource_id.parse().map_err(|_| {
+        ApiError::bad_request("resource_id", "the approval's preview names no page id")
+    })?;
+
+    let page = omnion_content::pages::update_page(
+        state.db().pool(),
+        page_id,
+        &omnion_content::model::PageChanges {
+            slug: change.slug,
+            title: change.title,
+            body: change.body,
+            summary: change.summary,
+        },
+        Some(actor),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    // `applied_at` is written **only after** the content write succeeded, so a crash between
+    // the two leaves the row approved-but-unapplied and a retry is safe. Writing it first
+    // would make a failed apply indistinguishable from a finished one.
+    io::mark_applied(state.db().pool(), organization, id, Some(actor))
+        .await
+        .map_err(ApiError::from)?;
+
+    bus::emit(
+        state.db().pool(),
+        NewEvent::new("ai.approval.applied")
+            .organization(organization)
+            .actor(actor)
+            .payload(json!({
+                "approval_id": id,
+                "resource_type": plan.resource_type,
+                "resource_id": plan.resource_id,
+            })),
+    )
+    .await?;
+
+    Ok(Json(AppliedResult {
+        applied: true,
+        resource_type: plan.resource_type,
+        resource_id: plan.resource_id,
+        slug: page.slug,
+        status: page.status,
+        fields_written: plan.diffs.len(),
+    }))
+}
+
+/// What an apply answers.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppliedResult {
+    pub applied: bool,
+    pub resource_type: String,
+    pub resource_id: String,
+    /// The slug the page carries now, so the screen can link straight at it.
+    pub slug: String,
+    /// Its status now — `draft` for an update that did not publish.
+    pub status: String,
+    /// How many mapped fields the frozen preview actually wrote. `0` on a delete, whose
+    /// consequence is the row going away rather than a field changing.
+    pub fields_written: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -457,7 +579,11 @@ pub async fn list_policies(
         policies,
         classes: io::class_options()
             .into_iter()
-            .map(|(key, label, irreversible)| ClassOption { key, label, irreversible })
+            .map(|(key, label, irreversible)| ClassOption {
+                key,
+                label,
+                irreversible,
+            })
             .collect(),
     }))
 }
@@ -499,7 +625,11 @@ pub async fn put_policy(
     // **every** class, not only the irreversible three, because the risk is cumulative.
     if body.mode == "allow" {
         let expected = format!("set {tool_class} to allow");
-        let typed = body.confirmation.as_deref().map(str::trim).unwrap_or_default();
+        let typed = body
+            .confirmation
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default();
         if typed.is_empty() {
             return Err(ApiError::new(
                 axum::http::StatusCode::PRECONDITION_REQUIRED,

@@ -1015,6 +1015,11 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "ai.approvals.act"));
     let ai_approval_reject = post(ai_approvals::reject)
         .layer(guards::require(&state, "ai.approvals.act"));
+    // The apply is a *write* and carries the same key as the decision: releasing a change and
+    // performing it are one authority, and a caller who may approve but not apply would leave
+    // approved rows nobody can carry out.
+    let ai_approval_apply = post(ai_approvals::apply)
+        .layer(guards::require(&state, "ai.approvals.act"));
     let ai_approval_sweep =
         post(ai_approvals::sweep).layer(guards::require(&state, "ai.approvals.act"));
     // The policy screen reads under the *read* key on purpose: an installation has to be able to
@@ -1973,6 +1978,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/approvals/{id}", ai_approval)
         .route("/ai/approvals/{id}/approve", ai_approval_approve)
         .route("/ai/approvals/{id}/reject", ai_approval_reject)
+        .route("/ai/approvals/{id}/apply", ai_approval_apply)
         .route("/ai/agents/{id}/tools", ai_agent_tool_set)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)

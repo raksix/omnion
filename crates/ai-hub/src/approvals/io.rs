@@ -359,13 +359,13 @@ async fn pending_for_step(
 }
 
 /// Approve. The single-use and the typed confirmation are both decided here.
-pub async fn approve(
+pub async fn approve<R: RevisionReader + ?Sized>(
     pool: &PgPool,
     organization_id: Uuid,
     id: Uuid,
     decided_by: Uuid,
     confirmation: Option<&str>,
-    current_revision: Option<&str>,
+    reader: &R,
     now: OffsetDateTime,
 ) -> Result<DecisionOutcome> {
     decide(
@@ -376,7 +376,7 @@ pub async fn approve(
         Decision::Approve {
             confirmation: confirmation.map(str::to_owned),
         },
-        current_revision,
+        reader,
         now,
     )
     .await
@@ -385,12 +385,13 @@ pub async fn approve(
 /// Reject. A reason is not optional, and the row's own check constraint refuses a blank one —
 /// so a caller that forgot the reason fails at the database rather than producing a rejection
 /// nobody can audit later.
-pub async fn reject(
+pub async fn reject<R: RevisionReader + ?Sized>(
     pool: &PgPool,
     organization_id: Uuid,
     id: Uuid,
     decided_by: Uuid,
     reason: &str,
+    reader: &R,
     now: OffsetDateTime,
 ) -> Result<DecisionOutcome> {
     let reason = reason.trim();
@@ -412,7 +413,7 @@ pub async fn reject(
         Decision::Reject {
             reason: reason.to_owned(),
         },
-        None,
+        reader,
         now,
     )
     .await
@@ -426,13 +427,42 @@ enum Decision {
     Reject { reason: String },
 }
 
-async fn decide(
+/// How the decision path learns a target's current revision.
+///
+/// A seam rather than a direct call because this function is where the guarantee lives and it
+/// has to be testable in both directions: a walk needs the **real** reader (so the stale check
+/// sees a genuinely edited page), and a unit test needs a **scripted** one (so the stale check
+/// can be fired without arranging a page edit, and so a reader that returned nothing can be
+/// proven to fail the decision rather than pass it).
+///
+/// `None` means "this resource type has no reader in this build", which is a **refusal to
+/// decide**, not a skip: an approval nobody can check the freshness of must not be applied.
+pub trait RevisionReader: Send + Sync {
+    /// The revision of the target right now.
+    fn read(
+        &self,
+        pool: &PgPool,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> impl std::future::Future<Output = Result<String>> + Send;
+}
+
+/// The reader that talks to the database.
+pub struct DbRevisionReader;
+
+impl RevisionReader for DbRevisionReader {
+    async fn read(&self, pool: &PgPool, resource_type: &str, resource_id: &str) -> Result<String> {
+        super::target::revision_of(pool, resource_type, resource_id).await
+    }
+}
+
+async fn decide<R: RevisionReader + ?Sized>(
     pool: &PgPool,
     organization_id: Uuid,
     id: Uuid,
     decided_by: Uuid,
     decision: Decision,
-    current_revision: Option<&str>,
+    reader: &R,
     now: OffsetDateTime,
 ) -> Result<DecisionOutcome> {
     let Some(row) = read(pool, organization_id, id).await? else {
@@ -491,11 +521,30 @@ async fn decide(
         // the reviewer's fault (the resource moved) must be distinguishable from one that is
         // (they typed the wrong thing), or the screen offers Re-preview to somebody whose only
         // mistake was a typo.
-        if let (Some(expected), Some(current)) = (row.base_revision.as_deref(), current_revision)
+        //
+        // **The revision is read here, not taken from the request.** Slice 1 compared the row
+        // against a `current_revision` the caller posted, which made the whole guarantee a
+        // self-report: a client that echoed the row's own stored base revision passed the
+        // check every time. The client may still send what it saw -- that is what the screen
+        // renders -- but the answer comes from the row.
+        let (Some(resource_type), Some(resource_id)) =
+            (row.resource_type.as_deref(), row.resource_id.as_deref())
+        else {
+            // An approval that names no target cannot be checked for freshness, so it cannot be
+            // applied through this path. Slice 1's rows are written this way by tests that
+            // park a request without a resource; refusing is the honest answer and the message
+            // names the fix.
+            return Err(AiHubError::InvalidApproval(format!(
+                "approval {} names no resource, so it cannot be checked for staleness",
+                row.id
+            )));
+        };
+        let current = reader.read(pool, resource_type, resource_id).await?;
+        if let Some(expected) = row.base_revision.as_deref()
             && expected != current
         {
             return Ok(DecisionOutcome::Stale {
-                current_revision: current.to_owned(),
+                current_revision: current,
             });
         }
     }
@@ -553,6 +602,52 @@ async fn decide(
             Ok(DecisionOutcome::AlreadyDecided(Box::new(current)))
         }
     }
+}
+
+/// Mark an approval applied, and write its audit row.
+///
+/// Called **after** the write it records, never before. The order is the whole retry story: if
+/// the process dies between the content write and this call, the row stays `approved` with a
+/// null `applied_at` and the reviewer can apply it again — re-applying an update is a second
+/// revision, which is visible and harmless. Writing the marker first would make a *failed*
+/// apply indistinguishable from a finished one, and there is no repair for that.
+///
+/// The `where applied_at is null` is the second half of single-use: two concurrent applies of
+/// one approval produce one audit row rather than two.
+pub async fn mark_applied(
+    pool: &PgPool,
+    organization_id: Uuid,
+    id: Uuid,
+    applied_by: Option<Uuid>,
+) -> Result<Option<Approval>> {
+    let sql = format!(
+        "update ai_approvals set status = 'applied', applied_at = now() \
+         where id = $1 and organization_id = $2 and applied_at is null \
+         returning {APPROVAL_COLUMNS}"
+    );
+    let updated: Option<Approval> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(organization_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(approval) = updated else {
+        // Somebody else got there first. Not an error: the caller's effect is the same, and
+        // answering `None` lets the route decide between "already applied" and "not yours".
+        return Ok(None);
+    };
+    audit(
+        pool,
+        organization_id,
+        &approval,
+        "ai.approval.applied",
+        applied_by,
+        json!({
+            "preview_hash": approval.preview_hash,
+            "operation_count": approval.operation_count,
+        }),
+    )
+    .await?;
+    Ok(Some(approval))
 }
 
 /// Mark one request expired, and hand the parked run back so it fails cleanly.
