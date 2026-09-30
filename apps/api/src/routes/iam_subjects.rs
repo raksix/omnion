@@ -348,6 +348,56 @@ async fn role_chips(
     Ok(map)
 }
 
+/// The row `update users` returns.
+#[derive(sqlx::FromRow)]
+struct UpdatedUser {
+    id: Uuid,
+    email: String,
+    display_name: String,
+    status: String,
+    organization_id: Option<Uuid>,
+    mfa_enforced: bool,
+    attributes: serde_json::Value,
+}
+
+/// The account update, on whatever the caller is holding.
+///
+/// **One function rather than the statement next to a guard.** The deactivation path runs this
+/// inside the transaction that took the `for share` lock, and the ordinary path runs it on the
+/// pool; a pasted second copy would be free to drift — the first column added to this update
+/// would land in one copy only, and the deactivation would keep the old value in silence.
+async fn apply_user_update<'e, E>(
+    executor: E,
+    user_id: Uuid,
+    body: &UpdateUserRequest,
+) -> Result<UpdatedUser, ApiError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as::<_, UpdatedUser>(
+        "update users set \
+            display_name = coalesce($2, display_name), \
+            status = coalesce($3, status), \
+            organization_id = case when $4::uuid is null then organization_id else $4 end, \
+            mfa_enforced = coalesce($5, mfa_enforced), \
+            attributes = coalesce($6, attributes), \
+            updated_at = now() \
+         where id = $1 \
+         returning id, email, display_name, status, organization_id, mfa_enforced, attributes",
+    )
+    .bind(user_id)
+    .bind(body.display_name.as_deref().map(str::trim))
+    .bind(body.status.as_deref())
+    .bind(body.organization_id)
+    .bind(body.mfa_enforced)
+    .bind(body.attributes.clone())
+    .fetch_one(executor)
+    .await
+    // The turbofish-free `.into()` cannot infer which target it converts into when the
+    // annotation is the function's return type, so the error is built explicitly.
+    .map_err(|error| -> ApiError { PermissionsError::Database(error).into() })
+}
+
 /// `POST /api/v1/iam/users` — create an account.
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
@@ -514,37 +564,67 @@ pub async fn update_user(
         resolve_organization(&current, Some(organization_id))?;
     }
 
-    #[derive(sqlx::FromRow)]
-    struct UpdatedUser {
-        id: Uuid,
-        email: String,
-        display_name: String,
-        status: String,
-        organization_id: Option<Uuid>,
-        mfa_enforced: bool,
-        attributes: serde_json::Value,
-    }
+    // Turning an account off is refused while it still owns a project (REQ-133). Three placement
+    // decisions, all load-bearing:
+    //
+    // * **Only on the transition.** A request that re-sends `disabled` for an account that is
+    //   already disabled changes nothing and must not start failing later — the day somebody
+    //   gives the last project a second owner, the save button on an unrelated profile field
+    //   would start raising on an account that is already off.
+    // * **In one transaction with the write, not before it.** The projects are read `for share`
+    //   and the `update` runs on that same transaction, so an ownership transfer that lands
+    //   between the read and the write is serialised behind it rather than opening a window in
+    //   which the account goes off and the project is left owned by somebody who cannot sign
+    //   in. A guard followed by a statement on the pool is the two-statement version of that
+    //   race, and the same one this module already removed from the run-start path.
+    // * **The `update` is a function, not a second copy of the statement.** A copy pasted next
+    //   to the guard is a second thing to forget: a column added to the update later would land
+    //   in one copy and the deactivation path would silently keep the old value.
+    let disabling = body.status.as_deref() == Some("disabled") && user.status != "disabled";
+    let mut tx = if disabling {
+        Some(
+            pool.begin()
+                .await
+                .map_err(|error| -> ApiError { PermissionsError::Database(error).into() })?,
+        )
+    } else {
+        None
+    };
 
-    let updated: UpdatedUser = sqlx::query_as(
-        "update users set \
-            display_name = coalesce($2, display_name), \
-            status = coalesce($3, status), \
-            organization_id = case when $4::uuid is null then organization_id else $4 end, \
-            mfa_enforced = coalesce($5, mfa_enforced), \
-            attributes = coalesce($6, attributes), \
-            updated_at = now() \
-         where id = $1 \
-         returning id, email, display_name, status, organization_id, mfa_enforced, attributes",
-    )
-    .bind(user_id)
-    .bind(body.display_name.as_deref().map(str::trim))
-    .bind(body.status.as_deref())
-    .bind(body.organization_id)
-    .bind(body.mfa_enforced)
-    .bind(body.attributes.clone())
-    .fetch_one(pool)
-    .await
-    .map_err(PermissionsError::Database)?;
+    let assignments = match tx.as_mut() {
+        Some(tx) => {
+            let organization_id = user.organization_id.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "user_without_organization",
+                    "a platform account owns no project — remove its automation roles first",
+                )
+            })?;
+            Some(
+                omnion_workflows::projects::ensure_user_can_be_disabled_in(
+                    &mut *tx,
+                    organization_id,
+                    user_id,
+                )
+                .await
+                .map_err(ApiError::from)?,
+            )
+        }
+        None => None,
+    };
+
+    // `&mut **tx` and not `&mut *tx`: sqlx 0.8 implements `Executor` for `PgConnection`, and a
+    // `Transaction` derefs to it once through `DerefMut` and once through `Acquire`. Passing the
+    // one-deref form is what `the trait Executor<'_> is not implemented` is.
+    let updated = match tx.as_mut() {
+        Some(tx) => apply_user_update(&mut **tx, user_id, &body).await?,
+        None => apply_user_update(pool, user_id, &body).await?,
+    };
+    if let Some(tx) = tx {
+        tx.commit()
+            .await
+            .map_err(PermissionsError::Database)?;
+    }
 
     // An account's details, status, organization or MFA requirement changing is a fact a
     // receiver acts on \u2014 a provisioning system mirrors it, a session bus drops the account
@@ -576,7 +656,15 @@ pub async fn update_user(
                     "organization_id": body.organization_id,
                     "mfa_enforced": body.mfa_enforced,
                     "attributes": body.attributes.is_some(),
-                }
+                },
+                // What the account still held at the moment it was allowed to go. The refusal
+                // is about ownership, so the count of what it *authored* is recorded next to
+                // the decision — an account switched off with twelve workflows behind it is a
+                // fact somebody asks for later, and the audit row is where it has to live.
+                "automations": assignments.as_ref().map(|a| json!({
+                    "owned_projects": a.owned.len(),
+                    "authored_workflows": a.authored_workflows,
+                })),
             }))
             .ip_address(address.as_text())
             .organization(updated.organization_id),
