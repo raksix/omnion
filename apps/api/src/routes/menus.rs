@@ -1054,7 +1054,7 @@ async fn entry_in_scope(
     Ok(organization_id)
 }
 
-async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
+pub(crate) async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> {
     omnion_audit::record(state.db().pool(), entry).await?;
     Ok(())
 }
@@ -1071,7 +1071,7 @@ async fn record(state: &AppState, entry: NewAuditEntry) -> Result<(), ApiError> 
 /// by the time this runs, so a bus that is momentarily full must not turn a successful save into
 /// a 500. Making it non-async is also what keeps the call sites honest — an `async fn` whose
 /// future nobody awaits is a silent no-op that compiles clean and emits nothing at all.
-fn emit(
+pub(crate) fn emit(
     state: &AppState,
     event: &'static str,
     payload: serde_json::Value,

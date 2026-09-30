@@ -82,6 +82,7 @@ pub mod restore_jobs;
 pub mod commands;
 pub mod comments;
 pub mod content;
+pub mod content_api;
 pub mod featured_media;
 pub mod forms;
 pub mod health;
@@ -1066,6 +1067,35 @@ pub fn router(state: AppState) -> Router {
     // query — see `menus::public_menu`.
     let public_menu = get(menus::public_menu);
 
+    // Content API tokens (REQ-019, slice 1). Reading the list and its vocabulary is one power
+    // (`content.api.read`) and minting, rotating and revoking is another (`content.api.manage`),
+    // because a token outlives the session that made it: whoever can create one can hand read
+    // access to published content to somebody outside the organization, and that is not the same
+    // privilege as watching who is already calling. The list answers prefix-only, so the route
+    // cannot leak a secret even by accident.
+    let content_api_tokens_list = get(content_api::list_tokens)
+        .layer(guards::require(&state, "content.api.read"));
+    let content_api_vocabulary = get(content_api::token_vocabulary)
+        .layer(guards::require(&state, "content.api.read"));
+    let content_api_token_create = post(content_api::create_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    let content_api_token_update = patch(content_api::update_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    let content_api_token_rotate = post(content_api::rotate_token)
+        .layer(guards::require(&state, "content.api.manage"));
+    let content_api_token_revoke = delete(content_api::revoke_token)
+        .layer(guards::require(&state, "content.api.manage"));
+
+    // The token surface itself. Declared as its own router so the six routes read as one unit
+    // next to their permission layer, and merged into the v1 tree below.
+    let content_api = Router::new()
+        .route("/content-api/tokens", content_api_tokens_list)
+        .route("/content-api/tokens", content_api_token_create)
+        .route("/content-api/tokens/vocabulary", content_api_vocabulary)
+        .route("/content-api/tokens/{id}", content_api_token_update)
+        .route("/content-api/tokens/{id}", content_api_token_revoke)
+        .route("/content-api/tokens/{id}/rotate", content_api_token_rotate);
+
     // Scheduled publishing (REQ-064, slice 1). One key for the whole queue: reading it, moving
     // an entry and cancelling one are the same power a publisher already has
     // (`content.pages.schedule`), and a second key would only answer "who may look at the
@@ -1706,6 +1736,12 @@ pub fn router(state: AppState) -> Router {
         // before the parameter ones so axum ranks them ahead of `{id}`.
         .route("/menus", menus_list)
         .route("/menus", menus_create)
+
+        // The panel-side token manager for the headless surface. Merged rather than nested
+        // under a prefix, because the guard layers already carry the permissions and a second
+        // nesting level would only add a place for a route to be declared and forgotten.
+        .merge(content_api)
+
         .route("/menus/{id}", menu_read.merge(menu_write))
         .route("/menus/{id}/items", menu_items_write)
         .route("/menus/{id}/items/from-pages", menu_items_from_pages)
