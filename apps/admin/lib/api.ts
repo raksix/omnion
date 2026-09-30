@@ -81,6 +81,7 @@ import type {
   BackupPurge,
   BackupPurgeFailure,
   BackupSweepReport,
+  RestoreOutcome,
   RestorePreview,
   BackupVerification,
   MediaRetentionRunList,
@@ -4896,6 +4897,24 @@ export function previewRestore(id: string): Promise<RestorePreview> {
 }
 
 /**
+ * Perform a restore of the ticked parts.
+ *
+ * The API takes the parts the operator **left ticked**, not "everything available": an empty
+ * array is a refusal naming the parts on offer, because a panel that posted nothing and got
+ * the whole archive back would be a panel that restored more than it showed.
+ */
+export function restoreBackup(
+  id: string,
+  parts: string[],
+  confirmation: string,
+): Promise<RestoreOutcome> {
+  return request<RestoreOutcome>(`/api/v1/backups/${id}/restore`, {
+    method: "POST",
+    body: JSON.stringify({ parts, confirmation }),
+  });
+}
+
+/**
  * Remove a run **and the artifacts it left on the destination**.
  *
  * The returned report is the point of this call: "the row is gone" and "the bytes are gone"
@@ -4920,9 +4939,82 @@ export function sweepBackups(): Promise<BackupSweepReport> {
   return request<BackupSweepReport>("/api/v1/backups/sweep", { method: "POST" });
 }
 
-/** The schedules table. Slice 3 adds the writes. */
+/** The schedules table. */
 export function fetchBackupSchedules(): Promise<BackupSchedule[]> {
   return request<BackupSchedule[]>("/api/v1/backup-schedules");
+}
+
+/**
+ * What the schedule editor sends.
+ *
+ * The conditional fields are sent as `null` rather than omitted, so a schedule changed from
+ * weekly to daily does not keep a `day_of_week` the server has to decide about. The server
+ * refuses a daily schedule that still carries one.
+ */
+export interface BackupScheduleInput {
+  name: string;
+  frequency: "hourly" | "daily" | "weekly" | "monthly";
+  at_time: string | null;
+  day_of_week: number | null;
+  day_of_month: number | null;
+  timezone: string;
+  scopes: string[];
+  retention_count: number;
+  enabled: boolean;
+}
+
+/**
+ * Create a schedule.
+ *
+ * The response carries the **computed** `next_run_at`, not a value the form supplied — the
+ * form never computes one. A schedule whose cadence cannot be computed (an unknown timezone,
+ * a daily row with no time) is refused with a `400` naming the field rather than stored with
+ * a null next run, which would leave a row that looks live and never fires.
+ */
+export function createBackupSchedule(input: BackupScheduleInput): Promise<BackupSchedule> {
+  return request<BackupSchedule>("/api/v1/backup-schedules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Edit a schedule, and get the recomputed next run back.
+ *
+ * The next run is recomputed on every save rather than left alone. An operator who moves a
+ * schedule from 02:00 to 04:00 and does not see the next run move has been told the change
+ * did not take, when in fact it was stored and the stale column is what the worker reads.
+ */
+export function updateBackupSchedule(
+  id: string,
+  input: BackupScheduleInput,
+): Promise<BackupSchedule> {
+  return request<BackupSchedule>(`/api/v1/backup-schedules/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * Remove a schedule.
+ *
+ * Its runs keep their own `kind` and lose only the link: deleting a schedule stops future
+ * backups and does not delete the restore points it produced. The schema is arranged so the
+ * other outcome is not expressible here.
+ */
+export function deleteBackupSchedule(id: string): Promise<void> {
+  return request<void>(`/api/v1/backup-schedules/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Take a backup on a schedule's terms, right now.
+ *
+ * `backup.create`, not `backup.manage`: this produces a backup and changes nothing else. It
+ * does **not** advance the schedule — clicking this at 09:00 to test a 02:00 schedule must
+ * not consume the 02:00 slot, which is the difference between a test and a silent skip.
+ */
+export function runBackupScheduleNow(id: string): Promise<BackupCreateResult> {
+  return request<BackupCreateResult>(`/api/v1/backup-schedules/${id}/run`, { method: "POST" });
 }
 
 /** The settings record. */
