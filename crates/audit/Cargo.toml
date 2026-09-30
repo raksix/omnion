@@ -7,6 +7,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+# `derive` for `AuditEntry`'s Serialize: the project audit screen returns rows as a response
+# body, and a hand-written mirror of the struct would be a second definition of a row.
+serde = { workspace = true, features = ["derive"] }
 sqlx.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

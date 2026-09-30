@@ -1,5 +1,6 @@
 //! Audit entries: append-only rows describing who did what, to which target.
 
+use serde::Serialize;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -33,7 +34,7 @@ impl ActorType {
 }
 
 /// A stored audit row.
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct AuditEntry {
     /// Creation order (identity column).
     pub id: i64,
@@ -53,6 +54,12 @@ pub struct AuditEntry {
     pub metadata: serde_json::Value,
     /// Peer address of the actor, when known.
     pub ip_address: Option<String>,
+    /// The automation project the action happened inside, when it happened inside one.
+    ///
+    /// **`None` for a platform-level row, and that is data rather than absence.** The project
+    /// audit screen filters on this column, and a reader asking "what happened to this project"
+    /// must not be shown a role creation from the same tenant.
+    pub project_id: Option<Uuid>,
     /// When the action was recorded.
     pub created_at: OffsetDateTime,
 }
@@ -140,21 +147,59 @@ impl NewAuditEntry {
         self.ip_address = ip_address;
         self
     }
+
 }
 
 /// Columns read back from `audit_log`, with `inet` rendered as text.
 const AUDIT_COLUMNS: &str = "id, organization_id, actor_user_id, actor_type, action, \
-     target_type, target_id, metadata, ip_address::text as ip_address, created_at";
+     target_type, target_id, metadata, ip_address::text as ip_address, project_id, created_at";
+
+/// Columns an entry writes. `project_id` is a *separate* parameter rather than part of
+/// [`AUDIT_COLUMNS`]: the column arrived with migration 0164, nullable, and every writer that
+/// does not name a project leaves it null — which is the correct answer for a platform-level row
+/// and the reason a project audit screen has to filter on it rather than on `organization_id`.
+///
+/// Before it existed, the project-scoped mutations (REQ-133) wrote rows that were indistinguishable
+/// from platform rows: `organization_id` was the same, and the trail could not answer "what
+/// happened to this project". A filter over an `organization_id` would have been worse than no
+/// filter, because it would have shown a project the whole tenant's history.
+const AUDIT_INSERT_COLUMNS: &str = "organization_id, actor_user_id, actor_type, action, \
+     target_type, target_id, metadata, ip_address, project_id";
 
 /// Append an entry to the audit trail.
 ///
 /// Callers treat a failure as a failure of the action itself: an unrecorded privileged action
 /// is worse than a reported one, because the trail is what the operator audits afterwards.
 pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
+    write(pool, entry, None).await
+}
+
+/// Append an entry **inside an automation project**, for the project audit screen (REQ-133).
+///
+/// **A second function rather than a field on [`NewAuditEntry`].** The column arrived with
+/// migration 0164 and every writer that does not belong to a project leaves it null, so the
+/// interesting fact is not "the entry has no project" but "this entry has *this* project" — a
+/// distinction a null cannot carry. A field would have said the same thing, and it would have
+/// broken every struct-literal construction of the entry in the workspace (two of them live in
+/// files other waves own), which is a merge hazard dressed as an audit decision. The platform's
+/// own rows keep calling [`record`] and keep their null.
+pub async fn record_for_project(
+    pool: &PgPool,
+    entry: NewAuditEntry,
+    project_id: Uuid,
+) -> Result<AuditEntry> {
+    write(pool, entry, Some(project_id)).await
+}
+
+/// The one insert both entry points share.
+async fn write(
+    pool: &PgPool,
+    entry: NewAuditEntry,
+    project_id: Option<Uuid>,
+) -> Result<AuditEntry> {
     let sql = format!(
-        "insert into audit_log (organization_id, actor_user_id, actor_type, action, target_type, \
-         target_id, metadata, ip_address) \
-         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet)) returning {AUDIT_COLUMNS}"
+        "insert into audit_log ({AUDIT_INSERT_COLUMNS}) \
+         values ($1, $2, $3, $4, $5, $6, $7, cast($8 as inet), $9) returning {AUDIT_COLUMNS}"
     );
 
     let stored: AuditEntry = sqlx::query_as(&sql)
@@ -166,6 +211,7 @@ pub async fn record(pool: &PgPool, entry: NewAuditEntry) -> Result<AuditEntry> {
         .bind(entry.target_id.as_deref())
         .bind(entry.metadata)
         .bind(entry.ip_address.as_deref())
+        .bind(project_id)
         .fetch_one(pool)
         .await?;
 
@@ -224,6 +270,38 @@ pub async fn for_target(
     let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
         .bind(target_id)
         .bind(target_types)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(entries)
+}
+
+/// Every entry recorded **inside one project**, newest first (REQ-133 slice 4).
+///
+/// The project audit screen is this function, and the reason it exists rather than a filter on
+/// [`recent`] is that `organization_id` cannot answer the question: every project mutation carries
+/// the tenant id, so filtering on it hands the reader the whole installation's history and calls it
+/// a project. `project_id` is the only column that is narrow enough to be a boundary.
+///
+/// `action` narrows further (the REQ's "with filters"), and an empty string means every action
+/// rather than none -- a screen whose filter defaults to "show nothing" is indistinguishable from a
+/// project where nothing happened.
+pub async fn for_project(
+    pool: &PgPool,
+    project_id: Uuid,
+    action: Option<&str>,
+    limit: i64,
+) -> Result<Vec<AuditEntry>> {
+    let sql = format!(
+        "select {AUDIT_COLUMNS} from audit_log \
+         where project_id = $1 and ($2 = '' or action = $2) \
+         order by created_at desc, id desc limit $3"
+    );
+
+    let entries: Vec<AuditEntry> = sqlx::query_as(&sql)
+        .bind(project_id)
+        .bind(action.unwrap_or_default())
         .bind(limit)
         .fetch_all(pool)
         .await?;
