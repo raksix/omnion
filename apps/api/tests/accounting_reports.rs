@@ -274,17 +274,26 @@ impl Fixture {
     /// A payment, so the income and cashflow reports have money in them.
     async fn payment(&self, amount: &str, paid_on: &str) -> Uuid {
         let reference = format!("RPT-PAY-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        // `payment_number` is NOT NULL and `reference` is the EXTERNAL one (a bank transfer id
-        // that may be empty). Writing a reference and no number answers 23502 -- the fixture
-        // being wrong, not the report.
-        let number = format!("PAY-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        // **`payment_number` is a `bigint`, not a text label** -- a per-organization sequence,
+        // unique with it. `reference` is the text one (an external bank id, which may be empty).
+        // Writing text answers 42804 and writing a fixed number would collide with the unique
+        // index as soon as two walks shared an organization, so the number comes from the same
+        // sequence the module reads, and the reference carries the walk's own uuid.
+        let number: i64 = sqlx::query_scalar(
+            "select coalesce(max(payment_number), 0) + 1 from accounting_payments \
+             where organization_id = $1",
+        )
+        .bind(self.organization)
+        .fetch_one(self.db.pool())
+        .await
+        .expect("the payment number must be readable");
         sqlx::query_scalar::<_, Uuid>(
             "insert into accounting_payments \
                  (organization_id, payment_number, reference, method, amount, paid_on, created_by) \
              values ($1, $2, $3, 'bank_transfer', $4::numeric, $5::date, $6) returning id",
         )
         .bind(self.organization)
-        .bind(&number)
+        .bind(number)
         .bind(&reference)
         .bind(amount)
         .bind(paid_on)
@@ -932,8 +941,12 @@ async fn the_tax_summary_reads_the_rate_copied_onto_the_line() {
     // A rate, an invoice line carrying it at 20%, and then the rate EDITED to 25%. The report
     // must still say 20%: the line keeps the percentage it was issued under, and a report that
     // joined the rate table would retroactively restate a filed period.
+    // The rate is written and then EDITED, and the report is expected to keep saying 20%. An
+    // accounting line does not reference a rate at all -- it keeps the percentage it was issued
+    // at -- so this row exists purely so that "somebody corrected a rate" is a real event in the
+    // database rather than a comment in the walk.
     let rate_id: Uuid = sqlx::query_scalar(
-        "insert into tax_rates (organization_id, rate_name, percent, tax_kind, is_default) \
+        "insert into accounting_tax_rates (organization_id, name, percent, kind, is_default) \
          values ($1, 'RPT Sales 20', 20, 'sales', false) returning id",
     )
     .bind(fixture.organization)
@@ -944,17 +957,17 @@ async fn the_tax_summary_reads_the_rate_copied_onto_the_line() {
     let invoice_id = fixture.invoice("TAXED", "120.00", "0.00", Some(&today.to_string())).await;
     sqlx::query(
         "insert into accounting_invoice_lines \
-             (invoice_id, position, description, quantity, unit_price, net_amount, tax_rate_id, \
-              tax_percent, tax_amount, line_total) \
-         values ($1, 0, 'Taxed line', 1000, 10000, 10000, $2, 2000, 2000, 12000)",
+             (invoice_id, organization_id, position, description, qty, unit_price, \
+              net_amount, tax_percent, tax_amount, line_total) \
+         values ($1, $2, 0, 'Taxed line', 1, 100.00, 100.00, 20.00, 20.00, 120.00)",
     )
     .bind(invoice_id)
-    .bind(rate_id)
+    .bind(fixture.organization)
     .execute(fixture.db.pool())
     .await
     .expect("the fixture line must be written");
 
-    sqlx::query("update tax_rates set percent = 25 where id = $1")
+    sqlx::query("update accounting_tax_rates set percent = 25 where id = $1")
         .bind(rate_id)
         .execute(fixture.db.pool())
         .await
@@ -978,7 +991,7 @@ async fn the_tax_summary_reads_the_rate_copied_onto_the_line() {
     let rows = response.body["rows"].as_array().expect("rows must be an array");
     let row = rows
         .iter()
-        .find(|row| row["rate_name"].as_str() == Some("RPT Sales 20"))
+        .find(|row| row["percent"].as_str() == Some("20.00"))
         .unwrap_or_else(|| panic!("the taxed rate must be listed: {rows:?}"));
     assert_eq!(
         row["percent"].as_str(),
@@ -986,7 +999,12 @@ async fn the_tax_summary_reads_the_rate_copied_onto_the_line() {
         "the report must use the rate the line was ISSUED at, not the edited one: {row}"
     );
     assert_eq!(row["tax"].as_str(), Some("20.00"));
-    assert_eq!(row["kind"].as_str(), Some("Sales"));
+    assert_eq!(row["base"].as_str(), Some("100.00"));
+    // The label is DERIVED from the percentage, so it cannot name 25% -- and that is the point:
+    // a label read from the rate table would have followed the edit and disagreed with the
+    // number printed beside it.
+    assert_eq!(row["rate_name"].as_str(), Some("Tax at 20.00%"));
+    assert_eq!(row["kind"].as_str(), Some("Collected"));
 }
 
 #[tokio::test]

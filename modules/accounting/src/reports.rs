@@ -1016,19 +1016,25 @@ impl<'a> Reports<'a> {
         let (from, to) = self.bounds();
         let rows = sqlx::query(
             r#"
-            select r.rate_name, l.tax_percent::text as percent, r.tax_kind as kind,
+            -- **No join to a rate table, and that is the design.** `accounting_invoice_lines`
+            -- has no `tax_rate_id` -- that column lives on the SALES lines (0053). An accounting
+            -- line keeps `tax_percent`, the copy taken when the line was issued, and that copy
+            -- IS the rate for reporting purposes: joining a rate table would be a second source
+            -- for a number the line already owns, and would restate a filed period the moment
+            -- somebody corrected a rate. The name is carried as a label only, so a summary can
+            -- still be read by a person.
+            select l.tax_percent::text as percent,
                    sum(l.net_amount)::text as base,
                    sum(l.tax_amount)::text as tax
             from accounting_invoice_lines l
             join accounting_invoices i on i.id = l.invoice_id
-            left join tax_rates r on r.id = l.tax_rate_id
             where i.organization_id = $1
               and i.invoice_status <> 'void'
               and l.tax_amount > 0
               and ($2::date is null or i.issue_date >= $2)
               and ($3::date is null or i.issue_date <= $3)
-            group by r.rate_name, l.tax_percent, r.tax_kind
-            order by l.tax_percent desc, r.rate_name nulls last
+            group by l.tax_percent
+            order by l.tax_percent desc
             "#,
         )
         .bind(self.org)
@@ -1043,15 +1049,16 @@ impl<'a> Reports<'a> {
         for row in &rows {
             let base = text_amount(row, "base")?;
             let tax = text_amount(row, "tax")?;
+            let percent = percent_text(row, "percent")?;
             total_base = total_base.plus(base);
             total_tax = total_tax.plus(tax);
-            let kind: Option<String> = row.get("kind");
             out_rows.push(TaxSummaryRow {
-                rate_name: row
-                    .get::<Option<String>, _>("rate_name")
-                    .unwrap_or_else(|| "No rate".to_string()),
-                percent: percent_text(row, "percent")?,
-                kind: kind_label(kind.as_deref()).to_string(),
+                // The name is DERIVED from the percentage the line carries, so it always says
+                // what the row actually is. A label read from a rate table would disagree with
+                // the number beside it as soon as the rate was edited.
+                rate_name: rate_label(&percent),
+                percent,
+                kind: kind_label().to_string(),
                 base: base.to_text(),
                 tax: tax.to_text(),
             });
@@ -1068,12 +1075,28 @@ impl<'a> Reports<'a> {
     }
 }
 
-/// The label for a tax rate's side.
-fn kind_label(kind: Option<&str>) -> &'static str {
-    match kind {
-        Some("sales") => "Sales",
-        Some("purchase") => "Purchase",
-        _ => "Unassigned",
+/// The label for the side a tax rate applies to.
+///
+/// An accounting line records only the percentage, not the side: `accounting_invoice_lines` has
+/// no rate reference at all, so "sales" and "purchase" cannot be read back from the row. Rather
+/// than invent a side the data does not carry, the summary says **"Collected"** -- which is the
+/// only side an invoice line can be, and the word a filing uses.
+fn kind_label() -> &'static str {
+    "Collected"
+}
+
+/// The label for a rate, derived from the percentage the line carries.
+///
+/// **Derived on purpose.** A name read from a rate table would disagree with the number printed
+/// beside it the moment somebody edited the rate -- and the whole reason this report groups by
+/// the line's own copy is that the issued document is the record.
+fn rate_label(percent: &str) -> String {
+    match Amount::parse(percent) {
+        Ok(amount) if amount.is_zero() => "Zero-rated".to_string(),
+        Ok(_) => format!("Tax at {percent}%"),
+        // An unreadable percentage is named, not hidden: a row that says "Tax at ??%" is a
+        // signal, where a blank cell reads as "no tax".
+        Err(_) => format!("Tax at an unreadable rate ({percent})"),
     }
 }
 
@@ -1315,9 +1338,13 @@ mod tests {
     }
 
     #[test]
-    fn the_tax_rate_side_is_labelled_in_words() {
-        assert_eq!(kind_label(Some("sales")), "Sales");
-        assert_eq!(kind_label(Some("purchase")), "Purchase");
-        assert_eq!(kind_label(None), "Unassigned");
+    fn the_rate_label_is_derived_from_the_percentage_the_line_carries() {
+        // The label and the number beside it can never disagree, because the label IS derived
+        // from the number -- the property a name read from a rate table loses the moment a rate
+        // is edited.
+        assert_eq!(rate_label("20.00"), "Tax at 20.00%");
+        assert_eq!(rate_label("0.00"), "Zero-rated");
+        assert!(rate_label("nonsense").contains("unreadable"));
+        assert_eq!(kind_label(), "Collected");
     }
 }
