@@ -24,11 +24,14 @@
 //! operator who upgraded from a build without the tool tables gets told to restart the API
 //! rather than shown a table with headers and no rows.
 
+use std::collections::BTreeMap;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use omnion_ai_hub::identity::{self, GrantEffect};
 use omnion_ai_hub::registry::{self, AgentRef, ToolLimits, ToolRow, ToolUsage};
 use omnion_events::NewEvent;
 use omnion_events::bus;
@@ -416,4 +419,166 @@ pub async fn patch_tool_route(
             .await?;
     let used_by = registry::agents_using(state.db().pool(), &key).await?;
     Ok(Json(ToolView::build(&after, usage.get(&key), used_by)))
+}
+
+// -------------------------------------------------------------------------------------------
+// Handlers · the grants of one tool
+// -------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/ai/tools/{key}/grants` — who has an opinion about this tool.
+///
+/// **The tool, not the identity, is the axis.** `PUT /ai/identities/{id}/tools` answers "what does
+/// this identity think of everything", and the tool detail screen answers the other question —
+/// "who decided something about *this* tool" — which is a different query, a different index
+/// (`ai_tool_grants (tool_key)`) and a different answer. The tool detail screen is where an
+/// operator goes to find out why `deployment.deploy` is refused, so this is what it renders.
+pub async fn get_tool_grants_route(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope_query): Query<OrgQuery>,
+    Path(key): Path<String>,
+) -> Result<Json<ToolGrantView>, ApiError> {
+    let organization = resolve_organization(&current, scope_query.organization_id)?;
+    if registry::get_tool(state.db().pool(), &key).await?.is_none() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "tool.not_found",
+            format!("no tool `{key}` in the registry"),
+        ));
+    }
+    let identities = identity::identities_granting(state.db().pool(), &key).await?;
+    Ok(Json(grant_view(key, &identities)))
+}
+
+/// `PUT /api/v1/ai/tools/{key}/grants` — replace the per-identity grants for one tool.
+///
+/// The spec's table names it "replace the per-agent grants for one tool", and there is no per-agent
+/// grant row: `ai_tool_grants` is keyed on `(identity_id, tool_key)`. An **agent's** opinion about a
+/// tool is its own `tools` / `approvals` list, replaced through `PUT /ai/agents/{id}/tools`. This
+/// route is the identity axis, scoped to one tool, because that is the shape the store has and the
+/// only one that can express a deny — a deny is a row, and a row needs an identity.
+///
+/// The body is the same `{ identity_id: allow | deny | inherit }` map the identity screen sends,
+/// so a client can round-trip one tool's row out of the matrix and back in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolGrantReplace {
+    /// `identity_id → allow | deny | inherit`. An id that is absent from the map is **not**
+    /// touched: the axis is "this tool", and the client is replacing what it can see, not clearing
+    /// the table. Clearing happens by sending `inherit` for the id, which deletes the row.
+    pub grants: BTreeMap<uuid::Uuid, GrantEffect>,
+}
+
+/// The response both grant routes answer with.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolGrantView {
+    pub tool_key: String,
+    /// Only the decided rows. A grant absent from this list is inherit, which is the same rule
+    /// `identity::grants_of` uses — stated once here so a client does not invent a second one.
+    pub grants: Vec<ToolGrant>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolGrant {
+    pub identity_id: uuid::Uuid,
+    pub identity_key: String,
+    pub identity_name: String,
+    /// A platform-level identity is visible to every tenant and not editable by one of them.
+    pub platform_level: bool,
+}
+
+impl ToolGrant {
+    /// One identity's row on this tool.
+    ///
+    /// **By reference, not by value**, and that is not a style choice: `is_platform_level` reads
+    /// `self`, so a `into_iter().map(|i| … { name: i.name, platform_level: i.is_platform_level() })`
+    /// moves `name` out of `i` and then borrows it — `E0382`, twice, once per route. One
+    /// constructor called from both places is also the reason the two responses cannot drift.
+    fn from_identity(identity: &omnion_ai_hub::identity::AiIdentity) -> Self {
+        Self {
+            identity_id: identity.id,
+            identity_key: identity.key.clone(),
+            identity_name: identity.name.clone(),
+            platform_level: identity.is_platform_level(),
+        }
+    }
+}
+
+/// The body both grant routes answer with, built from the rows that survived.
+///
+/// Shared so `GET` and `PUT` cannot answer different shapes for the same state — a client that
+/// reads then writes would otherwise have to handle a shape change it did not make.
+fn grant_view(tool_key: String, identities: &[omnion_ai_hub::identity::AiIdentity]) -> ToolGrantView {
+    ToolGrantView {
+        tool_key,
+        grants: identities.iter().map(ToolGrant::from_identity).collect(),
+    }
+}
+
+pub async fn put_tool_grants_route(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope_query): Query<OrgQuery>,
+    Path(key): Path<String>,
+    Json(body): Json<ToolGrantReplace>,
+) -> Result<Json<ToolGrantView>, ApiError> {
+    let organization = resolve_organization(&current, scope_query.organization_id)?;
+    // The tool is checked before the body is walked, so a typo in the path answers 404 rather
+    // than 400 and the caller's mistake is named as the key.
+    if registry::get_tool(state.db().pool(), &key).await?.is_none() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "tool.not_found",
+            format!("no tool `{key}` in the registry"),
+        ));
+    }
+
+    let mut changed = Vec::new();
+    for (identity_id, effect) in &body.grants {
+        // **Read first, then authorize.** A cross-tenant identity is a 404, not a 403: the status
+        // code must not be an existence oracle, and a 403 here would tell an operator of tenant A
+        // that tenant B has an identity with that id. This is the same order every other route in
+        // this area uses, and getting it backwards is the leak.
+        let Some(row) =
+            identity::get_identity(state.db().pool(), organization, *identity_id).await?
+        else {
+            return Err(ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "identity.not_found",
+                format!("no identity `{identity_id}` in this organization"),
+            ));
+        };
+        if row.is_platform_level() {
+            // Readable by everyone, writable by nobody outside the platform. The same rule the
+            // identity routes apply, and it is a 403 with the key because the operator CAN see
+            // this row — the refusal is about the right to change it, not about its existence.
+            return Err(ApiError::forbidden(
+                "identity.platform_level",
+                format!(
+                    "`{}` is a platform-level identity and cannot be changed from an organization",
+                    row.key
+                ),
+            ));
+        }
+        identity::set_grant(state.db().pool(), *identity_id, &key, *effect, Some(current.user.id))
+            .await?;
+        if *effect != GrantEffect::Inherit {
+            changed.push(json!({ "identity": row.key, "effect": effect.wire() }));
+        }
+    }
+
+    // One event for the whole save, like the identity-level route: twenty toggles are one
+    // decision, and the audit trail's value is in "this changed", not in counting the toggles.
+    if !changed.is_empty() {
+        bus::emit(
+            state.db().pool(),
+            NewEvent::new("ai.tool.grant_changed")
+                .organization(organization)
+                .actor(current.user.id)
+                .payload(json!({ "tool_key": key, "grants": changed })),
+        )
+        .await?;
+    }
+
+    let identities = identity::identities_granting(state.db().pool(), &key).await?;
+    Ok(Json(grant_view(key, &identities)))
 }

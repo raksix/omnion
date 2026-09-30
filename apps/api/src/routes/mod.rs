@@ -926,6 +926,21 @@ pub fn router(state: AppState) -> Router {
     // routes that caused it.
     let ai_tool_registry_usage =
         get(ai_tools::tool_usage_route).layer(guards::require(&state, "ai.tools.read"));
+    // The grants of ONE tool, on the tool's own path. The read is `ai.tools.read` for the same
+    // reason the usage chart is: "who has an opinion about this tool" is a fact about the tool,
+    // and the matrix already answers the same question from the identity side. The write is
+    // `ai.tools.manage` rather than `ai.identities.manage` because the caller is editing the
+    // tool's row in this screen — and a permission split that follows the screen is one an
+    // operator can predict from where they clicked.
+    //
+    // Registered under its own literal path so it cannot be read as a tool key, the same
+    // collision the classes route and the matrix route each document.
+    let ai_tool_grants = get(ai_tools::get_tool_grants_route)
+        .layer(guards::require(&state, "ai.tools.read"))
+        .merge(
+            axum::routing::put(ai_tools::put_tool_grants_route)
+                .layer(guards::require(&state, "ai.tools.manage")),
+        );
 
     // AI identities and the permission matrix (REQ-100 slice 2). The read/manage split is the
     // point: seeing which tools an installation's AI may take is a *fact about the platform*,
@@ -1743,6 +1758,7 @@ pub fn router(state: AppState) -> Router {
         // read as a tool whose key is "classes".
         .route("/ai/tools/classes", ai_tool_classes)
         .route("/ai/tools/{key}/usage", ai_tool_registry_usage)
+        .route("/ai/tools/{key}/grants", ai_tool_grants)
         .route("/ai/tools", ai_tools)
         .route("/ai/tools/{key}", ai_tool)
         // The identities and the matrix (REQ-100 slice 2). `/ai/permissions/matrix` is
