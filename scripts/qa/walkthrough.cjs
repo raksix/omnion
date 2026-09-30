@@ -7023,6 +7023,221 @@ async function runAiToolsDepth(page, report) {
   return steps;
 }
 
+/**
+ * The identities and the matrix (REQ-100, slice 2).
+ *
+ * The pass walks the tri-state in the order the spec names it — inherit → allow → deny → back to
+ * inherit — and after every step it asks **the database**, not the screen, what the cell now
+ * holds. That is the whole point of this pass: a client that renders a ✓ for a deny, or that
+ * optimistically shows "Inherited" while the row is still in the table, is a screen that lies
+ * about a permission, and the only way to catch it is to read past it.
+ */
+async function runAiIdentitiesDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-identities", action: "ai-identities", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+  const key = "qa-identity";
+
+  // A previous run's leftovers. This is the QA database and the pair index is real, so a second
+  // run without this would be refused with a 409 and every step below would read as a failure.
+  for (const leftover of qaSql(`select id from ai_identities where key = '${key}'`).split("\n").filter(Boolean)) {
+    await page.request.delete(api(`/identities/${leftover}`), { failOnStatusCode: false }).catch(() => {});
+  }
+
+  // The raw row for one (identity, tool) pair — the only source of truth about the tri-state.
+  const storedEffect = (identityId, toolKey) =>
+    qaSql(
+      `select coalesce((select effect::text from ai_tool_grants where identity_id = '${identityId}' and tool_key = '${toolKey}'), 'inherit')`,
+    )
+      .split("\n")
+      .filter(Boolean)[0]
+      ?.trim() || "inherit";
+
+  // ---- the list screen ---------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/identities`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.listScreen = (await page.locator("[data-ai-identities]").count()) > 0;
+  steps.emptyStateHasAnAction =
+    (await page.locator("[data-ai-identities]").count()) > 0 &&
+    (await page.locator('[data-action="new-identity"]').count()) > 0;
+  await shot(page, "ai-identities-list");
+
+  // ---- create one -------------------------------------------------------------------------------
+  await page.locator('[data-action="new-identity"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.formOpened = (await page.locator('[data-form="new-identity"]').count()) > 0;
+  await page.locator('[data-form="new-identity"] input').first().fill(key).catch(() => {});
+  await page
+    .locator('[data-form="new-identity"] input')
+    .nth(1)
+    .fill("QA identity")
+    .catch(() => {});
+  await page.locator('[data-form="new-identity"] button[type="submit"]').click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.rowCreated = (await page.locator(`[data-ai-identity="${key}"]`).count()) > 0;
+  steps.cardCreated = (await page.locator(`[data-ai-identity-card="${key}"]`).count()) > 0;
+  await shot(page, "ai-identities-created");
+
+  const identityId = qaSql(`select id from ai_identities where key = '${key}' order by created_at desc limit 1`) || "";
+  steps.identityRowExists = identityId !== "";
+
+  // ---- the grant editor and the tri-state, decided by SQL ----------------------------------------
+  if (identityId) {
+    await page.goto(`${URL_ADMIN}/ai/identities`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await page
+      .locator(`tr[data-ai-identity="${key}"] button, li[data-ai-identity-card="${key}"] button`)
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.waitForTimeout(1600);
+    steps.editorOpened = (await page.locator(`[data-grant-editor="${key}"]`).count()) > 0;
+    // The editor lists EVERY tool, not only the decided ones — an undecided tool has to render as
+    // inherit rather than as a missing row the client has to invent.
+    steps.editorListsEveryTool =
+      (await page.locator(`[data-grant-editor="${key}"] [data-grant-cell]`).count()) >= 20;
+    steps.editorNamesThePermission = (
+      await page.locator(`[data-grant-editor="${key}"]`).innerText().catch(() => "")
+    ).includes("needs ");
+    await shot(page, "ai-identities-editor");
+
+    // Pick the first content tool so the walk does not depend on a class ever changing.
+    const toolKey = qaSql("select key from ai_tools where class = 'content' order by key limit 1") || "";
+    steps.toolFound = toolKey !== "";
+
+    if (toolKey) {
+      const cell = `[data-grant-cell="${toolKey}"]`;
+
+      // 1. inherit → allow. The row must APPEAR, with effect true.
+      await page
+        .locator(`${cell} [data-effect="allow"]`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.allowWroteTrue = storedEffect(identityId, toolKey) === "true";
+      steps.allowCellShowsAllow =
+        (await page.locator(`${cell} [data-effect="allow"][aria-pressed="true"]`).count()) > 0;
+
+      // 2. allow → deny. Same pair, one row, and now false. Two rows would mean the pair index
+      //    is not an upsert, and the resolver's answer would depend on which one it read.
+      await page
+        .locator(`${cell} [data-effect="deny"]`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.denyReplacedTheRow = storedEffect(identityId, toolKey) === "false";
+      steps.onlyOneRowForThePair = Number(
+        qaSql(
+          `select count(*) from ai_tool_grants where identity_id = '${identityId}' and tool_key = '${toolKey}'`,
+        )
+          .split("\n")
+          .filter(Boolean)[0]
+          .split("|")[0],
+      ) === 1;
+
+      // 3. deny → inherit. THE spec sentence: re-toggling to inherit REMOVES the row. A UI that
+      //    only stops applying it would leave a deny alive that no screen shows any more.
+      await page
+        .locator(`${cell} [data-effect="inherit"]`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+      steps.inheritDeletedTheRow = storedEffect(identityId, toolKey) === "inherit";
+      steps.noRowRemains = Number(
+        qaSql(
+          `select count(*) from ai_tool_grants where identity_id = '${identityId}' and tool_key = '${toolKey}'`,
+        )
+          .split("\n")
+          .filter(Boolean)[0]
+          .split("|")[0],
+      ) === 0;
+      await shot(page, "ai-identities-tristate");
+
+      // The state survives a RELOAD. A cell that only looks right in memory is not persisted.
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1800);
+      await page
+        .locator(`tr[data-ai-identity="${key}"] button, li[data-ai-identity-card="${key}"] button`)
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+      await page.waitForTimeout(1500);
+      steps.inheritSurvivedTheReload =
+        (await page.locator(`${cell} [data-effect="inherit"][aria-pressed="true"]`).count()) > 0;
+    }
+  }
+
+  // ---- the matrix -------------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/permissions`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+  steps.matrixScreen = (await page.locator("[data-ai-permissions]").count()) > 0;
+  steps.matrixHasRows = (await page.locator("[data-matrix-tool]").count()) > 0;
+  // The legend is load-bearing, not decoration: a glyph-only matrix is unreadable to anyone who
+  // cannot separate the colours, and this screen is about making a permission decision.
+  const matrixText = await page.locator("[data-ai-permissions]").innerText().catch(() => "");
+  steps.matrixHasLegend = ["Allowed", "Denied", "Inherited"].every((word) => matrixText.includes(word));
+  steps.matrixNamesThePermission = matrixText.includes("needs ");
+  // Each row names the permission its tool requires, so a cell's sensitivity is legible without
+  // a tooltip nobody can reach on a touch screen.
+  steps.matrixShowsHighRiskWarning = matrixText.includes("approval gate");
+  await shot(page, "ai-permissions-matrix");
+
+  // The agent and identity columns come from the API in ONE shape; a screen that asked per column
+  // could disagree with itself between two columns of the same grid.
+  const matrix = await page.request.get(api("/permissions/matrix"), { failOnStatusCode: false });
+  steps.matrixEndpointAnswers = Boolean(matrix && matrix.ok());
+  const matrixBody = matrix ? await matrix.json().catch(() => null) : null;
+  if (matrixBody) {
+    steps.matrixCarriesEveryTool = Array.isArray(matrixBody.tools) && matrixBody.tools.length >= 20;
+    steps.matrixCarriesIdentities = Array.isArray(matrixBody.identities);
+    // The decided cells the API reports must be the decided cells in the table — the screen and
+    // the endpoint are allowed to disagree about a permission only in a bug.
+    const decided = qaSql(
+      `select count(*) from ai_tool_grants g join ai_identities i on i.id = g.identity_id where i.key = '${key}'`,
+    )
+      .split("\n")
+      .filter(Boolean)[0]
+      .split("|")[0];
+    const apiDecided = (matrixBody.identities ?? [])
+      .filter((column) => column.key === key)
+      .reduce((sum, column) => sum + Object.keys(column.grants ?? {}).length, 0);
+    steps.matrixAgreesWithTheTable = Number(decided) === apiDecided;
+  }
+
+  // The mobile pass: the accordion, not a scrolling grid. A grid a phone has to scroll sideways
+  // hides the very cells the operator came to check.
+  await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+  await page.goto(`${URL_ADMIN}/ai/permissions`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.matrixMobileIsAccordion = (await page.locator("[data-matrix-column]").count()) > 0;
+  steps.matrixMobileHasNoGrid =
+    (await page.locator("[data-ai-permissions] table").count()) === 0 ||
+    !(await page.locator("[data-ai-permissions] table").first().isVisible().catch(() => false));
+  await shot(page, "ai-permissions-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  // ---- remove the fixture -----------------------------------------------------------------------
+  if (identityId) {
+    await page.request.delete(api(`/identities/${identityId}`), { failOnStatusCode: false }).catch(() => {});
+    await page.waitForTimeout(900);
+    steps.deletedIdentityGone =
+      Number(
+        qaSql(`select count(*) from ai_identities where id = '${identityId}'`)
+          .split("\n")
+          .filter(Boolean)[0]
+          .split("|")[0],
+      ) === 0;
+  }
+
+  return steps;
+}
+
 async function runAiSkillsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -7865,6 +8080,11 @@ async function main() {
     // reorders it.
     { path: "/ai/skills", name: "ai-skills", area: "ai" },
     { path: "/ai/tools", name: "ai-tools", area: "ai" },
+    // The identities and the matrix (REQ-100, slice 2) — both are routes, so both are walked,
+    // clicked and measured. A screen that only ever appears behind a nav click is a screen whose
+    // empty state and error state nobody has seen.
+    { path: "/ai/identities", name: "ai-identities", area: "ai" },
+    { path: "/ai/permissions", name: "ai-permissions", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -8013,6 +8233,15 @@ async function main() {
     report.aiSkills = await runDepthPass("ai-skills", () => runAiSkillsDepth(page, report));
   }
   log(`ai skills: ${JSON.stringify(report.aiSkills)}`);
+  // The identities and the matrix (REQ-100, slice 2). Its own pass because the criterion it
+  // proves cannot be seen on a screen: the tri-state has to be confirmed against the TABLE, so
+  // a client that renders the right glyph over a stale row would otherwise pass.
+  if (inScope("ai")) {
+    report.aiIdentities = await runDepthPass("ai-identities", () =>
+      runAiIdentitiesDepth(page, report),
+    );
+  }
+  log(`ai identities: ${JSON.stringify(report.aiIdentities)}`);
   }
   log(`ai agents: ${JSON.stringify(report.aiAgents)}`);
 
