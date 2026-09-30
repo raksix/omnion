@@ -69,6 +69,16 @@ echo "[notif-http] creating a disposable database"
 # this build's name. Waiting for /readyz (below) is what proves the migration actually ran.
 
 echo "[notif-http] starting the API on :$PORT"
+# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
+# handler runs. Without one the API refuses EVERY write with `csrf_unavailable`, so this gate
+# reported seven FAILs — the emit, a ghost recipient, the mixed batch, dedupe, the read-state
+# split, the quiet-hours round trip and the digest round trip — that had nothing to do with the
+# code under test. Because the refusal is the *documented* behaviour of a deployment without a
+# secret, it reads as the product being correct rather than the harness being under-configured,
+# which is why it survived until this tick. `scripts/qa/run.sh` has always set it; this gate
+# did not. The value is throwaway: the process points at a database the trap above drops, and
+# listens on loopback.
+export OMNION_CSRF_SECRET="${OMNION_CSRF_SECRET:-qa-local-throwaway-value}"
 # The binary is read from `$CARGO_TARGET_DIR`, not from a hard-coded `./target` — otherwise a
 # script that builds into the scratch directory runs the *stale* one, which is a gate that
 # passes while testing code that was replaced. That is not hypothetical: it happened here, and
