@@ -8500,3 +8500,44 @@ its `csrf_unavailable` rows are history, not this pass.
 across the media screens and the retention tab's own states. Run `bash scripts/qa/run.sh` with
 `QA_ONLY=media,media-retention` on a quieter box, then close REQ-010 and move to REQ-014 (system
 health, still `pending`).
+
+## 2026-09-30 · wave4 tick 43 · REQ-054 slice 4c — the accounting reports SCREEN
+
+**What.** `/accounting/reports` renders for the first time. Slice 4b shipped the four reports,
+the two routes and fifteen API walks; nothing had ever opened the screen in a browser, and a
+route that answers JSON in a walk is not a screen. The screen offers the four report types as
+real controls, the window as real date/preset controls mirrored into the URL, a totals table and
+a bar chart for whichever report is selected, the server's own definition and period in the
+header, a loud "figures agree" note (`reportTotalsAgree`, re-added in integer cents), and an
+export that sends the same window the table is showing.
+
+The aging row gained `invoice_id` (`ee8bcc1d`) so the number in the table links to the invoice:
+`/accounting/invoices/{id}` takes a uuid, so a link built from the number would 404 — a dead
+button, which the definition of done forbids. The CSV is unchanged (its column list is written
+by hand in `to_csv`).
+
+A new depth pass `runAccountingReports` (`01359a28`) asserts the report-type control really
+switches the report, re-adds the aging bucket totals against the outstanding column **out of the
+DOM** (so a wrong "they agree" note fails), and watches the **download event** rather than a
+success return.
+
+**Proof.**
+- `cargo build -p omnion-module-accounting` — green.
+- `cargo test -p omnion-module-accounting --lib` — **67/67**.
+- `pnpm turbo run typecheck --force` — **2/2** (admin + web).
+- `node --check scripts/qa/walkthrough.cjs` — OK; the pass is registered under `--only=accounting`.
+- Browser pass `QA_STACK=w4 ... bash scripts/qa/run.sh --only=accounting` — **queued, not yet
+  run**: the box is carrying ten writers (load ~93-100, /mnt/apopic 93% full, ~4 GB RAM free) and
+  the single global QA slot is held by w3's long pass. Per the invariants I did not touch it.
+  Until that gate runs, the mobile / empty / loading / error boxes stay **unticked**.
+
+**Two things worth keeping from this tick.** (1) Nearly ran the pass against the MAIN writer's
+stack: I built the command from memory without `QA_STACK`, which would have defaulted to the
+main ports and database and restarted another worktree's servers — killed it in seconds and
+confirmed `omnion-qa-*-w3 restarts=0`. An omitted env var is silent because every one of them
+has a default; write the stack prefix first, every time. (2) `run.sh` derives the database from
+`QA_STACK` itself, so passing `OMNION_DATABASE_URL` is not just unnecessary, it contradicts the
+mechanism.
+
+**Next.** Run the queued browser pass and tick the mobile/empty/loading boxes on what it proves;
+then the ⌘K / global-search box and the audit-row assertion. PDF export stays deliberately unbuilt.
