@@ -19,13 +19,16 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BookOpen, Percent, ReceiptText, ScrollText } from "lucide-react";
+import { Banknote, BookOpen, Percent, ReceiptText, ScrollText } from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: typeof BookOpen }[] = [
   { href: "/accounting/journal", label: "Journal", icon: ScrollText },
   { href: "/accounting/accounts", label: "Chart of accounts", icon: BookOpen },
   { href: "/accounting/tax-rates", label: "Tax rates", icon: Percent },
   { href: "/accounting/invoices", label: "Invoices", icon: ReceiptText },
+  // Added with slice 3, in the order money moves: you raise an invoice, then the money arrives
+  // against it. A payments tab before the invoices one would read backwards.
+  { href: "/accounting/payments", label: "Payments", icon: Banknote },
 ];
 
 export function AccountingModuleNav() {
