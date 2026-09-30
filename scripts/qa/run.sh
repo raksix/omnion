@@ -73,10 +73,15 @@ wait_http() { # url, seconds
 # empty directory that claims a walkthrough happened.
 mkdir -p "$OUT"
 write_queued_record() {
+  # The stack name is expanded on purpose. Escaping the `$` (which a heredoc does not need for
+  # anything else on these lines) leaves the literal text `${QA_STACK:-main}` in the record, so
+  # every artifact says it belongs to a stack called `${QA_STACK:-main}` and none of them name
+  # the stack they actually wrote to — which is the one field that makes a void record useful.
+  local stack_label="${QA_STACK:-main}"
   cat > "$OUT/QUEUED.md" <<EOF
 # QA pass queued, not run
 
-- When: $TS · stack: \${QA_STACK:-main}
+- When: $TS · stack: $stack_label
 - This pass was created and never reached the browser walkthrough.
 
 The artifact directory is created before the QA slot is taken, so a pass killed while

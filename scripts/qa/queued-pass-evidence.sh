@@ -127,6 +127,24 @@ else
   printf 'FAIL after: the record does not name the queue\n'; fail=$((fail + 1))
 fi
 
+# 2a. The record's FIELDS have to be expanded, not merely present. This check exists because
+#     the previous version of the record passed every check above while writing the literal
+#     text `${QA_STACK:-main}` into the stack field: the heredoc escaped the `$`, so the
+#     artifact named a stack that does not exist and never named the one it wrote to. A
+#     presence assertion cannot see that — the file is there, the sentence is there, only
+#     the value is wrong. The stack line is the one field that makes a void record useful
+#     (it says WHICH stack's slot was contended), so a record that cannot fill it in is a
+#     record that has lost the reason it exists.
+if [ -n "$after_art" ] && [ -f "$after_art/QUEUED.md" ] \
+   && grep -q 'stack: gate' "$after_art/QUEUED.md" \
+   && ! grep -q '\${' "$after_art/QUEUED.md"; then
+  printf 'ok   after: the record expands its fields, including the stack name\n'; pass=$((pass + 1))
+else
+  got_stack="$(sed -n 's/^- When: .* · stack: //p' "$after_art/QUEUED.md" 2>/dev/null | head -1)"
+  printf 'FAIL after: the record does not expand its fields\n       stack line: %s\n' "${got_stack:-<none>}"
+  fail=$((fail + 1))
+fi
+
 # 2. The record must be able to say "void", or it can be read as a clean pass.
 verdict="$(python3 - "$after_art/summary.json" <<'PY' 2>/dev/null || echo missing
 import json, sys
