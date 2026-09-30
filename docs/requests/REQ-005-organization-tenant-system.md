@@ -1,6 +1,6 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** in-progress (`3eff59f`) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** in-progress (`3eff59f`; tick 78 closed the one defect tick 77 filed as another wave's, `f704bc25` — the environment chip read `/environments` with no session gate — and the last acceptance box is still open on the two-everything gate) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 >
 > Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,

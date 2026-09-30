@@ -7656,3 +7656,44 @@ this tick can claim, and the next tick should watch it when the box is quieter.
 died with `clicks.jsonl ENOENT` when `/mnt/apopic` hit 100% and the artifact directory was trimmed out
 from under it. That is now survivable (`25dddf5c`), and the two limiter screens are walked on desktop
 and at 390px, so the next tick is where the boxes naming a screen can be ticked.
+
+### Tick 78 — the environment chip is my own screen (2026-09-30)
+
+**What.** Merged `origin/main` (two commits, none in this worktree's files; the BUILD-LOG
+conflict was resolved by splicing both sides' post-ancestor insertions, 0 entries lost), then
+answered the question tick 77 filed as *somebody else's problem*.
+
+Tick 77 recorded ~20 × 401 on `/api/v1/environments` as "a finding about the sidebar, out of
+this wave". It is not. The environment chip **is REQ-017 slice 5** — this wave's own request —
+and `apps/admin/lib/active-environment.tsx` is mounted by the app shell. Its read lived in a bare
+`useEffect(..., [reloadToken])` with no session gate, so `/environments` was requested on the
+sign-in screen and on every page for every account, and the unauthenticated answer is 401. The
+two sibling providers in the same directory — `lib/tenant-status.tsx` and `lib/sites.tsx` — both
+open with `if (sessionStatus !== "signed-in")`. The odd one out was mine.
+
+`f704bc25` gates both effects in that provider on `sessionStatus`, and `85cf8d46` is the merge.
+
+**Also fixed: a stray `=======` committed in this worktree's BUILD-LOG** (line 6089) with zero
+matching `<<<<<<<`/`>>>>>>>` — residue from an earlier manual conflict edit in a 7.6k-line file.
+`merge-build-log.py` reported clean because its gate asks whether each side's `## ` entries
+survive, and a bare separator is not an entry. Removed after grepping for markers *because* the
+tool said OK.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `merge-build-log.py` | `base=4968 ours=7611 theirs=5016 merged=7659` · all entries of both sides present |
+| marker grep after the merge | 1 stray `=======` found, 0 after removal |
+| `pnpm typecheck` | **2/2 packages** (admin re-checked, cache miss) |
+| `cargo test --workspace` | still running at 09:5x — box at load 75 with six other writers |
+
+**The QA slot is w3's, alive and in use** (`holder pid 2153263`, cwd `/mnt/apopic/omnion-w3`);
+`QA_SLOTS=1` in `/etc/profile.d/omnion-qa-limits.sh`, so a second pass has to wait rather than
+barge in. REQ-005's last box is therefore still **unticked**: it names `cargo test --workspace`,
+`pnpm typecheck && pnpm build` and a walkthrough with zero high findings, and a scoped pass
+cannot honestly tick it.
+
+**Next.** Land the workspace gate when cargo finishes, run `pnpm build`, then take the slot for a
+REQ-005 pass. `04bc7e73`'s new count-match instruments give REQ-011's two boxes a pass they have
+never had.
