@@ -30,7 +30,19 @@ const { chromium } = require("playwright-core");
 
 // ---------------------------------------------------------------- args / env
 
+// Both spellings are accepted: `--only=a` and `--only a`. A caller reaching for the second gets
+// the default for the first, which looks exactly like the flag being ignored -- and `run.sh` emits
+// the equals form, so every `--only=` a focused pass was started with was **silently discarded**:
+// ONLY fell back to "all", the route filter became a no-op, and a pass asked to measure one depth
+// pass walked all seventy-seven routes instead. The symptom is a log with no
+// `focused pass: N/M routes` line, which reads like the filter worked and matched nothing.
+//
+// This is the same trap `ensure-organization.mjs` documents for `--url`/`--admin`, reached from the
+// other direction: there the fallback was the MAIN writer's port, here it is "everything".
 function arg(name, fallback) {
+  const prefix = `--${name}=`;
+  const joined = process.argv.find((entry) => entry.startsWith(prefix));
+  if (joined) return joined.slice(prefix.length);
   const i = process.argv.indexOf(`--${name}`);
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
 }
@@ -6727,6 +6739,48 @@ function legacyWizardDecision(url) {
   return url.includes("/setup") ? { action: "run" } : { action: "skip" };
 }
 
+/**
+ * Both flag spellings, for every flag the harness is started with. The equals form is the one
+ * `run.sh` emits, and it used to be dropped on the floor, so `ONLY` fell back to "all" and a pass
+ * asked for one depth pass walked the whole route list. The space form is checked too because it
+ * is the one that always worked, and a fix that only handled the broken spelling would be a fix
+ * that breaks the other caller.
+ *
+ * `--url` is here because its fallback is the MAIN writer's panel: reading it as absent is how a
+ * writer ends up measuring somebody else's stack.
+ */
+async function selfcheckArgs() {
+  const parse = (args) => {
+    const before = process.argv;
+    process.argv = args;
+    try {
+      return {
+        only: arg("only", "all"),
+        url: arg("url", "http://127.0.0.1:3100"),
+        out: arg("out", "fallback"),
+        missing: arg("nope", "fallback"),
+      };
+    } finally {
+      process.argv = before;
+    }
+  };
+  const equals = parse(["node", "walkthrough.cjs", "--only=workflow-builder", "--url=http://127.0.0.1:3102", "--out=/tmp/x"]);
+  const spaced = parse(["node", "walkthrough.cjs", "--only", "workflow-builder", "--url", "http://127.0.0.1:3102", "--out", "/tmp/x"]);
+  const bare = parse(["node", "walkthrough.cjs"]);
+  const checks = {
+    equalsReadsOnly: equals.only === "workflow-builder",
+    equalsReadsUrl: equals.url === "http://127.0.0.1:3102",
+    equalsReadsOut: equals.out === "/tmp/x",
+    spacedStillReadsOnly: spaced.only === "workflow-builder",
+    spacedStillReadsUrl: spaced.url === "http://127.0.0.1:3102",
+    bothSpellingsAgree: equals.only === spaced.only && equals.url === spaced.url,
+    absentFlagFallsBack: bare.only === "all" && bare.missing === "fallback",
+  };
+  const pass = Object.values(checks).every(Boolean);
+  console.log("ARGS_SELFCHECK " + JSON.stringify({ pass, checks }));
+  return pass;
+}
+
 async function selfcheckWizard() {
   const fresh = { completed: false, steps: { owner: true, organization: false, site: false } };
   const done = { completed: true, steps: { owner: true, organization: true, site: true } };
@@ -7654,6 +7708,13 @@ if (process.argv.includes("--selfcheck-recovery")) {
     .then((pass) => process.exit(pass ? 0 : 1))
     .catch((err) => {
       console.error("[walk] wizard selfcheck failed to run:", err);
+      process.exit(1);
+    });
+} else if (process.argv.includes("--selfcheck-args")) {
+  selfcheckArgs()
+    .then((pass) => process.exit(pass ? 0 : 1))
+    .catch((err) => {
+      console.error("[walk] args selfcheck failed to run:", err);
       process.exit(1);
     });
 } else {
