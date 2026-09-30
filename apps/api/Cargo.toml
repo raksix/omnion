@@ -59,6 +59,12 @@ url.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
+# The intake guard walk (tests/reliability_intake.rs) SIGNS a payload with the same HMAC the
+# guard verifies, because a fixture that hard-codes a signature would only prove that the
+# hard-coded value is accepted. `hex` is here for the same reason: the `v1,<id>:<tag>` shape is
+# hexadecimal, and a base64 tag would be testing a different scheme.
+hmac.workspace = true
+hex.workspace = true
 http-body-util = "0.1"
 # The passkey integration walk (tests/webauthn.rs) holds the private half of a credential and
 # signs the ceremony's own message, so the verification runs exactly as it does in production.

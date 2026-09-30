@@ -113,6 +113,7 @@ pub mod onboarding;
 pub mod public;
 pub mod readyz;
 pub mod reliability_idempotency;
+pub mod reliability_intake;
 pub mod reliability_limits;
 pub mod reliability_retries;
 pub mod scim;
@@ -1322,6 +1323,59 @@ pub fn router(state: AppState) -> Router {
             omnion_module_analytics::collect::MAX_BODY_BYTES,
         ));
 
+    // The intake guard (REQ-127 slice 4). TWO routers, deliberately not one:
+    //
+    // * `intake_panel` sits inside the versioned tree with its permission guards. Declaring a
+    //   path is `reliability.intake.manage`, which the catalogue keeps SEPARATE from
+    //   `reliability.manage` because a budget is a number and a declaration is a door.
+    // * `intake_ingress` is the guarded request itself, on a path that does not exist until an
+    //   operator declares it. It carries NO session extractor and NO guard: a provider posting a
+    //   signed webhook has no account, and the signature IS the credential. Its body limit is
+    //   the platform maximum, not an endpoint's cap — the per-endpoint cap is enforced by
+    //   `intake::evaluate` on the bytes that actually arrived, which is the only measurement
+    //   that cannot be lied about with a `content-length` header. An outer limit set BELOW the
+    //   declared cap would refuse a legitimate large export with a bare `413` and no
+    //   `payload_too_large` code, which is exactly the answer the acceptance criteria require
+    //   this guard to be able to give itself.
+    let intake_ingress = Router::new()
+        .route(
+            "/public/intake/{id}",
+            post(reliability_intake::guarded_request),
+        )
+        .layer(DefaultBodyLimit::max(
+            omnion_reliability::intake::MAX_PAYLOAD_BYTES as usize,
+        ));
+
+    let intake_panel = Router::new()
+        .route(
+            "/reliability/intake",
+            get(reliability_intake::list)
+                .layer(guards::require(&state, "reliability.read"))
+                .merge(
+                    post(reliability_intake::create)
+                        .layer(guards::require(&state, "reliability.intake.manage")),
+                ),
+        )
+        .route(
+            "/reliability/intake/rejections",
+            get(reliability_intake::rejections)
+                .layer(guards::require(&state, "reliability.read")),
+        )
+        .route(
+            "/reliability/intake/{id}",
+            patch(reliability_intake::update)
+                .layer(guards::require(&state, "reliability.intake.manage"))
+                .merge(
+                    delete(reliability_intake::remove)
+                        .layer(guards::require(&state, "reliability.intake.manage")),
+                ),
+        )
+        .route(
+            "/reliability/intake/{id}/verify-sample",
+            post(reliability_intake::verify_sample)
+                .layer(guards::require(&state, "reliability.intake.manage")),
+        );
+
     // The key ring and the rotation ceremony (docs/requests/REQ-125, slice 1). Reading the
     // ring is `secrets.read`; starting a rotation, pausing and resuming its walk is
     // `secrets.root.manage`, because a rotation is the one irreversible operation on the ring.
@@ -1680,6 +1734,10 @@ pub fn router(state: AppState) -> Router {
         .merge(analytics_goals_write)
         .merge(analytics_privacy)
         .merge(analytics_collect)
+        // The intake guard's two routers. The panel half joins the guarded tree beside the
+        // breakers above; the ingress half is the *request* path and carries no session.
+        .merge(intake_panel)
+        .merge(intake_ingress)
         .route(
             "/iam/permissions",
             get(iam::list_permissions).layer(guards::require(&state, "iam.permissions.read")),
