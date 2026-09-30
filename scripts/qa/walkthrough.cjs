@@ -788,6 +788,27 @@ async function fillSubtree(page, selector) {
 
 async function clickPrimaryIn(page, selector) {
   const loc = page.locator(`${selector} button[type="submit"], ${selector} button`).first();
+  // A guarded control is **not** this function's to click.
+  //
+  // `clickPrimaryIn` picks the first `button[type=submit]` (or the first button) inside a dialog
+  // and fires it. That is right for a settings form and catastrophic for a wizard whose submit
+  // creates a tenant-scoped record and starts a background job: the generic pass has already
+  // filled the fields with sample values, so it creates a *real* staging environment under the
+  // wrong key, and the screen's own depth pass — the one that chose the key and has to assert the
+  // clone, the promotion and the archive afterwards — then reports that its environment does not
+  // exist. The `data-qa-guard` contract was honoured in `interact`'s inventory loop and silently
+  // bypassed here, which is why declaring the guard on the button changed nothing.
+  //
+  // So the same attribute is honoured in both places, and the check is on the *candidate*: a
+  // dialog whose primary button declares a guard is a dialog the generic pass fills and then
+  // leaves open for its own depth pass to finish.
+  const guarded = await page
+    .locator(`${selector} button[data-qa-guard]`)
+    .count()
+    .catch(() => 0);
+  if (guarded > 0) {
+    return null;
+  }
   if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
     const text = ((await loc.innerText().catch(() => "")) || "").trim().slice(0, 40);
     await loc.click({ timeout: 5000 }).catch(() => {});
