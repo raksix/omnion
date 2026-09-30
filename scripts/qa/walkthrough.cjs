@@ -8319,6 +8319,126 @@ async function runAiApprovalsDepth(page, report) {
     note({ step: "approveMovedTheRow", passed: "skipped: no approval row to open" });
   }
 
+// ---- the stale banner and Re-preview (REQ-101 slice 2c) ----------------------------------------
+  // A second planted row, on a **real page**, because the banner is raised by the server
+  // comparing a revision it reads itself: a row whose `resource_id` is a made-up slug can never
+  // produce one, and a pass that asserted the banner on it would be asserting that the screen
+  // renders a state it fabricated locally. So this plants the row the way the runtime does —
+  // a preview built from the page — and then edits the page through SQL before pressing Approve.
+  const stalePageId = scalar(
+    `insert into pages (site_id, slug, status) ` +
+      `select s.id, 'qa-stale-page', 'draft' from sites s ` +
+      `join organizations o on o.id = s.organization_id where o.id = '${organizationId}' limit 1 ` +
+      `returning id`,
+  );
+  let staleRowId = "";
+  if (stalePageId) {
+    scalar(
+      `insert into page_revisions (page_id, revision_no, state, title, body, summary) ` +
+        `values ('${stalePageId}', 1, 'draft', 'QA stale page', 'Body', 'Summary')`,
+    );
+    // The preview shape is the runtime's own (`Plan::to_preview`): version, kind, target, label,
+    // base_revision, hash, diffs, cascades, mapping. A hand-rolled preview would prove the screen
+    // renders the shape the walkthrough invented rather than the one the applier reads.
+    const previewJson = JSON.stringify({
+      version: 1,
+      kind: "update",
+      resource_type: "page",
+      resource_id: stalePageId,
+      label: "qa-stale-page",
+      base_revision: "rev-before-edit",
+      hash: "qa-stale-hash",
+      diffs: [
+        {
+          arg: "title",
+          field: "title",
+          before: "QA stale page",
+          after: "QA stale page, renamed by the agent",
+        },
+      ],
+      cascades: [],
+      mapping: [
+        { arg: "slug", field: "slug", kind: "slug" },
+        { arg: "title", field: "title", kind: "title" },
+        { arg: "body", field: "body", kind: "body" },
+        { arg: "summary", field: "summary", kind: "summary" },
+        { arg: "status", field: "status", kind: "status" },
+      ],
+    }).replace(/'/g, "''");
+    staleRowId = scalar(
+      `insert into ai_approvals (organization_id, tool_key, tool_class, resource_type, resource_id, ` +
+        `resource_label, risk, title, summary, operation_count, preview, preview_hash, ` +
+        `base_revision, status, expires_at, created_at) values ` +
+        `('${organizationId}', 'content.publish', '${gateClass}', 'page', '${stalePageId}', ` +
+        `'qa-stale-page', 'medium', 'QA stale approval', ` +
+        `'A request whose page will change underneath it.', 1, ` +
+        `'${previewJson}'::jsonb, 'qa-stale-hash', 'rev-before-edit', 'pending', ` +
+        `now() + interval '60 minutes', now()) returning id`,
+    );
+  }
+  note({ step: "aRowExistsToMakeStale", passed: Boolean(staleRowId) });
+
+  if (staleRowId) {
+    // Move the page so the stored base revision is wrong. The server reads this itself, which is
+    // the whole point: nothing the client sends can make the check pass.
+    scalar(
+      `insert into page_revisions (page_id, revision_no, state, title, body, summary) ` +
+        `select '${stalePageId}', revision_no + 1, 'draft', 'QA stale page, edited by somebody', ` +
+        `body, summary from page_revisions where page_id = '${stalePageId}' ` +
+        `order by revision_no desc limit 1`,
+    );
+
+    await page.goto(`${URL_ADMIN}/ai/approvals/${staleRowId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1600);
+    // Approve first: the `stale` refusal is what raises the banner, so the banner is proven to
+    // hang off a real refusal rather than off a screen that always shows it.
+    await page.locator("[data-approval-approve]").click().catch(() => {});
+    await page.waitForTimeout(1800);
+    note({
+      step: "staleBannerAppears",
+      passed: (await page.locator("[data-approval-stale-banner]").count()) > 0,
+    });
+    note({
+      step: "approveIsDisabledWhileStale",
+      passed: await page.locator("[data-approval-approve]").isDisabled().catch(() => false),
+    });
+    note({
+      step: "rePreviewControlIsOffered",
+      passed: (await page.locator("[data-approval-repreview]").count()) > 0,
+    });
+    const bannerText = await page.locator("[data-approval-stale-banner]").innerText().catch(() => "");
+    note({
+      step: "theBannerExplainsWhy",
+      passed: /changed since this preview was taken/i.test(bannerText),
+    });
+    await shot(page, "ai-approval-stale-banner");
+
+    // Re-preview: the server recomputes and the banner must clear.
+    await page.locator("[data-approval-repreview]").click().catch(() => {});
+    await page.waitForTimeout(2200);
+    note({
+      step: "rePreviewClearsTheBanner",
+      passed: (await page.locator("[data-approval-stale-banner]").count()) === 0,
+    });
+    note({
+      step: "approveWorksAgainAfterRePreview",
+      passed: !(await page.locator("[data-approval-approve]").isDisabled().catch(() => true)),
+    });
+    // The proof that is not a screenshot: the row moved off its planted hash.
+    note({
+      step: "theFrozenHashActuallyChanged",
+      passed: (() => {
+        const hash = scalar(`select preview_hash from ai_approvals where id = '${staleRowId}'`);
+        return hash !== "" && hash !== "qa-stale-hash";
+      })(),
+    });
+    await shot(page, "ai-approval-repreviewed");
+  } else {
+    note({ step: "staleBannerAppears", passed: "skipped: no page to make stale" });
+    note({ step: "rePreviewClearsTheBanner", passed: "skipped: no page to make stale" });
+    note({ step: "theFrozenHashActuallyChanged", passed: "skipped: no page to make stale" });
+  }
+
   // ---- clean up so the next run starts clean ---------------------------------------------------
   qaSql(`delete from audit_log where target_id in (select id::text from ai_approvals where organization_id = '${organizationId}')`);
   qaSql(`delete from ai_approvals where organization_id = '${organizationId}'`);

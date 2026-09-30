@@ -1641,6 +1641,313 @@ async fn the_policy_rows_the_resolver_reads_are_the_ones_the_migration_wrote() {
     store.dispose().await;
 }
 
+// -------------------------------------------------------------------------------------------
+// Re-preview (REQ-101, slice 2c)
+// -------------------------------------------------------------------------------------------
+
+/// The phrase `preview_request`'s rows demand: it inherits `publish_request`, whose default
+/// policy is typed-confirmation-on with the page's name as the phrase. Every `io::approve` in
+/// this section carries it, because `decide()` checks the phrase before the revision — a walk
+/// that omitted it would be measuring the phrase guard under a stale-check name.
+const CONFIRMATION_PHRASE: &str = "Autumn pricing";
+//
+// The endpoint exists to clear one banner, so the walks answer exactly the two questions the
+// banner raises: does a moved target actually produce a *new* frozen preview, and does a still
+// target refuse? Everything here goes through the production path — `target::preview` reads the
+// page, `plan` resolves it, `re_preview` writes it — because a fixture that hand-wrote the
+// preview would prove the writer agrees with itself.
+//
+// The load-bearing detail is that the page is edited **through the content layer**, exactly as
+// the stale walk does, so "the resource moved" is a fact about the database rather than about a
+// column this file also writes by hand.
+
+#[tokio::test]
+async fn a_re_preview_of_a_moved_target_freezes_the_new_diff_and_the_decision_then_passes() {
+    let store = gate!();
+    let page_id = seed_page(&store.pool, store.organization_id, "repreview", "Before").await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .id();
+    let before = request.preview_hash.clone();
+
+    // Somebody edited the page while the request sat in the inbox — the content layer, so the
+    // revision the reader computes moves for the same reason it would in production.
+    omnion_content::pages::update_page(
+        &store.pool,
+        page_id,
+        &omnion_content::model::PageChanges {
+            title: Some("Edited by somebody else".to_owned()),
+            ..omnion_content::model::PageChanges::default()
+        },
+        None,
+    )
+    .await
+    .expect("the page must be editable");
+
+    // The decision refuses against the stored base revision — the state the banner is raised in.
+    let stale = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        store.user().await,
+        // The fixture's policy is `ClassPolicy::default()`, which demands the typed phrase, and
+        // `decide()` checks the phrase BEFORE staleness. So a walk that approves without it
+        // never reaches the revision comparison and would be asserting about a decision that
+        // was refused for a completely different reason.
+        Some(CONFIRMATION_PHRASE),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("the decision resolves");
+    assert!(
+        matches!(stale, DecisionOutcome::Stale { .. }),
+        "an edited page must refuse the decision, or the banner is never raised"
+    );
+
+    let refreshed = io::re_preview(&store.pool, store.organization_id, id)
+        .await
+        .expect("the re-preview must resolve");
+    let io::RePreview::Refreshed(row) = refreshed else {
+        panic!("a moved target must produce a new frozen preview");
+    };
+    assert_ne!(
+        row.preview_hash, before,
+        "the recomputed diff must not carry the old hash"
+    );
+
+    // The new preview is a *usable* one: the OLD value now reads as what the page really says,
+    // and the decision it was blocking goes through. Without this the write would be a hash
+    // that no longer matches anything.
+    let frozen = omnion_ai_hub::approvals::plan::Plan::from_preview(&row.preview)
+        .expect("the frozen preview must still be a plan");
+    let title = frozen
+        .diffs
+        .iter()
+        .find(|diff| diff.arg == "title")
+        .expect("the title is the previewed field");
+    assert_eq!(
+        title.before,
+        Some(serde_json::json!("Edited by somebody else")),
+        "the re-preview must diff against what the page says now"
+    );
+    assert_eq!(title.after, Some(serde_json::json!("Renamed by the agent")));
+
+    let decided = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        store.user().await,
+        // The fixture's policy is `ClassPolicy::default()`, which demands the typed phrase, and
+        // `decide()` checks the phrase BEFORE staleness. So a walk that approves without it
+        // never reaches the revision comparison and would be asserting about a decision that
+        // was refused for a completely different reason.
+        Some(CONFIRMATION_PHRASE),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("the decision resolves");
+    assert!(
+        matches!(decided, DecisionOutcome::Decided(_)),
+        "a decision on the refreshed preview must not be refused as stale"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_re_preview_of_an_unchanged_target_is_refused_and_writes_nothing() {
+    let store = gate!();
+    let page_id = seed_page(&store.pool, store.organization_id, "steady", "Steady").await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .id();
+
+    let first = io::re_preview(&store.pool, store.organization_id, id)
+        .await
+        .expect("the re-preview must resolve");
+    assert!(
+        matches!(first, io::RePreview::Unchanged(_)),
+        "the recomputed plan is identical, so the request says: refuse when the hash already \
+         matches. A `Refreshed` here would hand the reviewer a new hash for a diff nobody read."
+    );
+
+    // Twice must agree, and nothing may have moved. The audit row is the proof that the refusal
+    // is a refusal and not a silent no-op that logged something.
+    let again = io::re_preview(&store.pool, store.organization_id, id)
+        .await
+        .expect("the second re-preview must resolve");
+    let io::RePreview::Unchanged(row) = again else {
+        panic!("a second call on a still row must agree with the first");
+    };
+    assert_eq!(row.preview_hash, request.preview_hash);
+    assert_eq!(row.base_revision, request.base_revision);
+
+    let audited: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where target_type = 'ai_approval' \
+         and target_id = $1 and action = 'ai.approval.repreviewed'",
+    )
+    .bind(id.to_string())
+    .fetch_one(&store.pool)
+    .await
+    .expect("the audit count must read");
+    assert_eq!(audited, 0, "a refusal writes no audit row: nothing was recomputed onto the row");
+
+    let decided = io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        store.user().await,
+        // The fixture's policy is `ClassPolicy::default()`, which demands the typed phrase, and
+        // `decide()` checks the phrase BEFORE staleness. So a walk that approves without it
+        // never reaches the revision comparison and would be asserting about a decision that
+        // was refused for a completely different reason.
+        Some(CONFIRMATION_PHRASE),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("the decision resolves");
+    assert!(
+        matches!(decided, DecisionOutcome::Decided(_)),
+        "the row is untouched by the refused re-preview, so the decision still stands on its own"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_refreshed_re_preview_writes_exactly_one_audit_row_naming_both_revisions() {
+    // The trail is what an operator reads after the fact to answer "what did the reviewer
+    // approve, and what did the page look like when they looked at it?". Both hashes have to
+    // be there, and exactly one row has to exist — a re-preview that logged twice would make
+    // the trail claim the reviewer re-read the diff twice.
+    let store = gate!();
+    let page_id = seed_page(&store.pool, store.organization_id, "trail", "Before").await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .id();
+    let original_hash = request.preview_hash.clone();
+
+    omnion_content::pages::update_page(
+        &store.pool,
+        page_id,
+        &omnion_content::model::PageChanges {
+            title: Some("Moved twice".to_owned()),
+            ..omnion_content::model::PageChanges::default()
+        },
+        None,
+    )
+    .await
+    .expect("the page must be editable");
+
+    let refreshed = io::re_preview(&store.pool, store.organization_id, id)
+        .await
+        .expect("the re-preview must resolve");
+    let io::RePreview::Refreshed(row) = refreshed else {
+        panic!("a moved target must produce a new frozen preview");
+    };
+
+    let metadata: serde_json::Value = sqlx::query_scalar(
+        "select metadata from audit_log where target_type = 'ai_approval' \
+         and target_id = $1 and action = 'ai.approval.repreviewed'",
+    )
+    .bind(id.to_string())
+    .fetch_one(&store.pool)
+    .await
+    .expect("the re-preview audit row must exist");
+    assert_eq!(
+        metadata.get("previous_preview_hash").and_then(|v| v.as_str()),
+        Some(original_hash.as_str()),
+        "the trail must name the hash the reviewer had been looking at"
+    );
+    assert_eq!(
+        metadata.get("preview_hash").and_then(|v| v.as_str()),
+        Some(row.preview_hash.as_str()),
+        "and the hash it was replaced with"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn a_decided_row_cannot_be_re_previewed_because_its_preview_is_the_record() {
+    // Rewriting a decided row's preview would rewrite what was approved: the audit trail and the
+    // frozen diff would describe a proposal nobody saw. So the refusal has to be a *refusal*,
+    // not a refresh that keeps the old decision and attaches a new diff to it.
+    let store = gate!();
+    let page_id = seed_page(&store.pool, store.organization_id, "decided", "Before").await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .id();
+    let decided_hash = request.preview_hash.clone();
+
+    io::approve(
+        &store.pool,
+        store.organization_id,
+        id,
+        store.user().await,
+        // The fixture's policy is `ClassPolicy::default()`, which demands the typed phrase, and
+        // `decide()` checks the phrase BEFORE staleness. So a walk that approves without it
+        // never reaches the revision comparison and would be asserting about a decision that
+        // was refused for a completely different reason.
+        Some(CONFIRMATION_PHRASE),
+        &omnion_ai_hub::approvals::io::DbRevisionReader,
+        GateStore::now(),
+    )
+    .await
+    .expect("the decision resolves");
+
+    let err = io::re_preview(&store.pool, store.organization_id, id)
+        .await
+        .expect_err("a decided row is a record, not a draft");
+    assert!(
+        err.to_string().contains("record"),
+        "the refusal must say what the row now is, got: {err}"
+    );
+
+    let stored: String =
+        sqlx::query_scalar("select preview_hash from ai_approvals where id = $1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("the row must still be readable");
+    assert_eq!(
+        stored, decided_hash,
+        "the frozen preview of a decided request must survive the attempt untouched"
+    );
+    store.dispose().await;
+}
+
+#[tokio::test]
+async fn another_organizations_request_is_not_re_previewable() {
+    // The same tenant rule the read path keeps, proved on the write that a stale banner invites
+    // people to press: a 404 rather than a 403, so the endpoint cannot become an existence
+    // oracle, and no cross-tenant write of any kind.
+    let store = gate!();
+    let page_id = seed_page(&store.pool, store.organization_id, "tenant", "Before").await;
+    let request = preview_request(&store, page_id).await;
+    let id = io::request(&store.pool, &request)
+        .await
+        .expect("the request must be stored")
+        .id();
+
+    let err = io::re_preview(&store.pool, store.other_organization_id, id)
+        .await
+        .expect_err("another organization's row is not visible here");
+    assert!(
+        matches!(err, omnion_ai_hub::error::AiHubError::ApprovalNotFound(_)),
+        "another tenant's request must be a 404, got: {err}"
+    );
+    store.dispose().await;
+}
+
 /// A tiny helper so the walks above read as one sentence each.
 ///
 /// The alternative — matching on [`Requested`] at every call site — buries the assertion that
