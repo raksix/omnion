@@ -6541,3 +6541,70 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
+
+
+## Tick 31 — REQ-062 slice 3: theme layouts and packages (the part that was silently broken)
+
+**What.** The theme layouts and package layer, finished and proved: `crates/content/src/theme_layouts.rs`,
+`apps/api/src/routes/theme_layouts.rs`, migration `0173_theme_layout_default_blocks.sql`, the admin API client,
+and 17 walks. The eight slots the platform renders are a `const`, not a manifest field, for the same reason the
+contrast pairs are: an uploaded package is untrusted input, and a package that declared its own slot vocabulary
+would be describing its contract to itself.
+
+**Five defects, every one of which compiled and read correctly.** The interesting part of this tick is not the
+code that was written but the code that had been written earlier and looked fine:
+
+1. **The theme's blocks and the site's blocks were the same row.** `theme_layouts` has one row per
+   `(site_id, theme_key, slot)` — that identity is correct — and `save_slot` UPSERTed over `blocks` while setting
+   `is_default = false`. So the first custom edit deleted the only copy of the theme's shipped blocks, and
+   `reset_slot`, which read its default out of `where is_default`, answered 409 `theme_slot_no_default` on a slot
+   that had had a default one request earlier. **Reset was a one-way door**, behind a confirmation dialog that
+   lies in exactly the case that matters. Fixed by `0173`: the theme's blocks move into `default_blocks`, written
+   by `seed_default_layouts` and by nothing else.
+2. **An attempted fix that made it worse, and the reason to write down why.** The first repair filled the column
+   with `coalesce(default_blocks, excluded.blocks)` — "if we have no default yet, the current tree is one". For a
+   slot the theme never seeded, that made the site's OWN first save the thing a later reset restores, so "Reset to
+   theme default" returned the custom tree with a 200 and a confident `isDefault: true`. The save now never writes
+   that column at all, and the comment above the statement says so.
+3. **Every install was a 500.** `themes_upload_storage_check` requires an uploaded theme to point at a stored
+   package, and `install_package` wrote no `storage_key`. The rule is right — a row claiming a theme whose bytes
+   are nowhere is a theme nobody can reinstall — so the route now stores the package first, keyed by its checksum so
+   a re-upload overwrites its own object, and a removal takes the object with it.
+4. **The slice-1 gallery route had never worked.** `gallery_for_site` selected `t.id`, `t.key`, … unaliased into a
+   `theme_*`-prefixed struct, so sqlx answered 500 "no column found for name: theme_id" — on every call, because
+   asking the gallery for a site is the only way the route is used. Six aliases and a comment about JOINs.
+5. **Two state/serialisation defects in the new code.** A slot the site deliberately EMPTIES read `empty` instead
+   of `custom`, which hides the reset control on exactly the slot that needs it; and `SlotLayout` serialized no
+   `blockCount`, so a save response and the picker returned two shapes for the same slot.
+
+**Two probe bugs, recorded because both looked like product bugs.** The error envelope is `error.message`, not a
+top-level `message`, so an assertion on `body["message"]` was passing **vacuously on a null**. And a walk asserted
+400 for a `column` outside a `columns` — contradicting slice 2's half-built-pattern contract, which deliberately
+STORES an unfinished tree and reports the issues, because an author mid-edit needs somewhere to keep working. The
+walk was wrong, the product was right, and `is_fatal` is a hand-maintained list whose missing `columns` codes are a
+decision rather than an oversight. `blocks::fatal_classification` now asserts both directions: a payload nobody can
+render is refused, and an orphan column blocks the publish without blocking the save.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `apps/api --test cms_theme_layouts` | **17/0** (`--test-threads=1`; see below) |
+| `omnion-content --lib` | **252/0** (249 before: +3 classification tests) |
+| `apps/api --test cms_theme_settings` | **11/0** — slice 2 is not regressed |
+| `apps/admin` `tsc --noEmit` | clean |
+
+**Two environment facts worth keeping.** The walks must run with `--test-threads=1`: on the shared PostgreSQL the
+parallel run spent 15 minutes with four walks reporting "has been running for over 60 seconds" and then failed
+them, which is contention, not a defect. And a walk that cannot reach its database **SKIPs and reports `ok`** — the
+first run of these two new walks "passed" against a database that did not exist, because the DB URL pointed at
+port 5432 while the QA stack is on 5433. A green walk suite means nothing until the database is confirmed.
+
+**Not done, and why.** Acceptance 10–13 are annotated, not ticked: their API halves are proven by the walks and
+their screens (`/themes/<key>/builder`, `/themes/upload`) are not built. No browser pass ran — the QA slot is held
+by a live w5 pass (holder pid alive, cwd `/mnt/apopic/omnion-w5`) and `/mnt/apopic` was at 93-100% for most of the
+tick, which is the disk gate, not the slot gate. This tick also cleared three orphaned processes from earlier ticks
+of this loop that were still holding cargo slots and compiling into `/dev/shm`, one of them 22 hours old.
+
+**Next.** Build the builder screen on the REQ-063 editor with the slot picker and the reset control, then the
+upload screen with the validation report — then run `--only=theme-layouts` in a browser and tick 10–13.
