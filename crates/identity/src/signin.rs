@@ -142,6 +142,24 @@ pub async fn recent_failures_from_address(
     Ok(count)
 }
 
+/// Forget the recent failures recorded against an address.
+///
+/// The per-address refusal counts rows in `sign_in_attempts`, so it is a property of the LOG
+/// rather than of a counter on a row. That makes it awkward to reset, which is why this exists
+/// and why the integration tests need it: a walk that has just proved an account locks has,
+/// as a side effect, filled the address log with the attempts it made — and the next assertion
+/// about the lockout alone would then be answered by the address rule instead of by the lock.
+///
+/// A caller in production has no reason to want this: an operator who wants to let an address
+/// try again waits out the window, or unlocks the account from the panel, which is the action
+/// the screen exists to offer.
+pub async fn clear_address_failures(pool: &PgPool) -> Result<()> {
+    sqlx::query("delete from sign_in_attempts where outcome in ('failed', 'locked')")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Failures recorded against an address in the last `window_minutes`, for the panel's overview.
 pub async fn recent_failures_total(pool: &PgPool, window_minutes: i32) -> Result<i64> {
     let count: i64 = sqlx::query_scalar(

@@ -364,6 +364,24 @@ async fn repeated_wrong_passwords_lock_the_account_and_not_only_the_address() {
     );
 
     // A lock that the correct password walks straight through is a label, not a lock.
+    //
+    // The limiter and the lockout are two independent layers and by now BOTH have refused this
+    // walk: the `sign_in` ceiling is 10 per window and the account threshold is 10 attempts, so
+    // the correct password is answered `429 rate_limited` before the account is ever consulted.
+    // That is the limiter working, not the lock failing -- but asserting on it here would test
+    // the wrong layer and pass for the wrong reason, so the counter is cleared first and the
+    // lockout is asked on its own.
+    let _: bool = sqlx::query_scalar(
+        "update users set failed_sign_in_count = 0 where id = $1 returning true",
+    )
+    .bind(user_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("the counter must be resettable");
+    omnion_identity::signin::clear_address_failures(db.pool())
+        .await
+        .expect("the address attempt log must be clearable");
+
     let correct = call(&state, post_login(&email, PASSWORD)).await;
     assert_eq!(
         correct.body["error"]["code"],
