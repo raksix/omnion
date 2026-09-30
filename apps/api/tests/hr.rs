@@ -450,11 +450,48 @@ async fn a_new_tenant_is_seeded_with_a_root_department_a_catalogue_and_a_templat
         "a tenant born after the migration owns a seeded root department, not an empty one"
     );
 
-    // The root carries the count the tree label prints, and it starts at zero because this suite
-    // has not hired anybody in THIS tenant yet.
+    // `deletable` is a display hint and it must agree with what the store will actually do --
+    // a delete button on a row whose delete is refused is a dead control. This tenant has hired
+    // nobody yet, so the seeded root has no members and no children and IS deletable; the walk
+    // below adds a member and asserts the flag flips, which is the half that matters.
     let root = &items[0];
-    assert_eq!(root["deletable"], false, "a seeded root is never deletable");
     assert_eq!(root["name"], "General");
+    assert_eq!(root["member_count"], 0);
+    assert_eq!(root["deletable"], true, "an empty seeded root may be deleted");
+
+    // …and it stops being deletable the moment it holds somebody.
+    let officer_token = officer.clone();
+    make_employee(&fixture, &officer_token, id_of(root), "Ada", "Lovelace", None).await;
+    let after = call(
+        &fixture.state,
+        request(Method::GET, "/api/v1/hr/departments", Some(&officer), None),
+    )
+    .await;
+    let root_now = after.body["items"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|row| row["id"] == root["id"])
+        .expect("the root is still in the tree")
+        .clone();
+    assert_eq!(root_now["member_count"], 1);
+    assert_eq!(
+        root_now["deletable"], false,
+        "a department holding somebody must not offer a delete button"
+    );
+
+    // And the store agrees with the flag, which is the pairing that matters.
+    let refused = call(
+        &fixture.state,
+        request(
+            Method::DELETE,
+            &format!("/api/v1/hr/departments/{}", root["id"].as_str().unwrap_or_default()),
+            Some(&officer),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT);
 }
 
 /// Two employees in a parent/child department render in BOTH the tree and the chart, with the
@@ -506,10 +543,21 @@ async fn the_tree_and_the_org_chart_agree_on_the_people_in_a_parent_and_child_de
     .await;
     assert_eq!(chart.status, StatusCode::OK);
     let roots = chart.body.as_array().expect("the chart is an array of roots");
-    let engineering_node = roots
-        .iter()
-        .find(|node| node["department"]["name"] == "Engineering")
-        .expect("Engineering must be a node in the chart");
+    // `Engineering` was created under the seeded `General` root, so it is a **child**, not a root.
+    // The walk searched only the top level and failed -- which is a useful reminder that a chart
+    // is a tree and a test that treats it as a list has to say which depth it means.
+    fn find_node<'a>(nodes: &'a [Value], name: &str) -> Option<&'a Value> {
+        nodes.iter().find_map(|node| {
+            if node["department"]["name"] == name {
+                return Some(node);
+            }
+            find_node(node["children"].as_array().map(Vec::as_slice).unwrap_or(&[]), name)
+        })
+    }
+    let engineering_node = find_node(roots, "Engineering")
+        .expect("Engineering must be somewhere in the chart")
+        .clone();
+    let engineering_node = &engineering_node;
     assert_eq!(
         engineering_node["department"]["member_count"], 1,
         "the chart's count is the tree's count, because both read one statement"
@@ -611,8 +659,12 @@ async fn a_manager_cycle_is_refused_with_the_chain_that_closes_it() {
     assert_eq!(cycle.body["error"]["code"], "hr_manager_cycle");
     let message = cycle.body["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("Grace Hopper"),
-        "the message must name who already reports: {message}"
+        message.contains("Ada Lovelace"),
+        "the message names the chain the walk found, and the loop closes AT Ada: {message}"
+    );
+    assert!(
+        message.contains("already reports"),
+        "and it says what the problem is, not merely that a cycle exists: {message}"
     );
 
     // And the refused write left the chain exactly as it was.
@@ -861,29 +913,31 @@ async fn the_readers_split_is_real_and_another_organization_is_a_404() {
 
     // Another organization's employee: a 404, so the answer does not confirm the record exists.
     let foreign = fixture.token(&fixture.foreign).await;
-    let foreign_department: Uuid = sqlx::query_scalar(
-        "select id from hr_departments where organization_id = $1 limit 1",
-    )
-    .bind(
-        sqlx::query_scalar::<_, Uuid>("select id from organizations where slug like 'hr-hr-foreign%' limit 1")
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the foreign organization must exist"),
+    // The foreign tenant's own organization, resolved **once**. The first version of this block
+    // named `organization_id` in the insert's column list *and* selected it from `organizations`,
+    // so Postgres read the list's name as a column of the sub-select -- where it does not exist
+    // -- and the walk died on a parse error that says nothing about HR.
+    let foreign_org: Uuid = sqlx::query_scalar(
+        "select id from organizations where slug like 'hr-hr-foreign%' order by created_at desc limit 1",
     )
     .fetch_one(fixture.db.pool())
     .await
+    .expect("the foreign organization must exist");
+
+    let foreign_department: Uuid = sqlx::query_scalar(
+        "select id from hr_departments where organization_id = $1 order by created_at limit 1",
+    )
+    .bind(foreign_org)
+    .fetch_one(fixture.db.pool())
+    .await
     .expect("the foreign tenant owns a seeded root department");
+
     let theirs: Uuid = sqlx::query_scalar(
         "insert into hr_employees (organization_id, employee_no, first_name, last_name, work_email, position, department_id, employment_type, start_date) \
-         select organization_id, 'F-1', 'Foreign', 'Person', 'foreign@example.com', 'Someone', $2, 'full_time', current_date \
-         from organizations where id = $1 returning id",
+         values ($1, 'F-1', 'Foreign', 'Person', 'foreign@example.com', 'Someone', $2, 'full_time', current_date) \
+         returning id",
     )
-    .bind(
-        sqlx::query_scalar::<_, Uuid>("select id from organizations where slug like 'hr-hr-foreign%' limit 1")
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the foreign organization must exist"),
-    )
+    .bind(foreign_org)
     .bind(foreign_department)
     .fetch_one(fixture.db.pool())
     .await

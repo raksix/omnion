@@ -183,9 +183,16 @@ fn row_to_department(row: &sqlx::postgres::PgRow) -> Result<Department> {
         active: row.try_get("active")?,
         member_count,
         child_count,
-        // A department may be deleted only when nothing would be orphaned, and `parent_id` being
-        // set means the tree itself has to be re-parented — which is the merge flow, not a delete.
-        deletable: member_count == 0 && child_count == 0 && parent_id.is_none(),
+        // A department may be deleted only when nothing would be orphaned: no live members and
+        // no child departments.
+        //
+        // **Not** "and it has no parent". The first version included `parent_id.is_none()`, on the
+        // reasoning that a node with a parent needs the tree re-parented first — which is exactly
+        // backwards, because a *root* is the one node whose parent is null: the seeded root
+        // reported itself deletable and every child of it reported itself undeletable while
+        // having nothing under it. What a parent actually means is that the tree above has to
+        // cope, and the empty leaf is the case a delete screen can safely offer.
+        deletable: member_count == 0 && child_count == 0,
         created_at: row.try_get("created_at")?,
     })
 }
@@ -808,6 +815,50 @@ mod tests {
         assert_eq!(root.children[0].department.id, backend.id);
         assert_eq!(root.employees.len(), 1);
         assert!(placed.contains(&backend.id), "both departments must be placed");
+    }
+
+    #[test]
+    fn a_node_holds_the_people_who_are_in_that_department_and_nobody_else() {
+        // THE BUG: `list_chart_refs` returned `(employee_id, EmployeeRef)` while this function
+        // matches the key against `department.id`, so every node rendered an empty employee list
+        // while the same department's `member_count` said 1. The chart and the tree disagreed --
+        // the one criterion the request names -- and the chart still *looked* fine, because every
+        // department card drew with its own (correct) count.
+        //
+        // The test states the key's MEANING, so returning the wrong id fails here rather than in
+        // a browser pass eight minutes later.
+        let engineering = fake_department("Engineering", None);
+        let backend = fake_department("Backend", Some(engineering.id));
+        let mut by_parent: std::collections::HashMap<Option<Uuid>, Vec<Department>> =
+            std::collections::HashMap::new();
+        by_parent.insert(None, vec![engineering.clone()]);
+        by_parent.insert(Some(engineering.id), vec![backend.clone()]);
+
+        // Keyed by DEPARTMENT: Ada sits in Engineering, Grace in Backend.
+        let ada = fake_employee_ref("Ada");
+        let grace = fake_employee_ref("Grace");
+        let people = vec![
+            (engineering.id, ada.clone()),
+            (backend.id, grace.clone()),
+        ];
+
+        let mut placed = std::collections::HashSet::new();
+        let root = build_node(engineering.clone(), &by_parent, &people, &mut placed, 0);
+
+        assert_eq!(
+            root.employees.iter().map(|e| e.display_name.clone()).collect::<Vec<_>>(),
+            vec!["Ada".to_owned()],
+            "the root department holds the person who is IN it"
+        );
+        assert_eq!(
+            root.children[0]
+                .employees
+                .iter()
+                .map(|e| e.display_name.clone())
+                .collect::<Vec<_>>(),
+            vec!["Grace".to_owned()],
+            "and the child holds the other one -- neither is empty"
+        );
     }
 
     #[test]

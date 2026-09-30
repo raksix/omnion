@@ -705,13 +705,18 @@ pub async fn suggest_employee_no(pool: &PgPool, organization_id: Uuid) -> Result
     Ok(crate::model::suggest_employee_no(count))
 }
 
-/// The small employee shape the org chart and a department's member list draw.
+/// The small employee shape the org chart and a department's member list draw, **keyed by the
+/// department the person is in**.
+///
+/// The key is the department rather than the employee because the only caller is the chart, which
+/// groups by department; returning the employee's own id there made the grouping silently match
+/// nothing, and the chart looked plausible because every node still drew its department card.
 pub async fn list_chart_refs(
     pool: &PgPool,
     organization_id: Uuid,
 ) -> Result<Vec<(Uuid, EmployeeRef)>> {
     let rows = sqlx::query(
-        "select id, employee_no, first_name, last_name, position, employee_status, manager_id \
+        "select id, department_id, employee_no, first_name, last_name, position, employee_status, manager_id \
          from hr_employees \
          where organization_id = $1 and employee_status <> 'terminated' \
          order by lower(last_name), lower(first_name), id",
@@ -726,7 +731,11 @@ pub async fn list_chart_refs(
         let first: String = row.try_get("first_name")?;
         let last: String = row.try_get("last_name")?;
         refs.push((
-            row.try_get("id")?,
+            // The **department**, not the employee: `departments::build_node` matches this value
+            // against the node's department id. Returning the employee id here made every chart
+            // node render an empty employee list while the same row's `member_count` said 1 --
+            // the tree and the chart disagreeing, which is the criterion this request names.
+            row.try_get("department_id")?,
             EmployeeRef {
                 id: row.try_get("id")?,
                 employee_no: row.try_get("employee_no")?,
@@ -1266,8 +1275,13 @@ pub async fn assert_no_manager_cycle(
 
     /// Only the name is read: the ids the walk met are the *question*, not the answer, and the
     /// query already filtered the employee being edited out of its own chain.
+    /// The depth is carried, not just the name: the decision is "is the employee being edited
+    /// **strictly above** the proposed manager", and that is a question about depth, not about
+    /// which id happened to be unequal.
     #[derive(sqlx::FromRow)]
     struct ChainRow {
+        id: Uuid,
+        depth: i32,
         name: String,
     }
 
@@ -1284,27 +1298,51 @@ pub async fn assert_no_manager_cycle(
              join chain c on e.id = c.id \
              where e.organization_id = $1 and e.manager_id is not null and c.depth < $3 \
          ) \
-         select coalesce(e.first_name || ' ' || e.last_name, e.employee_no) as name \
+         select c.id as id, c.depth as depth, \
+                coalesce(e.first_name || ' ' || e.last_name, e.employee_no) as name \
          from chain c join hr_employees e on e.id = c.id \
-         where $4::uuid is null or c.id <> $4 \
+         where c.depth > 0 \
          order by c.depth",
     )
     .bind(organization_id)
     .bind(manager_id)
     .bind(MAX_CHAIN_DEPTH)
-    .bind(employee_id)
     .fetch_all(pool)
     .await?;
 
-    // The manager row itself is excluded by the id filter, so anything left in the chain is a
-    // *different* employee this one already manages, directly or through the proposal.
-    if let Some(row) = chain.first() {
-        return Err(HrError::ManagerCycle(crate::error::ManagementChain::new(vec![
-            row.name.clone(),
-        ])));
+    // The decision itself is [`chain_closes_a_loop`], so the unit test covers the create path
+    // that a walk with a real database cannot cheaply reach twice. `Uuid::nil()` is the honest
+    // "this employee does not exist yet" the create path passes, and the function is written so
+    // that it can never match on it.
+    let walked: Vec<(Uuid, i32)> = chain.iter().map(|row| (row.id, row.depth)).collect();
+    if chain_closes_a_loop(&walked, employee_id).is_some() {
+        return Err(HrError::ManagerCycle(crate::error::ManagementChain::new(
+            chain
+                .iter()
+                .map(|row| row.name.clone())
+                .collect(),
+        )));
     }
 
     Ok(())
+}
+
+/// `true` when the walked chain closes a loop for the employee being edited.
+///
+/// A **pure function** of the chain and the id, split out because it is the decision that a
+/// create and an update both depend on and neither can be tested for without a database. The bug
+/// it now guards: the first version compared `chain_id <> employee_id`, and a create passes
+/// `Uuid::nil()` because the row does not exist yet — so the manager's own row (depth 0) matched
+/// and **every** employee created with a manager was refused as a cycle. A walk that hired a
+/// report found it; a unit test on the list query would not have.
+fn chain_closes_a_loop(chain: &[(Uuid, i32)], employee_id: Uuid) -> Option<Uuid> {
+    // The proposed manager is the depth-0 anchor and is never itself a cycle: the person being
+    // edited cannot be found *at* the manager row, only strictly above them.
+    chain
+        .iter()
+        .filter(|(_, depth)| *depth > 0)
+        .find(|(id, _)| *id == employee_id)
+        .map(|(id, _)| *id)
 }
 
 /// Turn a unique-index violation into the sentence the form shows, by constraint name.
@@ -1611,6 +1649,39 @@ mod tests {
         // A field nobody filled in stays absent even for a caller who may read them — absent and
         // "hidden" must not become the same answer.
         assert_eq!(gated.address, None);
+    }
+
+    #[test]
+    fn a_chain_that_starts_at_the_proposed_manager_is_not_a_cycle() {
+        // THE BUG: the walk used to answer "does the chain contain a row that is not the employee
+        // being edited", and a create passes `Uuid::nil()` because the row does not exist yet.
+        // The manager's own row is therefore not-nil, it matched, and **every** employee created
+        // with a manager was refused as a cycle. The DB walk that tried to hire a report found it;
+        // nothing about the list query would have.
+        let manager = Uuid::new_v4();
+        let chain = vec![(manager, 0i32)];
+        assert_eq!(chain_closes_a_loop(&chain, Uuid::nil()), None);
+        assert_eq!(chain_closes_a_loop(&chain, Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn meeting_yourself_above_the_proposed_manager_is_the_cycle() {
+        let manager = Uuid::new_v4();
+        let middle = Uuid::new_v4();
+        let editor = Uuid::new_v4();
+        // manager -> middle -> editor: the editor is two steps up, so making the editor report to
+        // the manager closes a loop.
+        let chain = vec![(manager, 0), (middle, 1), (editor, 2)];
+        assert_eq!(chain_closes_a_loop(&chain, editor), Some(editor));
+        // The middle is a cycle too, and **that is correct**: the middle already reports to the
+        // manager, so making the middle report to the manager closes a one-step loop. The only
+        // id in a chain that is never a cycle is the anchor at depth 0 — the person being
+        // proposed is not below themselves.
+        assert_eq!(chain_closes_a_loop(&chain, middle), Some(middle));
+        assert_eq!(chain_closes_a_loop(&chain, manager), None);
+        // The direct case: editor reports to middle, and the middle's own manager is the editor.
+        let direct = vec![(middle, 0), (editor, 1)];
+        assert_eq!(chain_closes_a_loop(&direct, editor), Some(editor));
     }
 
     fn fake_employee() -> Employee {
