@@ -29,21 +29,29 @@ use http_body_util::BodyExt;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_cdn::purge::{self, PurgeKind, PurgeStatus};
-use omnion_core::config::Config;
+use omnion_core::config::{Config, CsrfSecret};
 use omnion_core::{BuildInfo, Db, RedisClient};
 use omnion_identity::sites;
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_security::RatePolicy;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const PASSWORD: &str = "correct horse battery";
 
+/// The CSRF secret this suite's own state carries.
+///
+/// A throwaway value, and the reason it is set on the config rather than read from the shell
+/// is in `live_state`. Nothing outside a test process ever sees it.
+const CSRF_SECRET: &str = "csrf-cdn-purge-walk-suite-key-material-not-a-real-secret";
+
 struct TestResponse {
     status: StatusCode,
-    set_cookie: Option<String>,
+    /// Every `Set-Cookie` the answer carried, joined. Empty when the answer set none.
+    set_cookie: String,
     body: Value,
 }
 
@@ -53,11 +61,19 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .await
         .expect("router must answer");
     let status = response.status();
+    // EVERY `Set-Cookie`, not the first one. Sign-in answers with two headers — the session
+    // and the CSRF token — and `headers().get(SET_COOKIE)` returns only the first, which is
+    // always the session. A helper that reads one header sees a session with no token and
+    // concludes the platform never issued one, which is indistinguishable from the message
+    // the CSRF layer gives a deployment that has no secret configured — so the two mistakes
+    // look identical from the call site. `get_all` is the only reading that separates them.
     let set_cookie = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
     let bytes = response
         .into_body()
         .collect()
@@ -76,10 +92,74 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+/// A signed-in account's cookie jar, in the shape a browser actually holds.
+///
+/// `login()` used to return the session token alone, and every write this file makes was
+/// refused `403 csrf_failed` at the security layer before reaching a handler — sign-in
+/// issues a session **and** a CSRF token, and a suite that keeps only the first one has
+/// built a client the platform is right to refuse. The same defect made three tenancy
+/// suites measure a 403 and read it as a broken product.
+///
+/// `Deref<Target = str>` is what keeps that fix to one function: the ~40 `Some(&token)`
+/// sites below, the `&str` parameters and every `format!("{token}")` compile unchanged,
+/// while the second cookie travels with the first. A session without its token is now
+/// unrepresentable rather than merely unlikely.
+///
+/// `Clone` is the other half of the same contract, and it is not optional bookkeeping: a
+/// dozen sites below read `fixture.token_a.clone()`, and `Deref` does not answer that. Both
+/// traits move the *same* value, and a wrapper that had one but not the other would push
+/// the type back out to the call sites — which is the shape of tick 79's reverted regex
+/// rewrite, and the reason this is a type and not a script.
+#[derive(Clone)]
+struct Credentials {
+    session: String,
+    /// `None` only where the platform configured no CSRF secret, in which case the layer
+    /// refuses writes with `csrf_unavailable` and there is nothing to send.
+    csrf: Option<String>,
+}
+
+impl std::ops::Deref for Credentials {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.session
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    /// Never prints the tokens: a failing assertion would otherwise write a live credential
+    /// into every CI log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("session", &"<redacted>")
+            .field("csrf", &self.csrf.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Build a request; `credentials` becomes the cookie jar and `body` the JSON payload.
+///
+/// Both cookies go out, plus the matching `x-omnion-csrf` header — which is exactly what a
+/// browser does, and what this suite did not.
+fn request(
+    method: Method,
+    uri: &str,
+    credentials: Option<&Credentials>,
+    body: Option<Value>,
+) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+    let builder = match credentials {
+        Some(credentials) => {
+            let mut cookies = format!("omnion_session={}", credentials.session);
+            let builder = match &credentials.csrf {
+                Some(csrf) => {
+                    cookies.push_str(&format!("; omnion_csrf={csrf}"));
+                    builder.header("x-omnion-csrf", csrf.as_str())
+                }
+                None => builder,
+            };
+            builder.header(header::COOKIE, cookies)
+        }
         None => builder,
     };
     match body {
@@ -97,7 +177,16 @@ fn test_storage() -> omnion_storage::Storage {
 }
 
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().ok()?;
+    let mut config = Config::from_env().ok()?;
+    // The CSRF secret goes on the **config**, not through the environment. Sign-in only
+    // issues a token when the running state carries one, and a suite that relies on
+    // `OMNION_CSRF_SECRET` being exported in the shell is a suite that silently stops
+    // testing writes the moment it is not — which is what this file was: every mutation
+    // below it answered `403 csrf_unavailable` at the security layer, the walks "passed"
+    // only on their read halves, and the message named the server's configuration rather
+    // than the suite's own missing token. `apps/api/tests/media.rs` carries the same two
+    // lines and the comment that says why.
+    config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
     let db = match Db::connect(&config.database).await {
         Ok(db) => db,
         Err(err) => {
@@ -114,7 +203,33 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
+    give_the_suite_its_own_rate_limit(&state);
     Some((state, db))
+}
+
+/// Raise the sign-in ceiling for this process only.
+///
+/// The limiter is a process-wide cell and the shipped `sign_in` policy allows ten attempts
+/// per five minutes. This file builds a fresh `Fixture` per walk and each one signs TWO
+/// accounts in, so twenty-one walks are twenty-five-plus sign-ins against a budget of ten —
+/// and the surplus failures read as `429 rate_limited` in the middle of an assertion about
+/// cache rules. Only the `sign_in` scope is raised: the other ceilings are the ones a
+/// deployment ships, and leaving them alone keeps a suite from becoming the reason a
+/// genuinely over-budget request stops being refused.
+fn give_the_suite_its_own_rate_limit(state: &AppState) {
+    let policies: Vec<RatePolicy> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            if policy.scope == "sign_in" {
+                policy.limit = 10_000;
+            }
+            policy
+        })
+        .collect();
+    omnion_api::rate_limit_middleware::install(omnion_api::rate_limit_middleware::RateLimiter::new(
+        state,
+        policies,
+    ));
 }
 
 async fn create_organization_row(db: &Db, suffix: &str) -> Uuid {
@@ -156,7 +271,7 @@ async fn create_admin(
     suffix: &str,
     state: &AppState,
     permissions: &[&str],
-) -> (Uuid, String) {
+) -> (Uuid, Credentials) {
     let email = format!("cdn-purge-{suffix}-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
         db.pool(),
@@ -206,12 +321,12 @@ async fn create_admin(
     .await
     .expect("binding must insert");
 
-    let token = login(state, &email).await;
-    (user.id, token)
+    let credentials = login(state, &email).await;
+    (user.id, credentials)
 }
 
-/// Sign an account in and return the raw session token.
-async fn login(state: &AppState, email: &str) -> String {
+/// Sign an account in and return the cookie jar a browser would hold.
+async fn login(state: &AppState, email: &str) -> Credentials {
     let response = call(
         state,
         request(
@@ -228,16 +343,31 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    response
-        .set_cookie
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("the cookie has a value")
-        .split_once('=')
-        .expect("the cookie is name=value")
-        .1
-        .to_string()
+    let set_cookie = response.set_cookie.clone();
+    assert!(
+        !set_cookie.is_empty(),
+        "login must set the session cookie; sent: {set_cookie:?}"
+    );
+
+    // Name each cookie: a missing one must be visible HERE, naming which cookie the platform
+    // did not send, instead of the failure surfacing three layers away as a 403.
+    let cookie_value = |name: &str| -> Option<String> {
+        set_cookie
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(cookie, _)| *cookie == name)
+            .map(|(_, value)| value.to_owned())
+    };
+
+    let session = cookie_value("omnion_session")
+        .unwrap_or_else(|| panic!("login must set the omnion_session cookie; sent: {set_cookie}"));
+    let csrf = cookie_value("omnion_csrf");
+    assert!(
+        csrf.is_some(),
+        "login must set the omnion_csrf cookie beside the session one; sent: {set_cookie}"
+    );
+
+    Credentials { session, csrf }
 }
 
 struct Fixture {
@@ -245,8 +375,8 @@ struct Fixture {
     db: Db,
     site_a: Uuid,
     site_b: Uuid,
-    token_a: String,
-    token_b: String,
+    token_a: Credentials,
+    token_b: Credentials,
     admin_a: Uuid,
     organizations: Vec<Uuid>,
 }
@@ -256,7 +386,9 @@ const ALL_PERMISSIONS: [&str; 3] = ["cdn.read", "cdn.manage", "cdn.purge"];
 impl Fixture {
     async fn new() -> Option<Self> {
         let (state, db) = live_state().await?;
-        seed::ensure(db.pool()).await.expect("the IAM seed must run");
+        seed::ensure(db.pool())
+            .await
+            .expect("the IAM seed must run");
 
         let org_a = create_organization_row(&db, "a").await;
         let org_b = create_organization_row(&db, "b").await;
@@ -301,7 +433,7 @@ impl Fixture {
     }
 
     /// Ask for a purge and return the created row.
-    async fn purge(&self, token: &str, site: Uuid, body: Value) -> TestResponse {
+    async fn purge(&self, token: &Credentials, site: Uuid, body: Value) -> TestResponse {
         call(
             &self.state,
             request(
@@ -315,7 +447,7 @@ impl Fixture {
     }
 
     /// The history of a site.
-    async fn history(&self, token: &str, site: Uuid) -> Value {
+    async fn history(&self, token: &Credentials, site: Uuid) -> Value {
         let response = call(
             &self.state,
             request(
@@ -331,7 +463,7 @@ impl Fixture {
     }
 
     /// The drawer contents of one purge.
-    async fn detail(&self, token: &str, id: &str) -> TestResponse {
+    async fn detail(&self, token: &Credentials, id: &str) -> TestResponse {
         call(
             &self.state,
             request(
@@ -389,7 +521,10 @@ async fn a_purge_by_url_list_is_written_and_answers_with_its_own_state() {
     assert_eq!(purge["status"], "queued", "a fresh purge is queued");
     assert_eq!(purge["item_count"], 2, "one item row per target");
     assert_eq!(purge["failed_count"], 0);
-    assert_eq!(purge["provider"], "origin", "the fixture has no settings row");
+    assert_eq!(
+        purge["provider"], "origin",
+        "the fixture has no settings row"
+    );
     assert_eq!(
         purge["retryable"], false,
         "a queued purge has nothing to retry"
@@ -422,7 +557,11 @@ async fn a_purge_by_tag_and_a_whole_zone_purge_are_both_accepted() {
     let token = fixture.token_a.clone();
 
     let tags = fixture
-        .purge(&token, site, json!({ "kind": "tag", "targets": ["/blog", "/docs"] }))
+        .purge(
+            &token,
+            site,
+            json!({ "kind": "tag", "targets": ["/blog", "/docs"] }),
+        )
         .await;
     assert_eq!(tags.status, StatusCode::CREATED, "tags: {}", tags.body);
     assert_eq!(tags.body["kind"], "tag");
@@ -449,9 +588,7 @@ async fn a_whole_zone_purge_without_the_typed_word_is_refused() {
     let site = fixture.site_a;
     let token = fixture.token_a.clone();
 
-    let response = fixture
-        .purge(&token, site, json!({ "kind": "all" }))
-        .await;
+    let response = fixture.purge(&token, site, json!({ "kind": "all" })).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert_eq!(response.body["error"]["code"], "purge_all_unconfirmed");
     assert_eq!(
@@ -475,26 +612,42 @@ async fn a_malformed_target_and_an_empty_list_are_refused_with_their_own_message
     let token = fixture.token_a.clone();
 
     let relative = fixture
-        .purge(&token, site, json!({ "kind": "url", "targets": ["blog/post"] }))
+        .purge(
+            &token,
+            site,
+            json!({ "kind": "url", "targets": ["blog/post"] }),
+        )
         .await;
     assert_eq!(relative.status, StatusCode::BAD_REQUEST);
     assert_eq!(relative.body["error"]["code"], "invalid_purge_url");
     assert_eq!(relative.body["error"]["details"]["field"], "targets");
 
     let bad_tag = fixture
-        .purge(&token, site, json!({ "kind": "tag", "targets": ["has space"] }))
+        .purge(
+            &token,
+            site,
+            json!({ "kind": "tag", "targets": ["has space"] }),
+        )
         .await;
     assert_eq!(bad_tag.status, StatusCode::BAD_REQUEST);
     assert_eq!(bad_tag.body["error"]["code"], "invalid_purge_tag");
 
     let empty = fixture
-        .purge(&token, site, json!({ "kind": "url", "targets": ["  ", ""] }))
+        .purge(
+            &token,
+            site,
+            json!({ "kind": "url", "targets": ["  ", ""] }),
+        )
         .await;
     assert_eq!(empty.status, StatusCode::BAD_REQUEST);
     assert_eq!(empty.body["error"]["code"], "empty_purge_targets");
 
     let unknown_kind = fixture
-        .purge(&token, site, json!({ "kind": "everything", "targets": ["/a"] }))
+        .purge(
+            &token,
+            site,
+            json!({ "kind": "everything", "targets": ["/a"] }),
+        )
         .await;
     assert_eq!(unknown_kind.status, StatusCode::BAD_REQUEST);
     assert_eq!(unknown_kind.body["error"]["code"], "invalid_purge_kind");
@@ -577,7 +730,11 @@ async fn another_organizations_purge_is_neither_readable_nor_writable() {
         return;
     };
     let response = fixture
-        .purge(&fixture.token_a, fixture.site_a, json!({ "kind": "url", "targets": ["/a"] }))
+        .purge(
+            &fixture.token_a,
+            fixture.site_a,
+            json!({ "kind": "url", "targets": ["/a"] }),
+        )
         .await;
     assert_eq!(response.status, StatusCode::CREATED);
     let id = response.body["id"].as_str().expect("an id").to_string();
@@ -614,7 +771,10 @@ async fn another_organizations_purge_is_neither_readable_nor_writable() {
     assert_eq!(forge.status, StatusCode::FORBIDDEN, "{}", forge.body);
 
     // ...and B's own history is empty, not A's.
-    assert_eq!(fixture.history(&fixture.token_b, fixture.site_b).await["total"], 0);
+    assert_eq!(
+        fixture.history(&fixture.token_b, fixture.site_b).await["total"],
+        0
+    );
 
     fixture.cleanup().await;
 }
@@ -697,7 +857,11 @@ async fn a_provider_refusal_lands_in_the_drawer_with_its_message_and_is_retryabl
         )
         .await;
     assert_eq!(created.status, StatusCode::CREATED);
-    let id: Uuid = created.body["id"].as_str().expect("an id").parse().expect("a uuid");
+    let id: Uuid = created.body["id"]
+        .as_str()
+        .expect("an id")
+        .parse()
+        .expect("a uuid");
 
     // The fixture's adapter is `origin`, which succeeds — so point the purge at an adapter
     // that fails by giving the site a settings row naming an unreachable endpoint.
@@ -767,7 +931,8 @@ async fn a_provider_refusal_lands_in_the_drawer_with_its_message_and_is_retryabl
     );
     let (third_failed, third_attempted) = drain_once(&fixture.state, Some(site)).await;
     assert_eq!(
-        (third_failed, third_attempted), (0, 0),
+        (third_failed, third_attempted),
+        (0, 0),
         "a failed item is never claimed again without a retry — a worker that keeps picking \
 up a `failed` row would retry for ever, which is what the attempt budget exists to prevent"
     );
@@ -780,7 +945,10 @@ up a `failed` row would retry for ever, which is what the attempt budget exists 
     );
     assert_eq!(final_state.body["purge"]["failed_count"], 2);
     assert!(
-        !final_state.body["purge"]["error"].as_str().unwrap_or("").is_empty(),
+        !final_state.body["purge"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
         "the provider's message must be on the parent row too"
     );
     assert_eq!(
@@ -803,12 +971,10 @@ up a `failed` row would retry for ever, which is what the attempt budget exists 
     assert_eq!(retry.status, StatusCode::OK, "retry: {}", retry.body);
     assert_eq!(retry.body["purge"]["status"], "queued");
     assert_eq!(
-        retry.body["items"]
-            .as_array()
-            .map(|items| items
-                .iter()
-                .filter(|item| item["status"] == "pending")
-                .count()),
+        retry.body["items"].as_array().map(|items| items
+            .iter()
+            .filter(|item| item["status"] == "pending")
+            .count()),
         Some(2),
         "every failed item is pending again: {}",
         retry.body
@@ -870,13 +1036,20 @@ async fn a_successful_drain_leaves_the_purge_succeeded_with_every_item_done() {
             json!({ "kind": "url", "targets": ["/blog/a", "/blog/b", "/blog/c"] }),
         )
         .await;
-    let id: Uuid = created.body["id"].as_str().expect("an id").parse().expect("a uuid");
+    let id: Uuid = created.body["id"]
+        .as_str()
+        .expect("an id")
+        .parse()
+        .expect("a uuid");
 
     // No settings row, so the adapter is `origin`: the correct answer for an installation
     // with no edge in front of it, and a successful no-op rather than a fake success.
     let (failed, attempted) = drain_once(&fixture.state, Some(site)).await;
     assert_eq!(attempted, 3, "all three targets were sent");
-    assert_eq!(failed, 0, "`origin` accepts every target, so nothing failed");
+    assert_eq!(
+        failed, 0,
+        "`origin` accepts every target, so nothing failed"
+    );
 
     let detail = fixture.detail(&token, &id.to_string()).await;
     assert_eq!(
@@ -924,7 +1097,11 @@ async fn a_partial_drain_says_partial_and_counts_only_what_failed() {
             json!({ "kind": "url", "targets": ["/a", "/b"] }),
         )
         .await;
-    let id: Uuid = created.body["id"].as_str().expect("an id").parse().expect("a uuid");
+    let id: Uuid = created.body["id"]
+        .as_str()
+        .expect("an id")
+        .parse()
+        .expect("a uuid");
 
     // Script the outcome directly rather than through a live provider: what is under test
     // is the fold from "one of two failed" to `partial` with `failed_count = 1`, and a real
@@ -1022,7 +1199,10 @@ async fn the_overview_reports_the_queue_the_counters_and_the_last_twenty() {
     assert_eq!(status.status, StatusCode::OK, "{}", status.body);
     let body = &status.body;
     assert_eq!(body["provider"], "origin");
-    assert_eq!(body["provider_shipped"], true, "origin is a shipped adapter");
+    assert_eq!(
+        body["provider_shipped"], true,
+        "origin is a shipped adapter"
+    );
     assert_eq!(
         body["queue_depth"], 2,
         "two queued purges are two waiting items: {body}"
@@ -1145,7 +1325,12 @@ async fn settings_outside_the_1_to_1000_batch_cap_are_refused_with_their_field()
     let site = fixture.site_a;
     let token = fixture.token_a.clone();
 
-    for (batch_size, max_attempts, field) in [(0, 5, "batch_size"), (1001, 5, "batch_size"), (10, 0, "max_attempts"), (10, 11, "max_attempts")] {
+    for (batch_size, max_attempts, field) in [
+        (0, 5, "batch_size"),
+        (1001, 5, "batch_size"),
+        (10, 0, "max_attempts"),
+        (10, 11, "max_attempts"),
+    ] {
         let response = call(
             &fixture.state,
             request(
@@ -1273,25 +1458,21 @@ async fn a_settings_row_cannot_name_an_adapter_this_build_does_not_ship() {
 
     // The row does not exist afterwards, which is the half that is easy to skip: a refusal
     // that still wrote the row would leave the panel showing a provider that cannot run.
-    let rows: i64 = sqlx::query_scalar(
-        "select count(*) from cdn_settings where site_id = $1",
-    )
-    .bind(site)
-    .fetch_one(fixture.db.pool())
-    .await
-    .expect("count must read");
+    let rows: i64 = sqlx::query_scalar("select count(*) from cdn_settings where site_id = $1")
+        .bind(site)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("count must read");
     assert_eq!(rows, 0, "a refused save must not leave a row behind");
 
     // And the database refuses it directly. `ok()` is not used to discard the error: the
     // assertion is that this statement *is* an error, and a swallowed failure would make
     // the walk pass on a database with no constraint at all — which is exactly the state it
     // is here to rule out.
-    let direct = sqlx::query(
-        "insert into cdn_settings (site_id, provider) values ($1, 'fastly')",
-    )
-    .bind(site)
-    .execute(fixture.db.pool())
-    .await;
+    let direct = sqlx::query("insert into cdn_settings (site_id, provider) values ($1, 'fastly')")
+        .bind(site)
+        .execute(fixture.db.pool())
+        .await;
     let error = direct.expect_err("the provider check must refuse an adapter that is not shipped");
     assert!(
         error.to_string().contains("cdn_settings_provider_known"),
@@ -1312,6 +1493,386 @@ async fn a_settings_row_cannot_name_an_adapter_this_build_does_not_ship() {
     assert_eq!(purge.body["provider"], "origin");
 
     fixture.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The write-only provider credential (REQ-011, slice 4)
+//
+// These walks exist because the screen shipped before the thing behind it. `/cdn/settings`
+// has rendered a `Replace credential` field since slice 1: it labels the field write-only,
+// starts empty on every visit, and the handler **discarded the value it was sent**. An
+// operator pasted a key, was told "Settings saved, and the credential was replaced", and
+// the column stayed `null` — so `has_credential` was pinned to `false` for ever and every
+// adapter that needs a key could never authenticate. A dead control, with a success message.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_credential_pasted_in_the_panel_is_stored_and_the_worker_sends_it() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let token = fixture.token_a.clone();
+
+    // A loopback endpoint that reports the `Authorization` header it received, so the
+    // assertion is about the *request the adapter made* and not about an outcome derived
+    // from it. A test that only checked "the purge succeeded" would pass with the
+    // credential never sent at all.
+    let (endpoint, received) = auth_recorder();
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/cdn/settings",
+            Some(&token),
+            Some(json!({
+                "site_id": site.to_string(),
+                "provider": "generic_http",
+                "endpoint_url": endpoint,
+                "zone_ref": "qa",
+                "batch_size": 100,
+                "max_attempts": 3,
+                "credential": "cdn-qa-key-0123456789",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "save: {}", saved.body);
+
+    // The response says a credential exists and does not carry one. Both halves: the flag is
+    // what the form's own hint reads, and a body carrying the value would be a leak on a
+    // response the panel fetches on every visit to the screen.
+    assert_eq!(
+        saved.body["has_credential"], true,
+        "the save must report the stored credential it just wrote: {}",
+        saved.body
+    );
+    assert!(
+        saved.body.get("credential").is_none(),
+        "the settings response must not carry a credential field at all: {}",
+        saved.body
+    );
+
+    // And the column holds an envelope, not the key. Read straight from the database, which
+    // is the only place the assertion is worth anything — the API already promised not to
+    // return it, and a promise is not a storage format.
+    let stored: Vec<u8> =
+        sqlx::query_scalar("select credential_ciphertext from cdn_settings where site_id = $1")
+            .bind(site)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the credential column must be readable");
+    let stored = String::from_utf8(stored).expect("the envelope is text");
+    assert!(
+        !stored.contains("cdn-qa-key"),
+        "the column must hold a sealed envelope, not the key: {stored}"
+    );
+    assert!(
+        stored.contains("omnion-cdn-credential.v1:"),
+        "the column must name its format, so a value written by another build reads as a \
+         corrupt row rather than as a credential: {stored}"
+    );
+
+    // The read the worker makes, resolved by the same function the drain calls. This is the
+    // assertion that the slice exists for: the screen's save and the worker's load are one
+    // contract, and a test of either half alone would pass with the other half missing.
+    let (_key, settings, _attempts) = purge::provider_for_site(fixture.db.pool(), Some(site))
+        .await
+        .expect("the provider settings must resolve");
+    assert_eq!(
+        settings.credential.as_deref(),
+        Some("cdn-qa-key-0123456789"),
+        "the worker must receive the credential the panel stored — this is the half that was \
+         wired to None and made the whole control dead"
+    );
+
+    // And it arrives at the provider, in the header, on a real purge.
+    let purge = fixture
+        .purge(
+            &token,
+            site,
+            json!({ "kind": "url", "targets": ["/authed"] }),
+        )
+        .await;
+    assert_eq!(purge.status, StatusCode::CREATED, "{}", purge.body);
+    let (failed, attempted) = drain_once(&fixture.state, Some(site)).await;
+    assert_eq!(
+        failed, 0,
+        "an authenticated purge must not fail: the worker got {attempted} item(s) and the \
+         endpoint answered 200 to all of them"
+    );
+
+    let head = received
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the adapter must have called the endpoint");
+    assert!(
+        head.contains("Authorization: Bearer cdn-qa-key-0123456789"),
+        "the provider must receive the stored credential, and the assertion is on the wire \
+         rather than on the adapter's own field: {head}"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_save_that_omits_the_credential_keeps_the_stored_one() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let token = fixture.token_a.clone();
+
+    let seeded = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/cdn/settings",
+            Some(&token),
+            Some(json!({
+                "site_id": site.to_string(),
+                "provider": "generic_http",
+                "endpoint_url": "https://edge.example/purge",
+                "batch_size": 100,
+                "max_attempts": 5,
+                "credential": "the-original-key",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(seeded.status, StatusCode::OK, "{}", seeded.body);
+
+    // The batch size is what an operator actually comes back to change. Sending no
+    // credential field — which is what the panel does whenever the input is empty, and the
+    // common case — must not destroy the key they pasted ten minutes earlier.
+    let updated = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/cdn/settings",
+            Some(&token),
+            Some(json!({
+                "site_id": site.to_string(),
+                "provider": "generic_http",
+                "endpoint_url": "https://edge.example/purge",
+                "batch_size": 250,
+                "max_attempts": 5,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::OK, "{}", updated.body);
+    assert_eq!(updated.body["batch_size"], 250);
+    assert_eq!(
+        updated.body["has_credential"], true,
+        "the flag must survive the edit"
+    );
+
+    let (_key, settings, _attempts) = purge::provider_for_site(fixture.db.pool(), Some(site))
+        .await
+        .expect("the provider settings must resolve");
+    assert_eq!(
+        settings.credential.as_deref(),
+        Some("the-original-key"),
+        "an omitted field means 'keep', not 'clear' — otherwise saving the batch size \
+         silently destroys the operator's credential"
+    );
+
+    // Replacing it is a deliberate act and takes effect: the panel says "the credential was
+    // replaced", so the second save must be a *different* key rather than a no-op.
+    let replaced = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/cdn/settings",
+            Some(&token),
+            Some(json!({
+                "site_id": site.to_string(),
+                "provider": "generic_http",
+                "endpoint_url": "https://edge.example/purge",
+                "batch_size": 250,
+                "max_attempts": 5,
+                "credential": "the-rotated-key",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{}", replaced.body);
+    let (_key, settings, _attempts) = purge::provider_for_site(fixture.db.pool(), Some(site))
+        .await
+        .expect("the provider settings must resolve");
+    assert_eq!(
+        settings.credential.as_deref(),
+        Some("the-rotated-key"),
+        "a replacement has to be a replacement, or the operator cannot rotate a key"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_blank_credential_is_refused_naming_the_field_and_stores_nothing() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let token = fixture.token_a.clone();
+
+    // An empty string is a *refusal*, not a clear. "The field is empty" and "remove my
+    // stored key" are different requests, and a form that sends the first and means the
+    // second is how a working edge provider gets an unauthenticated purge queue.
+    for (credential, why) in [("", "an empty string"), ("   ", "whitespace only")] {
+        let response = call(
+            &fixture.state,
+            request(
+                Method::PUT,
+                "/api/v1/cdn/settings",
+                Some(&token),
+                Some(json!({
+                    "site_id": site.to_string(),
+                    "provider": "generic_http",
+                    "endpoint_url": "https://edge.example/purge",
+                    "batch_size": 100,
+                    "max_attempts": 5,
+                    "credential": credential,
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{why} must be refused: {}",
+            response.body
+        );
+        assert_eq!(
+            response.body["error"]["code"], "invalid_credential",
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            response.body["error"]["details"]["field"], "credential",
+            "the refusal has to name the field the form can underline: {}",
+            response.body
+        );
+    }
+
+    // Nothing was written by any of them: the row the first refusal would have created is
+    // the row the panel would then show as "a credential is stored".
+    let rows: i64 = sqlx::query_scalar(
+        "select count(*) from cdn_settings where site_id = $1 and credential_ciphertext is not null",
+    )
+    .bind(site)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("count must read");
+    assert_eq!(
+        rows, 0,
+        "a refused credential must not leave a sealed value behind"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_credential_is_never_written_to_the_audit_trail() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let token = fixture.token_a.clone();
+
+    let saved = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            "/api/v1/cdn/settings",
+            Some(&token),
+            Some(json!({
+                "site_id": site.to_string(),
+                "provider": "generic_http",
+                "endpoint_url": "https://edge.example/purge",
+                "batch_size": 100,
+                "max_attempts": 5,
+                "credential": "cdn-qa-key-do-not-log-me",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+    // An incident review needs to know *that* a credential was replaced and by whom. It must
+    // never be able to learn *what*. The audit table is the one store every support
+    // conversation can read, so it is the worst possible place for a provider key.
+    let metadata: String = sqlx::query_scalar(
+        "select metadata::text from audit_log \
+         where action = 'cdn.settings.updated' \
+         order by created_at desc limit 1",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the settings write must be audited");
+    assert!(
+        !metadata.contains("cdn-qa-key"),
+        "the audit entry must record that a credential was replaced, never the value: {metadata}"
+    );
+    assert!(
+        metadata.contains("\"credential_replaced\":true"),
+        "and it must still say that one was: {metadata}"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// A loopback endpoint that answers `200 {}` and reports the request head it received.
+///
+/// Hand-rolled rather than a test framework for the same reason `crates/cdn`'s own adapter
+/// tests are: the assertion is one header on one request, and a framework would be a
+/// dependency to prove a line about a socket.
+fn auth_recorder() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("the test server must bind");
+    let port = listener.local_addr().expect("the bound address").port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Several connections: the settings save's own `Test connection` is not called here,
+        // but the drain may retry, and a listener that answers once and exits turns a retry
+        // into a refused purge that looks like a product bug.
+        for _ in 0..4 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(match stream.try_clone() {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                });
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let _ = tx.send(head);
+                let mut stream = stream;
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\
+                      Connection: close\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}/purge"), rx)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1338,12 +1899,16 @@ async fn drain_once(state: &AppState, site_id: Option<Uuid>) -> (i32, i32) {
             break;
         }
         for item in claimed {
-            let owner: Option<Uuid> = sqlx::query_scalar("select site_id from cdn_purges where id = $1")
-                .bind(item.purge_id)
-                .fetch_one(pool)
-                .await
-                .expect("the purge row must exist");
-            per_site.entry(owner.unwrap_or_else(Uuid::nil)).or_default().push(item);
+            let owner: Option<Uuid> =
+                sqlx::query_scalar("select site_id from cdn_purges where id = $1")
+                    .bind(item.purge_id)
+                    .fetch_one(pool)
+                    .await
+                    .expect("the purge row must exist");
+            per_site
+                .entry(owner.unwrap_or_else(Uuid::nil))
+                .or_default()
+                .push(item);
         }
     }
 
@@ -1351,8 +1916,14 @@ async fn drain_once(state: &AppState, site_id: Option<Uuid>) -> (i32, i32) {
     // walk drains a queue the binary would have stamped, and `started_at` stays null — which
     // is a difference between the helper and the worker, not a difference between a purge
     // that started and one that did not.
-    let claimed_purges: Vec<Uuid> = per_site.values().flatten().map(|item| item.purge_id).collect();
-    purge::mark_running(pool, &claimed_purges).await.expect("parents must be marked running");
+    let claimed_purges: Vec<Uuid> = per_site
+        .values()
+        .flatten()
+        .map(|item| item.purge_id)
+        .collect();
+    purge::mark_running(pool, &claimed_purges)
+        .await
+        .expect("parents must be marked running");
 
     let mut total_failed = 0;
     let mut total_items = 0;
@@ -1369,7 +1940,8 @@ async fn drain_once(state: &AppState, site_id: Option<Uuid>) -> (i32, i32) {
         }
         total_items += items.len() as i32;
 
-        let (key, settings, max_attempts) = purge::provider_for_site(pool, Some(site)).await
+        let (key, settings, max_attempts) = purge::provider_for_site(pool, Some(site))
+            .await
             .expect("the provider must resolve");
         let kind = PurgeKind::Url;
         let targets: Vec<String> = items.iter().map(|item| item.target.clone()).collect();
@@ -1439,7 +2011,8 @@ static POOL: std::sync::OnceLock<sqlx::PgPool> = std::sync::OnceLock::new();
 
 /// The registered pool, or a clear panic naming the mistake.
 fn current_pool() -> &'static sqlx::PgPool {
-    POOL.get().expect("the pool is registered by the first drain_once call")
+    POOL.get()
+        .expect("the pool is registered by the first drain_once call")
 }
 
 #[allow(dead_code)]

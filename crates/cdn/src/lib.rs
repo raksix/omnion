@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod credential;
 pub mod error;
 pub mod etag;
 pub mod headers;

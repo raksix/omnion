@@ -968,35 +968,66 @@ pub async fn counters(
 /// agree — a worker that resolved the provider differently from the screen that configured
 /// it is how a purge ends up sent to an adapter the operator never chose, and two reads
 /// racing a concurrent write is the smaller half of that bug.
+///
+/// The `credential_ciphertext` column is read **here and nowhere else** on this path, and it
+/// is decrypted rather than passed through. That is the whole of slice 4: a credential that
+/// the settings screen stores and the worker never sends is a credential an operator pastes,
+/// is told was saved, and which then never authenticates — the failure looks exactly like a
+/// wrong key at the provider, and the one place that can rule that out is the code that
+/// builds the adapter.
+///
+/// An unreadable envelope is an **error**, not a silent `None`. `None` here means "the
+/// operator never configured one" and the adapter reports that honestly; a row that holds a
+/// credential this process cannot open is a rotated or mismatched key, and answering "not
+/// configured" to it would send the operator to paste the right key they have already pasted.
 pub async fn provider_for_site(
     pool: &sqlx::PgPool,
     site_id: Option<Uuid>,
 ) -> Result<(String, crate::provider::ProviderSettings, i32), CdnError> {
-    let row: Option<(String, Option<String>, Option<String>, i32, i32)> = sqlx::query_as(
-        "select provider, endpoint_url, zone_ref, batch_size, max_attempts \
-         from cdn_settings \
-         where site_id is not distinct from $1 or site_id is null \
-         order by site_id is null asc, site_id nulls last \
-         limit 1",
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+        i32,
+        i32,
+    )> = sqlx::query_as(
+        "select provider, endpoint_url, zone_ref, credential_ciphertext, batch_size, \
+                    max_attempts \
+             from cdn_settings \
+             where site_id is not distinct from $1 or site_id is null \
+             order by site_id is null asc, site_id nulls last \
+             limit 1",
     )
     .bind(site_id)
     .fetch_optional(pool)
     .await?;
 
+    let box_ = omnion_identity::SecretBox::from_env();
     Ok(match row {
-        Some((key, endpoint, zone, _batch, max_attempts)) => (
-            key.clone(),
-            // The credential is not read here. `cdn_settings.credential_ciphertext` is
-            // write-only by design (REQ-011, "Risks") and slice 4 wires the decrypt; until
-            // then an adapter with a stored credential gets `None` and answers honestly
-            // that it is not configured, which is the true state of this build.
-            crate::provider::ProviderSettings {
-                endpoint,
-                zone,
-                credential: None,
-            },
-            max_attempts.clamp(1, 10),
-        ),
+        Some((key, endpoint, zone, stored, _batch, max_attempts)) => {
+            let credential = match stored.as_deref() {
+                None => None,
+                Some(bytes) => match crate::credential::open(&box_, bytes) {
+                    Some(Ok(value)) => Some(value),
+                    Some(Err(error)) => return Err(error),
+                    // Present but not an envelope: a row written before this build, or by
+                    // hand. Absent is the honest reading — there is nothing this build can
+                    // use — and it is exactly the state the panel reports as
+                    // `has_credential: false`.
+                    None => None,
+                },
+            };
+            (
+                key,
+                crate::provider::ProviderSettings {
+                    endpoint,
+                    zone,
+                    credential,
+                },
+                max_attempts.clamp(1, 10),
+            )
+        }
         None => (
             "origin".to_string(),
             crate::provider::ProviderSettings::default(),

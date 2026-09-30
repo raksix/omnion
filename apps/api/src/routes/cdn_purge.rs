@@ -512,10 +512,30 @@ pub async fn put_settings(
         .with_details(json!({ "field": "max_attempts" })));
     }
 
+    // The credential is sealed BEFORE the row is written, so a refused credential never
+    // leaves the rest of the save half-applied. Sealing cannot fail for a reason the
+    // operator can act on after a partial write — a blank or oversized value is refused
+    // above, and the rest is pure CPU — but doing it first means the failure mode is "nothing
+    // was saved" rather than "the endpoint moved and the key did not".
+    let sealed = match input.credential.as_deref() {
+        Some(credential) => Some(
+            omnion_cdn::credential::seal(&omnion_identity::SecretBox::from_env(), credential)
+                .map_err(|error| {
+                    ApiError::bad_request(error.code(), error.to_string())
+                        .with_details(json!({ "field": "credential" }))
+                })?,
+        ),
+        // `None` is "keep whatever is stored". The panel omits the field for exactly this
+        // case, and treating an absent field as a clear would make saving the batch size
+        // silently destroy the operator's key.
+        None => None,
+    };
+
     let row = sqlx::query_as::<_, SettingsRow>(
         "insert into cdn_settings \
-            (site_id, provider, endpoint_url, zone_ref, auto_purge, batch_size, max_attempts, updated_by) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8) \
+            (site_id, provider, endpoint_url, zone_ref, credential_ciphertext, auto_purge, \
+             batch_size, max_attempts, updated_by) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          on conflict do nothing \
          returning id, site_id, provider, endpoint_url, zone_ref, \
                    (credential_ciphertext is not null) as has_credential, auto_purge, batch_size, \
@@ -525,6 +545,7 @@ pub async fn put_settings(
     .bind(&input.provider)
     .bind(&input.endpoint_url)
     .bind(&input.zone_ref)
+    .bind(sealed.as_deref())
     .bind(&input.auto_purge)
     .bind(input.batch_size)
     .bind(input.max_attempts)
@@ -540,10 +561,16 @@ pub async fn put_settings(
     let row = match row {
         Some(row) => row,
         None => {
+            // `credential_ciphertext = coalesce($2, credential_ciphertext)` is the whole
+            // "keep what is stored" contract, in the statement. The alternative — reading
+            // the old value and writing it back — is a race with a concurrent save from
+            // another operator, and it is a `bytea` round trip in application memory, which
+            // is where a credential ends up in a heap dump.
             sqlx::query_as::<_, SettingsRow>(
                 "update cdn_settings \
-                 set provider = $2, endpoint_url = $3, zone_ref = $4, auto_purge = $5, \
-                     batch_size = $6, max_attempts = $7, updated_by = $8 \
+                 set provider = $2, endpoint_url = $3, zone_ref = $4, \
+                     credential_ciphertext = coalesce($5, credential_ciphertext), \
+                     auto_purge = $6, batch_size = $7, max_attempts = $8, updated_by = $9 \
                  where site_id is not distinct from $1 \
                  returning id, site_id, provider, endpoint_url, zone_ref, \
                            (credential_ciphertext is not null) as has_credential, auto_purge, \
@@ -553,6 +580,7 @@ pub async fn put_settings(
             .bind(&input.provider)
             .bind(&input.endpoint_url)
             .bind(&input.zone_ref)
+            .bind(sealed.as_deref())
             .bind(&input.auto_purge)
             .bind(input.batch_size)
             .bind(input.max_attempts)
@@ -570,18 +598,24 @@ pub async fn put_settings(
         }
     };
 
-    // The credential is deliberately NOT written here. `cdn_settings.credential_ciphertext`
-    // is a write-only column by design (REQ-011, "Risks") and wiring a decrypt path is
-    // slice 4; accepting the field here and ignoring it would make the form's "replace
-    // credential" affordance a button that reports success and stores nothing.
+    // The audit entry names that a credential was replaced and never carries its value.
+    // "Was a credential sent?" is the question an incident review asks; "what was it?" is
+    // the question the audit log must never be able to answer, and a metadata key that said
+    // `credential_replaced: true` answers the first without touching the second.
     omnion_audit::record(
         pool,
         NewAuditEntry::by_user(current.user.id, "cdn.settings.updated")
-            .target("cdn_settings", input.site_id.map_or_else(|| "platform".into(), |id| id.to_string()))
+            .target(
+                "cdn_settings",
+                input
+                    .site_id
+                    .map_or_else(|| "platform".into(), |id| id.to_string()),
+            )
             .metadata(json!({
                 "provider": input.provider,
                 "batch_size": input.batch_size,
                 "max_attempts": input.max_attempts,
+                "credential_replaced": sealed.is_some(),
             }))
             .ip_address(address.as_text()),
     )
@@ -756,6 +790,15 @@ pub struct SettingsInput {
     pub batch_size: i32,
     /// Attempt budget, 1–10.
     pub max_attempts: i32,
+    /// The write-only provider credential (REQ-011, slice 4).
+    ///
+    /// Optional, and `None` is the *only* way to keep the stored credential: an empty string
+    /// is a refusal naming the field, because "the field is empty" and "clear the stored
+    /// credential" would otherwise be the same request, and the second one is never what
+    /// the operator meant. Replacing a credential is a deliberate act and gets a deliberate
+    /// body.
+    #[serde(default)]
+    pub credential: Option<String>,
 }
 
 /// `?site_id=` for the routes that accept a platform row.

@@ -38,6 +38,17 @@ pub enum CdnError {
         /// How many ids the caller sent.
         given: usize,
     },
+    /// A write-only provider credential the operator sent was refused. A `4xx`.
+    #[error("{0}")]
+    InvalidCredential(String),
+    /// A credential is stored for this site and this process cannot read it. A `500`.
+    ///
+    /// A separate row from [`CdnError::InvalidCredential`] because the two need opposite
+    /// advice: this one means the *key* is wrong or rotated, and telling the operator to
+    /// paste their credential again would send them away with a working key and no idea
+    /// why it is not being used.
+    #[error("{0}")]
+    CredentialUnreadable(String),
     /// The database refused or was unreachable.
     #[error("cdn storage error: {0}")]
     Store(#[from] sqlx::Error),
@@ -65,6 +76,11 @@ impl CdnError {
             CdnError::DuplicateName { .. } => "duplicate_rule_name",
             CdnError::RuleNotFound { .. } => "cache_rule_not_found",
             CdnError::IncompleteReorder { .. } => "incomplete_reorder",
+            CdnError::InvalidCredential(_) => "invalid_credential",
+            // Deliberately NOT `invalid_credential`. The stored value is fine; this process
+            // cannot read it, and an operator who is told their credential is invalid will
+            // paste it again and see the same refusal with no better information.
+            CdnError::CredentialUnreadable(_) => "credential_unreadable",
             CdnError::Store(error) => match error {
                 sqlx::Error::RowNotFound => "cache_rule_not_found",
                 _ => "cdn_storage_error",
@@ -73,11 +89,19 @@ impl CdnError {
     }
 
     /// Whether this error is the caller's fault, and so a `4xx` rather than a `500`.
+    ///
+    /// `CredentialUnreadable` is the interesting exclusion. The operator did nothing wrong —
+    /// the row is fine and this process holds the wrong key — and answering `400` would put
+    /// a fixable server condition on the "check your input" branch of every client in the
+    /// platform. It is the same shape as a pool timeout: a dependency problem, not a request
+    /// problem.
     #[must_use]
     pub fn is_client_error(&self) -> bool {
         !matches!(
             self,
-            CdnError::Store(sqlx::Error::Io(_)) | CdnError::Store(sqlx::Error::PoolTimedOut)
+            CdnError::Store(sqlx::Error::Io(_))
+                | CdnError::Store(sqlx::Error::PoolTimedOut)
+                | CdnError::CredentialUnreadable(_)
         )
     }
 }
