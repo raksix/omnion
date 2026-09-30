@@ -1,6 +1,6 @@
 # REQ-127 — Reliability Primitives
 
-> **Status:** in-progress (slice 1 is on the request path AND on the screen: the Redis counter, the store, the middleware, the headers on BOTH the served and the refused response, the `429` with `Retry-After`, the panel's policy CRUD, its dry-run and its refusal rollup at `/settings/reliability/limits`, plus the shipped default budgets — `crates/reliability` at 113 unit tests, `apps/api/tests/reliability_limits` at 8/8 individually / 6/8 in one sequential run (see the suite status below — the two stragglers are `sign_in` cost against seven sibling writers, not a product defect), migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database, `apps/admin` `tsc --noEmit` clean) · **Captured:** 2026-09-26 · **Layer:** core + infra
+> **Status:** in-progress (slice 1 is on the request path AND on the screen: the Redis counter, the store, the middleware, the headers on BOTH the served and the refused response, the `429` with `Retry-After`, the panel's policy CRUD, its dry-run and its refusal rollup at `/settings/reliability/limits`, plus the shipped default budgets — `crates/reliability` at 113 unit tests, migration `0165` applied twice with no duplicate rows, `0162` applied and reversed on a scratch database, `apps/admin` `tsc --noEmit` clean. The two stragglers in `apps/api/tests/reliability_limits` are **located, not fixed**: both are a `200` served with no `X-RateLimit-*` headers, which is the `Uncounted` verdict, and it is reachable because `resolve_user_id` treats a session it could not ask PostgreSQL about the same as one that does not exist — see "third pass" below for the measurement, the rejected hypothesis and the fix that is not yet written. The QA browser pass against the screen still has not run· **Captured:** 2026-09-26 · **Layer:** core + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -305,6 +305,81 @@ screen nobody has opened in a browser is not finished. (2) Split the suite's `si
 a full sequential run fits the tick and close the two stragglers. (3) Then REQ-127 slice 2
 (idempotency): `decide`, the fingerprint and `StoredResponse::seal` are in; the store, the
 middleware and the screen are not.
+
+### Slices — progress, third pass: what the two stragglers actually are
+
+Three ticks recorded the suite at "8/8 individually, 6/8 in one sequential run" and named the two
+failures as *`sign_in` cost against seven sibling writers*. That was a reasonable reading and it
+was **wrong**. This pass measured both, on an idle box where the whole suite runs in 125 s, and
+neither failure is a scheduling artefact.
+
+**The evidence, in order.**
+
+- A full sequential run on an idle box: **7/8, then 6/8** — the two names are
+  `a_saved_policy_takes_effect_on_the_next_request_without_a_restart` and
+  `refusals_roll_up_into_one_row_per_window`. Timing is not the variable; the failing PAIR is.
+- The rollup one, isolated: the row said `1` for 3 real refusals. Reproduced the `insert … on
+  conflict … do update … returning xmax = 0` in `psql` by hand: it counts 1 → 2 → 3 correctly. So
+  the store is right, and the walk was reading a different **window** than the one it wrote — the
+  900-second bucket rolled mid-burst, which is the table doing its job (one row *per window*), not
+  a defect. The walk recomputed `window_start` from the clock *after* the burst.
+- The policy one, isolated with the response printed: the first request is `200` with **no
+  `X-RateLimit-*` headers at all**, while the second carries the right policy id and
+  `remaining: 0`. `apply_headers` withholds the headers on exactly one verdict — `Uncounted` — and
+  `enforce` produces it when the winning policy's subject has **no key**, which for a `user`-scoped
+  policy means `resolve_user_id` returned `None`.
+
+**The defect, and it is a product one, in `apps/api/src/reliability_middleware.rs`.**
+`resolve_user_id` is written as `resolve_session(...).await.ok().flatten()?`. `.ok()` turns
+*every* failure into `None`, and the doc comment above it says the `None` is deliberate: "a request
+whose session cannot be resolved … spends the IP budget in the meantime". That reasoning is right
+about the IP budget and wrong about the user budget, because the two failures look identical
+downstream:
+
+- a session that genuinely does not resolve should spend the **IP** budget and nothing else — the
+  request is unattributable and that is a real condition;
+- a session that failed to resolve because PostgreSQL was busy — a pool `acquire_timeout` of 5 s on
+  a box at load 250 — produces the **same** answer, and the signed-in caller's request is then
+  served **uncounted**, with no header saying so, and its budget is gone.
+
+A caller that cannot spend its budget is the failure this whole slice exists to prevent, and it
+arrives from a saturated connection pool rather than from an outage anyone would see. The fix is
+to stop treating "could not ask" as "does not exist": `resolve_user_id` needs to distinguish the
+two, and a request that failed to resolve its session must not be answered `Unlimited` quietly.
+This is **not fixed in this tick** — the diagnosis is measured and the fix has not been written,
+so it is recorded as open rather than claimed.
+
+**Two harness defects found and fixed on the way, both committed with the suite.**
+
+- `install_suite_policy` called `layer.reload(vec![saved])`, and `reload` REPLACES the list, so
+  installing an `ip` policy silently evicted every other budget the process was enforcing. A walk
+  that installs a policy must not disable the budgets around it. The merging alternative was
+  written and measured too, and is **also wrong**: the layer is process-wide and shared by every
+  walk in the binary, so a merge inherits the previous walk's rows, a stale tighter ceiling
+  outranks this walk's, and 5/8 walks then failed with a count of zero. Both are recorded because
+  both fail, and the reason one is right is not obvious from the code.
+- The walk asserted only that the *second* request was refused. A first request served **without
+  being counted** passed that line, the second then arrived as the counter's first, and the walk
+  reported "the saved policy did not take effect" — three lines later, pointing at the store and
+  the reload, neither of which was wrong. The served request's own budget is now asserted, and
+  that is the assertion that located this defect.
+
+**One measurement worth keeping, because it is the most expensive kind of green.** The obvious
+regression test for the suspected cause — a `RedisClient::forget_connection` eviction, so a
+limiter's "retry on a fresh connection" is genuinely fresh — **passes with the fix deleted**. A
+`ConnectionManager` heals a dropped socket transparently, and the server accepted 14 connections
+for 2 attempts, so neither the cache state nor the accept count can tell the fixed code from the
+broken one. That fix was therefore **not** written: it was a hypothesis, it was tested, and it was
+wrong. A green regression test for a defect it never reproduces is worth less than no test.
+
+**Not done, and named.** The QA browser pass against `/settings/reliability/limits` still has not
+run — the `qa-slot.sh` place was held by a sibling for the whole tick and `uptime` read 256 during
+the investigation. A screen nobody has opened in a browser is not finished, and that is unchanged.
+
+**Next.** (1) Fix `resolve_user_id` so a session that could not be asked is not a session that does
+not exist, and make the served request's headers the thing a walk asserts. (2) Get the QA slot and
+run the browser pass against the limits screen. (3) Then REQ-127 slice 2 (idempotency): `decide`,
+the fingerprint and `StoredResponse::seal` are in; the store, the middleware and the screen are not.
 
 **The walk did not run, and the reason is worth more than the slice.** `apps/api/tests/
 reliability_limits.rs` reaches the link step and the link dies with

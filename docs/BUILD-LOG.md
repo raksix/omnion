@@ -5735,3 +5735,49 @@ per scope — so a full run fits the tick and the two can be closed honestly.
 screen nobody has opened in a browser is not finished. (2) Then the `sign_in` split. (3) Then
 REQ-127 slice 2, idempotency: `decide`, the fingerprint and `StoredResponse::seal` are in; the
 store, the middleware and the screen are not.
+
+## 2026-09-29 · wave6 · REQ-127 slice 1 · the two stragglers were a product defect, not a schedule
+
+**What this pass did.** Ran the suite end to end on an idle box (125 s, 7/8), isolated the two
+failures, and measured instead of inferring. Both are the same shape, and it is not the
+`sign_in` cost three ticks assumed.
+
+**The finding.** A signed-in request is answered `200` with **no `X-RateLimit-*` headers at all**.
+`apply_headers` withholds those on exactly one verdict — `Uncounted` — so the request was served
+without being counted and its budget was never spent. `enforce` reaches it when the winning
+`user`-scoped policy's subject has no key, i.e. `resolve_user_id` returned `None`, and that
+function ends in `resolve_session(...).await.ok().flatten()?`: `.ok()` maps a PostgreSQL failure
+(5 s `acquire_timeout`, load 250) onto the same `None` as a session that genuinely does not exist.
+The doc comment calls that deliberate and is right about the IP budget — but a caller that cannot
+spend its budget is the failure this slice exists to prevent, and it now arrives from a saturated
+pool instead of an outage. **Not fixed this tick; located, measured and recorded as open.**
+
+**Proof.**
+- `cargo test -p omnion-reliability --lib` — 113/0.
+- `apps/api/tests/reliability_limits` — full sequential run 7/8 on an idle box, 6/8 with the
+  harness changes below; the two remaining failures both report a count of zero and both name the
+  uncounted request.
+- The rollup's own SQL, run by hand in `psql`: `xmax = 0` upsert counts 1 → 2 → 3 correctly, which
+  is what proved the store innocent and sent the investigation at the window.
+- `pnpm typecheck` not run this tick: the browser pass was blocked, and a typecheck on an
+  unchanged admin tree is not worth the box.
+
+**Two harness defects fixed in the suite, both committed with it.** `install_suite_policy` used
+`layer.reload(vec![saved])`, and `reload` REPLACES — so installing an `ip` policy evicted every
+other budget the process was enforcing. The merging alternative was written, measured and is
+**also** wrong (the layer is process-wide, so a merge inherits the previous walk's rows and 5/8
+walks then failed with a count of zero); both are written down because both fail. And the walk
+now asserts the **first** request's own budget, which is the assertion that located this defect:
+asserting only the second request's refusal let an uncounted first request through with a message
+pointing at the store and the reload.
+
+**One rejected hypothesis, kept because it is the expensive kind of wrong.** The obvious cause —
+a cached `ConnectionManager` making the limiter's "retry on a fresh connection" a second trip down
+one dead socket — was implemented, then proved non-discriminating: the test passed with the fix
+deleted, because the manager heals a socket transparently (14 accepts for 2 attempts). The fix was
+**not** written. A green regression test for a defect it never reproduces is worth less than none.
+
+**Next.** (1) `resolve_user_id` must tell "could not ask" from "does not exist", and a request that
+failed to resolve must not be answered `Unlimited` quietly. (2) Acquire `qa-slot.sh` and run the
+browser pass against `/settings/reliability/limits` — held by a sibling all tick, `uptime` 256.
+(3) Then REQ-127 slice 2 (idempotency).
