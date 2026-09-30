@@ -9168,3 +9168,71 @@ csrf_failed` over a run never executed in a fourth suite proves nothing about th
 **Next.** REQ-011's two unticked boxes still need a browser pass (the instrument exists as
 `04bc7e73`; the run has not happened), and the same scoped pass closes REQ-005's last box. The
 QA slot is held by `w4`'s pass; `w5`'s own orphan waiters are reaped by `/proc/<pid>/cwd`.
+
+## Tick 82 — the filter whose only correct input was a value nobody could know
+
+**What.** `60ff5567` and `9169162f`. Not a slice: a defect the tick found while looking for
+something the QA slot would let it measure, in the same place the last three ticks were
+blocked.
+
+REQ-011's unticked clause is "filters, empty, loading and error states exist on every screen;
+the rows shown match the API counts", and the instrument for it has existed since `04bc7e73`
+without ever having run. Reading the pass instead of waiting for it found that **the filter
+this clause measures could not express its own values.** The purge history's status filter was
+an `<input type="search">` whose raw string went straight to `?status=`. `PurgeStatus::parse`
+returns `None` for anything unrecognised and `PurgeListQuery` deliberately turns that into *no
+filter* rather than a 400 — the right decision for an API, because a chip mid-transition
+should show the unfiltered table rather than an error banner over a screen that works.
+
+That decision is inherited by the control as a hazard, because here the writer is a person.
+Typing `fail` filters nothing. Typing `Failed` filters nothing, because the stored spelling is
+lowercase. The `STATUSES` table with all five labels has been in the file since slice 1,
+written for this control and rendered by nothing — the same shape as tick 81's credential
+field, one layer down: a table describing a value, a field collecting it, and no line joining
+them. It is a `<select>` now, `/` still focuses it so the spec's keyboard line stays true, and
+the `Search` icon and the `HTMLInputElement` ref went with it.
+
+**The second half is the part that generalises.** `runCdnPurgeDepth` drove the control with
+`selectOption("failed")` inside a `.catch(() => {})`. On an `<input>` the call throws, the
+catch ate it, and the pass went on to record `filterNarrows: false` — a line the summary reads
+as *the product's filter does not narrow its rows*. "The harness cannot drive the control" and
+"the control does not work" are the same `false`, and only the second is actionable. The
+interaction has no catch now, and `statusFilterIsSelect` records the control's tag name next to
+the outcome so the two readings cannot collapse into one number again.
+
+Having found the class once, I swept it: every `selectOption` in the 10k-line pass resolved
+against the admin sources — **30 call sites, every one a real `<select>`, no other instance**.
+The sweep needs whitespace-normalised source and the nearest opening tag before each hook; a
+400-character lookback picks up the previous statement's `fill` and invents defects.
+
+**`9169162f` is the other half of the same tick.** `run.sh` wrote its artifacts to
+`$ROOT/qa-artifacts`, which is the shared volume — 97% full, seven worktrees — so the pass that
+writes the most evidence is the one that fills the disk, and the next build then dies with
+`No space left on device`, which reads as a build defect and sends a tick to `rustc`.
+`QA_OUT_ROOT` moves them; the default is unchanged. The pass was launched pointed at
+`/dev/shm`.
+
+**Merge.** `origin/main` was 31 commits ahead, including a second `crates/health` lineage
+that had landed on this branch as an uncommitted chore. Seven files were `add/add` and are
+main's outright (`checkout --theirs`); the eight genuinely shared files were resolved by
+hand. Two of them were worth reading rather than merging: `apps/api/src/main.rs` had the same
+runner list on both sides and only `wave5`'s knew about `cdn_purge_runner`, and
+`apps/api/src/lib.rs` had `module_guard` (REQ-005's module switch) on one side only — taking
+main's side there would have deleted a REQ-005 feature with no conflict marker anywhere
+near it. `docs/BUILD-LOG.md` went through the append-only merger with the exact-multiset
+check, since both sides only add at the tail.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo build -p omnion-api` (post-merge) | `BUILD_EXIT=0`, 4m58s |
+| `cargo test -p omnion-cdn --lib` | **116 passed, 0 failed** |
+| `pnpm typecheck` | 2/2 packages |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| `bash -n scripts/qa/run.sh` | clean |
+| QA pass | **queued** — w3's pass holds the slot and is at route 51 of its list |
+
+**Next.** The CDN-scoped pass is running. Its numbers either tick the two open boxes on this
+REQ or name what is wrong with them. If it comes back green, REQ-011 closes and the queue
+moves to REQ-017's two unticked boxes, which are the same measurement on `/environments`.

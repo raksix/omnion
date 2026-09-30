@@ -218,6 +218,27 @@ Webhook relevance: `cdn.purge.failed` is subscribable so an operations endpoint 
   that would measure it was scoped to the tenant surface, and the CDN scope is the next one. The box
   stays open until a correctly-scoped CDN pass reports the numbers; a measurement that exists but
   has never spoken is not evidence._
+
+  **Tick 82: the filter this clause measures was a control that could not express its own
+  values, so the clause was not merely unmeasured — it was unmeetable.** The purge history's
+  status filter was an `<input type="search">` whose raw string went to `?status=`.
+  `PurgeStatus::parse` returns `None` for anything it does not recognise and the route
+  deliberately turns that into *no filter* rather than a 400, which is the right call for an
+  API and a hazard for a control a person types into: `fail` filters nothing, `Failed` filters
+  nothing because the stored spelling is lowercase, and the screen has no way to say which of
+  those two happened. The `STATUSES` table with all five labels had been in the file since
+  slice 1, written for this control and rendered by nothing. It is a `<select>` now
+  (`60ff5567`), `/` still focuses it so the keyboard line stays honest, and the sweep for the
+  class across the whole pass found 30 `selectOption` call sites and no other instance.
+
+  The second half of that fix is the part worth keeping. `runCdnPurgeDepth` drove the control
+  with `selectOption("failed")` inside a `.catch(() => {})`: on an `<input>` the call throws,
+  the catch ate it, and the pass recorded `filterNarrows: false` — a sentence the summary
+  reads as *the product's filter does not narrow its rows*. "The harness could not drive the
+  control" and "the control does not work" are the same line, and only the second is
+  actionable. There is no catch on that interaction now and the control's tag name is recorded
+  beside the outcome, so the two readings can never collapse into one number again.
+
 - [ ] The CDN screens pass the browser walkthrough with zero high findings.
   _Blocked on the same missing run, and on the box rather than on the CDN code. `free -g` during
   the tick-77 pass: 32 G RAM with 0 free and 25 G of swap in use, six writers compiling at once,
