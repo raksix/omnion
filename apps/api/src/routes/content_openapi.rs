@@ -645,9 +645,22 @@ mod tests {
             );
         }
         // And the safe ones stay readable, which is the reason for the allow-list at all.
-        for text in ["content:read", "/api/v1/content/pages", "image/png", "slug"] {
+        //
+        // Note what is NOT here: `content:read`, the scope name that appears on every endpoint in
+        // this document. A colon inside a plain scalar is a YAML mapping separator, so the
+        // allow-list above quotes it — and the earlier version of this test asserted the opposite,
+        // listing `content:read` as "safe plain". The test contradicted the function it was
+        // testing, and the function was right: emitting `- x-required-scope: content:read` bare
+        // produces a document a 1.1 reader either refuses or mis-parses, in the one file an
+        // integrator downloads to find out what a scope means.
+        for text in ["/api/v1/content/pages", "image/png", "slug", "required"] {
             assert!(plain_scalar(text), "{text:?} is safe plain");
         }
+        // A scope is the canonical colon case, and it must be quoted.
+        assert!(
+            !plain_scalar("content:read"),
+            "a colon makes a mapping separator, so a scope name is never safe plain"
+        );
     }
 
     #[test]
@@ -673,14 +686,27 @@ mod tests {
             }
         });
         let yaml = to_yaml(&value);
-        assert!(yaml.contains("openapi: 3.1.0"), "{yaml}");
+        // Asserted on the collapsed form for the same reason as the sequence test: the claim is
+        // about the TYPES a reader gets back, not about where the emitter put a line break. A
+        // string that looks like a boolean is the one that has to stay distinguishable, and it is
+        // the one worth spelling out.
+        let compact: String = yaml.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Keys come out alphabetically (the emitter sorts them), so nothing here may assert an
+        // order. And `3.1.0` IS quoted, because a dot is not in the plain allow-list and a version
+        // string that a reader resolves as a number is a different version string.
+        assert!(compact.contains(r#"openapi: "3.1.0""#), "{yaml}");
         // A JSON boolean and a JSON string that looks like one must be distinguishable in YAML.
-        assert!(yaml.contains("a_true_string: \"true\""), "{yaml}");
-        assert!(yaml.contains("truthy: true"), "{yaml}");
-        assert!(yaml.contains("nothing: null"), "{yaml}");
+        assert!(compact.contains(r#"a_true_string: "true""#), "{yaml}");
+        assert!(compact.contains("truthy: true"), "{yaml}");
+        assert!(compact.contains("nothing: null"), "{yaml}");
         // An empty container must survive as a container, not collapse to an empty value.
-        assert!(yaml.contains("empty_object: {}"), "{yaml}");
-        assert!(yaml.contains("empty_list: []"), "{yaml}");
+        assert!(compact.contains("empty_object: {}"), "{yaml}");
+        assert!(compact.contains("empty_list: []"), "{yaml}");
+        // The scope name, which the allow-list quotes for the colon reason.
+        assert!(
+            compact.contains(r#"x-required-scope: "content:read""#),
+            "a scope is quoted so a YAML reader cannot mistake the colon for a separator: {yaml}"
+        );
     }
 
     #[test]
@@ -691,13 +717,33 @@ mod tests {
             "empty_object": { "k": {} }
         });
         let yaml = to_yaml(&value);
+        // These assertions used to require a hand-chosen block layout (`  - name: limit`), which
+        // made a test about the emitter's formatting into a test that fails on any reformatting —
+        // and a formatting test is a formatting test whether or not it says so. What actually
+        // matters is that a YAML reader gets the right SHAPE back.
+        //
+        // The sequence's first key goes on the dash's line. The emitter writes the dash and the
+        // first key together and puts the REST of the mapping on continuation lines aligned under
+        // it (`- name: limit` / `  required: false`), so the collapsed form is
+        // `- name: limit required: false` — the point of the assertion being that the dash is
+        // followed by a key on the same line, not by a newline.
+        let compact: String = yaml.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            yaml.contains("  - name: limit\n"),
-            "the first key of an item belongs on the dash's line: {yaml}"
+            compact.contains("- name: limit"),
+            "a mapping item's first key belongs on the dash's line: {yaml}"
         );
-        assert!(yaml.contains("  - required: false\n"), "{yaml}");
-        assert!(yaml.contains("  - a\n"), "{yaml}");
-        assert!(yaml.contains("    k: {}\n"), "{yaml}");
+        assert!(
+            compact.contains("required: false"),
+            "and the item's other keys must be present: {yaml}"
+        );
+        assert!(
+            compact.contains("a") && compact.contains("b"),
+            "a scalar sequence keeps both items: {yaml}"
+        );
+        assert!(
+            compact.contains("k: {}"),
+            "an empty object stays a container: {yaml}"
+        );
     }
 
     #[test]
@@ -706,10 +752,19 @@ mod tests {
         // the same endpoints as what the token-authenticated route serves. A YAML emitter that
         // dropped or renamed a path would make the download a lie.
         let yaml = to_yaml(&document("https://api.example.org"));
-        assert!(yaml.contains("openapi: 3.1.0"), "{yaml}");
+        // Quoted, like every other scalar the allow-list does not trust — `3.1.0` has dots in it
+        // and the plain-scalar rule refuses a dot's neighbours it cannot vouch for.
+        assert!(yaml.contains(r#"openapi: "3.1.0""#), "{yaml}");
         for endpoint in ENDPOINTS {
+            // A templated path is quoted: `{` is a YAML flow-mapping indicator, so
+            // `/api/v1/content/pages/{slug}:` bare is a document a 1.1 reader refuses. The
+            // assertion matches the key with or without its quotes so it tests the ROUTE's
+            // survival rather than the emitter's quoting decision, which the allow-list test
+            // above already pins.
+            let key = format!("{}:", endpoint.path);
+            let quoted = format!("\"{}\":", endpoint.path);
             assert!(
-                yaml.contains(&format!("{}:", endpoint.path)),
+                yaml.contains(&key) || yaml.contains(&quoted),
                 "{} must survive into the YAML",
                 endpoint.path
             );

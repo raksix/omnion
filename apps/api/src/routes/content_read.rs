@@ -72,19 +72,36 @@ impl ContentToken {
 
     /// The site a request addresses, intersected with the token's own scope.
     ///
-    /// `Ok(None)` means every site of the organization, which is only reachable when the caller
-    /// named none: naming a site that the token is not scoped to yields an empty result rather
-    /// than a refusal, and the caller cannot tell a site that does not exist from a site that
-    /// holds nothing they may read.
+    /// `Ok(None)` means **every site of the organization**, and it is reachable only when the
+    /// caller named none AND the token is organization-wide. Naming a site the token is not
+    /// scoped to yields an empty result rather than a refusal, and the caller cannot tell a site
+    /// that does not exist from a site that holds nothing they may read.
+    ///
+    /// The out-of-scope case returns [`SITE_OUT_OF_SCOPE`] — a **sentinel the SQL never matches**,
+    /// not `Uuid::nil()`. The earlier version returned the nil UUID and the call sites stripped it
+    /// back to `None` with `.filter(|site| *site != Uuid::nil())`, which is exactly backwards: the
+    /// strip turned "match nothing" into "match every site", so a single-site token asking about
+    /// another site read **that other site's published pages** with a `200`. A sentinel is only
+    /// safe if nothing in the chain can remove it, and that chain is three call sites deep — so
+    /// the value carried here is a real UUID that no site can hold, and the SQL's
+    /// `p.site_id = $n` does the rest.
     pub fn site_filter(&self, requested: Option<Uuid>) -> Result<Option<Uuid>, ApiError> {
         match (self.0.token.site_id, requested) {
             (None, _) => Ok(requested),
             (Some(scoped), None) => Ok(Some(scoped)),
             (Some(scoped), Some(asked)) if asked == scoped => Ok(Some(asked)),
-            (Some(_), Some(_)) => Ok(Some(Uuid::nil())),
+            (Some(_), Some(_)) => Ok(Some(SITE_OUT_OF_SCOPE)),
         }
     }
 }
+
+/// A site id no site can hold, used to answer "out of scope" as an empty result.
+///
+/// Deliberately *not* [`Uuid::nil`]: nil was the earlier sentinel and two call sites removed it
+/// before the query ran, which turned the refusal into a full-table read. A value that is merely
+/// unlikely can be stripped by accident; this one cannot be produced by any insert, and the test
+/// that pins it checks the value the **SQL receives** rather than the value this function returns.
+pub const SITE_OUT_OF_SCOPE: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
 
 impl FromRequestParts<AppState> for ContentToken {
     type Rejection = ApiError;
@@ -316,9 +333,10 @@ struct ListRequest {
 impl ListRequest {
     /// Validate a page/post list call.
     fn for_pages(token: &ContentToken, query: &ContentListQuery) -> Result<Self, ApiError> {
-        let site_id = token
-            .site_filter(query.site)?
-            .filter(|site| *site != Uuid::nil());
+        // No `.filter(...)` here, and that omission is the fix: the filter was there to strip an
+        // out-of-scope sentinel and it stripped the *wrong* meaning. `site_filter` now returns
+        // `SITE_OUT_OF_SCOPE` for that case, so it has to reach the SQL untouched.
+        let site_id = token.site_filter(query.site)?;
         Ok(Self {
             site_id,
             locale: query
@@ -353,9 +371,7 @@ impl ListRequest {
     /// Validate a media list call.
     fn for_media(token: &ContentToken, query: &MediaListQuery) -> Result<Self, ApiError> {
         Ok(Self {
-            site_id: token
-                .site_filter(query.site)?
-                .filter(|site| *site != Uuid::nil()),
+            site_id: token.site_filter(query.site)?,
             locale: None,
             limit: limit_of(query.limit)?,
             sort: sort_of(query.sort.as_deref())?,
@@ -648,11 +664,28 @@ async fn list_pages_of_type(
 }
 
 /// The value a cursor stores for a row, in the sort the request asked for.
+///
+/// **Timestamps go into the cursor as RFC 3339, not as the driver's `Display`.** That is the
+/// whole fix for a pagination walk that returned page one forever: `OffsetDateTime::to_string()`
+/// writes `2026-09-30 21:53:21.509904 +00:00:00`, the consumer above parses with `Rfc3339`, the
+/// parse fails, and — because the failure happens while *building* the keyset predicate — the
+/// request answers `400` for every page after the first. A caller paging through five rows saw
+/// two rows and a `next_cursor: null` and concluded the set was smaller than it was.
+///
+/// The two ends of a round trip live in different files (`encode` in the store, the predicate
+/// here), so the format is pinned on **both** sides by name rather than left to whichever
+/// `Display` happens to be in scope. `sort_value_of` is the writer; the `Rfc3339` parse above is
+/// the reader; this comment is the contract between them.
 fn sort_value_of(row: &sqlx::postgres::PgRow, sort: SortKey) -> String {
+    fn stamp(value: OffsetDateTime) -> String {
+        value
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| value.to_string())
+    }
     match sort {
         SortKey::Title => row.get::<String, _>("title"),
-        SortKey::CreatedAt => row.get::<OffsetDateTime, _>("created_at").to_string(),
-        SortKey::UpdatedAt => row.get::<OffsetDateTime, _>("updated_at").to_string(),
+        SortKey::CreatedAt => stamp(row.get::<OffsetDateTime, _>("created_at")),
+        SortKey::UpdatedAt => stamp(row.get::<OffsetDateTime, _>("updated_at")),
     }
 }
 
@@ -1040,18 +1073,76 @@ mod tests {
                 .expect("allowed"),
             Some(Uuid::from_u128(20))
         );
-        // Asking for another site yields the nil filter, which the query turns into "no rows" —
-        // not a 403, which would confirm the site exists.
+        // Asking for another site yields a filter that matches NO site — not a 403, which would
+        // confirm the site exists.
         assert_eq!(
             scoped
                 .site_filter(Some(Uuid::from_u128(21)))
                 .expect("filtered"),
-            Some(Uuid::nil())
+            Some(SITE_OUT_OF_SCOPE)
         );
         // And asking for nothing reads its own site.
         assert_eq!(
             scoped.site_filter(None).expect("own site"),
             Some(Uuid::from_u128(20))
+        );
+    }
+
+    /// The out-of-scope sentinel must survive the whole chain into the query.
+    ///
+    /// The bug this pins is a **cross-site read**: `site_filter` returned `Uuid::nil()` and both
+    /// call sites stripped it with `.filter(|site| *site != Uuid::nil())` before binding, so
+    /// "match nothing" became "no site predicate" — and a single-site token asking about another
+    /// site got that site's published pages back with a `200`. The unit test above passed the
+    /// whole time, because it asserted the value `site_filter` *returned* and never the value the
+    /// SQL *received*.
+    ///
+    /// So the assertion here is on `ListRequest`, which is what the query builder reads.
+    #[test]
+    fn the_out_of_scope_sentinel_reaches_the_query_instead_of_being_stripped() {
+        let scoped = ContentToken(AuthenticatedToken {
+            token: omnion_content::api_tokens::ApiToken {
+                id: Uuid::nil(),
+                organization_id: Uuid::from_u128(1),
+                site_id: Some(Uuid::from_u128(20)),
+                name: "frontend".into(),
+                prefix: "omn_00000000".into(),
+                scopes: vec!["content:read".into()],
+                allowed_origins: vec![],
+                rate_limit_per_minute: 120,
+                expires_at: None,
+                revoked_at: None,
+                last_used_at: None,
+                created_by: None,
+                created_at: OffsetDateTime::now_utc(),
+            },
+        });
+        let query = ContentListQuery {
+            site: Some(Uuid::from_u128(21)),
+            ..ContentListQuery::default()
+        };
+        let request = ListRequest::for_pages(&scoped, &query).expect("a filtered list is valid");
+        assert_eq!(
+            request.site_id,
+            Some(SITE_OUT_OF_SCOPE),
+            "a site predicate must be bound; None would read every site"
+        );
+        // And the media list, which had the identical strip, must not have it either.
+        let media = MediaListQuery {
+            site: Some(Uuid::from_u128(21)),
+            ..MediaListQuery::default()
+        };
+        let media_request = ListRequest::for_media(&scoped, &media).expect("a filtered list is valid");
+        assert_eq!(media_request.site_id, Some(SITE_OUT_OF_SCOPE));
+    }
+
+    /// The sentinel must not be a value a site could ever hold, and `Uuid::nil()` is out.
+    #[test]
+    fn the_out_of_scope_sentinel_is_not_the_nil_uuid() {
+        assert_ne!(
+            SITE_OUT_OF_SCOPE,
+            Uuid::nil(),
+            "nil was the earlier sentinel and two call sites stripped it before the query ran"
         );
     }
 

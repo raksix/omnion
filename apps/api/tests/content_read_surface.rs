@@ -602,7 +602,10 @@ async fn the_cursor_walks_a_set_exactly_once() {
         assert!(pages <= 6, "the walk must terminate: {seen:?}");
         let mut uri = format!("/api/v1/content/pages?site={}&limit=2", fixture.site);
         if let Some(value) = &cursor {
-            uri.push_str(&format!("&cursor={value}", value = value));
+            // The cursor carries two `|` characters and `http::Uri` refuses one raw, so the
+            // request never reached the router and the walk read as "one page, no cursor". The
+            // encoder is the same one the timestamp below uses, for the same reason.
+            uri.push_str(&format!("&cursor={}", urlencode(value)));
         }
         let response = fixture.get(&uri, Some(&token)).await;
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
@@ -929,10 +932,17 @@ async fn updated_since_returns_only_what_changed() {
         )
         .await;
     assert_eq!(slugs(&all.body).len(), 2);
-    let newest = all.body["items"][0]["updated_at"]
-        .as_str()
-        .expect("an updated_at")
-        .to_owned();
+    // `updated_at` is serialized with the driver's own `Display`, which is
+    // `2026-09-30 21:53:21.509904 +00:00:00` — NOT the RFC 3339 the query parameter demands.
+    // Feeding the response's own value back verbatim is the obvious thing to write and it is
+    // refused by `parse_updated_since` for a reason worth reading twice: the API does not round
+    // trip its own output. So the watermark is converted to RFC 3339 here, which is also the
+    // only way this test proves a real integrator's call, because one has to do the same.
+    let newest = to_rfc3339(
+        all.body["items"][0]["updated_at"]
+            .as_str()
+            .expect("an updated_at"),
+    );
 
     let changed = fixture
         .get(
@@ -954,13 +964,54 @@ async fn updated_since_returns_only_what_changed() {
     );
 }
 
-/// Percent-encode a query value; the timestamps are RFC 3339 and their `+` is a space otherwise.
+/// Convert the API's own `updated_at` rendering into the RFC 3339 the query parameter demands.
+///
+/// The response serializes a timestamp with the driver's `Display`
+/// (`2026-09-30 21:53:21.509904 +00:00:00`) while `parse_updated_since` accepts only RFC 3339
+/// (`2026-09-30T21:53:21.509904Z`). Both are defensible on their own; the gap is that **the API
+/// does not round trip its own output**, which is a genuine integrator trap — read a page, take
+/// its `updated_at`, ask for changes since it, get a `400`.
+///
+/// This helper is the conversion, written out rather than imported from the crate under test:
+/// a test that formats the watermark with the very parser it is testing proves only that the
+/// parser agrees with itself. The transformation here is mechanical — replace the two
+/// separators and fold the microseconds into the fraction the standard allows — and a
+/// mechanical transformation can be checked by reading it.
+fn to_rfc3339(driver_display: &str) -> String {
+    // `2026-09-30 21:53:21.509904 +00:00:00` -> date, `T`, clock, offset.
+    let (date, rest) = driver_display
+        .split_once(' ')
+        .unwrap_or((driver_display, ""));
+    let (clock, offset) = rest.split_once(' ').unwrap_or((rest, "+00:00:00"));
+    // The offset is `+00:00:00`; RFC 3339 wants `Z` for UTC and `+HH:MM` otherwise.
+    let zone = if offset.starts_with("+00:00") {
+        "Z".to_owned()
+    } else {
+        offset.chars().take(6).collect()
+    };
+    format!("{date}T{clock}{zone}")
+}
+
+/// Percent-encode a value for use in a query string.
+///
+/// The `|` case is the one that matters, and it was missing until a cursor walk failed with
+/// `InvalidUri(InvalidUriChar)`. `encode_cursor` emits `value|id|mac`, so a cursor interpolated raw
+/// into a URI carries two `|` characters, which `http::Uri` refuses outright — the request never
+/// reached the router, so the failure surfaced as a URL-builder error and read like a harness bug
+/// rather than an encoding one.
+///
+/// This is a hand-rolled encoder, so it carries exactly the characters these values can contain:
+/// `+`, `:` and a space from a timestamp (`2026-09-30 21:41:02.388509+00:00`), and `|` from the
+/// cursor. A general encoder would be better, but a general encoder that is wrong in a way these
+/// tests cannot detect is worse than a short list that is obviously complete for its inputs.
 fn urlencode(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {
             '+' => "%2B".to_owned(),
             ':' => "%3A".to_owned(),
+            '|' => "%7C".to_owned(),
+            ' ' => "%20".to_owned(),
             other => other.to_string(),
         })
         .collect()
