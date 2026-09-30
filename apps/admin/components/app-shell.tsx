@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, FileText, Fingerprint, Globe, HardDriveDownload, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, X } from "lucide-react";import Link from "next/link";
+import { Activity, BarChart3, Bell, BookMarked, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Grid3x3, HardDriveDownload, History as HistoryIcon, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Wrench, X } from "lucide-react";import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { SiteSwitcher } from "@/components/site-switcher";
@@ -43,6 +43,14 @@ const NAV = [
   // The skills registry (REQ-099, slice 3) is its own entry because it is a *library* rather
   // than a runtime screen: an operator maintains the guidance here and attaches it over there.
   { href: "/ai/skills", label: "Skills", icon: BookMarked },
+  // The tool registry, the identities that grant them, and the matrix that shows both
+  // (REQ-100). Three entries because they answer three different questions in the order an
+  // operator asks them: what exists → what this organization decided → who ends up able to use
+  // it. The registry entry was missing from the nav entirely until now, which is the sort of
+  // omission that makes a finished feature look unfinished.
+  { href: "/ai/tools", label: "Tool registry", icon: Wrench },
+  { href: "/ai/identities", label: "AI identities", icon: ShieldCheck },
+  { href: "/ai/permissions", label: "AI permissions", icon: Grid3x3 },
   { href: "/ai/runs", label: "Agent runs", icon: HistoryIcon },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },

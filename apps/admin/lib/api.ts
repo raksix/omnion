@@ -6305,6 +6305,183 @@ export type AiToolUsageChart = {
   series: { day: string; calls: number; errors: number; avg_duration_ms: number | null }[];
 };
 
+// ---- AI identities and the permission matrix (REQ-100 slice 2) ----------------------------
+//
+// The tri-state is a *string union*, not a boolean and not `boolean | null`. A cell that a
+// client cannot distinguish from "unset" is a cell a client will guess about, and the guess is
+// always "allow" — which for a permission matrix is the dangerous direction. The API sends
+// `"inherit"` explicitly so a toggle back to the default state is a value, not an omission.
+
+/** The three states one matrix cell can be in. Inherit writes no row. */
+export type AiGrantEffect = "allow" | "deny" | "inherit";
+
+/** One identity, as the list and the detail render it. */
+export type AiIdentity = {
+  id: string;
+  /** `null` is the platform-level identity, shared by every organization. */
+  organization_id: string | null;
+  key: string;
+  name: string;
+  description: string;
+  is_default: boolean;
+  platform_level: boolean;
+  /** Decided allow cells. Inherit is not counted: it is the absence of a decision. */
+  allowed: number;
+  denied: number;
+  agents_using: number;
+  updated_at: string;
+};
+
+/** The identity table's body. */
+export type AiIdentityList = { identities: AiIdentity[]; own: number };
+
+/** One row of the identity's grant editor — every tool, not only the decided ones. */
+export type AiIdentityToolCell = {
+  tool_key: string;
+  class: string;
+  risk: string;
+  /** The permission the tool itself needs, shown so a cell's sensitivity is legible. */
+  permission: string;
+  enabled: boolean;
+  requires_approval: boolean;
+  effect: AiGrantEffect;
+};
+
+/** One identity with its whole grant editor. */
+export type AiIdentityDetail = AiIdentity & { tools: AiIdentityToolCell[] };
+
+/** A grant map: `tool_key → effect`. Inherit is present in the map and writes no row. */
+export type AiIdentityGrants = { grants: Record<string, AiGrantEffect> };
+
+/** One row of the matrix. */
+export type AiMatrixTool = {
+  key: string;
+  class: string;
+  risk: string;
+  description: string;
+  permission: string;
+  enabled: boolean;
+  requires_approval: boolean;
+  ungated_high_risk: boolean;
+};
+
+/** One agent's column. A tool absent from `tools` is "not in the agent's list". */
+export type AiMatrixAgentColumn = {
+  id: string;
+  key: string;
+  name: string;
+  enabled: boolean;
+  tools: string[];
+  approvals: string[];
+};
+
+/** One identity's column — the cells that actually carry a real tri-state. */
+export type AiMatrixIdentityColumn = {
+  id: string;
+  key: string;
+  name: string;
+  is_default: boolean;
+  platform_level: boolean;
+  /** Decided cells only; anything else is inherit. */
+  grants: Record<string, AiGrantEffect>;
+};
+
+/** The whole grid, with the viewer's own permissions so disabled cells can be explained. */
+export type AiPermissionMatrix = {
+  tools: AiMatrixTool[];
+  agents: AiMatrixAgentColumn[];
+  identities: AiMatrixIdentityColumn[];
+  /** The tool permissions the caller holds. */
+  viewer_permissions: string[];
+  /** `tool_key → the permissions the caller is missing`, named so the cell can say which. */
+  viewer_missing: Record<string, string[]>;
+};
+
+/** The identities table. */
+export function fetchAiIdentities(
+  organizationId?: string | null,
+): Promise<AiIdentityList> {
+  return request<AiIdentityList>(
+    `/api/v1/ai/identities${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** One identity with its whole grant editor. */
+export function fetchAiIdentity(
+  id: string,
+  organizationId?: string | null,
+): Promise<AiIdentityDetail> {
+  return request<AiIdentityDetail>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** Create an identity. */
+export function createAiIdentity(
+  body: { key: string; name: string; description?: string; is_default?: boolean },
+  organizationId?: string | null,
+): Promise<AiIdentity> {
+  return request<AiIdentity>(`/api/v1/ai/identities${toolScopeParams(organizationId)}`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Rename, re-describe or promote an identity. An absent field is left as it is. */
+export function updateAiIdentity(
+  id: string,
+  changes: { name?: string; description?: string; is_default?: boolean },
+  organizationId?: string | null,
+): Promise<AiIdentity> {
+  return request<AiIdentity>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
+    { method: "PATCH", body: JSON.stringify(changes) },
+  );
+}
+
+/** Remove an identity and, with it, its grants. */
+export function deleteAiIdentity(
+  id: string,
+  organizationId?: string | null,
+): Promise<void> {
+  return request<void>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}${toolScopeParams(organizationId)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One identity's decided grants. */
+export function fetchAiIdentityGrants(
+  id: string,
+  organizationId?: string | null,
+): Promise<AiIdentityGrants> {
+  return request<AiIdentityGrants>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}/tools${toolScopeParams(organizationId)}`,
+  );
+}
+
+/** Replace one identity's whole grant map. Inherit in the map writes no row. */
+export function saveAiIdentityGrants(
+  id: string,
+  grants: Record<string, AiGrantEffect>,
+  organizationId?: string | null,
+): Promise<AiIdentityGrants> {
+  return request<AiIdentityGrants>(
+    `/api/v1/ai/identities/${encodeURIComponent(id)}/tools${toolScopeParams(organizationId)}`,
+    { method: "PUT", body: JSON.stringify({ grants }) },
+  );
+}
+
+/** The full tool × (agents, identities) grid. */
+export function fetchAiPermissionMatrix(
+  organizationId?: string | null,
+): Promise<AiPermissionMatrix> {
+  return request<AiPermissionMatrix>(
+    `/api/v1/ai/permissions/matrix${toolScopeParams(organizationId)}`,
+  );
+}
+
+
 function toolScopeParams(organizationId?: string | null): string {
   return organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
 }
