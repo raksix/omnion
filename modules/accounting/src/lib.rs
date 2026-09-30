@@ -24,6 +24,9 @@
 //!   than by a flag the next route can forget.
 //! * [`journal`] — the entries, and the posting path that writes the lines and both totals in
 //!   one statement.
+//! * [`reports`] — the four read-only questions (income/expense, aging, cashflow, tax), where
+//!   **the export and the screen call the same function**, so a CSV cannot disagree with the
+//!   table it was exported from.
 
 #![forbid(unsafe_code)]
 
@@ -36,6 +39,7 @@ pub mod journal;
 pub mod model;
 pub mod money;
 pub mod payments;
+pub mod reports;
 pub mod store;
 
 pub use accounts::{
@@ -57,5 +61,11 @@ pub use journal::{
 pub use payments::{
     AllocationInput, AllocationState, AllocationView, NewPayment, PaymentMethod, PaymentSummary,
     PaymentView, SettledInvoice,
+};
+pub use reports::{
+    AgingBucket, AgingBucketTotal, AgingReport, AgingRow, CashflowReport, CashflowRow, CashflowTotals,
+    IncomeExpenseReport, IncomeExpenseRow, IncomeExpenseTotals, Period, ReportKind, ReportKindName,
+    ReportMeta, ReportPayload, TaxSummaryReport, TaxSummaryRow, TaxTotals, days_past_due,
+    read_report, read_report_in,
 };
 pub use store::Page;
