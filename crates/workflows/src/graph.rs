@@ -970,45 +970,52 @@ pub fn validate_with_plugins(
         }
     }
 
-    // A node the linear walk cannot choose between.
+    // **The count is over EDGES, not over distinct port keys, and the tick-39 version got
+    // that wrong.** The check first counted how many *ports* a node left on, which refused a
+    // switch with `case_1` and `default` both wired — and stayed quiet about the same node
+    // carrying two edges on **one** of those ports. Every other check was quiet about it too:
+    // `duplicate_edge` keys on the `(source, port, target)` triple, and two different targets
+    // are two different triples.
     //
-    // `find_cycle` follows every edge out of a node (that was the tick-38 fix), and the
-    // projection is the consumer that has to *pick* one, because the v0 engine executes an
-    // ordered list. It used to pick with `find(|edge| … follows(port))` — the first matching
-    // edge in the saved array — which means a node carrying two edges on ports the walk
-    // follows (`case_1` and `default` on a switch; two `out` edges) resolved to whichever one
-    // the client happened to serialise first.
+    // So a node with `case_1` wired to two targets validated CLEAN and then walked to
+    // whichever target came first in the saved array. That is the same wrong-run bug the
+    // port version was written for, one shape narrower, and it was introduced by the fix —
+    // which is the reason the invariant is stated as "two followed edges out of one node"
+    // rather than "two followed ports". The traversal picks an *edge*; a check that counts
+    // ports is counting the wrong collection.
     //
-    // That is a wrong-run bug dressed as a working feature: the rule validates clean, and it
-    // silently runs the other branch on every execution. Worse, the answer is not a property
-    // of the drawing at all — re-saving the identical graph with the edges in a different
-    // order would change what it does.
-    //
-    // So it is refused here, at write time, naming the ports. Two walkable ports on one node
-    // is not a shape the engine can execute, and the author needs to hear that from the
-    // problems panel rather than from a run that did the wrong thing.
-    let mut walkable: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    // A target repeated on the *same* port is `duplicate_edge`'s job and stays there: it is a
+    // different mistake with a different sentence, and folding it in here would report the
+    // same drawing twice for one cause.
+    let mut walked: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
     for edge in &graph.edges {
         if follows(edge.source_port.as_str()) {
-            let entry = walkable.entry(edge.source.as_str()).or_default();
-            if !entry.contains(&edge.source_port.as_str()) {
-                entry.push(edge.source_port.as_str());
-            }
+            walked
+                .entry(edge.source.as_str())
+                .or_default()
+                .push((edge.source_port.as_str(), edge.target.as_str()));
         }
     }
-    for (source_id, ports) in &walkable {
-        if ports.len() < 2 {
+    for (source_id, out) in &walked {
+        // Distinct (port, target) pairs: two edges on one port pointing at the SAME target
+        // are a duplicate edge, not a choice, and are reported by the check above.
+        let mut choices: Vec<&str> = out.iter().map(|(port, _)| *port).collect();
+        choices.sort_unstable();
+        choices.dedup();
+        let ambiguous = choices.len() >= 2 || out.len() >= 2 && distinct_targets(out) >= 2;
+        if !ambiguous {
             continue;
         }
         let label = graph
             .node(source_id)
             .map_or(*source_id, |node| node.label.as_str());
+        let ports: Vec<&str> = choices.clone();
         findings.push(Finding::error(
             "ambiguous_branch",
             format!(
-                "{:?} leaves on two ports the run follows ({}), so the engine cannot tell \
-                 which one to take — connect one of them to something else, or route the \
-                 other through a condition",
+                "{:?} leaves on more than one connection the run follows ({}), so the engine \
+                 cannot tell which one to take — connect one of them to something else, or route \
+                 the other through a condition",
                 label,
                 ports.join(", ")
             ),
@@ -1569,6 +1576,20 @@ fn follows(port: &str) -> bool {
     matches!(port, "out" | "true" | "success" | "case_1" | "default")
 }
 
+/// How many different nodes a node's followed edges point at.
+///
+/// The ambiguous-branch check needs both numbers and they mean different things: the number
+/// of *ports* answers "could the walk have chosen a different arm", and the number of
+/// *targets* answers "did the author wire the same arm twice". A duplicate on one port
+/// pointing at one node is `duplicate_edge`'s finding — a re-drawn line, not a choice — so
+/// it must not also be reported as a branch the engine cannot pick.
+fn distinct_targets(out: &[(&str, &str)]) -> usize {
+    let mut targets: Vec<&str> = out.iter().map(|(_, target)| *target).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets.len()
+}
+
 /// The step one node projects onto.
 fn step_for(node: &Node, node_type: &NodeType, graph: &Graph) -> Result<StepDefinition> {
     let name = node.label.clone();
@@ -2029,8 +2050,8 @@ mod tests {
         let err = project(&graph).expect_err("a switch with two walkable ports is not walkable");
         let rendered = format!("{err:?}");
         assert!(
-            rendered.contains("two") && (rendered.contains("case_1") || rendered.contains("port")),
-            "the refusal names the ports rather than picking one: {rendered}"
+            rendered.contains("case_1") && rendered.contains("default"),
+            "the refusal names BOTH ports rather than picking one: {rendered}"
         );
 
         // And the array order must not decide: reversing it has to produce the SAME
@@ -2044,6 +2065,76 @@ mod tests {
             "the verdict is a property of the drawing, not of the saved array order"
         );
     }
+
+    #[test]
+    fn a_node_with_two_edges_on_one_walked_port_is_refused_rather_than_guessed() {
+        // **The tick-39 fix counted PORTS; the traversal picks an EDGE.** The sibling of
+        // `a_node_with_two_followed_ports_is_refused_rather_than_guessed`, one step down,
+        // and it is the same failure the whole pair is about — a rule that validates clean
+        // and then runs whichever target the client serialised first.
+        //
+        // The shape: `case_1` wired to *two* different targets. There is one walkable port
+        // here, so `ambiguous_branch` sees a set of size one and stays quiet, and the
+        // `duplicate_edge` check keys on the `(source, port, target)` triple — two different
+        // targets are two different triples, so it is quiet too. Every check says the
+        // drawing is fine.
+        //
+        // And the run is not fine. `project` resolves the next node with a `find` over the
+        // saved array, so this walks to whichever of the two `case_1` edges comes first. An
+        // author who wired a second case arm "just to be safe" gets a rule that silently
+        // ignores it, in the order they happened to save it.
+        //
+        // So the count has to be over **edges out of a node on a walked port**, not over
+        // distinct port keys — a node with two followed edges is un-walkable whatever the
+        // port keys are, and `duplicate_edge` already owns the case where the two agree on
+        // the target as well.
+        let mut sw = node("sw", "switch");
+        sw.params = json!({ "cases": "a\nb" });
+        let graph = Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                sw,
+                action("first"),
+                action("second"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "sw".to_owned() },
+                // Two edges, ONE port, two targets.
+                Edge { id: "e1".to_owned(), source: "sw".to_owned(), source_port: "case_1".to_owned(), target: "first".to_owned() },
+                Edge { id: "e2".to_owned(), source: "sw".to_owned(), source_port: "case_1".to_owned(), target: "second".to_owned() },
+                Edge { id: "e3".to_owned(), source: "first".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+                Edge { id: "e4".to_owned(), source: "second".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+            ],
+        };
+
+        let findings = validate(&graph);
+        let codes: Vec<&str> = findings
+            .iter()
+            .map(|finding| finding.code.as_str())
+            .collect();
+        assert!(
+            codes.contains(&"ambiguous_branch"),
+            "two edges on one walked port is the same un-walkable node as two walked ports: {codes:?}"
+        );
+
+        // And the projection must refuse it rather than picking one. This is the assertion
+        // that was GREEN before the fix: `project` returned a step list, because `find`
+        // found the first `case_1` edge and the graph was never in question.
+        let err = project(&graph).expect_err("two edges on one walked port is not walkable");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("case_1"),
+            "the refusal names the port rather than picking a target: {rendered}"
+        );
+
+        // Order independence again — the property the old `find` got wrong.
+        let mut reversed = graph.clone();
+        reversed.edges.swap(1, 2);
+        let err2 = project(&reversed).expect_err("order must not change the verdict");
+        assert_eq!(err2.code(), err.code());
+    }
+
 
     #[test]
     fn a_second_trigger_is_refused_by_name() {
