@@ -109,6 +109,18 @@ impl ProbeResult {
     /// The one constructor that says "the dependency did not answer", so the
     /// path that produces a red row cannot be forgotten by a probe that fails a
     /// different way.
+    ///
+    /// **It still reports a `latency_ms` metric, and that is the point.** A probe that produced
+    /// no metrics produced no *samples* either — `report_of` derives `health_samples` rows from
+    /// `metrics` — so an outage was recorded as the *absence* of a reading. Every green metric
+    /// either side of it stayed at its last healthy value, and the 24 h trend drew one straight
+    /// line straight through the outage. The panel's present tense was honest (the live read
+    /// probes) and its history was a lie, which is the worse of the two: the chart is what an
+    /// operator opens *after* the incident to see how long it lasted.
+    ///
+    /// The value is the time until the give-up (`PROBE_TIMEOUT_MS` or less, never a measured
+    /// round trip), and the unit says so in the row the chart draws: a missing reading and a
+    /// reading that timed out are different facts, and this is the one the platform can prove.
     #[must_use]
     pub fn down(service: &str, latency_ms: i64, reason: impl Into<String>) -> Self {
         Self {
@@ -117,7 +129,11 @@ impl ProbeResult {
             latency_ms,
             detail: json!({}),
             checks: Vec::new(),
-            metrics: Vec::new(),
+            metrics: vec![MetricReading {
+                metric: "latency_ms".to_string(),
+                value: f64::from(i32::try_from(latency_ms).unwrap_or(i32::MAX)),
+                unit: "ms (timeout)".to_string(),
+            }],
         }
     }
 
@@ -186,6 +202,14 @@ pub struct MetricReading {
 /// its own rather than a shade of red: a four-second round trip to the database
 /// is not the same event as a refused connection, and somebody woken at 03:00
 /// needs to be told which one happened.
+///
+/// **A non-healthy outcome still records its latency.** `report_of` turns `metrics` into
+/// `health_samples` rows, so a probe that ended `down` or `unknown` without a metric wrote *no
+/// sample*, and the stored history showed a continuous healthy line through the outage. The live
+/// read was right and the 24 h chart was not, and the chart is the one somebody opens afterwards
+/// to see how long it lasted. One reading, marked with the state that produced it, is the honest
+/// minimum: the platform cannot say what the metric *was* while nothing answered, and the unit
+/// says which of the two this is.
 fn finish(service: &str, outcome: Observation, elapsed: Instant) -> ProbeResult {
     let latency_ms = i64::try_from(elapsed.elapsed().as_millis()).unwrap_or(i64::MAX);
     let state = outcome.state();
@@ -195,7 +219,19 @@ fn finish(service: &str, outcome: Observation, elapsed: Instant) -> ProbeResult 
         latency_ms,
         detail: json!({}),
         checks: Vec::new(),
-        metrics: Vec::new(),
+        // Only the healthy path gets this from the caller; a `down`/`unknown` result is
+        // recorded here so the history carries the outage instead of a gap that reads as
+        // "nothing happened". `PROBE_TIMEOUT_MS` is the ceiling, so the value can never
+        // be mistaken for a measured round trip.
+        metrics: if state == "healthy" {
+            Vec::new()
+        } else {
+            vec![MetricReading {
+                metric: "latency_ms".to_string(),
+                value: f64::from(i32::try_from(latency_ms).unwrap_or(i32::MAX)),
+                unit: "ms (timeout)".to_string(),
+            }]
+        },
     };
     if state == "healthy" && latency_ms > DEGRADED_LATENCY_MS {
         result.outcome = Observation::Degraded(format!(
@@ -1244,6 +1280,66 @@ mod tests {
     fn a_fast_probe_stays_healthy() {
         let result = finish("redis", Observation::Healthy("answered".to_string()), Instant::now());
         assert_eq!(result.outcome.state(), "healthy");
+    }
+
+    /// **A probe that did not answer still records a sample.**
+    ///
+    /// The fourth instance of this REQ's own defect class — a reader with no writer — one level
+    /// down. `report_of` derives `health_samples` rows from `metrics`, and both `ProbeResult::down`
+    /// and `finish` used to leave `metrics` empty for a non-healthy outcome, so an outage wrote
+    /// *no row at all*. The panel's live read was correct (it probes) and its stored history was a
+    /// straight healthy line drawn straight through the outage, which is the chart somebody opens
+    /// afterwards to measure how long it lasted.
+    ///
+    /// The assertion is on the *unit* as much as the value: `ms (timeout)` is what distinguishes
+    /// "nothing answered after 3000 ms" from "it answered in 3000 ms", and a chart that shows the
+    /// number without saying which it is has invented a round trip that never happened.
+    #[test]
+    fn an_unanswered_dependency_still_records_a_sample_marked_as_a_timeout() {
+        for result in [
+            ProbeResult::down_with_check("redis", "ping", 3_000, "connection refused"),
+            finish("redis", Observation::Down("no answer".to_string()), Instant::now()),
+            finish(
+                "storage",
+                Observation::Unknown("no interface on this kernel".to_string()),
+                Instant::now(),
+            ),
+        ] {
+            assert_ne!(
+                result.outcome.state(),
+                "healthy",
+                "this test is about the non-healthy paths"
+            );
+            let latency = result
+                .metrics
+                .iter()
+                .find(|reading| reading.metric == "latency_ms")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} left metrics empty, so the outage writes no sample at all",
+                        result.service
+                    )
+                });
+            assert_eq!(latency.unit, "ms (timeout)");
+            assert!(
+                latency.value.is_finite() && latency.value >= 0.0,
+                "a timeout is a real number, got {}",
+                latency.value
+            );
+        }
+    }
+
+    /// The healthy path is untouched: a probe that answered must **not** gain a synthetic
+    /// reading, because that is the metric the chart's y-axis is calibrated against.
+    #[test]
+    fn a_healthy_result_keeps_exactly_the_metrics_its_probe_produced() {
+        let mut result = finish("redis", Observation::Healthy("answered".to_string()), Instant::now());
+        assert!(
+            result.metrics.is_empty(),
+            "no reading is invented for a probe that answered"
+        );
+        result = result.with_metric("used_memory_bytes", 1_024.0, "bytes");
+        assert_eq!(result.metrics.len(), 1, "and a real one is still kept");
     }
 
     #[test]
