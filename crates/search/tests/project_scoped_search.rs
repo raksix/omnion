@@ -386,9 +386,15 @@ async fn the_suggestion_query_is_narrowed_by_the_same_rule_as_the_results() {
 
 #[tokio::test]
 async fn a_workflow_moved_to_another_project_stops_answering_for_the_old_membership() {
-    // The conflict tail refreshes `project_id`; without that line the index keeps the old
-    // membership for ever, and a moved workflow stays visible to exactly the people who lost
-    // access to it. This is the assertion that makes the move surface and the search agree.
+    // This asserts a real property — a reindex DOES repair a stale project on the row — and it is
+    // deliberately kept beside `move_reindex.rs`, which asserts the other half: that the MOVE
+    // repairs it too, without anybody re-indexing.
+    //
+    // The two halves were once one, and this half was carrying the whole claim. The fixture moves
+    // the workflow with a raw `update` and then calls `reindex` by hand, so it exercises the
+    // reindexer's conflict tail (`project_id = excluded.project_id`) and never `move_workflow` —
+    // and nothing re-indexes on the write path, so on this branch the answer stayed the same for
+    // ever. Read as "the move is covered", it was green against code that had never run.
     let Some(pool) = pool().await else { return };
     let fx = fixture(&pool).await;
     indexer::reindex(&pool, "workflows").await.expect("reindex");
