@@ -1368,6 +1368,7 @@ dependencies = [
  "omnion-content",
  "omnion-core",
  "omnion-events",
+ "omnion-health",
  "omnion-identity",
  "omnion-media",
  "omnion-module-accounting",
@@ -1494,6 +1495,24 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "omnion-health"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "omnion-core",
+ "omnion-storage",
+ "redis",
+ "serde",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.21",
  "time",

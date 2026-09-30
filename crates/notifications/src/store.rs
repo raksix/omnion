@@ -22,7 +22,7 @@ use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::error::{NotificationError, Result};
-use crate::model::{ListQuery, NewNotification, Notification, NotificationPage};
+use crate::model::{DeliveryRow, ListQuery, NewNotification, Notification, NotificationPage};
 use crate::vocabulary::{MAX_PAGE, is_category, is_channel};
 
 const COLUMNS: &str = "id, organization_id, user_id, category, priority, title, body, url, \
@@ -154,6 +154,40 @@ pub async fn summary(pool: &PgPool, user_id: Uuid) -> Result<crate::model::Summa
         unread,
         by_category,
     })
+}
+
+/// One notification's delivery rows.
+///
+/// **Ordered deterministically, because the drawer is a list and a table's row order is not
+/// one.** Without `order by` Postgres may return the channels in any order it finds cheapest, so
+/// the drawer would re-order itself between two reads of the same row and "which channel is
+/// first" would be a property of the query plan.
+///
+/// **The order is chronological where it can be, and alphabetical where it cannot — and the
+/// second case is the common one, so it is written down rather than implied.** `enqueue` inserts
+/// every channel of one notification inside a single call, and `created_at` defaults to
+/// `now()`, which is one timestamp for the whole statement. So a notification that went out over
+/// three channels has three rows with *identical* `created_at`, and the chronological key ties.
+/// The `channel` tiebreak then decides, which is alphabetical: `email`, then `in_app`, then
+/// `web_push`. That order is arbitrary as a story and stable as a sort, and stability is the
+/// property the drawer needs — the alternative, letting Postgres choose, is a list that reshuffles
+/// on every read.
+///
+/// Attempts made *later* by the runner keep their own timestamps, so a retried channel really
+/// does sort after one that was sent on the first try. The tiebreak only ever governs rows
+/// enqueued together, which by definition were enqueued together.
+pub async fn deliveries(pool: &PgPool, notification_id: Uuid) -> Result<Vec<DeliveryRow>> {
+    let rows = sqlx::query_as::<_, DeliveryRow>(
+        "select channel, status, attempts, max_attempts, response_status, error, sent_at, \
+                next_attempt_at \
+         from notification_deliveries \
+         where notification_id = $1 \
+         order by created_at, channel",
+    )
+    .bind(notification_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// One notification, and only if that person owns it.

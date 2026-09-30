@@ -7,9 +7,9 @@
 import { useState, type ReactNode } from "react";
 
 // Both sides added icons in the same import: wave4 brought Package/Users/Warehouse for the
-// business modules' nav entries, main brought HardDriveDownload for the backup centre. They are
+// business modules' nav entries, main brought HeartPulse for the health centre. They are
 // additive, so the union keeps every entry the two features render.
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, HardDriveDownload, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -26,6 +26,12 @@ const NAV = [
   // files and can I get them back" is one question, and burying half of it under a
   // settings sub-path is what makes somebody believe the platform has no restore point.
   { href: "/backups", label: "Backups", icon: HardDriveDownload },
+  // System health (REQ-014, slice 1). It sits with Backups rather than under Settings for
+  // the same reason: "can I get my data back" and "is anything answering" are both questions
+  // an operator asks at the same moment, usually while something is already wrong — and
+  // burying the liveness screen under a settings sub-path is how a platform looks healthy
+  // to the person who opened the admin panel to find out that it is not.
+  { href: "/health", label: "System Health", icon: HeartPulse },
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
   { href: "/crm/contacts", label: "CRM", icon: Users },
   { href: "/sales/catalog", label: "Sales", icon: Package },

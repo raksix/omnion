@@ -100,6 +100,7 @@ pub mod crm_deals;
 pub mod crm_leads;
 pub mod crm_views;
 pub mod health;
+pub mod health_panel;
 pub mod iam;
 pub mod inventory;
 pub mod iam_approvals;
@@ -1061,6 +1062,50 @@ pub fn router(state: AppState) -> Router {
         // deployment that grants both lets an account that can only look also dismiss what it
         // saw. The static segments come first so axum ranks them ahead of
         // `/security/findings/{id}`.
+        // System health (REQ-014, slice 1). Two keys, and the split is the one the request
+        // draws: seeing that a dependency is unhappy is `health.read`, and everything that
+        // *writes* is `health.manage`.
+        //
+        // `POST /health/checks/run` rides `health.manage` rather than `health.read` even
+        // though it "only runs probes", because it is a mutation: it records a sample per
+        // metric. An account that could trigger a run on demand could fill the retention
+        // window with rows of its own choosing, one press at a time, and the trends would
+        // become a fiction nobody could audit. Reading a status screen and *causing* the
+        // platform to record something are different powers.
+        //
+        // `/healthz` and `/readyz` are NOT here and must not be: they stay unversioned and
+        // unguarded so an orchestrator's probe never depends on a session or a permission
+        // (see `crate::routes::health` and `crate::routes::readyz`).
+        .route(
+            "/health/overview",
+            get(health_panel::overview).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/checks/run",
+            post(health_panel::run_checks).layer(guards::require(&state, "health.manage")),
+        )
+        .route(
+            "/health/services/{key}",
+            get(health_panel::service).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/samples",
+            get(health_panel::samples).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/host",
+            get(health_panel::host_metrics).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/summary",
+            get(health_panel::summary).layer(guards::require(&state, "health.read")),
+        )
+        // Pruning is destructive and irreversible, so it is a POST behind the managing key
+        // and not a side effect of a settings save.
+        .route(
+            "/health/maintenance/prune",
+            post(health_panel::prune).layer(guards::require(&state, "health.manage")),
+        )
         .route(
             "/security/overview",
             get(security::overview).layer(guards::require(&state, "security.read")),

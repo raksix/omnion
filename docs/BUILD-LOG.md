@@ -8848,3 +8848,122 @@ One heavy thing at a time on this box, and measure the disk *while* the heavy th
 **Next.** Re-run the CRM pass alone, with the build cache warm and no competing test build, and
 read the two unticked boxes (390×844, keyboard sheet) off `summary.json` — the leg now *runs*,
 which is the first time that has been true in four ticks.
+## 2026-09-30 — REQ-014 slice 1 (probes + overview) · the screen whose job is not to reassure you
+
+feat(health): the probe registry, the versioned surface, `/health` and its drill-down
+
+The tick before this one wrote the code and ran out of clock before it ran. So the first
+thing this tick did was *make it fail*, and the five red tests were not the boring kind: four
+of them were the product lying, and they are now fixed rather than waived.
+
+**Four wrong numbers and one unreachable word, all in the same class.** `longest_mount` read
+the mount point from the wrong side of the ` - ` separator in `/proc/self/mountinfo`: the path
+is field five of the LEFT half and `ext4` is what the right half opens with. Every lookup
+therefore returned `None` and the disk card fell back to the root filesystem — a plausible,
+wrong, **green** number for a data directory living on its own volume, on the one row an
+operator reads when disk is their suspicion. That is the exact failure the longest-match
+ranking exists to prevent, and it was shipping.
+
+The ranking then asked whether a path begins with `//` to decide it was under `/`. Nothing
+does, so the root filesystem dropped out and a single-filesystem host reported `unknown`.
+Depth was then measured in **slashes**, where `/` and `/mnt` tie at one, so the first line in
+the file won — and a tie broken by document order is not a ranking, and is not reproducible
+across hosts. Segments cannot tie; the comparison is now total.
+
+`unescape_mount` read `\040` as base 10. It is octal: 40 decimal is `(`, not a space. A mount
+point containing a space decoded to something unmatchable, which routes straight back into
+the first bug — wrong number, silently.
+
+And the banner had **no `healthy` branch at all**. With every service green, `worst` returned
+`Some(("healthy", ..))`, which fell into the "not checked yet" arm. A fully healthy platform
+reported `unknown`, and "All systems operational" was unreachable code on the one screen
+whose entire job is to be believed. The reassurance was never wired up.
+
+**What the tests were actually asserting matters here.** A `mountinfo` parser is exactly the
+kind of function whose unit test looks green and whose bug is invisible: the test compared a
+string and the string was wrong in a way nobody typed. Writing "040 is octal, not decimal"
+into the code is cheaper than rediscovering it on a box whose `/` and `/mnt` are the same
+depth.
+
+**`/health/services/{key}` did not exist** when the overview was written, and the overview
+links to it from all eight rows. That is eight dead affordances — the specific thing the
+definition of done forbids — and it was invisible to every gate that had run so far, because
+the gates tested the *server*, and the server was correct. It ships now, and the walkthrough
+route list names it.
+
+Proof:
+
+```
+omnion-health --lib   29 passed; 0 failed          (four product bugs fixed to get here)
+admin tsc --noEmit    exit 0
+node --check walkthrough.cjs   syntax ok
+```
+
+**What this costs the next tick:** the browser pass (`bash scripts/qa/run.sh`) has still not
+run, so the walkthrough leg, the drill-down and the row-click path are unproven in a browser.
+The box is at load 93 with `/mnt/apopic` at 97% and nine sibling writers, and a browser pass is
+the one instrument that wants both. Slice 2 (history, ranges, CSV export) is next and does not
+need it.
+
+**Next:** REQ-014 slice 2 — sample aggregation, 1 h / 24 h / 7 d ranges, CSV export and the
+24 h trend charts on `/health/metrics`.
+
+
+## Tick 78 — the box that said "when deliveries exist" (and last tick they started to)
+
+REQ-021's drawer box had been unticked since the request was written, with a note that read *"the
+per-channel delivery rows are slice 2's, when deliveries exist"*. Tick 77 made them exist. The note
+expired and the gap became real: `GET /api/v1/notifications/{id}` promised "one notification, **with
+its delivery rows**" in its own doc comment and returned a bare notification — so the platform knew
+an e-mail had been given up on, and the person waiting for it was told nothing.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `c3394bb5` | `store::deliveries` + `NotificationBody.deliveries`, filled after the ownership check |
+| `30c27d12` | `notification_delivery_reader` — 4 walks over live PostgreSQL |
+| `326061ee` | the drawer's Delivery section; one channel vocabulary for three screens |
+| `a7b94201` | the walkthrough leg for that section |
+
+**Proof**
+
+```
+notification_delivery_reader   4 passed; 0 failed  (26.47s, live PostgreSQL)
+notification_delivery          8 passed; 0 failed  (49.12s)  ← the runner's suite, unchanged
+omnion-notifications --lib    90 passed; 0 failed
+admin tsc -p tsconfig --noEmit  exit 0
+node --check walkthrough.cjs   syntax ok
+```
+
+**The access-control shape is the part worth keeping.** `notification_deliveries` is keyed by
+`notification_id` and carries **no `user_id`** — nothing in that query can be scoped to a caller, so
+the ownership read is the entire check. A delivery read placed *before* it would answer a populated
+channel list for somebody else's notification, which turns the route's `404` into an existence
+oracle. The route reads the notification first and only then its deliveries, and the walk asserts
+the *mechanism* rather than the outcome: the stranger resolves nothing **and** the owner still gets
+rows through the same function, because a read that returned nothing for everybody would pass the
+stranger leg while hiding the entire feature.
+
+**Three of the four walks caught this tick's own wrong assumptions before the product did.** Each
+correction is now written into the walk, because the next tick would otherwise re-make them:
+
+1. `on conflict (channel)` — the uniqueness is `(organization_id, channel)`, so the fixture asserted
+   a constraint the schema does not have (`42P10`). It creates the organization now.
+2. "`in_app` is written first" — it is not: `enqueue` loops the *enabled* channels and appends
+   `in_app` after. And every row in one call shares a single `now()`, so the chronological key ties
+   and the alphabetical tiebreak decides. The walk now asserts **stability** (same notification, two
+   reads, same order), which is the property the drawer needs and the only one a missing
+   `order by` fails — on the *second* read; the first always looks right.
+3. "the in-app row is `sent` because enqueueing is delivering it" — `enqueue` writes it `pending` and
+   a tick only makes it `sent` by draining it through a transport. The walk registers the real
+   `InAppTransport` next to the refusing e-mail one.
+
+**What this costs the next tick:** the browser pass (`bash scripts/qa/run.sh`) has still not run, so
+the walkthrough leg and the drawer's rendering are unproven in a browser. The QA slot queue is
+shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for this tick.
+
+**Next:** REQ-021's remaining boxes are the two unproven keyboard legs and the browser pass, both of
+which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
+order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
+all waiting on the same missing instrument.
