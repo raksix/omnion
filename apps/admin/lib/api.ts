@@ -12,6 +12,7 @@ import type {
   ContentApiToken,
   ContentApiVocabulary,
   CreatedContentApiToken,
+  OpenApiDocument,
 
   SecurityBulkResult,
   SecurityFinding,
@@ -6863,4 +6864,72 @@ export function revokeContentApiToken(tokenId: string): Promise<void> {
   return request<void>(`/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}`, {
     method: "DELETE",
   });
+}
+
+/**
+ * `GET /api/v1/content-api/openapi.json` — the contract, rendered by the Docs tab.
+ *
+ * Session-authenticated on purpose, even though the same document is also served to a content
+ * token: the panel cannot hold a token, and an admin screen that has to mint a credential to show
+ * a description eventually leaks one. The document itself is built by the same server function in
+ * both cases, so the two cannot describe different APIs.
+ */
+export function fetchContentApiOpenApi(): Promise<OpenApiDocument> {
+  return request<OpenApiDocument>("/api/v1/content-api/openapi.json");
+}
+
+/**
+ * Download the document in one of its two serializations.
+ *
+ * A blob rather than a link to the route, for two reasons that are both about the panel and not
+ * about the download: the response's `content-disposition` names the filename the API chose, and a
+ * session cookie is only sent by `fetch`, never by an `<a href>` the browser navigates for. So a
+ * plain link would either download `openapi.json` under the wrong name or answer `401` — and the
+ * first of those looks like it worked.
+ */
+export async function downloadContentApiOpenApi(
+  format: "json" | "yaml",
+): Promise<{ blob: Blob; filename: string }> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/v1/content-api/openapi.json?format=${format}`, {
+      credentials: "same-origin",
+      headers: { accept: format === "yaml" ? "application/yaml" : "application/json" },
+    });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+  if (!response.ok) {
+    const body = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      body?.error?.code ?? "unknown_error",
+      body?.error?.message ?? `The API answered with status ${response.status}.`,
+      body?.error?.details ?? null,
+    );
+  }
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  return {
+    blob: await response.blob(),
+    filename: match?.[1] ?? `omnion-content-api.${format}`,
+  };
+}
+
+/**
+ * Save a blob under `filename` and report the name that landed.
+ *
+ * `URL.revokeObjectURL` runs after `click()` rather than immediately: revoking synchronously can
+ * beat the browser to the download it was just asked to start, which shows up as a download that
+ * "does nothing" on a fast machine and works on a slow one.
+ */
+export function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
 }

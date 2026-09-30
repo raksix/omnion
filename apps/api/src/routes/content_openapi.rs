@@ -15,7 +15,7 @@
 //!   is the panel's session-authenticated media CRUD surface. Reusing it with a second auth model
 //!   would be a security trap, so the document says so where a reader will see it.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// The version string reported as the document's version.
 pub const OPENAPI_VERSION: &str = "3.1.0";
@@ -350,6 +350,141 @@ pub fn document(base_url: &str) -> Value {
     })
 }
 
+/// Render a JSON value as YAML (block style).
+///
+/// The panel offers `Download OpenAPI (YAML)` because that is what a code generator and most API
+/// tooling actually ingests, and the workspace carries no YAML crate — so this is a small emitter
+/// rather than a dependency on a document format one screen downloads.
+///
+/// Two properties make the hand-rolled version safe, and both are asserted below:
+///
+/// - **A scalar is quoted unless it is unambiguously plain.** The dangerous case is not an exotic
+///   string, it is `"true"`, `"null"` or `"2026-01-01"` — values a JSON reader accepts and a YAML
+///   reader silently converts into a boolean, a null or a date. `plain_scalar` is the allow-list
+///   that refuses all of them.
+/// - **Keys are emitted through the same rule as values.** A key is quoted or it is not, and a key
+///   that needs quoting but got none produces a document that parses into a *different* structure
+///   than the JSON one — the exact class of drift this file exists to prevent.
+#[must_use]
+pub fn to_yaml(value: &Value) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value, 0, false);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Write one value at `indent`; `inline` means it follows a `key:` or `- ` already written.
+fn write_value(out: &mut String, value: &Value, indent: usize, inline: bool) {
+    // Whether the next entry belongs on the current line. Only the FIRST entry of a container can:
+    // the second one starts its own line, so this is a local rather than a mutation of `inline` —
+    // which also happens to be the reason `inline` reads as a fact about position and not as state.
+    let mut lead = inline;
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                if lead {
+                    out.push(' ');
+                    lead = false;
+                } else {
+                    push_indent(out, indent);
+                }
+                out.push_str(&scalar(&Value::String(key.clone())));
+                out.push(':');
+                if is_scalar(child) {
+                    out.push(' ');
+                    out.push_str(&scalar(child));
+                } else {
+                    out.push('\n');
+                    write_value(out, child, indent + 1, false);
+                }
+            }
+        }
+        Value::Array(items) if !items.is_empty() => {
+            for item in items {
+                if lead {
+                    out.push(' ');
+                    lead = false;
+                } else {
+                    push_indent(out, indent);
+                }
+                out.push('-');
+                if is_scalar(item) {
+                    out.push(' ');
+                    out.push_str(&scalar(item));
+                } else {
+                    out.push('\n');
+                    // A sequence item's nested block sits one level deeper than the dash, which is
+                    // what makes `- key: value` come out with `key` on the dash's line.
+                    write_value(out, item, indent + 1, true);
+                }
+            }
+        }
+        // An empty collection has no block form that reads as a container: `key:` alone would be
+        // read as a null value, and the whole point of this file is that a YAML reader and a JSON
+        // reader agree.
+        _ => {
+            if lead {
+                out.push(' ');
+            } else {
+                push_indent(out, indent);
+            }
+            out.push_str(&scalar(value));
+            out.push('\n');
+        }
+    }
+}
+
+fn push_indent(out: &mut String, indent: usize) {
+    for _ in 0..indent {
+        out.push_str("  ");
+    }
+}
+
+fn is_scalar(value: &Value) -> bool {
+    !matches!(value, Value::Object(map) if !map.is_empty())
+        && !matches!(value, Value::Array(items) if !items.is_empty())
+}
+
+/// A JSON scalar as a YAML scalar: JSON itself when quoting is required.
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) if plain_scalar(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "\"\"".to_string()),
+    }
+}
+
+/// `true` only for a string that YAML would read back as the identical plain string.
+///
+/// The allow-list is deliberately narrow. Anything with a leading indicator character, a colon, a
+/// `#`, a quote, a newline, a leading or trailing space — or anything YAML would resolve as a
+/// boolean, a null, a number or a timestamp — is quoted instead.
+fn plain_scalar(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let first = text.chars().next().expect("non-empty");
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '/') {
+        return false;
+    }
+    if !text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return false;
+    }
+    // The reserved words YAML resolves rather than reads. `yes`/`no`/`on`/`off` are included
+    // because that resolution is a YAML 1.1 behaviour and most tooling still does it.
+    !matches!(
+        text.to_ascii_lowercase().as_str(),
+        "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "~"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +622,108 @@ mod tests {
         assert!(
             text.contains("updated_since"),
             "the rebuild primitive must be documented"
+        );
+    }
+
+    // ---- YAML --------------------------------------------------------------------------------
+
+    #[test]
+    fn a_scalar_yaml_reader_would_resolve_rather_than_read_is_quoted() {
+        // Each of these reads back as a BOOLEAN, a NULL or a DATE in a YAML 1.1 reader. Emitted
+        // plain, a document that a JSON reader and a YAML reader agree on becomes one where a
+        // path called `on` is a boolean key — and the failure is invisible until a generator
+        // resolves it.
+        for text in ["true", "no", "off", "~", "null", "1.5", ""] {
+            assert!(
+                !plain_scalar(text),
+                "{text:?} must not be emitted plain — it resolves rather than reads"
+            );
+            assert_eq!(
+                scalar(&json!(text)),
+                serde_json::to_string(text).expect("a JSON string"),
+                "{text:?} must be emitted as a JSON-quoted string"
+            );
+        }
+        // And the safe ones stay readable, which is the reason for the allow-list at all.
+        for text in ["content:read", "/api/v1/content/pages", "image/png", "slug"] {
+            assert!(plain_scalar(text), "{text:?} is safe plain");
+        }
+    }
+
+    #[test]
+    fn yaml_keeps_the_types_json_carries() {
+        let value = json!({
+            "openapi": "3.1.0",
+            "a_true_string": "true",
+            "truthy": true,
+            "nothing": null,
+            "count": 3,
+            "empty_object": {},
+            "empty_list": [],
+            "paths": {
+                "/api/v1/content/pages": {
+                    "get": {
+                        "parameters": [
+                            { "name": "limit", "required": false },
+                            { "name": "slug", "required": true }
+                        ],
+                        "x-required-scope": "content:read"
+                    }
+                }
+            }
+        });
+        let yaml = to_yaml(&value);
+        assert!(yaml.contains("openapi: 3.1.0"), "{yaml}");
+        // A JSON boolean and a JSON string that looks like one must be distinguishable in YAML.
+        assert!(yaml.contains("a_true_string: \"true\""), "{yaml}");
+        assert!(yaml.contains("truthy: true"), "{yaml}");
+        assert!(yaml.contains("nothing: null"), "{yaml}");
+        // An empty container must survive as a container, not collapse to an empty value.
+        assert!(yaml.contains("empty_object: {}"), "{yaml}");
+        assert!(yaml.contains("empty_list: []"), "{yaml}");
+    }
+
+    #[test]
+    fn yaml_sequences_nest_under_their_dash() {
+        let value = json!({
+            "parameters": [{ "name": "limit", "required": false }],
+            "list_of_scalars": ["a", "b"],
+            "empty_object": { "k": {} }
+        });
+        let yaml = to_yaml(&value);
+        assert!(
+            yaml.contains("  - name: limit\n"),
+            "the first key of an item belongs on the dash's line: {yaml}"
+        );
+        assert!(yaml.contains("  - required: false\n"), "{yaml}");
+        assert!(yaml.contains("  - a\n"), "{yaml}");
+        assert!(yaml.contains("    k: {}\n"), "{yaml}");
+    }
+
+    #[test]
+    fn the_whole_document_round_trips_through_yaml_without_losing_a_path() {
+        // The end-to-end claim the download button makes: what the operator downloads describes
+        // the same endpoints as what the token-authenticated route serves. A YAML emitter that
+        // dropped or renamed a path would make the download a lie.
+        let yaml = to_yaml(&document("https://api.example.org"));
+        assert!(yaml.contains("openapi: 3.1.0"), "{yaml}");
+        for endpoint in ENDPOINTS {
+            assert!(
+                yaml.contains(&format!("{}:", endpoint.path)),
+                "{} must survive into the YAML",
+                endpoint.path
+            );
+            assert!(
+                yaml.contains(&format!("operationId: {}", endpoint.id)),
+                "{} must survive into the YAML",
+                endpoint.id
+            );
+        }
+        // The note about the panel's own `/api/v1/media` is the one an integrator needs most, so
+        // it is asserted by content rather than by key.
+        assert!(
+            yaml.contains("Not part of the headless surface"),
+            "the media-path note must survive"
         );
     }
 }

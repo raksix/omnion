@@ -3174,3 +3174,56 @@ export type ContentApiVocabulary = {
   rate_tiers: RateTier[];
   max_name_length: number;
 };
+
+/**
+ * One documented operation, as the Docs tab reads it.
+ *
+ * A *narrowed* view of the OpenAPI document rather than the document itself typed out. The panel
+ * indexes into a handful of well-known keys, and a `Record<string, unknown>` for everything else
+ * would let a rename in the document turn into `undefined` at render time rather than a type
+ * error. The tests assert the server's document actually has these keys.
+ */
+export type OpenApiOperation = {
+  /** Stable id — also the Explorer's dropdown key (`pages.list`). */
+  operationId: string;
+  /** One line written for somebody integrating. */
+  summary: string;
+  /** The scope the token needs, or `null` for a route that needs only a valid token. */
+  "x-required-scope": string | null;
+  /** `posts` is a page type today; the blog module will give it its own fields. */
+  "x-experimental"?: boolean;
+  parameters: OpenApiParameter[];
+  responses: Record<string, { description: string }>;
+};
+
+/** One query (or path, or header) parameter. */
+export type OpenApiParameter = {
+  name: string;
+  /** `query`, `path` or `header`. */
+  in: string;
+  required: boolean;
+  description: string;
+};
+
+/**
+ * The document the Docs tab renders.
+ *
+ * Only the keys the screen reads are typed; `paths` is indexed by the path string and the method
+ * beside it, because that is exactly the document's own shape and pretending otherwise would mean
+ * a second data model that has to be kept in step.
+ */
+export type OpenApiDocument = {
+  openapi: string;
+  info: {
+    title: string;
+    version: string;
+    description: string;
+    license?: { name: string };
+  };
+  servers: { url: string }[];
+  paths: Record<string, Record<string, OpenApiOperation>>;
+  components: {
+    securitySchemes: Record<string, { type: string; scheme?: string; description?: string }>;
+    schemas: Record<string, { description?: string; required?: string[]; properties?: Record<string, unknown> }>;
+  };
+};

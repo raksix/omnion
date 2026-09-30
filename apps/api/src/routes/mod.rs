@@ -1087,6 +1087,11 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "content.api.manage"));
     let content_api_token_revoke = delete(content_api::revoke_token)
         .layer(guards::require(&state, "content.api.manage"));
+    // The Docs tab's own read. A reader who may see the tokens may see the contract they are for —
+    // and the panel cannot reach the token-authenticated copy, so this is not a convenience
+    // duplicate but the only way the screen can render at all.
+    let content_api_openapi = get(content_api::openapi_document)
+        .layer(guards::require(&state, "content.api.read"));
 
     // The token surface itself. Declared as its own router so the six routes read as one unit
     // next to their permission layer, and merged into the v1 tree below.
@@ -1096,7 +1101,10 @@ pub fn router(state: AppState) -> Router {
         .route("/content-api/tokens/vocabulary", content_api_vocabulary)
         .route("/content-api/tokens/{id}", content_api_token_update)
         .route("/content-api/tokens/{id}", content_api_token_revoke)
-        .route("/content-api/tokens/{id}/rotate", content_api_token_rotate);
+        .route("/content-api/tokens/{id}/rotate", content_api_token_rotate)
+        // A literal path next to the `{id}` siblings: registering it after them would make
+        // matchit read `openapi` as a token id.
+        .route("/content-api/openapi.json", content_api_openapi);
 
     // The headless content read surface (REQ-019, slice 2). No panel permission layer: these
     // routes authenticate a *content token* through the `ContentToken` extractor instead, and

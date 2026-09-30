@@ -1,5 +1,6 @@
 import { AppShell } from "@/components/app-shell";
 import { RequireAuth } from "@/components/require-auth";
+import { ContentApiShell } from "@/features/content-api/content-api-shell";
 import { ContentApiTokensView } from "@/features/content-api/tokens-view";
 
 export const metadata = { title: "Content API" };
@@ -24,7 +25,9 @@ export default function ContentApiPage() {
         title="Content API"
         description="Read-only tokens for headless frontends"
       >
-        <ContentApiTokensView />
+        <ContentApiShell>
+          <ContentApiTokensView />
+        </ContentApiShell>
       </AppShell>
     </RequireAuth>
   );

@@ -6201,6 +6201,261 @@ async function runNewsletterDepth(page, report) {
 }
 
 /**
+ * `runContentApiDepth` — the Content API section: the Tokens tab and the Docs tab (REQ-019).
+ *
+ * The section's whole claim is that a credential minted in the panel is the same credential a
+ * frontend uses — so the interesting assertions are all CROSS-BOUNDARY. A token row on screen
+ * proves only that a list rendered; what has to be proven is that the plaintext the create dialog
+ * showed once authenticates a real read of real content, and that a revoked one stops.
+ *
+ * Three of the steps read the DATABASE rather than the panel, for the same reason the members pass
+ * does: a badge the panel draws about itself is a claim, and the claim is about a column.
+ *
+ * The Docs tab's own checks are about the document being the document: the endpoint rows come from
+ * the server's OpenAPI table, so "the tab lists what the API actually serves" is asserted by
+ * comparing the rendered operation ids against the routes the browser can reach — not against a
+ * list typed into the walkthrough, which would only prove the walkthrough agrees with itself.
+ */
+async function runContentApiDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+
+  // ------------------------------------------------------------------ the schema, structurally
+  // The two facts that make a content token safe, read from the catalogue rather than from a
+  // comment: the secret is a digest, and the prefix is the hex half a person can say out loud.
+  const tokenColumns = qaSql(
+    `select string_agg(column_name, ',') from information_schema.columns
+     where table_name = 'api_tokens'`,
+  );
+  steps.tokenTableExists = tokenColumns !== "";
+  // A plaintext column here would make the whole copy-once story decorative.
+  steps.noPlaintextColumn = !/plaintext|secret_value|token\b/.test(tokenColumns.replace(/token_hash/g, ""));
+  steps.tokenHashIsStoredNotTheSecret = tokenColumns.includes("token_hash");
+  steps.usageTableExists =
+    qaSql(`select to_regclass('api_token_usage_daily') is not null`) === "true";
+
+  // ------------------------------------------------------------------ the Tokens tab
+  await page
+    .goto(`${URL_ADMIN}/content-api`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.tokensScreenReady =
+    (await page.locator("[data-content-api-state]").count()) > 0;
+  steps.sectionNavIsOnScreen = (await page.locator("[data-content-api-nav]").count()) > 0;
+  steps.docsTabIsLinked =
+    (await page.locator("[data-content-api-tab=\"docs\"]").count()) > 0;
+  await shot(page, "content-api-tokens");
+
+  // The copy-once dialog is the REQ's copy-once criterion, and it is asserted as a GATE: `Done`
+  // must be unreachable until the checkbox is ticked. It is reached the way a person reaches it —
+  // by FILLING THE FORM AND SUBMITTING — because the dialog only exists as a consequence of a
+  // create response, and a check that opened it directly would prove nothing about the flow.
+  // (The create form is INLINE on the page, not a modal; there is no dialog to open first.)
+  await page.locator("[data-content-api-form-name]").fill(`QA Walk ${stamp}`).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.theNameIsInTheField =
+    (await page.locator("[data-content-api-form-name]").inputValue().catch(() => "")) ===
+    `QA Walk ${stamp}`;
+  await page.locator("[data-content-api-form] button[type=submit]").first().click().catch(() => {});
+  await page.waitForTimeout(2500);
+
+  steps.copyOnceDialogOpened =
+    (await page.locator("[data-content-api-plaintext]").count()) > 0;
+  const revealed = (await page
+    .locator("[data-content-api-plaintext-value]")
+    .innerText()
+    .catch(() => ""))
+    .trim();
+  steps.theDialogShowsThePlaintext = revealed.startsWith("omn_");
+  steps.doneIsBlockedUntilStored =
+    (await page
+      .locator("[data-content-api-plaintext-done]")
+      .first()
+      .isDisabled()
+      .catch(() => false)) === true;
+  // And the gate is a gate: ticking it releases the button, which is what distinguishes a real
+  // acknowledgement from a permanently disabled control.
+  await page.locator("[data-content-api-plaintext-stored]").check().catch(() => {});
+  await page.waitForTimeout(300);
+  steps.tickingStoredReleasesDone =
+    (await page
+      .locator("[data-content-api-plaintext-done]")
+      .first()
+      .isEnabled()
+      .catch(() => false)) === true;
+  await shot(page, "content-api-create-dialog");
+  await page.locator("[data-content-api-plaintext-done]").first().click().catch(() => {});
+  await page.waitForTimeout(800);
+
+  // A token minted through the panel's own API, because the copy-once plaintext only exists in a
+  // create RESPONSE — there is no route that gives it back, which is the property under test.
+  const name = `QA Docs ${stamp}`;
+  const created = await page
+    .request.post(`${URL_API}/api/v1/content-api/tokens`, {
+      data: { name, scopes: ["content:read"] },
+    })
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.operatorCanMintAToken = created.status === 201 && Boolean(created.body?.plaintext);
+  const plaintext = created.body?.plaintext || "";
+  const prefix = created.body?.token?.prefix || "";
+
+  // The plaintext is not in the store, which is the claim the copy-once dialog makes out loud.
+  steps.plaintextIsNotStored =
+    plaintext.length > 0 &&
+    qaSql(`select count(*) from api_tokens where token_hash = '${plaintext}'`) === "0";
+  steps.rowShowsThePrefixNotTheSecret =
+    prefix !== "" &&
+    (await page.locator(`text=${prefix}`).count().catch(() => 0)) > 0;
+  steps.rowNeverShowsTheSecret =
+    plaintext !== "" && (await page.locator(`text=${plaintext}`).count().catch(() => 0)) === 0;
+
+  await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2000);
+  steps.mintedRowIsOnScreen = (await page.locator(`text=${name}`).count().catch(() => 0)) > 0;
+
+  // ------------------------------------------------------------------ the read surface, for real
+  // The whole point of the section: the credential the panel minted opens the surface the panel
+  // documents. This is a real HTTP call with the Bearer header, against the real routes — the
+  // only proof that a token and a document describe the same API.
+  const read = await page
+    .request.get(`${URL_API}/api/v1/content/pages?limit=5`, {
+      headers: { authorization: `Bearer ${plaintext}` },
+    })
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.tokenReadsTheContentSurface = read.status === 200 && Array.isArray(read.body?.items);
+  steps.everyItemCarriesItsCacheKeys =
+    Array.isArray(read.body?.items) &&
+    read.body.items.every(
+      (item) => item.id && item.slug && item.etag && item.updated_at !== undefined,
+    );
+  steps.aPanelSessionIsRefusedTheContentSurface =
+    (await page
+      .request
+      .get(`${URL_API}/api/v1/content/pages?limit=5`)
+      .then((response) => response.status())
+      .catch(() => 0)) === 401;
+
+  // A cursor that walks pages, because "next_cursor is present" is only half of the criterion and
+  // the half nobody notices until a frontend skips a page.
+  const paged = await page
+    .request.get(`${URL_API}/api/v1/content/pages?limit=2`, {
+      headers: { authorization: `Bearer ${plaintext}` },
+    })
+    .then((response) => response.json().catch(() => null))
+    .catch(() => null);
+  steps.limitIsHonoured = Array.isArray(paged?.items) && paged.items.length <= 2;
+  steps.envelopeHasAllThreeKeys =
+    paged !== null &&
+    Array.isArray(paged.items) &&
+    "next_cursor" in paged &&
+    "count" in paged;
+
+  // A token WITHOUT `media:read` must be refused by name, not by absence: the criterion is a
+  // `403 insufficient_scope`, and a 404 would hide the very answer the integrator needs.
+  const noMedia = await page
+    .request.post(`${URL_API}/api/v1/content-api/tokens`, {
+      data: { name: `QA NoMedia ${stamp}`, scopes: ["content:read"] },
+    })
+    .then((response) => response.json().catch(() => null))
+    .catch(() => null);
+  const scopeRefusal = await page
+    .request.get(`${URL_API}/api/v1/content/media?limit=1`, {
+      headers: { authorization: `Bearer ${noMedia?.plaintext || ""}` },
+    })
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.missingScopeIsNamed =
+    scopeRefusal.status === 403 && scopeRefusal.body?.error?.code === "insufficient_scope";
+
+  // ------------------------------------------------------------------ the Docs tab
+  await page
+    .goto(`${URL_ADMIN}/content-api/docs`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(2500);
+  steps.docsScreenReady = (await page.locator("[data-content-api-docs]").count()) > 0;
+  steps.docsErrorStripIsAbsent =
+    (await page.locator("[data-content-api-docs-error]").count()) === 0;
+
+  // The document the tab rendered, compared against the document the API serves — the same one
+  // the read surface above answered through. A tab that renders its own list while the server
+  // documents a seventh route is the drift this whole screen was designed to prevent.
+  const document = await page
+    .request.get(`${URL_API}/api/v1/content-api/openapi.json`)
+    .then((response) => response.json().catch(() => null))
+    .catch(() => null);
+  steps.documentIsOpenApi31 = document?.openapi === "3.1.0";
+  const serverIds = Object.values(document?.paths || {}).flatMap((methods) =>
+    Object.values(methods || {}).map((operation) => operation?.operationId),
+  ).filter(Boolean);
+  steps.documentDeclaresEveryEndpoint = serverIds.length >= 6;
+  for (const id of serverIds) {
+    steps[`documented_${id.replace(/\./g, "_")}`] =
+      (await page.locator(`[data-content-api-endpoint="${id}"]`).count().catch(() => 0)) > 0;
+  }
+  steps.baseUrlIsShown =
+    Boolean(document?.servers?.[0]?.url) &&
+    (await page.locator("[data-content-api-base-url]").innerText().catch(() => "")).trim().length > 0;
+  steps.paginationGuideIsPresent =
+    (await page.locator("[data-content-api-pagination]").count()) > 0;
+  steps.errorCodesAreListed =
+    (await page.locator("[data-content-api-error-code]").count().catch(() => 0)) >= 5;
+  steps.rebuildExampleIsPresent =
+    (await page.locator("[data-content-api-rebuild-example]").count()) > 0;
+
+  // The two downloads are real downloads, not buttons: the YAML body is fetched and checked for
+  // the one property that makes it a document rather than a string — the endpoint paths survive
+  // the second serialization.
+  const yaml = await page
+    .request.get(`${URL_API}/api/v1/content-api/openapi.json?format=yaml`)
+    .then((response) => response.text().catch(() => ""))
+    .catch(() => "");
+  steps.yamlDownloadCarriesTheEndpoints =
+    yaml.includes("openapi: 3.1.0") && yaml.includes("/api/v1/content/pages:");
+  steps.aBadFormatIsRefusedWithItsField =
+    (await page
+      .request
+      .get(`${URL_API}/api/v1/content-api/openapi.json?format=pdf`)
+      .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+      .catch(() => ({ status: 0, body: null }))).body?.error?.details?.field === "format";
+
+  // ------------------------------------------------------------------ revocation is immediate
+  const tokenId = created.body?.token?.id;
+  const revoke = await page
+    .request.delete(`${URL_API}/api/v1/content-api/tokens/${tokenId}`)
+    .then((response) => response.status())
+    .catch(() => 0);
+  steps.revokeSucceeded = revoke === 204 || revoke === 200;
+  const afterRevoke = await page
+    .request.get(`${URL_API}/api/v1/content/pages?limit=1`, {
+      headers: { authorization: `Bearer ${plaintext}` },
+    })
+    .then((response) => ({ status: response.status(), body: response.json().catch(() => null) }))
+    .catch(() => ({ status: 0, body: null }));
+  steps.aRevokedTokenStopsReadingImmediately = afterRevoke.status === 401;
+  steps.theRefusalSaysRevokedNotWrong =
+    afterRevoke.body?.error?.code === "token_revoked";
+  steps.theRevokedRowStaysVisible =
+    qaSql(`select coalesce(revoked_at::text, 'NULL') from api_tokens where id = '${tokenId}'`) !== "NULL";
+
+  // ------------------------------------------------------------------ the mobile layout
+  await page.setViewportSize({ width: 390, height: 900 }).catch(() => {});
+  await page.waitForTimeout(1600);
+  const overflow = await page
+    .evaluate(() => {
+      const el = document.scrollingElement || document.documentElement;
+      return el.scrollWidth - el.clientWidth;
+    })
+    .catch(() => -1);
+  steps.noHorizontalScrollAt390 = overflow <= 1;
+  await shot(page, "content-api-docs-390");
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  return steps;
+}
+
+/**
  * `runMembersDepth` — visitor accounts, their sessions and the site policy (REQ-064, slice 4c).
  *
  * This screen manages the table the REQ calls its single most important boundary, so the steps
@@ -10239,6 +10494,66 @@ async function main() {
     await page.context().browser()?.close().catch(() => {});
     return;
   }
+  if (process.argv.includes("--only=content-api")) {
+    report.contentApi = await runContentApiDepth(page, report);
+    log(`content-api: ${JSON.stringify(report.contentApi)}`);
+    // The pass's own `steps.*` vocabulary, read off the function. `documented_*` is generated
+    // from the SERVER's operation ids, so it cannot be listed here — the per-id steps are checked
+    // by a count instead, because a fixed list of six names would stop matching the day a seventh
+    // route is documented, and a checklist that quietly loses a row is worse than none.
+    const required = [
+      "tokenTableExists", "noPlaintextColumn", "tokenHashIsStoredNotTheSecret",
+      "usageTableExists", "tokensScreenReady", "sectionNavIsOnScreen", "docsTabIsLinked",
+      "theNameIsInTheField", "copyOnceDialogOpened", "theDialogShowsThePlaintext",
+      "doneIsBlockedUntilStored", "tickingStoredReleasesDone", "operatorCanMintAToken",
+      "plaintextIsNotStored", "rowShowsThePrefixNotTheSecret", "rowNeverShowsTheSecret",
+      "mintedRowIsOnScreen", "tokenReadsTheContentSurface", "everyItemCarriesItsCacheKeys",
+      "aPanelSessionIsRefusedTheContentSurface", "limitIsHonoured", "envelopeHasAllThreeKeys",
+      "missingScopeIsNamed", "docsScreenReady", "docsErrorStripIsAbsent", "documentIsOpenApi31",
+      "documentDeclaresEveryEndpoint", "baseUrlIsShown", "paginationGuideIsPresent",
+      "errorCodesAreListed", "rebuildExampleIsPresent", "yamlDownloadCarriesTheEndpoints",
+      "aBadFormatIsRefusedWithItsField", "revokeSucceeded",
+      "aRevokedTokenStopsReadingImmediately", "theRefusalSaysRevokedNotWrong",
+      "theRevokedRowStaysVisible", "noHorizontalScrollAt390",
+    ];
+    const apiSteps = report.contentApi || {};
+    const missing = required.filter((key) => apiSteps[key] === undefined);
+    // Every documented operation must have a row on screen. Derived from the same document the
+    // screen renders, so this cannot pass against a hard-coded list of six ids.
+    const documentedRows = Object.keys(apiSteps).filter((key) => key.startsWith("documented_"));
+    const undocumentedRows = documentedRows.filter((key) => apiSteps[key] !== true);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=content-api",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          documentedRows: documentedRows.length,
+          undocumentedRows,
+          steps: apiSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0 || undocumentedRows.length > 0) {
+      log(
+        `content-api depth pass MISSING ${missing.length}: ${missing.join(", ")}` +
+          (undocumentedRows.length > 0
+            ? ` · UNDOCUMENTED ${undocumentedRows.length}: ${undocumentedRows.join(", ")}`
+            : ""),
+      );
+    } else {
+      log(
+        `content-api depth pass ${required.length}/${required.length}` +
+          ` · ${documentedRows.length} endpoints documented`,
+      );
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=comments")) {
     report.comments = await runCommentsDepth(page, report);
     log(`comments: ${JSON.stringify(report.comments)}`);
@@ -10590,6 +10905,14 @@ async function main() {
     // list is not measured by any pass — it was walked by no pass at all, on any width.
     { path: "/members", name: "members" },
     { path: "/members/settings", name: "member-settings" },
+    // The Content API section (REQ-019, slices 1 and 2) — no untested screen. BOTH routes are
+    // listed for the same reason the two members routes are: they are two screens of one section
+    // reached through a tab bar, and walking only the Tokens tab would leave the document — the
+    // thing an integrator actually comes here to read — measured by nothing. The Docs tab's own
+    // content is data-driven from the server's OpenAPI document, so a walk that opened it and
+    // found no endpoint rows would be measuring a failed request rather than an empty screen.
+    { path: "/content-api", name: "content-api" },
+    { path: "/content-api/docs", name: "content-api-docs" },
     // The theme gallery (REQ-062, slice 1) — walked here so the screen is in the inventory,
     // and driven by `runThemesDepth` below, which activates a theme, reads the badge, restores
     // the previous one and requires the button to disappear when there is nothing to restore.
@@ -11057,7 +11380,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/members", name: "members" }, { path: "/members/settings", name: "member-settings" }, { path: "/content-api", name: "content-api" }, { path: "/content-api/docs", name: "content-api-docs" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been

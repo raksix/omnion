@@ -24,6 +24,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use omnion_audit::NewAuditEntry;
 use omnion_content::api_tokens::{
     self, AuthFailure, TokenChanges, EXPIRY_PRESETS, RATE_TIER_ELEVATED, RATE_TIER_STANDARD, SCOPES,
@@ -213,6 +214,82 @@ pub async fn token_vocabulary(
         ],
         max_name_length: api_tokens::MAX_NAME_LENGTH,
     }))
+}
+
+/// Which serialization the panel asked for.
+#[derive(Debug, Default, Deserialize)]
+pub struct OpenApiQuery {
+    /// `json` (the default) or `yaml`.
+    pub format: Option<String>,
+}
+
+/// `GET /api/v1/content-api/openapi.json` — the same document, for a panel session.
+///
+/// The token-authenticated route exists, and this one exists anyway, because the panel cannot hold
+/// a content token: to read a token's own document an operator would have to mint a credential for
+/// the surface they are administering. That is the wrong shape — an admin screen that manufactures
+/// a secret to show a description is a screen that eventually leaks one.
+///
+/// The document is the same value, built by the same function, so the two can never disagree; the
+/// only difference is the authority in front of it. `content.api.read` is the same power the token
+/// list needs, because a reader who may see the tokens may see what they are for.
+///
+/// `?format=yaml` returns the same document as a download, because that is what a code generator
+/// ingests and the request text asks for both. It is a parameter rather than a second route on
+/// purpose: two routes means two documents eventually, and a YAML copy that has fallen behind its
+/// JSON twin is the one nobody notices.
+///
+/// The base URL is taken from the request's own authority, exactly as the token route does it: a
+/// hard-coded host makes every example in the document wrong on every installation but one.
+pub async fn openapi_document(
+    State(_state): State<AppState>,
+    _current: CurrentSession,
+    axum::extract::Query(query): axum::extract::Query<OpenApiQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost");
+    let document = crate::routes::content_openapi::document(&format!("https://{host}/api/v1"));
+    let wanted = query.format.as_deref().unwrap_or("json").trim();
+
+    match wanted {
+        "json" => Ok(Json(document).into_response()),
+        "yaml" | "yml" => {
+            let body = crate::routes::content_openapi::to_yaml(&document);
+            let headers = [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/yaml; charset=utf-8".to_owned(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"omnion-content-api.yaml\"".to_owned(),
+                ),
+            ];
+            let mut response = axum::response::Response::new(axum::body::Body::from(body));
+            for (name, value) in headers {
+                response.headers_mut().insert(name, value.parse().map_err(|_| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "the download headers could not be written",
+                    )
+                })?);
+            }
+            Ok(response)
+        }
+        // A refusal that names the field, like every other bad body on this surface: a client that
+        // asks for `?format=pdf` needs to be told what the two choices are.
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_parameter",
+            "format must be json or yaml",
+        )
+        .with_details(json!({ "field": "format", "received": other }))),
+    }
 }
 
 /// `POST /api/v1/content-api/tokens` — mint, and return the plaintext exactly once.
