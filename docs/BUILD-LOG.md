@@ -9277,3 +9277,79 @@ not by a missing cleanup, and the next run found zero of them.
 as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
 this box until then** — treat a `53100` as environmental and read the assertion line above it for
 the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
+
+---
+
+## Tick 43 — REQ-133 slice 14: the confirmations no client could send
+
+**What.** Acceptance 12's fourth claim — *"transferring ownership requires both confirmations"* — was a
+**handler** property that nothing on the branch drove. The store never sees `confirm_owner` /
+`confirm_audit`; they exist only in the request body, so the store tests could not reach them and the
+earlier reasoning ("the store proves it, the handler compiles") was the greenest lie available here.
+
+Writing the gate found a **client that could not honour the rule**. `transferProjectOwnership` in
+`apps/admin/lib/api.ts` hardcoded `confirm_owner: true, confirm_audit: true`, so the dialog's two
+acknowledgement checkboxes gated its own button and then sent a body byte-identical to a caller who
+ticked nothing. Two consequences: `ownership_transfer_unconfirmed` was unreachable from every client
+path, and the two confirmations were indistinguishable to the server. Fixed in `7c423ec3`.
+
+**Proof.**
+
+- `scripts/qa/run-transfer-ownership.sh` **17/17**, and **PROVEN TO FAIL at 8/17** with the confirmation
+  rule deleted from the handler. The first failure is the one worth quoting: an unconfirmed transfer
+  answers **`200 {"previous_owner_user_id": …, "owner_user_id": …}` — it actually hands the project
+  away.** The next two fail because the caller is by then a demoted editor and cannot retry, which is
+  the sharpest statement of the defect available.
+- The nine survivors are exactly the assertions that only *read* state back — which is the point: a
+  handover that happened looks identical whether or not the confirmations were required.
+- `run-delegated-admin.sh` **23/23** unchanged after the `origin/main` merge (all 162 derived
+  instance-wide routes still refused).
+- `apps/admin` `tsc --noEmit` exit 0.
+
+**The gate earned its keep in its own fixture, and that is the transferable part.** Its first run
+reported seven failures with one cause: `POST /iam/users` creates a `member`, which carries no
+`projects.*` key, so *every* call was refused by `permission_denied` — including the confirmed one. A
+gate asserting "refused" without reading the body would have reported **the confirmation rule** broken
+while it had never been reached. `transfer()` therefore requires `400` **and** the code string. The
+guard's refusal and the validation's refusal are different mechanisms wearing the same status; on a
+route that *should* be allowed a CSRF or permission failure shows up red, but on one that *should* be
+refused it passes green, and that asymmetry is invisible unless the body is read.
+
+**Both owner representations are asserted separately.** `transfer_ownership` moves the
+`owner_user_id` column *and* the `owner` membership row, and `upsert_member` writes only the
+membership — so a project can carry an owner nobody is recorded as owning. A transfer that moved one
+of the two would leave a project whose owner cannot administer it. The demotion to `editor` is
+asserted as a row rather than as a comment, and the audit half is asserted in the **negative**: a
+refused transfer must write no `project_ownership.transferred` row, for the same reason
+`DELETE /scim/v2/Users/{id}` is checked before `user.deleted` is emitted.
+
+**Also this tick, and worth recording as method.** Merged `origin/main` first: two conflicts, both in
+shared files. `apps/api/src/main.rs` was an import-list union (`notification_runner` from main,
+`project_limit_runner` + `crm_*` from this branch). `docs/BUILD-LOG.md` was resolved with
+`scripts/qa/merge-build-log.py`, **which then failed on damage the merge surfaced and the script could
+not name**: this branch carries a *truncated* copy of Tick 75 (41 prose lines where the base holds
+80, from an earlier line-level merge). Step 1 repaired the base entry from the superset, but the
+damaged copy then failed to match by content, was classified "new", and was appended — so the
+truncation detector fired on damage the script had just written. Fixed in the tool: a block whose
+heading is a base heading and whose prose is a strict subset of that base entry is a **wound, not
+history**, and it is dropped — with the exemption in the two checks below it stated as *held in full*
+(`contains`, not equality). The three checks now share one predicate; the rule had been written in
+three places and had drifted in two.
+
+Both audits this tick came back clean, and the second one produced its own false alarm first: a
+hand-written table list named `ecommerce_storefront_settings` for three ticks while the migration
+creates `storefront_settings`. Deriving the list from the migrations instead found all 15 business
+tables with a writer (`automation_cursor` reads 0/0 only because it is written by `crates/automation`,
+outside this branch's roots — a scope limit, not a defect).
+
+**Not proved, and stated.** No browser pass: the QA slot was held by a live w3 pass for the whole tick
+(holder pid alive, cwd `/mnt/apopic/omnion-w3`, artifacts still being written at 12:29) and load ran
+82–99 across ten writers. Unlike the previous six ticks this is **verified rather than inferred** — the
+holder pid was tested, found alive, and its owning walkthrough confirmed running. The dialog's own
+rendering therefore remains un-observed, and no line here claims otherwise.
+
+**Next.** Acceptance 12's contract half is closed; its screen half waits on a pass that finishes. The
+`credentials` / `workflow_folders` / `workflow_schedules` filter kinds and the move-dependency
+refusals still have no table on this branch and stay named rather than ticked. `omnion-workflows --lib`
+was still linking under load 92 when this entry was written — the gate, the sibling regression gate and
+`tsc` are the proof quoted above; the lib count is recorded in the ledger, not claimed here.
