@@ -10268,7 +10268,29 @@ note({
       if (!ctm) return null;
       const mid = hit.getPointAtLength(hit.getTotalLength() / 2);
       const screen = mid.matrixTransform(ctm);
-      return { x: screen.x, y: screen.y };
+      // What is actually AT that point, by the browser's own hit test. "The click missed the
+      // curve" is a conclusion; this is the evidence. The point is the midpoint of a curve
+      // between two 220px cards, so the two ordinary reasons it lands on nothing are a card
+      // covering the arc and a pane covering the canvas — and both are answerable here
+      // instead of next tick.
+      const at = document.elementFromPoint(screen.x, screen.y);
+      const edge = at?.closest("[data-edge]");
+      return {
+        x: screen.x,
+        y: screen.y,
+        // Which element won the hit test, so a miss says *what* was in the way.
+        onEdge: Boolean(edge),
+        blockedBy: at
+          ? `${at.tagName.toLowerCase()}${
+              at.closest("[data-node-id]") ? "[node-card]" : at.closest("[data-builder-canvas]") ? "" : "[other]"
+            }${at.closest("[data-builder-problems]") ? "[problems]" : ""}`
+          : null,
+        inViewport:
+          screen.x >= 0 &&
+          screen.y >= 0 &&
+          screen.x <= window.innerWidth &&
+          screen.y <= window.innerHeight,
+      };
     })
     .catch(() => null);
   let edgeHit = false;
@@ -10315,6 +10337,12 @@ note({
       selected: false,
       point: edgeScreenPoint,
       reason: edgeScreenPoint ? "the click missed the curve" : "no edge could be measured",
+      // The evidence for the reason above. Without it "missed" is a guess, and the two
+      // candidates — the point is off-canvas after a pan, or a card is sitting on the arc —
+      // need different fixes, so a note that cannot tell them apart costs a tick either way.
+      onEdge: edgeScreenPoint?.onEdge ?? null,
+      blockedBy: edgeScreenPoint?.blockedBy ?? null,
+      inViewport: edgeScreenPoint?.inViewport ?? null,
     });
   }
 
