@@ -9333,6 +9333,137 @@ note({
     await shot(page, "page-workflow-builder-keyboard-final");
   }
 
+  // ---- Tab walks the canvas (REQ-004 slice 4) ---------------------------------------------
+  // The list said `Tab` walks to the next card for two ticks and **no handler existed**:
+  // `onCanvasKeyDown` bound no `Tab` case and every card is `tabIndex={-1}`, so the browser
+  // moved focus out to the toolbar and the selection never moved. `focusOrder` existed in
+  // `selection.ts` with a unit test on its shape and no caller.
+  //
+  // The unit test (in `canvas-walk.test.ts`) proves the *rotation* and that a text guard
+  // cannot see a delegated binding. It cannot prove that pressing the key moves anything, so
+  // this does. Three claims, and the one that matters is the first:
+  //
+  //  1. **The selection and the focus ring land on the same card.** They are two mechanisms —
+  //     `setSelection` and a programmatic `.focus()` — and a handler that did only the first
+  //     would move the outline while the browser kept focus on the toolbar, which is invisible
+  //     in a screenshot and would make the next keystroke (`C`, `I`) act on the wrong card.
+  //     So both are read, and `document.activeElement` is the authority for where focus is.
+  //  2. **A second press reaches a connection**, and `⇧Tab` comes back. The edge is the
+  //     reason the walk exists for this criterion: "Del on a selected edge removes it" is only
+  //     satisfiable from a keyboard if a keyboard can *reach* an edge, and a walk that stopped
+  //     at the last node would be indistinguishable from a walk that only visits nodes.
+  //  3. **A Tab inside a field is the field's.** `I` focuses the inspector's first input, so
+  //     this is the claim that keeps the keyboard criterion satisfiable: a walk that consumed
+  //     Tab there would make "edits a parameter" impossible while looking like a broken
+  //     shortcut. It is measured by pressing Tab in the field and reading the *field's* focus
+  //     afterwards — a walk would have pulled focus onto a card, which is the failure.
+  {
+    const width = 1440;
+    await page.setViewportSize({ width, height: 900 });
+    await page.waitForTimeout(800);
+
+    /** The drawn selection, read off the canvas's own marker rather than a class string. */
+    const readSelection = () =>
+      page.$$eval("[data-node-id][data-node-selected='true'], [data-edge][data-edge-selected='true']", (els) =>
+        els.map((el) => el.getAttribute("data-node-id") ?? el.getAttribute("data-edge")),
+      );
+    const readActive = () =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        if (!el) return null;
+        return (
+          el.getAttribute?.("data-node-id") ??
+          el.getAttribute?.("data-edge") ??
+          el.tagName.toLowerCase()
+        );
+      });
+
+    // Start from a known card: the first one, selected by a click. A walk measured from
+    // "nothing is selected" would pass on any implementation that returns the first card, so
+    // the probe deliberately begins in the *middle* of the graph.
+    const ids = await page.$$eval("[data-node-id]", (els) =>
+      els.map((el) => el.getAttribute("data-node-id")),
+    );
+    const startId = ids.length > 1 ? ids[1] : ids[0] ?? null;
+    if (startId) {
+      await page.locator(`[data-node-id="${startId}"]`).first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(500);
+    }
+    const before = { selection: await readSelection(), active: await readActive() };
+
+    // A plain Tab. The canvas must have focus for its keydown to fire at all, and the click
+    // above gave it to the card (or the canvas) — this reads where focus actually is, so a
+    // probe that clicked and assumed would report "Tab did nothing" for the wrong reason.
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(600);
+    const afterForward = { selection: await readSelection(), active: await readActive() };
+
+    await page.keyboard.press("Tab");
+    await page.waitForTimeout(600);
+    const afterSecond = { selection: await readSelection(), active: await readActive() };
+
+    // Backwards, from wherever the second press landed.
+    await page.keyboard.press("Shift+Tab");
+    await page.waitForTimeout(600);
+    const afterBack = { selection: await readSelection(), active: await readActive() };
+
+    // And the field half: `I` focuses the inspector's first input, and a Tab there must
+    // leave the field rather than walk the canvas.
+    await page.keyboard.press("i");
+    await page.waitForTimeout(500);
+    const fieldBefore = await page.evaluate(() => {
+      const el = document.activeElement;
+      return el ? el.tagName.toLowerCase() : null;
+    });
+    let fieldKeptFocus = null;
+    if (["input", "textarea", "select"].includes(fieldBefore ?? "")) {
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(500);
+      const after = await page.evaluate(() => {
+        const el = document.activeElement;
+        return el ? el.tagName.toLowerCase() : null;
+      });
+      // Either the field kept the caret or focus moved to the *next field* — both are the
+      // field's own Tab. What must NOT happen is focus landing on a canvas card, which is
+      // the walk having eaten it.
+      fieldKeptFocus = !["div", "span", "g"].includes(after ?? "");
+    }
+    // Put the selection somewhere harmless so the rest of the pass is not driven from a
+    // focused input.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+
+    const moved = (state) =>
+      state.selection.length > 0 && state.selection[0] !== before.selection[0];
+    note({
+      step: "tab-walk",
+      cardsOnCanvas: ids.length,
+      startedFrom: before.selection[0] ?? null,
+      // The load-bearing claim: the two mechanisms agree. A walk that moved only one of them
+      // passes "did the selection change" and fails here.
+      forward: { selection: afterForward.selection, active: afterForward.active, moved: moved(afterForward) },
+      selectionAndFocusAgree:
+        afterForward.selection.length > 0 &&
+        afterForward.selection[0] === afterForward.active,
+      second: { selection: afterSecond.selection, active: afterSecond.active },
+      // The edge claim. A walk that never leaves the nodes is a walk that leaves "Del on a
+      // selected edge" pointer-only, so the note records whether an edge was ever reached
+      // rather than asserting it must have been on this graph.
+      reachedAnEdge:
+        afterForward.selection.some((id) => id.startsWith("e")) ||
+        afterSecond.selection.some((id) => id.startsWith("e")),
+      backwardsReturns:
+        afterBack.selection.length > 0 &&
+        afterBack.selection[0] === afterForward.selection[0],
+      fieldKeptFocus,
+      // NOTE: whether the list *documents* Tab is deliberately not read here. This block runs
+      // before the overlay is opened, so a `[data-help-row]` query would find zero rows and
+      // report a false defect — a probe reading a screen it has not opened is the same class
+      // of error as one written against the old contract. The claim lives in the
+      // `shortcut-help` note below, which holds the overlay open while it reads it.
+    });
+  }
+
   // ---- ⌘/ and the shortcut list (REQ-004 slice 4) -----------------------------------------
   // The criterion is "⌘/ help", and the interesting part is that an overlay which *renders* is
   // the easy half. The claim worth measuring is the one a screenshot cannot: **the list does
@@ -9410,6 +9541,14 @@ note({
       marksTheLockedRows:
         rows.filter((row) => row.locked).length > 0 &&
         rows.filter((row) => row.locked).every((row) => row.text.toLowerCase().includes("read-only")),
+      // The row that lied for two ticks. `Tab` was on this list from the day it was written
+      // and no handler existed; the list is the only place an author looks to find out what
+      // is possible, so a row for a key that does nothing is worse than a missing row — the
+      // author presses it, sees nothing, and concludes the keyboard does not work here.
+      // Read from the *rendered* rows rather than the catalogue: a catalogue nobody renders
+      // passes every unit test, which is exactly how the first version of this claim could
+      // have been satisfied by a list that never appeared on screen.
+      documentsTab: [...documented].some((label) => label.includes("tab")),
     });
   }
 
