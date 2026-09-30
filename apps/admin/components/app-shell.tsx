@@ -80,6 +80,12 @@ const NAV = [
   // purpose: `UserCog` already means a PANEL user two rows down, and an operator who confuses
   // the two is about to grant a visitor a set of platform permissions.
   { href: "/members", label: "Members", icon: UserRoundCheck },
+  // The headless content API (REQ-019, slice 1). It sits AFTER Members rather than beside
+  // Settings because the thing it manages is a credential that leaves the building: an operator
+  // asking "who outside our org is reading our site" is the same question as "who is a member",
+  // asked about a stranger rather than an account. `KeyRound` rather than a settings key, because
+  // it is a credential and not a preference.
+  { href: "/content-api", label: "Content API", icon: KeyRound },
   // The theme gallery (REQ-062). It sits directly BEFORE Media on purpose: the gallery decides
   // what a visitor sees, and every row below it in this shelf — media, menus, pages — is content
   // a theme then presents. `Palette` rather than `LayoutTemplate`, which the block editor

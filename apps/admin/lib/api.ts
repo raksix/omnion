@@ -9,6 +9,9 @@ import type {
   BlockValidationResult,
   ContentBlock,
   ContentPattern,
+  ContentApiToken,
+  ContentApiVocabulary,
+  CreatedContentApiToken,
 
   SecurityBulkResult,
   SecurityFinding,
@@ -6789,6 +6792,75 @@ export async function installThemePackage(pkg: unknown): Promise<ThemeInstallRes
  */
 export async function removeTheme(themeKey: string): Promise<{ removed: string }> {
   return request<{ removed: string }>(`/api/v1/themes/${encodeURIComponent(themeKey)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Content API tokens (REQ-019, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/** Every token of the organization. Prefix-only: the API has no secret to return here. */
+export function fetchContentApiTokens(): Promise<ContentApiToken[]> {
+  return request<ContentApiToken[]>("/api/v1/content-api/tokens");
+}
+
+/**
+ * The vocabulary the create dialog draws from.
+ *
+ * Read from the server rather than hard-coded: a dialog that invents its own scope list will
+ * eventually offer a scope the store refuses, and the editor finds out at submit time.
+ */
+export function fetchContentApiVocabulary(): Promise<ContentApiVocabulary> {
+  return request<ContentApiVocabulary>("/api/v1/content-api/tokens/vocabulary");
+}
+
+/**
+ * Mint a token. The returned `plaintext` exists once and cannot be fetched again — the store keeps
+ * only its SHA-256 — so the caller must show it before discarding the response.
+ */
+export function createContentApiToken(input: {
+  name: string;
+  site_id?: string | null;
+  scopes: string[];
+  allowed_origins?: string[];
+  rate_limit_per_minute?: number;
+  expires_in_days?: number;
+}): Promise<CreatedContentApiToken> {
+  return request<CreatedContentApiToken>("/api/v1/content-api/tokens", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Edit a token. Rotation is a separate verb: a rename must not silently reissue a secret. */
+export function updateContentApiToken(
+  tokenId: string,
+  input: {
+    name?: string;
+    scopes?: string[];
+    allowed_origins?: string[];
+    rate_limit_per_minute?: number;
+    expires_in_days?: number;
+  },
+): Promise<ContentApiToken> {
+  return request<ContentApiToken>(`/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Issue a new secret. The previous one stops working immediately. */
+export function rotateContentApiToken(tokenId: string): Promise<CreatedContentApiToken> {
+  return request<CreatedContentApiToken>(
+    `/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}/rotate`,
+    { method: "POST" },
+  );
+}
+
+/** Revoke. Idempotent, so a double-clicked confirm is not an error. */
+export function revokeContentApiToken(tokenId: string): Promise<void> {
+  return request<void>(`/api/v1/content-api/tokens/${encodeURIComponent(tokenId)}`, {
     method: "DELETE",
   });
 }

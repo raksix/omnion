@@ -3057,3 +3057,79 @@ export interface BackupSchedule {
   /** What the screen says the frequency means, in one sentence. */
   cadence: string;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Content API tokens (REQ-019, slice 1)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A content API token as the list renders it.
+ *
+ * There is deliberately no field a secret could hide in: the row is the server's `TokenBody`, and
+ * that struct cannot hold one either. A `secret?: string` here would be `undefined` forever and
+ * would teach the next person that this shape is where a secret goes.
+ */
+export type ContentApiToken = {
+  id: string;
+  name: string;
+  /** The copyable `omn_xxxxxxxx` marker — the only part of the credential that is ever shown. */
+  prefix: string;
+  /** `null` means every site of the organization. */
+  site_id: string | null;
+  /** The site's key when scoped, for a column a person can read. */
+  site_key: string | null;
+  scopes: string[];
+  allowed_origins: string[];
+  rate_limit_per_minute: number;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+  /** `active`, `expired` or `revoked`. Derived by the server from the two columns above. */
+  status: "active" | "expired" | "revoked";
+};
+
+/** The create/rotate response: the row plus the one copy of the plaintext. */
+export type CreatedContentApiToken = {
+  token: ContentApiToken;
+  /**
+   * `omn_<prefix>_<secret>`, shown exactly once. It is not fetchable afterwards — the API stores
+   * only its digest — so the screen that renders it must not offer a "show again".
+   */
+  plaintext: string;
+  /** Always `true`; the client renders the warning from the payload rather than from a guess. */
+  plaintext_shown_once: boolean;
+};
+
+/** One expiry choice the create dialog offers. */
+export type ExpiryPreset = {
+  label: string;
+  /** `0` means "never". */
+  days: number;
+};
+
+/** One rate-limit tier. */
+export type RateTier = {
+  label: string;
+  per_minute: number;
+  /** Whether the tier needs a permission the other one does not. */
+  elevated: boolean;
+};
+
+/** A scope that exists in the store but is not implemented in v1. */
+export type ReservedScope = {
+  scope: string;
+  /** Why it is not live, in the panel's own voice. */
+  note: string;
+};
+
+/** Everything the create dialog may offer, read from the server rather than hard-coded. */
+export type ContentApiVocabulary = {
+  /** The scopes v1 offers. */
+  scopes: string[];
+  /** Reserved by name, so a future write surface needs no migration. */
+  reserved_scopes: ReservedScope[];
+  expiry_presets: ExpiryPreset[];
+  rate_tiers: RateTier[];
+  max_name_length: number;
+};
