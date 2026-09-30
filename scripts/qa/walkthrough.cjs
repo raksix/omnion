@@ -11857,28 +11857,80 @@ async function runCrmKeyboardAndMobile(page, report) {
 
   // The form is single-column: two side-by-side fields at 390px is a layout that is technically
   // responsive and practically unreadable, and the spec asks for one column.
-  await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(`${URL_ADMIN}/crm/contacts`, { waitUntil: "domcontentloaded" }).catch(() => {});
-  await page.waitForTimeout(1500);
-  await page.setViewportSize({ width: 390, height: 844 });
-  await page.waitForTimeout(700);
-  await page.locator("[data-qa-guard='crm-depth']").first().click({ timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(800);
-  const form = page.locator("#crm-first-name").first();
-  steps.theFormIsOnAPhone = (await form.count()) > 0;
-  if (steps.theFormIsOnAPhone) {
-    const boxes = await page
+  //
+  // This was one screen's form — `/crm/contacts` — and the screen whose form actually *was* two-up
+  // (`/crm/activities`, "Hangs off" beside "Record id") was never measured at all, so the box was
+  // green over the defect it exists to catch. The measurement is now per screen: every CRM form the
+  // module offers is opened on a phone and measured, because "the contact form is one column" was
+  // never the claim — "the module's forms are" was.
+  const formGeometry = {};
+  const measuredForms = [
+    { path: "/crm/contacts", name: "contacts", open: "[data-qa-guard='crm-depth']" },
+    // The activity form is on the page by default; it is the one that carried the defect.
+    { path: "/crm/activities", name: "activities", open: null },
+    { path: "/crm/deals", name: "deals", open: "[data-qa-guard='crm-depth']" },
+    { path: "/crm/companies", name: "companies", open: "[data-qa-guard='crm-depth']" },
+  ];
+  for (const entry of measuredForms) {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`${URL_ADMIN}${entry.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(700);
+    if (entry.open) {
+      await page.locator(entry.open).first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(800);
+    }
+
+    // Single column is a claim about *pairs*: for every visible field, no other field may start on
+    // the same row. That is measured rather than counted, so a two-up form fails by construction
+    // rather than by a threshold someone picked. Only rendered boxes — `width > 0` — are compared,
+    // so a hidden label is not evidence.
+    //
+    // `lefts.length <= 2` was the earlier version and it could not fail: it counted *distinct left
+    // offsets* and allowed two of them, which is exactly what a two-column form produces. Both
+    // fields sit side by side, give two distinct lefts, and pass.
+    const rows = await page
       .locator("form label, form .grid > label")
       .evaluateAll((nodes) =>
         nodes
           .map((node) => node.getBoundingClientRect())
           .filter((rect) => rect.width > 0 && rect.height > 0)
-          .map((rect) => Math.round(rect.left)),
+          .map((rect) => ({ left: Math.round(rect.left), top: Math.round(rect.top) })),
       )
       .catch(() => []);
-    const lefts = [...new Set(boxes)];
-    steps.theFormIsSingleColumn = lefts.length <= 2;
+    // Two fields share a row when their tops are within a label's own line box of each other; the
+    // tolerance is a few pixels so sub-pixel rounding does not invent a second row.
+    const perRow = new Map();
+    for (const box of rows) {
+      const key = [...perRow.keys()].find((seen) => Math.abs(seen - box.top) <= 4) ?? box.top;
+      const bucket = perRow.get(key) ?? [];
+      bucket.push(box.left);
+      perRow.set(key, bucket);
+    }
+    const widestRow = Math.max(0, ...[...perRow.values()].map((group) => new Set(group).size));
+    formGeometry[entry.name] = { fields: rows.length, widestRow, singleColumn: widestRow <= 1 };
+    if (entry.name === "contacts") {
+      steps.theFormIsOnAPhone = rows.length > 0;
+      steps.theWidestFormRowHasOneField = widestRow;
+      steps.theFormFieldsMeasured = rows.length;
+    }
+    if (entry.name === "activities") {
+      await shot(page, "mobile-crm-activity-form");
+    }
   }
+  steps.theFormsOnAPhone = formGeometry;
+  // Every measured form has to be one column. A form with no fields at all is a screen whose form
+  // did not open, and it is reported rather than passed — otherwise the check silently measures
+  // nothing on the screen that needs it most.
+  steps.theFormIsSingleColumn = Object.values(formGeometry).every(
+    (entry) => entry.fields > 0 && entry.singleColumn,
+  );
+  steps.everyMeasuredFormIsSingleColumn = Object.entries(formGeometry)
+    .filter(([, entry]) => entry.fields > 0)
+    .every(([, entry]) => entry.singleColumn);
+  steps.theFormsMeasured = Object.values(formGeometry).filter((entry) => entry.fields > 0).length;
+
   await shot(page, "mobile-crm-contact-form");
   await page.setViewportSize({ width: 1440, height: 900 });
 
