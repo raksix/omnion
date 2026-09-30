@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** in-progress (slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815` — the console on the wire: `apps/api/src/routes/ai_workflows.rs` (list/get/authors/examples/delete + a `generate` that answers `text/event-stream` with `stage`/`done`/`error` frames), two events (`ai.workflow_draft.generated`, `ai.workflow_draft.failed`), the console and review screens with the nav entry, and a 10-walk suite that was 5/10 red on arrival — every failure a fixture, none a product defect. Slice 2's `ai.prompt` was found to have a **product** bug this tick: the repair round-trip sent an empty user message, so the one repair the request is built around was unreachable (`375da98c`); slice 1 · `b6392a80`; slice 2 · `06f28399`) · **Captured:** 2026-09-25 · **Layer:** AI Hub × workflow engine
+> **Status:** in-progress (slice 4 · `f3943740` (the decision bar: approve materialises a **disabled** workflow with `enabled: false` written at the call site, approval is refused when the *approver* lacks a permission a step needs, `revise` streams like `generate`, and `test-run` provably dispatches nothing — plus the two refusals that were correct and useless: `reject` told the operator the status instead of naming the builder, and the "already a rule" message named no path), `a600e272` (the end-to-end probe), `61f227c6` (three criteria closed), `c63a6a1b` (**the approval bar was dead on every draft** — `has_definition` was declared in the TypeScript type and never sent by the API, so `approvable` was permanently `false` and every decision button was disabled; only the probe clicking the screen could find it, and the same commit fixed the psql `returning`-id bug that had the walkthrough reporting a visit it never made) · slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815`, `375da98c`; slice 2 · `06f28399`; slice 1 · `b6392a80`)
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -166,13 +166,26 @@ only: never the prompt body, never the definition, never a provider key.
       (the call counter proves zero calls), a reader holding only `workflows.read` reads the list and
       the detail, another organization sees an empty list and `404` on a direct fetch and on a
       delete, and the row survives. `approve` is slice 4.*
-- [ ] Empty, loading, error and no-provider states all exist; a failed generation never leaves the
-      UI stuck in `generating`.
-- [ ] Every list filter is URL-persisted and survives a reload.
+- [x] Empty, loading, error and no-provider states all exist; a failed generation never leaves the
+      UI stuck in `generating`. — *the console's own states are asserted by the walkthrough
+      (`runAiWorkflowConsole` reaches either the no-provider panel or the form, and refuses the
+      form in the first), and the focus probe drives the review screen's decision states
+      (`probe-ai-workflow-builder.cjs`, 14/14 against the live stack).*
+- [x] Every list filter is URL-persisted and survives a reload. — *typed live against the w3
+      stack: the query reaches the URL (`?q=`) and the input still holds it after a reload,
+      which is the assertion that matters — a screen can write the query string and still
+      re-seed its own state. Now in `probe-ai-workflow-builder.cjs` so it cannot rot.*
 - [x] A generated definition never carries a secret: params are limited to the closed vocabulary,
       asserted by a validation test, and a deleted draft never disables its workflow.
-- [ ] Both screens use Lucide icons only, render in light and dark mode with visible focus rings,
-      and show no clipped text at 1280 px or 390 px.
+- [x] Both screens use Lucide icons only, render in light and dark mode with visible focus rings,
+      and show no clipped text at 1280 px or 390 px. — *the only non-ASCII glyphs in either file
+      are `⌘`, `↵` and `≥`: a key label, a key label and a length bound, not an icon. Measured
+      live on the w3 stack in both themes at 1280 and 390: zero clipped controls, and
+      `:focus-visible` matches with a 2px solid outline on the console's own controls. The
+      first measurement said "no focus ring" at 390 — it had focused the header's **Sign out**
+      button, because `document.querySelector('button')` is the first button on the page and
+      not one of the screen's. A probe that measures the wrong element reports a defect that
+      is not there, which is the same failure the three assertions in this REQ started with.*
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and `bash scripts/qa/run.sh` are
       green and both screens appear in the walkthrough inventory (no untested screen).
 

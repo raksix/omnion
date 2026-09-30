@@ -6835,3 +6835,81 @@ that must run before this REQ closes will exercise a screen that exists. Queued 
 pass rather than started in parallel: two Chrome instances on a box already holding ~17 writer
 targets is the tab-death condition, and a pass that dies mid-route reports it as a product
 finding.
+
+## 2026-09-30 · tick 34 · REQ-046 slice 4 — the decision bar, and the screen that was dead
+
+**What.** The four decisions (approve / reject / revise / test-run) as a route module, the
+end-to-end probe slice 4 is "done when" without, and — the part that matters — a bug that made
+every one of those decisions unreachable through the UI.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p omnion-api --tests` | exit 0 |
+| `ai_workflow_decisions` | **12 passed / 0 failed** (was 9/11 on arrival) |
+| `probe-ai-workflow-builder.cjs` | **16/16** against the live w3 stack |
+| `omnion-api --lib` | 250/0 |
+| `omnion-workflows --lib` | 146/0 (was 144 — two definition regressions landed) |
+| `omnion-events --lib` | 47/0 |
+| `apps/admin` `tsc --noEmit` | clean |
+
+**The headline is a one-word wire bug.** `approvable` on the review screen is derived from
+`draft.has_definition`. The TypeScript type declared it, the screen read it, and the API's
+`DraftBody` **never sent it** — so at runtime it was `undefined`, `approvable` was permanently
+`false`, and Approve / Reject / Ask for changes / Test run were all disabled on a draft that was
+perfectly approvable. Slice 4 could have been committed as "the bar works", because the eleven
+Rust walks were green, `tsc` was clean and the screen *rendered* correctly. It rendered a
+disabled bar. **A declared type is an assertion about the wire, and nothing checks it against
+the server except a person clicking the screen.** The probe is now that person, and it found
+this in its first run.
+
+**The probe earned its keep three more times, and every one of the three was the probe's fault.**
+
+* **The last line of a psql `insert … returning` is the command tag.** With `-t -A` the row
+  prints first and `INSERT 0 1` last, so the walkthrough's `…pop()` handed it the string
+  `"INSERT 0 1"` — truthy, so `seededDraft: true` was recorded and the next line opened
+  `/ai/workflows/INSERT 0 1`. The review screen reported itself visited while nothing had been
+  visited, for two ticks. Fixed in the walkthrough and the probe, with a shape check.
+* **A probe that re-implements authentication tests its own guess.** It read `document.cookie`
+  for a cookie named `token` and replayed it from Node; the real cookie has another name and a
+  mutating call also needs CSRF, so every read would have failed *silently* and worn the
+  product's clothes. It now reads through the page, with the screen's own credentials.
+* **It asserted on the wrong element twice** — `[data-step]` belongs to the read-only step list,
+  not the test-run plan (0 steps on a plan that rendered perfectly), and "the bar must not offer
+  a second decision" tested a design nobody specified: the contract is that the button is
+  *disabled*. It also opened the *first* row, which was a `generating` draft, so the bar was
+  correctly disabled and the report blamed the screen.
+
+**Two refusals that were correct and useless.** `reject` loaded the draft with `draft_in_scope`
+while every other decision used `draft_for_decision`, so the same row was refused with two
+different stories — one naming the builder, one saying "this one is `activated`". And the
+"already a rule" message said *change that rule instead* with no path; it now names
+`/workflows/{id}/builder`, the route the screen already links.
+
+**`conditions` needed a normaliser, and the reason is two constraints that disagree.**
+`workflows_conditions_is_group` (0020) admits an array or a group object, while
+`workflows_conditions_need_event` (0010) evaluates `jsonb_array_length(conditions) = 0` — and
+that function *raises* on a non-array rather than answering something falsy, so the check
+survives an object only when the trigger is an event. A generated rule is manual more often than
+not, and a model that sent the group shape (what the automation layer stores, so what a model
+has seen) made every approval answer `400` naming the constraint that had *passed*. The
+regression test lives in the definition crate, where the shape is chosen.
+
+**A shared, process-wide budget means test N+1 reports the problem.** Adding a twelfth walk
+pushed the suite past the `sign_in` ceiling (10 per 5 minutes) and the failure landed on
+whichever test signed in last — naming a rate limit on a suite that was never testing rate
+limits. Fixed with the helper `apps/api/tests/support/walk_auth.rs` already documents for exactly
+this, raising only `sign_in`.
+
+**QA browser pass — ran, and the result is not a verdict on this change.** The pass reached
+`ai-workflows` and then the tab died: 43 routes across analytics, media, backups and IAM all
+answered `Page crashed` / `Target crashed`, starting at IAM — the known tab-death condition when
+several writers run passes on one box, not a product fault. The stack stayed healthy
+(`/healthz` 200) and the focused probe then ran against it, which is where the 16/16 comes from.
+**The pass is still owed before this REQ closes**, and the walkthrough fixture fix has not yet
+been exercised by a full pass.
+
+**Next.** Re-run the QA pass (the fixture now yields a real draft id), then the `ai.prompt` run
+criterion — a manual run of a workflow containing an `ai.prompt` step, showing the output
+visible in the execution's step rows.
