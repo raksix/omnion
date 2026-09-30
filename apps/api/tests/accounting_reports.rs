@@ -271,8 +271,19 @@ impl Fixture {
         .expect("the fixture invoice must be written")
     }
 
-    /// A payment, so the income and cashflow reports have money in them.
+    /// A payment against a real sent invoice, so the income and cashflow reports have money in.
+    ///
+    /// **The invoice is not decoration.** `accounting_payments.invoice_id` is nullable only since
+    /// 0175 (slice 3's change, for the transfer that pays several invoices at once), and a
+    /// payment with no invoice at all is a case neither report is about. Writing one keeps the
+    /// fixture on the ordinary path.
     async fn payment(&self, amount: &str, paid_on: &str) -> Uuid {
+        let invoice = self.invoice("PAID", amount, "0.00", Some(paid_on)).await;
+        sqlx::query("update accounting_invoices set invoice_status = 'sent' where id = $1")
+            .bind(invoice)
+            .execute(self.db.pool())
+            .await
+            .expect("the paid invoice must be sent");
         let reference = format!("RPT-PAY-{}", &Uuid::new_v4().simple().to_string()[..8]);
         // **`payment_number` is a `bigint`, not a text label** -- a per-organization sequence,
         // unique with it. `reference` is the text one (an external bank id, which may be empty).
@@ -287,13 +298,21 @@ impl Fixture {
         .fetch_one(self.db.pool())
         .await
         .expect("the payment number must be readable");
+        // `number` is NOT NULL and is the payment's own label; `payment_number` is the bigint
+        // sequence; `reference` is the external bank id and may be empty. Three similar columns,
+        // none of which the others may be used for.
+        let label = format!("PAY-{}", &Uuid::new_v4().simple().to_string()[..8]);
         sqlx::query_scalar::<_, Uuid>(
             "insert into accounting_payments \
-                 (organization_id, payment_number, reference, method, amount, paid_on, created_by) \
-             values ($1, $2, $3, 'bank_transfer', $4::numeric, $5::date, $6) returning id",
+                 (organization_id, invoice_id, payment_number, number, customer_name, reference, \
+                  method, amount, paid_on, created_by) \
+             values ($1, $2, $3, $4, $5, $6, 'bank_transfer', $7::numeric, $8::date, $9) returning id",
         )
         .bind(self.organization)
+        .bind(invoice)
         .bind(number)
+        .bind(&label)
+        .bind("Report Payer")
         .bind(&reference)
         .bind(amount)
         .bind(paid_on)
