@@ -454,9 +454,36 @@ async fn a_run_records_samples_that_agree_with_the_rows() {
     let storage = directory_storage();
     let ctx = context(harness.pool(), &redis, &storage);
 
-    let overview = omnion_health::run_and_record(harness.pool(), &ctx)
+    let (overview, policy) = omnion_health::run_and_record(harness.pool(), &ctx)
         .await
         .expect("a run must not fail because a dependency is down");
+    // The run's outcome is what slice 4's emitters announce from, so it has to agree with the
+    // overview rather than be a second, independent reading. The reachable services here are
+    // `healthy` or `unknown`; an `unknown` is a gap in our knowledge and deliberately opens no
+    // incident, so on a fresh database with one unreachable dependency the honest answer is
+    // that nothing was announced — and a policy that announced something would mean the
+    // emitter is about to page somebody for a probe that simply could not run.
+    assert_eq!(
+        policy.announcements(),
+        policy
+            .transitions
+            .iter()
+            .filter(|entry| entry.outcome.incident().is_some())
+            .count()
+            + policy
+                .breaches
+                .iter()
+                .filter(|(_, check)| check.should_announce())
+                .count(),
+        "announcements() must be the count the store already decided, not a second opinion"
+    );
+    for entry in &policy.transitions {
+        assert!(
+            entry.outcome.incident().is_some(),
+            "a transition the store did not act on must not reach an emitter"
+        );
+        assert_eq!(entry.service, entry.transition.service);
+    }
 
     assert_eq!(overview.services.len(), 8);
     let stored = omnion_health::latest_samples(harness.pool())
