@@ -116,6 +116,7 @@ pub struct RecentItemBody {
     pub title: Option<String>,
     pub route: Option<String>,
     pub result_count: Option<i32>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
