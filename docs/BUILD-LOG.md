@@ -8193,3 +8193,64 @@ free.
 a sentence in a document. That is a catalogue addition plus five emitters. The browser pass is still
 outstanding: the QA slot was **legitimately held** by a live w3 pass when this tick checked (holder
 pid alive, log one minute old), so it was left alone rather than reclaimed.
+
+## 2026-09-30 · omnion-wave6 tick 38 · REQ-128 slice 3 (release manifest)
+
+**What.** `release/lib/manifest.py` — the release manifest an operator's install reads, with
+`build` · `verify` · `schema` · deterministic `facts` subcommands — plus
+`release/tests/test_release_manifest.py` (46 tests), `scripts/qa/release-manifest.sh` (42
+checks, 19 mutations), an `omnion:non-service` marker in `cli.Dockerfile` and a CI job that
+runs both on every commit rather than only on a tag.
+
+**Proof.**
+- `bash scripts/qa/release-manifest.sh` → **42 passed, 19/19 mutations caught**.
+- `python3 release/tests/test_release_manifest.py` → **46 tests, OK**.
+- `bash scripts/qa/helm-chart.sh` → 70 passed, 0 failed.
+- `cargo check -p omnion-api --tests` → clean (4m07s, after the merge).
+- A fake tag produces **16 artifacts**: 4 images, 5 CLI binaries, 1 chart, 4 SBOMs, 2 compose
+  stacks — verified, not assumed.
+
+**The manifest's image list was WRONG in the way that ships a broken release.**
+`admin.Dockerfile` builds two runtime images (`admin-runtime` AND `web-runtime`, deliberately,
+so the panel and renderer cannot drift on the install layer), so "one Dockerfile, one image"
+published a manifest with **no public-site image** — the one both compose stacks and the chart
+deploy. Discovery reads the runtime stages now and cross-checks them against the images the
+deployment artifacts reference in both directions. The reverse direction cannot be a flat
+failure: `cli` is built by nobody and deployed by nobody, correctly, because a CLI is not a
+service — so it is allowed only via a marker in the Dockerfile that carries its own reason,
+with the reason's length asserted.
+
+**Four defects in this slice's own code, each found by running the thing rather than reading
+it.** `repository_mismatch` built `f"{registry}/{repository}"` and asked whether the result
+started with `registry` — it always does, so it returned `None` for every input including
+`docker.io/…`. `_require_digest` indexed the facts one level too shallow and reported "no
+digest supplied" for a digest sitting in the file, which sends the next person to debug a
+pipeline that is working. CLI platform coverage was computed INSIDE the per-artifact loop, so
+dropping the Windows binary passed — coverage is a property of the set. And the unit test that
+caught that one then caught itself: renaming `artifacts[0]` aimed at the CHART, because the
+list is sorted by kind.
+
+**A check that compares nothing is worse than no check.** The version rule first exempted any
+`package.json` with `private: true` — the pnpm workspace convention, which EVERY package here
+sets. The exemption applied to all of them, the check compared nothing, and it reported
+agreement. It now states the honest policy (every package carries the platform version) and
+asserts the exemption list is empty.
+
+**RED, and it is real: `themes/minimal` declares 0.1.1 while the platform releases 0.1.0.**
+It is a pnpm workspace member and `admin.Dockerfile` copies `themes/` into the shipped admin
+image, so the theme ships inside `admin:0.1.0` at a version the image tag contradicts. The gate
+refuses the build for it. The file belongs to wave 2 and the condition is present on `main`, so
+this loop reports it rather than editing it — the gate stays red until the owning writer aligns
+the version, which is the correct outcome for a gate meant to be hard to satisfy.
+
+**NOT claimed.** No image was built or pushed, so every digest comes from `synthetic_facts`
+(deterministic, self-marking). No real SBOM, no attestation verification, no tag pipeline
+(`.github/workflows/release.yml` is still to come), no `/deployment/artifacts` screen — those
+need `release_manifests`, whose migration number belongs to REQ-129.
+
+**Next.** REQ-128 slice 3 remainder: the tag pipeline with a dry-run mode that CAN be exercised
+on a build box, then the migration for `release_artifacts` / `release_manifests` /
+`environment_bundles` / `upgrade_plans` (numbered above the 0192 high-water across all ten
+worktrees, per the shared-namespace rule), then `/deployment/artifacts` and
+`/deployment/install`. Slice 2's two remaining Kubernetes lines still need a cluster this box
+does not have.

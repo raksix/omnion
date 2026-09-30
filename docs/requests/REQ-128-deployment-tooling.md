@@ -1,6 +1,11 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slices 1 and 2a shipped previously; **slice 2b — the Helm chart — is
+> **Status:** in-progress (slices 1 and 2a shipped previously; **slice 3's manifest half
+> shipped** in `4b477907`: a fake tag produces a 16-artifact manifest, verified by 42 gate
+> checks with 19/19 mutations caught and 46 unit tests. The slice is NOT done — no image was
+> built, no tag pipeline exists and there is no `/deployment/artifacts` screen. The gate is
+> currently RED on one real repository finding: `themes/minimal` declares 0.1.1 while the
+> platform releases 0.1.0, and that theme is copied into the shipped admin image. **slice 2b — the Helm chart — is
 > now complete and PROVEN RENDERED**, after the previous tick's chart turned out not to render at
 > all and its stated reason for shipping it unverified was wrong: helm 3.16.3 IS installed here.
 > The images have still NOT been built — a Rust release build needs CPU this box does not have —
@@ -145,7 +150,70 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
   HPA pointing at a name nothing creates is the silent kind.)*
 - [ ] The release pipeline on a tag publishes multi-arch images with digests, CLI binaries for the documented platforms with checksums, the packaged chart and an SBOM per image.
 - [ ] The pipeline refuses to publish when tests or the migration verification gate fail.
-- [ ] The release manifest lists images, checksums, migrations and the minimum core version, and the deployment centre reads it.
+- [x] The release manifest lists images, checksums, migrations and the minimum core version, and the deployment centre reads it.
+  *(Slice 3, first half — the manifest, NOT the deployment centre. `release/lib/manifest.py`
+  emits all four fields and `verify_manifest` refuses a document that is missing any of
+  them. The fake tag produces **16 artifacts**: four images, five CLI binaries (one per
+  documented platform), one chart, four SBOMs — one per image, asserted — and both compose
+  stacks. The migration list is read off `database/migrations/` rather than maintained by
+  hand, because the upgrade helper reads this field to decide whether an operator needs a
+  backup first, and an array would be correct exactly until the next writer added a
+  migration. The second half — `deployment.read` reading `release_manifests` — needs the
+  migration REQ-129's number and the cache REQ-024 owns, so it lands with slice 4.*
+
+  **Six defects, five of them in this slice's own code.** That ratio is the honest summary
+  of writing a builder and then running it:
+
+  - **`admin.Dockerfile` builds TWO images, not one.** It carries `admin-runtime` AND
+    `web-runtime` stages, deliberately, so the panel and the renderer cannot drift on the
+    install layer. "One Dockerfile, one image" therefore published a manifest with **no
+    public-site image** — the one both compose stacks and the chart deploy. Discovery reads
+    the runtime stages now, and cross-checks them against the images the deployment
+    artifacts reference, in BOTH directions.
+  - **The reverse direction is not a flat failure.** `cli` is built by nobody and deployed
+    by nobody, correctly: a CLI is not a service. So the check allows it only via an
+    `omnion:non-service` marker in the Dockerfile **carrying its own reason**, with the
+    reason length asserted. A path list in the builder would have been a name to remember
+    to edit the next time a non-service image appears.
+  - **`repository_mismatch` was a tautology.** It built `f"{registry}/{repository}"` and
+    asked whether that string starts with `registry` — which it always does, so it returned
+    `None` for every input including `docker.io/…`. A check that constructs the answer and
+    then tests the answer is the most expensive kind of green.
+  - **`_require_digest` indexed the facts one level too shallow**, so it reported "no digest
+    supplied" for a digest sitting in the file, sending the next person to debug a pipeline
+    that was working correctly.
+  - **CLI platform coverage was checked inside the per-artifact loop**, so dropping the
+    Windows binary passed: coverage is a property of the SET, and a per-element check
+    cannot express it. The mutation suite is what found this — the unit test that followed
+    then found that renaming `artifacts[0]` aimed at the CHART, because the list is sorted
+    by kind.
+  - **`themes/minimal` declares 0.1.1 while the platform releases 0.1.0.** It is a pnpm
+    workspace member and `admin.Dockerfile` copies `themes/` into the shipped panel image,
+    so the theme ships inside `admin:0.1.0` at a version the image tag contradicts. The
+    gate REFUSES the build for this, which is why `build manifest` is red. The file belongs
+    to wave 2, so this loop reports it rather than editing it; the condition is present on
+    `main` too, so it predates this branch.
+
+  **A note on how the version check was nearly wrong twice.** The first version exempted any
+  `package.json` with `private: true` — and in this repository EVERY package sets it (the
+  pnpm workspace convention), so the exemption applied to all of them and the check compared
+  nothing while reporting agreement. An assertion that cannot fail is worse than no
+  assertion. The rule is now the honest one: every package carries the platform version,
+  which is true except for that one file, and the exemption list is empty by construction
+  and asserted to stay so.
+
+  **Gate.** `scripts/qa/release-manifest.sh` — 42 passed, **19/19 mutations caught**.
+  `release/tests/test_release_manifest.py` — 46 tests. `scripts/qa/helm-chart.sh` 70/70.
+  `cargo check -p omnion-api --tests` clean. Wired into CI on every commit, not only on a
+  tag: a tag is the moment the pipeline can no longer refuse anything cheaply, and every
+  rule here is about repository facts that are already committed.*
+
+  **NOT claimed.** No image was built or pushed, so no digest in this manifest came from a
+  registry — every digest comes from `synthetic_facts`, which is deterministic and marks
+  itself. No SBOM was generated by a real scanner. No attestation was verified. The
+  `.github/workflows/release.yml` tag pipeline itself is NOT in this commit: it builds and
+  pushes, and a pipeline that cannot be exercised on this box is exactly what the request's
+  own risk note warns about shipping unverified. It is slice 3's remaining work.
 - [ ] `/deployment/artifacts` shows digests and checksums that match the published artifacts byte for byte.
 - [ ] A generated compose bundle boots on a clean host from its own files, and a generated Helm values file installs the chart unmodified.
 - [ ] Generated bundles contain secret **references** only — a test greps every generated file for the fixture value and for common secret-shaped strings and finds none.
@@ -277,6 +345,21 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
    observed from job logs, and no image built. The two Kubernetes acceptance lines that need those
    stay unticked, and the release pipeline and the upgrade helper are untouched.
 3. **Release pipeline + artifacts UI.** Tag-driven build and publish, CLI binaries, SBOM, manifest, artifact cache, `/deployment/artifacts` screens, bundle generator and downloads. *Done when:* a fake tag produces a complete manifest and the panel shows digests matching the registry.
+   — **The manifest half shipped** (`4b477907`, `9be5323d`): `release/lib/manifest.py`
+   (build · verify · schema · deterministic synthetic facts), `release/tests/` (46 unit
+   tests) and `scripts/qa/release-manifest.sh` (42 checks, 19/19 mutations), plus the
+   `omnion:non-service` marker in `cli.Dockerfile` and a CI job that runs both on every
+   commit. The definition-of-done sentence has two halves and only the first is met: a fake
+   tag produces a complete manifest; **the panel has no `/deployment/artifacts` screen
+   yet**, because those need the `release_manifests` cache table (REQ-129's migration
+   number) and the deployment centre REQ-024 owns. Also outstanding in this slice: the
+   tag-driven pipeline itself (`.github/workflows/release.yml`), which builds, pushes and
+   attests — none of which can be exercised on a build box, so it ships last and only after
+   its dry-run mode exists.
+
+   **Why the manifest came before the screens.** The screens render whatever the manifest
+   says, so building them first would have meant rendering a hand-written fixture and calling
+   that progress. The manifest is the contract; the screens are a view of it.
 4. **Upgrade helper + docs.** Upgrade plans, destructiveness flags from REQ-129, acknowledgement, `/deployment/upgrade`, `docs/deployment/upgrade.md` and the per-version notes workflow. *Done when:* the guide's steps are executed verbatim on the QA stack and the helper's checklist matches what the operator does.
 
 ### Risks / notes
