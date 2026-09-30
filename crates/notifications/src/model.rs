@@ -180,6 +180,38 @@ impl NewNotification {
     }
 }
 
+/// One channel a notification was tried on, and what became of it.
+///
+/// **The reader's own view of the queue, not the runner's.** This is the type the detail drawer
+/// renders, and it exists because "it is in my panel but the e-mail never arrived" has to be a
+/// *row the reader can see* rather than an inference from the absence of something. A status
+/// the reader cannot see is a status they cannot trust: the platform knows a channel failed and
+/// the notification is delivered all the same, and that is exactly the state a person needs to
+/// be shown.
+///
+/// The `attempts`/`max_attempts` pair is carried because the interesting answer is not "failed"
+/// but "failed after four tries", and a drawer that prints only the state makes a delivery
+/// retried once look identical to one abandoned.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct DeliveryRow {
+    /// The channel this attempt was made over.
+    pub channel: String,
+    /// Where it got to: `pending`, `sent`, `failed` or `skipped`.
+    pub status: String,
+    /// How many times it has been tried, including the one in flight.
+    pub attempts: i32,
+    /// The number of tries before it gives up.
+    pub max_attempts: i32,
+    /// The transport's own status code, when it answered with one.
+    pub response_status: Option<i32>,
+    /// Why it did not go out, in the platform's words rather than a raw driver error.
+    pub error: Option<String>,
+    /// When it was delivered, if it was.
+    pub sent_at: Option<OffsetDateTime>,
+    /// When the attempt is next due; `None` once the row is no longer retryable.
+    pub next_attempt_at: Option<OffsetDateTime>,
+}
+
 /// The filters a list read accepts.
 ///
 /// One struct rather than a dozen query parameters, and the reason is the same as everywhere

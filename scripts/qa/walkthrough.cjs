@@ -4873,6 +4873,37 @@ async function runNotificationsDepth(page, report) {
   await page.waitForTimeout(1200);
   steps.keyboardOpenedDrawer = (await page.locator("[data-notification-drawer]").count()) > 0;
   await shot(page, "page-notifications-drawer");
+
+  // The drawer's delivery rows. This is the section that makes "it is in my panel but the
+  // e-mail never arrived" a thing a reader can see rather than infer, and it has two states that
+  // are both correct on a fresh database — so the assertion is deliberately about the SHAPE:
+  // either a list of channel rows, or the honest sentence that nothing has been tried. What it
+  // refuses to accept is a section heading with nothing under it, which is what a screen that
+  // renders the heading before the read returns looks like, and which reads as a broken panel.
+  if (steps.keyboardOpenedDrawer) {
+    const drawerDelivery = page.locator("[data-notification-drawer] [data-notification-deliveries]");
+    steps.drawerHasDeliverySection = (await drawerDelivery.count()) > 0;
+    const rows = await page.locator("[data-notification-drawer] [data-notification-delivery]").count();
+    const empty = await page
+      .locator("[data-notification-drawer] [data-notification-deliveries-empty]")
+      .count();
+    steps.drawerDeliveryRows = rows;
+    steps.drawerDeliveryEmptyState = empty > 0;
+    // A channel the platform has five of: the reader must never see a raw database value.
+    steps.drawerDeliveryNamesChannelsInProse =
+      rows === 0 ||
+      (await page
+        .locator("[data-notification-drawer] [data-notification-delivery]")
+        .allInnerTexts()
+        .catch(() => []))
+        .every((text) => !/\b(in_app|web_push)\b/.test(text));
+  } else {
+    steps.drawerHasDeliverySection = "the drawer never opened, so the section cannot be asserted";
+    steps.drawerDeliveryRows = "no drawer";
+    steps.drawerDeliveryEmptyState = "no drawer";
+    steps.drawerDeliveryNamesChannelsInProse = "no drawer";
+  }
+
   await page.keyboard.press("Escape");
   await page.waitForTimeout(600);
   steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;

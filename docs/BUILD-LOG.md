@@ -8072,3 +8072,62 @@ made.
 **Next.** (a) Read the `content_api_tokens` suite result and tick what it actually proves.
 (b) REQ-019 slice 2 — the `/api/v1/content/*` read surface, which is what makes a token mean
 anything: pagination, `fields`, `updated_since`, the OpenAPI document.
+
+## Tick 78 — the box that said "when deliveries exist" (and last tick they started to)
+
+REQ-021's drawer box had been unticked since the request was written, with a note that read *"the
+per-channel delivery rows are slice 2's, when deliveries exist"*. Tick 77 made them exist. The note
+expired and the gap became real: `GET /api/v1/notifications/{id}` promised "one notification, **with
+its delivery rows**" in its own doc comment and returned a bare notification — so the platform knew
+an e-mail had been given up on, and the person waiting for it was told nothing.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `c3394bb5` | `store::deliveries` + `NotificationBody.deliveries`, filled after the ownership check |
+| `30c27d12` | `notification_delivery_reader` — 4 walks over live PostgreSQL |
+| `326061ee` | the drawer's Delivery section; one channel vocabulary for three screens |
+| `a7b94201` | the walkthrough leg for that section |
+
+**Proof**
+
+```
+notification_delivery_reader   4 passed; 0 failed  (26.47s, live PostgreSQL)
+notification_delivery          8 passed; 0 failed  (49.12s)  ← the runner's suite, unchanged
+omnion-notifications --lib    90 passed; 0 failed
+admin tsc -p tsconfig --noEmit  exit 0
+node --check walkthrough.cjs   syntax ok
+```
+
+**The access-control shape is the part worth keeping.** `notification_deliveries` is keyed by
+`notification_id` and carries **no `user_id`** — nothing in that query can be scoped to a caller, so
+the ownership read is the entire check. A delivery read placed *before* it would answer a populated
+channel list for somebody else's notification, which turns the route's `404` into an existence
+oracle. The route reads the notification first and only then its deliveries, and the walk asserts
+the *mechanism* rather than the outcome: the stranger resolves nothing **and** the owner still gets
+rows through the same function, because a read that returned nothing for everybody would pass the
+stranger leg while hiding the entire feature.
+
+**Three of the four walks caught this tick's own wrong assumptions before the product did.** Each
+correction is now written into the walk, because the next tick would otherwise re-make them:
+
+1. `on conflict (channel)` — the uniqueness is `(organization_id, channel)`, so the fixture asserted
+   a constraint the schema does not have (`42P10`). It creates the organization now.
+2. "`in_app` is written first" — it is not: `enqueue` loops the *enabled* channels and appends
+   `in_app` after. And every row in one call shares a single `now()`, so the chronological key ties
+   and the alphabetical tiebreak decides. The walk now asserts **stability** (same notification, two
+   reads, same order), which is the property the drawer needs and the only one a missing
+   `order by` fails — on the *second* read; the first always looks right.
+3. "the in-app row is `sent` because enqueueing is delivering it" — `enqueue` writes it `pending` and
+   a tick only makes it `sent` by draining it through a transport. The walk registers the real
+   `InAppTransport` next to the refusing e-mail one.
+
+**What this costs the next tick:** the browser pass (`bash scripts/qa/run.sh`) has still not run, so
+the walkthrough leg and the drawer's rendering are unproven in a browser. The QA slot queue is
+shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for this tick.
+
+**Next:** REQ-021's remaining boxes are the two unproven keyboard legs and the browser pass, both of
+which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
+order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
+all waiting on the same missing instrument.
