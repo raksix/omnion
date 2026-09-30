@@ -4792,3 +4792,37 @@ have resumed into the middle of edited text. Killed rather than trusted.
 single slot and is genuinely advancing, with w2, w3 and w9 behind it. When it lands: close REQ-099
 on `runAiAgentsDepth`, then finish REQ-100 slice 1 (the `ai_tools` migration, the seeder with edit
 preservation, `/ai/tools` and `/ai/tools/[key]`).
+
+**Read next, and what it said.** The scoped pass finished: **620 high findings**, which is the
+number this log has carried for three ticks. Collapsed to unique (url, status) pairs it is **26**.
+`/api/v1/ai/agents` → 400 accounts for **136** of them, `/ai/skills` 68, `/ai/runs?limit=200` 68 — and
+every one of those is `scope::resolve_organization` answering `organization_required` because the QA
+owner has **no organization**.
+
+The wizard log says it outright: step `owner` at iterations 1–3, step `organization` at iterations
+**4–10** with `"clicked": "Create organization"` seven times and the step never moving. Meanwhile
+`signedIn: true`, `reLogin: true` and a real `user.created` payload in the event console — a healthy
+sign-in into an installation with **one user and zero organizations**.
+
+`run.sh` started the API with no `OMNION_CSRF_SECRET`, and `headers_middleware` fail-closes without
+one: *"a platform that silently drops CSRF protection when the key is missing is worse than one that
+refuses writes, because the refusal is visible and the skip is not."* **That is the correct behaviour,
+and it is what made the number unrecognisable** — a security decision in the product became three
+ticks of harness-shaped noise in the report. The QA stack now starts with a throwaway secret (the
+database is dropped at the top of every pass and nothing outside the box reaches these ports), and
+`scripts/qa/probe-qa-stack-env.cjs` gates it at 5/5.
+
+The same tick also found that **twelve depth passes ignored the scope** (`d89e963d`) — the pass's own
+log shows `media duplicates`, `media retention`, `notifications` and `events` running under
+`--only=ai`. A walk of `main()` by indent depth finds them in one script; `probe-pass-scope.cjs` was
+7/7 throughout, because its asserts cover the passes somebody remembered to list.
+
+**Proof this tick.** `cargo test -p omnion-ai-hub --lib` → **374 passed, 0 failed**. `pnpm typecheck`
+→ **2/2**. `node --check scripts/qa/walkthrough.cjs` → OK. `bash -n scripts/qa/run.sh` → OK.
+`node scripts/qa/probe-pass-scope.cjs` → **7/7**. `node scripts/qa/probe-qa-stack-env.cjs` → **5/5**.
+
+**Next.** The re-run pass is queued behind w3. When it lands, the one line that decides whether the
+620 collapses is whether `wizard: organization` reports the step moving: `steps` must contain a
+non-`organization` step after index 4. If it does, `runAiAgentsDepth` executes for the first time and
+REQ-099 can close; if it does not, the CSRF fix did not take and the harness — not the product — is
+still the reader being sent to the wrong system.
