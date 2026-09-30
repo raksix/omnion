@@ -81,6 +81,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod accounting;
+pub mod accounting_invoices;
 pub mod ai;
 pub mod analytics;
 pub mod auth;
@@ -1538,6 +1539,46 @@ pub fn router(state: AppState) -> Router {
         .route("/accounting/journal", post(accounting::post_journal_entry))
         .route_layer(guards::require(&state, "accounting.journal.manage"));
 
+    // The invoice surface (docs/requests/REQ-054, slice 2).
+    //
+    // Three keys, and the split is **what a mistake costs**. Reading a list of receivables costs
+    // nothing worse than an inconvenience. Creating a draft is a document nobody has seen. Sending
+    // is different again: it issues a number to a customer, it is the event a finance automation
+    // subscribes to, and after it the document is immutable. Void is separate from send for the
+    // same reason — a withdrawal is a statement about money owed, and a person who may issue an
+    // invoice is not automatically a person who may cancel one.
+    let accounting_invoices_read = Router::new()
+        .route("/accounting/invoices", get(accounting_invoices::list_invoices))
+        .route(
+            "/accounting/invoices/{id}",
+            get(accounting_invoices::get_invoice),
+        )
+        .route_layer(guards::require(&state, "accounting.invoices.read"));
+
+    let accounting_invoices_create = Router::new()
+        .route("/accounting/invoices", post(accounting_invoices::create_invoice))
+        .route_layer(guards::require(&state, "accounting.invoices.create"));
+
+    // Send, void and the sweep are one layer on purpose: each is the point where a document stops
+    // being the organization's own draft and becomes a statement about money owed. The sweep
+    // lives here rather than behind a background job because the platform's automation family
+    // (wave 3) is what *triggers* it — the trigger is a schedule, the statement is a route, and
+    // putting the statement in three places is how "which invoices are late" gets three answers.
+    let accounting_invoices_issue = Router::new()
+        .route(
+            "/accounting/invoices/{id}/send",
+            post(accounting_invoices::send_invoice),
+        )
+        .route(
+            "/accounting/invoices/{id}/void",
+            post(accounting_invoices::void_invoice),
+        )
+        .route(
+            "/accounting/invoices/sweep-overdue",
+            post(accounting_invoices::sweep_overdue_invoices),
+        )
+        .route_layer(guards::require(&state, "accounting.invoices.send"));
+
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
     // a document would be prefetched by a crawler and accepted on the customer's behalf.
@@ -1568,7 +1609,10 @@ pub fn router(state: AppState) -> Router {
         .merge(accounting_accounts_read)
         .merge(accounting_accounts_manage)
         .merge(accounting_journal_read)
-        .merge(accounting_journal_manage);
+        .merge(accounting_journal_manage)
+        .merge(accounting_invoices_read)
+        .merge(accounting_invoices_create)
+        .merge(accounting_invoices_issue);
 
     // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
     // stock rollup and the append-only ledger.

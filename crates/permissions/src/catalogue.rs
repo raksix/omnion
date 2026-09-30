@@ -857,6 +857,35 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "accounting",
         description: "Post a manual journal entry (a balanced, attributed, permanent record)",
     },
+    // Invoices (docs/requests/REQ-054, slice 2). Three keys, and the middle one is the
+    // interesting split:
+    //
+    // * `accounting.invoices.read` / `.create` / `.send`. A draft is a document nobody has seen, so
+    //   creating one is cheap. **`send` is not**: it gives a number to a customer, fires
+    //   `accounting.invoice.issued` to every webhook subscriber, and makes the document immutable
+    //   from that moment — the flow becomes void-and-duplicate. A role that may draft but not
+    //   issue is an ordinary role (a sales assistant preparing invoices for review), so the
+    //   boundary is a real one and not a formality.
+    // * Void shares `send`'s layer rather than getting a key of its own, and the reason is that
+    //   both are statements **about money owed** rather than edits of a private document. Splitting
+    //   them would produce a role that can tell a customer an invoice is cancelled while not being
+    //   able to issue it, which is a strictly worse configuration than either.
+    PermissionDef {
+        key: "accounting.invoices.read",
+        category: "accounting",
+        description: "Read invoices, their lines and their outstanding balances",
+    },
+    PermissionDef {
+        key: "accounting.invoices.create",
+        category: "accounting",
+        description: "Write a draft invoice, manual or converted from a sales order",
+    },
+    PermissionDef {
+        key: "accounting.invoices.send",
+        category: "accounting",
+        description:
+            "Issue, void and overdue-sweep an invoice (a permanent statement about money owed)",
+    },
 ];
 
 /// Look a permission up by key.
@@ -1136,11 +1165,10 @@ mod tests {
 
     #[test]
     fn the_accounting_family_is_catalogued_and_posting_is_its_own_key() {
-        // REQ-054, slice 1. Four keys: the chart and the rates read/manage as one pair (they are
-        // the same decision — what a line picks and what it defaults to), and the journal split
-        // read/post because posting is a claim with the poster's name on it, not an edit. The
-        // assertion is the first half of the guarantee; the comment in
-        // `routes/accounting.rs` is the second.
+        // REQ-054, slice 1. Four keys for the chart, the rates and the journal: the chart and the
+        // rates read/manage as one pair (they are the same decision — what a line picks and what
+        // it defaults to), and the journal split read/post because posting is a claim with the
+        // poster's name on it, not an edit.
         for key in [
             "accounting.accounts.read",
             "accounting.accounts.manage",
@@ -1153,10 +1181,40 @@ mod tests {
                 "{key} belongs to the accounting category"
             );
         }
-        assert!(
-            get("accounting.invoices.read").is_none(),
-            "the invoice keys belong to slice 2 and must not appear before their routes do"
-        );
+    }
+
+    #[test]
+    fn the_invoice_family_is_catalogued_and_issuing_is_its_own_key() {
+        // REQ-054, slice 2. Slice 1's test asserted these three keys were ABSENT — the routes did
+        // not exist yet and a key with no route is a promise the permission screen makes that the
+        // product does not keep. This test is the same assertion run in the other direction: the
+        // keys exist because the routes do, and `send` is separate from `create` because issuing
+        // a number to a customer is not drafting one.
+        for key in [
+            "accounting.invoices.read",
+            "accounting.invoices.create",
+            "accounting.invoices.send",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+        }
+        // The keys the REQ's API table names for later slices must STILL not be here. Payments,
+        // expenses, reports and the PDF are slices 3 and 4, and a key with no route is exactly
+        // the lie this assertion exists to prevent — so it is kept, aimed at the next slice.
+        for later in [
+            "accounting.payments.read",
+            "accounting.payments.record",
+            "accounting.expenses.read",
+            "accounting.reports.read",
+        ] {
+            assert!(
+                get(later).is_none(),
+                "{later} belongs to slices 3-4 and must not appear before its route does"
+            );
+        }
     }
 
     #[test]

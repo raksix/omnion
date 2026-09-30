@@ -565,7 +565,13 @@ pub struct OrganizationParam {
 }
 
 /// Parse a `YYYY-MM-DD` filter, naming the parameter that was wrong.
-fn parse_day(raw: Option<&str>, field: &'static str) -> Result<Option<time::Date>, ApiError> {
+///
+/// `pub(crate)` because the invoice routes in [`super::accounting_invoices`] filter by day too,
+/// and a second date parser is a second definition of what a malformed day answers with.
+pub(crate) fn parse_day(
+    raw: Option<&str>,
+    field: &'static str,
+) -> Result<Option<time::Date>, ApiError> {
     match raw.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok(None),
         Some(value) => omnion_module_accounting::dates::parse(value).map(Some).map_err(|_| {
@@ -582,7 +588,11 @@ fn parse_day(raw: Option<&str>, field: &'static str) -> Result<Option<time::Date
 /// A journal entry that is posted but whose event did not emit is still a posted entry; refusing
 /// the response would tell the bookkeeper their entry failed when it did not, which is a worse
 /// outcome than a missing automation trigger.
-async fn emit(state: &AppState, event: NewEvent) {
+///
+/// `pub(crate)` because the invoice routes emit through this one function rather than carrying a
+/// second copy of the "log and carry on" decision — a module that forgets to tolerate its own
+/// event failure answers 500 for a write that succeeded.
+pub(crate) async fn emit(state: &AppState, event: NewEvent) {
     if let Err(error) = bus::emit(state.db().pool(), event).await {
         tracing::warn!(error = %error, "the accounting event could not be recorded");
     }
