@@ -6504,3 +6504,158 @@ export async function restoreThemeRevision(
     { method: "POST" },
   );
 }
+
+// --- Theme layouts and packages (REQ-062, slice 3) --------------------------------------------
+
+/**
+ * One slot as the builder's picker renders it.
+ *
+ * `state` is a word and not a boolean because the badge has three of them: a slot the theme
+ * ships, a slot the site replaced, and a slot nobody has put anything in. A client that got
+ * `isDefault: false` for both a customised slot and an empty one would paint the same badge on
+ * two different facts.
+ */
+export type ThemeSlotEntry = {
+  slot: string;
+  state: "theme" | "custom" | "empty";
+  isDefault: boolean;
+  blockCount: number;
+  blocks: unknown[];
+};
+
+export type ThemeLayoutsView = {
+  siteId: string;
+  themeKey: string;
+  /** Always all eight slots the platform renders, in the picker's order. */
+  slots: ThemeSlotEntry[];
+  /** The registry's block types, so the package validator can be shown without a round trip. */
+  knownBlockTypes: string[];
+};
+
+export type ThemeSlot = {
+  siteId: string;
+  themeKey: string;
+  slot: string;
+  blocks: unknown[];
+  isDefault: boolean;
+  updatedAt?: string;
+};
+
+/**
+ * What a slot save answers.
+ *
+ * `issues` are the validator's own messages — warnings travel back with the save rather than
+ * being thrown away, because an empty column in a header is stored and rendered and the author
+ * is the only person who can decide that was deliberate.
+ */
+export type ThemeSlotSaveResult = {
+  layout: ThemeSlot;
+  issues: string[];
+};
+
+/** One thing wrong with an uploaded package, addressed by a path into the file. */
+export type ThemePackageFinding = {
+  path: string;
+  message: string;
+  severity: "error" | "warning";
+};
+
+export type ThemePackageReport = {
+  themeKey: string;
+  name: string;
+  version: string;
+  slots: unknown;
+  tokens: unknown;
+  findings: ThemePackageFinding[];
+  valid: boolean;
+  errorCount: number;
+};
+
+export type ThemePackageExport = ThemePackageReport;
+
+export type ThemeInstallResult = {
+  install: { themeKey: string; version: string; active: boolean };
+  report: ThemePackageReport;
+};
+
+/** The builder's whole payload: the slot picker and the first slot's canvas in one answer. */
+export async function fetchThemeLayouts(siteId: string): Promise<ThemeLayoutsView> {
+  return request<ThemeLayoutsView>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts`,
+  );
+}
+
+export async function fetchThemeSlot(siteId: string, slot: string): Promise<ThemeSlot> {
+  return request<ThemeSlot>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts/${encodeURIComponent(slot)}`,
+  );
+}
+
+/**
+ * Save a slot's blocks.
+ *
+ * The body is the block tree itself and not a `{ blocks }` wrapper, because the canvas already
+ * holds a tree and a wrapper is one more shape to keep in step with it.
+ */
+export async function saveThemeSlot(
+  siteId: string,
+  slot: string,
+  blocks: unknown[],
+): Promise<ThemeSlotSaveResult> {
+  return request<ThemeSlotSaveResult>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts/${encodeURIComponent(slot)}`,
+    { method: "PUT", body: JSON.stringify(blocks) },
+  );
+}
+
+/**
+ * Put a slot back to what the theme ships.
+ *
+ * The server answers 409 when the theme shipped no default for that slot, and that is a real
+ * state rather than an error to swallow: there is nothing to restore to, and a client that
+ * emptied the slot instead would destroy work.
+ */
+export async function resetThemeSlot(siteId: string, slot: string): Promise<{ layout: ThemeSlot }> {
+  return request<{ layout: ThemeSlot }>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-layouts/${encodeURIComponent(slot)}/reset`,
+    { method: "POST" },
+  );
+}
+
+/** The site's look as a package: its active theme, its published tokens, its slot trees. */
+export async function exportThemePackage(siteId: string): Promise<ThemePackageExport> {
+  return request<ThemePackageExport>(
+    `/api/v1/sites/${encodeURIComponent(siteId)}/theme-package/export`,
+  );
+}
+
+/** A dry run. Writes nothing, and answers with every problem rather than the first one. */
+export async function validateThemePackage(
+  pkg: unknown,
+): Promise<ThemePackageReport> {
+  return request<ThemePackageReport>("/api/v1/themes/validate", {
+    method: "POST",
+    body: JSON.stringify(pkg),
+  });
+}
+
+/** Install a validated package. The result says `active: false` — an install is not a switch. */
+export async function installThemePackage(pkg: unknown): Promise<ThemeInstallResult> {
+  return request<ThemeInstallResult>("/api/v1/themes/install", {
+    method: "POST",
+    body: JSON.stringify(pkg),
+  });
+}
+
+/**
+ * Remove an uploaded theme.
+ *
+ * The server refuses with 409 for a bundled theme and for one a site still renders with, and
+ * the two refusals are different problems — so this throws rather than returning a boolean, and
+ * the screen shows the server's sentence.
+ */
+export async function removeTheme(themeKey: string): Promise<{ removed: string }> {
+  return request<{ removed: string }>(`/api/v1/themes/${encodeURIComponent(themeKey)}`, {
+    method: "DELETE",
+  });
+}
