@@ -20,6 +20,7 @@ pub mod error;
 pub mod event_retention_runner;
 pub mod event_runner;
 pub mod guards;
+pub mod health_runner;
 pub mod headers_middleware;
 pub mod intent_resolver;
 pub mod module_guard;

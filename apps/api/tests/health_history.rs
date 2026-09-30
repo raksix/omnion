@@ -92,12 +92,10 @@ impl Harness {
     async fn dispose(self) {
         self.db.pool().close().await;
         let database = self.database;
-        sqlx::query(&format!(
-            r#"drop database if exists "{database}" with (force)"#
-        ))
-        .execute(self.maintenance.pool())
-        .await
-        .expect("the temporary database must be removed");
+        sqlx::query(&format!(r#"drop database if exists "{database}" with (force)"#))
+            .execute(self.maintenance.pool())
+            .await
+            .expect("the temporary database must be removed");
     }
 }
 
@@ -185,10 +183,13 @@ async fn an_empty_window_reports_no_aggregates_rather_than_zero() {
     };
 
     for range in Range::all() {
-        let summaries =
-            omnion_health::metric_summaries(harness.pool(), range, time::OffsetDateTime::now_utc())
-                .await
-                .expect("an empty window is not an error");
+        let summaries = omnion_health::metric_summaries(
+            harness.pool(),
+            range,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("an empty window is not an error");
         assert!(
             summaries.is_empty(),
             "{range} invented rows out of an empty table"
@@ -232,7 +233,11 @@ async fn a_populated_window_reports_real_aggregates_and_its_own_bounds() {
     let hour_row = find(&hour, "redis", "latency_ms");
     assert_eq!(hour_row.samples, 1, "the two-hour-old sample is outside 1h");
     assert_eq!(hour_row.current, Some(30.0));
-    assert_eq!(hour_row.avg, Some(30.0), "one sample's mean is that sample");
+    assert_eq!(
+        hour_row.avg,
+        Some(30.0),
+        "one sample's mean is that sample"
+    );
 
     harness.dispose().await;
 }
@@ -252,11 +257,7 @@ async fn the_sparkline_is_the_window_values_oldest_first() {
         omnion_health::sparkline_values(harness.pool(), "redis", "latency_ms", Range::Day, now)
             .await
             .expect("the series must be readable");
-    assert_eq!(
-        series,
-        vec![10.0, 20.0, 30.0],
-        "oldest first, not newest first"
-    );
+    assert_eq!(series, vec![10.0, 20.0, 30.0], "oldest first, not newest first");
 
     // The same metric read as a roll-up is one bucket per day, and the day it
     // lands in is the day the *sample* says — not the reader's clock.
@@ -273,9 +274,10 @@ async fn the_sparkline_is_the_window_values_oldest_first() {
 
     // A metric with no samples produces no buckets at all — an empty roll-up is
     // the honest answer, and a bucket of zeroes is not.
-    let none = omnion_health::daily_rollup(harness.pool(), "s3", "latency_ms", Range::Week, now)
-        .await
-        .expect("an unmeasured metric is not an error");
+    let none =
+        omnion_health::daily_rollup(harness.pool(), "s3", "latency_ms", Range::Week, now)
+            .await
+            .expect("an unmeasured metric is not an error");
     assert!(none.is_empty());
 
     harness.dispose().await;
@@ -316,33 +318,16 @@ async fn the_export_carries_exactly_the_rows_the_table_rendered() {
         let row = lines
             .iter()
             .find(|line| line.starts_with(&format!("{},{},", summary.service, summary.metric)))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{} / {} is missing from the export",
-                    summary.service, summary.metric
-                )
-            });
+            .unwrap_or_else(|| panic!("{} / {} is missing from the export", summary.service, summary.metric));
         let cells: Vec<&str> = row.split(',').collect();
         assert_eq!(cells[0], summary.service);
         assert_eq!(cells[1], summary.metric);
         assert_eq!(cells[3], summary.samples.to_string());
         // The aggregate cells must be the table's, in the table's units — this
         // is the assertion that a zero-filled cell cannot satisfy.
-        assert_eq!(
-            cells[6].parse::<f64>().ok(),
-            summary.avg,
-            "avg matches the table"
-        );
-        assert_eq!(
-            cells[7].parse::<f64>().ok(),
-            summary.max,
-            "max matches the table"
-        );
-        assert_eq!(
-            *cells.last().expect("a range cell"),
-            "24h",
-            "every row says its window"
-        );
+        assert_eq!(cells[6].parse::<f64>().ok(), summary.avg, "avg matches the table");
+        assert_eq!(cells[7].parse::<f64>().ok(), summary.max, "max matches the table");
+        assert_eq!(*cells.last().expect("a range cell"), "24h", "every row says its window");
     }
 
     // And the same list in the week window produces a file that says `7d`, so a
@@ -512,11 +497,7 @@ async fn the_detail_window_is_a_day_and_the_samples_query_no_longer_clamps() {
     // chart it drew was confidently the wrong window. The route now resolves a
     // *named* range through the same `Range::parse` the metric table uses, so the
     // refusal is a property of the vocabulary rather than of one handler.
-    assert_eq!(
-        omnion_health::DEFAULT_RANGE,
-        Range::Day,
-        "the detail draws a day"
-    );
+    assert_eq!(omnion_health::DEFAULT_RANGE, Range::Day, "the detail draws a day");
     for offered in omnion_health::RANGE_KEYS {
         assert!(
             Range::parse(offered).is_ok(),

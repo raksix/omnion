@@ -17,8 +17,10 @@
 use std::collections::BTreeMap;
 
 use sqlx::PgPool;
+use time::OffsetDateTime;
 
 use crate::error::Result;
+use crate::incidents;
 use crate::model::{HealthOverview, NewSample, ServiceReport};
 use crate::probes::{
     Observation, ProbeContext, ProbeResult, probe_api, probe_host, probe_postgres, probe_queue,
@@ -160,7 +162,87 @@ pub async fn run_and_record(pool: &PgPool, ctx: &ProbeContext<'_>) -> Result<Hea
         tracing::warn!(error = %error, "health samples could not be stored");
     }
 
+    // Slice 3's emitter. This is here, and not in the runner task, for the reason the
+    // doc comment above gives: the manual "Run all checks" button has to produce exactly the
+    // incidents the schedule would have produced, and a second call site is how an operator
+    // ends up with a button that reports `healthy` while the page below it shows an
+    // unacknowledged incident that only the scheduler ever opens.
+    //
+    // Like the sample write, a policy failure is logged rather than propagated: this run's
+    // readings are still true, and an `incident` table that cannot be written must not turn a
+    // probe report into a `500`. The cost of that choice is bounded and paid in the open: an
+    // outage during a database blip is visible in the samples and absent from the timeline.
+    match apply_policy(pool, &reports, &samples).await {
+        Ok(()) => {}
+        Err(error) => tracing::warn!(error = %error, "health incident policy could not be applied"),
+    }
+
     Ok(build_overview(reports))
+}
+
+/// Open, resolve and de-duplicate everything this run implies.
+///
+/// Three passes, and the order is the contract:
+///
+/// 1. **Transitions first**, per service. A state change is the only thing that opens an
+///    incident, and it has to be decided against the *previous* state, so it cannot be folded
+///    into the metric loop — a service whose state flipped has one incident even though five
+///    of its metrics also moved.
+/// 2. **Breaches second**, per sample. A metric crossing its critical line is an event of its
+///    own: the request names "threshold breach" separately from a service going `degraded`.
+/// 3. **Clears last.** A metric back under its warn limit resolves its ledger row only *after*
+///    the breaches of this run were recorded, so a run that reads one sample of the metric
+///    cannot clear the row it just wrote.
+///
+/// Every service is visited even when its policy is a no-op, because "nothing happened" is the
+/// outcome most runs produce and the outcome that has to be cheap.
+async fn apply_policy(
+    pool: &PgPool,
+    reports: &[ServiceReport],
+    samples: &[NewSample],
+) -> Result<()> {
+    let now = OffsetDateTime::now_utc();
+
+    for report in reports {
+        // The host row is a metric aggregate, not a dependency: it has no incident lifecycle
+        // and its state is derived per-card by `host_metrics`. Letting it open an incident
+        // would produce one entry per busy minute.
+        if report.service == HOST_SERVICE {
+            continue;
+        }
+        let Some(transition) = incidents::detect(pool, report).await? else {
+            continue;
+        };
+        let suppressed = incidents::is_suppressed(pool, &report.service, now).await?;
+        incidents::apply(pool, &transition, suppressed).await?;
+    }
+
+    // `THRESHOLD_METRICS` is read once and turned into a lookup: the stored document wins over
+    // the suggestion, because an operator who typed 92 is entitled to 92 and the placeholder
+    // is explicitly "not saved yet". A metric with no *stored* pair is never breached — that is
+    // the request's "thresholds start empty" promise, and defaulting to the suggestion here
+    // would open incidents on a deployment nobody configured.
+    let stored = incidents::thresholds(pool).await?;
+    for sample in samples {
+        let Some(threshold) = stored.get(sample.metric.as_str()) else {
+            continue;
+        };
+        match threshold.classify(sample.value) {
+            Some("down") => {
+                incidents::record_breach(pool, &sample.metric, sample.value, now).await?;
+            }
+            Some(_) => {
+                // Over the warn line but not the critical one: the ledger row for a previous
+                // critical crossing is resolved, because the metric came back from the line
+                // that woke somebody.
+                incidents::clear_breach(pool, &sample.metric, now).await?;
+            }
+            None => {
+                incidents::clear_breach(pool, &sample.metric, now).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The overview, from a set of fresh reports and whatever the store remembers.

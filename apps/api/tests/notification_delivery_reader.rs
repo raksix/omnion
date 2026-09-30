@@ -26,8 +26,8 @@
 //! then been discarded afterwards — which is the same leak, closed by accident.
 #![allow(clippy::too_many_lines)]
 
-use omnion_core::Db;
 use omnion_core::config::{Config, DatabaseConfig};
+use omnion_core::Db;
 use omnion_notifications::model::NewNotification;
 use omnion_notifications::store;
 use sqlx::PgPool;
@@ -237,8 +237,9 @@ impl omnion_notifications::delivery::Transport for RefusingTransport {
         _config: &omnion_notifications::delivery::DeliveryConfig,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = omnion_notifications::delivery::TransportOutcome>
-                + Send,
+            dyn std::future::Future<
+                    Output = omnion_notifications::delivery::TransportOutcome,
+                > + Send,
         >,
     > {
         let reason = self.reason.clone();
@@ -375,8 +376,7 @@ async fn the_readers_own_deliveries_carry_the_state_the_attempt_count_and_the_re
         "a channel refused at every attempt and is at the cap, so the row says so out loud"
     );
     assert!(
-        email
-            .error
+        email.error
             .as_deref()
             .unwrap_or_default()
             .contains("refused the connection"),
@@ -444,8 +444,7 @@ async fn the_delivery_rows_are_listed_in_a_stable_order_with_each_channel_once()
          channel the reader is never told about. got: {rows:?}"
     );
 
-    let unique: std::collections::HashSet<_> =
-        rows.iter().map(|row| row.channel.as_str()).collect();
+    let unique: std::collections::HashSet<_> = rows.iter().map(|row| row.channel.as_str()).collect();
     assert_eq!(
         unique.len(),
         3,
@@ -579,15 +578,17 @@ async fn a_delivery_read_is_gated_on_the_ownership_check_and_never_ahead_of_it()
     // Written as an `if let` rather than a combinator chain: `map` over an `Option` yields a
     // *future*, and `Option<Result<..>>` is not the type that comes out, so the compact
     // `transpose()` form does not typecheck. An explicit branch says the same thing and does.
-    let resolved = omnion_notifications::store::find(&pool, stranger.id, notification)
-        .await
-        .expect("the read must not fail");
+    let resolved =
+        omnion_notifications::store::find(&pool, stranger.id, notification)
+            .await
+            .expect("the read must not fail");
     match resolved {
         None => {}
         Some(row) => {
-            let leaked = omnion_notifications::store::deliveries(&pool, row.id)
-                .await
-                .expect("the delivery read must not fail");
+            let leaked =
+                omnion_notifications::store::deliveries(&pool, row.id)
+                    .await
+                    .expect("the delivery read must not fail");
             panic!(
                 "a stranger resolved somebody else's notification and read {} channels off it. \
                  The delivery rows carry no user_id, so the only thing standing between the two \
