@@ -7319,3 +7319,73 @@ not by a missing cleanup, and the next run found zero of them.
 as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
 this box until then** — treat a `53100` as environmental and read the assertion line above it for
 the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
+
+## Tick 31 — REQ-127 close gate: a migration number that had already been taken, and a filter that had never fired
+
+**Merged `origin/main` (10 commits) first, and it collided in the one place two writers cannot
+share.** Main arrived with a fresh `0185_notification_delivery_lease.sql` and w2 had already
+taken `0186_content_api_tokens.sql`. My slice-4 `0185_reliability_intake_replay.sql` was written
+before either existed, and git merged two DIFFERENT files into the same directory without
+complaining — two names, one number — while sqlx keys `_sqlx_migrations` by NUMBER. Renumbered
+above the union high-water to **`0187_reliability_intake_replay.sql`** (all ten worktrees scanned
+first, per the rule: a branch's own last number is a lower bound and is always wrong here).
+
+Two conflict resolutions:
+
+* `apps/api/src/main.rs` — the runner import list. Both sides added a runner; the answer is the
+  union, not a choice: `notification_runner` (main) and `secrets_runner` (mine) both ship.
+* `docs/BUILD-LOG.md` — the append-only log both sides write. Resolved by **splice + multiset
+  proof** (`scripts/qa/merge-build-log.py`, committed this tick): every line of `ours`, of
+  `theirs` and of the merge base must appear in the result at least as many times as it appears
+  in its source, and every `## ` heading of both sides must survive. Result: `base=4968
+  ours=6992 theirs=5297 merged=7321`, **0 lines missing, 0 headings lost**, exit 0. The line
+  count that would "prove" a merge (`base + ours + theirs == merged`) is exactly the check that
+  passes on a merge which duplicated one block and dropped another.
+
+Renumbering a migration is a data change, so the dev database was dropped and recreated
+(`omnion_w6_dev`) — the old `_sqlx_migrations` row at 185 carried the old checksum, and the
+walks' own `migrate()` would have died on it.
+
+### The gate
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-reliability --quiet` | **116 / 0** |
+| `cargo test -p omnion-api --lib --quiet` | **291 / 0** (285 last tick; main's merge brought six) |
+| `cargo test -p omnion-api --test reliability_intake` (against the recreated `omnion_w6_dev`) | **10 / 0**, 293 s |
+| `pnpm typecheck` | **2 / 2** |
+
+**`cargo test -p omnion-api` — the whole package — filled the ROOT filesystem to 100% (89 MB free)
+and failed on its own.** It links forty integration binaries; 44 executables over 80 MB totalled
+6.5 GB, against a target that had been 2.9 GB at tick start. The signature is the familiar one
+and still names no source file: `linking with 'cc' failed` plus
+`failed to write file …/dep-graph.part.bin: No space left on device (os error 28)`. Two things
+are new about it. First, the target resolves to `/opt/omnion-w6-target` on **`/`**, not on
+`/mnt/apopic` — the loop image still had 3.8 GB free while the box ran out, so "check
+`/mnt/apopic`" is the wrong measurement; measure the filesystem `readlink -f target` resolves
+to. Second, the recovery is fast: deleting the extension-less executables over 20 MB in
+`debug/deps` (keeping every `.rlib`/`.rmeta`) returned **6.17 GB in under a minute**. The
+per-tick gate is therefore `--lib` plus the specific `--test` targets the slice touched — a gate
+that links 6.5 GB to prove a ten-walk file fails the box rather than testing it.
+
+### The defect this pass was queued to look for was in the harness
+
+The pass queued since tick 30 for `reliability-intake,reliability-retries,reliability-breakers`
+logged `page: iam-users`, `page: media-trash`, `page: analytics-audience` — screens no writer on
+this branch had touched. `run.sh` builds the filter as `--only="$QA_ONLY"`; `walkthrough.cjs`'s
+`arg()` matched only the two-word `--only a,b`, so `indexOf("--only")` was `-1`, the filter fell
+back to `all`, and **every focused pass any writer has ever run walked the entire route list** —
+the exact wall-time problem `--only` was added to solve, three requests ago. It survived because
+a filter that matches everything produces a complete, entirely green report: the "unmatched name
+is a finding, not a silent no-op" guard the file documents in its own comment never fired, and
+the `focused pass: N/routes` line never printed.
+
+`arg()` now accepts both spellings, treats a following token that is itself a flag as "no value"
+instead of swallowing it, and `scripts/qa/focused-pass-args.test.cjs` checks the parser with no
+browser and no server over both spellings, both orders, the absent case, the valueless case and
+the neighbouring-token case. **Proven against the old parser: 5 of 9 cases fail there; all 9
+pass with the fix** (`git stash push -- scripts/qa/walkthrough.cjs` → red, pop → green).
+
+That unfiltered pass was killed mid-walk and a fresh focused one started; the three reliability
+screens are the ones this tick is waiting on. **The close box stays UNTICKED until that pass
+reports** — the same reason as tick 30, and the reason it is the last box in the file.
