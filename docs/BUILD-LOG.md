@@ -6826,3 +6826,12 @@ instead of the permission.
 
 **Next.** Slice 4 — approve/reject/revise/test-run, workflow materialisation (which must pass
 `enabled: false` explicitly: the API arms a new rule by default), and the probe.
+
+**QA browser pass — deferred, with the reason.** The single QA place is held by a live w5 pass
+(holder pid 3793843, cwd `/mnt/apopic/omnion-w5`), and slice 3 is not a close tick: the REQ stays
+open for slice 4. The per-tick gate that *is* due — the crates I touched — is green, and the
+walkthrough segment for both screens is already written and committed (`a7a70815`), so the pass
+that must run before this REQ closes will exercise a screen that exists. Queued behind a live
+pass rather than started in parallel: two Chrome instances on a box already holding ~17 writer
+targets is the tab-death condition, and a pass that dies mid-route reports it as a product
+finding.
