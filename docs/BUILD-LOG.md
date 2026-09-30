@@ -6414,6 +6414,27 @@ does not pass the edition, and `cargo build` is the authority. And a doc comment
 `**/` inside a Python triple-quoted string closes the string: two patches this tick failed to
 parse for that reason, and the fix is the `patch` tool, not `execute_code`.
 
+**Browser pass: still not run, fifth tick running, and the reason has changed.** It is no
+longer the `qa-slot.sh` hold recorded in tick 68. That hold is **genuinely live** — I verified
+the holder pid's parent is a running `run.sh` with a walkthrough against `:3102`, so reclaiming
+it would have been stealing another writer's slot, not fixing a stale lock. The pass queued,
+took its place, and then sat in the stack build: at 22:54 the default stack's `18080/3100/3200`
+were still not listening, `qa-artifacts/20260929-224017/` was empty, and the box was at **load
+19** with four sibling stacks (w3, w5, w6, w7) each holding three pm2 processes and Chromium
+sessions. I stopped the pass rather than add a fifth Chromium to a box already at 19, and left
+no orphans: the one remaining slot place is the sibling's, and no `omnion-qa-*` process of mine
+survived. The rule that came out of it is the one already in the ledger — **load 15+ with under
+4 GB free is a deferred pass, not a failed one** — and the discipline that matters more is that
+a deferred pass is reported as deferred. `runBackupDepth` remains written-but-unrun, so REQ-013
+does not close on tests alone, and the walkthrough extension committed in `54f305e` means there
+is a real pass waiting the moment the box has room.
+
+**Two halves making the same mistake are not a cross-check** is a general rule, not a backup
+one, and it is worth carrying out of this feature: the walkthrough's `artifact()` helper and
+`local_path_for` both resolve a prefix to a path, and had the walkthrough repeated the
+double-prefix bug this crate already fixed once, the preview would have "passed" against a
+directory no operator would ever look in.
+
 **Next.** (a) The destructive half of the restore: part selection, the mandatory safety backup
 before the first write, the enforced phrase behind `backup.restore`, abort until the import
 begins, and the `backup.restored` audit entry. (b) The `partial` box is still unticked — a run
