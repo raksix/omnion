@@ -208,6 +208,13 @@ impl CallOutcome {
             Self::Refused { code, .. } if code == "permission_denied" || code == "tool_denied" => {
                 Some("ai.tool.denied")
             }
+            // The request lists `ai.tool.disabled` as its own event, and it was unreachable while
+            // `Pipeline::enabled` answered from the compiled catalogue: no call could ever be
+            // refused with `tool_disabled`, so nothing could emit this. Routing it to
+            // `ai.tool.denied` would have been a lie in the other direction — an operator watching
+            // denials would see a run's ordinary permission refusal and a global tool being
+            // switched off arrive as the same event, and only one of those is their decision.
+            Self::Refused { code, .. } if code == "tool_disabled" => Some("ai.tool.disabled"),
             Self::Refused { code, .. } if code == "tool_limited" => Some("ai.tool.limited"),
             Self::TimedOut { .. } => Some("ai.tool.failed"),
             Self::Ran { failed: true, .. } => Some("ai.tool.failed"),
@@ -254,16 +261,39 @@ pub struct Pipeline {
     gate: std::sync::Arc<dyn PermissionGate>,
     /// Who is calling, for the log and the permission gate.
     caller: Caller,
+    /// The keys an operator has switched off, read once from `ai_tools.enabled`.
+    ///
+    /// **Why a snapshot and not a per-cell query.** [`Pipeline::model_facing`] has no pool and is
+    /// called once per run, when the runner assembles the provider's tool payload — so the
+    /// operator's decision has to be carried in rather than fetched. One query per *run* is the
+    /// right cost; a query per tool per cell is not.
+    ///
+    /// **Why `Pipeline::call` does not use it.** That method has the pool and is the door that
+    /// actually matters, so it re-reads the row and refuses from the row's own `enabled`. A
+    /// refusal that trusts a snapshot taken before the run started is a refusal an operator
+    /// cannot rely on for the length of a run.
+    ///
+    /// Fails **open** if a caller passes an empty set, which is why it is a constructor argument
+    /// rather than a defaulted one: a caller cannot forget it, and forgetting it is the shape of
+    /// bug this field exists to remove.
+    disabled: std::collections::BTreeSet<String>,
 }
 
 impl Pipeline {
     /// Build a pipeline. Nothing is checked here; the first call is the first check.
+    ///
+    /// `disabled` is the operator's `ai_tools.enabled = false` set, read once by the caller. It is
+    /// a parameter rather than a defaulted one so that every construction site has to decide what
+    /// it believes about the operator's decisions — a `Default::default()` here would be an empty
+    /// set, which means "nothing is disabled", and that is the exact belief the previous
+    /// compiled-catalogue check encoded by accident.
     #[must_use]
     pub fn new(
         registry: std::sync::Arc<ToolRegistry>,
         identity: Option<ResolvedIdentity>,
         agent_tools: Vec<String>,
         approvals: Vec<String>,
+        disabled: std::collections::BTreeSet<String>,
         gate: std::sync::Arc<dyn PermissionGate>,
         caller: Caller,
     ) -> Self {
@@ -274,6 +304,7 @@ impl Pipeline {
             approvals,
             gate,
             caller,
+            disabled,
         }
     }
 
@@ -339,6 +370,7 @@ impl Pipeline {
             agent_tools: self.agent_tools.clone(),
             approvals: self.approvals.clone(),
             gate: std::sync::Arc::clone(&self.gate),
+            disabled: self.disabled.clone(),
             caller: Caller {
                 organization_id: self.caller.organization_id,
                 agent_id: self.caller.agent_id,
@@ -360,17 +392,45 @@ impl Pipeline {
         self.identity.as_ref().map(|id| id.id)
     }
 
-    /// Whether the operator has the tool switched on.
+    /// Whether the operator has the tool switched on, **as this pipeline was told**.
     ///
-    /// Read from the **compiled** spec rather than the row, and the reason is a latency budget
-    /// rather than a preference: `model_facing` runs this once per tool per step, and a `select`
-    /// per cell turns assembling a 20-tool payload into 20 round trips. The trade — a tool
-    /// disabled mid-run keeps working until the next run starts — is the one the request already
-    /// implies, since the run's tool set is resolved at step one and a per-call row read would
-    /// make an operator's disable non-deterministic inside a run they can watch happening. The
-    /// row's `enabled` stays authoritative for the screens and for the next run's first step.
+    /// Reads the snapshot the caller assembled from `ai_tools.enabled`, not the compiled
+    /// catalogue. This method used to answer `catalogue::find(key).is_some()`, and that was a
+    /// real defect rather than a latency trade: by the time `model_facing` consults it the key
+    /// has already come out of `registry.catalogue()`, so it answered `true` for **every** tool
+    /// that reached it. `ResolutionReason::Disabled` was unreachable from both ends — the
+    /// payload filter and `call` — so `identity::resolve`'s first rule ("disabled wins") had no
+    /// caller that could ever fire it, the request's `ai.tool.disabled` event was never emitted,
+    /// and an operator switching a tool off on `/ai/tools` changed nothing at runtime.
+    ///
+    /// The two are not equivalent even when the catalogue is right: the catalogue knows which
+    /// tools **exist**, and the row knows which tools an operator **allows**. A retired tool is
+    /// absent from the catalogue and disabled in the row, and only the row carries the second.
+    #[must_use]
     fn enabled(&self, key: &str) -> bool {
-        crate::catalogue::find(key).is_some()
+        !self.disabled.contains(key)
+    }
+
+    /// The same question asked of the **row**, for the door that has a pool.
+    ///
+    /// [`Pipeline::call`] runs this instead of the snapshot, and that asymmetry is deliberate:
+    /// the payload a run started with cannot be retracted from a provider mid-flight, but a
+    /// *call* can be refused against the operator's current decision. So the strongest statement
+    /// an operator can make — "this tool is off" — takes effect on the next call of a run that
+    /// was already in flight, rather than at the start of the next run.
+    async fn enabled_in_row(&self, pool: &sqlx::PgPool, key: &str) -> Result<bool> {
+        // `is not null`-shaped question asked in the database rather than in the decoder: an
+        // `Option<bool>` from `select enabled` is `Option<Option<bool>>` in sqlx because a NULL
+        // column is indistinguishable from no row, and the crate's columns are `not null` — so
+        // the existence of the row is the answer.
+        let row: Option<(bool,)> = sqlx::query_as("select enabled from ai_tools where key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+        // A tool with no row is treated as enabled *here only* because [`Pipeline::call`] has
+        // already read that same row a few lines earlier and refused with `tool_unknown` when it
+        // was missing. Reaching this function without a row is not a state the caller can be in.
+        Ok(row.is_none_or(|(enabled,)| enabled))
     }
 
     /// Walk the whole path for one call.
@@ -408,11 +468,15 @@ impl Pipeline {
         // `identity::resolve` — the one ordering, called rather than re-derived. The comment at its
         // definition says the ordering IS the security claim; this call is what makes that true
         // for the execution path and not only for the unit tests.
+        //
+        // `enabled` comes from the **row**, not from the snapshot `model_facing` was built with,
+        // so an operator's disable lands on the next call of a run already in flight. See
+        // [`Pipeline::enabled_in_row`] for why the two doors answer from different places.
         let resolution: Resolution = identity::resolve(
             &self.grants(),
             &self.agent_tools,
             &tool.key(),
-            self.enabled(&call.tool),
+            self.enabled_in_row(pool, &call.tool).await?,
         );
         if resolution.effect == GrantEffect::Deny {
             return self
@@ -420,7 +484,7 @@ impl Pipeline {
                     pool,
                     &call.tool,
                     resolution.reason.code(),
-                    &refusal_sentence(&resolution.reason),
+                    &refusal_sentence(&call.tool, &resolution.reason),
                     Some(identity.id),
                 )
                 .await;
@@ -636,19 +700,26 @@ impl Pipeline {
 }
 
 /// A sentence for each refusal reason, so the model reads prose and the log reads a code.
-fn refusal_sentence(reason: &ResolutionReason) -> String {
-    match reason {
-        ResolutionReason::Allowed => "this tool is allowed (unreachable, but total)".to_owned(),
+///
+/// `tool` is threaded in because **a refusal the model cannot act on is a retry generator.** The
+/// four sentences below name a *cause* ("switched off", "not on the agent's list") but not a
+/// *subject*: a model that named four different tools and got the identical sentence has learned
+/// nothing except that it should try again, and for `Disabled` there is no retry that can ever
+/// work — the tool is gone from its payload for the whole run. The first clause is therefore the
+/// key the model itself sent, which is what lets it drop the call instead of repeating it.
+fn refusal_sentence(tool: &str, reason: &ResolutionReason) -> String {
+    let cause = match reason {
+        ResolutionReason::Allowed => "this tool is allowed (unreachable, but total)",
         ResolutionReason::Disabled => {
-            "an operator has switched this tool off for the whole installation".to_owned()
+            "an operator has switched this tool off for the whole installation, and asking again \
+             will not change that"
         }
         ResolutionReason::ExplicitDeny => {
-            "this run's AI identity carries an explicit deny for it".to_owned()
+            "this run's AI identity carries an explicit deny for it"
         }
-        ResolutionReason::NotInAgentList => {
-            "the agent's own tool list does not name it".to_owned()
-        }
-    }
+        ResolutionReason::NotInAgentList => "the agent's own tool list does not name it",
+    };
+    format!("{tool}: {cause}")
 }
 
 /// How the loop gets one tool call done.
@@ -829,11 +900,27 @@ mod tests {
         agent_tools: &[&str],
         gate: std::sync::Arc<dyn PermissionGate>,
     ) -> Pipeline {
+        pipeline_with_disabled(registry, identity, agent_tools, gate, Default::default())
+    }
+
+    /// The same, with the operator's disabled set supplied.
+    ///
+    /// The two-argument [`pipeline`] above defaults to "nothing is disabled", which is the right
+    /// answer for a crate that has no database — but it is also the answer a caller gets for
+    /// free, so the disabled walks say which set they mean rather than inheriting one.
+    fn pipeline_with_disabled(
+        registry: &ToolRegistry,
+        identity: Option<ResolvedIdentity>,
+        agent_tools: &[&str],
+        gate: std::sync::Arc<dyn PermissionGate>,
+        disabled: std::collections::BTreeSet<String>,
+    ) -> Pipeline {
         Pipeline::new(
             std::sync::Arc::new(registry.clone()),
             identity,
             agent_tools.iter().map(|k| (*k).to_owned()).collect(),
             Vec::new(),
+            disabled,
             gate,
             caller(),
         )
@@ -985,6 +1072,24 @@ mod tests {
         assert_eq!(limited.alert_event(), Some("ai.tool.limited"));
         assert_eq!(ran.alert_event(), None);
         assert_eq!(failed.alert_event(), Some("ai.tool.failed"));
+
+        // `ai.tool.disabled` is the request's own event for an operator switching a tool off, and
+        // it must be distinguishable from an ordinary denial. Asserting it routes somewhere
+        // (rather than to `ai.tool.denied`) is the whole point: a subscriber that wants to know
+        // "somebody switched this tool off and a run tried it anyway" cannot get that from the
+        // denial stream, which also carries every permission refusal in the installation.
+        let disabled = CallOutcome::Refused {
+            tool: "content.search".to_owned(),
+            code: "tool_disabled".to_owned(),
+            reason: "off".to_owned(),
+            call_id: 5,
+        };
+        assert_eq!(disabled.alert_event(), Some("ai.tool.disabled"));
+        assert_ne!(
+            disabled.alert_event(),
+            denied.alert_event(),
+            "a global disable and a permission denial are different facts"
+        );
     }
 
     #[test]
@@ -1063,14 +1168,70 @@ mod tests {
         // `Allowed` is unreachable for a refusal and says so, rather than panicking: a match arm
         // added to `ResolutionReason` without a sentence here would be a compile error, and that
         // is the point — the compiler is the reminder.
+        //
+        // The second assertion is the one that was missing. `!sentence.is_empty()` passed for
+        // sentences that named no subject at all, which is how four different refusals came back
+        // as the same string and a model that had just named four different tools could not tell
+        // which one it had been told about. So the sentence must carry the key.
         for reason in [
             ResolutionReason::Allowed,
             ResolutionReason::Disabled,
             ResolutionReason::ExplicitDeny,
             ResolutionReason::NotInAgentList,
         ] {
-            assert!(!refusal_sentence(&reason).is_empty());
+            let sentence = refusal_sentence("content.search", &reason);
+            assert!(!sentence.is_empty());
+            assert!(
+                sentence.contains("content.search"),
+                "a refusal must name the tool it is about, or a model cannot act on it. Got: \
+                 {sentence}"
+            );
         }
+    }
+
+    #[test]
+    fn every_refusal_code_the_pipeline_documents_survives_the_projection_to_the_loop() {
+        // `as_execution` is the seam the loop reads, and it maps through `DenyReason::from_code`
+        // with a `ToolDenied` fallback. **That fallback is what hid the defect this test exists
+        // for**: `tool_disabled` was a documented code on `CallOutcome::Refused` and was missing
+        // from the table, so an operator switching a tool off reached the loop, the model and the
+        // guardrail as `tool_denied` — a permissions problem with a permissions fix, when the
+        // real cause is a global switch nobody at the agent level can undo.
+        //
+        // Asserted over the codes rather than over the enum, because the codes are API surface
+        // (`CallOutcome::Refused` documents them in its own doc comment) and the table is what
+        // has to keep up. A code added to the product without a row here turns into a silent
+        // `ToolDenied`; this is the check that makes that a red test instead.
+        for code in [
+            "tool_unknown",
+            "tool_denied",
+            "approval_required",
+            "tool_bad_arguments",
+            "tool_timeout",
+            "tool_disabled",
+            "tool_limited",
+        ] {
+            let mapped = crate::tools::DenyReason::from_code(code);
+            assert_eq!(
+                mapped.map(crate::tools::DenyReason::code),
+                Some(code),
+                "{code} is documented on CallOutcome::Refused and must reach the loop as itself, \
+                 not as a generic denial"
+            );
+        }
+
+        // And the direction that actually bit: a disable must NOT be a denial, or a model that
+        // was told "permission refused" retries a call that can never succeed.
+        assert_ne!(
+            crate::tools::DenyReason::from_code("tool_disabled"),
+            Some(crate::tools::DenyReason::ToolDenied),
+            "an operator's global switch-off is a different fact from an allow-list refusal"
+        );
+        assert_ne!(
+            crate::tools::DenyReason::from_code("tool_limited"),
+            Some(crate::tools::DenyReason::ToolDenied),
+            "a spent budget is not a permissions problem either"
+        );
     }
 
     #[test]

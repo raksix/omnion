@@ -216,6 +216,24 @@ pub async fn list_tools(pool: &PgPool) -> Result<Vec<ToolRow>> {
     Ok(rows)
 }
 
+/// The keys an operator has switched off, in one query.
+///
+/// **This is the input the model-facing payload is built from**, and it is a separate function
+/// from [`get_tool`] on purpose: a run asks "which tools are off" once, not "what is the state
+/// of each of the twenty-four tools I might offer". Reading the column directly — rather than
+/// pulling every [`ToolRow`] and filtering in Rust — is what keeps the payload's cost at one
+/// round trip whatever the catalogue grows to.
+///
+/// A retired tool is included, because a retired tool is disabled: the seeder sets `enabled =
+/// false` on it and the operator's row is the only place that decision exists. Offering a
+/// retired tool to a model is the exact failure this criterion exists to prevent.
+pub async fn disabled_keys(pool: &PgPool) -> Result<std::collections::BTreeSet<String>> {
+    let keys: Vec<String> = sqlx::query_scalar("select key from ai_tools where enabled is false")
+        .fetch_all(pool)
+        .await?;
+    Ok(keys.into_iter().collect())
+}
+
 /// One tool by key. A retired row is still found — the panel has to be able to explain it.
 pub async fn get_tool(pool: &PgPool, key: &str) -> Result<Option<ToolRow>> {
     let sql = format!("select {TOOL_COLUMNS} from ai_tools where key = $1");

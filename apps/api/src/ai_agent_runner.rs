@@ -38,6 +38,7 @@ use omnion_ai_hub::loop_engine::{
     CancelHandle, OutputVerification, Persist, RunOptions, Runtime, Sink, run_with as run_agent,
 };
 use omnion_ai_hub::provider_model::ProviderModel;
+use omnion_ai_hub::registry;
 use omnion_ai_hub::run_store::{self, Run};
 use omnion_ai_hub::tool_exec::{self, ToolExecutor};
 use omnion_ai_hub::tools::{AllowList, Execution, ToolRegistry, ToolSummary};
@@ -538,6 +539,33 @@ pub async fn execute_with_sink(
     // three lines later at the `clone` — one of which is the only place the type is written down.
     let registry = std::sync::Arc::new(registry);
     let gate: Arc<dyn tool_exec::PermissionGate> = gate;
+
+    // The operator's own decisions, read once for this run. **This is the value that makes a
+    // disable on `/ai/tools` mean something at runtime** — `Pipeline::enabled` used to answer
+    // from the compiled catalogue, which is `true` for every key that got that far, so the
+    // payload offered a switched-off tool and `call` refused nothing. A read failure is *not*
+    // swallowed into an empty set: an empty set means "the operator disabled nothing", which is
+    // the one answer that must never be invented, so a registry that cannot be read ends the run
+    // the same way an unresolvable model does — visibly, with a reason.
+    let disabled = match registry::disabled_keys(pool).await {
+        Ok(disabled) => disabled,
+        Err(error) => {
+            let _ = run_store::finish_run(
+                pool,
+                run.id,
+                StepStatus::Failed,
+                StopReason::Error,
+                Some("the AI tool registry could not be read for this run"),
+            )
+            .await;
+            tracing::warn!(%run.id, %error, "the tool registry could not be read");
+            return RunOutcomeRow {
+                status: "failed".to_owned(),
+                stop_reason: StopReason::Error.as_str().to_owned(),
+            };
+        }
+    };
+
     let executor = Arc::new(RunExecutor {
         pool: pool.clone(),
         run_id: run.id,
@@ -550,6 +578,7 @@ pub async fn execute_with_sink(
             resolved_identity,
             agent.tools.clone(),
             agent.approvals.clone(),
+            disabled,
             std::sync::Arc::clone(&gate),
             tool_exec::Caller {
                 organization_id: run.organization_id,
