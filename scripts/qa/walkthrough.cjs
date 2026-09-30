@@ -595,12 +595,13 @@ async function runWizard(page, report) {
   // completed installation still short-circuits: nothing to seed, and the walk must not spend a
   // pass re-running a wizard the owner already finished.
   const before = await installationState();
-  if (!url.includes("/setup") && before?.completed) {
-    log(`wizard: installation already complete (${url})`);
+  const decision = wizardDecision(url, before);
+  if (decision.action === "skip") {
+    log(`wizard: ${decision.reason} (${url})`);
     return { ran: false, url, completed: true };
   }
-  if (!url.includes("/setup")) {
-    log(`wizard: not in setup (${url}) — resuming an installation that is ${before?.completed ? "complete" : "half built"}`);
+  if (decision.action === "resume") {
+    log(`wizard: not in setup (${url}) — ${decision.reason}, steps ${JSON.stringify(before?.steps ?? null)}`);
     await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(900);
     // A completed installation redirects away from /setup again; that is the only case where the
@@ -6691,6 +6692,66 @@ const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL
  * `node scripts/qa/walkthrough.cjs --selfcheck-recovery`; it launches its own browser, needs no
  * stack, and prints one RECOVERY_SELFCHECK line.
  */
+/**
+ * The wizard's "is there anything to do?" decision, with the URL and the onboarding steps supplied
+ * rather than fetched, so the four states that matter are each answered without a server.
+ *
+ * Every case here is a state a real `run.sh` produces, and the two that used to be wrong are the
+ * reason the function exists:
+ *
+ *   - a fresh reset lands on `/login` with `owner: true, organization: false` — HALF BUILT, and the
+ *     old code called it "installation already exists" and seeded nothing;
+ *   - a finished installation answers `completed: true` and must still short-circuit, because a
+ *     pass that re-ran a finished wizard would be measuring a second tenant.
+ *
+ * The half-built case is checked in BOTH directions: resuming has to happen, and short-circuiting
+ * must not. A guard nobody has seen bite is a comment, so `shortCircuitsOnACompleteInstall` is the
+ * half that keeps the fix from becoming "always re-run the wizard".
+ */
+function wizardDecision(url, state) {
+  const onSetup = url.includes("/setup");
+  const complete = state?.completed === true;
+  if (!onSetup && complete) return { action: "skip", reason: "installation already complete" };
+  if (!onSetup) return { action: "resume", reason: "half built, /setup is resumable" };
+  return { action: "run", reason: "in setup" };
+}
+
+/**
+ * What the previous version decided, kept as code so the regression is reproduced rather than
+ * remembered. The old condition was `if (!url.includes("/setup")) return { ran: false }` — the URL
+ * alone, with no question asked of the installation. Passing `true` for the half-built case here
+ * is a fact about that function, and the check below compares the two so the fix cannot be undone
+ * by making the same guess again.
+ */
+function legacyWizardDecision(url) {
+  return url.includes("/setup") ? { action: "run" } : { action: "skip" };
+}
+
+async function selfcheckWizard() {
+  const fresh = { completed: false, steps: { owner: true, organization: false, site: false } };
+  const done = { completed: true, steps: { owner: true, organization: true, site: true } };
+  const unstarted = { completed: false, steps: { owner: false, organization: false, site: false } };
+
+  const loginHalfBuilt = wizardDecision("http://127.0.0.1:3102/login", fresh);
+  const setupHalfBuilt = wizardDecision("http://127.0.0.1:3102/setup", fresh);
+  const panelComplete = wizardDecision("http://127.0.0.1:3102/overview", done);
+  const panelUnstarted = wizardDecision("http://127.0.0.1:3102/login", unstarted);
+
+  const checks = {
+    resumesAHalfBuiltInstall: loginHalfBuilt.action === "resume",
+    runsWhenAlreadyOnSetup: setupHalfBuilt.action === "run",
+    shortCircuitsOnACompleteInstall: panelComplete.action === "skip",
+    resumesAnUnstartedInstall: panelUnstarted.action === "resume",
+    // The old code skipped this state, and it is the state a fresh reset produces every time.
+    legacySkipsAHalfBuiltInstall: legacyWizardDecision("http://127.0.0.1:3102/login").action === "skip",
+    // ...and the two must disagree, or the fix is not a fix.
+    fixChangesTheHalfBuiltAnswer: legacyWizardDecision("http://127.0.0.1:3102/login").action !== loginHalfBuilt.action,
+  };
+  const pass = Object.values(checks).every(Boolean);
+  console.log("WIZARD_SELFCHECK " + JSON.stringify({ pass, checks, decisions: { loginHalfBuilt, setupHalfBuilt, panelComplete, panelUnstarted } }));
+  return pass;
+}
+
 async function selfcheckRecovery() {
   const browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"] });
   const context = await browser.newContext();
@@ -7584,6 +7645,15 @@ if (process.argv.includes("--selfcheck-recovery")) {
     .then((pass) => process.exit(pass ? 0 : 1))
     .catch((err) => {
       console.error("[walk] selfcheck failed to run:", err);
+      process.exit(1);
+    });
+} else if (process.argv.includes("--selfcheck-wizard")) {
+  // No browser and no stack: the decision is a pure function, so this is a five-second check that
+  // can be run by anyone, on a loaded box, without taking a QA place.
+  selfcheckWizard()
+    .then((pass) => process.exit(pass ? 0 : 1))
+    .catch((err) => {
+      console.error("[walk] wizard selfcheck failed to run:", err);
       process.exit(1);
     });
 } else {
