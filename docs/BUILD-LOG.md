@@ -9070,10 +9070,14 @@ and `cargo test -p omnion-module-crm --lib` are waiting on cargo's shared packag
 **No acceptance box is ticked by this commit** — the CRM pass has still not produced a
 `summary.json` this branch can believe.
 
-**Gates.** `bash -n scripts/qa/qa-slot.sh` OK, `bash -n scripts/qa/qa-slot-reap-probe.sh` OK,
-`bash scripts/qa/qa-slot-reap-probe.sh` → **5/5**, and the same probe against the pre-fix script
-→ **3/5** (the "proven to fail" direction). `cargo test -p omnion-module-crm --lib` and the
-browser pass are queued on the box, not green and not red.
+**Gates, completed after the entry above.** `bash -n scripts/qa/qa-slot.sh` OK,
+`bash -n scripts/qa/qa-slot-reap-probe.sh` OK, `bash scripts/qa/qa-slot-reap-probe.sh` → **5/5**,
+and the same probe against the pre-fix script → **3/5** (the "proven to fail" direction).
+`CARGO_TARGET_DIR=/mnt/apopic/w4build CARGO_INCREMENTAL=0 cargo test -p omnion-module-crm --lib`
+→ **172 passed; 0 failed** (0.16 s of test time; the wall clock was the shared package-cache lock
+under six compiling writers). `pnpm turbo run typecheck` → **2/2 successful** (3m33s, 1 cached),
+run under `env -i` because a node command that dies with a bare SIGABRT on this box is usually
+inherited env, not the toolchain. The browser pass is still compiling its API binary.
 
 **Next.** Read `summary.json` off the private-target pass and tick the 390×844 and keyboard boxes
 on whatever it actually measured — `runCrmKeyboardAndMobile` is the leg that has to answer for
