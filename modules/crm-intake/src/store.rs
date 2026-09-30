@@ -35,6 +35,14 @@ pub const SOURCE_COLUMNS: &str = "id, organization_id, site_id, name, kind, form
      rate_limit_per_hour, last_received_at, last_error, broken_mappings, created_by, \
      created_at, updated_at";
 
+// **`submitter_ip::text` is cast here and not at the call sites.** `inet` is the right column
+// type — it is what the platform stores addresses as everywhere else, and a text column would
+// be a second spelling of every value — but sqlx has no `INET` decoder without the `ipnetwork`
+// feature, so a bare `submitter_ip` in the returning list raises `ColumnDecode: Rust type
+// Option<String> is not compatible with SQL type INET` on **every** read of a lead. A cast in
+// this one list is what keeps that from being a decision at the twenty call sites that select
+// or return a lead. PostgreSQL keeps the column name through a cast, so the name-based decode
+// is unaffected.
 pub const LEAD_COLUMNS: &str = "id, organization_id, site_id, source_id, status, contact_id, \
      company_id, deal_id, quote_id, owner_user_id, first_name, last_name, email, phone, \
      company_name, job_title, product_interest, message, consent_text, consent_given, \
@@ -42,8 +50,8 @@ pub const LEAD_COLUMNS: &str = "id, organization_id, site_id, source_id, status,
      landing_path, source_path, payload, payload_bytes, dedupe_key, duplicate_of, \
      dedupe_contact_id, dedupe_score, decision, \
      assignment_rule_id, assignment_reason, sla_policy_id, first_response_due_at, \
-     first_response_at, escalated_at, spam_score, rejection_reason, received_at, \
-     converted_at, created_at, updated_at";
+     first_response_at, escalated_at, spam_score, rejection_reason, submitter_ip::text, \
+     received_at, converted_at, created_at, updated_at";
 
 // ---------------------------------------------------------------------------------------------
 // Sources
@@ -534,6 +542,53 @@ pub async fn submissions_this_hour(pool: &PgPool, source_id: Uuid) -> Result<i64
     Ok(row.0)
 }
 
+/// How many submissions **one address** has sent to this source in the last hour.
+///
+/// **This is the second ceiling, and it is the one the per-source counter cannot do.** A
+/// source's hourly budget is shared by every visitor to every page the source is bound to, so
+/// a single address can spend all of it in seconds. Without a per-address dial the operator
+/// has exactly one lever — lower `rate_limit_per_hour` — and that lever takes their real
+/// form's legitimate traffic down with the flood it was meant to stop. The REQ's own Risks
+/// section calls this surface "the attack surface"; this is the function that makes that
+/// sentence true rather than decorative.
+///
+/// Counted from the rows rather than a counter column, for the same reason
+/// [`submissions_this_hour`] is: a counter that is not decremented when a row is deleted is a
+/// limit that eventually blocks a source nobody is using. The read runs through the partial
+/// index `crm_leads_submitter_ip_idx` (migration `0192`) because the predicate
+/// `submitter_ip is not null` is exactly the shape of every row that can match.
+///
+/// A submission with **no** address is never limited by this function. An event-bus capture
+/// has no HTTP request behind it, and refusing one because a *different* transport cannot
+/// identify the sender would make the platform's own pipeline throttle-able by anybody who
+/// can reach the source's public endpoint from a host without a parseable address.
+pub async fn submissions_from_address_this_hour(
+    pool: &PgPool,
+    source_id: Uuid,
+    address: Option<&str>,
+) -> Result<i64> {
+    let Some(address) = address else {
+        return Ok(0);
+    };
+    // An unparseable address is treated as *no* address rather than as a bucket keyed on the
+    // raw string: a header a client can write freely is not an identity, and grouping every
+    // malformed value into one shared bucket would let any caller throttle every other
+    // malformed caller.
+    let Ok(parsed) = address.parse::<std::net::IpAddr>() else {
+        return Ok(0);
+    };
+    let row: (i64,) = sqlx::query_as(
+        "select count(*) from crm_leads \
+         where source_id = $1 and submitter_ip = $2::inet \
+           and received_at > now() - interval '1 hour'",
+    )
+    .bind(source_id)
+    .bind(parsed.to_string())
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Capture
 // ---------------------------------------------------------------------------------------------
@@ -613,6 +668,25 @@ pub async fn capture(pool: &PgPool, submission: &Submission) -> Result<Captured>
     // both read "29 of 30" and both write.
     let taken = submissions_this_hour(pool, source.id).await?;
     if taken >= i64::from(source.rate_limit_per_hour) {
+        return Err(CrmIntakeError::RateLimited);
+    }
+
+    // **The per-address ceiling, and the one that makes the sentence above true.**
+    //
+    // `Submission.ip` has said "for the per-IP rate limit" since the struct shipped, and
+    // until this line no such limit existed: `submissions_this_hour` is the *only* ceiling in
+    // the capture path and it counts by source. So the REQ's Risks section — "the public
+    // intake surface is the attack surface … a flood is throttled" — was carried by one dial
+    // that moves the flood and the business together, and a single address could spend a
+    // whole source's budget in seconds.
+    //
+    // It is checked **after** the source's ceiling on purpose, not before. The two refusals
+    // are the same `429` to the public endpoint, so the order is not observable by a caller —
+    // but it *is* observable in the log, and the source ceiling is the one an operator
+    // configured, so it is the one that should be the reason recorded.
+    let from_address = submissions_from_address_this_hour(pool, source.id, submission.ip.as_deref())
+        .await?;
+    if from_address >= crate::vocabulary::MAX_SUBMISSIONS_PER_ADDRESS_PER_HOUR {
         return Err(CrmIntakeError::RateLimited);
     }
 
@@ -1246,6 +1320,63 @@ struct LeadWrite {
     spam_score: i32,
 }
 
+/// Which `$n` the `values` list assigns to the column called `name`, if it appears there.
+///
+/// The insert's column list and its `values` list are two hand-counted lists that must agree,
+/// and the one place they can disagree is a *cast*: a `::inet` written one placeholder to the
+/// right does not name a column in the error, it names a type. `42846 cannot cast type
+/// timestamp with time zone to inet` is how this file spent a gate run — the message points
+/// at the cast, and the mistake is in the counting.
+///
+/// Parsed out of the statement rather than remembered beside it, so a column added above
+/// moves both lists together.
+///
+/// **The line continuations have to go first, and that is not a detail.** The statement is
+/// written as a Rust string with `\` at the end of each line, so the text handed to a
+/// `str::split(',')` has ` \\\n          last_name` as the *start* of the next segment. The
+/// first version of this returned the right answer for every column except those that follow
+/// a wrapped line, and reported `$35` for a column that is `$34` — a checker that is wrong
+/// on most inputs is worse than no checker, because it is trusted on the ones it gets right.
+fn placeholder_of(query: &str, name: &str) -> Option<usize> {
+    // Unwrap the statement onto one line first. `trim_start` on each continuation's tail is
+    // what makes the segment a name again rather than a name preceded by a backslash.
+    let flat: String = query
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (_, after_columns) = flat.split_once('(')?;
+    let (columns, _) = after_columns.split_once(')')?;
+    // The first value segment is `($1` — the opening paren rides on it, so it does not start
+    // with `$` and is dropped by the filter below, which shifts every count by one and
+    // reports `$35` for the `$34` that is actually in the statement. Strip it first.
+    let values = flat
+        .rsplit_once("values ")?
+        .1
+        .split(" returning ")
+        .next()?
+        .trim_start()
+        .trim_start_matches('(');
+    let position = columns
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .position(|entry| entry == name)?;
+    values
+        .split(',')
+        .map(str::trim)
+        .filter_map(|entry| entry.strip_prefix('$'))
+        .filter_map(|entry| {
+            entry
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<usize>()
+                .ok()
+        })
+        .nth(position)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn insert_lead(
     pool: &PgPool,
@@ -1259,6 +1390,30 @@ async fn insert_lead(
     let payload = serde_json::to_value(&submission.payload).map_err(|error| {
         CrmIntakeError::invalid(format!("payload is not serializable: {error}"))
     })?;
+    // The address is written here, by the same statement that writes the row, for two reasons.
+    //
+    // First, `returning {LEAD_COLUMNS}` cannot include a column the insert does not name, so a
+    // second `update` after the insert would either need its own `returning` (a second read of
+    // a row this function already holds) or leave the in-memory `Lead` disagreeing with the
+    // table — and the lead this function returns is what the trail and the response are built
+    // from, so the panel would show a row whose address the count says is absent.
+    //
+    // Second, an address that is only *derived* at count time is not the submitter's address
+    // at all: `submission.ip` is the one the request carried, and the window the ceiling
+    // counts is the window the row was received in.
+    //
+    // **`$34::inet` is a cast, not decoration.** Binding an `Option<String>` into an `inet`
+    // column raises `42804 column "submitter_ip" is of type inet but expression is of type
+    // text` — the DB gate caught it on the first run, and it is the kind of failure that
+    // reaches production as a `500` on the *first* submission a site ever takes, which is the
+    // worst possible moment to find it. The value is parsed here first, so an unparseable one
+    // becomes `None` rather than an error: a submission is not lost because the header that
+    // carried its address was malformed.
+    let submitter_ip = submission
+        .ip
+        .as_deref()
+        .and_then(|text| text.trim().parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string());
     let query = format!(
         "insert into crm_leads \
          (organization_id, site_id, source_id, status, contact_id, duplicate_of, first_name, \
@@ -1266,9 +1421,9 @@ async fn insert_lead(
           consent_text, consent_given, utm_source, utm_medium, utm_campaign, utm_term, \
           utm_content, click_id, referrer_host, landing_path, source_path, payload, \
           payload_bytes, dedupe_key, dedupe_contact_id, dedupe_score, decision, spam_score, \
-          rejection_reason, received_at) \
+          rejection_reason, submitter_ip, received_at) \
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,\
-         $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34) returning {LEAD_COLUMNS}"
+         $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34::inet,$35) returning {LEAD_COLUMNS}"
     );
     let lead = sqlx::query_as::<_, Lead>(&query)
         .bind(submission.organization_id)
@@ -1304,9 +1459,22 @@ async fn insert_lead(
         .bind(write.decision.as_deref())
         .bind(write.spam_score)
         .bind(write.rejection_reason.as_deref())
+        .bind(&submitter_ip)
         .bind(submission.received_at)
         .fetch_one(pool)
         .await?;
+
+    // The placeholder number above is the *only* thing that binds the address to the right
+    // column, and it is counted by hand. When it was written one too high, PostgreSQL said
+    // `cannot cast type timestamp with time zone to inet` — which names a type and not a
+    // column, so the failure reads like a cast problem rather than an off-by-one. The check
+    // below is cheap and total: the cast must sit on the placeholder of the same name.
+    debug_assert_eq!(
+        placeholder_of(&query, "submitter_ip"),
+        Some(34),
+        "the ::inet cast must stay on the submitter_ip placeholder; count the columns, do not \
+         guess — the alternative failure names a type, not a column"
+    );
 
     // The trail's first line is written with the row, not after it: a lead with no history is
     // a lead the detail page renders with a blank timeline, and an empty timeline is
