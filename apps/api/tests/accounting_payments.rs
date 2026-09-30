@@ -783,17 +783,38 @@ async fn the_oldest_first_sweep_splits_the_money_the_way_the_docs_say() {
     assert_eq!(allocations.len(), 2, "60.00 settles the first and part of the second");
     assert_eq!(money(&allocations[0], "amount"), "50.00", "the oldest is taken whole");
     assert_eq!(money(&allocations[1], "amount"), "10.00", "the remainder goes to the next");
-    // The allocations name the invoices, oldest first, in the order the sweep walked them.
+    // The allocations name the invoices, oldest first, in the order the sweep walked them. The
+    // key is `invoice_id`: an allocation row has an `id` of its own (it is a real row, with
+    // `invoice_id` pointing at what it was applied to), so reading `id` here compares a uuid to a
+    // uuid and fails on a walk whose real content is correct.
     assert_eq!(
-        id_of(&allocations[0]),
-        first,
+        text(&allocations[0], "invoice_number"),
+        "INV-000001",
         "the oldest invoice is the first allocation: {}",
         swept.body
     );
     assert_eq!(
-        id_of(&allocations[1]),
-        second,
+        text(&allocations[1], "invoice_number"),
+        "INV-000002",
         "the remainder goes to the next oldest, never the newest: {}",
+        swept.body
+    );
+    // …and, read by id rather than by number, so a sweep that put the rows in the right order but
+    // attached them to the wrong invoices is still caught.
+    let invoices: Vec<String> = allocations
+        .iter()
+        .map(|entry| {
+            entry
+                .get("invoice_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        invoices,
+        vec![first.to_string(), second.to_string()],
+        "in sweep order, not by number: {}",
         swept.body
     );
 
@@ -1009,7 +1030,10 @@ async fn a_reversal_recomputes_the_invoice_from_what_is_still_allocated() {
 
     // Reverse the **first** one while the second is still standing. Subtracting 60.00 from a paid
     // invoice would take it to -60.00 and the column's own CHECK would refuse the write with a
-    // constraint name instead of an answer. The correct figure is the sum of what remains: 40.00.
+    // constraint name instead of an answer. The correct figure is the sum of what remains: 40.00
+    // is what is still *paid*, so of a 100.00 invoice the **outstanding** is 60.00 — paid and
+    // outstanding are the two ends of one subtraction and an assertion that reads one while meaning
+    // the other is how a correct module gets "fixed" into an incorrect one.
     let reversed = call(
         &fixture.state,
         request(
@@ -1027,10 +1051,25 @@ async fn a_reversal_recomputes_the_invoice_from_what_is_still_allocated() {
 
     let (status, outstanding) = invoice_state(&fixture, &book, invoice).await;
     assert_eq!(
-        outstanding, "40.00",
-        "the invoice keeps what the surviving payment paid: {status}"
+        outstanding, "60.00",
+        "the invoice keeps what the surviving payment left owed: {status}"
     );
     assert_eq!(status, "partial", "and it is partial again, not paid");
+
+    // The same fact from the other end, so a future reader cannot read this as "40.00 of money
+    // vanished": `paid_total` is the surviving 40.00 and `grand_total` is untouched at 100.00.
+    let read = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/accounting/invoices/{invoice}"),
+            Some(&book),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(money(&read.body, "paid_total"), "40.00", "only the surviving payment pays");
+    assert_eq!(money(&read.body, "grand_total"), "100.00", "the total never moved");
 }
 
 #[tokio::test]
