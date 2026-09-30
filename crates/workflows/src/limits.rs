@@ -200,6 +200,12 @@ pub async fn set_limits(pool: &PgPool, project_id: Uuid, limits: LimitOverrides)
     .bind(limits.updated_by)
     .fetch_one(pool)
     .await?;
+    // A raised cap has to be able to warn again, and the `ever` notices are what stop it. Deleted
+    // after the write rather than before, so a failed write does not clear the history of a
+    // crossing that is still true. It runs on its own connection rather than inside a transaction
+    // this function does not own: two statements, and the second is idempotent.
+    let mut connection = pool.acquire().await?;
+    clear_open_period_notices_in(&mut connection, project_id).await?;
     Ok(limits)
 }
 
@@ -436,6 +442,317 @@ async fn owner_display(
         Some((key, _)) => (key, "the project owner".into()),
         None => ("this project".into(), "the project owner".into()),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Limit notices: the "once" in "fires once"
+// ---------------------------------------------------------------------------------------------
+
+/// Which crossing a notice records.
+///
+/// `Serialize` because the notice is the body of a platform event and an event payload is JSON —
+/// the wire form of `kind` is the same two words the `kind` column holds, so a consumer reading
+/// the column and one reading the payload cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoticeKind {
+    /// The `warn_at_percent` threshold was crossed.
+    #[serde(rename = "warning")]
+    Warning,
+    /// The cap itself was reached; further runs are refused.
+    #[serde(rename = "exceeded")]
+    Exceeded,
+}
+
+impl NoticeKind {
+    /// The value stored in the `kind` column, and the only two values it may hold.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Exceeded => "exceeded",
+        }
+    }
+}
+
+/// A crossing this caller is responsible for telling the platform about.
+///
+/// **The struct is the return of a claim, not a computation.** Whoever gets one has already won
+/// the row and MUST emit; everyone else got an empty list and MUST NOT. Computing "is this over
+/// quota" separately would be the shape this whole file exists to argue against — two answers
+/// that agree until they do not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitNotice {
+    /// The project that crossed.
+    pub project_id: Uuid,
+    /// Which cap: `max_runs_per_day`, `max_concurrent_runs`, `max_workflows` or
+    /// `max_credentials`. The column name, because the payload's `limit` is what an operator
+    /// reads and a screen label invented here is one more word to translate.
+    pub limit: String,
+    /// The count at the crossing.
+    pub current: i64,
+    /// The cap it crossed.
+    pub max: i32,
+    /// The period the notice belongs to: a `YYYY-MM-DD` day for counters that reset, `ever` for
+    /// caps that do not.
+    pub period: String,
+    /// The project's key, for a message a human reads.
+    pub project_key: String,
+    /// Which crossing this is.
+    pub kind: NoticeKind,
+}
+
+/// The period key for a cap that resets at midnight.
+#[must_use]
+pub fn daily_period(date: time::Date) -> String {
+    // `Date` renders as `YYYY-MM-DD` under its own `Display`; going through `format!` rather
+    // than a hand-rolled pad is what keeps this agreeing with what a reader of the row expects.
+    date.to_string()
+}
+
+/// Take the one notice slot for `(project, limit, period, kind)`, answering whether this caller won.
+///
+/// **The row count is the decision, and it is taken before the emit.** Reversed — emit, then
+/// stamp — this is the read-then-write that produces two notifications and one line saying one
+/// was sent, which is the outcome this module has now been fixed for three times (the round-robin
+/// cursor, the autoresponder reservation, the submission claim). At-least-once delivery is a
+/// property of every bus in the platform, so "who is allowed to say it" has to be a fact of the
+/// data rather than a property of one worker being the only one running.
+pub async fn claim_notice_in(
+    connection: &mut sqlx::PgConnection,
+    notice: &LimitNotice,
+) -> Result<bool> {
+    let inserted = sqlx::query(
+        "insert into automation_project_limit_notices \
+         (project_id, limit_name, period_key, kind) values ($1, $2, $3, $4) \
+         on conflict (project_id, limit_name, period_key, kind) do nothing",
+    )
+    .bind(notice.project_id)
+    .bind(&notice.limit)
+    .bind(&notice.period)
+    .bind(notice.kind.as_str())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    Ok(inserted == 1)
+}
+
+/// Take the slot, with a pool.
+pub async fn claim_notice(pool: &PgPool, notice: &LimitNotice) -> Result<bool> {
+    let mut connection = pool.acquire().await?;
+    claim_notice_in(&mut connection, notice).await
+}
+
+/// Whether this caller has already been told about a crossing.
+///
+/// The read side of the same fact, for a caller that must not write — the API's limits screen
+/// answering "has anybody been notified?". It is deliberately *not* how the claim is made: a read
+/// here would be the check-then-write shape the claim exists to remove.
+pub async fn notice_claimed(
+    pool: &PgPool,
+    project_id: Uuid,
+    limit: &str,
+    period: &str,
+    kind: NoticeKind,
+) -> Result<bool> {
+    let found: i64 = sqlx::query_scalar(
+        "select count(*) from automation_project_limit_notices \
+         where project_id = $1 and limit_name = $2 and period_key = $3 and kind = $4",
+    )
+    .bind(project_id)
+    .bind(limit)
+    .bind(period)
+    .bind(kind.as_str())
+    .fetch_one(pool)
+    .await?;
+    Ok(found > 0)
+}
+
+/// Every crossing this project owes the platform, having already claimed the ones it is first to
+/// see. Returns the notices this caller alone must emit.
+///
+/// **Four caps, one loop, and the caps are asked in the order an operator reads them** — the two
+/// run counters first (they are the ones that refuse work, and the ones a subscriber wants while
+/// there is still something to do), then the two object counts (which grow by a click rather than
+/// by a run). The order is also the only thing that makes the answer deterministic, and a
+/// deterministic answer is what lets a caller log a stable set.
+///
+/// `Exceeded` wins over `Warning` for the same cap: a project that is at 100 percent is not
+/// "warned about", and emitting both for one crossing is how a subscriber ends up with an
+/// escalation and a heads-up for the same instant.
+pub async fn claim_due_notices_in(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<Vec<LimitNotice>> {
+    let limits = read_limits_in(connection, project_id).await?;
+    if Limits::is_unlimited(limits.max_workflows)
+        && Limits::is_unlimited(limits.max_credentials)
+        && Limits::is_unlimited(limits.max_runs_per_day)
+        && Limits::is_unlimited(limits.max_concurrent_runs)
+    {
+        // No caps at all: nothing to cross, and a claim row for each of four absent limits would
+        // be four rows per project per day of pure noise.
+        return Ok(Vec::new());
+    }
+
+    let (key, _owner) = owner_display(connection, project_id).await?;
+    let today = usage_today_in(connection, project_id).await?;
+    let running = if Limits::is_unlimited(limits.max_concurrent_runs) {
+        0
+    } else {
+        concurrent_runs_in(connection, project_id).await?
+    };
+    let workflows = count_in(connection, "workflows", project_id).await?;
+    let credentials = if table_exists_in(connection, "credentials").await? {
+        count_in(connection, "credentials", project_id).await?
+    } else {
+        // The limits screen already renders this counter as "no counter on this build", and the
+        // reason is the same here: a hard `0` would be a claim about a table that does not exist.
+        0
+    };
+
+    let period = daily_period(today.usage_date);
+    let candidates = [
+        (
+            "max_runs_per_day",
+            limits.max_runs_per_day,
+            i64::from(today.runs),
+            period.clone(),
+        ),
+        (
+            "max_concurrent_runs",
+            limits.max_concurrent_runs,
+            running,
+            period.clone(),
+        ),
+        (
+            "max_workflows",
+            limits.max_workflows,
+            i64::from(workflows),
+            "ever".to_owned(),
+        ),
+        (
+            "max_credentials",
+            limits.max_credentials,
+            i64::from(credentials),
+            "ever".to_owned(),
+        ),
+    ];
+
+    let mut claimed = Vec::new();
+    for (limit, max, current, period) in candidates {
+        if Limits::is_unlimited(max) {
+            continue;
+        }
+        let kind = if Limits::exceeded(max, current).is_some() {
+            NoticeKind::Exceeded
+        } else if Limits::warns(max, current, limits.warn_at_percent) {
+            NoticeKind::Warning
+        } else {
+            continue;
+        };
+        let notice = LimitNotice {
+            project_id,
+            limit: limit.to_owned(),
+            current,
+            max,
+            period,
+            project_key: key.clone(),
+            kind,
+        };
+        if claim_notice_in(connection, &notice).await? {
+            claimed.push(notice);
+        }
+    }
+    Ok(claimed)
+}
+
+/// [`claim_due_notices_in`] with a pool — the sweep's call.
+pub async fn claim_due_notices(pool: &PgPool, project_id: Uuid) -> Result<Vec<LimitNotice>> {
+    let mut connection = pool.acquire().await?;
+    claim_due_notices_in(&mut connection, project_id).await
+}
+
+/// The projects a sweep should look at: the ones with at least one cap set.
+///
+/// A sweep that walked every project would be a full table scan of the tenant list every tick, and
+/// the overwhelming majority of those rows are `0 = unlimited`. The filter is the same predicate
+/// [`set_limits`] validates, so a project that cannot be in the result is a project with nothing
+/// to say.
+pub async fn projects_with_caps(pool: &PgPool, limit: i64) -> Result<Vec<Uuid>> {
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "select project_id from automation_project_limits \
+         where max_workflows > 0 or max_credentials > 0 or max_runs_per_day > 0 \
+            or max_concurrent_runs > 0 order by project_id limit $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
+/// Forget a project's open-ended notices, so a raised cap can warn again.
+///
+/// **Called from [`set_limits`], and only for the `ever` caps.** Those use a period that never
+/// rolls, so without this a project that hit its workflow cap could never warn a second time for
+/// the rest of its life — including after an operator does the obvious thing and raises the
+/// number. That is a warning reporting history instead of the present, which is the specific
+/// wrongness this table was added to remove.
+///
+/// The daily notices are deliberately untouched: yesterday's warning is a fact, and raising a cap
+/// does not un-warn the day it was set.
+pub async fn clear_open_period_notices_in(
+    connection: &mut sqlx::PgConnection,
+    project_id: Uuid,
+) -> Result<u64> {
+    let cleared = sqlx::query(
+        "delete from automation_project_limit_notices \
+         where project_id = $1 and period_key = 'ever'",
+    )
+    .bind(project_id)
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    Ok(cleared)
+}
+
+/// How many rows of one table belong to a project, for the two object-count caps.
+async fn count_in(
+    connection: &mut sqlx::PgConnection,
+    table: &str,
+    project_id: Uuid,
+) -> Result<i32> {
+    // `table` is never a caller-supplied string: both call sites pass a literal, and the
+    // identifiers are interpolated rather than bound because a bind parameter cannot name a
+    // relation. The assertion is what keeps that true.
+    debug_assert!(
+        matches!(table, "workflows" | "credentials"),
+        "unknown table {table}"
+    );
+    let query = format!("select count(*) from {table} where project_id = $1");
+    let count: i64 = sqlx::query_scalar(&query)
+        .bind(project_id)
+        .fetch_one(&mut *connection)
+        .await?;
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(count as i32)
+}
+
+/// Whether a relation exists, for a cap whose table another wave may not have shipped yet.
+///
+/// `to_regclass` answers `None` rather than raising, which is the whole point: a sweep that
+/// crashed on a missing table would take every project's notices down with it, over a table this
+/// branch is not responsible for.
+async fn table_exists_in(connection: &mut sqlx::PgConnection, table: &str) -> Result<bool> {
+    // **`is not null`, not the name.** `to_regclass` answers NULL for an absent relation, so
+    // selecting the name and decoding it into `(String,)` inside `fetch_optional` asks sqlx for
+    // `Option<Option<String>>` and it raises `ColumnDecode: UnexpectedNullError` — which is
+    // precisely the answer this function exists to give, turned into an error. Comparing against
+    // NULL in the database makes the column non-nullable, so the decode has nothing to trip over.
+    let row: (bool,) = sqlx::query_as("select to_regclass($1) is not null")
+        .bind(table)
+        .fetch_one(&mut *connection)
+        .await?;
+    Ok(row.0)
 }
 
 // ---------------------------------------------------------------------------------------------
