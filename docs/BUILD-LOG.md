@@ -7263,27 +7263,34 @@ page-level defects** — `diagnostics.json` reports an empty list for every one 
 clicked, 39 interactive elements.
 
 **But the headline number is 21 high, and it is not 21 defects.** Grouping
-`summary.json` by what actually failed: **6 + 2 × `GET /api/v1/environments` → 401** and
-**`POST /api/v1/auth/logout` → 403** on the main phase, the same 401 twice more on mobile, plus
-`/qa-sample` → 404 on the public renderer. That is one root cause wearing five costumes, and it
-is a **harness** failure, not a product one:
+`summary.json` by what actually failed: **6 × `GET /api/v1/environments` → 401** on the main
+phase, the same 401 twice more on mobile, plus **`POST /api/v1/auth/logout` → 403**,
+`command-center/resolve` → 403, and `/qa-sample` → 404 on the public renderer. And
+`environments` reported `ok: false — "/environments rendered no rows at all"`.
 
-`apps/admin/next.config.ts` puts the API origin into `rewrites()`, and `rewrites()` is resolved
-at **build** time — a Next config value, not a runtime env read. `run.sh` passes
-`OMNION_API_URL` only in the pm2 start environment (line 207), so a dev server that was already
-running keeps the origin it was built with, and the panel's `/api/*` forwarder points wherever
-that build was aimed. The symptom is a signed-in session whose every API call comes back 401,
-and a panel that renders an empty table while looking perfectly healthy: `environments` reported
-`ok: false — "/environments rendered no rows at all"`, which is the *correct* reading of a page
-whose data never arrived.
+**A correction, because I wrote the cause down before checking it.** The obvious explanation is
+that `apps/admin/next.config.ts` puts the API origin inside `rewrites()`, which Next resolves at
+**build** time, while `run.sh` supplies `OMNION_API_URL` only in the pm2 start environment — so a
+dev server that is already running forwards `/api/*` to whatever origin it was built with. It is
+a real property of Next and it fits the symptom "every screen is empty". **It does not fit the
+status code.** A 401 is the API *refusing a request it received*; a panel wired to a dead or
+wrong port cannot connect and reports `000`, and this stack reports `000` for that case when
+asked. The forwarder reached an API and the session did not survive the hop — a cookie, CSRF or
+origin story, not a routing one.
 
-**So the REQ-017 gate is still red, and the honest reason is now a name instead of a
-hypothesis.** Three ticks of "the box" and three of "the slot" were both partly true; the
-measurement is finally pointing at something specific. The fix belongs in `run.sh`: the admin and
-web dev servers must be (re)started with the env *inside* the process that evaluates
-`next.config.ts`, or the pass must pass an explicit origin that the config reads at config-load
-time. That is next tick's first slice — it is worth more than any REQ-017 code, because until the
-forwarder points at the right API, every screen in the panel is being measured empty.
+So the rewrite theory is the *first* thing to check and the entry that must not be inherited
+without that check. The next tick distinguishes them in one command: with the stack up, `curl`
+the panel's own `/api/v1/environments` **with the walkthrough's session cookie**. A 000 answers
+"wrong origin"; a 401 answers "the request arrived and was refused", and moves the question to
+the session.
+
+**What is honestly established.** The pass ran to completion on the private stack for the first
+time in three ticks: 31 screenshots, 34 clicks, 21 pages, **zero page-level defects** in
+`diagnostics.json` (every list — `brokenImages`, `emptyInteractives`, `unlabeledInputs`,
+`duplicateIds`, `lowContrast`, `tinyTargets`, `offscreen`, `scrollable` — is empty on all 21
+pages), `environments` visited and clicked with 39 interactive elements. The REQ-017 gate is
+still red, and the reason is now a narrow question about the session rather than a vague claim
+about the box.
 
 **One more thing the pass proved about the harness itself.** `cargo-slot.sh`'s exec bit
 (`81a670f2`) is what let this pass run at all: the previous attempt died on `Permission denied`
