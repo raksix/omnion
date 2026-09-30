@@ -7849,3 +7849,47 @@ stashed-baseline run proves all 5 fail on the old file.
 writer's slot rather than contending — reproducing this race needs the cold start a loaded box
 destroys). Tick REQ-127's close box only if it measures all three reliability screens against a
 tenant that exists.
+
+## 2026-09-30 — omnion-w6 tick 34 — the gate that ran the fix instead of reading it, and two empty passes
+
+`origin/main` was 3 ahead at tick start, and the confirming pass last tick was waiting for **does
+not exist**: `qa-artifacts/20260930-175936/` and `…/20260930-180938/` are both **empty
+directories**. Two passes started today and neither wrote a report, so REQ-127's close box is
+unticked for a fourth reason and the newest one is the bluntest — the pass did not merely measure
+the wrong thing, it produced nothing. Reading the previous report was never the right move
+(invariant 12); reading a *directory listing* and concluding "the pass is running" was the same
+error one level up.
+
+**A regex over the source is not a gate, and this branch has now paid for that twice.** The gate
+committed last tick (`wizard-gate.test.cjs`) checks that `walkthrough.cjs` *contains* the shape of
+the fix, with comments stripped first because this file documents the bug in prose. It passes 5/5
+— against code that works. `wizard-behaviour.test.cjs` replaces it: it slices the real
+`runWizard` body out of the file, evaluates it with a stub page, and asks the three questions the
+race actually asked. **8/8 now; 6 of the 8 fail against the pre-fix walkthrough (`61358f91`)**, so
+the checks discriminate.
+
+**The one red check was the fixture, not the walkthrough — and the honest fix was the stub.**
+Three readers share `page.evaluate`; my stub answered all of them with the current step key, so
+the *boolean* reader (`/Your installation is ready/i.test(...)`) received a truthy **string** and
+the loop read itself finished after one step. The walkthrough was right. A gate that goes red
+because its fixture lies about the page teaches one thing only: delete the gate.
+
+**Both merge conflicts were an append point, and only one of them is a merge.** `apps/admin/lib/api.ts`
+conflicted inside a docblock main had rewritten (the `hours` → `range` change) directly above
+functions main has never seen; the resolution is **both**: main's doc comment, my reliability
+client functions, one docblock each. `docs/BUILD-LOG.md` is append-only, so the resolution is a
+**multiset** merge and it is proved as one — 3 blocks, **0 dropped against either parent**, union
+complete with content identity (every parent-only block byte-identical). Line count proves nothing
+here; it is the Counter that decides.
+
+**Gates.** `cargo build -p omnion-api` clean after the merge (binary 18:50) ·
+`cargo test -p omnion-reliability --lib` **116 passed / 0 failed** · `pnpm typecheck` (admin)
+clean · `node --check` clean · `wizard-gate` 5/5 · `wizard-behaviour` **8/8**, with 6/8 red
+against the old file.
+
+**Still owed:** REQ-127's close box. The focused pass is queued second behind w4's live pass
+(slot `193597`, holder alive) and w3 — the right call on a box at load 74 with ten writers, and
+the queue is the harness working, not failing. Tick the box only when the pass measures all three
+reliability screens against a tenant that exists.
+
+**Next:** read the pass, tick the box, close REQ-127; then REQ-128 (deployment tooling).
