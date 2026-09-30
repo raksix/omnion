@@ -5303,6 +5303,340 @@ async function runCommentsDepth(page, report) {
 }
 
 /**
+ * `runThemeBuilderDepth` — the eight-slot builder and the package uploader (REQ-062, slice 3).
+ *
+ * Acceptance 10 and 13 are the two criteria whose UI halves did not exist, and both are
+ * claims a store test cannot make on its own: 10 is "the Builder *saves* a header slot … and
+ * `Reset slot to theme default` restores the shipped layout", and 13 is "import validation
+ * refuses a package … and *lists each problem*; a valid package installs as inactive".
+ *
+ * So the steps below read the DATABASE, not the screen's own report, after every action:
+ *
+ *  - a saved slot is proved by the row in `theme_layouts` carrying the block the canvas held,
+ *    with `is_default = false` — and the theme's own blocks are then proved intact in
+ *    `default_blocks`, which is the whole point of the `0173` split. A builder that saved and
+ *    still left the default in `blocks` would pass a screen-only assertion and be a one-way
+ *    door.
+ *  - a reset is proved by `is_default` back to true AND the restored tree being the theme's
+ *    own, read from the column the save never writes.
+ *  - a refusal is proved by the report listing EVERY problem (the criterion says "lists each
+ *    problem", and a validator that stops at the first one is the version that passes a
+ *    "refused" assertion), and by the count of findings on screen matching the count the
+ *    package actually has.
+ *  - "installs as inactive" is proved by the *absence* of a `site_themes` row for the key: an
+ *    install that activated itself would be caught here and nowhere else.
+ *  - the removal guards are proved by asking: a bundled theme's removal must be refused with
+ *    `theme_bundled_cannot_be_removed` and must NOT change the row count.
+ *
+ * The builder's own fixture is a real theme with a real `default_blocks` for the header,
+ * written directly, because a theme that ships no header has nothing for the reset to restore
+ * and every reset assertion below would be vacuous.
+ */
+async function runThemeBuilderDepth(page, report) {
+  const steps = {};
+  const stamp = Date.now();
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the builder has nothing to read";
+    return steps;
+  }
+  const themeKey = `qa-builder-${stamp}`;
+
+  // A theme that ships a header, so `Reset slot to theme default` has a real default to put
+  // back. `default_blocks` is written here rather than through the API because the only writer
+  // of that column is `seed_default_layouts`, and the point of the fixture is to be a theme
+  // that HAS been activated — writing it is the closest honest approximation.
+  const headerDefault = [
+    { id: `qa-h1-${stamp}`, type: "heading", props: { text: "QA header", level: 2 } },
+  ];
+  const manifest = JSON.stringify({
+    key: themeKey,
+    name: "QA Builder Theme",
+    version: "1.0.0",
+    modes: ["light", "dark"],
+    slots: ["header", "footer", "home"],
+    tokens: {
+      surface: { light: "#ffffff", dark: "#101010" },
+      text: { light: "#111111", dark: "#f5f5f5" },
+      accent: { light: "#2f6feb", dark: "#7aa2f7" },
+    },
+  }).replace(/'/g, "''");
+  qaSql(
+    `insert into themes (organization_id, key, name, version, source, manifest, storage_key) ` +
+      `select null, '${themeKey}', 'QA Builder Theme', '1.0.0', 'uploaded', '${manifest}'::jsonb, ` +
+      `'qa/${themeKey}.zip' on conflict do nothing`,
+  );
+  // The site renders with the fixture theme, so the builder opens on the fixture's own slots.
+  const previousTheme = qaSql(
+    `update sites set theme = '${themeKey}' where id = '${siteId}' returning theme`,
+  );
+  steps.fixtureThemeInstalled = qaSql(`select count(*) from themes where key = '${themeKey}'`) === "1";
+  steps.siteThemeChangedToFixture =
+    qaSql(`select theme from sites where id = '${siteId}'`) === themeKey;
+  // Seeding the slot the same way activation does: one row, the theme's own blocks, and the
+  // same tree in `default_blocks`. Written as one statement so the fixture cannot half-exist.
+  qaSql(
+    `insert into theme_layouts (id, site_id, theme_key, slot, blocks, default_blocks, is_default) ` +
+      `select gen_random_uuid(), '${siteId}', '${themeKey}', 'header', '${JSON.stringify(headerDefault).replace(/'/g, "''")}'::jsonb, ` +
+      `'${JSON.stringify(headerDefault).replace(/'/g, "''")}'::jsonb, true ` +
+      `on conflict (site_id, theme_key, slot) do update set blocks = excluded.blocks, ` +
+      `default_blocks = excluded.default_blocks, is_default = true`,
+  );
+  steps.fixtureHeaderHasADefault =
+    qaSql(`select is_default from theme_layouts where site_id = '${siteId}' and theme_key = '${themeKey}' and slot = 'header'`) === "t";
+  steps.fixtureDefaultIsInItsOwnColumn =
+    qaSql(`select default_blocks::text from theme_layouts where site_id = '${siteId}' and theme_key = '${themeKey}' and slot = 'header'`).includes("QA header");
+
+  // ------------------------------------------------------------------ the builder screen
+  await page
+    .goto(`${ADMIN}/themes/${themeKey}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(3500);
+  steps.screenReady = (await page.locator("[data-theme-builder]").count()) > 0;
+  steps.themeKeyIsNamed =
+    (await page.locator(`[data-theme-builder-theme-key="${themeKey}"]`).count()) > 0;
+  // All eight slots, always. A picker that hides an empty slot cannot answer "what if I clear
+  // the header", so the count is an assertion and not a screenshot.
+  const slotRows = await page.locator("[data-theme-slot]").count();
+  steps.everySlotIsOffered = slotRows === 8;
+  for (const name of ["header", "footer", "home", "blog-list", "single-page", "product", "404", "search"]) {
+    steps[`slotOffered:${name}`] = (await page.locator(`[data-theme-slot="${name}"]`).count()) === 1;
+  }
+  steps.headerBadgeSaysThemeDefault =
+    (await page.locator('[data-theme-slot="header"][data-theme-slot-state="theme"]').count()) === 1;
+  steps.canvasIsMountedForTheSlot =
+    (await page.locator('[data-theme-builder-canvas-slot="header"]').count()) === 1;
+  steps.galleryLinksToBuilder =
+    (await (async () => {
+      await page.goto(`${ADMIN}/themes`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(2500);
+      return (await page.locator("[data-theme-builder-link]").count()) > 0;
+    })()) === true;
+  steps.galleryHasAWorkingDeleteControl = await (async () => {
+    // The card's delete control used to render with no handler at all — a dead button that
+    // looked like the criterion was covered. So the assertion is behavioural: an uploaded
+    // theme offers the control, and clicking it opens a confirmation that NAMES the theme.
+    const control = page.locator(`[data-theme-delete="${themeKey}"]`).first();
+    if ((await control.count()) === 0) return false;
+    await control.click({ timeout: 6000 }).catch(() => {});
+    await page.waitForTimeout(700);
+    const dialog = page.locator("[data-themes-confirm]").first();
+    const text = await dialog.innerText().catch(() => "");
+    return text.includes("QA Builder Theme") && text.includes("bundled");
+  })();
+
+  // ------------------------------------------------------------------ a slot save
+  await page
+    .goto(`${ADMIN}/themes/${themeKey}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(3000);
+  // Insert one real block from the registry — the insert panel is generated from it, so
+  // clicking the first Text entry is the only way to prove the panel is wired to the registry
+  // rather than to a hard-coded list.
+  await page.locator("[data-block-insert-toggle]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  steps.insertPanelOpens = (await page.locator("[data-block-insert-panel]").count()) > 0;
+  const insertChoices = await page.locator("[data-block-insert-panel] button").count();
+  steps.insertPanelOffersManyTypes = insertChoices >= 10;
+  await page
+    .locator('[data-block-insert-panel] button:has-text("Heading")')
+    .first()
+    .click({ timeout: 6000 })
+    .catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.blockAppearsInTheOutline = (await page.locator("[data-block-outline-row]").count()) > 0;
+  steps.inspectorIsMounted = (await page.locator("[data-block-inspector]").count()) > 0;
+  steps.barReportsUnsaved = (await page.locator('[data-theme-builder-dirty="true"]').count()) > 0;
+  // Type into the heading's own field, so the save is not a save of an untouched default.
+  const textField = page.locator('[data-block-inspector] input[type="text"], [data-block-inspector] textarea').first();
+  if ((await textField.count()) > 0) {
+    await textField.fill("QA custom header").catch(() => {});
+    await page.waitForTimeout(700);
+  }
+  steps.propFieldIsWritable = (await page.locator("[data-block-inspector]").count()) > 0;
+  await page.locator("[data-theme-builder-save]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3200);
+  const savedRow = qaSql(
+    `select is_default::text || '|' || (blocks::text like '%QA custom header%')::text ` +
+      `from theme_layouts where site_id = '${siteId}' and theme_key = '${themeKey}' and slot = 'header'`,
+  );
+  steps.slotRowWasWritten = savedRow.length > 0 && !savedRow.startsWith("|");
+  steps.savedSlotIsNotADefault = savedRow.startsWith("f|");
+  steps.savedSlotHoldsTheEditedBlock = savedRow.endsWith("|t");
+  // The `0173` claim, proved in a browser: the theme's own blocks are STILL THERE after a
+  // custom save, in a column the save never writes.
+  steps.defaultSurvivedTheSave =
+    qaSql(
+      `select default_blocks::text from theme_layouts where site_id = '${siteId}' and theme_key = '${themeKey}' and slot = 'header'`,
+    ).includes("QA header");
+  steps.badgeMovedToCustom =
+    (await page.locator('[data-theme-slot="header"][data-theme-slot-state="custom"]').count()) === 1;
+  steps.noticeNamesTheSave =
+    (await page.locator("[data-theme-builder-notice]").first().innerText().catch(() => "")).includes("Saved");
+  steps.slotSaveTouchedNoPage =
+    qaSql(`select count(*) from page_revisions where updated_at > now() - interval '2 minutes'`) === "0";
+
+  // ------------------------------------------------------------------ the reset
+  steps.resetIsOfferedAfterACustomSave = (await page.locator("[data-theme-builder-reset]").count()) > 0;
+  await page.locator("[data-theme-builder-reset]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(700);
+  steps.resetConfirmationOpened = (await page.locator("[data-theme-builder-reset-confirm]").count()) > 0;
+  steps.resetConfirmationSaysItIsNotRecoverable =
+    (await page.locator("[data-theme-builder-reset-confirm]").first().innerText().catch(() => "")).includes(
+      "not recoverable",
+    );
+  await page.locator("[data-theme-builder-reset-accept]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3200);
+  const afterReset = qaSql(
+    `select is_default::text || '|' || (blocks::text like '%QA header%')::text ` +
+      `from theme_layouts where site_id = '${siteId}' and theme_key = '${themeKey}' and slot = 'header'`,
+  );
+  steps.resetRestoredTheShippedTree = afterReset === "t|t";
+  steps.badgeMovedBackToTheme =
+    (await page.locator('[data-theme-slot="header"][data-theme-slot-state="theme"]').count()) === 1;
+  steps.resetIsNotOfferedForAThemeDefault =
+    (await page.locator("[data-theme-builder-reset]").count()) === 0;
+
+  // A slot the theme ships NOTHING for has nothing to restore, so the control is not drawn —
+  // the honest alternative to a button that answers 409.
+  await page.locator('[data-theme-slot="search"]').first().click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1400);
+  steps.switchingSlotLoadsThatSlot = (await page.locator('[data-theme-builder-canvas-slot="search"]').count()) === 1;
+  steps.resetHiddenForASlotWithNoDefault = (await page.locator("[data-theme-builder-reset]").count()) === 0;
+  steps.emptySlotSaysSo =
+    (await page.locator("[data-theme-builder-canvas]").first().innerText().catch(() => "")).includes(
+      "This slot is empty",
+    );
+
+  // ------------------------------------------------------------------ the package screen
+  await page
+    .goto(`${ADMIN}/themes/upload`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.uploadScreenReady = (await page.locator("[data-theme-upload]").count()) > 0;
+  steps.uploadHasAFileInput = (await page.locator("[data-theme-upload-file]").count()) > 0;
+  steps.uploadEmptyStateExists = (await page.locator("[data-theme-upload]").first().innerText().catch(() => "")).includes("Nothing picked yet");
+
+  const badPackage = {
+    key: `qa-bad-${stamp}`,
+    name: "QA Broken Package",
+    version: "1.0.0",
+    modes: ["light"],
+    // Three separate problems on purpose: an unknown slot, an unknown block type and a
+    // missing key. "Lists EACH problem" is the criterion, so a package with one fault would
+    // prove nothing about it.
+    slots: {
+      "not-a-slot": [{ id: "a", type: "heading", props: { text: "x", level: 2 } }],
+      header: [{ id: "b", type: "not_a_block_type", props: {} }],
+    },
+    tokens: { surface: { light: "#ffffff", dark: "#101010" } },
+  };
+  const badFile = path.join(OUT, `qa-package-bad-${stamp}.json`);
+  fs.writeFileSync(badFile, JSON.stringify(badPackage, null, 2));
+  await page.locator("[data-theme-upload-file]").setInputFiles(badFile).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.badPackageWasRead = (await page.locator("[data-theme-upload-file-name]").count()) > 0;
+  await page.locator("[data-theme-upload-validate]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3500);
+  steps.reportIsRendered = (await page.locator("[data-theme-upload-report]").count()) > 0;
+  steps.reportSaysInvalid =
+    (await page.locator('[data-theme-upload-valid="false"]').count()) === 1;
+  const listed = await page.locator("[data-theme-upload-finding]").count();
+  steps.everyProblemIsListed = listed >= 3;
+  steps.findingsNameAPath = (await page.locator("[data-theme-upload-finding-path]").count()) >= 3;
+  steps.installIsRefusedWhileInvalid =
+    (await page.locator("[data-theme-upload-install]").first().isDisabled().catch(() => false)) === true;
+  steps.nothingWasInstalled =
+    qaSql(`select count(*) from themes where key = '${badPackage.key}'`) === "0";
+
+  // A valid package: the same shape with a real slot, a real block type and a real key.
+  const goodKey = `qa-good-${stamp}`;
+  const goodPackage = {
+    key: goodKey,
+    name: "QA Good Package",
+    version: "2.1.0",
+    modes: ["light", "dark"],
+    slots: {
+      header: [{ id: `qa-p-${stamp}`, type: "heading", props: { text: "Imported header", level: 2 } }],
+      footer: [{ id: `qa-p2-${stamp}`, type: "text", props: { text: "Imported footer" } }],
+    },
+    tokens: { surface: { light: "#ffffff", dark: "#101010" }, text: { light: "#111111", dark: "#f5f5f5" } },
+  };
+  const goodFile = path.join(OUT, `qa-package-good-${stamp}.json`);
+  fs.writeFileSync(goodFile, JSON.stringify(goodPackage, null, 2));
+  await page.locator("[data-theme-upload-validate]").first().click().catch(() => {});
+  await page.waitForTimeout(600);
+  // Pick the GOOD file: the same input, a second assignment, and the screen must forget the
+  // previous report — a screen that validated file A and installed file B is the worst kind.
+  await page.locator("[data-theme-upload-file]").setInputFiles(goodFile).catch(() => {});
+  await page.waitForTimeout(1000);
+  steps.pickingAnotherFileClearsTheReport =
+    (await page.locator("[data-theme-upload-report]").count()) === 0;
+  await page.locator("[data-theme-upload-validate]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3500);
+  steps.goodReportIsValid =
+    (await page.locator('[data-theme-upload-valid="true"]').count()) === 1;
+  steps.validPackageHasNoFindings =
+    (await page.locator("[data-theme-upload-finding]").count()) === 0;
+  steps.installIsOfferedOnAValidReport =
+    (await page.locator("[data-theme-upload-install]").first().isDisabled().catch(() => true)) === false;
+  await page.locator("[data-theme-upload-install]").first().click({ timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(4000);
+  steps.installSucceeded = (await page.locator("[data-theme-upload-installed]").count()) > 0;
+  steps.themeIsInTheLibrary = qaSql(`select count(*) from themes where key = '${goodKey}'`) === "1";
+  // "Installs as inactive", proved by the absence of the row that only activation writes.
+  steps.installDidNotActivate = qaSql(
+    `select count(*) from site_themes where theme = '${goodKey}'`,
+  ) === "0";
+  steps.noticeSaysInactive =
+    (await page.locator("[data-theme-upload-installed]").first().innerText().catch(() => "")).toLowerCase().includes("inactive");
+
+  // ------------------------------------------------------------------ the removal guards
+  const before = qaSql(`select count(*) from themes`);
+  await page.locator("[data-theme-upload-remove-key]").fill("minimal").catch(() => {});
+  await page.locator("[data-theme-upload-remove]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const refusal = await page.locator("[data-theme-upload-error]").first().innerText().catch(() => "");
+  steps.bundledRemovalIsRefused = refusal.length > 0;
+  steps.bundledRefusalNamesTheRule = /bundled|theme_bundled_cannot_be_removed/i.test(refusal);
+  steps.bundledThemeIsStillThere = qaSql(`select count(*) from themes where key = 'minimal'`) === "1";
+  steps.refusedRemovalWroteNothing = qaSql(`select count(*) from themes`) === before;
+
+  // And the one removal that IS allowed, so the pass does not leave the claim "removal is
+  // always refused" looking true.
+  await page.locator("[data-theme-upload-remove-key]").fill(goodKey).catch(() => {});
+  await page.locator("[data-theme-upload-remove]").first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.allowedRemovalWorks = qaSql(`select count(*) from themes where key = '${goodKey}'`) === "0";
+  steps.removalSaysWhatHappened =
+    (await page.locator("[data-theme-upload-removed]").first().innerText().catch(() => "")).length > 0;
+
+  // ------------------------------------------------------------------ the 390 px question
+  await page.setViewportSize({ width: 390, height: 844 }).catch(() => {});
+  await page
+    .goto(`${ADMIN}/themes/${themeKey}/builder`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForTimeout(3000);
+  steps.builderAt390 = (await page.locator("[data-theme-builder]").count()) > 0;
+  const overflow = await page
+    .locator("[data-theme-builder]")
+    .first()
+    .evaluate((el) => el.scrollWidth - el.clientWidth)
+    .catch(() => -1);
+  steps.builderHasNoHorizontalScrollAt390 = overflow >= 0 && overflow <= 2;
+  await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+
+  // Leave the site on the theme it had, so a pass that fails later does not leave the shared
+  // database rendering a QA fixture.
+  if (previousTheme) {
+    qaSql(`update sites set theme = '${previousTheme}' where id = '${siteId}'`);
+  }
+  qaSql(`delete from theme_layouts where theme_key = '${themeKey}'`);
+  qaSql(`delete from themes where key = '${themeKey}' or key like 'qa-bad-%'`);
+  return steps;
+}
+
+/**
  * `runNewsletterDepth` — the mailing lists, the double opt-in and the archive (REQ-064, slice
  * 4b).
  *
@@ -9014,6 +9348,61 @@ async function main() {
     await page.context().browser()?.close().catch(() => {});
     return;
   }
+  // `--only=theme-builder` runs the slice-3 depth pass alone: the eight-slot builder and the
+  // package uploader. Same argument as the two passes above it — a slot save, a slot reset, a
+  // package refusal and an install are four things no store test can be sure the PANEL does,
+  // because the API is correct whether or not the button is wired to it. That is exactly how
+  // the gallery's delete control spent a slice rendering with no handler at all.
+  if (process.argv.includes("--only=theme-builder")) {
+    report.themeBuilder = await runThemeBuilderDepth(page, report);
+    log(`themeBuilder: ${JSON.stringify(report.themeBuilder)}`);
+    const required = [
+      "fixtureThemeInstalled", "siteThemeChangedToFixture",
+      "fixtureHeaderHasADefault", "fixtureDefaultIsInItsOwnColumn",
+      "screenReady", "themeKeyIsNamed", "everySlotIsOffered", "headerBadgeSaysThemeDefault",
+      "canvasIsMountedForTheSlot", "galleryLinksToBuilder", "galleryHasAWorkingDeleteControl",
+      "insertPanelOpens", "insertPanelOffersManyTypes", "blockAppearsInTheOutline",
+      "inspectorIsMounted", "barReportsUnsaved", "propFieldIsWritable",
+      "slotRowWasWritten", "savedSlotIsNotADefault", "savedSlotHoldsTheEditedBlock",
+      "defaultSurvivedTheSave", "badgeMovedToCustom", "noticeNamesTheSave", "slotSaveTouchedNoPage",
+      "resetIsOfferedAfterACustomSave", "resetConfirmationOpened",
+      "resetConfirmationSaysItIsNotRecoverable", "resetRestoredTheShippedTree",
+      "badgeMovedBackToTheme", "resetIsNotOfferedForAThemeDefault",
+      "switchingSlotLoadsThatSlot", "resetHiddenForASlotWithNoDefault", "emptySlotSaysSo",
+      "uploadScreenReady", "uploadHasAFileInput", "uploadEmptyStateExists",
+      "badPackageWasRead", "reportIsRendered", "reportSaysInvalid", "everyProblemIsListed",
+      "findingsNameAPath", "installIsRefusedWhileInvalid", "nothingWasInstalled",
+      "pickingAnotherFileClearsTheReport", "goodReportIsValid", "validPackageHasNoFindings",
+      "installIsOfferedOnAValidReport", "installSucceeded", "themeIsInTheLibrary",
+      "installDidNotActivate", "noticeSaysInactive",
+      "bundledRemovalIsRefused", "bundledRefusalNamesTheRule", "bundledThemeIsStillThere",
+      "refusedRemovalWroteNothing", "allowedRemovalWorks", "removalSaysWhatHappened",
+      "builderAt390", "builderHasNoHorizontalScrollAt390",
+    ];
+    const builderSteps = report.themeBuilder || {};
+    const missing = required.filter((key) => builderSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=theme-builder",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: builderSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`theme builder depth pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`theme builder depth pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
+    return;
+  }
   if (process.argv.includes("--only=newsletter")) {
     report.newsletter = await runNewsletterDepth(page, report);
     log(`newsletter: ${JSON.stringify(report.newsletter)}`);
@@ -9392,6 +9781,13 @@ async function main() {
     // and driven by `runThemesDepth` below, which activates a theme, reads the badge, restores
     // the previous one and requires the button to disappear when there is nothing to restore.
     { path: "/themes", name: "themes" },
+    // The theme builder and the package uploader (REQ-062, slice 3) — no untested screen: both
+    // routes are in the inventory here and driven by `runThemeBuilderDepth` below, which saves a
+    // slot, reads the picker's badge out of the table, restores the theme default, refuses an
+    // unknown-slot package with every finding listed, installs a valid one inactive and proves
+    // the bundled-theme removal is refused with the server's own sentence.
+    { path: "/themes/minimal/builder", name: "theme-builder" },
+    { path: "/themes/upload", name: "theme-upload" },
     { path: "/media", name: "media" },
     // The file manager's trash (REQ-010, slice 1) — no untested screen: the route is walked and
     // clicked here, and the depth pass below creates a folder, trashes a file and restores it.

@@ -27,7 +27,7 @@
  */
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Check, History, Loader2, RefreshCw, RotateCcw, SlidersHorizontal, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, History, LayoutTemplate, Loader2, RefreshCw, RotateCcw, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -35,6 +35,7 @@ import {
   ApiError,
   activateTheme,
   fetchThemeGallery,
+  removeTheme,
   rollbackTheme,
 } from "@/lib/api";
 import type { GalleryEntry, ThemeCard, ThemeGallery } from "@/lib/api";
@@ -56,7 +57,10 @@ export function ThemesView() {
   const [loading, setLoading] = useState(false);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [pending, setPending] = useState<
-    { kind: "activate"; key: string; name: string } | { kind: "rollback"; key: string } | null
+    | { kind: "activate"; key: string; name: string }
+    | { kind: "rollback"; key: string }
+    | { kind: "remove"; key: string; name: string }
+    | null
   >(null);
 
   const load = useCallback(async () => {
@@ -84,6 +88,16 @@ export function ThemesView() {
     setError(null);
     setNotice(null);
     try {
+      if (target.kind === "remove") {
+        // A removal is the one write here that does not answer with the gallery, so the screen
+        // re-reads it. The two refusals the server owns — a bundled theme and a theme a site
+        // still renders with — are printed as their own sentences, because "could not remove
+        // this theme" tells an operator nothing about which of the two stopped them.
+        await removeTheme(target.key);
+        setNotice(`${target.name} was removed from the library.`);
+        await load();
+        return;
+      }
       const result =
         target.kind === "activate"
           ? await activateTheme(selectedSite.id, target.key)
@@ -137,6 +151,15 @@ export function ThemesView() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <Link
+            href="/themes/upload"
+            className="btn btn-ghost"
+            data-themes-upload-link
+            title="Validate and install a theme package"
+          >
+            <Upload className="h-4 w-4" aria-hidden />
+            Upload a theme
+          </Link>
           <ReloadButton onClick={load} busy={loading} />
           <button
             type="button"
@@ -205,6 +228,7 @@ export function ThemesView() {
               onActivate={() =>
                 setPending({ kind: "activate", key: entry.theme.key, name: entry.theme.name })
               }
+              onRemove={(key, name) => setPending({ kind: "remove", key, name })}
             />
           ))}
         </ul>
@@ -222,13 +246,21 @@ export function ThemesView() {
             <h2 id="themes-confirm-title" className="text-base font-semibold text-ink">
               {pending.kind === "activate"
                 ? `Use ${pending.key} for ${gallery.siteKey || "this site"}?`
-                : `Restore ${pending.key}?`}
+                : pending.kind === "remove"
+                  ? `Remove ${pending.name}?`
+                  : `Restore ${pending.key}?`}
             </h2>
             <p className="mt-2 text-sm text-muted">
               {pending.kind === "activate" ? (
                 <>
                   Every page a visitor sees changes to {pending.key}. The current theme (
                   {gallery.activeKey}) is kept and can be restored with one click.
+                </>
+              ) : pending.kind === "remove" ? (
+                <>
+                  {pending.name} is taken out of the library for every site of this organization.
+                  The server refuses this for a bundled theme and for one a site still renders
+                  with, and it will not remove the files of a theme it does not own.
                 </>
               ) : (
                 <>
@@ -247,7 +279,11 @@ export function ThemesView() {
                 data-themes-confirm-accept
                 onClick={() => void confirm()}
               >
-                {pending.kind === "activate" ? "Activate" : "Restore"}
+                {pending.kind === "activate"
+                  ? "Activate"
+                  : pending.kind === "remove"
+                    ? "Remove it"
+                    : "Restore"}
               </button>
             </div>
           </div>
@@ -262,11 +298,13 @@ function ThemeCardView({
   busy,
   disabled,
   onActivate,
+  onRemove,
 }: {
   entry: GalleryEntry;
   busy: boolean;
   disabled: boolean;
   onActivate: () => void;
+  onRemove: (key: string, name: string) => void;
 }) {
   const { theme, isActive } = entry;
   return (
@@ -330,12 +368,13 @@ function ThemeCardView({
             type="button"
             className="btn btn-ghost"
             data-theme-delete={theme.key}
-            disabled={disabled || isActive}
+            disabled={disabled || isActive || busy}
             title={
               isActive
                 ? "A site cannot render a theme that is not installed"
                 : "Remove this uploaded theme"
             }
+            onClick={() => onRemove(theme.key, theme.name)}
           >
             <Trash2 className="h-4 w-4" aria-hidden />
           </button>
@@ -345,6 +384,15 @@ function ThemeCardView({
             theme key in the path because that is the URL the operator remembers. The editor
             re-reads the site's active theme and shows it, so a link from an inactive card
             lands on the site's own settings rather than pretending to edit another theme. */}
+        <Link
+          href={`/themes/${encodeURIComponent(theme.key)}/builder`}
+          className="btn btn-ghost"
+          data-theme-builder-link={theme.key}
+          title="Build the eight regions of this site out of blocks"
+        >
+          <LayoutTemplate className="h-4 w-4" aria-hidden />
+          Builder
+        </Link>
         <Link
           href={`/themes/${encodeURIComponent(theme.key)}/customize`}
           className="btn btn-ghost"
