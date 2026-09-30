@@ -1,3 +1,63 @@
+## 2026-09-30 — REQ-014 slice 1 (probes + overview) · the screen whose job is not to reassure you
+
+feat(health): the probe registry, the versioned surface, `/health` and its drill-down
+
+The tick before this one wrote the code and ran out of clock before it ran. So the first
+thing this tick did was *make it fail*, and the five red tests were not the boring kind: four
+of them were the product lying, and they are now fixed rather than waived.
+
+**Four wrong numbers and one unreachable word, all in the same class.** `longest_mount` read
+the mount point from the wrong side of the ` - ` separator in `/proc/self/mountinfo`: the path
+is field five of the LEFT half and `ext4` is what the right half opens with. Every lookup
+therefore returned `None` and the disk card fell back to the root filesystem — a plausible,
+wrong, **green** number for a data directory living on its own volume, on the one row an
+operator reads when disk is their suspicion. That is the exact failure the longest-match
+ranking exists to prevent, and it was shipping.
+
+The ranking then asked whether a path begins with `//` to decide it was under `/`. Nothing
+does, so the root filesystem dropped out and a single-filesystem host reported `unknown`.
+Depth was then measured in **slashes**, where `/` and `/mnt` tie at one, so the first line in
+the file won — and a tie broken by document order is not a ranking, and is not reproducible
+across hosts. Segments cannot tie; the comparison is now total.
+
+`unescape_mount` read `\040` as base 10. It is octal: 40 decimal is `(`, not a space. A mount
+point containing a space decoded to something unmatchable, which routes straight back into
+the first bug — wrong number, silently.
+
+And the banner had **no `healthy` branch at all**. With every service green, `worst` returned
+`Some(("healthy", ..))`, which fell into the "not checked yet" arm. A fully healthy platform
+reported `unknown`, and "All systems operational" was unreachable code on the one screen
+whose entire job is to be believed. The reassurance was never wired up.
+
+**What the tests were actually asserting matters here.** A `mountinfo` parser is exactly the
+kind of function whose unit test looks green and whose bug is invisible: the test compared a
+string and the string was wrong in a way nobody typed. Writing "040 is octal, not decimal"
+into the code is cheaper than rediscovering it on a box whose `/` and `/mnt` are the same
+depth.
+
+**`/health/services/{key}` did not exist** when the overview was written, and the overview
+links to it from all eight rows. That is eight dead affordances — the specific thing the
+definition of done forbids — and it was invisible to every gate that had run so far, because
+the gates tested the *server*, and the server was correct. It ships now, and the walkthrough
+route list names it.
+
+Proof:
+
+```
+omnion-health --lib   29 passed; 0 failed          (four product bugs fixed to get here)
+admin tsc --noEmit    exit 0
+node --check walkthrough.cjs   syntax ok
+```
+
+**What this costs the next tick:** the browser pass (`bash scripts/qa/run.sh`) has still not
+run, so the walkthrough leg, the drill-down and the row-click path are unproven in a browser.
+The box is at load 93 with `/mnt/apopic` at 97% and nine sibling writers, and a browser pass is
+the one instrument that wants both. Slice 2 (history, ranges, CSV export) is next and does not
+need it.
+
+**Next:** REQ-014 slice 2 — sample aggregation, 1 h / 24 h / 7 d ranges, CSV export and the
+24 h trend charts on `/health/metrics`.
+
 
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
