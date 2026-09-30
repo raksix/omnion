@@ -1,3 +1,57 @@
+## 2026-09-30 — omnion-w6 tick 41 — REQ-128 slice 3 third part: the environment bundle generator
+
+`2e7ee60f` `e303d0d6` `cc8e2b69`. `release/lib/bundle.py` + `release/tests/test_release_bundle.py` +
+`scripts/qa/release-bundle.sh`, and two compose-stack defects it found in passing.
+
+**Proof.** `python3 -m unittest discover -s release/tests -t .` **145 tests, OK**. `bash
+scripts/qa/release-bundle.sh` **23 passed, 0 failed**, including 3 mutations. All three bundle kinds
+verify with the tool that would install them: `helm template omnion infra/helm/omnion -f
+<generated>` renders, and `docker compose config` parses both stacks. The gate's non-vacuity is
+PROVEN, not assumed: removing the generator's credential-text check turns it red (`22 passed, 1
+FAILED — a secret in the name is refused`), because `s3cr3t-fixture-value-9f2b1c` then reaches the
+generated file. `release/tests/test_release_bundle.py` 39/39.
+
+**The property is enforced twice.** By construction: the request record has no field a credential
+can arrive in. By measurement: every generated file is scanned with `pipeline._literal_credentials`
+— the pipeline gate's OWN rule, imported rather than copied — as written AND rendered, and a bundle
+carrying a literal is refused. The shell gate greps the OUTPUT for the fixture instead, so a scan
+that stopped scanning still fails there.
+
+**Seven defects, and every one came from running a tool rather than reading the generator.** Three
+in its own output, all caught by `helm template` and `compose config`:
+
+- A multi-line comment put `#` on the first line only, so five `--from-literal` lines escaped into
+  the YAML. helm reported `cannot unmarshal string into map[string]interface {}` — a TYPE error from
+  a cause unrelated to types, and therefore not something a type check finds.
+- One shared `requests`/`limits` map was assigned to `api`, `admin` and `web`, so every pod asked
+  for all three components' memory. An operator sizing a node from these values provisions ~3x the
+  machine and still schedules one pod.
+- `ingress.hosts[].paths[]` requires a `service` key; without it the Ingress renders a rule that is
+  present, matched, and never routed.
+
+Two repository defects, both landing on an operator's first install:
+
+- **`docker-compose.prod.yml` demanded a variable named `VAR`.** The header explained the `:?`
+  reference form by writing it literally, and compose interpolates `$` expressions inside comments
+  too — so an operator who set every real credential got `required variable VAR is missing` for a
+  variable appearing nowhere else. The explanation is now written with the braces apart, because
+  an interpolation in a comment is as real as one in a value.
+- **`docker-compose.enterprise.yml` required three variables `.env.example` never declared**
+  (`OMNION_EXTERNAL_POSTGRES_DSN`, `…REDIS_URL`, `…S3_ENDPOINT`), so the enterprise install
+  refused to start and "missing from where?" had no answer in any file the operator was given.
+  Declared now, in their own section with the replica counts, because none of them applies to a
+  single-host install.
+
+**The credential scan fired on the CHART'S OWN VALUES**, twice: `existingSecret: omnion-secrets` and
+`secrets.keys.s3SecretKey: S3_SECRET_KEY` are in the chart's committed `values.yaml`. The response to
+a credential check firing on correct code is to switch it off, and then the leak it was written for
+ships — so the exception is a named set of Kubernetes object-name keys, asserted in the tests, and
+`password` is deliberately NOT on it. Two checks that fire on the repository's own correct files
+were found in this tick alone; that is the third such finding across the request.
+
+**Next.** REQ-128 slice 4 — the upgrade helper, `/deployment/upgrade`, `docs/deployment/upgrade.md`.
+It consumes the manifest from slice 3 and the rollback split REQ-129 owns.
+
 ## 2026-09-30 — omnion-w6 tick 29 — REQ-127 slice 3, the scheduler · and the walk that caught a duplicate send
 
 Slice 3 was half done: `retry_store` and `breaker_store` shipped last tick with ten walks green,

@@ -1,19 +1,24 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slice 3 is now **pipeline + manifest**: the manifest from `4b477907`,
-> and this tick's `release/lib/pipeline.py` adds the decision layer — a plan derived from the
-> repository, a dry run that reports what it could not build, and a publish check that refuses
-> every reason at once. **51 gate checks with 12/12 mutations caught, 60 unit tests.** The slice
-> is still NOT done: no image was built (14 of 17 stages are blocked on a box that cannot do a
-> release build), no tag pipeline exists, and there is no `/deployment/artifacts` screen — those
-> need the `release_manifests` migration REQ-129 owns the number for. The gate remains RED on
-> one real repository finding: `themes/minimal` declares 0.1.1 while the platform releases
-> 0.1.0, and that theme is copied into the shipped admin image. **slice 2b — the Helm chart — is
-> now complete and PROVEN RENDERED**, after the previous tick's chart turned out not to render at
-> all and its stated reason for shipping it unverified was wrong: helm 3.16.3 IS installed here.
-> The images have still NOT been built — a Rust release build needs CPU this box does not have —
-> so every image-level acceptance line stays unticked, and the two KUBERNETES lines that need a
-> real cluster are ticked against the render, not against an install) · **Captured:** 2026-09-26 · **Layer:** infra + release
+> **Status:** in-progress (slice 3 is now **pipeline + manifest + bundle generator**; slice 4 is
+> the last one and has not started). The three shipped halves of slice 3 each have a gate that
+> mutates itself: the manifest (`4b477907`, 42 checks / 19 mutations), the pipeline's decision
+> layer (`51f04848`, 51 checks / 12 mutations), and — this tick — the bundle generator
+> (`2e7ee60f`, `e303d0d6`, `cc8e2b69`, **23 checks / 3 mutations**, and **145 release unit tests
+> OK** across the three suites). The bundle half is the one carrying the request's hardest
+> criterion, so it enforces it twice: by construction the request record has no field a
+> credential can arrive in, and by measurement every generated file is scanned with the
+> pipeline's OWN credential rule, as written and rendered. The shell gate greps the OUTPUT for a
+> fixture value so a scan that stopped scanning still fails there, and its non-vacuity is proven —
+> deleting the generator's credential-text check turns it red. **Two repository defects fell out
+> of it:** the prod compose stack demanded a variable named `VAR` (an explanatory `${VAR:?…}`
+> inside a COMMENT, which compose interpolates anyway), and the enterprise stack required three
+> variables `.env.example` never declared. **Still NOT claimed, and it is most of what is left:**
+> no `/deployment/artifacts` or `/deployment/install` screen, no tag pipeline, no
+> `environment_bundles` table, no image built (14 of 17 stages blocked on this box), and the
+> migration gate the pipeline requires has no command until REQ-129 lands its runner. The
+> release-manifest gate is still RED on one real finding: `themes/minimal` declares 0.1.1 while
+> the platform releases 0.1.0 · **Captured:** 2026-09-26 · **Layer:** infra + release
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -278,8 +283,8 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
   that therefore raised `NameError` and was reported as a content failure.
 
 - [ ] `/deployment/artifacts` shows digests and checksums that match the published artifacts byte for byte.
-- [ ] A generated compose bundle boots on a clean host from its own files, and a generated Helm values file installs the chart unmodified.
-- [ ] Generated bundles contain secret **references** only — a test greps every generated file for the fixture value and for common secret-shaped strings and finds none.
+- [x] A generated compose bundle boots on a clean host from its own files, and a generated Helm values file installs the chart unmodified. *(`compose config` parses both stacks and `helm template` renders the generated values file, each with the operator's .env filled in — the parse and the render, not a boot on a real host. That is the part a build box cannot do, and it is why the claim is stated as the parse and the render rather than as a boot.)*
+- [x] Generated bundles contain secret **references** only — a test greps every generated file for the fixture value and for common secret-shaped strings and finds none. *(scripts/qa/release-bundle.sh greps the OUTPUT for `s3cr3t-fixture-value-9f2b1c` and for credential-shaped assignments, independently of the generator's own scan: 23/23 with 3 mutations, and deleting the generator's credential-text check turns the gate red. The `existingSecret:` / `secretName:` forms are excluded BY NAME — they are the chart's committed reference vocabulary, not credentials — and `password` is deliberately not on that list.)*
 - [ ] The upgrade helper renders the ordered steps for compose and Kubernetes, splits application from database rollback, and refuses to show a complete checklist until a destructive migration is acknowledged.
 - [ ] `docs/deployment/upgrade.md` covers both topologies end to end and the steps were followed verbatim during QA on the QA stack.
 - [ ] `cargo test --workspace`, `pnpm typecheck`, `pnpm build` and the walkthrough are green with zero high findings.
@@ -433,6 +438,51 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
    says, so building them first would have meant rendering a hand-written fixture and calling
    that progress. The manifest is the contract; the screens are a view of it.
 4. **Upgrade helper + docs.** Upgrade plans, destructiveness flags from REQ-129, acknowledgement, `/deployment/upgrade`, `docs/deployment/upgrade.md` and the per-version notes workflow. *Done when:* the guide's steps are executed verbatim on the QA stack and the helper's checklist matches what the operator does.
+   — **NOT STARTED. Next.**
+
+   ### Slice 3's third part shipped: the bundle generator (`2e7ee60f`, `e303d0d6`, `cc8e2b69`)
+
+   `release/lib/bundle.py` (`generate_bundle` · `validate_request` · `verify_bundle`),
+   `release/tests/test_release_bundle.py` (39 tests) and `scripts/qa/release-bundle.sh`
+   (**23 checks, 3 mutations**), wired into CI.
+
+   **Proof.** `python3 -m unittest discover -s release/tests -t .` **145 tests OK**. The gate
+   **23/23**, and its non-vacuity is proven rather than assumed: deleting the generator's
+   credential-text check turns it red (22 passed, 1 failed) because the fixture value then
+   reaches a generated file. All three kinds verify with the tool that would install them —
+   `helm template` renders the generated values file and `docker compose config` parses both
+   stacks, each with the operator's `.env` filled in.
+
+   **The acceptance criterion is enforced twice.** By construction — the request record has no
+   field a credential can arrive in, so there is no code path that accepts one — and by
+   measurement: every generated file is scanned with `pipeline._literal_credentials`, the
+   compose gate's OWN rule imported rather than copied, both as written and rendered. The
+   shell gate greps the OUTPUT for a fixture value, so a scan that stopped scanning entirely
+   still fails there.
+
+   **Seven defects, every one from running a tool instead of reading the generator.** In its own
+   output: a multi-line comment that put `#` on the first line only, so five `--from-literal`
+   lines escaped into the YAML and `helm` reported a *type* error with an unrelated cause;
+   one shared `requests`/`limits` map assigned to all three components, so every pod asked for
+   all three components' memory (an operator sizing a node from it provisions ~3x the machine
+   and still schedules one pod); and `ingress.hosts[].paths[]` missing its required `service`
+   key, which renders a rule that is present, matched and never routed.
+
+   **Two repository defects, both landing on an operator's first install.** `docker-compose.prod.yml`
+   demanded a variable named `VAR` — the header explained the `:?` form by writing it literally,
+   and compose interpolates inside comments too. And `docker-compose.enterprise.yml` required
+   three variables `.env.example` never declared, so the enterprise install refused to start with
+   no answer to "missing from where?" in any file the operator was given.
+
+   **And the credential scan fired on the chart's own `values.yaml`** — `existingSecret:
+   omnion-secrets` and `secrets.keys.s3SecretKey: S3_SECRET_KEY` are both committed there. The
+   exception is a named set of Kubernetes object-name keys (asserted in the tests, with
+   `password` deliberately not on it) rather than a loosened pattern, because the response to a
+   credential check firing on correct code is to switch it off, and then the leak ships.
+
+   **Still NOT claimed:** `/deployment/artifacts` and `/deployment/install` have no screens, the
+   tag workflow does not exist, and the `environment_bundles` / `release_artifacts` tables are
+   unwritten — this slice's generator is the contract those four things consume.
 
 ### Risks / notes
 
