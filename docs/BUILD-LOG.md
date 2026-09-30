@@ -7522,3 +7522,90 @@ mine to clear.
 question tick 75 left: `GET /api/v1/environments` through the panel with the walkthrough's own
 session cookie — a `000` answers "wrong origin", a `401` answers "the request arrived and was
 refused" and moves the question to the session.
+
+## Tick 77 — wave5 (2026-09-30 08:09–09:25 UTC)
+
+**What.** Two things, and the second one was the tick.
+
+1. `04bc7e73` — REQ-011's unticked box, *"Filters, empty, loading and error states exist on
+   every screen; the rows shown match the API counts"*, had **no instrument**. `runCdnPurgeDepth`
+   captured the header sentence into `steps.pageTotal` and `runCdnRulesDepth` counted rows into
+   `steps.rows`, and neither compared either to the API. The reason recorded against that box
+   since tick 22 was "blocked on the box" — the tick-21 pass reporting `0 elements` — which is a
+   far more comfortable blocker than "nobody built the measurement", and it sent 55 ticks looking
+   at the harness's flakiness instead of at the harness. The measurement now exists: two
+   deterministic hooks (`data-cdn-purge-count`, `data-cdn-rule-count`) so the sentence is read by
+   identity rather than by the positional `header p`; a three-way comparison of DOM rows, the
+   API's `total` and the rendered sentence, **refused when the table holds a single row** (where
+   `Showing N of N` is true by construction and a pager that never pages is indistinguishable
+   from a table with nothing to page through); a deliberately *different* assertion for the
+   unpaged rules screen, whose failure mode is a silently dropped rule that a screenshot cannot
+   see; and a drive of the filtered empty state no pass had reached — the failed fixture is a
+   `url` purge, so `status=failed AND kind=tag` empties the table while the unfiltered one has
+   rows, which is the only way to tell "nothing matches this filter" from "no purges yet".
+
+2. `668b4b9b` — **the `QA_ONLY` scope flag was never read.** Tick 76 recorded `71d55cb` as
+   closing this defect; it closed the half where depth passes ran outside the scope, and left
+   the flag itself broken. `run.sh` sends `--only="$QA_ONLY"`; `arg()` only understood
+   `--only VALUE`. The inline form matched no argv entry, `arg` returned its fallback,
+   `ONLY_ALL` stayed `true`, and **every scoped pass walked all 54 routes** while its
+   screenshots, its click list and its summary `scope` field all claimed the narrow coverage.
+   The end-of-pass guard — *"`--only` matched no route and no depth pass: this pass proved
+   nothing"* — could not fire, because its entire premise is a scope that was never applied.
+
+   The evidence that settled it did not come from the log. The pass printed routes I had not
+   scoped, and the log could be argued three ways (stale binary, bad name, mis-parse);
+   `/proc/<pid>/cmdline` showed the inline form going in exactly as `run.sh` builds it, and the
+   absence of `focused pass:` in the output confirmed `ONLY_ALL`. Two readings, one conclusion.
+
+   `scripts/qa/arg-test.sh` is new: 6/6 against the fix, **4/6 and exit 1 against the old
+   parser**, on exactly the two broken cases. It extracts `arg()` from the real source with
+   `sed` rather than restating it — a test carrying its own copy of the logic passes against a
+   copy that agrees with it, which is now the third file in three ticks to have this shape
+   (`qa-slot-parse-test.sh`, tick 75's reaper suite, this one).
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| `bash -n scripts/qa/arg-test.sh` | clean |
+| `bash scripts/qa/arg-test.sh` | **6/6** |
+| the same suite against the pre-fix `arg()` | **FAILED 2 of 6**, exit 1 — the defect it exists for |
+| `pnpm typecheck` | **2/2** packages, clean |
+| `cargo test -p omnion-cdn --lib --quiet` | green |
+| focused QA pass, tenant scope | `focused pass: 1/54 routes` · **7 walked, 0 unmatched** · 32 clicks · 59 shots |
+
+**The 44 high findings, read as a cause rather than a number.** The counter said 44; the
+grouping says three causes, none of them the product:
+
+- **~20 × 401** on `/api/v1/environments` and `/notifications*` — the harness's *own* refusals.
+  `expectRefusal` provokes a 403 to prove a 403, and the browser logs the refused request as a
+  finding. A pass that proves refusals reports refusals.
+- **1 × 409** on `/invitations` — the walk invites the same address twice on purpose, and the
+  duplicate refusal is the acceptance criterion.
+- **6 × `net::ERR_INSUFFICIENT_RESOURCES`** on `/_next/static/chunks/*`, and the **1 × 500** on
+  `/organizations/{id}/members` that followed it — the box. `free -g` during the pass: **32 G
+  RAM, 0 free, 25 G of 32 G swap used**, six writers compiling at once. Chromium could not fetch
+  a JS chunk, and the 500 is the admin *dev server* dying of the same starvation: the API never
+  logged that request at all and every `/organizations/...` page answered 200. A request the
+  service never received is the layer in front of it failing, not a handler panicking.
+
+So one real harness defect (the scope flag) and **zero product defects** in this pass. Counting
+first would have sent the tick to audit 44 things; the number was an argument about the box.
+
+**Tick 76's open question, answered.** `GET /api/v1/environments` through the panel answers
+**401**, not `000` — so the same-origin rewrite is right and the question moves to the session.
+Worth recording *where* the request comes from: the `environments` depth pass was out of scope
+and `/environments` was not a route asked for, yet the call fired on every page. That is the
+**sidebar prefetch**, so the 401 is a finding about the sidebar asking a question the QA account
+cannot answer — out of this wave.
+
+**Disk / memory.** `/` was at 99% (2.1 G free); 900 M of it was this worktree's own
+`/root/w5target` `incremental` + `build`, verified cold by three tests (0 open fds, no live
+cargo, no writes in 30 min outside this writer's own 07:48 fingerprint) with the binary kept.
+
+**Next.** (a) REQ-011's two boxes, on a pass that is actually scoped. (b) REQ-005's
+`cargo test --workspace` box, which is the only one left on that request. (c) Box note for the
+curator: at 0 free RAM and 25 G swap, `QA_SLOTS` and per-writer cargo concurrency are now the
+binding constraint on every pass — above any single wave.
