@@ -529,10 +529,18 @@ jobs:
           python-version: "3.12"
       - name: Manifest unit tests
         run: python3 release/tests/test_release_manifest.py
+      - name: Release pipeline unit tests
+        run: python3 release/tests/test_release_pipeline.py
       # The gate mutates the manifest nineteen ways and requires every one to be caught. A
       # green run therefore means two things at once: the builder works, and the checks are
       # capable of failing.
       - name: Manifest gate (with mutations)
         run: bash scripts/qa/release-manifest.sh
+      # The pipeline's decision layer: a dry run that reports what it could not build, and
+      # a publish check that refuses. It runs here for the same reason as the gate above —
+      # the refusals are properties of committed files, findable on a commit, and only
+      # findable after the fact once a tag has been pushed under a name people trust.
+      - name: Release pipeline gate (with mutations)
+        run: bash scripts/qa/release-pipeline.sh
       - name: Chart renders and lints
         run: bash scripts/qa/helm-chart.sh
