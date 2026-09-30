@@ -1790,7 +1790,11 @@ pub fn router(state: AppState) -> Router {
         .merge(accounting_expenses_read)
         .merge(accounting_expenses_create)
         .merge(accounting_expenses_update)
-        .merge(accounting_expenses_decide);
+        .merge(accounting_expenses_decide)
+        // **This merge is the route.** Without it the router is built, compiles, and every
+        // request answers 404 -- a walk that only checked "the handler exists" would call that
+        // done. It is the one line that made a green build a usable endpoint.
+        .merge(accounting_reports);
 
     // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
     // stock rollup and the append-only ledger.
