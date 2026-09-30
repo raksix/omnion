@@ -83,14 +83,26 @@ impl Harness {
         self.db.pool()
     }
 
-    /// Dropped explicitly, and `mem::forget`ed after.
+    /// Dropped explicitly, and it is the *only* cleanup there is.
     ///
     /// **A panicking walk that skips `dispose` leaves its database behind, and
     /// this box shares a connection pool with nine sibling writers.** Each leaked
     /// database is a directory of files nothing reclaims, and the walks stop
     /// being runnable once the disk fills. `close().await` is what releases the
-    /// pool; the `forget` stops the later `Drop` from running against a
-    /// moved-from handle.
+    /// pool.
+    ///
+    /// There is deliberately **no `mem::forget` after the call, and there never
+    /// should be one.** This signature takes `self`, so the call *moves* the
+    /// harness; by the time it returns there is no value left to forget, and the
+    /// `std::mem::forget(harness)` these walks used to end with was a
+    /// use-after-move — eleven of them, in a file that was committed that way
+    /// because every gate that had run (the health *crate's* unit tests, the
+    /// admin's `tsc`, `node --check`) puts this test binary in nobody's
+    /// dependency graph. It is recorded here because the original comment gave a
+    /// confident reason for it ("stops the later `Drop` from running against a
+    /// moved-from handle") and the reason is false: there is no later `Drop` of
+    /// that value, because the value was consumed. A plausible-sounding
+    /// justification is how a line like that survives review twice.
     async fn dispose(self) {
         self.db.pool().close().await;
         let database = self.database;
@@ -219,7 +231,6 @@ async fn every_table_a_probe_reads_really_exists() {
     assert_eq!(settings, 1, "health_settings is a singleton and ships with one row");
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -261,7 +272,6 @@ async fn a_fresh_database_has_every_service_row_and_no_samples() {
     assert_eq!(stored, 0, "nothing has been sampled yet");
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -328,7 +338,6 @@ async fn an_unreachable_dependency_is_down_and_the_row_still_exists() {
     );
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -364,7 +373,6 @@ async fn the_queue_probe_reports_zero_on_an_empty_installation() {
     assert_eq!(search.detail["documents"], 0);
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -430,7 +438,6 @@ async fn workers_are_unknown_until_one_registers_a_heartbeat() {
     assert_eq!(recovered.detail["alive"], 2);
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -502,7 +509,6 @@ async fn a_run_records_samples_that_agree_with_the_rows() {
     }
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -572,7 +578,6 @@ async fn retention_prunes_old_samples_and_keeps_the_incident_history() {
     );
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -617,7 +622,6 @@ async fn the_store_refuses_a_sample_it_could_not_honestly_render() {
     assert_eq!(stored, 0, "neither refusal wrote a row");
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -655,8 +659,12 @@ async fn a_whole_run_is_written_atomically() {
         .expect("the count must be readable");
     assert_eq!(stored, 0, "validation happens before the transaction opens");
 
-    // The same batch without the bad sample is written.
-    omnion_health::record_run(harness.pool(), &[good, good])
+    // The same batch without the bad sample is written — two rows, so the count
+    // proves the *whole* batch landed rather than that the write happened once.
+    // `good` is cloned rather than moved twice: `NewSample` owns a `String` and a
+    // `serde_json::Value`, so `&[good, good]` moves the same value into the array
+    // twice and the test would not compile.
+    omnion_health::record_run(harness.pool(), &[good.clone(), good])
         .await
         .expect("a clean batch must be written");
     let stored: i64 = sqlx::query_scalar("select count(*)::bigint from health_samples")
@@ -666,7 +674,6 @@ async fn a_whole_run_is_written_atomically() {
     assert_eq!(stored, 2);
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 #[tokio::test]
@@ -709,7 +716,6 @@ async fn a_series_comes_back_oldest_first() {
     assert!(outside.is_empty());
 
     harness.dispose().await;
-    std::mem::forget(harness);
 }
 
 // ---------------------------------------------------------------------------------------------

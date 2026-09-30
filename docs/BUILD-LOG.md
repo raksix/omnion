@@ -5440,6 +5440,94 @@ not by a missing cleanup, and the next run found zero of them.
 as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
 this box until then** — treat a `53100` as environmental and read the assertion line above it for
 the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
+
+## Tick 78 — the box that said "when deliveries exist" (and last tick they started to)
+
+REQ-021's drawer box had been unticked since the request was written, with a note that read *"the
+per-channel delivery rows are slice 2's, when deliveries exist"*. Tick 77 made them exist. The note
+expired and the gap became real: `GET /api/v1/notifications/{id}` promised "one notification, **with
+its delivery rows**" in its own doc comment and returned a bare notification — so the platform knew
+an e-mail had been given up on, and the person waiting for it was told nothing.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `c3394bb5` | `store::deliveries` + `NotificationBody.deliveries`, filled after the ownership check |
+| `30c27d12` | `notification_delivery_reader` — 4 walks over live PostgreSQL |
+| `326061ee` | the drawer's Delivery section; one channel vocabulary for three screens |
+| `a7b94201` | the walkthrough leg for that section |
+
+**Proof**
+
+```
+notification_delivery_reader   4 passed; 0 failed  (26.47s, live PostgreSQL)
+notification_delivery          8 passed; 0 failed  (49.12s)  ← the runner's suite, unchanged
+omnion-notifications --lib    90 passed; 0 failed
+admin tsc -p tsconfig --noEmit  exit 0
+node --check walkthrough.cjs   syntax ok
+```
+
+**The access-control shape is the part worth keeping.** `notification_deliveries` is keyed by
+`notification_id` and carries **no `user_id`** — nothing in that query can be scoped to a caller, so
+the ownership read is the entire check. A delivery read placed *before* it would answer a populated
+channel list for somebody else's notification, which turns the route's `404` into an existence
+oracle. The route reads the notification first and only then its deliveries, and the walk asserts
+the *mechanism* rather than the outcome: the stranger resolves nothing **and** the owner still gets
+rows through the same function, because a read that returned nothing for everybody would pass the
+stranger leg while hiding the entire feature.
+
+**Three of the four walks caught this tick's own wrong assumptions before the product did.** Each
+correction is now written into the walk, because the next tick would otherwise re-make them:
+
+1. `on conflict (channel)` — the uniqueness is `(organization_id, channel)`, so the fixture asserted
+   a constraint the schema does not have (`42P10`). It creates the organization now.
+2. "`in_app` is written first" — it is not: `enqueue` loops the *enabled* channels and appends
+   `in_app` after. And every row in one call shares a single `now()`, so the chronological key ties
+   and the alphabetical tiebreak decides. The walk now asserts **stability** (same notification, two
+   reads, same order), which is the property the drawer needs and the only one a missing
+   `order by` fails — on the *second* read; the first always looks right.
+3. "the in-app row is `sent` because enqueueing is delivering it" — `enqueue` writes it `pending` and
+   a tick only makes it `sent` by draining it through a transport. The walk registers the real
+   `InAppTransport` next to the refusing e-mail one.
+
+**What this costs the next tick:** the browser pass (`bash scripts/qa/run.sh`) has still not run, so
+the walkthrough leg and the drawer's rendering are unproven in a browser. The QA slot queue is
+shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for this tick.
+
+**Next:** REQ-021's remaining boxes are the two unproven keyboard legs and the browser pass, both of
+which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
+order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
+all waiting on the same missing instrument.
+## Tick 77 addendum — the box ran out of disk mid-verification (named, not worked around)
+
+The 8/8 green run above is real and was measured. Everything red *after* it, in this tick and
+across two re-runs, is the same environmental failure and no product defect:
+
+```
+could not create directory "base/12250615": No space left on device
+code 53100, could not extend file "base/12245557/12250419"
+```
+
+`df` at that moment:
+
+| Filesystem | Size | Avail | Use% |
+|---|---|---|---|
+| `/` (PostgreSQL's `data_directory` = `/var/lib/postgresql/16/main`) | 123G | 3.0G | **98%** |
+| `/mnt/apopic` (all ten writers' worktrees and `target`s) | 60G | **0** | **100%** |
+
+**This is shared, so it is reported and not worked around.** Reclaiming it means deleting build
+output that nine sibling writers are compiling *right now*; the loop discipline is explicit that
+a writer may only reclaim its own `target`, and this tick reclaimed only its own
+`target/debug/incremental` (58M, after the three checks: no open file descriptors, no write in
+the last 20 minutes, its own directory). The 14 orphaned `omnion_notifdel_*` scratch databases
+are already gone — the walks do drop them; the ones that leaked were killed by the box mid-run,
+not by a missing cleanup, and the next run found zero of them.
+
+**What this costs the next tick, stated plainly:** `notification_delivery` is green on the code
+as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
+this box until then** — treat a `53100` as environmental and read the assertion line above it for
+the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
 ## 2026-09-30 — Tick 76 · REQ-010, the audit criterion (the entry that was never missing, and the one that was)
 
 REQ-010 is the first request in wave order that is not `done`, and it had two open boxes. One of
@@ -9527,36 +9615,6 @@ rendering therefore remains un-observed, and no line here claims otherwise.
 refusals still have no table on this branch and stay named rather than ticked. `omnion-workflows --lib`
 was still linking under load 92 when this entry was written — the gate, the sibling regression gate and
 `tsc` are the proof quoted above; the lib count is recorded in the ledger, not claimed here.
-## Tick 77 addendum — the box ran out of disk mid-verification (named, not worked around)
-
-The 8/8 green run above is real and was measured. Everything red *after* it, in this tick and
-across two re-runs, is the same environmental failure and no product defect:
-
-```
-could not create directory "base/12250615": No space left on device
-code 53100, could not extend file "base/12245557/12250419"
-```
-
-`df` at that moment:
-
-| Filesystem | Size | Avail | Use% |
-|---|---|---|---|
-| `/` (PostgreSQL's `data_directory` = `/var/lib/postgresql/16/main`) | 123G | 3.0G | **98%** |
-| `/mnt/apopic` (all ten writers' worktrees and `target`s) | 60G | **0** | **100%** |
-
-**This is shared, so it is reported and not worked around.** Reclaiming it means deleting build
-output that nine sibling writers are compiling *right now*; the loop discipline is explicit that
-a writer may only reclaim its own `target`, and this tick reclaimed only its own
-`target/debug/incremental` (58M, after the three checks: no open file descriptors, no write in
-the last 20 minutes, its own directory). The 14 orphaned `omnion_notifdel_*` scratch databases
-are already gone — the walks do drop them; the ones that leaked were killed by the box mid-run,
-not by a missing cleanup, and the next run found zero of them.
-
-**What this costs the next tick, stated plainly:** `notification_delivery` is green on the code
-as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
-this box until then** — treat a `53100` as environmental and read the assertion line above it for
-the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
-
 ## Tick 78 — the box that said "when deliveries exist" (and last tick they started to)
 
 REQ-021's drawer box had been unticked since the request was written, with a note that read *"the
@@ -9856,3 +9914,234 @@ API build is left to the next tick rather than claimed here.
 
 **Next.** The same detector over `apps/admin` (TypeScript) is the obvious extension — the same
 signature defect in a language this one has never swept.
+## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
+
+feat(health): the service detail page draws a 24 h trend. fix(health): the health
+walks did not compile, and had been committed that way.
+
+**Slice 2 was one screen short, and it was short in the way that looks the least
+broken.** The request names the drill-down's contents: "current state, checks table,
+**a 24 h trend chart**, recent failures". The screen listed current values in four
+columns and drew no line. Nothing about it errored — the route resolved, the values
+were right, the heading was right — and "a table with no chart in it" is not a
+defect any compiler, type checker or linter in this workspace has an opinion about.
+
+Three things made it a chart rather than a decoration:
+
+| | |
+|---|---|
+| one window per response | `SERVICE_TREND_RANGE` is read once, before the loop, so every row covers the same 24 h. A per-row `now()` gives row one a fraction of a second more than row nine, and two lines on one screen that end at different instants cannot be compared. |
+| an empty window speaks | a row with no samples draws "no samples in the last 24 h", because an empty box on a numbers screen reads as a chart that failed to load. |
+| one point draws a dot | a polyline through one point has zero length and renders as nothing at all — which the table reads as "no data" on a row that has one. |
+
+**The sparkline was extracted, not copied.** Both screens now assert
+`data-health-spark`, and "what does an unmeasured window look like" is one answer or
+two. A second copy is how the metric table learns to draw a dot while the drill-down
+keeps drawing nothing — and *nothing* is what the walk reads as a missing chart. It
+gained a `label` prop in the same move: twelve rows all named "sparkline" is a screen
+a screen reader cannot be read from.
+
+**`/health/samples` stopped taking `hours`.** It was the last endpoint in the centre
+still clamping an hour count — the exact defect slice 2 removed from `/health/metrics`.
+A caller asking for 30 days got 7 with a `200` and no warning, drew the wrong chart,
+and had no way to tell. It now goes through the same `Range::parse`, so the refusal
+is a property of the *vocabulary* rather than of one handler, and `fetchHealthSamples`
+moved with it: `hours=24` and `range=24h` are one window with two spellings, and the
+second spelling travels into the CSV filename.
+
+## The other half of this tick: 14 errors, committed, invisible to every gate
+
+`cargo check -p omnion-api --tests` reported **fourteen compile errors** across the
+two health walk files. All fourteen were committed. Not one gate had ever caught
+them, and each gate was *correct about the thing it checked*:
+
+| gate | what it compiles |
+|---|---|
+| `cargo test -p omnion-health --lib` | the health **crate** — not `apps/api`, and not its test binaries |
+| `pnpm typecheck` (admin) | TypeScript — cannot see Rust |
+| `node --check walkthrough.cjs` | the walkthrough — does not parse `.rs` |
+| `tsc` on a screen | the admin's JSX — cannot see the route that serves it |
+
+**Not one of them puts an `apps/api` test binary in a dependency graph.** Tick 80
+wrote that rule into the ledger after finding the mirror-image failure in
+`health_panel.rs`; the rule was in the ledger, in my own words, when it happened
+again on the very next tick. That is the part worth writing down: reading a lesson
+is not the same as the lesson being in force, and the only thing that put
+`apps/api`'s tests in the graph this time was deliberately reaching for
+`--tests`.
+
+**Eleven of the fourteen were the same line, in the same shape.**
+
+```rust
+harness.dispose().await;          // dispose(self) — takes the harness BY VALUE
+std::mem::forget(harness);        // …and this moves it again
+```
+
+`dispose(self)` consumes the harness, so the call above *moves* it and there is
+nothing left to forget — E0382, eleven times. The comment above the method gave a
+confident reason for the `forget`: "stops the later `Drop` from running against a
+moved-from handle". **That reason is false.** There is no later `Drop` of that
+value, because the value was consumed by the call two lines up. The same comment
+had already been copied into `notification_delivery_reader.rs`, which received the
+justification without the code — a file that reads as though the hazard is real,
+which is how the next writer adds it back.
+
+Both comments now record why there is deliberately no `forget`, because a
+plausible-sounding story is what carried this through two reviews and four ticks.
+The rule that falls out of it: **a comment that explains a line's purpose is a
+claim to verify, and the ones that sound most confident are the ones nobody reads
+closely.**
+
+The other three: a stray `await` on a non-`await` expression; an import list naming
+the crate's own root (`use omnion_health::{MetricSummary, Range, omnion_health};` —
+there is no such item); and `&[good, good]`, which moves the same non-`Copy`
+`NewSample` into an array twice.
+
+**Proof**
+
+```
+cargo check -p omnion-api --tests   clean   (was 14 errors)
+cargo test -p omnion-health --lib    40 passed; 0 failed   (0.27s)
+admin tsc -p tsconfig.json --noEmit  exit 0
+node --check walkthrough.cjs        syntax ok
+```
+
+**What this costs the next tick, stated plainly.** The `health_history` and
+`health_probes` suites have still **not been run** — they now compile, which is a
+different and much lower claim. An `omnion-api` test binary needs a ~30-minute link
+at the current load average (85, four sibling cargo trees), and the browser pass
+(`bash scripts/qa/run.sh`) has still not run at all: the QA slot is held by a sibling
+writer and `/mnt/apopic` is at 87%. So slice 2's screen behaviour rests on the walk
+being **written and wired**, not on a rendered page, and the REQ says so.
+
+**Next:** run `health_history` and `health_probes` when a slot frees, then
+`bash scripts/qa/run.sh` — which closes slice 2's last box and the walkthrough box
+at the same time. Then slice 3 (incidents + thresholds), whose schema
+(`health_incidents`, `health_settings`) has shipped empty since slice 1 and whose
+empty-only screen the migration comment explicitly refuses to build.
+
+## Tick 78 — the box that said "when deliveries exist" (and last tick they started to)
+
+REQ-021's drawer box had been unticked since the request was written, with a note that read *"the
+per-channel delivery rows are slice 2's, when deliveries exist"*. Tick 77 made them exist. The note
+expired and the gap became real: `GET /api/v1/notifications/{id}` promised "one notification, **with
+its delivery rows**" in its own doc comment and returned a bare notification — so the platform knew
+an e-mail had been given up on, and the person waiting for it was told nothing.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `c3394bb5` | `store::deliveries` + `NotificationBody.deliveries`, filled after the ownership check |
+| `30c27d12` | `notification_delivery_reader` — 4 walks over live PostgreSQL |
+| `326061ee` | the drawer's Delivery section; one channel vocabulary for three screens |
+| `a7b94201` | the walkthrough leg for that section |
+
+**Proof**
+
+```
+notification_delivery_reader   4 passed; 0 failed  (26.47s, live PostgreSQL)
+notification_delivery          8 passed; 0 failed  (49.12s)  ← the runner's suite, unchanged
+omnion-notifications --lib    90 passed; 0 failed
+admin tsc -p tsconfig --noEmit  exit 0
+node --check walkthrough.cjs   syntax ok
+```
+
+**The access-control shape is the part worth keeping.** `notification_deliveries` is keyed by
+`notification_id` and carries **no `user_id`** — nothing in that query can be scoped to a caller, so
+the ownership read is the entire check. A delivery read placed *before* it would answer a populated
+channel list for somebody else's notification, which turns the route's `404` into an existence
+oracle. The route reads the notification first and only then its deliveries, and the walk asserts
+the *mechanism* rather than the outcome: the stranger resolves nothing **and** the owner still gets
+rows through the same function, because a read that returned nothing for everybody would pass the
+stranger leg while hiding the entire feature.
+
+**Three of the four walks caught this tick's own wrong assumptions before the product did.** Each
+correction is now written into the walk, because the next tick would otherwise re-make them:
+
+1. `on conflict (channel)` — the uniqueness is `(organization_id, channel)`, so the fixture asserted
+   a constraint the schema does not have (`42P10`). It creates the organization now.
+2. "`in_app` is written first" — it is not: `enqueue` loops the *enabled* channels and appends
+   `in_app` after. And every row in one call shares a single `now()`, so the chronological key ties
+   and the alphabetical tiebreak decides. The walk now asserts **stability** (same notification, two
+   reads, same order), which is the property the drawer needs and the only one a missing
+   `order by` fails — on the *second* read; the first always looks right.
+3. "the in-app row is `sent` because enqueueing is delivering it" — `enqueue` writes it `pending` and
+   a tick only makes it `sent` by draining it through a transport. The walk registers the real
+   `InAppTransport` next to the refusing e-mail one.
+
+**What this costs the next tick:** the browser pass (`bash scripts/qa/run.sh`) has still not run, so
+the walkthrough leg and the drawer's rendering are unproven in a browser. The QA slot queue is
+shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for this tick.
+
+**Next:** REQ-021's remaining boxes are the two unproven keyboard legs and the browser pass, both of
+which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
+order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
+all waiting on the same missing instrument.
+
+## Tick 82 — the constraint that made the incidents table unusable, and the one below it
+
+The tree arrived **dirty**: 2 080 uncommitted lines of slice 3 (`incidents.rs`, `health_incidents.rs`,
+`0190`) with two wiring lines and no test. Half-written work is the state this loop is worst at,
+because a tick that starts by writing something new leaves two half-written things. So the tick
+spent its first act finishing that.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `f572dbde` | `crates/health::incidents`, the routes, `/health/incidents` + `/health/settings`, the walks |
+| this tick | `0191` — two database constraints that were wrong, found by the walk |
+
+**The two bugs, and they are the same bug twice.**
+
+`0188` shipped `health_incidents` with
+
+```sql
+check ((resolved_at is null) = (to_state = 'healthy'))
+```
+
+under the comment *"A run that is still open has no end; a resolved one always does."* The comment
+is true and the expression is its **inverse**: read literally, an open row must have
+`to_state = 'healthy'` and a resolved row must have anything *but* `healthy`. Between them the
+constraint makes the table unable to store the one thing it exists to store — the first
+`insert` of an open incident fails `23514`.
+
+The second is `0190`'s `check (warn < crit)`, unconditional, while `Threshold::classify` reads a
+`below` pair as `value <= crit` / `value <= warn` — i.e. it *expects* `warn > crit`. Every valid
+`below` threshold in the product ("at least 2 healthy workers") is refused, and the inverted ones
+are accepted. `Threshold::new` had the same defect in Rust, with a message that said "must be
+below" regardless of direction.
+
+**Why four green gates could not see either one.** A `check` constraint is not a type error, so
+`cargo check` is blind to it by construction. And both tables had **no writer**: slices 1 and 2
+are probes and samples, and nothing had ever inserted a row here. A constraint on a table with no
+writer is a comment with `check` in front of it. The tick that writes the first row is the tick
+that finds out what the table allows — an argument for writing the row *earlier*, not for
+trusting the comment next to it.
+
+**A third bug the walk found, in the code rather than the schema.** `record_breach` took
+`crit_limit` from `(select crit from health_thresholds where metric = $1)`, which is `NULL` for an
+unconfigured metric, and the column is `not null` — so the call died on `23502` and the helpful
+"has no threshold pair" message in its own `.ok_or_else` **could never fire**, because the row was
+never coming back. The threshold is now read *before* the insert.
+
+**The fixtures were wrong too, and that is worth writing down.** `acknowledged_by` and
+`created_by` are foreign keys to `users`, and the walk passed `Uuid::new_v4()`. The failure is a
+`23503` naming a constraint nothing in the test is about, so the obvious reading — "the window
+insert is broken" — points away from the cause. A walk that invents an actor is also asserting
+something the product deliberately forbids: acknowledgement whose actor points at no row is the
+un-evidenced acknowledgement the request rules out.
+
+**Proof**
+
+```
+cargo check -p omnion-api --tests         clean
+tsc -p tsconfig.json --noEmit             exit 0
+node --check scripts/qa/walkthrough.cjs   syntax ok
+health_incidents                          8 walks, live PostgreSQL
+```
+
+**Next:** the browser pass (`bash scripts/qa/run.sh`) still has not run on this box, and it is now
+the only thing standing between REQ-014 and slice 4. Both new screens have depth passes written
+and registered; they have not been executed.
