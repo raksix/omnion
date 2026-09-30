@@ -5901,3 +5901,520 @@ minutes. Reclaiming only my own `/root/w7target` stale `rlib`/`rmeta` duplicates
 artifact a live process held open — freed 0.66 GB and brought it to 98 %. A sibling's or a live
 QA process's target was never touched, and the `ai_tool_execution` binary the run was using was
 held out of the sweep by an `lsof` check.
+
+## Tick 73 · REQ-013 slice 2c — the restore you can still stop
+
+**What.** The one acceptance criterion REQ-013 had been carrying since slice 2b is closed:
+*aborting before the import starts cancels cleanly and leaves the platform untouched.* Slice
+2b's answer — a restore inside the `POST`, no cancel, and a panel that says why — was correct
+and **incomplete**, and the criterion said so: *"a genuine abort belongs with a queued
+restore"*. This is the queued restore.
+
+`backup_restore_jobs` (migration `0177`), `crates/backup/src/restore_jobs.rs`,
+`apps/api/src/routes/restore_jobs.rs`, `apps/api/src/restore_job_runner.rs`, and a
+**Queue it (can be stopped)** control beside the immediate one. The immediate restore keeps
+its refusal and keeps its explanation; the queued one is the shape with a real window, and the
+window is **before the first write**.
+
+**The three decisions, and the shortcut each one refuses.**
+
+* **The window is a state the schema names.** `queued` is the only cancellable status and
+  `cancellable` is a **field on the wire**, not a derivation the panel makes — a panel that
+  re-derives it is one edit away from offering Stop on a running restore, which would discard
+  the safety backup the operator was told they had.
+* **A cancel is an intent, then a transition.** `cancel_requested` is a flag, because a cancel
+  can land while the worker is reading the index and a `status = 'aborted'` write *then* is a
+  lie the constraint refuses. The worker is the only thing that may turn the flag into an
+  abort. The cancel route settles a still-queued row **synchronously**; leaving it to the
+  next tick shows a Stop control on a row the operator already stopped, and a control that
+  appears not to work is worse than none.
+* **A job nobody claims is `aborted`, not `failed`.** `failed` requires a start by the
+  schema's own constraint, and loosening it would stop `failed` meaning what it says. The
+  state that already meant "stopped before the first write" is the honest one.
+
+**The defect the walk found, which reading could not have.** `0177` shipped with **two
+constraints that contradicted each other**: the main status check required `started_at IS NOT
+NULL` for `aborted`, and the abort-specific check required `IS NULL`. A worker *does* stamp
+`started_at` when it claims a job and may then find the flag, so the real transition needs the
+column cleared — and **every cancellation would have been refused by the database.** Nothing
+else in the platform writes that table, so the only place it could ever surface is the first
+cancel in a walk, and a walk that did not cancel would have shipped it. The two are now one
+consistent pair, with `aborted` the one terminal state permitted to have no start.
+
+**The second defect, in my own first draft of the worker.** It read the queue through the
+**tenant-scoped** reader with `None`, and `is not distinct from null` matches rows whose
+`organization_id` *is* null — the platform's own jobs. Every tenant's restore would have sat
+`queued` for ever while the tick reported a clean pass. A background worker is *supposed* to
+cross tenants, and the scoping that protects a request is exactly what hides a tenant's work
+from the thing that has to perform it; `all_queued_restore_jobs` and `queued_restore_jobs` are
+now two functions with two names, so the unsafe form cannot be reached by passing the wrong
+argument. Same silence as the uncalled `next_due_schedules` one feature over.
+
+**The preview is now built in ONE place.** The third caller forced a refactor that found a
+live disagreement: the preview route substituted zeros when the live media library could not
+be counted and rendered a reassuring "you lose nothing", while the restore **refused** on the
+same failure. Both defensible alone; together they are the defect — one price on the screen
+and another in the effect. `rebuild_preview` reports `live_comparison_failed` and each caller
+decides what to *do* about a fact the function only *reports*.
+
+**A third finding, from the walk rather than from the code.** The fixture's run is a
+**media-only** one, so `database` is refused as `part_not_in_run` — the run-check comes first,
+and it is the better answer because it names what the run *can* offer. My table of expected
+refusals asserted `part_not_restorable` and was **wrong**; the deeper rule needed a run that
+really produced the part, and the walk now builds one. Two refusals that are both right, and a
+test that asserted the wrong one.
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **153/0** (was 150; +3 for the queue's own rules) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `apps/api --test backups` | see the run below — the suite found two real defects, both fixed and both now covered |
+| QA browser pass | **ran, and got through `/backups`** (visited, 39 interactive elements) before my own `timeout 1500` killed the walkthrough mid-run. The whole route list is longer than 25 minutes on this box, and every later step reported `Target page, context or browser has been closed` — the tab dying under memory pressure, not a finding. **No report was written, so no finding count is claimed**: the queue controls were not exercised in a browser, and this REQ is **not** closed on this |
+
+**The environment fought this tick and the wins are worth writing down.** `/mnt/apopic` hit
+100% mid-tick, so the first `cargo test` died with `No space left on device (os error 28)` and
+**the walk passed in 0.01 s** — the fixture's `Fixture::new()` returns `None` when PostgreSQL
+is unreachable and the test body simply returns. That is a green that measures nothing, and it
+is the same class as the em dash: a loss and a designed answer, pixel-identical. Two things
+gave it away and both are now habits: **0.01 s is not a walk that takes a backup**, and the
+database it named did not exist. Moving the target to `/root` produced `ld terminated with
+signal 7 [Bus error]` — a **linker** OOM, not a Rust one, on a box with 7 GB available. Only
+my own artifacts were ever deleted; the siblings' `target`s were left alone.
+
+**The suite then hung, and the hang was the second defect — a real one.** It stalled with a
+job sitting in **`running`** and no query outstanding: `not granted` locks **0**, no non-idle
+backend, no filesystem activity, the main thread in `futex`. Reading the row named the bug:
+`fail_stale_restore_jobs` swept only `queued`, and **nothing else can move a `running` job** —
+the queue read is the only thing that advances one, a worker killed mid-restore is by
+definition not going to, and the partial unique index refuses a new restore of that run while
+the row stands. So **one deploy in the middle of a restore costs that run its restore point
+for ever**, and the panel draws it as in progress the whole time. The sweep now covers
+`running`, and a reclaimed `running` job becomes **`failed`, never `aborted`**: it was
+claimed, so it probably already took a safety backup and may have written objects, and
+"nothing was written" about it would be the exact lie this feature exists to avoid. The
+reason string says what is *unknown* and names the backup to go back to.
+
+**The first defect the suite found was in a test, and it is the tick-72 wire-format fix
+coming back.** `a_backup_of_all_five_parts…` asserted that `last_successful_at` **is an
+array**, with a comment explaining that `OffsetDateTime` serialises as a tuple. That is true
+only of `time` with its `serde-human-readable` feature *off* — the same feature gap tick 72
+diagnosed — so the line **documented the defect as if it were the contract**, and the fix made
+the test fail. A test that pins the bug is worse than no test: it is a green that trains the
+next reader to distrust the code instead of the test, and it makes a fix look like a
+regression. It now asserts the JSON **type** is a string and that the value looks like
+RFC 3339, which is the only assertion that tells a *lost* timestamp apart from a designed one.
+
+**A third finding, from my own walk's bookkeeping.** The new worker walk queued a second job
+to prove the run was restorable again — and then queued a third, which the partial unique
+index refused, because the walk's own leftover was still live. A self-inflicted failure that
+reads exactly like a product bug; the leftover is now cancelled at once.
+
+**The browser pass, and what it did and did not prove.** The QA slot was **free** this tick
+and the disk had recovered to 9.8 GB, so the pass ran — three ticks of "the slot is held"
+turned out to be the wait, not the gate. It reset `omnion_qa`, brought up the API on :18080
+and the panel on :3100, and walked 22 routes including `/backups` with 39 interactive
+elements, **before my own `timeout 1500` killed it mid-run**. The later steps all reported
+`Target page, context or browser has been closed`: the browser tab dying under this box's
+memory pressure, the same pattern the loop's own lessons record, and not a finding. **So the
+queue controls are not yet exercised in a browser and the REQ stays open** — the honest
+number is "the screen renders and is reachable", not "zero high findings". The next tick runs
+it with a longer ceiling, or with the route list trimmed, because a pass that is killed by
+its own timeout has verified nothing about the pages after the cut.
+
+**Next.** (a) The browser pass with a ceiling longer than the route list (three ticks of
+"the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
+UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
+rather than a test alone. (c) Slice 4, encryption.
+
+---
+
+## Tick 74 — the check that had been red since the request was written
+
+**What.** A criterion left open since tick 1 — *the status card's age is consumed by the security
+overview check* — turned out to be hiding a defect that had been in the platform since the
+request was written, and the reading of it is the whole tick. `backup_age` in
+`apps/api/src/routes/security.rs` asked **`backup_runs`** for the last successful run. **No
+migration in this repository has ever created `backup_runs`.** The table is `backups`
+(`0157`); the name was guessed when the request predated the schema and never revisited when the
+schema landed. A missing table makes `fetch_optional` answer `Err`, `Err` was flattened into "no
+backup", and `backup_healthy` answered **`fail` on every installation, for ever** — the one
+check in the registry that could never go green, on a platform that had taken a backup every night
+for a year, with a detail that named the right rule for entirely the wrong reason.
+
+**Why nothing caught it, and why that is the interesting half.** `backup_healthy` is a pure
+function of a hand-built `Environment`, so no unit test ever executed the query. An integration
+test asserting "no backup → `fail`" would have stayed green for ever, because **the broken reader
+*is* a permanent no-backup.** The two worlds are indistinguishable from inside the code and only
+distinguishable from outside it: the walk has to take a real backup and then read the screen.
+This is the second time in two features that the missing thing was a caller — `next_due_schedules`
+shipped with a column and a query and no writer, and `prune_candidates` shipped with four
+documented exemptions and nothing calling it. A predicate nothing evaluates is a comment.
+
+**The second defect surfaced only because the walk signed in as a restricted account.** Every walk
+that had ever read the posture screen signed in as an account holding *both* keys — the platform
+owner's role is granted everything, and a walk that also touches analytics needs them. So the
+security centre had been written **inside the `analytics_reports` router builder**, whose
+`route_layer(require("analytics.read"))` reaches every route declared on it. `/security/overview`
+carried its own, correct `security.read` guard on the handler *and* an `analytics.read` guard it
+never declared: an account holding `security.read` and nothing else was refused with `403 this
+action requires the "analytics.read" permission` — on the screen whose entire purpose is to be
+readable by the person doing the diagnosing. A deployment granting the least would have found the
+security centre unreadable, and the natural response to that is to grant more. **A guard that is
+only ever satisfied is not a guard that was checked.** The group now has its own `Router::new()`
+and its own `merge`, and the comment states the rule for the next group added there.
+
+**A third defect, in a test, of the family this suite keeps finding.** The cancel walk asserted
+`select count(*) from backup_restore_jobs` — no `where` — in a database every suite in
+`apps/api/tests` shares. A row any other walk had left behind (a killed run, a concurrent suite)
+failed it with *"a refused queue wrote a row"*: a sentence about this tenant's refusals, read off
+the whole platform's table. It is now scoped to its own tenant. Same shape as the media-part leak
+one feature ago — a test that creates fixtures for exactly one organization cannot tell "the whole
+deployment" from "my own" apart.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| `omnion-backup --lib` | **153/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/api --test backups` | **26/26** over a live database, each walk run in its own process |
+| `apps/admin` `tsc --noEmit` | clean |
+| Load-bearing | the posture walk is **red** when the reader is reverted to counting any finished row, **green** on the fix |
+
+**The suite cannot be run as one process, and the reason is the suite's own design.**
+`cargo test -p omnion-api --test backups` in parallel gave **18 passed / 8 failed**; the same eight
+walks pass individually, and `--test-threads=1` hung in the ninth with a live process, no query
+outstanding, `not granted` locks 0 and a main thread in `futex`. Every walk builds a `Fixture`
+that **opens a scratch database per test**, and 26 of them at once exhaust the shared pool's
+`max_connections = 100` — the same finding the w5 loop recorded, one suite over. A contention
+failure that reports itself as `FAILED` with no panic message is the expensive kind: it reads as a
+product regression and sends the next tick hunting a defect that is not there. The pass that
+counts is 26 walks in 26 processes, and the number worth reporting is that, not the parallel one.
+
+**Next.** (a) The browser pass — the QA slot was held by a sibling for the whole tick, and the
+route list is longer than the 25 minutes the harness's own ceiling allows, so it needs the
+trimmed-route variant rather than a longer `timeout`. (b) The `partial`-run UI. (c) Slice 4,
+encryption.
+
+## Tick 75 — 2026-09-30 — REQ-012 slice 3 (rate limiting + lockout), plus the harness that had to be fixed to run it
+
+**What.** The security centre's two limiter screens (`/security/rate-limits`,
+`/security/sign-in-protection`) had never been opened by anything. Four commits:
+
+| Commit | Change |
+|---|---|
+| `1ded0b5c` | `--only` narrows a pass to named routes/depth passes; both screens walked on desktop and at 390px; the QA API now gets an `OMNION_CSRF_SECRET` |
+| `5ca68087` | a QA-slot holder file with two pids on one line deadlocked the pass queue |
+| `9e91f2c9` | the QA API could not reach its own database — a masked `***` password |
+| `669d584d` | the account lockout was unreachable behind the address lockout |
+| `25dddf5c` | a pass died when its click stream could not be written |
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| The lockout, measured | before: `403 address_blocked` x10, `429 rate_limited` x2, `users.failed_sign_in_count` = **0**, `locked_until` = never |
+| The slot deadlock | `reap` resolved `2332198 2332152` -> `2332152`, found it dead, freed the place |
+| The database credential | `psql` over TCP with the exact string `run.sh` hands the process returns `1` |
+| The click stream | `record()` against a missing directory warns once, keeps all 3 clicks |
+
+**The finding worth the tick.** The account lock and the address lock were compared against the
+**same number** (`lockout_attempts`). From one address the address rule therefore fired on the
+exact attempt that would have incremented the account counter, so the counter never moved, no
+account was ever locked, and the "currently locked accounts" table had no possible content. The
+module doc above `sign_in` states that the two dimensions exist for different reasons; the code
+gave them one value. The address threshold is now `lockout_attempts * 3`.
+
+**Three harness defects the pass had been hiding behind.**
+
+1. *The QA API had no `OMNION_CSRF_SECRET`.* Every cookie-authenticated write was refused with
+   `csrf_unavailable` before its handler ran — so every save, upload and backup in every pass
+   was recorded as a screen that "works" while the API answered 403 throughout. The refusal is
+   the documented behaviour of a deployment *without* a secret, which is why it read as the
+   product being correct.
+2. *The QA API's database password was `***`* — a masking artifact, committed long enough to
+   look deliberate. It survived a previous check because that check ran `docker exec psql`, which
+   uses the container's unix socket and never authenticates; the path that actually uses it (TCP
+   to `127.0.0.1:5433`) had never worked. Two paths, one of which nobody exercised.
+3. *The pass queue could not drain.* `reap()` handed a whole holder line to `kill -0`, which
+   wants one pid; a two-pid line answers false, so the place is judged ownerless -- reclaimed
+   while its owner walks, and unreclaimable by the owner whose trap then kills a string.
+
+**Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
+naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+### Tick 75, continued — what the lockout fix actually cost to prove
+
+`669d584d` shipped a fix and a walk, and the walk was **green with the fix reverted**. Reverting
+one line — `address_failure_limit` back to `lockout_attempts` — left the test passing. That is the
+outcome a regression test exists to prevent, and the reason was structural rather than accidental:
+
+`ClientAddress` and the rate-limit middleware both read `ConnectInfo<SocketAddr>` out of the request
+extensions, and `into_make_service_with_connect_info` is the only thing that puts it there. A request
+driven through `router().oneshot()` arrives with **no address**, and with no address the per-address
+refusal cannot run at all. The walk was skipping the very rule a brute-force walk is meant to test.
+Absence of input is not a neutral default; it is the branch that skips the code.
+
+Installing the extension (`7865076d`) then broke two walks that had been passing for the wrong
+reason, both the same mistake one layer up:
+
+- **The limiter counted walks against each other.** Every walk shared `127.0.0.1` and the `sign_in`
+  ceiling is 10, so the sign-in round trip was refused `429` by a counter it never incremented.
+  `test_peer()` now allocates a loopback address per walk — the same shared-state mistake as an
+  unscoped `select count(*)`, one layer up.
+- **The sign-out walk had never signed out.** `post_logout` sent no CSRF token and this file's state
+  carried no secret, so sign-in issued no `omnion_csrf` cookie and the POST was refused `403`. That
+  assertion had been failing in CI since the CSRF layer landed. It took three fixes: the suite's own
+  secret on its own state, the token read out of the sign-in response, and `get_all(SET_COOKIE)`
+  instead of `get(SET_COOKIE)` — sign-in sends TWO cookies, so "no CSRF cookie was issued" was
+  concluded about a platform that had issued one.
+
+**Gates, final state.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `omnion-identity --lib` | **113/0** (the new threshold-invariant test is in this number) |
+| `apps/api --test auth` | **7/7** in 8.8s, over a live PostgreSQL + Redis |
+| `apps/admin` `tsc --noEmit` | clean |
+
+**Not proved, and named.** The lockout walk could not be shown **red** with the fix reverted: the
+reverted run died on a Redis connect timeout before reaching its assertion, because the box ran at
+load 80–107 with four sibling writers. The walk is green with the fix and the walk demonstrably
+cannot see the address rule without `ConnectInfo` (which is why it passed with the fix reverted),
+so the two together are strong evidence — but "the revert was watched going red" is not something
+this tick can claim, and the next tick should watch it when the box is quieter.
+
+**The browser pass still has not reported.** It ran for twenty minutes, walked seven screens and then
+died with `clicks.jsonl ENOENT` when `/mnt/apopic` hit 100% and the artifact directory was trimmed out
+from under it. That is now survivable (`25dddf5c`), and the two limiter screens are walked on desktop
+and at 390px, so the next tick is where the boxes naming a screen can be ticked.
+
+## 2026-09-30 — Tick 76 · REQ-010, the audit criterion (the entry that was never missing, and the one that was)
+
+REQ-010 is the first request in wave order that is not `done`, and it had two open boxes. One of
+them was the browser pass, which had not run in two ticks. The other was a sentence in its own
+acceptance list that read:
+
+> The one criterion left open in this line is the *replace* audit entry, which lands with slice 3's
+> CDN purge hook.
+
+**That sentence was wrong, and the error was worth more than the fix underneath it.**
+`media.version_created` has been written by `apps/api/src/routes/media_versions.rs` since slice 2,
+and `apps/api/tests/media.rs:2053` has read it back out of `audit_log` after a real replace. Rather
+than believe the file, this tick measured all nine actions the criterion names — writer present,
+and a walk that reads the row back:
+
+| Action | Writer | Walk asserts | Walk *performs* the action |
+|---|---|---|---|
+| `media.uploaded` | 1 | 1 | yes |
+| `media.version_created` | 1 | 1 | yes |
+| `media.folder_moved` | 1 | 1 | yes |
+| `media.deleted` | 2 | 3 | yes |
+| `media.restored` | 1 | 1 | yes |
+| `media.purged` | 1 | 1 | yes |
+| `media.grant_changed` | 1 | 2 | yes |
+| `media.share_created` / `share_revoked` | 1 / 1 | 3 / 1 | yes |
+| `media.scan_released` | 1 | 1 | yes |
+
+Nine of nine. A "still open" note in a checklist is not evidence, and this one had been carried
+forward across slices until it described a defect that had never existed.
+
+**The defect that did exist was in the same sentence.** `media.retention_applied` was emitted onto
+the event bus and **nowhere else** (`apps/api/src/routes/media_retention.rs:758`) — the `audit()`
+helper in that file is only ever called for the five *policy* actions, never for a run. So the one
+purge in this module that runs **unattended**, and the most destructive thing it does, left no
+record at all, while `Empty trash` next door wrote `media.trash_emptied` for the same deletion.
+That asymmetry is the shape of the defect: a person could see what they had done, the nightly worker
+could not, and an event bus nobody subscribed to is not a record.
+
+`09a0c25d` writes the entry before the event — for the same reason the event is recorded as a run
+error rather than a failed request, since the rows are already gone and a failure would tell an
+operator to re-run a sweep that already happened. The actor is the account that asked when there is
+one and the platform itself when the runner started it: an unattended deletion must not carry
+somebody's name.
+
+**The walk proves the branch nothing covered.** `an_unattended_sweep_audits_itself_as_the_platform`
+drives `run_once` with `actor: None` rather than the HTTP route, because the route always has a
+signed-in account and could never reach the system-actor path. It also asserts that a sweep which
+removed *nothing* writes nothing, or the log is a heartbeat rather than a record.
+
+**It was watched going red.** Reverting only the source change (the test file kept) and rebuilding:
+
+```
+test result: FAILED. 0 passed; 1 failed; 6 filtered out
+an_unattended_sweep_audits_itself_as_the_platform ... FAILED
+  assertion `left == right` failed: exactly one entry for the one run that removed something: []
+    left: 0   right: 1
+```
+
+`[]` — not a wrong actor, not a wrong count, **no row at all**, which is the shape the defect
+actually had. Restored via `git stash pop` and byte-compared against the pre-revert copy
+(`diff` clean) before the suite was re-run.
+
+**The first run of the walk failed for a reason that was not the code.** It read `purged: 0` and the
+assertion blamed the audit entry that came after it. The fixture was wrong: the seeded default keeps
+a file for **30** days and only purges it two days after that, so ageing a deletion 40 days reaches
+the *trash* window and leaves the purge window 30 days behind. The walk now tightens the policy first,
+exactly as `a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window` does. The lesson is
+in the walk's own comment, because it is expensive to learn twice.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `apps/api --test media_retention` | **7 passed / 0 failed** (277.95 s, live PostgreSQL + Redis, 7/7 including the new walk) |
+| the same walk, fix reverted | **FAILED** — `[]`, 0 rows |
+| `omnion-media --lib` | **199 passed / 0 failed** |
+| `pnpm typecheck` | 2/2 successful (admin rebuilt, web cached) |
+| `rustfmt --check` on both files | clean for the added code; the two remaining diffs are pre-existing (`bfe46c3e`, `b0b45428`) |
+
+**Pre-existing red, not mine, and named rather than quietly left.** `cargo fmt --all -- --check` fails
+on `backup_schedule_runner.rs`, `backup_sweep_runner.rs`, `restore_job_runner.rs`, `routes/backups.rs`,
+`lib.rs`, `main.rs`, `rate_limit_middleware.rs`, and `tests/support/walk_auth.rs`; `cargo clippy -p
+omnion-api --all-targets -- -D warnings` fails in `omnion-events` (4 errors) and `omnion-identity`
+(`too_many_arguments` ×2). `git status crates/` is clean, so none of it is in files this tick
+touched. Reformatting the workspace to green would rewrite files nine sibling writers are actively
+editing, so it is reported rather than done.
+
+**The browser pass is still the thing standing between this REQ and `done`.** Measured this tick:
+the QA slot queue is **37 deep with entries up to 23 hours old**, one place is held by a live
+`omnion-w5` walkthrough, and the box sat at load 80–89 with 8 concurrent `rustc` processes. A pass
+was queued (`QA_ONLY=media,media-duplicates,media-trash,media-settings,media-retention`) and left
+waiting; on this box that is not a usable instrument, so the tick spent itself on a defect that a
+walk could find instead. `/tmp/omnion-qa-pass.log` is from **yesterday** (mtime 2026-09-29 17:14) and
+its `csrf_unavailable` rows are history, not this pass.
+
+**Next.** Two boxes remain, both naming the same missing browser pass: the empty/loading/error states
+across the media screens and the retention tab's own states. Run `bash scripts/qa/run.sh` with
+`QA_ONLY=media,media-retention` on a quieter box, then close REQ-010 and move to REQ-014 (system
+health, still `pending`).
+
+## Tick 77 — REQ-021 slice 4: the delivery queue that never existed
+
+**What.** The acceptance criterion "Delivery runner retries a failing channel per backoff and
+marks it `failed` after the cap" had been open since the request was written, and the reason is
+worth stating plainly: **it described a runner that did not exist.** `notification_deliveries`
+shipped in migration `0050` and every later slice *read* it — the outbox lists it, the retry
+button re-queues it, the channel filter joins it, the per-channel counts group by it — and not
+one line of code anywhere wrote a row or claimed one. It was the only table in the platform with
+readers and no writer, which is precisely the shape a queue must never have: the outbox screen
+rendered a permanently empty table and called it the truth.
+
+Three pieces, in three commits:
+
+| Commit | What | Why it is where it is |
+|---|---|---|
+| `d6b74a52` | `0185_notification_delivery_lease.sql` — the `claimed_at` lease | A claim has to say "somebody is on this row" and "nobody is any more" after a process dies mid-send. With no column for the second half, a crashed runner either strands the row or re-sends it forever, and there is nowhere to record which. |
+| `f2772386` | `crates/notifications/src/delivery.rs` — enqueue, claim, backoff, cap | The queue is infrastructure, so it belongs in the crate. It is also the first code in this crate that *writes* the table every other file reads. |
+| `fac577a2` | `apps/api/src/notification_runner.rs` — the transports, spawned from `main.rs` | A transport is an SMTP conversation and an HTTP POST, and `omnion-automation` already owns the mail sender. Putting one in the crate would make infrastructure depend on a mail stack and an HTTP client to satisfy a trait it defined itself. The crate publishes the trait; the binary, which already depends on both, supplies the implementations. |
+
+**The walk found two real defects, and both were silent.** That is the argument for writing
+walks rather than reading code, so they are recorded in full rather than as a changelog line.
+
+**1. `enqueue` contradicted its own contract.** The function's doc comment promised that the
+in-app row is written unconditionally — "a reader who turned in-app off would have no inbox at
+all" — and three paragraphs below it, a guard that returned early when both channel lists were
+empty. So a caller with no remote channel to ask about (a fresh install; a reader who has
+everything switched off) got **no rows at all**: the notification existed, the panel showed it,
+and the outbox had nothing to say about any channel. The guard is gone, and
+`the_in_app_transport_needs_no_configuration_and_always_succeeds` enqueues with two empty lists
+specifically to hold the contract down.
+
+**2. `settle_not_ready`'s `not exists` was uncorrelated.** The statement reads "settle every
+pending row whose channel nobody has switched on", and the obvious SQL for that —
+`not exists (select 1 from notification_channels c where c.channel = d.channel and c.enabled)` —
+asks "does *anybody* have this channel on". On a single-tenant install those are the same
+question. On this platform they are not: `notification_channels` is per organization, so one
+customer configuring e-mail would have silently marked **every other customer's** e-mail
+deliveries as "not configured" and stopped them from ever being sent. The correlation on
+`notifications.organization_id` is in the statement, and
+`a_tenant_that_switched_a_channel_on_keeps_its_own_deliveries_queued` builds two organizations,
+configures one, and asserts `settled == 1` — the bare tenant's row and not the other's.
+
+**It was watched going red, in both directions.** The early return was reintroduced into
+`delivery.rs` with the tests untouched:
+
+```
+test the_in_app_transport_needs_no_configuration_and_always_succeeds ... FAILED
+  the in-app row must exist even with no channels requested: RowNotFound
+test result: FAILED. 1 passed; 1 failed
+```
+
+`RowNotFound`, not a wrong status and not a wrong count — **no row at all**, which is the exact
+shape the defect had. Restored from the copy taken before the edit and byte-compared with
+`diff` before the suite was re-run.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `apps/api --test notification_delivery` | **8 passed / 0 failed** (88.18s, live PostgreSQL, 8 scratch databases) |
+| the same, with the `enqueue` guard reintroduced | **FAILED** — `RowNotFound` |
+| `omnion-notifications --lib` | **90 passed / 0 failed** (was 79; +11) |
+| `omnion-api --lib` | **226 passed / 0 failed** (was 219; +7) |
+| `pnpm typecheck` | 2/2 successful |
+| `rustfmt --check` on all three new files | clean |
+
+**The eight walks, and what each one is for.** The criterion is a sentence about *time*, and a
+sentence about time cannot be proved by a unit test, so all eight drive a real database:
+
+1. `a_failing_channel_is_retried_and_then_marked_failed_after_the_cap` — the criterion itself.
+   Attempts 1 and 2 leave the row `pending` with a reason on it; attempt 3 writes `failed`; a
+   fourth tick claims nothing. Between the attempts it asserts the row is **not** due, which is
+   what makes "the cap is reached in three attempts" mean three attempts over the backoff window
+   rather than three in three ticks. The backoff is real, not merely scheduled: a row retried
+   with `next_attempt_at = now()` is due on the very next tick, so the cap would be reached in
+   milliseconds and every tick would hammer a broken mail server.
+2. `a_claim_makes_the_row_exclusive_until_the_lease_expires` — a second runner finds nothing
+   inside the lease, and the row comes back once the lease ages. That second half is what keeps
+   a crash from stranding a notification.
+3. `enqueueing_the_same_notification_twice_does_not_double_its_deliveries` — the unique
+   constraint makes a re-run of the same emit idempotent, so a reader does not get two copies.
+4. `a_channel_nobody_configured_is_skipped_rather_than_left_queued_forever` — a channel nobody
+   configured is settled with a reason, never left pending, and the settlement is idempotent.
+5. `a_tenant_that_switched_a_channel_on_keeps_its_own_deliveries_queued` — the tenancy defect
+   above.
+6. `the_outbox_reads_back_what_the_queue_wrote` — the read the outbox page performs agrees with
+   the queue's own state (one of each state, failed-first ordering, and the admin retry button
+   still works on a row the queue gave up on). A queue whose rows nobody can read is a queue
+   whose failures are invisible, which is the whole reason the table exists.
+7. `the_in_app_transport_needs_no_configuration_and_always_succeeds` — the defect-1 guard.
+8. `the_email_transport_refuses_a_reader_with_no_address_instead_of_pretending` — a reader with
+   no address is a failure with a reason. The alternative, a silent success, writes a `sent` row
+   for a message that was never sent: the one lie this table must not tell.
+
+**Three of the eight failed before the code was right, and two of those were the test's fault
+rather than the code's — recorded because the direction matters.** The walks asserted
+`claimed == 1` on a fixture that queues two rows, and they asserted a *delivered* e-mail on a
+database where no channel was configured — where the settlement is right to skip it, so the
+fixture had to describe an installation (`configure_channel`) instead of inheriting an empty one.
+A walk that forgets that reads as a queue bug and is a fixture gap; the difference is worth
+knowing before somebody spends a tick on it.
+
+**The browser pass did not run, for the fourth tick running, and the measurement is in the
+ledger.** The QA slot queue is one deep but held by a live `omnion-w3` walkthrough, and the box
+sat at load 60–102 with 5–8 concurrent `rustc` from sibling writers; one cargo run of this
+suite's binary alone took 11 minutes to link. A browser pass was queued behind a live slot and
+this tick spent itself on a defect a walk could find instead.
+
+**Pre-existing red, not mine, and named.** `git status crates/` is clean apart from this tick's
+own file. `cargo test -p omnion-api --lib` compiles the workspace's pre-existing warnings
+(unused imports in `headers_middleware.rs`, `rate_limit_middleware.rs`, `routes/backups.rs`,
+`routes/notifications.rs`, `routes/notifications_admin.rs`; a `PartialEq` derive on a function
+pointer in `crates/security/src/posture.rs`), and `cargo fmt --all -- --check` still fails on the
+files listed in tick 76 — none of which this tick touched. Reformatting the workspace to green
+would rewrite files nine sibling writers are actively editing, so it is reported rather than
+done.
+
+**Next.** REQ-021 has four boxes left, all naming the same missing browser pass: the keyboard
+path, the mobile sheet, the per-channel delivery rows in the drawer, and the test-delivery
+inline result. The drawer rows are now *provable by a walk* rather than by a browser — the
+deliveries exist — so the next quiet-box tick should run `bash scripts/qa/run.sh` with
+`QA_ONLY=notifications,notifications-outbox,notifications-settings`, then close REQ-021 and move
+to REQ-014 (system health, still `pending`).

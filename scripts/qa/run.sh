@@ -214,6 +214,7 @@ QA_ONLY_ARGS=()
 step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
 node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
+
 # The vision review reads the whole shot set and judges it against the product's visual rules.
 # On a scoped pass that set is a fraction of the screens, so its verdicts describe a product
 # state that does not exist — and it is the slowest step in the pass. Skipping it is honest;
