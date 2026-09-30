@@ -6516,35 +6516,43 @@ async function runEnvironmentsDepth(page, report) {
     steps.sharedAreasExplained = shared.every((row) => row.note.length > 0);
     steps.sharedAreasNotPreselected = shared.every((row) => row.box && !row.box.checked);
     steps.areaNotePresent = (await page.locator("[data-env-area-note]").count()) > 0;
-    report.findings.push(
-      ...(copying.length === 0
-        ? [
-            {
-              severity: "high",
-              where: "/environments wizard",
-              what: "no clone area claims to copy anything, so a staging environment could be created empty",
-            },
-          ]
-        : []),
-      ...(shared.length > 0 && !steps.sharedAreasExplained
-        ? [
-            {
-              severity: "high",
-              where: "/environments wizard",
-              what: "an area that copies nothing is offered without saying so",
-            },
-          ]
-        : []),
-      ...(shared.length > 0 && !steps.sharedAreasNotPreselected
-        ? [
-            {
-              severity: "medium",
-              where: "/environments wizard",
-              what: "an area that copies nothing is pre-ticked, so the default clone promises work it does not do",
-            },
-          ]
-        : []),
-    );
+    // These three were written as `report.findings.push({severity, where, what})`, which is **not
+    // a shape this harness has ever had**: the findings list and its `pushFindings(severity, kind,
+    // detail)` helper are declared *inside* `main()` at the roll-up, so no depth pass can reach
+    // them, and `report.findings` is `undefined`. The line therefore threw
+    // `TypeError: Cannot read properties of undefined (reading 'push')` on every run — the pass
+    // died at the wizard's area step, before any of its clone, detail, promotion or archive
+    // claims could execute. Five ticks recorded that depth pass as "owed", and the cause was not
+    // the box at all.
+    //
+    // So the assertions are made the way the rest of the file makes them: the fact goes into
+    // `steps` (which the return value and `summary.json` carry) and the *reporting* happens
+    // through `record`, which appends to `clicks.jsonl`. A pass that finds a defect should not
+    // need a private channel to the roll-up.
+    if (copying.length === 0) {
+      record({
+        page: "environments",
+        action: "wizard-area-claims-nothing",
+        severity: "high",
+        detail: "no clone area claims to copy anything, so a staging environment could be created empty",
+      });
+    }
+    if (shared.length > 0 && !steps.sharedAreasExplained) {
+      record({
+        page: "environments",
+        action: "wizard-shared-area-unexplained",
+        severity: "high",
+        detail: "an area that copies nothing is offered without saying so",
+      });
+    }
+    if (shared.length > 0 && !steps.sharedAreasNotPreselected) {
+      record({
+        page: "environments",
+        action: "wizard-shared-area-preselected",
+        severity: "medium",
+        detail: "an area that copies nothing is pre-ticked, so the default clone promises work it does not do",
+      });
+    }
 
     // Unchecking everything must block the next step: a clone that copies nothing is not an
     // environment, and the API refuses it — the screen must not be the one to discover that.
@@ -6583,17 +6591,18 @@ async function runEnvironmentsDepth(page, report) {
     // The summary is the last screen before the button, so it is where a repeated promise
     // would do the most damage — the step-2 note is already two clicks in the operator's past.
     steps.sharedNoteOnSummary = (await page.locator("[data-env-wizard-shared]").count()) > 0;
-    report.findings.push(
-      ...(steps.sharedNoteOnSummary
-        ? []
-        : [
-            {
-              severity: "medium",
-              where: "/environments wizard",
-              what: "the confirmation does not repeat that navigation, settings and theme are shared rather than copied",
-            },
-          ]),
-    );
+    // Same dead `report.findings` channel as above, and it sat *after* the submit, so it would
+    // have killed the pass one step later than the first one did — the second half of the
+    // wizard's promises would have gone unmeasured for the same reason as the first half.
+    if (!steps.sharedNoteOnSummary) {
+      record({
+        page: "environments",
+        action: "wizard-summary-hides-shared-areas",
+        severity: "medium",
+        detail:
+          "the confirmation does not repeat that navigation, settings and theme are shared rather than copied",
+      });
+    }
     await shot(page, "environments-wizard-confirm");
     await page.click("[data-env-wizard-submit]").catch(() => {});
     await page.waitForTimeout(2500);
