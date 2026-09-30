@@ -13,7 +13,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-OUT="$ROOT/qa-artifacts/$TS"
+# `QA_OUT_ROOT` moves the artifacts off the worktree. A pass writes screenshots for every
+# screen and every mobile viewport, and seven worktrees on one volume at 96% means the
+# pass that measures the most is the one that fills the disk — which is how a QA run
+# becomes the reason the next build fails with "No space left on device". `/dev/shm` is
+# the right default for a *disposable* pass: the artifacts are read by the vision review
+# and the summary in the same run and are worthless the next morning. The default is
+# unchanged so nobody loses their history by accident.
+OUT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}/$TS"
 mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
