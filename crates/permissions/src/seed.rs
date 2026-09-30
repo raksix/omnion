@@ -102,6 +102,13 @@ const BASE_ROLES: &[BaseRole] = &[
             // read/manage split is what lets this row be honest instead of convenient.
             "ai.tools.read",
             "ai.identities.read",
+            // The approval inbox, read-only. A manager is exactly the person who needs to know
+            // an agent wants to publish or delete, and is deliberately NOT the person who
+            // releases it: `ai.approvals.act` and `ai.policies.manage` stay with the roles that
+            // own the installation. This row is what makes the acceptance criterion's "viewer
+            // sees Approve disabled, with the missing permission named" a real configuration
+            // rather than a hypothetical one.
+            "ai.approvals.read",
             "workflows.read",
             "workflows.manage",
             "workflows.run",

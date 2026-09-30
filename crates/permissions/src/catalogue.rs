@@ -207,6 +207,28 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Create, edit and remove AI identities and their grants",
     },
+    // The approval gate (REQ-101). Read and act are separate keys because the whole point of the
+    // inbox is that *seeing* a dangerous operation is a much weaker power than *releasing* it:
+    // an installation that lets a support lead read the queue while only a manager decides is
+    // the common shape, and a single key cannot express it. The third key is separate again
+    // because un-gating a class (`content_publish` → `allow`) is a durable edit to what the
+    // installation's own agents may do without asking — a policy change, not a decision about
+    // one request, and REQ-101 requires both the permission *and* a typed phrase for it.
+    PermissionDef {
+        key: "ai.approvals.read",
+        category: "ai",
+        description: "Read the AI approval inbox, its diffs and its audit trail",
+    },
+    PermissionDef {
+        key: "ai.approvals.act",
+        category: "ai",
+        description: "Approve, reject and expire AI approval requests",
+    },
+    PermissionDef {
+        key: "ai.policies.manage",
+        category: "ai",
+        description: "Change which AI tool classes require approval",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {
