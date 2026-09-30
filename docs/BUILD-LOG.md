@@ -8484,3 +8484,116 @@ gave them one value. The address threshold is now `lockout_attempts * 3`.
 
 **Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
 naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+## Tick 40 — REQ-133 slice 11: delegated administration, and two screens nobody could ever open
+
+**What.** Acceptance 10 — *"a project owner can manage members and workflows through the API,
+and every instance-wide endpoint (users, settings, licence, other projects) returns `403` for
+them from direct calls, not just from the UI"* — is the first criterion on this REQ that could
+not be proved where the last ten slices proved theirs, and the reason is structural rather than
+an oversight. "Can manage members and workflows" is the capability matrix answering from a
+membership row, and `run-project-role-freshness.sh` (slice 9) already proved that at the store.
+"Every instance-wide endpoint returns `403`" is a property of the **guard layer**, and the
+projects module is not on those routes at all — a store-level test of `permits` stays perfectly
+green while all 162 of them answer `200`. "Not just from the UI" is literally the clause that
+requires HTTP.
+
+So `scripts/qa/run-delegated-admin.sh` boots the API on its own database and its own port and
+speaks HTTP. The caller is a **plain organization account on the `member` role with exactly the
+project keys added on top**, asserted to hold no `projects.admin` — an account holding the one
+key that overrides membership would answer `200` on the "other projects" call and turn the rest
+of the gate into a green lie. Every refusal is measured over that account's own session cookie,
+and the **negative control is the same cookie on `/me`**, because an API that refused everything
+would otherwise score full marks.
+
+**A refusal is only proved when it is the guard's own answer, and that is the whole reason the
+gate is not a status-code check.** `csrf_unavailable` is also a `403`, and an API booted without
+`OMNION_CSRF_SECRET` produces one on every cookie-authenticated write. The failure is
+*asymmetric*, which is what makes it dangerous: a CSRF failure on a route that *should* have been
+allowed shows up red and visible; a CSRF failure on a route that *should* have been refused shows
+up green, and wrong. The gate therefore reads the body and checks for the guard's own code, and
+excludes `csrf` by name. (`scripts/qa/run.sh` documents the same secret for the same reason; the
+note belongs in every gate that speaks HTTP, which is a fair argument for it living in the
+harness rather than in each one.)
+
+**The instance-wide list is derived, not written down** (`scripts/qa/instance-wide-routes.py`). A
+hand-written list is a snapshot, and a snapshot rots *silently*: the day a writer adds
+`/iam/bindings`, the gate keeps passing against the routes it remembers and the acceptance reads
+as proved over a surface nobody looked at. The list is read out of `apps/api/src/routes/mod.rs` —
+the file that decides what is registered and under which key — and a hand-named floor is checked
+against the derivation, so a hole in the *derivation* fails the gate rather than shrinking the
+list it is judged on.
+
+**Four shapes had to be handled there, and every one of them first produced a FALSE claim rather
+than a missing row** — the harder defect to see, because a missing row reads as a gap and a false
+row reads as rigour.
+
+1. The IAM surface declares `let iam_users = get(h).layer(require("users.read"))` and attaches it
+   with `.route("/iam/users", iam_users)`: the guard and the path are in *different statements*.
+   A scan reading only inline `.route("…", expr)` sees the path with no guard at all and drops
+   it — and `/iam/users` is the route the REQ names **first**.
+2. `.route_layer(require(k))` guards a whole sub-router whose routes carry no key of their own.
+3. A word boundary **does not delimit a Rust identifier**: it fires between
+   `workflow_execution` and `_cancel`, so `/workflows/{id}`'s guard was spliced into
+   `/workflow-executions/{id}`, producing PUT and DELETE rows for a route that answers GET.
+4. A bare-identifier body whose verb lives in the binding falls back to an invented `{"GET"}`.
+   The output is `VERB /path` rather than a bare path for that reason: a wrong verb is a **405**,
+   which axum answers *before* the guard runs and which in a list of 162 rows is indistinguishable
+   from a refusal. 405s are reported as a separate derivation verdict, so a harness defect can
+   never hide inside a product result.
+
+**One claim of mine was removed because the product was right and I was wrong.** The first list
+carried `GET /api/v1/search/settings`, on the REQ's word "settings". It is guarded by
+`search.read`, which the smallest base role holds *on purpose* — those are a reader's own
+preferences, not instance-wide settings. Asserting a refusal the platform does not make is a
+false claim about a shipped product, and that is strictly worse than a missing row. The
+instance-wide settings on this branch are `/backup-settings`, `/media/settings` and
+`/analytics/settings`.
+
+**The gate found a real product defect while building its own fixture.** It refused to set up:
+granting the project owner the keys it needs hit `permission 'projects.limits.manage' is not in
+the catalogue`. `PUT /api/v1/projects/{id}/limits` and `GET /api/v1/projects/{id}/audit` are
+guarded by `projects.limits.manage` and `projects.audit.read`, and **neither key was catalogued** —
+deliberately, with the catalogue's own test asserting their absence ("no route behind it yet").
+The routes then landed and the assertion was never re-read. Since `authorize` resolves a key
+through the catalogue, **both screens were refused for every account, the instance owner
+included**: a project owner could read nobody's usage, nobody's audit trail, and change nobody's
+limits. The only reason nothing had noticed is that the panel hides both behind a project role
+check that fails first — the REQ's own delegated-administration rule masking the platform's
+missing permission. **A tripwire nobody fires is decoration**; the fix is `23842f87` and the
+assertion now covers `workflows.move` only, which is genuinely still routeless.
+
+**Proof.**
+- `bash scripts/qa/run-delegated-admin.sh` — **23/23**, and **PROVEN TO FAIL** with the two
+  catalogue keys removed: the gate halts at the fixture line naming them, before a single
+  assertion runs. That is the defect named by the thing that tried to use it.
+- **All 162 derived instance-wide routes answer `403` to a project owner**, each with the guard's
+  own code and not a CSRF answer.
+- `cargo test -p omnion-permissions --lib --quiet` — **63 passed**, 0 failed.
+- `apps/admin`: `tsc --noEmit` unchanged. **No screen was added or claimed** this slice: the
+  limits and audit screens exist and are harness-driven, and both of them are exactly the two
+  this tick proved were unreadable until `23842f87` — so the tick's honest statement is that the
+  code was right, the permission was not, and the browser has still not seen either.
+
+**Three fixture defects of mine, all recorded because the product was right each time.**
+`gen_random_uuid()` for an organization fails `users_organization_id_fkey` — a gate that invents
+an id and hopes the fixture resolves it depends on what the product *doesn't* enforce.
+`permissions` is keyed by `key` itself (`permissions_pkey btree (key)`) with `role_permissions.
+permission_key text`; there is no `id` and no surrogate id on that pair, and `role_bindings` — not
+`role_assignments` — carries both `user_id` and the generic `subject_id`/`subject_type` the
+authorization path actually reads, so filling only the legacy column is a binding that exists in
+the table and is invisible to the guard. And the workflow body took three attempts (`definition`,
+then `trigger.type`, then no `steps` at all) when the minimal body is written out in the route's
+**own** unit test: a 422 names the field, but a 422 that costs a five-minute rebuild under load
+90 is a field the gate should have read before the first run.
+
+**Not proved here, and stated.** The browser pass is still owed on this branch — load ran 76–99
+across ten writers for the whole tick, so no `scripts/qa/run.sh` pass was started rather than
+starting an unreliable one. The IAM screens remain the un-observed ones. "Other projects" is
+proved at the store only, because it is a *visibility* fact (404, and the list omits it) and no
+guard *could* produce a 403 there: the caller legitimately holds `projects.read`.
+
+**Next.** The two screens this tick proved unreadable are exactly the two a browser pass would
+have caught, which is the argument for running one as soon as the box has room. Acceptance 9's
+confirmation dialog and the `workflow` dependency-refusal halves remain; no browser pass is
+claimed by this tick.
