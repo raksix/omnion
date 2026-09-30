@@ -772,10 +772,21 @@ export function fetchRevisionDiff(
 export function fetchPagePreview(
   pageId: string,
   viewport: "desktop" | "mobile" = "desktop",
+  simulatedMedia: string[] = [],
 ): Promise<PagePreview> {
-  const query = viewport === "mobile" ? "?viewport=mobile" : "";
+  const query = new URLSearchParams();
+  if (viewport === "mobile") {
+    query.set("viewport", "mobile");
+  }
+  // The simulation travels in the query rather than being applied here: the server owns which
+  // files are gone, and a client that dropped the ids itself would be a second implementation of
+  // the degradation this screen exists to show.
+  if (simulatedMedia.length > 0) {
+    query.set("media", simulatedMedia.join(","));
+  }
+  const suffix = query.size > 0 ? `?${query.toString()}` : "";
   return request<PagePreview>(
-    `/api/v1/pages/${encodeURIComponent(pageId)}/preview${query}`,
+    `/api/v1/pages/${encodeURIComponent(pageId)}/preview${suffix}`,
   );
 }
 

@@ -26,6 +26,7 @@ import type { BlockIssue, BlockRegistry, ContentBlock } from "@omnion/types";
 import {
   Check,
   Eye,
+  ImageOff,
   Monitor,
   Pencil,
   RotateCcw,
@@ -41,6 +42,7 @@ import { EmptyState } from "@/components/empty-state";
 import { ApiError, fetchBlockRegistry, fetchPagePreview, updatePage } from "@/lib/api";
 import type { PagePreview } from "@/lib/types";
 import { BlockCanvas } from "@/features/blocks/block-canvas";
+import { MediaPanel } from "@/features/blocks/media-panel";
 import { blockLabel, definitionFor } from "@/features/blocks/block-library";
 import { blockAt, setProp, walk } from "@/features/blocks/block-tree";
 
@@ -92,6 +94,11 @@ export function BlockPreview() {
   const [preview, setPreview] = useState<PagePreview | null>(null);
   const [viewport, setViewport] = useState<"desktop" | "mobile">("desktop");
   const [editing, setEditing] = useState(false);
+  // Ids the frame is *pretending* are deleted (REQ-063, slice 4). The only way to see what a
+  // trashed picture does to a page is to look, and looking for real would change the page every
+  // visitor sees. So the simulation is a query parameter and the library is never touched.
+  const [simulated, setSimulated] = useState<string[]>([]);
+  const [mediaOpen, setMediaOpen] = useState(false);
   // The working copy the frame draws. It starts as the server's answer and is then owned by the
   // author: a save pushes it to the API and the answer replaces it, so what is drawn is always
   // either the saved tree or the author's unsaved edit — never a mixture.
@@ -137,7 +144,7 @@ export function BlockPreview() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchPagePreview(pageId, viewport)
+    fetchPagePreview(pageId, viewport, simulated)
       .then((payload) => {
         if (cancelled) {
           return;
@@ -164,7 +171,10 @@ export function BlockPreview() {
     return () => {
       cancelled = true;
     };
-  }, [pageId, viewport]);
+    // `simulated` is a dependency on purpose: the frame is a *render* of the draft, and a
+    // simulation changes what the render is. Leaving it out would leave the toggle drawing the
+    // undegraded page while the button says it is on — the one lie this screen cannot tell.
+  }, [pageId, viewport, simulated]);
 
   // Leaving with unsaved inline edits must ask, or the author loses a paragraph to a mis-click.
   // `beforeunload` covers the tab; the link handler covers the panel's own navigation, which is
@@ -257,7 +267,9 @@ export function BlockPreview() {
       });
       // Re-read so the frame draws the server's own tree (post-sanitisation) rather than the
       // bytes that were sent.
-      const payload = await fetchPagePreview(pageId, viewport);
+      // The simulation survives a save: it is the frame's viewing mode, not part of the page,
+      // and dropping it here would make a save appear to "fix" the gap the author was looking at.
+      const payload = await fetchPagePreview(pageId, viewport, simulated);
       setPreview(payload);
       setBlocks(
         (Array.isArray(payload.visible_blocks) ? payload.visible_blocks : []) as ContentBlock[],
@@ -274,6 +286,19 @@ export function BlockPreview() {
     }
   };
 
+  /**
+   * Turn one file's deletion on or off in the frame.
+   *
+   * A *set*, not a toggle of a boolean, because two files can be simulated at once and the frame
+   * has to be able to answer "what if both of these go?" — a single boolean can only ever hold
+   * one of them, and the second toggle would silently undo the first.
+   */
+  const toggleSimulated = useCallback((id: string) => {
+    setSimulated((current) =>
+      current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id],
+    );
+  }, []);
+
   const reload = async () => {
     if (dirty && !window.confirm("Discard the inline edits and read the saved page again?")) {
       return;
@@ -281,7 +306,7 @@ export function BlockPreview() {
     setLoading(true);
     setError(null);
     try {
-      const payload = await fetchPagePreview(pageId, viewport);
+      const payload = await fetchPagePreview(pageId, viewport, simulated);
       setPreview(payload);
       setBlocks(
         (Array.isArray(payload.visible_blocks) ? payload.visible_blocks : []) as ContentBlock[],
@@ -452,6 +477,30 @@ export function BlockPreview() {
           Reload
         </button>
 
+        <button
+          type="button"
+          data-block-media-toggle
+          onClick={() => setMediaOpen((value) => !value)}
+          aria-expanded={mediaOpen}
+          aria-pressed={mediaOpen}
+          className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12.5px] transition ${
+            mediaOpen
+              ? "border-accent bg-accent-soft text-accent-strong"
+              : "border-line hover:bg-canvas"
+          }`}
+        >
+          <ImageOff className="size-3.5" aria-hidden />
+          Images
+          {preview.media_broken_count > 0 ? (
+            <span
+              data-block-media-toggle-count
+              className="rounded-md bg-caution-soft px-1.5 py-0.5 text-[11px] text-caution"
+            >
+              {preview.media_broken_count}
+            </span>
+          ) : null}
+        </button>
+
         {dirty ? (
           <span
             data-block-preview-dirty
@@ -462,6 +511,13 @@ export function BlockPreview() {
           </span>
         ) : null}
       </div>
+
+      {/* The media panel, on demand. It is not open by default because a page with no images
+          has nothing to say, and a permanent panel that says "no images" on every page teaches
+          authors to stop reading it. */}
+      {mediaOpen ? (
+        <MediaPanel preview={preview} simulated={simulated} onToggle={toggleSimulated} />
+      ) : null}
 
       {/* The frame. The narrow screen is not a CSS trick: the *server* already dropped the
           blocks hidden from a phone, so what is drawn here is the phone payload. */}

@@ -300,6 +300,54 @@ export type PagePreview = {
   published_revision_no: number | null;
   can_publish: boolean;
   issues: BlockIssue[];
+  /** The files this page's blocks name, and what can be done with each (REQ-063, slice 4). */
+  media: BlockMediaReport;
+  /** Files the tree names. */
+  media_file_count: number;
+  /** How many of them cannot be served. */
+  media_broken_count: number;
+  /** The server's one-line summary, or `""` when nothing is broken. */
+  media_warning: string;
+  /** Ids this frame is *pretending* are deleted, and name a file on this page. */
+  simulated_media: number;
+};
+
+/**
+ * One block's relationship with one file.
+ *
+ * Mirrors the server's `BlockMediaRef` rather than importing it, because the panel's own feature
+ * exports already bind server types by hand and `@omnion/types` does not carry the media report
+ * (it is a *content* report, not a block-registry document). The duplication is deliberate and
+ * narrow: a field added here without one on the server is a `undefined` in the panel, and the
+ * panel renders every field it is given.
+ */
+export type BlockMediaRef = {
+  /** Block that names the file. */
+  block_id: string;
+  /** The block's type (`image`, `gallery`). */
+  block_type: string;
+  /** Prop the file came from (`[0].props.src`). */
+  path: string;
+  /** The media id, as stored. */
+  media_id: string;
+  /** `live`, `trashed` or `purged` — see the server's `FileState`. */
+  state: "live" | "trashed" | "purged";
+  /** The viewport this block draws on, as `hide_on` names it. */
+  visible_on: "none" | "mobile" | "desktop";
+  /** A caption the block degrades to, when the file is gone. */
+  caption: string | null;
+  /** What to do about it, in the author's words. */
+  advice: string;
+};
+
+/** Every file a page's blocks name, and what can be done with it. */
+export type BlockMediaReport = {
+  /** One entry per block/prop pair that names a file, in tree order. */
+  refs: BlockMediaRef[];
+  /** Distinct files the tree names. */
+  file_count: number;
+  /** Distinct files that cannot be served. */
+  broken_count: number;
 };
 
 /** One file in a site's media library (`GET /api/v1/media`). */
