@@ -152,10 +152,18 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 delete "$API_NAME" >/dev/null
 fi
+# The CSRF secret is a **throwaway for this disposable stack**, not a credential: the database is
+# dropped and rebuilt at the top of this script and nobody outside this box ever talks to these
+# ports. It is here because its absence is a fail-closed refusal, not a warning — with no secret
+# configured the middleware answers *every* cookie-authenticated POST with 403, so the first-run
+# wizard cannot create the organization, no agent route can resolve a tenant, and one missing
+# environment variable turns the whole pass into hundreds of identical refusals that read like
+# hundreds of defects. The refusal is correct behaviour; an unconfigured QA stack is not.
 OMNION_DATABASE_URL="$(qa_db_url)" \
 OMNION_REDIS_URL="redis://127.0.0.1:6380" \
 OMNION_PORT="$API_PORT" \
 OMNION_ENV=development \
+OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-stack-only-not-a-real-secret}" \
   pm2 start "$API_BIN" --name "$API_NAME" --time >/dev/null
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
 curl -fsS "$API_URL/readyz" >/dev/null || { echo "[qa] API /readyz is not healthy"; curl -sS "$API_URL/readyz" || true; exit 1; }
