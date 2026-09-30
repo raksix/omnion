@@ -6412,3 +6412,74 @@ belongs with a queued restore in slice 3's worker. (c) The browser pass is still
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
 
+
+## 2026-09-30 — REQ-004 slice 4 (accessibility assertions) · three live regions a reader never heard from
+
+**What.** `builder-a11y.ts` (the sentences: what a card announces, what the save state says and
+how loudly, what a selection says, what a lock says) and its test, plus `LiveRegion` — one
+permanent, visually-hidden `role="status"` — wired into the save indicator, the connection
+notice, the selection and the lock banner. A QA probe (`builder-announcements`) reads the same
+surface in a browser.
+
+**The defect was structural, and invisible to every gate that had been running.** All three
+regions were **mounted conditionally**: the save indicator rendered a *different element* per
+state, so `dirty → saving → saved` replaced the node three times and announced nothing — and the
+only branch carrying a role was `conflict`, which appears after a second tab has already
+overwritten the author. The connection notice had the same shape. The lock banner was
+`role="status"` and absent from the tree on every screen *wider* than the breakpoint, which is
+the moment a reader most needs it, because a narrow screen is usually narrow *before* the page
+loads. A live region is announced when its content changes **while it is already in the
+accessibility tree**, so "rendered with a role" and "announced" are different claims, and only
+the first was true. The cards were worse: `role="button"` with a truncated label and
+`tabIndex={-1}` means a reader heard "Send mail, button" — no node type, no parameters, and
+**nothing at all when Tab moved the selection**, because an outline is a CSS class and not a
+text change. That last one is the same class of bug as tick 28's `Tab`: a keyboard feature that
+is complete, tested and silent.
+
+**A PARAMETER THAT IS UNSET HAS TO BE SAID AS UNSET.** `""`, `null` and `undefined` all render
+as nothing on the card, so a reader that skipped them would hear "to:" and stop — which reads as
+a broken render rather than a field nobody filled in. `""` is in the test alongside the other
+two precisely because it is the one a hand-written check forgets.
+
+**FIVE OF THE SIX FAILURES WERE THE INSTRUMENT, AND THE SIXTH WAS THE PRODUCT.** The guard had
+to be *seen* red, and every attempt to make it red first found a reason it could not be. Worth
+writing down, because four are one mistake in new clothes. (1) The guard sliced
+`SaveIndicator` → `ToolbarButton` and read `LiveRegion`, which is declared **between** them, so
+it reported a second live region on a file that had one — *a range delimited by the next known
+name is only as good as that name's position*, which is why it is brace matching now. (2) The
+string `role="status"` appears in this test's own comments explaining the rule, so counting it
+anywhere reported 3 declarations on a file with 1: **a guard that reads its own documentation
+as a violation is worse than no guard**, because the only fix is to delete the explanation. (3)
+The injection searched `' role="status"'` with a leading space; the attribute is on its own
+line, so it matched nothing and failed with "the injection did not take" — a message
+indistinguishable from a broken guard on a file that still had its region. (4) `replace` rather
+than `replaceAll` left the other regions in place, so the injection half-landed and the guard
+stayed green. (5) The first version shipped **both** `LiveRegion` and a near-identical
+`SaveRegion` — and that one was real: two components with the same role and different rules,
+one of which would have kept a stale `politeness` while the other was updated. The guard caught
+it, which is the argument for writing the guard before the second copy. **A test that has only
+ever been green is a comment with a test runner attached**, and four of the five defects above
+were defects in the test that was supposed to catch defects in the product.
+
+**Proof.** `apps/admin` **200/200** unit (17 new) · `tsc --noEmit` exit 0 ·
+`node --check scripts/qa/walkthrough.cjs` clean · the guard re-proved by injection
+(`role="status"` → `role="presentation"` in the file, the test names the missing region, file
+restored: 199/200, restored 200/200). Commit `635c5191` + the probe.
+
+**Not ticked, and why.** **A unit test cannot prove a screen reader speaks.** These are
+assertions about the DOM and about what the rules produce; only a reader confirms the speech,
+and this repo has no assistive technology in CI — so the criterion is left unticked on purpose
+rather than claimed on the strength of a green suite. The probe `builder-announcements` is wired
+and **has not run**: the pass in flight (`20260929-233341`) started before this commit and is
+still in the static-route sweep at 1170 clicks, so it has not reached the builder depth pass
+where the probe lives.
+
+**Next.** Read the pass in this order: `builder-announcements` first (it is new and it is the
+only thing that can move this criterion), then `shortcut-help`, `tab-walk` (whose load-bearing
+claim is `selectionAndFocusAgree`), `workflow-table` (`create.status` expects **201**), then
+`validate-classes`, `cmd-s-writes-once`, `two-tab-conflict`, `run-from-here`, `step-trace`. The
+walkthrough's probe must read the four regions *before* any save — that is the only moment the
+"permanently in the tree" claim is falsifiable — and a selection that speaks when `Tab` moves it.
+**Slice 4 cannot close on the sample-plugin run**: `plugins_enabled_for` is the seam **REQ-121**
+(wave 5b, unclaimed) fills, so no plugin node can appear in any browser, and building a plugin
+store on this branch would be taking a slice of another wave.

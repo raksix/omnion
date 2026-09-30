@@ -9669,6 +9669,126 @@ note({
     });
   }
 
+  // ---- What the builder announces (REQ-004 slice 4 — the accessibility assertions) --------
+  // The keyboard-only criterion is satisfiable by a canvas a screen reader cannot use, and no
+  // screenshot can tell the difference: an outline is a CSS class, a live region is a `span`
+  // clipped to a pixel, and both are invisible in a capture of the page. So this probe reads
+  // the *accessibility* surface, and the three claims are the three shapes the defect took.
+  //
+  // **A live region that appears with its text is not a live region.** The save indicator used
+  // to render a different element per state, so the region did not exist until the thing it
+  // had to announce had already happened. The probe therefore checks the region is in the DOM
+  // *before* anything is saved — the only moment the claim is falsifiable, because afterwards
+  // a region that exists proves nothing.
+  {
+    const regions = await page.evaluate(() => {
+      const read = (name) => {
+        const el = document.querySelector(`[data-live-region="${name}"]`);
+        if (!el) return { present: false };
+        const style = window.getComputedStyle(el);
+        return {
+          present: true,
+          role: el.getAttribute("role"),
+          live: el.getAttribute("aria-live"),
+          atomic: el.getAttribute("aria-atomic"),
+          text: (el.textContent ?? "").trim(),
+          // A region hidden from layout is removed from the accessibility tree, which is the
+          // same defect as not rendering it. `clip` is the honest check; `display: none` and
+          // `visibility: hidden` are the two that would pass a `count()` and fail a reader.
+          hiddenFromLayout: style.display === "none" || style.visibility === "hidden",
+          inTree: el.getClientRects().length > 0 || style.position === "absolute",
+        };
+      };
+      return {
+        total: document.querySelectorAll("[data-live-region]").length,
+        save: read("save-region"),
+        selection: read("selection-region"),
+        link: read("link-region"),
+        lock: read("lock-region"),
+      };
+    });
+
+    // The cards' own names. A card is `role="button"` with a truncated label, so a reader that
+    // heard only the visible text would announce "Send mail, button" — with no node type and
+    // no parameters, and nothing at all when Tab moved the selection.
+    const cards = await page
+      .locator("[data-node-id]")
+      .evaluateAll((els) =>
+        els.map((el) => ({
+          id: el.getAttribute("data-node-id"),
+          role: el.getAttribute("role"),
+          label: el.getAttribute("aria-label"),
+          // The visible text, for the comparison the probe exists to make.
+          visible: (el.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 40),
+        })),
+      )
+      .catch(() => []);
+
+    const named = cards.filter((card) => typeof card.label === "string" && card.label.length > 0);
+    // The name has to carry the node *type*, which is the fact the visible text does not: a
+    // reader who hears only "Send mail" cannot tell the first card of a rule from the last.
+    // `action.`/`event.`/`trigger.` are the registry's own dotted keys, so this reads the shape
+    // the product produces rather than a list of magic strings kept in the probe.
+    const namesNodeType = named.filter((card) => /[a-z]+\.[a-z]/.test(String(card.label))).length;
+
+    // A Tab press and then read the selection region — the third claim, and the one the
+    // previous two ticks could not have found by reading the shortcut list: a selection that
+    // moved is not a text change anywhere on the page.
+    const ids = cards.map((card) => card.id).filter(Boolean);
+    let selectionBefore = null;
+    let selectionAfter = null;
+    if (ids.length > 1) {
+      await page.locator(`[data-node-id="${ids[1]}"]`).first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(400);
+      selectionBefore = await page
+        .locator('[data-live-region="selection-region"]')
+        .innerText()
+        .catch(() => null);
+      await page.keyboard.press("Tab");
+      await page.waitForTimeout(600);
+      selectionAfter = await page
+        .locator('[data-live-region="selection-region"]')
+        .innerText()
+        .catch(() => null);
+    }
+
+    note({
+      step: "builder-announcements",
+      regionCount: regions.total,
+      // The structural claim. Read BEFORE any save, while the region is empty — a region that
+      // exists only after the event it should have announced has already passed.
+      saveRegionPresent: regions.save.present,
+      saveRegionRole: regions.save.role,
+      saveRegionLive: regions.save.live,
+      saveRegionAtomic: regions.save.atomic,
+      saveRegionHidden: regions.save.hiddenFromLayout,
+      everyRegionIsAStatus: [regions.save, regions.selection, regions.link, regions.lock].every(
+        (region) => region.present && region.role === "status",
+      ),
+      // A card that announces nothing is a card the author cannot verify.
+      cardsOnCanvas: cards.length,
+      cardsNamed: named.length,
+      allCardsNamed: named.length === cards.length,
+      cardsAsButtons: cards.every((card) => card.role === "button"),
+      // The name has to carry more than the visible text, or it is decoration.
+      namesNodeType,
+      namesGoBeyondVisibleText: named.filter(
+        (card) => String(card.label) !== String(card.visible).replace(/[. ]+$/, ""),
+      ).length,
+      sampleCardName: named[0]?.label ?? null,
+      sampleCardVisible: named[0]?.visible ?? null,
+      // And the selection has to speak when it moves.
+      selectionRegionPresent: regions.selection.present,
+      selectionBefore,
+      selectionAfter,
+      selectionAnnouncedOnMove:
+        typeof selectionBefore === "string" &&
+        typeof selectionAfter === "string" &&
+        selectionBefore.length > 0 &&
+        selectionAfter.length > 0,
+    });
+  }
+
   // ---- ⌘/ and the shortcut list (REQ-004 slice 4) -----------------------------------------
   // The criterion is "⌘/ help", and the interesting part is that an overlay which *renders* is
   // the easy half. The claim worth measuring is the one a screenshot cannot: **the list does
