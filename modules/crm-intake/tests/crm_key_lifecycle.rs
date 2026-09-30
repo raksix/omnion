@@ -329,6 +329,82 @@ async fn a_form_bound_source_is_not_reachable_by_any_key() {
     drop_org(&pool, org).await;
 }
 
+/// A digest that reached a form-bound row by a route *other* than rotation still does not open
+/// the public path.
+///
+/// This is the half `rotate_key`'s guard cannot cover, and it is the test that would go red if
+/// only the guard existed. A digest is the *fact that a key was written*, not the boundary: a
+/// restored dump, a hand-written insert, an import tool and a future kind's own migration all
+/// put one on a row without asking `rotate_key`. So the row is given a real digest for a real
+/// issued key, by raw SQL — the way those paths would — and the lookup must still refuse it.
+///
+/// The contrast is the point: *the digest is stored* passes on its own, and only the lookup can
+/// tell an unkeyed row from an unaddressable one. Both are asserted, in that order, so a reader
+/// sees which one the fix moved.
+#[tokio::test]
+async fn a_digest_written_onto_a_form_source_still_does_not_open_the_public_path() {
+    let pool = pool().await;
+    let org = fresh_org(&pool, "smuggled digest").await;
+    let source_id = form_source(&pool, org).await;
+    // A key that belongs to a real endpoint source, copied onto the form row by hand — the
+    // exact state a restored dump or an import tool would leave behind.
+    let (endpoint_id, borrowed) = endpoint_source(&pool, org).await;
+
+    // Write a real digest onto the form-bound row by hand — a path that never calls rotate.
+    sqlx::query(
+        "update crm_intake_sources set endpoint_key_hash = $2, endpoint_key_hint = 'smug' \
+         where id = $1",
+    )
+    .bind(source_id)
+    .bind(omnion_module_crm_intake::hash_key(&borrowed))
+    .execute(&pool)
+    .await
+    .expect("the hand-written digest");
+
+    let digest_present: Option<String> =
+        sqlx::query_scalar("select endpoint_key_hash from crm_intake_sources where id = $1")
+            .bind(source_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the source's key column");
+    assert!(
+        digest_present.is_some(),
+        "the premise of this test: the digest really is stored, so a lookup that matched on \
+         the digest alone would have served this row"
+    );
+
+    // The digest resolves to the *endpoint* row, never to the form-bound one that carries the
+    // same value — and the id is what makes that readable. The first draft of this assertion
+    // demanded `None` and failed with `Some(<endpoint id>)`: the two rows share a digest, and
+    // `fetch_optional` returns the row that is legitimately addressable. That is the correct
+    // product answer and the assertion was the thing that was wrong — a test that names the
+    // wrong expected value sends the next reader to fix the product instead of the test.
+    assert_eq!(
+        resolvable_by_key(&pool, &borrowed).await,
+        Some(endpoint_id),
+        "the digest resolves to the key-bearing source, never to the form-bound row that \
+         carries the same value — a key is not an address, the kind is"
+    );
+
+    // Now the control that keeps the assertion above honest: deactivate the *endpoint* row and
+    // the same digest must resolve to nothing at all. Without it, the assertion would also pass
+    // on a build where `find_source_by_key` answered `None` unconditionally — the same trap as
+    // a test that measures its own fixture.
+    sqlx::query("update crm_intake_sources set active = false where id = $1")
+        .bind(endpoint_id)
+        .execute(&pool)
+        .await
+        .expect("deactivate the key-bearing source");
+    assert_eq!(
+        resolvable_by_key(&pool, &borrowed).await,
+        None,
+        "with no key-bearing row left, the same digest resolves to nothing — so the assertion \
+         above was answering about the kind and not about the digest being unmatchable"
+    );
+
+    drop_org(&pool, org).await;
+}
+
 /// The patch path cannot be used to smuggle a key in either.
 ///
 /// `update_source`'s `SourcePatch` has no key field and this test pins that: a key can only
