@@ -6418,3 +6418,98 @@ inline result. The drawer rows are now *provable by a walk* rather than by a bro
 deliveries exist — so the next quiet-box tick should run `bash scripts/qa/run.sh` with
 `QA_ONLY=notifications,notifications-outbox,notifications-settings`, then close REQ-021 and move
 to REQ-014 (system health, still `pending`).
+
+## tick 34 (wave7) — the ops-tool criterion, and a merge that had to be hand-resolved four times over
+
+**Merged `origin/main` first (31 commits behind), and the merge was the work.** Four files
+conflicted. Three of them were not text conflicts:
+
+- `scripts/qa/walkthrough.cjs` — **both branches independently added an `--only` filter**, so the
+  merge produced **two `const ONLY` declarations** and the file did not parse. The survivor is the
+  superset (`wants(name, route)` can expand an area name to reach a depth pass that has no path;
+  the bare `wants` cannot). Ten further blocks were HEAD's `inScope("area")` against main's
+  `wants("name") { matchedOnly.add(...) }`; the name filter wins because `matchedOnly` is what the
+  end-of-file empty-pass finding reads. The route list is the **union**: HEAD's `area:` rows plus
+  main's five security screens, which until now no pass had ever opened.
+- `scripts/qa/run.sh` — HEAD's delete-then-start kept (it is a real fix: `pm2 restart` re-executes
+  the path recorded at first start, so a corrected binary kept running the old one), with the
+  `OMNION_CSRF_SECRET` argument it needs.
+- `apps/api/src/main.rs` — the runner import is the union of both sides.
+- `docs/BUILD-LOG.md` — spliced with `scripts/qa/merge-build-log.py`, verified as a multiset
+  against **both** parents (not a line count, which adds up while duplicating a block).
+
+**Proof the resolution lost nothing.** `node --check` and `bash -n` pass. Every depth-pass
+invocation and every route entry was compared as a **multiset against each parent**: 50 depth
+passes and 88 routes merged, `LOST from mine: none`, `LOST from main: none`. A hand merge that
+reads clean is not evidence; a merge that drops one of main's twenty-one blocks is.
+
+**The falsification tick 33 owed, paid.** Put `content.search`'s permission back to the fictional
+`content.read` and ran the one test:
+
+```
+thread '...no_tool_names_a_permission_the_platform_cannot_grant' panicked at ops_binding.rs:599:
+content.search names permission `content.read`, which is not a key of the platform's permission
+catalogue, so no role can ever grant it and the tool is permanently denied
+--- verdict ---
+PASS: the test went red AND named both the tool and the ungrantable key.
+```
+
+Restored by an `EXIT` trap, not a follow-up line — the first attempt at this pair lived inside a
+300 s `execute_code` cell that timed out and left `catalogue.rs` holding the falsified value for
+the rest of the tick. `git diff` on `catalogue.rs` is empty and the test is green again.
+
+**The ops-tool criterion (REQ-100), which is two claims in two different layers.** That split is
+the finding, not a detail. The *command* half is a property of the tool's **schema**: every tool
+ships `additionalProperties: false`, so `{"site_id": "…", "command": "rm -rf /"}` is refused before
+any service is reached. The *tenancy* half is a property of the **query** and is not in the
+registry at all — the tool table carries no organization. `logs.read` binds to `events.read`, whose
+surface is `omnion_events::store::list_events`; that function takes
+`organization_id: Option<Uuid>` and documents `None` as "reads every organization's" (the
+platform-wide feed retention needs). Both readers go through it, so **there is no scoped variant to
+forget to call** — the only thing between a scoped read and a cross-tenant dump is the `Option` the
+caller passes.
+
+- `a_deployment_tool_cannot_be_invoked_with_a_raw_command` — all four install-touching tools, and
+  the refusal must **name the field**: a tool that only said "invalid arguments" is a schema a
+  model cannot learn from.
+- `no_ops_tool_accepts_a_command_shaped_argument` — the same rule keyed on the `ops` **class**, not
+  on a list of four, so the next ops tool inherits it.
+- `apps/api/tests/ai_tool_log_scope.rs` — two organizations, one event each, identical shape; an
+  org-scoped read answers exactly one. Not blanked, not redacted: absent. Its companion proves the
+  same function with `None` answers **both**, which is what makes the first a scope rather than a
+  coincidence.
+
+**Two helpers I invented and had to delete.** I wrote `crate::testing_db` in `ai-hub` and
+`crate::tests::scratch_pool` in `events` before checking whether either existed. Neither does —
+`ai-hub` is a unit-test crate with no DB harness, and this repo's DB-backed walks live in
+`apps/api/tests/` with a per-test throwaway database. Both files were restored from git and the
+tenancy proof moved to where the harness actually is. The cost was two compile cycles; the
+lesson is that `grep` for the helper is cheaper than a 15-minute link on a load-90 box.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` — **429 passed, 0 failed** (10 in `ops_binding`, 2 of them
+  new).
+- Falsification — red **and** self-naming, then restored and re-green.
+- `apps/api/tests/ai_tool_log_scope.rs` — **2 passed, 0 failed** against a real database (28.4 s),
+  with zero scratch databases left behind.
+
+**Both walks failed the first time, and the failure was mine, not the code's.** `left: 0,
+right: 1` — against a database that demonstrably held two organizations and two events (checked
+with `psql` against the orphan the panic left behind). The filter was correct and the **page size
+was zero**: `EventFilter` derives `Default`, every field is an `Option`, and the derived `limit` is
+`0`. The route fills it from the query string; `..Default::default()` does not, and a
+`truncate(limit)` makes a zero limit answer zero rows. `Default` on an all-`Option` struct is a
+trap because it reads as "no filter" and is actually "match nothing" — the fix names the limit in
+one helper (`filter_for`) rather than at each call site, and the reason is in its doc comment.
+
+Two of my own new tests, four of my own unchecked claims this tick: the `json!` import, the
+`input_schema` thunk (`fn() -> Value`, not a `Value`), `crate::testing_db`, and a `Default` that
+means the opposite of what it looks like.
+
+**Not run this tick: `cargo test --workspace`, `pnpm build`, and the QA pass.** The box sat at load
+87–94 with 5–8 concurrent `rustc` from sibling writers, and one `cargo build -p omnion-api` hit its
+900 s cap mid-dependency. The closing gate is a REQ CLOSE tick's work and the queue is not empty;
+it is the next tick's first job on a quieter box.
+
+**Next.** The last two boxes of REQ-100: every screen's empty/loading/error states, and the
+workspace + QA gate. Then REQ-101 (AI approvals & action preview).
