@@ -8131,3 +8131,72 @@ shared and `/mnt/apopic` is at 97%, so a pass was not the right instrument for t
 which need that pass. Move to **REQ-014 (system health, `pending`)** — it is the first item in wave
 order with no code at all, which is worth more than a fourth box on a REQ whose remaining boxes are
 all waiting on the same missing instrument.
+
+## Tick 42 — REQ-019 slice 2: the headless content read surface
+
+**What.** The token minted in slice 1 finally has something to read. Six routes under
+`/api/v1/content/*` (pages, pages/{slug}, posts, posts/{slug}, media, sites) plus the served
+OpenAPI 3.1 document, behind a `ContentToken` extractor. Slice 1's done line — "a created token
+authenticates and a revoked one is refused" — is now provable *through HTTP* instead of against the
+store, which is the only way the claim was ever worth anything.
+
+**Proof — what ran, and what did not.**
+
+- `origin/main` merged at the start of the tick (`0373c630`). The BUILD-LOG conflict went through
+  `scripts/qa/merge-build-log.py`; its multiset gate reported no entry from either side missing, and
+  the one line the advisory flagged was checked by hand in both parents and in the merge (2 / 2 / 2).
+- Disk first: `/mnt/apopic` opened the tick at **100% full, 0 bytes free**, with a load of 85 and
+  `free -g` at 0. Reclaimed 0.94 GB from this worktree's own `deps/*` by crate stem.
+- `cargo test -p omnion-content --lib` and the two API suites: **started, not finished.** The box
+  never gave them CPU. Ten writers at load 73–101 on six cores, `vmstat` showing 69 runnable and a
+  `%CPU` column reading 0.0 for every process including cargo's own — the machine is not merely
+  busy, its CPU accounting has stopped crediting work. Both cargo processes sat in
+  `futex_do_wait` at 0% for 40+ minutes.
+- **No acceptance box is ticked.** Nothing about the two suites is known yet, and the REQ status
+  line says exactly that in those words.
+
+**Two mistakes worth writing down, because both cost the tick.**
+
+1. **The deps de-duplication from tick 40, repeated while a build was running, broke that build.**
+   The trick — group `deps/*` by crate stem, keep the newest mtime, drop the rest — is correct in
+   principle. I applied it in the same tick that had a 40-minute integration build in flight
+   against the same target. It died with `error[E0463]: can't find crate for 'rustls'`, then the
+   same for `hyper`, `hyper_util` and `tokio_rustls`: four unrelated crates, all missing, at once,
+   in a build that was working thirty seconds earlier. That is the signature of an `rm` of an
+   `.rlib` during a link, and it impersonates a corrupted registry. **`lsof +D` on the target first,
+   and never sweep a directory a live cargo is pointed at.**
+2. **`cargo fmt -p <crate>` is a repo-wide operation wearing a per-crate name.** It rewrote 49
+   files across `omnion-content` and `omnion-api` — module and `pub use` reordering, 125 lines of it
+   in `routes/mod.rs` — and none of it was mine. Reverting with `git checkout --` then re-applying
+   only my own hunks left a diff of `+22 / -0`, which is the number to insist on. A per-crate
+   formatter's output is a diff to review, never a cleanup to trust.
+
+**What the code does, and the three decisions in it.**
+
+- **A cursor is a keyset over `(sort_value, id)`, signed.** An offset cursor works until the first
+  deletion, which is exactly the moment a frontend rebuilding its cache cares about. The digest is
+  over a domain-separated payload, so a hand-edited value is refused with a `400` naming `cursor`
+  rather than being read as a query.
+- **`fields` is a projection that cannot orphan a response.** The identity keys (`id`, `slug`,
+  `type`, `locale`, `updated_at`, plus `etag`) are unioned in *inside the parser*, so no render site
+  can forget them. A response stripped of its own addressing cannot be cached and cannot ask for
+  the next page.
+- **A site scope is a filter; a `403` is a confirmation.** A single-site token naming another site
+  gets an empty list, which makes a non-existent site, an existing empty site and a forbidden site
+  indistinguishable. The nil-uuid the filter returns is the mechanism, and the `filter(|site| *site
+  != Uuid::nil())` that turns it into "no rows" is the part that must not be forgotten.
+- **A panel session is refused.** These are the only token-authenticated routes in the v1 tree, on
+  purpose: a session is a human inside the organization, and this surface exists to hand published
+  content to something outside it. A session fallback would make every integrator's token optional.
+
+**The OpenAPI document is generated from the endpoint table the routes are documented by**, not
+maintained beside it — a hand-written document and a hand-written validator drift, and the drift
+shows up as a parameter the validator refuses and the document never mentioned. It also carries the
+note the brief's own path demands: `/api/v1/media` is the *panel's* session-authenticated CRUD
+surface, the token-authenticated one is `/api/v1/content/media`, and reusing a path with two auth
+models would be a security trap.
+
+**Next.** Read both suites' numbers before writing another line — that is the only unmeasured thing
+about this slice. Then the `/content-api/docs` tab (the document is already served; only the screen
+is missing), and then slice 3: the explorer with real calls, Redis metering, the rate limiter with
+`429`/`Retry-After` and the usage tab.
