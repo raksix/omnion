@@ -32,7 +32,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
-import { ChevronDown, ChevronRight, Loader2, Search, TriangleAlert } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2, Pause, Search, TriangleAlert } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
 import { LoadingTable } from "@/components/loading-table";
@@ -155,8 +155,24 @@ export function AiPermissionsView({ organizationId }: { organizationId?: string 
   if (matrix === null && error === null) return <LoadingTable columns={5} />;
   if (matrix === null) {
     return (
-      <div role="alert" className="rounded-md border border-rose-500/40 bg-rose-500/5 p-3 text-sm">
-        {error}
+      <div
+        role="alert"
+        className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-rose-500/40 bg-rose-500/5 p-3 text-sm"
+      >
+        <span>{error}</span>
+        {/* The retry the other two screens in this wave carry. This one rendered the message and
+            stopped, which is the dead end the acceptance criterion names: a failed matrix fetch
+            left the operator staring at a red sentence with no way back except a full page
+            reload. The error string is kept rather than replaced by a generic "try again" because
+            a 403 has to stay legible — it means the viewer lacks a permission, and retrying will
+            not change that. */}
+        <button
+          type="button"
+          onClick={() => void load()}
+          className="shrink-0 rounded-md border px-2 py-1 text-xs"
+        >
+          Retry
+        </button>
       </div>
     );
   }
@@ -293,9 +309,18 @@ export function AiPermissionsView({ organizationId }: { organizationId?: string 
                             {column.gated(tool.key) && (
                               <span
                                 title="This agent parks the run for a person instead of running it"
-                                className="ml-1 text-[10px] text-violet-600 dark:text-violet-400"
+                                className="ml-1 inline-flex align-middle text-violet-600 dark:text-violet-400"
                               >
-                                ⏸
+                                {/*
+                                  A Lucide icon rather than a ⏸ glyph: the emoji-shaped character
+                                  renders at a different weight and baseline on every platform and
+                                  cannot inherit `currentColor` reliably, so the marker that means
+                                  "a person must approve this" ended up a different size from the
+                                  tri-state cell it annotates — including as the only symbol on the
+                                  screen that no screen reader announced as an image.
+                                */}
+                                <Pause className="size-3" aria-hidden="true" />
+                                <span className="sr-only">gated behind approval</span>
                               </span>
                             )}
                           </td>
