@@ -4636,3 +4636,88 @@ at; a pass that barges into a live sibling's slot steals rather than fixes.
 walkthrough leg for each — the panel branches the conditional fields and only the shape
 assertions are written. (c) Slice 2c, the queued/abortable worker, is still the honest home
 for a real abort: a cancel that cannot undo a half-written library is a dead control.
+
+## 2026-09-30 · tick 72 · the nine-element array
+
+**REQ-013** (slice continuation). Not a new screen this tick: a defect that made six screens
+wrong at once, found while auditing the uncommitted diff left behind by tick 71.
+
+**What the defect was.** `time`'s `Serialize for OffsetDateTime` has two arms — a formatted
+string for a human-readable serializer, and a **nine-element tuple** as the fallback. The
+string arm is gated on the crate feature `serde-human-readable`. The workspace declares
+`serde-well-known`, which enables `serde`, `formatting` and `parsing` and *leaves
+`serde-human-readable` off*. So the arm that ships is the tuple. Proved rather than recalled,
+against the vendored crate's own source and then against a scratch binary:
+
+```
+bare  = {"created_at":[2026,273,1,39,51,668190318,0,0,0],"maybe":null}
+rfc   = {"created_at":"2026-09-30T01:39:51.668190318Z"}
+```
+
+**Why it survived this long.** Nothing above the serialiser objects. `apps/admin/lib/api.ts`
+declares `expires_at: string`, so `tsc` is green; `formatTimestamp` guards with
+`Number.isNaN` and returns `"—"`; `new Date([2026,273,…])` is `Invalid Date`, so the guard
+fires and swallows it. The result is that a share link which expires renders no expiry, a
+scan run shows no time, a retention run shows no window, a delivery shows no attempt, and the
+schedule table's next-run cell sits empty beside a cadence sentence. **An em dash for "this has
+not happened yet" is pixel-identical to an em dash for "this value was lost"**, and every one
+of these screens has legitimate reasons to show the first. That is the whole defect class: a
+loss that renders exactly like a designed answer.
+
+**Scope found by scanning, not by memory.** Twenty-eight fields across seven route modules —
+`backups`, `commands`, `media_files`, `media_retention`, `media_scan`, `media_shares`,
+`webhooks` — covering `BackupBody`, `StatusBody`, `SettingsBody`, `ScheduleBody`, `ShareBody`,
+`RunBody`, `ScanRunBody`, `QuarantineBody`, `RecentItemBody`, `DeliveryBody`,
+`RetentionRunBody`, `SweepBody`, plus the two list-query filters.
+
+**The half that nearly shipped in the same commit.** `#[serde(with = "…::option")]` on a
+**query** field makes serde *require the key*. The fix for "the date filter returns 400"
+turns every ordinary unfiltered list — `{}` — into `400 missing field created_after`, so the
+obvious improvement would have broken every screen that filters. The annotation needs `default`
+alongside it, and the absence case is the one that has to be asserted:
+
+```
+with_only   absent -> Err("missing field `created_after`")
+with_default absent -> Ok
+```
+
+**A third finding, from the test rather than the code.** `axum::extract::Query` deserialises
+**snake_case** query parameters, and `ListQuery` carries no `rename_all`. My first draft of the
+test sent `createdAfter`, it parsed without error, and the assertion "the filter parsed" passed
+for a filter that was never applied — an unmatched key is ignored rather than refused. The test
+now asserts the snake_case name binds *and* that the camelCase spelling does not, because
+"parsed" and "parsed into nothing" are the same green.
+
+| Gate | Result |
+| --- | --- |
+| `wire_dates` | **4/0** (new suite) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `no_serialised_struct_carries_a_bare_instant` | **negative-proved** — removing one attribute turns the suite red with `ShareBody.created_at serialised as [2026,273,2,0,0,0,0,0,0]` and names `media_shares.rs:71` |
+| QA browser pass | **deferred** — the single slot is a live w3 pass (holder pid 3355724, alive), load 12–28 with sibling stacks compiling |
+
+**Three of my own bugs, all from trusting a shape I did not read.** (1) The patcher added a
+second `#[serde(with = …)]` under a four-line `#[serde(with = …, skip_serializing_if = …)]`,
+producing `duplicate serde attribute` and then a cascade of six `E0277`s from the derive — the
+one-line lookback that skipped an existing annotation is the same lookback the *gate* was
+written with, so the gate got the same bug and had it fixed before it ever ran. (2) Every
+struct literal in the new test was written from memory: `ScheduleBody` has no `updated_at`,
+`RunBody` has no `dry_run` or `purged_files`, `StatusBody` nests a `StatusTotals`, and
+`ScanRunBody` has `kind`/`outcome`/`flagged` rather than `status`/`clean`/`infected`. Twenty
+`E0560`s, all of them mine. A test whose fixtures are invented is a test of the author.
+(3) My first assertion helper treated a `None` instant as a failure, so it demanded a string
+from a field whose correct wire value is `null`. The array is the failure; the null is the
+answer, and they render identically — which is the reason the defect survived.
+
+**Toolchain.** `cargo fmt -p omnion-api` reformatted **nine files I had not touched** and, worse,
+85 unrelated lines *inside* `backups.rs` — a file I do own, so the usual "revert the foreign
+set" habit does not catch it. The commit was rebuilt from `git show HEAD:apps/api/src/routes/
+backups.rs` plus only the eleven attributes, which is why the diff is 11 added lines and zero
+elsewhere. The invariant generalises: *owning the file is not the same as having written the
+line.* `cargo fmt` is not run at the crate level in a ten-worktree workspace.
+
+**Next.** (a) The browser pass, when the slot is free — `runBackupSchedules` asserts the
+next-run cell carries a date and the zone, and this tick explains why that cell was blank even
+with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
+belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
+this tick looked at.
