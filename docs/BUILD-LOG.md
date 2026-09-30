@@ -7225,3 +7225,60 @@ gave them one value. The address threshold is now `lockout_attempts * 3`.
 
 **Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
 naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
+
+## Tick 76 — 2026-09-30 — wave 2, tick 35 — merge(origin/main), then the half of acceptance 17 nobody measured
+
+**What.** `origin/main` had moved eight commits (the pass budget, the CSRF secret, the identity
+lockout). The merge produced three conflicts in `scripts/qa/run.sh` and one in the BUILD-LOG.
+
+**Every `run.sh` conflict was resolved by keeping BOTH sides**, because each side's half was a
+feature the other half's author had not noticed was missing:
+
+| Hunk | This branch | main | What picking one would have cost |
+|---|---|---|---|
+| after the build | copy the scratch-target binary to `target/debug` | the `OMNION_CSRF_SECRET` comment | a scratch-target build leaves `target/debug/omnion-api` absent and the pass dies with *no report*; without the secret every cookie-authenticated write answers 403 and the screens still look like they work |
+| pm2 env | `OMNION_ADMIN_EMAIL`/`PASSWORD` | `OMNION_CSRF_SECRET` | the same two lines from both sides, so the union is both |
+| walkthrough call | `--api "$API_URL"` | `QA_ONLY` as a bash **array** | `walkthrough.cjs` declares `URL_API = process.env.QA_API_URL || arg("api", URL_ADMIN)`, and the admin origin is not the API origin; main's unquoted `${QA_ONLY:+…}` word-splits a comma list, which `--only` does not read |
+
+**BUILD-LOG** merged with `scripts/qa/merge-build-log.py`: `base=4918 ours=7177 theirs=4968
+merged=7227`, every `## ` entry of both sides present, 108 block headings. The line-delta advisory
+is not a failure here — a log full of ``` fences and `---` rules reports those as "missing" the
+moment the merge holds more copies than one side did.
+
+**Then acceptance 17's remaining half, and the half was not merely unticked.** The criterion
+reads "usable at 1440 px and 390 px without horizontal scroll (read-only notice on the phone)" and
+`runBlockEditorDepth` called `setViewportSize` **zero** times in 880 lines — so the 390 px claim
+was being read off a screenshot of a 1440-wide page, the one measurement that cannot fail. The
+product half was missing too: `grep matchMedia apps/admin` returned a single hit, in analytics, so
+a phone received the full three-pane editor with a 19rem inspector below the fold.
+
+`c9e88cc1` ships both halves:
+
+* the viewport is **measured** (`matchMedia`, 901px) and carried into the DOM as
+  `data-block-editor-narrow` / `-editable`, so the assertion is about the product and not about a
+  button that happens to be dim;
+* narrow **removes** the outline and the inspector rather than stacking them, and the canvas
+  switches to the same component the public renderer draws with — a read-only editor showing a
+  *different* preview of one tree would be a third implementation of "what the page looks like";
+* the notice carries the REQ's own sentence and offers the preview, which stays fully usable;
+* 18 new steps measure both widths at the end of the pass, on a page that has real blocks, and
+  restore the viewport in a `finally` — a pass whose failure changes what the rest of it measures
+  reports somebody else's bug.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo check -p omnion-api -p omnion-identity` (post-merge) | exit 0, 13 pre-existing warnings |
+| `apps/admin` `tsc --noEmit` | clean |
+| `bash -n scripts/qa/run.sh` | clean, 0 conflict markers |
+| `merge-build-log.py` | 7227 lines, 0 entries lost, 108 headings |
+| QA pass | **queued, not run** — a live w3 pass (holder 4127477, cwd `/mnt/apopic/omnion-w3`) holds the single place; `df` at queue time 82% |
+
+**No acceptance box is ticked.** A pass that has not run is not evidence, and criterion 17 also
+still owns `publicRendered` — the `fef91938` site-hint fix is shipped and unproven for the same
+reason.
+
+**Next.** (a) Read that pass's `summary.json` for the new 390/1440 steps and `publicRendered`; tick
+17 only when both halves are green. (b) REQ-064's open slices. (c) REQ-062 acceptance 15's render
+half — the scaffolder compiles a theme but has never been watched drawing one.
