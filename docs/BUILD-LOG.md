@@ -7893,3 +7893,42 @@ the queue is the harness working, not failing. Tick the box only when the pass m
 reliability screens against a tenant that exists.
 
 **Next:** read the pass, tick the box, close REQ-127; then REQ-128 (deployment tooling).
+
+## 2026-09-30 — omnion-w6 tick 35 — five empty directories, and the pass that made them
+
+Two of my confirming passes left `qa-artifacts/<ts>/` **empty**, and a third tick was spent
+deciding whether that meant "a pass ran and died" or "no pass ran". Both directories were
+created at 18:53:17 — the same second my log's only line was written: `waiting for a QA
+slot`. That is the whole story, and it was sitting in the artifacts the whole time.
+
+**The defect is an ordering bug in `run.sh`, and it is not w6's.** `mkdir -p "$OUT"` sat on
+line 17; the QA slot is taken on line 64; the first trap is installed on line 92. A pass
+killed while queued therefore leaves a directory and nothing else — and an empty directory
+is indistinguishable from a pass that started. It is box-wide: five of nine worktrees had
+empty artifact directories today, two of them mine. The harness could report a verdict and
+had no way to report *nothing happened*.
+
+**The fix writes the absence eagerly, because a SIGKILL never runs an EXIT trap.** I tried
+the trap first and the gate caught it — a queued pass killed with `timeout -s KILL` runs
+no trap, so the record has to exist before the wait, not be written on the way out. The
+directory is now created with a `QUEUED.md` and a `summary.json` carrying `"void": true`,
+and both are retired the moment the pass owns a slot, because a stale void summary next to
+a real one is the same ambiguity this change exists to remove.
+
+**Two of my own gates were wrong before the fix was proven.** The first version reset a real
+QA database and wrote into the repository's `qa-artifacts/` — `run.sh` derives ROOT from
+its own location, so the only honest way to redirect it is to run a staged COPY. The second
+assumed `QA_SLOT_WAIT=3` meant "blocked"; it means "wait three seconds, then proceed anyway",
+so the pass reached the `rm` that retires the record and the check failed against correct
+code. Both times the honest reading was that the gate was wrong. **A gate that goes red
+because its premise is wrong teaches one thing only: fix the gate, or delete it.**
+
+`queued-pass-evidence.sh` 7/7, of which **2 are red against the pre-fix script** — it runs
+the real `run.sh` under the real failure rather than grepping it for the shape of the fix.
+
+**Gates.** `bash -n run.sh` and the gate clean · `queued-pass-evidence` 7/7 (discriminating)
+· `qa-slot-queue` all cases pass · `wizard-behaviour` 8/8 · `wizard-gate` 5/5 ·
+`focused-pass-args` pass · `node --check walkthrough.cjs` clean.
+
+**Next.** REQ-127's close box still needs a pass that reaches the walkthrough. The gate for
+that is unchanged: all three reliability screens measured against a tenant that exists.

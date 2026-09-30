@@ -14,7 +14,6 @@ cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
 OUT="$ROOT/qa-artifacts/$TS"
-mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"
 ADMIN_PORT="${QA_ADMIN_PORT:-3100}"
@@ -58,16 +57,74 @@ wait_http() { # url, seconds
 # side by side. Take a slot first so the passes queue instead of all landing on the
 # machine at once; the wait is bounded and then the pass proceeds regardless.
 # One pass at a time on this box: it is the difference between load 20 and load 6.
+#
+# A pass that never reached the walkthrough has to be able to say so. The artifact
+# directory used to be created on the first line of the script, BEFORE this wait and
+# before any trap was installed, so a pass that was killed while queued left an empty
+# `qa-artifacts/<ts>/` behind. An empty directory reads exactly like a pass that started
+# and died: `ls -1t qa-artifacts` shows the newest entry either way, and the next tick
+# spends itself deciding which of the two it is looking at. On 2026-09-30 five of nine
+# worktrees had empty artifact directories, two of them mine, and two ticks were lost to
+# directories that were never passes.
+#
+# So the directory is created BEFORE the wait, stamped as a queued record, and converted
+# into a real pass only once this script has a QA slot and is about to do real work. A pass
+# killed while queued therefore leaves a summary that declares itself void instead of an
+# empty directory that claims a walkthrough happened.
+mkdir -p "$OUT"
+write_queued_record() {
+  cat > "$OUT/QUEUED.md" <<EOF
+# QA pass queued, not run
+
+- When: $TS · stack: \${QA_STACK:-main}
+- This pass was created and never reached the browser walkthrough.
+
+The artifact directory is created before the QA slot is taken, so a pass killed while
+queued would otherwise leave an empty directory that reads like a pass that ran. This file
+is the record of the queue; \`summary.json\` marks the pass void until the walkthrough runs.
+EOF
+  python3 - "$OUT/summary.json" <<'PY'
+import json, sys
+json.dump(
+    {
+        "void": True,
+        "reason": "queued-and-never-ran",
+        "detail": "the pass did not reach the browser walkthrough; it was killed or timed out while waiting for a QA slot",
+        "counts": {"clicks": 0, "screenshots": 0, "shotFailures": 0},
+        "findings": [],
+    },
+    open(sys.argv[1], "w"),
+    indent=2,
+)
+PY
+}
+write_queued_record
+# Stamped as soon as this pass owns a place and is about to do real work. `release` below
+# is the only trap once a place is held; this one exists for the window before that.
+QA_PASS_STARTED=0
+queued_exit() {
+  [ "${QA_PASS_STARTED:-0}" = "1" ] && return 0
+  printf '[qa] queued pass never reached the walkthrough; void record kept in %s\n' "$OUT" >&2
+}
+trap queued_exit EXIT INT TERM
+
 QA_SLOT_PID=""
+# Free the place whenever this pass ends, however it ends.
 if [ "${QA_SLOTS:-1}" != "0" ]; then
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
   QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
 fi
-# Free the place whenever this pass ends, however it ends.
+
 if [ -n "$QA_SLOT_PID" ]; then
   trap 'kill "$QA_SLOT_PID" 2>/dev/null || true' EXIT INT TERM
 fi
+
+# The pass has a place and is about to do real work, so the queued record is retired: the
+# walkthrough owns `summary.json` from here, and a stale void summary next to a real one is
+# the same ambiguity this change exists to remove.
+QA_PASS_STARTED=1
+rm -f "$OUT/QUEUED.md"
 
 # The QA servers are disposable: a pass starts them, walks, and the next pass can
 # start them again. Leaving seven stacks of three servers running between passes cost
