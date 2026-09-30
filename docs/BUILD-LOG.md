@@ -7347,3 +7347,73 @@ Nothing here is a REQ-046 or REQ-004 defect; the measurements that close them ar
 pass to reach `ai-workflows` and click the approval bar; REQ-004 has thirteen criteria whose probes
 are built and whose measurements are all still missing. If the pass survives to the depth passes
 this tick, the two are one measurement apart from both closing.
+
+## Tick 37 — the harness seeded half an installation, and the filter was a no-op
+
+**What.** Four commits, all in the harness, none in the product: `8bcd0fc4` (resume the first-run
+wizard), `a92bae31` (a selfcheck for that decision, legacy function kept beside it), `a22036cb`
+(`arg()` read `--only=` as absent) and `0f39548d` (a depth pass is coverage; a focused pass has no
+page to publish). Then the measurements, which are the first this stack has ever produced.
+
+**The defect that removed the tenant.** `runWizard` asked "is there anything to do?" from the URL:
+`if (!url.includes("/setup")) return`. The owner step answers with a redirect to `/login` — a
+half-built installation has no session to keep — so the walk read that as "installation already
+exists" and returned. `run.sh` resets the database, so this happened on **every pass**: 1 user, **0
+organizations, 0 sites**. Downstream, every org-scoped fixture read `''` for a uuid and psql answered
+`invalid input syntax for type uuid: ""` — the exact string REQ-046 has been blocked on — the
+analytics seed reported `accepted: 0, spread: skipped` (indistinguishable from a product that collects
+nothing) and six media passes said "did not render". The URL is the wrong question;
+`/api/v1/onboarding` answers it and `/setup` is resumable by URL.
+
+**Proof it was the tenant, not the product.** The focused pass now prints
+`half built, /setup is resumable`, the wizard finishes, and the panel answers `completed: True` with
+**1 org / 1 user / 1 site**. Downstream, for the first time on this stack: the analytics seed returns
+`accepted: 4, spread: applied` with a real 202, `media upload: uploaded: true, listed: 2`, and the
+depth passes that used to print `undefined` print data — `automations` with 12 steps and a real rule
+href, `automations-operations` with run history, a trace, retry, three versions and a template
+install. `--selfcheck-wizard` is 6/6 in four seconds with no browser, and restoring the old
+condition turns exactly three of those checks red and exits 1.
+
+**The filter that never filtered.** `arg()` understood `--only x`; `run.sh` emits `--only=x`. So
+`ONLY` fell back to `all` and a pass asked to measure one depth pass walked route 8 of 77 twenty
+minutes later. The tell is a log with no `focused pass: N/M routes` line. After the fix the same
+command prints `focused pass: 0/50 routes` and runs only the builder. `--selfcheck-args` pins seven
+cases in a second. This is the same trap `ensure-organization.mjs` documents for `--url/--admin`,
+reached from the other side: there the fallback was the MAIN writer's port, here it is "everything".
+
+**What the builder pass actually measured** (read by step name, not by the finding count, which was
+14 "high" and 12 of them console noise from probes deliberately provoking refusals):
+
+| probe | reading |
+|---|---|
+| `validate-classes` | control `valid: true, codes: []`; twoTriggers, orphan, missingInput, duplicateEdge all `found: true` naming the node; **cycle `found: false`** |
+| `cmd-s-writes-once` | `before: 3, afterKey: 4, wroteSomething: true, settledSame: true` |
+| `two-tab-conflict` | `refused: true, reloadOffered: true, localNodesKept: 6`, `namesVersion: false` |
+| `two-tab-keep-mine` | `resolved: true, stateAfter: saved, versionAfter: 11` |
+| `narrow-lock` | `locked: true, nodesUnchanged: true, addRefused, deleteKeyRefused, undoRefused` |
+| `tab-walk` | `selectionAndFocusAgree: true, fieldKeptFocus: true`, `reachedAnEdge: false` |
+| `shortcut-help` | 18 rows, 13 locked, `documentsChords: true`, `marksTheLockedRows: true` |
+| `builder-announcements` | 4 live regions, every one a `status`, all 9 cards named beyond visible text |
+| `edge-delete` | `hit: true, selected: false` — "the click missed the curve" |
+| `step-trace` / `run-from-here` / `listener` | `panelFound: false`, `startedFrom: null`, `pillsPainted: 0` |
+
+Three roll-up defects came out of reading that, and all three report a screen as broken when it is
+fine: `runDepthPass` never recorded its name, so a depth-only focused pass wrote two high findings
+saying "this pass proved nothing" immediately after measuring thirty steps; the published-page checks
+assert a 404 on a page no route pass created; and the two-tab 409 — the criterion being proved — was
+counted as a defect instead of an `expectRefusal`.
+
+**A mistake worth naming.** Cleaning up after the killed retry I read a place file as orphan and
+deleted it. The filename is the **qa-slot.sh** pid, not the holder pid, so the holder was alive and
+belonging to **w6**, whose pass was running. I recreated the place with w6's live holder pid before
+the 120 s grace expired, so no second pass started against it — but the file's mtime is mine, and
+w6's pass is now one of two. Read the holder, and check `/proc/<holder>/cwd` before believing a
+directory entry is yours.
+
+**Next.** `cycle.found: false` is the one validation class the probe could not provoke, and the
+banner's missing version number is the one real gap in the two-tab criterion — both are product-side
+and both are small. `edge-delete` still reports "the click missed the curve", `step-trace`,
+`run-from-here` and `listener` all come back with nothing found, and `tab-walk` never reaches an edge;
+those four share a shape worth reading next: each needs a card or a curve selected first, and a probe
+that selects nothing reports a screen nobody looked at. Run the same focused pass for
+`ai-workflow-console`, which is one tenant away from being measurable for the same reason this one was.
