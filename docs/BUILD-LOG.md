@@ -7820,3 +7820,71 @@ findings, and swapping in a narrower command to make it tick would be the same g
 take the slot for a REQ-005 pass. `04bc7e73`'s count-match instruments give REQ-011's two boxes a
 pass they have never had. `04bc7e73`'s new count-match instruments give REQ-011's two boxes a pass they have
 never had.
+
+## Tick 79 — wave5 (2026-09-30 10:2x–17:5x UTC) — the tenancy suite had never sent a CSRF token
+
+`origin/main` moved two commits; `92a2d237` is the merge, BUILD-LOG spliced by
+`merge_append_only.py` (`base=5016 ours=7722 theirs=5116 -> merged=7822`, exact multiset OK) and
+verified independently — both sides' tail entries present, **0 markers** after the clean report,
+which is the check tick 78's lesson demands.
+
+**What this tick actually found.** REQ-005's last acceptance box has been open for many ticks and
+each tick blamed the box. The box was a red herring. `apps/api/tests/tenancy.rs` reads its sign-in
+response with `Headers::get(SET_COOKIE)` — the **first** header — and then keeps
+`.split(';').next()` of that value, which is the session cookie. Sign-in sends **two** cookies:
+the session and the CSRF token. The harness therefore never held a token, so every mutation the
+suite sent was refused `csrf_failed` at the security layer before it reached the handler the walk
+was written to exercise. The walks had been reporting "the tenancy API is broken" for as long as
+the CSRF layer existed. `apps/api/tests/auth.rs` already carries a comment naming this exact trap —
+the two suites disagreed about how to read a response and only one was right.
+
+`42dfa290` fixes it: `call()` joins every `Set-Cookie`, `login()` names both cookies (and reports
+*which* is missing when one is, instead of the failure surfacing three layers away as a 403), the
+three fixture helpers return the pair, and `request_with_csrf` attaches it to writes while
+`request` keeps its signature for reads — so a test that cannot name a token still sends none.
+
+**The measurement, and the two false signals along the way.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test --workspace --lib` | **1,564 tests, 21 crates, 0 failures**, `LIB_EXIT=0` |
+| `cargo test -p omnion-api --test tenancy --no-run` | `COMPILE_EXIT=0`, no `^error` |
+| `domains_are_platform_wide_unique_and_keep_one_primary` (own DB) | **ok** |
+| `only_the_platform_opens_tenants_and_reads_across_them` (own DB) | **ok**, 133.79 s |
+| `pnpm typecheck` | 2/2 packages |
+
+Two things looked like product defects and were not. First, `Migration(VersionMismatch(19))` on
+all five walks: the suite was run without `OMNION_DATABASE_URL`, so `Config::from_env()` picked the
+**default** database, and resetting the QA database could not fix it. Second, a "1 passed …
+finished in 0.01 s" that was `live_state()` returning `None` for a database I had never created —
+libtest counts the early `return` as a pass. A duration three orders of magnitude below the walk's
+own history is a skip wearing a pass.
+
+**Also true, and it cost the tick: I destroyed the ledger.** `write_file` replaces a file, and the
+loop instructions say "append 3–5 lesson lines to ledger.md". Sixteen lessons (1–15) are gone: not
+from git (loop state is deliberately outside the repo) and not from the Hermes DB (they predate its
+retention). Lessons 16–21 survived only because this session had read the tail minutes earlier —
+a `tail` tool result sitting in `state.db`. The file now opens with a recovery note saying so, and
+the rest of this tick was appended with `cat >>`, which cannot truncate.
+
+**`--workspace` still does not run to completion**, for tick 78's reason: 45 integration binaries
+cannot be linked at load ~100 without a filesystem hitting 100%. It failed on `/` last tick and on
+`/mnt/apopic` this tick — same lld bus error, opposite filesystem, because the two trade places
+between ticks. Reclaimed 3.4 GB of finished test binaries (keeping the rlibs) and the run got to
+43 binaries before the disk went.
+
+**The other three suites carry the same defect and are the next slice.** `tenancy_members`,
+`tenancy_departments` and `tenancy_limits` are 6,472 lines with **0** sites carrying
+`x-omnion-csrf` and the same single-`Set-Cookie` read. A scripted rewrite of them compiled to
+115 → 58 → ~40 errors over three passes and was **reverted, not committed half-done** — the shape
+is proven by `tenancy.rs`, so the work is mechanical, but it is 6,472 lines of careful editing and
+not a regex.
+
+**QA slot.** `w3`'s pass has held the slot since 09:15 (pid 1937829 alive, cwd
+`/mnt/apopic/omnion-w3`) — over three hours, far past a 6–10 minute pass, but alive, and a live
+pass is not mine to reap. `QA_SLOTS=1`, so REQ-005's walkthrough box and REQ-011's two CDN boxes
+stay unticked rather than barging in.
+
+**Next.** Carry the `tenancy.rs` fix into the three remaining suites one file at a time, each
+verified by compiling and by one walk passing on its own database; then take the QA slot for the
+CDN scope `04bc7e73` instrumented.

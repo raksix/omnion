@@ -1,6 +1,6 @@
 # REQ-005 — Organization / Tenant System
 
-> **Status:** in-progress (`3eff59f`; tick 78 closed the one defect tick 77 filed as another wave's, `f704bc25` — the environment chip read `/environments` with no session gate — and the last acceptance box is still open on the two-everything gate) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
+> **Status:** in-progress (`42dfa290`; tick 79 — the blocker on the last acceptance box was not the box but the suite: `tenancy.rs` read only the first `Set-Cookie` and kept the session cookie, so it never held the CSRF token sign-in issued and every mutation it sent was refused before reaching its handler. Two walks now pass on their own database (133.79 s against a 0.01 s skip-pass). The same fix is owed to `tenancy_members`, `tenancy_departments` and `tenancy_limits` — 6,472 lines, next slice; `--workspace` itself still cannot link at load 100, and the QA slot is w3's) · **Captured:** 2026-09-25 · **Layer:** core (`crates/identity`)
 > **Source:** owner brief — platform feature pool (2026-09-25)
 >
 > Slices 1 and 2 shipped (`0c63b73` for slice 2). Slice 3's API, migration and the Settings,
@@ -215,6 +215,26 @@ automation engine uses; the token never appears in an event payload.
   tenant is a platform fact, queues 0 deliveries, and the following tick claims 0 — the endpoints
   subscribed to that very name must not receive it._
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough pass with zero high findings.
+  _**Still open, and this tick found out why it has been open.** The box names `cargo test
+  --workspace`; what actually stands between the suite and a green run is not the box but the
+  suite. `apps/api/tests/tenancy.rs` read one `Set-Cookie` header (`Headers::get`) and kept
+  `.split(';').next()` of it — the session — while sign-in sends the session **and** a CSRF
+  token. The harness therefore never held a token, and every mutation it sent was refused
+  `csrf_failed` at the security layer before reaching the handler the walk was written to
+  exercise. `auth.rs` carries a comment naming this exact trap; the two suites disagreed about
+  how to read a response and only one was right. `42dfa290` fixes it: `call()` joins every
+  `Set-Cookie`, `login()` names both cookies and reports which is missing when one is, and the
+  three fixture helpers return the pair, which `request_with_csrf` attaches to writes.
+  **Proven, not assumed** — `domains_are_platform_wide_unique_and_keep_one_primary` and
+  `only_the_platform_opens_tenants_and_reads_across_them` both pass on their own database
+  (the second in 133.79 s, against a `0.01 s` "pass" that was really `live_state()` returning
+  `None` for a database I had not created). The remaining `tenancy_members` /
+  `tenancy_departments` / `tenancy_limits` carry the identical defect — 6,472 lines, `0` sites
+  carrying `x-omnion-csrf` — and are the next slice; the scoped rewrite of `tenancy.rs` compiled
+  clean at `COMPILE_EXIT=0`, so the shape is proven, but a scripted rewrite of the other three
+  was reverted rather than committed half-done. The `--workspace` run itself remains unproven
+  for the reason tick 78 recorded: the box cannot link ~45 integration binaries at load 100
+  without one of the two filesystems reaching 100%._
   _Closer, and the first part of the gate now has a name. Tick 77 ran the tenant-scoped pass that
   this box had been waiting on: `focused pass: 1/54 routes`, **7 route/pass names walked, 0
   unmatched**, 32 clicks, 59 screenshots — and the scoping itself is now trustworthy, because
