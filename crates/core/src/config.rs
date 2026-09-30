@@ -145,6 +145,27 @@ pub const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS: i64 = 100;
 /// must not drift: a default of 100 in one place and 10 in the other is a worker that reads
 /// ten times slower than its own documentation says.
 const DEFAULT_CRM_SLA_MAX_ORGANIZATIONS_U64: u64 = 100;
+
+/// How often the project limit notice worker runs (REQ-133, slice 4).
+///
+/// A limit crossing is not a deadline, so a minute is generosity rather than a requirement: the
+/// run counters move on a run, and a subscriber to the warning is an operations team rather than
+/// an on-call pager. A tick that finds nothing is one partial-index read over the projects that
+/// have a cap, so a broken worker shows up within the tick.
+pub const DEFAULT_PROJECT_LIMIT_POLL_MS: u64 = 60_000;
+
+/// How many capped projects one pass walks. A pass is four counts and up to four claims per
+/// project, so a thousand projects is a maintenance window; the read is ordered by id so the
+/// projects that wait for the next tick are the same ones every time rather than a rotating
+/// subset that can starve a project for ever.
+pub const DEFAULT_PROJECT_LIMIT_MAX_PROJECTS: i64 = 50;
+
+/// [`DEFAULT_PROJECT_LIMIT_MAX_PROJECTS`] as the unsigned value the env reader hands back.
+///
+/// The environment gives strings and the reader returns `u64`, so a signed constant needs a twin
+/// — the same pairing as the CRM SLA pair above, for the same reason: a default of 50 in one
+/// place and 5 in the other is a worker that reads ten times slower than it says.
+const DEFAULT_PROJECT_LIMIT_MAX_PROJECTS_U64: u64 = 50;
 /// How often the backup retention sweep runs (REQ-013, slice 3).
 ///
 /// Six hours, and the number is chosen from the feature rather than from taste: the sweep
@@ -625,6 +646,32 @@ impl Default for CrmSlaConfig {
     }
 }
 
+/// The automation project limit notice worker (REQ-133, slice 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectLimitConfig {
+    /// Whether this process emits the project's limit crossings
+    /// (`OMNION_PROJECT_LIMIT_RUNNER`).
+    ///
+    /// **On by default, and a second process is safe.** The once-ness is a claim in the
+    /// database, not a property of one worker, so two API nodes both sweeping cannot both
+    /// notify — which is why this is a switch rather than a singleton decision.
+    pub runner_enabled: bool,
+    /// Delay between two passes (`OMNION_PROJECT_LIMIT_POLL_MS`).
+    pub poll_ms: u64,
+    /// How many capped projects one pass walks (`OMNION_PROJECT_LIMIT_MAX_PROJECTS`).
+    pub max_projects: i64,
+}
+
+impl Default for ProjectLimitConfig {
+    fn default() -> Self {
+        Self {
+            runner_enabled: true,
+            poll_ms: DEFAULT_PROJECT_LIMIT_POLL_MS,
+            max_projects: DEFAULT_PROJECT_LIMIT_MAX_PROJECTS,
+        }
+    }
+}
+
 /// Email settings of the `send_email` action (`OMNION_SMTP_*`, `OMNION_MAIL_*`).
 ///
 /// Development defaults point at Mailpit, which the compose stack publishes on `1025`; a
@@ -792,6 +839,8 @@ pub struct Config {
     pub crm_autoresponder: CrmAutoresponderConfig,
     /// CRM SLA worker knobs (REQ-117, slice 3).
     pub crm_sla: CrmSlaConfig,
+    /// The project limit notice worker (REQ-133, slice 4).
+    pub project_limit: ProjectLimitConfig,
     /// Email settings of the `send_email` action (P13).
     pub mail: MailConfig,
     /// The secret CSRF tokens are derived from (REQ-012, slice 2).
@@ -1012,6 +1061,18 @@ impl Config {
             .unwrap_or(DEFAULT_CRM_SLA_MAX_ORGANIZATIONS),
         };
 
+        let project_limit = ProjectLimitConfig {
+            runner_enabled: read_flag(&read, "OMNION_PROJECT_LIMIT_RUNNER", true)?,
+            poll_ms: read_positive(&read, "OMNION_PROJECT_LIMIT_POLL_MS", DEFAULT_PROJECT_LIMIT_POLL_MS)?,
+            max_projects: i64::try_from(read_positive(
+                &read,
+                "OMNION_PROJECT_LIMIT_MAX_PROJECTS",
+                DEFAULT_PROJECT_LIMIT_MAX_PROJECTS_U64,
+            )?)
+            .unwrap_or(DEFAULT_PROJECT_LIMIT_MAX_PROJECTS),
+        };
+
+
         let analytics = AnalyticsConfig {
             runner_enabled: read_flag(&read, "OMNION_ANALYTICS_RUNNER", true)?,
             poll_ms: read_positive(&read, "OMNION_ANALYTICS_POLL_MS", DEFAULT_ANALYTICS_POLL_MS)?,
@@ -1052,6 +1113,7 @@ impl Config {
             retention,
             crm_autoresponder,
             crm_sla,
+            project_limit,
             mail,
             csrf,
             log,
@@ -1094,6 +1156,7 @@ impl Default for Config {
             retention: RetentionConfig::default(),
             crm_autoresponder: CrmAutoresponderConfig::default(),
             crm_sla: CrmSlaConfig::default(),
+            project_limit: ProjectLimitConfig::default(),
             mail: MailConfig::default(),
             // No secret by default, which is the honest default: a default key would be a key
             // every deployment shares, and a shared CSRF secret is no CSRF secret.
