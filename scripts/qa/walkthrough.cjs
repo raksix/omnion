@@ -1645,6 +1645,87 @@ async function runBackups(page, report) {
         });
       }
     }
+    // ---- The queued restore (REQ-013 slice 2c) ---------------------------------------------
+    // The one control in this file that exists to be *pressed and then un-pressed*, so the
+    // order is the order a nervous operator would use: read the state, press Stop, and read
+    // the state again. The load-bearing assertion is the LAST one — that a Stop control is
+    // gone once the job is no longer cancellable. A panel that keeps offering "Stop" on a
+    // finished restore is inviting an operator to press it, and a control that appears not to
+    // work is worse than no control at all.
+    const queueButton = page.locator('[data-testid="restore-queue"]');
+    const queueOffered = (await queueButton.count()) > 0;
+    const queueDisabled = queueOffered ? await queueButton.first().isDisabled() : null;
+    const queueHint = await page
+      .locator('[data-testid="restore-queue-hint"]')
+      .innerText()
+      .catch(() => "");
+    note({
+      step: "restore-queue-button",
+      offered: queueOffered,
+      disabledWithAnOutcomeShown: queueDisabled,
+      // The difference between the two buttons must be IN WORDS on the screen, not inferred
+      // from colour: the hint is what stops somebody in a hurry pressing the wrong one.
+      hintNamesStoppability: /stop/i.test(queueHint),
+      hint: queueHint.trim().slice(0, 200),
+    });
+
+    // The jobs list, before anything is queued. The empty state is a real state and it is
+    // asserted, because "nothing here" and "this list could not be read" render the same and
+    // only the wording tells them apart.
+    const jobsEmpty = await page
+      .locator('[data-testid="restore-jobs-empty"]')
+      .count();
+    note({ step: "restore-jobs-empty", offered: jobsEmpty > 0 });
+
+    if (queueOffered && !queueDisabled) {
+      await queueButton.first().click().catch(() => {});
+      await page
+        .waitForSelector('[data-testid^="restore-job-"]', { timeout: 30000 })
+        .catch(() => {});
+      await page.waitForTimeout(1500);
+
+      const queuedRows = await page
+        .locator('[data-testid^="restore-job-queued"], [data-testid^="restore-job-running"]')
+        .allInnerTexts();
+      const stopButtons = page.locator('[data-testid^="restore-job-stop-"]');
+      const stopCount = await stopButtons.count();
+      note({
+        step: "restore-queued",
+        rows: queuedRows.length,
+        firstRow: queuedRows[0] ? queuedRows[0].split("\n")[0].trim() : "",
+        stopButtonsOffered: stopCount,
+      });
+
+      if (stopCount > 0) {
+        await stopButtons.first().click().catch(() => {});
+        await page
+          .waitForSelector('[data-testid="restore-job-aborted"]', { timeout: 30000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        const abortedText = await page
+          .locator('[data-testid="restore-job-aborted"]')
+          .first()
+          .innerText()
+          .catch(() => "");
+        // The Stop control must be GONE. `cancellable` is the API's own field rather than a
+        // derivation the panel makes, so this also proves the panel is reading it.
+        const stopAfter = await page.locator('[data-testid^="restore-job-stop-"]').count();
+        note({
+          step: "restore-aborted",
+          shown: abortedText.trim().length > 0,
+          // An abort is a success and says so in words. If this reads as a failure the
+          // operator stopped the right thing and believes it went wrong.
+          saysNothingWasChanged: /nothing/i.test(abortedText),
+          stopButtonsRemaining: stopAfter,
+          text: abortedText.trim().slice(0, 240),
+        });
+      } else {
+        note({
+          step: "restore-aborted",
+          reason: "the job left the queue before the Stop control could be pressed",
+        });
+      }
+    }
   } else {
     note({
       step: "restore-button",

@@ -124,6 +124,7 @@ import type {
   BackupPurge,
   BackupPurgeFailure,
   BackupSweepReport,
+  RestoreJob,
   RestoreOutcome,
   RestorePreview,
   BackupVerification,
@@ -6253,6 +6254,54 @@ export function restoreBackup(
   return request<RestoreOutcome>(`/api/v1/backups/${id}/restore`, {
     method: "POST",
     body: JSON.stringify({ parts, confirmation }),
+  });
+}
+
+/**
+ * Queue a restore instead of performing it — the one that can still be stopped (REQ-013
+ * slice 2c).
+ *
+ * The distinction is the whole point and the panel is careful about it: `restoreBackup` runs
+ * inside the request and has no cancel, because a `POST` in flight cannot be un-pressed. This
+ * one answers `202` with the queued job, and the job can be stopped until its worker claims
+ * it. Offering the cancellable one by default and the immediate one behind a named choice is
+ * the honest arrangement; offering only the immediate one is a screen with no way back.
+ */
+export function queueRestore(
+  id: string,
+  parts: string[],
+  confirmation: string,
+): Promise<RestoreJob> {
+  return request<RestoreJob>(`/api/v1/backups/${id}/restore-queue`, {
+    method: "POST",
+    body: JSON.stringify({ parts, confirmation }),
+  });
+}
+
+/**
+ * This run's queued and finished restores, newest first.
+ *
+ * `backup.read`, not `backup.restore`: reading that a restore is queued changes nothing, and
+ * hiding it behind the destructive key means the first time an operator looks for the thing
+ * they are waiting for is a 403.
+ */
+export function listRestoreJobs(id: string): Promise<RestoreJob[]> {
+  return request<RestoreJob[]>(`/api/v1/backups/${id}/restore-jobs`, { method: "GET" });
+}
+
+/**
+ * Stop a queued restore.
+ *
+ * Addressed by the JOB's id and not the run's, because they are different resources: a route
+ * that accepted either would let a cancel for one run's job stop another run's restore.
+ *
+ * The response is the job as it now reads, so a call that lost the race to the worker comes
+ * back `running` rather than a `200` claiming a cancellation that did not happen.
+ */
+export function cancelRestoreJob(jobId: string): Promise<RestoreJob> {
+  return request<RestoreJob>(`/api/v1/restore-jobs/${jobId}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({}),
   });
 }
 
