@@ -32,7 +32,18 @@ const { chromium } = require("playwright-core");
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
-  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+  if (i !== -1 && process.argv[i + 1] && !process.argv[i + 1].startsWith("--")) {
+    return process.argv[i + 1];
+  }
+  // `--name=value` is the other spelling, and it is the one `run.sh` builds
+  // (`QA_ONLY_ARGS=(--only="$QA_ONLY")`). Without this branch `arg("only")` returned
+  // the fallback for every focused pass a writer has ever run, so `--only` narrowed
+  // nothing: the pass walked the whole route list and every depth pass, which is the
+  // exact wall-time problem `--only` was added to solve — and it failed silently,
+  // because a filter that matches everything produces a complete, entirely green report.
+  const eq = process.argv.find((a) => a.startsWith(`--${name}=`));
+  if (eq !== undefined) return eq.slice(name.length + 3);
+  return fallback;
 }
 
 const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
