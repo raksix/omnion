@@ -1,0 +1,37 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "omnion.fullname" . }}
+{{- $svcPort := (dict "api" .Values.api.service.port "admin" 3000 "web" 3000) }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "omnion.componentLabels" (list "ingress" .) | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType }}
+            backend:
+              service:
+                name: {{ printf "%s-%s" $fullName .service }}
+                port:
+                  number: {{ index $svcPort .service }}
+          {{- end }}
+    {{- end }}
+{{- end }}

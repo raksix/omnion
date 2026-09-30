@@ -1,0 +1,308 @@
+# Omnion Helm values (REQ-128, slice 2b).
+#
+#   helm install omnion infra/helm/omnion -f my-values.yaml
+#
+# **No value in this file is a secret.** Every credential is an `existingSecret` REFERENCE — the
+# name of a Secret the operator created, plus the keys inside it. The chart never takes a
+# password, a token or a connection string as a value, for the same reason the compose stacks use
+# `${VAR:?…}`: a credential in a values file is a credential in a git repository, a CI log and
+# every `helm get values` output for the next three years.
+#
+# Start from here, not from zero: `helm show values` prints this file with every default already
+# resolved, so the smallest useful override set is the difference between that and this comment
+# header.
+
+# ---------------------------------------------------------------------------------------------
+# Image registry and tag
+# ---------------------------------------------------------------------------------------------
+image:
+  registry: ghcr.io
+  repository: raksix/omnion
+  # The tag defaults to the chart's appVersion, so a release upgrades the chart and the images
+  # together. `digest` wins over `tag` when both are set — that is what makes a rollout
+  # reproducible: a tag is a name someone can re-push, a digest is not.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+  # Two hosts because the panel and the public renderer are different applications with
+  # different security postures: the renderer is anonymous, the panel is not, and serving them
+  # from one host puts the panel's cookies on a public name.
+  hosts:
+    - host: omnion.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+    - host: admin.omnion.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: admin
+  tls: []
+  #   - secretName: omnion-tls
+  #     hosts:
+  #       - omnion.example.com
+  #       - admin.omnion.example.com
+  # cert-manager: leave this empty and set `annotations.cert-manager.io/*` plus `clusterIssuer`
+  # instead. Both paths are supported and they are mutually exclusive per host: a host with a
+  # `secretName` is served by whatever wrote that Secret.
+
+# ---------------------------------------------------------------------------------------------
+# The migration Job
+# ---------------------------------------------------------------------------------------------
+# Migrations run as a `pre-install`/`pre-upgrade` Helm hook, which is the mechanism that
+# guarantees "migrations finish before new pods roll": a hook Job completes before helm starts
+# applying the rest of the release at all. The failure mode this replaces is the one the compose
+# stack already had to guard against with `service_completed_successfully` — an API that migrates
+# on boot races its own replicas.
+migration:
+  enabled: true
+  image:
+    # Same repository and tag as the API by default: the migration code and the code that reads
+    # the schema are one build, and two different tags is the way a "migration added in 0.4"
+    # surprise reaches production.
+    #
+    # LEAVE ALL THREE EMPTY unless a migration must run from a DIFFERENT build. An empty value
+    # falls through to the top-level `image`, so the job inherits the release tag and a
+    # `--set image.tag=` upgrade moves the job and the pods together. The failure this replaces
+    # was real and silent: `migration.image.tag` was defaulted to "" but the helper read the
+    # component key while building the name from a different one, so the job fell back to
+    # `appVersion` while every other component honoured --set. An upgrade then ran 0.4's
+    # migrations and then started 0.5's pods — the exact surprise the comment above warns about,
+    # produced by the setting that is supposed to prevent it.
+    repository: ""
+    tag: ""
+    digest: ""
+  # Hook weights run in ascending order. This is the only hook, but a backup hook a future
+  # release adds must sort BEFORE this one, and the gap is what leaves room for it.
+  hookWeight: -5
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  # Extra args appended after `--migrate-only`, for an operator who needs to point the job at a
+  # specific migration set.
+  extraArgs: []
+
+# ---------------------------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------------------------
+api:
+  replicaCount: 2
+  image: {}
+  service:
+    type: ClusterIP
+    port: 8080
+  # `/healthz` answers "the process exists"; `/readyz` answers "the dependencies are reachable",
+  # which is why the readiness probe below is the one that gates traffic. Pointing the probe at
+  # /healthz is the mistake that makes a rollout succeed on top of an instance whose database is
+  # gone — the container is alive and cannot serve a single request.
+  probes:
+    liveness:
+      path: /healthz
+      initialDelaySeconds: 10
+      periodSeconds: 15
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      path: /readyz
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    startup:
+      enabled: true
+      path: /readyz
+      periodSeconds: 5
+      failureThreshold: 30
+  # SIGTERM → drain. UNITS DIFFER AND THE PAIR IS RELATED, which is the trap:
+  #   drainTimeoutMs is MILLISECONDS (10 000 = 10 s of request draining)
+  #   terminationGracePeriodSeconds is SECONDS (30 = the pod's total SIGTERM budget)
+  # The grace period must exceed drainTimeoutMs/1000 with room for the telemetry flush that
+  # follows, so 30 s covers a 10 s drain plus 20 s. `drainTimeoutMs: 20000` against the default
+  # 30 s grace then has NO room and the flush is cut in half — a values pair that type-checks,
+  # lints, renders and is wrong. The chart does not (and must not) rewrite the operator's pair,
+  # so the relationship is stated here and the gate asserts it; changing one without the other is
+  # a deliberate act.
+  drainTimeoutMs: 10000
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  autoscaling:
+    # Off by default: an HPA that targets CPU on a service whose replicas are already pinned by
+    # a node's capacity fights the scheduler, and the minimum replicas of an autoscaled API is
+    # the number that decides whether a rolling upgrade has a spare pod.
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 0
+  podDisruptionBudget:
+    enabled: true
+    # minAvailable: 1 keeps one API serving through a node drain. It is deliberately NOT
+    # `maxUnavailable: 1`, which with replicaCount 1 can take the only pod away.
+    minAvailable: 1
+
+# ---------------------------------------------------------------------------------------------
+# Admin panel and public renderer
+# ---------------------------------------------------------------------------------------------
+admin:
+  replicaCount: 2
+  image: {}
+  service:
+    type: ClusterIP
+    port: 3000
+  probes:
+    liveness:
+      path: /
+      initialDelaySeconds: 15
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      path: /
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 75
+    targetMemoryUtilizationPercentage: 0
+
+web:
+  replicaCount: 2
+  image: {}
+  service:
+    type: ClusterIP
+    port: 3000
+  probes:
+    liveness:
+      path: /
+      initialDelaySeconds: 15
+      periodSeconds: 20
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readiness:
+      path: /
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 75
+    targetMemoryUtilizationPercentage: 0
+
+# ---------------------------------------------------------------------------------------------
+# Credentials — references only
+# ---------------------------------------------------------------------------------------------
+# One Secret carries every credential, because a Kubernetes Secret is a base64 file with a
+# permission model, not a key ring: N secrets means N RBAC grants to read them. `required: true`
+# makes a missing Secret a template failure at install time, which is louder and earlier than a
+# pod that starts and crash-loops on an unset variable.
+secrets:
+  existingSecret: omnion-secrets
+  required: true
+  # The keys read from that Secret, in one place so the mapping is auditable.
+  keys:
+    databaseUrl: DATABASE_URL
+    redisUrl: REDIS_URL
+    s3AccessKey: S3_ACCESS_KEY
+    s3SecretKey: S3_SECRET_KEY
+    csrfSecret: CSRF_SECRET
+    adminEmail: ADMIN_EMAIL
+    adminPassword: ADMIN_PASSWORD
+
+# ---------------------------------------------------------------------------------------------
+# External services
+# ---------------------------------------------------------------------------------------------
+# The chart never creates a database. `helm install … --set postgresql.enabled=true` is
+# explicitly not supported, and the chart's README says so, because the day someone installs the
+# bundled PostgreSQL by accident is the day an enterprise's production data is written to an
+# empty-dir volume that disappears with the pod.
+postgresql:
+  dsn: ""
+  existingSecret: ""
+  existingSecretKey: DATABASE_URL
+redis:
+  url: ""
+  existingSecret: ""
+  existingSecretKey: REDIS_URL
+s3:
+  endpoint: ""
+  bucket: omnion-media
+  region: us-east-1
+  forcePathStyle: true
+
+# The origin browsers reach. Used for absolute links in e-mail, OAuth callbacks and the public
+# content API — a wrong value here produces links nobody can follow rather than an error.
+publicUrl: https://omnion.example.com
+
+logLevel: info
+logFormat: json
+
+# ---------------------------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+priorityClassName: ""
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+# The one writable path the Node images ask for. Next.js writes its cache under /tmp and the
+# distroless API writes nothing else; without this tmpfs a read-only root filesystem fails the
+# container at startup with EROFS.
+extraVolumes: []
+extraVolumeMounts: []

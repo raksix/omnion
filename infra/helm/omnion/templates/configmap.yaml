@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "omnion.fullname" . }}-config
+  labels:
+    {{- include "omnion.componentLabels" (list "config" .) | nindent 4 }}
+data:
+  # Non-secret configuration only. The pod templates read their env directly rather than
+  # `envFrom` this map, so this ConfigMap exists as the single place an operator looks for the
+  # resolved, non-credential settings of a release — `helm get manifest` shows what was applied,
+  # and this is the subset of it that is safe to paste into a ticket.
+  publicUrl: {{ .Values.publicUrl | quote }}
+  logLevel: {{ .Values.logLevel | quote }}
+  logFormat: {{ .Values.logFormat | quote }}
+  s3Bucket: {{ .Values.s3.bucket | quote }}
+  s3Region: {{ .Values.s3.region | quote }}
+  {{- if .Values.s3.endpoint }}
+  s3Endpoint: {{ .Values.s3.endpoint | quote }}
+  {{- end }}
+  drainTimeoutMs: {{ .Values.api.drainTimeoutMs | quote }}

@@ -1,0 +1,13 @@
+# Files that must never end up inside the packaged chart (`helm package` would include them).
+.DS_Store
+.git/
+.gitignore
+*.tmproj
+*.orig
+*.bak
+*.swp
+*.tmp
+*.tgz
+.idea/
+.vscode/
+ci/

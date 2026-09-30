@@ -1,0 +1,36 @@
+{{- $root := . }}
+{{- range $component, $cfg := dict "api" $root.Values.api "admin" $root.Values.admin "web" $root.Values.web }}
+{{- if $cfg.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "omnion.fullname" $root }}-{{ $component }}
+  labels:
+    {{- include "omnion.componentLabels" (list $component $root) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "omnion.fullname" $root }}-{{ $component }}
+  minReplicas: {{ $cfg.autoscaling.minReplicas }}
+  maxReplicas: {{ $cfg.autoscaling.maxReplicas }}
+  metrics:
+    {{- if $cfg.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $cfg.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if $cfg.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ $cfg.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+{{- end }}
+{{- end }}

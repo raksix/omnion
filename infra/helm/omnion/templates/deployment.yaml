@@ -1,0 +1,257 @@
+{{- define "omnion.deployment" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "omnion.fullname" .root }}-{{ .component }}
+  labels:
+    {{- include "omnion.componentLabels" (list .component .root) | nindent 4 }}
+spec:
+  {{- if not .root.Values.api.autoscaling.enabled | default false }}
+  {{- if eq .component "api" }}
+  replicas: {{ .root.Values.api.replicaCount }}
+  {{- else if eq .component "admin" }}
+  replicas: {{ .root.Values.admin.replicaCount }}
+  {{- else if eq .component "web" }}
+  replicas: {{ .root.Values.web.replicaCount }}
+  {{- end }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "omnion.componentSelectorLabels" (list .component .root) | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    {{- if eq .component "api" }}
+    rollingUpdate:
+      # maxUnavailable 0 with maxSurge 1: a rollout replaces pods one at a time and never shortens
+      # the serving set. The API is the only component whose downtime is a customer-visible 502,
+      # and the drain below (SIGTERM → readiness 503 → flush → exit) is what makes a surge
+      # unnoticeable while the old pod finishes its in-flight requests.
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- else }}
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "omnion.componentLabels" (list .component .root) | nindent 8 }}
+        {{- with .root.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A config change to the chart must roll the pods. The annotation is UNCONDITIONAL: it was
+        # inside a `with .Values.podAnnotations` block, so an operator who set no pod annotations —
+        # which is the default — got no checksum at all, and a values edit that only changes an
+        # env var left every pod running the old value while `helm upgrade` reported success. The
+        # block and the annotation have to exist independently: there is a checksum to compute
+        # whether or not anybody customised the pods.
+        checksum/config: {{ include (print .root.Template.BasePath "/configmap.yaml") .root | sha256sum }}
+        {{- with .root.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .root.Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .root.Values.podSecurityContext | nindent 8 }}
+      {{- if eq .component "api" }}
+      # SIGTERM → drain (REQ-126's lifecycle contract). The grace period exceeds the drain
+      # timeout so the flush has room; setting it equal is how a rollout cuts a telemetry batch
+      # in half and loses it.
+      terminationGracePeriodSeconds: {{ .root.Values.api.terminationGracePeriodSeconds }}
+      {{- end }}
+      containers:
+        - name: {{ .component }}
+          image: {{ include "omnion.image" (dict "root" .root "component" .component) }}
+          imagePullPolicy: {{ .root.Values.image.pullPolicy }}
+          {{- if eq .component "api" }}
+          env:
+            - name: OMNION_ENV
+              value: production
+            - name: OMNION_HOST
+              value: 0.0.0.0
+            - name: OMNION_PORT
+              value: "8080"
+            - name: OMNION_PUBLIC_URL
+              value: {{ .root.Values.publicUrl | quote }}
+            - name: OMNION_LOG_FORMAT
+              value: {{ .root.Values.logFormat | quote }}
+            - name: OMNION_LOG
+              value: {{ .root.Values.logLevel | quote }}
+            - name: OMNION_DRAIN_TIMEOUT_MS
+              value: {{ .root.Values.api.drainTimeoutMs | quote }}
+            - name: OMNION_STORAGE_DIR
+              value: /tmp/omnion-storage
+            - name: DATABASE_URL
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" (or .root.Values.postgresql.existingSecretKey .root.Values.secrets.keys.databaseUrl) "name" (or .root.Values.postgresql.existingSecret .root.Values.secrets.existingSecret) "required" .root.Values.secrets.required) | nindent 16 }}
+            - name: OMNION_DATABASE_URL
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" (or .root.Values.postgresql.existingSecretKey .root.Values.secrets.keys.databaseUrl) "name" (or .root.Values.postgresql.existingSecret .root.Values.secrets.existingSecret) "required" .root.Values.secrets.required) | nindent 16 }}
+            - name: REDIS_URL
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" (or .root.Values.redis.existingSecretKey .root.Values.secrets.keys.redisUrl) "name" (or .root.Values.redis.existingSecret .root.Values.secrets.existingSecret) "required" .root.Values.secrets.required) | nindent 16 }}
+            - name: OMNION_REDIS_URL
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" (or .root.Values.redis.existingSecretKey .root.Values.secrets.keys.redisUrl) "name" (or .root.Values.redis.existingSecret .root.Values.secrets.existingSecret) "required" .root.Values.secrets.required) | nindent 16 }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" .root.Values.secrets.keys.s3AccessKey "name" .root.Values.secrets.existingSecret "required" .root.Values.secrets.required) | nindent 16 }}
+            - name: S3_SECRET_KEY
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" .root.Values.secrets.keys.s3SecretKey "name" .root.Values.secrets.existingSecret "required" .root.Values.secrets.required) | nindent 16 }}
+            - name: CSRF_SECRET
+              valueFrom:
+                {{- include "omnion.secretKeyRef" (dict "key" .root.Values.secrets.keys.csrfSecret "name" .root.Values.secrets.existingSecret "required" .root.Values.secrets.required) | nindent 16 }}
+          {{- else }}
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: NEXT_TELEMETRY_DISABLED
+              value: "1"
+            - name: PORT
+              value: {{ ternary "3000" "3000" true | quote }}
+            - name: HOSTNAME
+              value: 0.0.0.0
+            - name: OMNION_API_URL
+              value: http://{{ include "omnion.fullname" .root }}-api:{{ .root.Values.api.service.port }}
+          {{- end }}
+          {{- if eq .component "api" }}
+          livenessProbe:
+            httpGet:
+              path: {{ .root.Values.api.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .root.Values.api.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .root.Values.api.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .root.Values.api.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .root.Values.api.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .root.Values.api.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .root.Values.api.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .root.Values.api.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .root.Values.api.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .root.Values.api.probes.readiness.failureThreshold }}
+          {{- if .root.Values.api.probes.startup.enabled }}
+          # The startup probe is what makes a slow first boot survivable: liveness stays out of
+          # the way until the app has answered /readyz once, so a cold start that takes 40s is
+          # not killed three times on the way there.
+          startupProbe:
+            httpGet:
+              path: {{ .root.Values.api.probes.startup.path }}
+              port: http
+            periodSeconds: {{ .root.Values.api.probes.startup.periodSeconds }}
+            failureThreshold: {{ .root.Values.api.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- else if eq .component "admin" }}
+          livenessProbe:
+            httpGet:
+              path: {{ .root.Values.admin.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .root.Values.admin.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .root.Values.admin.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .root.Values.admin.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .root.Values.admin.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .root.Values.admin.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .root.Values.admin.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .root.Values.admin.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .root.Values.admin.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .root.Values.admin.probes.readiness.failureThreshold }}
+          {{- else }}
+          livenessProbe:
+            httpGet:
+              path: {{ .root.Values.web.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .root.Values.web.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .root.Values.web.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .root.Values.web.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .root.Values.web.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .root.Values.web.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .root.Values.web.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .root.Values.web.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .root.Values.web.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .root.Values.web.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- if eq .component "api" }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          {{- else }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          {{- end }}
+          {{- if eq .component "api" }}
+          resources:
+            {{- toYaml .root.Values.api.resources | nindent 12 }}
+          {{- else if eq .component "admin" }}
+          resources:
+            {{- toYaml .root.Values.admin.resources | nindent 12 }}
+          {{- else }}
+          resources:
+            {{- toYaml .root.Values.web.resources | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .root.Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem is on for every container (values.yaml), so the one writable
+            # path is declared here rather than discovered as an EROFS at startup.
+            - name: tmp
+              mountPath: /tmp
+            {{- with .root.Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- with .root.Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .root.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .root.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .root.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .root.Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+{{- end }}
+
+{{- $root := . }}
+{{- range $component := list "api" "admin" "web" }}
+{{- if not (hasKey $.Values $component) }}{{ continue }}{{- end }}
+{{/* The separator must sit on its OWN line and be followed by a newline. `---` glued to the
+     first key of the next document is not a separator at all: `---apiVersion: apps/v1` parses
+     as a scalar named `---apiVersion`, and helm reports it as an invalid document separator
+     four lines away from the cause. `helm template` joins documents itself and tolerated all
+     three of these; `helm lint` parses each file and did not. **A tool that passed is not a
+     tool that ran** — see the note in the chart's own README about which gates are real. */}}
+---
+{{ include "omnion.deployment" (dict "component" $component "root" $root) }}
+{{- end }}

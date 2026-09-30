@@ -1,10 +1,11 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slice 1 shipped and the first half of slice 2; slice 2's Helm chart,
-> the release pipeline and the upgrade helper are untouched. The images have NOT been built — a
-> Rust release build needs CPU the box does not currently have — so every image-level acceptance
-> line is still unticked and the composition-level ones are ticked against the parser rather
-> than against a running container) · **Captured:** 2026-09-26 · **Layer:** infra + release
+> **Status:** in-progress (slices 1 and 2a shipped previously; **slice 2b — the Helm chart — is
+> now complete and PROVEN RENDERED**, after the previous tick's chart turned out not to render at
+> all and its stated reason for shipping it unverified was wrong: helm 3.16.3 IS installed here.
+> The images have still NOT been built — a Rust release build needs CPU this box does not have —
+> so every image-level acceptance line stays unticked, and the two KUBERNETES lines that need a
+> real cluster are ticked against the render, not against an install) · **Captured:** 2026-09-26 · **Layer:** infra + release
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -126,10 +127,22 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
   volume. **The first discrimination mutation appended a service that did not parse, so the
   check went red for the wrong reason;** with a valid one it is 29/31 and the datastore line
   is the failure. A mutation that cannot be told apart from a file defect is not a mutation.*
-- [ ] `helm lint` passes with the schema present, and a deliberately wrong values file fails with a field-level message.
+- [x] `helm lint` passes with the schema present, and a deliberately wrong values file fails with a field-level message.
+  *(Slice 2b. `helm lint` is green against the chart as committed, and four wrong-values cases
+  each fail naming the FIELD: a non-integer `replicaCount`, a malformed `image.digest`, a
+  misspelled `api.replicaCounts`, and a misspelled TOP-LEVEL key. The last one is the interesting
+  one — the per-object `additionalProperties: false` rules do not reach the root, so a fat-fingered
+  `imagePullSecret` was accepted in silence and produced a release with no pull secret and no
+  warning. Only the root's own rule catches it, and the check exists because a mutation removing
+  that rule was the first one to survive the first mutation run.)*
 - [ ] The chart installs on a local cluster in CI with `--set` values for ingress host, TLS mode, resources, replicas and `existingSecret`, and every pod becomes ready.
 - [ ] The migration hook runs before application pods roll, and a subsequent `helm upgrade` re-runs it in order (verified with the REQ-129 runner).
-- [ ] Autoscaling values render an HPA with the configured min/max and target utilisation; a low-values install renders no HPA instead of a broken one.
+- [x] Autoscaling values render an HPA with the configured min/max and target utilisation; a low-values install renders no HPA instead of a broken one.
+  *(Slice 2b. Enabled → exactly one HPA with min 3 / max 12 / CPU target 65, and the Deployment it
+  scales deliberately omits `replicas` (pinning both is how an HPA and a rollout fight). Disabled
+  → zero HPAs, asserted by count rather than by the absence of a field. Only the ENABLED component
+  gets one. The `scaleTargetRef` is cross-checked against the Deployments that exist, because an
+  HPA pointing at a name nothing creates is the silent kind.)*
 - [ ] The release pipeline on a tag publishes multi-arch images with digests, CLI binaries for the documented platforms with checksums, the packaged chart and an SBOM per image.
 - [ ] The pipeline refuses to publish when tests or the migration verification gate fail.
 - [ ] The release manifest lists images, checksums, migrations and the minimum core version, and the deployment centre reads it.
@@ -191,11 +204,78 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
 2. **Enterprise topology + Helm chart.** External-service compose file, chart with schema, values groups, probes, PDB, HPA, migration hook, NOTES. *Done when:* a local-cluster install and upgrade cycle passes in CI with the hook ordering proven.
    — **The external-service compose file is done** (`845143da`): no datastore container by
    contract, every endpoint a required reference, replicas configured, no host publishing.
-   **Not yet in this slice, deliberately:** the Helm chart, its `values.schema.json`, the
-   migration hook and `NOTES.txt`. `helm` is not installed on this box, so a chart written here
-   could not be linted, rendered or installed, and shipping one that has never rendered is the
-   "documented but unreachable" shape this wave has produced in the other requests. The chart
-   lands with a `helm template` assertion in the same commit that writes it.
+   — **Slice 2b shipped**: `infra/helm/omnion/` (chart, `values.schema.json`, deployment /
+   service / ingress / HPA / PDB / migration-hook / ConfigMap / NOTES), gated by
+   `scripts/qa/helm-chart.sh` at **70 checks, 13 mutations, 13 caught**.
+
+   **The chart the previous tick left UNTRACKED did not render. Not one template of it compiled.**
+   The recorded reason — "`helm` is not installed on this box, so a chart written here could not be
+   linted, rendered or installed" — was a correct conclusion from a false premise: helm 3.16.3 is
+   installed at `/usr/local/bin/helm`. So the reasoning was sound, the check was skipped, and the
+   cost was a chart that had never been executed:
+
+   - `omnion.image` read `$root := .` while every caller passes `dict "root" … "component" …`, so
+     `.Values` was nil and `index nil "migrate"` failed on **every** render.
+   - the same helper emitted its own `image:` key under a caller's `image:` key — `image: image:
+     ghcr.io/…`, a YAML parse error rather than a wrong image.
+   - all three `range` loops wrote `---` glued to the next document's first key. **`helm template`
+     tolerates it; `helm lint`, which parses per file, does not** — so the one gate that would have
+     caught it was the one the previous tick could not run, and the tool that would have passed is
+     not the tool that ran.
+   - the migration Job asked for `ghcr.io/raksix/omnion-migrate`, an image no Dockerfile builds and
+     no release publishes: a pull failure during `pre-install`, the worst possible moment to
+     discover it. `--migrate-only` is a MODE of the API binary, so the job pulls the API image.
+   - `migration.image.tag: ""` **overrode** the release tag instead of inheriting it, so
+     `--set image.tag=9.9.9` moved every pod to 9.9.9 and left the migration job on `appVersion`:
+     0.4's migrations running immediately before 0.5's pods. The comment above that value warned
+     against exactly this, produced by the setting meant to prevent it. Empty now means "inherit",
+     by construction — the restore copies the BASE value back, because `unset`ing the key produces
+     the same fall-through one indirection further from the cause.
+   - `checksum/config` sat inside `with .Values.podAnnotations`, so with no pod annotations — the
+     default — a values edit left every pod running the old value while `helm upgrade` reported
+     success.
+   - the migration Job inherited `readOnlyRootFilesystem: true` with **no** `/tmp` mounted: an EROFS
+     at startup, in the pre-upgrade hook, before the release begins.
+   - `migration.enabled` was documented in `values.yaml` and ignored by the template.
+
+   **The gate's own defects are the more useful half of the record, because each was a check that
+   was not checking.** Six, in order of how long each one hid:
+
+   1. **`set -o pipefail` + `grep -q` in a pipeline inverts the result.** `-q` exits on the first
+      match, the upstream `grep -v` dies of SIGPIPE, and 141 becomes the pipeline's status — so the
+      `if` took the `else` branch on precisely the file where the leak WAS present, and reported a
+      clean pass over a 679-line render carrying a real credential. It only became visible because
+      the toy case was small; **a check whose exit status can be 141 is a check whose result is
+      inverted by success.**
+   2. **A grep for a secret is unrunnable when the display masks it.** The tooling that shows helm's
+      output redacts `postgres://u:hunter2password@db/x` to `u:***`, so any pattern that walks the
+      password stops matching at the asterisks — green on a clean render AND on a leaking one. The
+      rule is now STRUCTURAL: `scheme://` + userinfo `@` + host. It fires identically on the file
+      and on its masked display, and a plain endpoint (`http://omnion-api:8080`) has no `@` and
+      does not match, which is what keeps three legitimate endpoints from training a reader to
+      ignore the line.
+   3. **A pattern naming one SYNTAX of a thing is a pattern for that syntax.** The first version
+      matched `value: postgres://…` and missed `DATABASE_URL=postgres://…` — which is literally the
+      line NOTES.txt tells the operator to run, so that was the form that mattered most.
+   4. **`[ 	]` is Python's `re`, not POSIX.** It is green in a python spot-check and DEAD under
+      `grep -E`, which matched a literal `t`. Two languages, one expression, only one ever ran it.
+   5. **NOTES.txt cannot be rendered without a cluster.** `helm template` omits it and both
+      `helm install --dry-run` variants dial the API server — the flag is documented as "will not
+      attempt cluster connections" and connects anyway. The text moved into a `define` that a probe
+      template renders, so there is ONE source and the text the gate greps is the text the operator
+      reads.
+   6. **A check scoped to the whole file is scoped to things its subject never said.** `/readyz`
+      also appears in the Deployment probes and in a template comment, so a whole-file grep stayed
+      green when the notes' own guidance sentence was rewritten. The check now reads the notes
+      document and the guidance sentence itself.
+
+   The gate also carries a **self-test**: it writes a fixture containing a deliberate leak and
+   requires the scanner to fire on it while ignoring two plain endpoints. A scanner that has only
+   ever been green has demonstrated that it does not fire, not that the chart is clean.
+
+   **Still NOT claimed:** no cluster install, no `helm upgrade` cycle, no migration-hook ordering
+   observed from job logs, and no image built. The two Kubernetes acceptance lines that need those
+   stay unticked, and the release pipeline and the upgrade helper are untouched.
 3. **Release pipeline + artifacts UI.** Tag-driven build and publish, CLI binaries, SBOM, manifest, artifact cache, `/deployment/artifacts` screens, bundle generator and downloads. *Done when:* a fake tag produces a complete manifest and the panel shows digests matching the registry.
 4. **Upgrade helper + docs.** Upgrade plans, destructiveness flags from REQ-129, acknowledgement, `/deployment/upgrade`, `docs/deployment/upgrade.md` and the per-version notes workflow. *Done when:* the guide's steps are executed verbatim on the QA stack and the helper's checklist matches what the operator does.
 

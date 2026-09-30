@@ -1,0 +1,26 @@
+apiVersion: v2
+name: omnion
+description: Omnion — an open-source enterprise application platform with a powerful CMS at its core.
+type: application
+
+# The chart version moves when the chart's own templates change; the app version tracks the
+# platform release the chart deploys. They are separate numbers on purpose: a template fix
+# (a probe path, a label) has to be publishable without pretending the platform moved, because a
+# chart version is what `helm dependency` and an operator's lock file actually resolve.
+version: 0.1.0
+appVersion: "0.1.0"
+
+home: https://github.com/raksix/omnion
+sources:
+  - https://github.com/raksix/omnion
+
+keywords:
+  - cms
+  - platform
+
+maintainers:
+  - name: Omnion
+    url: https://github.com/raksix/omnion
+
+annotations:
+  category: Application

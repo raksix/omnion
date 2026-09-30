@@ -1,0 +1,22 @@
+{{- $root := . }}
+{{- range $component, $cfg := dict "api" $root.Values.api "admin" $root.Values.admin "web" $root.Values.web }}
+{{- if $cfg.podDisruptionBudget }}
+{{- if $cfg.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "omnion.fullname" $root }}-{{ $component }}
+  labels:
+    {{- include "omnion.componentLabels" (list $component $root) | nindent 4 }}
+spec:
+  # minAvailable, not maxUnavailable: with maxUnavailable: 1 a single-replica install can have its
+  # only pod taken by a node drain, and the eviction is allowed because the budget is satisfied
+  # (1 available, 0 unavailable).
+  minAvailable: {{ min $cfg.podDisruptionBudget.minAvailable ($cfg.replicaCount | default 1) }}
+  selector:
+    matchLabels:
+      {{- include "omnion.componentSelectorLabels" (list $component $root) | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}
