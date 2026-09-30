@@ -26,7 +26,9 @@ pub mod dates;
 pub mod departments;
 pub mod employees;
 pub mod error;
+pub mod leave;
 pub mod model;
+pub mod requests;
 pub mod store;
 
 pub use error::{HrError, Result};

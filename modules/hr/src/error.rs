@@ -12,6 +12,8 @@
 //! and a substring test on a message is a question that breaks when somebody improves the wording.
 
 use thiserror::Error;
+use time::Date as CalendarDay;
+use uuid::Uuid;
 
 /// Everything the HR module can refuse to do.
 #[derive(Debug, Error)]
@@ -69,6 +71,62 @@ pub enum HrError {
     /// A merge whose two records are the same, or a merge of different organizations.
     #[error("invalid merge: {0}")]
     InvalidMerge(String),
+    /// The requested range overlaps a `pending` or `approved` request of the same employee.
+    ///
+    /// The variant carries **both** ranges. The acceptance criterion asks for "the conflicting
+    /// dates in the message", and it is the right ask: "conflicts with another request" sends the
+    /// person back to the list to work out which one, which is a different screen and a different
+    /// search. Rejected and cancelled rows are *not* conflicts — they are history, and a person
+    /// who was refused once and then cancelled is not double booked.
+    #[error("these dates overlap request {other_request_id}, which runs from {starts_on} to {ends_on}")]
+    LeaveOverlap {
+        /// The request that already holds those days.
+        other_request_id: Uuid,
+        /// The first day that request holds.
+        starts_on: CalendarDay,
+        /// The last day that request holds.
+        ends_on: CalendarDay,
+    },
+    /// The request asks for more days than the balance has left, on a type that does not allow a
+    /// negative balance.
+    ///
+    /// Carries all five numbers: entitled, used, pending, requested and remaining. A refusal that
+    /// says "not enough balance" makes the person go and read the balance card, and the card is
+    /// the thing they are already on.
+    #[error("this request is {requested} days of {leave_type}, but only {remaining} are left ({entitled} entitled, {used} used, {pending} pending)")]
+    InsufficientBalance {
+        /// The type's name, so the message is about a policy and not an id.
+        leave_type: String,
+        /// What the organization promised.
+        entitled: String,
+        /// What is already spent.
+        used: String,
+        /// What is waiting for a decision.
+        pending: String,
+        /// What this request asks for.
+        requested: String,
+        /// What would be left.
+        remaining: String,
+    },
+    /// A request that is not `pending` was decided.
+    ///
+    /// Its own variant, with the status it already carries, because "cannot decide" and "cannot
+    /// cancel" are different sentences and a second approver clicking at the same moment as the
+    /// first has to be told which one happened.
+    #[error("this request is already {status}, so it cannot be decided again")]
+    LeaveAlreadyDecided {
+        /// The status it holds now.
+        status: String,
+    },
+    /// A request that is not `pending` was cancelled.
+    ///
+    /// An approved request is history: it is ended by the leave actually happening, not by
+    /// pretending it was never agreed.
+    #[error("this request is {status}, so it can no longer be cancelled")]
+    LeaveNotCancellable {
+        /// The status it holds now.
+        status: String,
+    },
     /// PostgreSQL refused or could not answer.
     #[error("hr storage error: {0}")]
     Database(#[from] sqlx::Error),

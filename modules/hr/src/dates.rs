@@ -145,6 +145,49 @@ pub mod instant {
     {
         deserialize_instant(deserializer)
     }
+
+    /// The same pair for an **absent** instant.
+    ///
+    /// Added by the leave slice, and it is a real gap rather than a preference: `dates::option`
+    /// exists for `Date`, and before this the only way to carry an `Option<OffsetDateTime>` was
+    /// to default to the **date** adapter — which compiles into a field that serialises a
+    /// timestamp as `2026-10-01` and deserialises it as midnight on that day. The field kept the
+    /// *instant* type and silently lost the *time*, so "decided at" would have read as a date and
+    /// two decisions on the same day would have been indistinguishable. A missing adapter is a
+    /// wrong answer waiting for the next `Option<OffsetDateTime>` somebody adds.
+    pub mod option {
+        use super::super::{instant_to_wire, OffsetDateTime, Rfc3339};
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        /// Write the instant, or `null`.
+        pub fn serialize<S>(value: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match value {
+                Some(moment) => serializer.serialize_some(&instant_to_wire(moment)),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        /// Read the instant, mapping an absent key or a `null` to an absent value.
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let raw = Option::<String>::deserialize(deserializer)?;
+            match raw.map(|text| text.trim().to_owned()).filter(|t| !t.is_empty()) {
+                None => Ok(None),
+                // `OffsetDateTime::parse`, not `deserialize_instant`: that one takes a
+                // `Deserializer`, and the `String` is already in hand here.
+                Some(text) => OffsetDateTime::parse(&text, &Rfc3339).map(Some).map_err(|_| {
+                    serde::de::Error::custom(format!(
+                        "expected a timestamp as RFC 3339, received \"{text}\""
+                    ))
+                }),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
