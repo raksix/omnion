@@ -65,6 +65,20 @@ w3 pass (`/tmp/omnion-qa-slot-holders`, cwd `/mnt/apopic/omnion-w3`). No screen 
 this slice. The REQ stays open on two counts that are not mine: the REQ-064 form-editor
 card is still slice 3's one missing screen, and REQ-064's forms module is on no branch.
 
+**One red that is not this slice's, checked rather than assumed.** `apps/api/tests/analytics.rs`
+is red on this branch — `settings_are_scoped_validated_and_readable` expects `400` and gets
+`403`, and the suite is red as a whole. It is **pre-existing**: checked out at `0bdba397`
+(slice 19, before the proxy fix) the same assertion fails with the identical `left: 403,
+right: 400`, so it is not this change. The cause is legible in the suite's own request builder:
+`fn request` puts the session cookie and `content-type` on the request and sends **no `Origin`**
+header, and the line before the failing one asserts `403` for a genuinely unauthorised
+caller — so the failing PUT is being refused by CSRF before the handler's validation runs.
+Recorded here rather than fixed: `apps/api/tests` is shared surface, the suite belongs to the
+analytics work, and a fix written inside an unrelated business slice would be a change no gate
+of mine covers. **It is the reason `cargo test --workspace` cannot be used as a per-tick gate
+on this branch — the honest per-tick gates are the touched crate's `--lib` plus the
+module's own suite.**
+
 **Next.** REQ-117's remaining surface is thin, so the queue moves to REQ-061
 manufacturing (`pending`, no crate on this branch) or back to REQ-064's form-editor card,
 which cannot be built while its module exists nowhere.
