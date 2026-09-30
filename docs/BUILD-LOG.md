@@ -9027,3 +9027,9 @@ pid dead-or-waiter), and burning the tick waiting for it is the trap this writer
 `summary.json` — the legs run, which has been true since tick 46 and is still unproven. No box is
 ticked by this commit, and `runCrmKeyboardAndMobile` is the one that matters: it is the pass whose
 exit code is now honest enough to be believed.
+
+**Gates, completed after the entry above.** `cargo test -p omnion-module-crm --lib` → **172 passed;
+0 failed** (0.02s of actual test time; the 19 minutes were 411 crates compiled from cold, at load
+76 with six writers on the box — the `--quiet` log stayed 0 bytes for the whole of it, which reads
+as a hung build and was not). `bash scripts/qa/void-pass-classifier-probe.sh` → **12/12**,
+`node --check walkthrough.cjs` OK, `bash -n run.sh` OK, `turbo run typecheck` **2/2**.
