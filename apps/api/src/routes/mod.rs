@@ -72,6 +72,7 @@
 pub mod ai;
 pub mod ai_agents;
 pub mod ai_agent_workspace;
+pub mod ai_approvals;
 pub mod ai_decisions;
 pub mod ai_identities;
 pub mod ai_routing;
@@ -998,6 +999,34 @@ pub fn router(state: AppState) -> Router {
     let ai_permissions_matrix =
         get(ai_identities::permission_matrix_route).layer(guards::require(&state, "ai.tools.read"));
 
+    // The approval gate (REQ-101 slice 1). Three powers, and the split is the request's second
+    // acceptance criterion expressed in routing: reading the inbox is knowing what an agent wants
+    // to do, deciding is releasing it, and changing a class policy is deciding for **every**
+    // request from now on. A viewer holding only the first key gets `403` from the layer on the
+    // other two, naming the missing key — which is why the keys are in the catalogue and not
+    // invented at the call site.
+    let ai_approvals = get(ai_approvals::list_approvals)
+        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval = get(ai_approvals::get_approval)
+        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval_approve = post(ai_approvals::approve)
+        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_approval_reject = post(ai_approvals::reject)
+        .layer(guards::require(&state, "ai.approvals.act"));
+    let ai_approval_sweep =
+        post(ai_approvals::sweep).layer(guards::require(&state, "ai.approvals.act"));
+    // The policy screen reads under the *read* key on purpose: an installation has to be able to
+    // show "these six classes are all gated" to somebody who cannot change it, or the screen is
+    // only visible to the people who already trust it.
+    let ai_approval_policies = get(ai_approvals::list_policies)
+        .layer(guards::require(&state, "ai.approvals.read"));
+    let ai_approval_policy = put(ai_approvals::put_policy)
+        .layer(guards::require(&state, "ai.policies.manage"))
+        .merge(
+            axum::routing::delete(ai_approvals::delete_policy)
+                .layer(guards::require(&state, "ai.policies.manage")),
+        );
+
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run_steps = get(ai_agents::get_run_steps).layer(guards::require(&state, "ai.agents.read"));
@@ -1870,6 +1899,17 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/identities", ai_identities)
         .route("/ai/identities/{id}", ai_identity)
         .route("/ai/identities/{id}/tools", ai_identity_tools)
+        // The approval gate (REQ-101 slice 1). `/ai/approvals/policies` is registered under its
+        // own literal for the same reason `/ai/permissions/matrix` is two lines above: axum
+        // prefers a literal segment over a capture, and `/ai/approvals/{id}` would otherwise read
+        // `policies` as an approval id — a 400 on a screen whose only job is to list policies.
+        .route("/ai/approvals", ai_approvals)
+        .route("/ai/approvals/policies", ai_approval_policies)
+        .route("/ai/approvals/policies/{class}", ai_approval_policy)
+        .route("/ai/approvals/sweep", ai_approval_sweep)
+        .route("/ai/approvals/{id}", ai_approval)
+        .route("/ai/approvals/{id}/approve", ai_approval_approve)
+        .route("/ai/approvals/{id}/reject", ai_approval_reject)
         .route("/ai/agents/{id}/tools", ai_agent_tool_set)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)

@@ -1140,6 +1140,20 @@ impl From<AiHubError> for ApiError {
             AiHubError::IdentityConflict(message) => {
                 Self::new(StatusCode::CONFLICT, "identity_conflict", message)
             }
+            // Approvals (REQ-101). The same three-way split, and for the same reason: an
+            // `invalid_approval` is a field on the review or the policy form (a class nobody
+            // has heard of, an expiry of zero, a rejection with no reason), an
+            // `approval_not_found` is a pruned row or **another tenant's** — never a 403,
+            // because an approval id that exists must not be confirmable by its status code,
+            // and the inbox would become an existence oracle for every deletion on record.
+            AiHubError::InvalidApproval(message) => {
+                Self::bad_request("invalid_approval", message)
+            }
+            AiHubError::ApprovalNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "approval_not_found",
+                format!("no approval `{id}` in this organization"),
+            ),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code
