@@ -4850,6 +4850,41 @@ function qaSql(statement) {
   ).trim();
 }
 
+/**
+ * The value a `RETURNING` clause produced, or `""`.
+ *
+ * `qaSql` returns psql's stdout verbatim, and a statement that spans several lines and ends
+ * in `RETURNING id` does NOT come back as a uuid: psql prints its own status line first, so
+ * the caller received the literal string `INSERT 0 0` and used it as a `page_id`. The next
+ * fixture statement then failed on `invalid input syntax for type uuid`, and the whole depth
+ * pass reported **"the promotion screen is broken"** — a finding about a screen, caused
+ * entirely by a fixture helper returning the wrong shape.
+ *
+ * That is the same shape of mistake as a swallowed Playwright error: the harness's failure
+ * and the product's failure land on the same output line, and only the second is actionable.
+ * The fix is to make the helper that reads a value refuse to return one it could not have
+ * come from, rather than to patch each call site.
+ *
+ * The last non-empty line is psql's value; a status line is `INSERT 0 1` / `UPDATE 1` /
+ * `DELETE 3` and never a uuid. Both halves are needed: taking the last line stops the
+ * statement from returning the status line at all, and rejecting a non-uuid stops a caller
+ * from pasting a status line into a uuid column ever again.
+ */
+function qaReturning(statement) {
+  const raw = qaSql(statement);
+  if (!raw) return "";
+  // psql prints RETURNING rows FIRST and its own status line (`INSERT 0 1`) LAST. Both
+  // orders have to be right, and I got the first version backwards: taking the last line
+  // would hand back "INSERT 0 1" for every statement that worked.
+  const uuid = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(line));
+  // No uuid means the statement matched no rows — and psql still exits 0 and still prints a
+  // status line, so the caller used to receive "INSERT 0 0" and paste it into a uuid column.
+  return uuid || "";
+}
+
 /** Post one beacon to the public collection endpoint of the QA site. */
 async function postBeacon(body, { userAgent, forwardedFor, country }) {
   const headers = { "content-type": "application/json", "user-agent": userAgent };
@@ -5962,7 +5997,9 @@ async function runCdnPurgeDepth(page, report) {
   // A failed fixture, written directly: the pass must not depend on a provider being down,
   // and a `generic_http` adapter pointed at a closed port would make every run slower and
   // its result depend on the box's networking.
-  const failedId = qaSql(
+  // `qaReturning`, not `qaSql`: this statement spans lines, so psql's own status line comes
+  // back with the value and `failedId` would be the string "INSERT 0 0".
+  const failedId = qaReturning(
     `insert into cdn_purges (site_id, kind, targets, status, provider, item_count, failed_count, error) ` +
       `values ('${site}', 'url', array['/qa/never-cached'], 'failed', 'origin', 1, 1, ` +
       `'the provider refused: target is not in this zone') returning id`,
@@ -7005,7 +7042,7 @@ async function runEnvironmentsDepth(page, report) {
       // column does not exist fails at the first insert and the whole pass reports "the promotion
       // screen is broken" for a reason that is entirely in the fixture. The revision is created
       // as a draft, which is the state the change set reads its title from.
-      const seeded = qaSql(
+      const seeded = qaReturning(
         `insert into pages (id, site_id, environment_id, slug, status, created_by, created_at, updated_at) ` +
           `select gen_random_uuid(), p.site_id, '${environmentId}', '${seedSlug}', 'draft', p.created_by, now(), now() ` +
           `from pages p ` +
