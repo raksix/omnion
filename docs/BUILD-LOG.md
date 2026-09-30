@@ -5604,3 +5604,65 @@ did at the end of tick 37.
 **Next.** Read `validate-classes.cycleOnABranch` off the queued pass — the unit gate proved the
 traversal, only the server proves the wire. Then the four probes that select nothing
 (`edge-delete`, `step-trace`, `run-from-here`, `listener`) as one defect rather than four.
+## Tick 39 — the same bug was still in the consumer, one level below the fix
+
+Tick 38 repaired `find_cycle`, which followed only the first edge out of each node. This tick
+found the identical mistake in the function that *consumes* the same graph: the projection
+picked the next node with `find(|edge| edge.source == node.id && follows(port))` — the first
+matching edge in the saved array.
+
+The shape that triggers it is a node with two edges on ports the linear walk follows.
+`follows` accepts `out | true | success | case_1 | default`, and a `switch` exports both
+`case_1` and `default`, so any switch with both arms wired projects down one of them —
+whichever the client happened to serialise first.
+
+**This one is worse than the cycle bug it sits next to.** A cycle is refused-or-not; the author
+finds out. This one validates *clean* and then runs the wrong branch on every execution, with no
+signal at any point. And the answer is not a property of the drawing at all: saving the
+identical graph with the edges reordered changes what it does, which means the same picture can
+be two different rules depending on a request-body ordering nobody chose.
+
+`validate` now refuses it (`ambiguous_branch`, naming both ports) rather than letting the walk
+pick, because the v0 engine executes an ordered list and walks ONE path — two walkable ports on
+a node is not a shape it can execute, and the author needs that from the problems panel at save
+time. The findings pass through the route verbatim (`findings: all`), so the panel needed no
+change: it renders `finding.message` and tags `data-finding={code}`.
+
+**Proof.** `a_node_with_two_followed_ports_is_refused_rather_than_guessed` was written first and
+FAILED against the old `find` (`expect_err` on a graph that projected successfully). It also
+asserts the verdict is byte-identical when the two edges are swapped, which is the property the
+old code got wrong, so the ordering cannot creep back in as a passing test.
+`cargo test -p omnion-workflows --lib` 148 passed / 0 failed (147 before). `pnpm typecheck` 2/2.
+`node --check scripts/qa/walkthrough.cjs` clean.
+
+**The merge.** 18 commits behind `origin/main`, merged at the start of the tick as the loop
+requires. Two conflicts, both add/add on files two waves appended to, and neither was a text
+merge. `app-shell.tsx` had two imports of the same lucide symbols — concatenating them does not
+compile, so the symbol sets have to be merged into one statement. `lib/api.ts` is subtler: the
+REQ-046 console block and main's REQ-014 health block are both at the tail, and the console
+function's closing brace has to land *before* the health block — appending it at EOF nests the
+entire health surface inside that function body and every export becomes a syntax error. The
+brace was appended at EOF twice before the nesting showed up in the compiler rather than in a
+review. `docs/BUILD-LOG.md` needed the entry-level splice (main 19 entries + this branch's
+missing 3), verified as a multiset of headings rather than a line count.
+
+**`origin/main` does not compile, and that is not this branch's to fix.** The pass took the QA
+place after a 2693 s queue and then died in `run.sh`'s build gate: five errors in
+`apps/api/src/routes/health_panel.rs`, four `From<HealthError> for ApiError` (not implemented in
+`apps/api/src/error.rs`) and one `no field storage on &Config`. All five are present verbatim on
+`origin/main` — `git show origin/main:apps/api/src/routes/health_panel.rs` has the same five
+`run_and_record` call sites and the same `config.storage.driver()`, and `origin/main`'s
+`error.rs` has no `HealthError` conversion at all. This is the main writer's in-flight REQ-014.
+The fast gate could not have caught it: every gate this branch runs (`cargo test -p
+omnion-workflows --lib`, `pnpm typecheck`) compiles its own crate and not `omnion-api`.
+
+**Consequence for the tick.** No browser pass. `validate-classes.ambiguousBranch` (both rows of
+it, including `orderIndependent`) is written and syntax-checked but has never run against a
+server; it is the next thing to read.
+
+**Next.** Read `ambiguousBranch` off a pass once `omnion-api` builds again — `found` AND
+`orderIndependent`, because `found` alone was the reading that was green before the fix. Then the
+`listener` row (`panelFound:false, controlFound:false`) and `tab-walk`'s `reachedAnEdge:false`,
+both of which need a node selected first. REQ-004's sample-plugin run stays BLOCKED on REQ-121
+(wave 5b, unclaimed): `plugins_enabled_for` returns an empty registry, so no plugin node can
+appear in any browser.
