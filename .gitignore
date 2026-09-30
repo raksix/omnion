@@ -40,3 +40,7 @@ CLAUDE.md
 
 # The scratch target dir a writer loop uses when /mnt/apopic is tight (docs/BUILD-LOG.md).
 .tmp-target/
+
+# Python bytecode from the QA helper scripts (scripts/qa/*.py are executable tooling).
+__pycache__/
+*.pyc
