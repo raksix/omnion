@@ -115,7 +115,22 @@ fn session_request(
 ) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
     let builder = match token {
-        Some(cookies) => builder.header(header::COOKIE, cookies),
+        Some(cookies) => {
+            let builder = builder.header(header::COOKIE, cookies);
+            // The CSRF secret travels as a HEADER, and the cookie it was issued alongside is only
+            // the readable half. Sending the cookie without the header is the shape every
+            // cookie-authenticated mutation in this suite used to have, and the platform's answer
+            // was `403 csrf_unavailable` — twelve identical failures whose message names a
+            // missing environment variable rather than a missing header, so the cost of reading
+            // them as "the suite is misconfigured" was a whole tick.
+            //
+            // Read out of the SAME cookie string the session is sent in, so the two can never
+            // disagree about which session they belong to.
+            match csrf_of(cookies) {
+                Some(secret) => builder.header("x-omnion-csrf", secret),
+                None => builder,
+            }
+        }
         None => builder,
     };
     match body {
@@ -127,6 +142,14 @@ fn session_request(
             .expect("request builds"),
         None => builder.body(Body::empty()).expect("request builds"),
     }
+}
+
+/// The `omnion_csrf` value from a joined cookie header.
+fn csrf_of(cookies: &str) -> Option<String> {
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key.trim() == "omnion_csrf" && !value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 /// A request carrying a content token rather than a session.
