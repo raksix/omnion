@@ -7487,3 +7487,88 @@ as the verdict.
 the four new 390 px keys. (c) REQ-062 acceptance 15's render half. Note for the next tick: the
 invariants file still says to build in `/dev/shm/w2-target`, which is now 82% full with eight siblings'
 targets — tick 36 established `/mnt/apopic/omnion-w2-target` and that line needs rewriting.
+
+## 2026-09-30 · Tick 38 — the canvas a phone draws was invisible to the step that counted it (REQ-063 criterion 17)
+
+The `--only=block-editor` pass queued last tick ran: started 08:40, summary written 09:11, exit 0,
+`missing: []`. For the first time in this REQ's life the criterion had **numbers** in it. Ten of the
+eleven new keys are green, including every one the criterion actually names — `editorNarrowAt1440`,
+`editorNoHorizontalScrollAt1440`, `editorNarrowAt390`, `editorReadOnlyAt390`, `noPublishControlAt390`,
+`editorNoHorizontalScrollAt390`, `narrowNoticeSaysWhy`, `narrowNoticeOffersPreview` — and the phone
+overflow figures are exact: scroll 358 against client 358, document 390 against 390. The phone really
+does open read-only, with the publish control *absent* rather than dimmed, and the notice says why.
+
+The eleventh, `canvasDrawnAt390`, read **false**, on a canvas that had drawn every block on the page.
+
+**The defect was in the product, and it had been there since the narrow editor shipped.**
+`BlockCanvas` attaches `data-block-canvas-block={block.type}` on the edit branch. The render branch —
+the one a phone gets, and the one the preview frame draws with — returns a bare
+`<div class="bl-canvas-block">` with no identifying attribute at all. So `canvasDrawnAt390`, which counts
+`[data-block-canvas] [data-block-canvas-block]`, counted **zero elements** on a canvas that was
+visibly full.
+
+The same hole explains two other numbers in the same report. `previewDrawnBlocks` and
+`previewPhoneBlocks` were both 0 — and sitting three fields away,
+`previewCounts: {block: "6", visible: "6"}`. That is the shape of the failure, and it is worth naming
+precisely: **both numbers came off the server payload, so they agreed with each other, and neither was
+the DOM.** The status element says "6 of 6 blocks render on desktop" and the frame beside it held
+nothing a step could see, and the report printed both without contradiction because no assertion ever
+compared a payload to a render. Counting a thing and counting what the thing claims to have are
+different measurements; the harness had been doing the first twice and calling it a cross-check.
+
+`7dea0378` gives the render branch the edit branch's attributes — type, error state, selection,
+inline-editability — plus `data-block-canvas-mode="render"`. That last one is not decoration: it lets a
+step demand the *read-only* branch specifically, which both describes the screen it is about and
+catches the reverse regression, a phone that quietly grew a full editor.
+
+`8b12f120` closes the self-referential half. The phone canvas is counted by
+`[data-block-canvas-mode=render]` and then compared against the editor's own `data-block-count`; the
+frame is held to **never exceed** its stated visible count, which is the claim a broken frame
+violates, since blocks hidden on a viewport are absent by design. The eleven keys are now demanded by
+`--only=block-editor`, so a pass that dies before them reports `missing` instead of staying silent.
+
+**Criterion 17 is NOT ticked, and the reason is the whole point.** The pass measured the tree as it
+stood at 09:11. The fix was committed at 09:24. A red that is stale is still the last thing anybody
+actually measured, and rewriting it as green without a run would repeat the failure that has kept this
+box open for three ticks — a claim no pass has ever seen. Same for REQ-064's criterion 18, where
+`--only=members` is queued for the four new 390 px keys.
+
+**A fourth blind spot, and a tool for the class.** Three ticks, three harnesses that could not see the
+thing they measured: `setViewportSize` called zero times in 880 lines; a 390 px number read off a
+1440 px screenshot; and now a selector that cannot see the element it names. None is detectable by
+parsing, by `tsc`, or by 252 Rust tests. The fourth arrived while writing this one: my own patch put
+`statusAttr` and `frameAttr` *above* the `const` that declares them — valid syntax, clean
+`node --check`, `ReferenceError` on the first real run, in the exact path the tick exists to repair.
+That is the second time this file has made it (the first was `memberSteps`, last tick). So `dd537259`
+adds `scripts/qa/check-tdz.cjs`: it scans every function body for a bare identifier read that precedes
+its own declaration at the same brace depth, in 0.5 s over 1906 bodies.
+
+The interesting part is what it took to make that tool *trustworthy*. Its first draft reported 41
+findings in a file with no such defect — property accesses, `for`-head loop counters, arrow parameters,
+object-literal keys, and `/revision/i` **flags**, because the flag scan started at the closing slash
+and so left the `i` standing in the stripped output as a bare identifier. Forty-one false positives is
+how a gate gets switched off, so every one was traced to its cause and excluded at the cause:
+`for`-of bindings including destructured patterns, nested-arrow shadowing, own-parameter-list
+mentions, keys and shorthand properties, and regex literals. What remains is six findings, each opened
+in the file and confirmed ordinary, baselined by `function:line:name` with a stale-entry warning so
+the list cannot quietly rot. **A planted temporal dead zone still exits 1** — a checker that cannot
+fail is the same defect wearing a different hat, and the class of mistake this tick is about is
+precisely the assertion that cannot fail.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `cargo test -p omnion-content --lib` | **252 passed, 0 failed** |
+| `apps/admin` `tsc --noEmit` | **exit 0** |
+| `node --check scripts/qa/walkthrough.cjs` | **exit 0** |
+| `node scripts/qa/check-tdz.cjs scripts/qa/walkthrough.cjs` | **clean**, 1906 bodies, 6 baselined, 0.5 s |
+| `check-tdz` on a planted TDZ fixture | **exit 1** (negative control) |
+| `check-tdz` runtime after fixing an O(n²) `slice(0, m.index)` | 181 s → **0.5 s** |
+| `--only=block-editor` pass (08:40→09:11) | `missing: []`, 10/11 green, `netFailures` 1 (a `404` on a placeholder media id) |
+
+**Next.** (a) Re-run `--only=block-editor` against the fixed build; criterion 17 is tickable the moment
+`canvasDrawnAt390` and `canvasCountMatchesStatus` come back true, and that run is queued behind
+`--only=members`. (b) Read the members summary for `membersTableNoHorizontalScrollAt390`,
+`membersLayoutAt390`, `drawerFitsAt390` and `policyRouteNoHorizontalScrollAt390` — REQ-064 criterion 18
+closes on those four. (c) REQ-062 acceptance 15's render half.
