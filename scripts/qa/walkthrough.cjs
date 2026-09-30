@@ -9895,6 +9895,15 @@ async function main() {
       "deleted", "saved", "published", "publicRendered", "historyCoversFifty",
       "outlineWarningCleared", "columnsInserted", "breadcrumbReachesNested",
       "unwindLandedOnSavedTree",
+      // Criterion 17's two widths. These are DEMANDED, which is the point: a summary that
+      // asked for them a tick ago would have reported "missing" for a pass that died before
+      // them, and a summary that does not ask reports nothing at all for a pass that ran them
+      // and got `false`. Neither the criterion nor the "no untested screen" rule survives a
+      // measurement nothing is obliged to produce.
+      "editorNarrowAt1440", "editorNoHorizontalScrollAt1440",
+      "editorNarrowAt390", "editorReadOnlyAt390", "noPublishControlAt390",
+      "canvasDrawnAt390", "canvasCountMatchesStatus", "editorNoHorizontalScrollAt390",
+      "narrowNoticeSaysWhy", "narrowNoticeOffersPreview", "publicRendered",
     ];
     const missing = flags.filter((f) => be[f] === undefined);
     if (be.warningJumpOffered === true && be.warningReachable === undefined) {
@@ -12730,18 +12739,17 @@ async function runBlockEditorDepth(page, report) {
     steps.previewSaysDraft = /draft/i.test(steps.previewBanner);
     // There is no publish control on this screen at all — not a disabled one, not a hidden one.
     steps.previewHasNoPublish = (await page.locator("[data-block-preview] [data-block-publish]").count()) === 0;
-    steps.previewDrawnBlocks = await page.locator("[data-block-preview-frame] [data-block-canvas-block]").count();
-    await shot(page, "page-block-preview");
-
-    // The screen switch is a server round trip, and the two payloads genuinely differ: a block
-    // the author hid from phones is ABSENT, not invisible.
-    await page.locator("[data-block-preview-viewport=mobile]").first().click({ timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(2000);
-    // Every read on this frame is `.catch()`-guarded AND timeout-bounded. A bare
-    // `getAttribute` waits the full 30s and then throws a TimeoutError that aborts the whole
-    // pass — after the report would have been written — and the run is lost with no summary at
-    // all. The frame is a *secondary* screen reached by a link, so its absence is a fact to
-    // record, never a reason to end the run.
+    // Every read on the frame and the status element is `.catch()`-guarded AND timeout-bounded.
+    // A bare `getAttribute` waits the full 30s and then throws a TimeoutError that aborts the
+    // whole pass — after the report would have been written — and the run is lost with no
+    // summary at all. The frame is a *secondary* screen reached by a link, so its absence is a
+    // fact to record, never a reason to end the run.
+    //
+    // Declared HERE, above the first use, rather than beside the mobile switch they were
+    // originally written for. A helper declared further down and called above is a temporal
+    // dead zone crash: valid syntax, `node --check` clean, and a ReferenceError on the first
+    // real run. That is the same mistake this file made once already (`memberSteps`), and it is
+    // invisible to every gate except actually running it.
     const frameAttr = async (name) =>
       page
         .locator("[data-block-preview-frame]")
@@ -12757,6 +12765,30 @@ async function runBlockEditorDepth(page, report) {
         .first()
         .getAttribute(name, { timeout: 5000 })
         .catch(() => null);
+    // The count, and the status element's own `visible_count`, side by side. These used to be
+    // the same number twice, which is why `previewCounts: {block: "6", visible: "6"}` could
+    // sit in a report beside a drawn count of 0 without either line contradicting the other:
+    // both were read off the server payload, and nothing compared them to the DOM. A frame that
+    // renders a payload is only proven by something in the frame.
+    steps.previewDrawnBlocks = await page
+      .locator("[data-block-preview-frame] [data-block-canvas-block]")
+      .count();
+    steps.previewStatedVisible = Number(
+      (await statusAttr("data-block-preview-visible-count")) ?? Number.NaN,
+    );
+    // Hidden-on-this-viewport blocks are absent from the render by design, so the frame is
+    // expected to hold FEWER than the total and never more. "Never more" is the real assertion
+    // and the one a broken frame violates; equality is demanded only when nothing is hidden.
+    steps.previewFrameWithinStatedCount =
+      Number.isFinite(steps.previewStatedVisible) &&
+      steps.previewDrawnBlocks > 0 &&
+      steps.previewDrawnBlocks <= steps.previewStatedVisible;
+    await shot(page, "page-block-preview");
+
+    // The screen switch is a server round trip, and the two payloads genuinely differ: a block
+    // the author hid from phones is ABSENT, not invisible.
+    await page.locator("[data-block-preview-viewport=mobile]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(2000);
     // The live-pass guard is the same shape: the frame's save must NOT move the published
     // revision, and reading that number is the assertion. Unguarded, a missing banner hangs
     // 30s and then throws — the exact failure that cost this pass its entire summary.
@@ -12903,7 +12935,34 @@ async function runBlockEditorDepth(page, report) {
       steps.noPublishControlAt390 = (await page.locator("[data-block-publish]").count()) === 0;
       steps.noInspectorAt390 = (await page.locator("[data-block-inspector]").count()) === 0;
       // The page still READS: the canvas is drawn, which is the whole promise of the notice.
-      steps.canvasDrawnAt390 = (await page.locator("[data-block-canvas] [data-block-canvas-block]").count()) > 0;
+      //
+      // Scoped to `mode="render"` rather than counted wherever blocks appear. On a phone the
+      // editor is read-only, so the ONLY blocks on screen are render-mode ones — but that is a
+      // fact about the current screen, and the count this replaces was taken against every
+      // block, which meant it could be satisfied by an edit-mode block that only exists at
+      // 1440. Demand the read-only branch by name so the assertion describes the screen it is
+      // about; this also catches the reverse regression, a phone that quietly grew an editor.
+      const phoneRenderBlocks = await page
+        .locator("[data-block-canvas] [data-block-canvas-block][data-block-canvas-mode=render]")
+        .count();
+      steps.canvasDrawnAt390 = phoneRenderBlocks > 0;
+      // How many, not only whether: a canvas that draws exactly one of twelve blocks passes a
+      // boolean and fails the promise. The editor's own status element already publishes
+      // `data-block-count`, so the DOM count can be checked against the number the screen shows
+      // the author — which is the disagreement that let this ship: the status read "12 blocks"
+      // while the canvas held nothing a step could see.
+      steps.canvasRenderBlocksAt390 = phoneRenderBlocks;
+      const statedCount = await page
+        .locator("[data-block-status]")
+        .first()
+        .getAttribute("data-block-count", { timeout: 5000 })
+        .catch(() => null);
+      steps.canvasStatedCountAt390 = statedCount === null ? null : Number(statedCount);
+      // A mismatch is a defect even when both numbers are non-zero (a canvas quietly dropping a
+      // nested column's children), and a `null` is a defect too: it means the count could not be
+      // read at all, which is how this measurement was empty for two ticks running.
+      steps.canvasCountMatchesStatus =
+        steps.canvasStatedCountAt390 !== null && phoneRenderBlocks === steps.canvasStatedCountAt390;
       const phone = await page
         .locator("[data-block-editor]")
         .first()
