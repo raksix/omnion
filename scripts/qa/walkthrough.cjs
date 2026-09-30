@@ -12710,6 +12710,78 @@ async function runBlockEditorDepth(page, report) {
   // the screen correctly reports "nothing changed" — a true answer that proves nothing.
   await runRevisionCompare();
 
+  // ---- The two widths the criterion names ---------------------------------------------------
+  //
+  // 1440 and 390, measured, in that order, at the END so the pass arrives with a page that has
+  // real blocks on it — an empty page has nothing to overflow. This is the half of the criterion
+  // that had no step at all: the depth pass never called `setViewportSize`, so "usable at 390 px"
+  // was being read off a screenshot of a 1440-wide page, which is the one measurement that
+  // cannot fail and therefore proves nothing.
+  //
+  // `restore()` puts the viewport back with a `finally`, because an exception between the two
+  // widths would leave every later step screenshotting a phone — and a pass whose failure changes
+  // what the rest of the pass measures is a pass that reports somebody else's bug.
+  const editorPath = steps.path;
+  if (editorPath) {
+    try {
+      // ---- 1440 px: the editor is for this width, and it must not scroll sideways.
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.goto(`${URL_ADMIN}${editorPath}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForSelector("[data-block-editor]", { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(800);
+      steps.editorNarrowAt1440 =
+        (await page.locator("[data-block-editor]").first().getAttribute("data-block-editor-narrow", { timeout: 5000 }).catch(() => null)) === "false";
+      steps.editorHasOutlineAt1440 = (await page.locator("[data-block-outline-row]").count()) > 0;
+      steps.editorHasInspectorAt1440 = (await page.locator("[data-block-inspector]").count()) > 0;
+      steps.editorHasInsertAt1440 = (await page.locator("[data-block-insert-toggle]").count()) > 0;
+      const wide = await page
+        .locator("[data-block-editor]")
+        .first()
+        .evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth, doc: document.documentElement.scrollWidth, docClient: document.documentElement.clientWidth }))
+        .catch(() => null);
+      steps.editorOverflow1440 = wide;
+      steps.editorNoHorizontalScrollAt1440 =
+        wide !== null && wide.scroll <= wide.client + 1 && wide.doc <= wide.docClient + 1;
+      await shot(page, "page-block-editor-1440");
+
+      // ---- 390 px: read-only, said out loud, no sideways scroll, and the preview still offered.
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.waitForTimeout(900);
+      steps.editorNarrowAt390 =
+        (await page.locator("[data-block-editor]").first().getAttribute("data-block-editor-narrow", { timeout: 5000 }).catch(() => null)) === "true";
+      steps.editorReadOnlyAt390 =
+        (await page.locator("[data-block-editor]").first().getAttribute("data-block-editor-editable", { timeout: 5000 }).catch(() => null)) === "false";
+      // The notice is the criterion's own sentence, read back from the DOM instead of a pixel.
+      steps.narrowNoticeAt390 = (
+        await page.locator("[data-block-editor-narrow-notice]").innerText().catch(() => "")
+      )
+        .replace(/\s+/g, " ")
+        .trim();
+      steps.narrowNoticeSaysWhy = /wider screen/i.test(steps.narrowNoticeAt390);
+      steps.narrowNoticeOffersPreview = (await page.locator("[data-block-narrow-preview]").count()) > 0;
+      // The controls are ABSENT, not disabled. A greyed-out Publish on a phone is still a Publish
+      // an author can aim at, and the REQ says the editor "opens read-only" — which is a
+      // different screen, not the same one with its buttons dimmed.
+      steps.noInsertControlAt390 = (await page.locator("[data-block-insert-toggle]").count()) === 0;
+      steps.noSaveControlAt390 = (await page.locator("[data-block-save]").count()) === 0;
+      steps.noPublishControlAt390 = (await page.locator("[data-block-publish]").count()) === 0;
+      steps.noInspectorAt390 = (await page.locator("[data-block-inspector]").count()) === 0;
+      // The page still READS: the canvas is drawn, which is the whole promise of the notice.
+      steps.canvasDrawnAt390 = (await page.locator("[data-block-canvas] [data-block-canvas-block]").count()) > 0;
+      const phone = await page
+        .locator("[data-block-editor]")
+        .first()
+        .evaluate((el) => ({ scroll: el.scrollWidth, client: el.clientWidth, doc: document.documentElement.scrollWidth, docClient: document.documentElement.clientWidth }))
+        .catch(() => null);
+      steps.editorOverflow390 = phone;
+      steps.editorNoHorizontalScrollAt390 =
+        phone !== null && phone.scroll <= phone.client + 1 && phone.doc <= phone.docClient + 1;
+      await shot(page, "page-block-editor-390");
+    } finally {
+      await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
+    }
+  }
+
   report.blockEditor = steps;
   return steps;
 }

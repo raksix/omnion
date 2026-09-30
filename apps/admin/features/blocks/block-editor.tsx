@@ -170,6 +170,25 @@ export function BlockEditor() {
   // a deep-equal of 400 blocks on every keystroke.
   const savedTreeRef = useRef<ContentBlock[]>([]);
   const [dirty, setDirty] = useState(false);
+  // Whether the viewport is wide enough to *edit* on, per the REQ's mobile rule. The answer is
+  // measured, not guessed from a CSS class: the editor is three panes, and at 390 px the third
+  // one is a stack of 19rem columns the author cannot drag between, so the honest answer there
+  // is "read the page, edit it on a wider screen, preview it here" rather than an editor whose
+  // inspector is off-screen. `matchMedia` and not a resize listener, because the question is
+  // a breakpoint and the browser answers it from the same source the stylesheet does.
+  // `false` until the first measure lands, so a server-rendered pass and the first paint agree.
+  const [wideEnough, setWideEnough] = useState(false);
+  const [viewportKnown, setViewportKnown] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia("(min-width: 901px)");
+    const measure = () => {
+      setWideEnough(query.matches);
+      setViewportKnown(true);
+    };
+    measure();
+    query.addEventListener("change", measure);
+    return () => query.removeEventListener("change", measure);
+  }, []);
   // The newest step's identity. Two prop edits in a row on the same block collapse into one
   // undoable step: without this, a paragraph of typing evicts every structural edit the author
   // made before it from a 100-step history, and undo starts feeling broken.
@@ -602,9 +621,49 @@ export function BlockEditor() {
   const canRemoveColumn =
     columnParentPath !== null &&
     (blockAt(blocks, columnParentPath)?.children?.length ?? 0) > MIN_COLUMNS;
+  // Narrow means "measured, and too narrow to edit". An unmeasured viewport is treated as wide
+  // for one frame, because the alternative is a phone that flashes a read-only notice before the
+  // author has seen an editor — and a desktop that does the same on a slow first paint.
+  const narrow = viewportKnown && !wideEnough;
 
   return (
-    <div className="flex flex-col gap-4" data-block-editor>
+    <div
+      className="flex flex-col gap-4"
+      data-block-editor
+      // The narrow answer, readable from the DOM rather than from a screenshot: a screen the
+      // author cannot edit on says so with these three attributes, and the pass asserts them
+      // instead of asserting that a button happens to be greyed out.
+      data-block-editor-narrow={narrow ? "true" : "false"}
+      data-block-editor-editable={narrow ? "false" : "true"}
+    >
+      {narrow ? (
+        <div
+          role="status"
+          data-block-editor-narrow-notice
+          className="flex flex-col gap-2 rounded-xl border border-line bg-surface px-4 py-3"
+        >
+          <p className="text-[13px] font-medium">Editing needs a wider screen</p>
+          <p className="max-w-prose text-[12.5px] text-muted">
+            This editor arranges a page in three panes side by side, which a phone has no room
+            for. The page below still reads exactly as it will be published, and the preview is
+            fully usable here — open it, switch to the phone, and edit the text in place. Save
+            draft and Publish need the wider screen.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href={`/pages/${pageId}/preview`}
+              data-block-narrow-preview
+              className="flex w-fit items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] transition hover:bg-canvas"
+            >
+              <Eye className="size-3.5" aria-hidden />
+              Open the preview
+            </Link>
+            <span className="text-[12px] text-muted">
+              {blockCount} block{blockCount === 1 ? "" : "s"} · {words} words
+            </span>
+          </div>
+        </div>
+      ) : null}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-baseline gap-2">
           <h2 className="text-[15px] font-medium">{pageTitle(page)}</h2>
@@ -629,6 +688,8 @@ export function BlockEditor() {
           >
             All pages
           </Link>
+          {!narrow ? (
+            <>
           <button
             type="button"
             data-block-insert-toggle
@@ -702,6 +763,8 @@ export function BlockEditor() {
             <Rocket className="size-3.5" aria-hidden />
             {publishing ? "Publishing…" : "Publish"}
           </button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -746,7 +809,16 @@ export function BlockEditor() {
         />
       ) : null}
 
-      <div className="grid gap-4 lg:grid-cols-[15rem_minmax(0,1fr)_19rem]">
+      {/* The three panes are one column on a narrow screen, and the outline and the inspector
+          are *removed* there rather than stacked: a selection that scrolls away while the author
+          types, and an inspector below a canvas nobody can see, are two ways to make the phone
+          look like a broken editor. `narrow` is the measured question, not a Tailwind class, so
+          the DOM the pass reads and the layout the browser draws are the same fact. */}
+      <div
+        className={`grid gap-4 ${narrow ? "grid-cols-1" : "lg:grid-cols-[15rem_minmax(0,1fr)_19rem]"}`}
+      >
+        {!narrow ? (
+          <>
         {/* Left: the outline of the page's blocks. */}
         <nav aria-label="Page blocks" className="rounded-xl border border-line bg-surface">
           <div className="flex items-center gap-1.5 border-b border-line px-3 py-2">
@@ -790,6 +862,8 @@ export function BlockEditor() {
             )}
           </div>
         </nav>
+          </>
+        ) : null}
 
         {/* Centre: the canvas. */}
         <div className="min-w-0">
@@ -801,7 +875,11 @@ export function BlockEditor() {
             <BlockCanvas
               registry={registry}
               blocks={blocks}
-              mode="edit"
+              // `render` on a phone, and it is the same component the public renderer draws the
+              // page with: a read-only editor that showed a *different* preview of the same tree
+              // would be a third implementation of "what the page looks like", which is the class
+              // of bug this REQ has been fighting since slice 1.
+              mode={narrow ? "render" : "edit"}
               selected={selected}
               issues={issueMap}
               onSelect={setSelected}
@@ -809,6 +887,8 @@ export function BlockEditor() {
           </div>
         </div>
 
+        {!narrow ? (
+          <>
         {/* Right: the inspector of the selected block. */}
         <div className="min-w-0">
           {selectedBlock ? (
@@ -979,6 +1059,8 @@ export function BlockEditor() {
             </div>
           )}
         </div>
+          </>
+        ) : null}
       </div>
 
       {/* Bottom bar: what the page is made of, what is wrong with it, and when it was saved. */}
