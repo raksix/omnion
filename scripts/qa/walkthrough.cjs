@@ -1047,6 +1047,42 @@ async function uploadMediaSample(page, source) {
  * that only looked right in a screenshot would pass all of that without doing any of it.
  */
 /**
+ * Is this page still a page?
+ *
+ * `Page crashed` and `Target closed` are not a screen with a bug in it: the renderer died, usually
+ * because eleven writers share 32 GB and one of them lost the race. The distinction matters because
+ * a dead tab poisons every statement after it — `locator.count()` throws, `page.url()` throws,
+ * `shot()` throws — so the first crash decided the fate of every screen the pass had not reached.
+ * Chrome's `page.isClosed()` answers *false* for a crashed tab (the tab is open; it is the
+ * renderer that is gone), so the only reliable signal is a cheap evaluation, which is what this asks.
+ */
+async function pageIsAlive(page) {
+  try {
+    await page.evaluate(() => 1);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// `main`'s page is a local and the 23 depth-pass call sites close over it, so a reviver cannot reach
+// it from here. This slot is the seam: `main` installs a setter, `reviveMainPage` calls it, and the
+// call sites read `page` lazily (each is an arrow, `() => runX(page, report)`), so every pass after
+// the swap is handed the new tab without one call site being edited.
+let installMainPage = null;
+
+/** Open a replacement tab and sign it in; returns it, or null when there is no browser to ask. */
+async function reviveMainPage() {
+  if (!installMainPage) return null;
+  try {
+    return await installMainPage();
+  } catch (cause) {
+    log(`the replacement tab could not be opened: ${cause instanceof Error ? cause.message : cause}`);
+    return null;
+  }
+}
+
+/**
  * Run one depth pass without letting it end the run.
  *
  * A depth pass is a question asked of a screen; a screen that answers badly is a finding, and a
@@ -1066,6 +1102,13 @@ async function runDepthPass(name, pass) {
     const reason = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
     log(`depth pass ${name} failed: ${reason}`);
     record({ page: "qa", action: "depth-pass-failed", pass: name, reason });
+    // A dead renderer is a condition of the box, not a verdict on the screen, and every pass after
+    // this one would fail identically for the same reason. Swapping the tab costs one sign-in; the
+    // alternative is losing the rest of the run to one memory race.
+    if (/Page crashed|Target closed|Target crashed|Session closed|browser has been closed/i.test(reason)) {
+      const revived = await reviveMainPage();
+      if (revived) log(`depth pass ${name} lost its tab to the box; a new one is in place for the passes after it`);
+    }
     return { ok: false, steps: 0, reason };
   }
 }
@@ -6557,8 +6600,47 @@ async function runAnalyticsSettingsDepth(page, report) {
 
 // ---------------------------------------------------------------- run
 
+// The report lives at module scope, not inside `main`, for one reason: a pass that dies late
+// used to write `{"fatal": "..."}` and nothing else, so a run that had already walked forty-eight
+// routes and taken a hundred and forty screenshots left behind a report saying only that it died.
+// The evidence a pass gathers is the expensive part; losing it to one bad statement at the end
+// makes the whole pass a no-result run for a reason that has nothing to do with the product.
+const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
+
+/**
+ * Prove the tab swap with a real dead tab.
+ *
+ * A guard nobody has watched work is a comment. `page.close()` is the same shape as a renderer the
+ * box killed: the object is still there and every call on it throws, so without the seam the pass
+ * after it reports the identical error for an unrelated reason. Run it with
+ * `node scripts/qa/walkthrough.cjs --selfcheck-recovery`; it launches its own browser, needs no
+ * stack, and prints one RECOVERY_SELFCHECK line.
+ */
+async function selfcheckRecovery() {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"] });
+  const context = await browser.newContext();
+  let page = await context.newPage();
+  installMainPage = async () => {
+    page = await context.newPage();
+    return page;
+  };
+  const first = await runDepthPass("before-crash", async () => ({ ok: true, title: await page.title() }));
+  await page.close();
+  const second = await runDepthPass("on-dead-tab", async () => ({ ok: true, title: await page.title() }));
+  const third = await runDepthPass("after-recovery", async () => ({ ok: true, title: await page.title() }));
+  const checks = {
+    firstRan: Boolean(first && first.ok),
+    secondReportedTheDeadTab: Boolean(second && second.ok === false),
+    secondNamedTheCause: Boolean(second && /closed|crash/i.test(second.reason || "")),
+    thirdRanOnTheReplacement: Boolean(third && third.ok),
+  };
+  const pass = Object.values(checks).every(Boolean);
+  console.log("RECOVERY_SELFCHECK " + JSON.stringify({ pass, checks, secondReason: second && second.reason }));
+  await browser.close();
+  return pass;
+}
+
 async function main() {
-  const report = { startedAt: new Date().toISOString(), admin: URL_ADMIN, web: URL_WEB, steps: [], pages: [], mobile: [], web: {} };
   const SITE_HOST = process.env.QA_SITE_HOST || CREDS.domain;
   const browser = await chromium.launch({
     executablePath: CHROME,
@@ -6575,8 +6657,16 @@ async function main() {
   });
 
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
-  const page = markHydrationWait(await context.newPage());
+  let page = markHydrationWait(await context.newPage());
   attach(page, "main");
+  // The swap seam for `reviveMainPage`: a tab the box killed is replaced, not mourned.
+  installMainPage = async () => {
+    const replacement = markHydrationWait(await context.newPage());
+    attach(replacement, "main-recovered");
+    await ensureSignedIn(replacement, report).catch(() => {});
+    page = replacement;
+    return replacement;
+  };
 
   // Reachable?
   try {
@@ -7414,15 +7504,29 @@ async function main() {
   console.log(`QA_FINDINGS=${findings.length} QA_HIGH=${bySeverity.high} QA_CLICKS=${clicks.length} QA_SHOTS=${shots.length}`);
 }
 
-main().catch(async (err) => {
+if (process.argv.includes("--selfcheck-recovery")) {
+  selfcheckRecovery()
+    .then((pass) => process.exit(pass ? 0 : 1))
+    .catch((err) => {
+      console.error("[walk] selfcheck failed to run:", err);
+      process.exit(1);
+    });
+} else {
+  main().catch(async (err) => {
   console.error("[walk] unexpected failure:", err);
   try {
-    fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify({ fatal: String(err) }, null, 2));
+    // Everything gathered up to the failure, plus the failure itself. A reader must be able to
+    // tell "the pass proved nothing" from "the pass proved 48 screens and then lost its tab".
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify({ fatal: String(err), fatalAfter: { pages: report.pages.length, steps: report.steps.length, mobile: report.mobile.length }, ...report, netFailures }, null, 2),
+    );
   } catch {
     /* ignore */
   }
   process.exit(1);
-});
+  });
+}
 
 /**
  * The security-policy, session, device and second-factor pass (REQ-006, slice 3).
