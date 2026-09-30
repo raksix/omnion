@@ -501,7 +501,14 @@ pub const NODE_TYPES: &[NodeType] = &[
         key: "switch",
         label: "Switch",
         category: "Logic",
-        summary: "One branch per case, plus a default.",
+        // **The summary is a promise, and this one used to make one the engine cannot keep.**
+        // The palette draws this sentence under the card, the inspector shows it above the
+        // node editor, and the author decides whether a card is worth dragging onto a canvas
+        // from exactly this text. "One branch per case, plus a default" describes a node that
+        // runs; the v0 engine runs one `condition` step and has no multi-arm step at all, so
+        // this card saves, validates and then refuses to project. Said here, the same sentence
+        // is also what keeps the card honest while the engine catches up.
+        summary: "One branch per case, plus a default — not executed yet: the engine runs one Condition per step. Chain Conditions for now.",
         outputs: SWITCH_PORTS,
         params: &[ParamField::required_text(
             "cases",
@@ -1725,6 +1732,34 @@ fn step_for(node: &Node, node_type: &NodeType, graph: &Graph) -> Result<StepDefi
             };
             Ok(StepDefinition::task(name, action, action_params))
         }
+        // **The switch is refused here, with its own code and its own sentence.** It has no
+        // arm in `step_for` and never had: the v0 engine executes ONE branch step, and a
+        // switch declares one arm *per case*. So a switch is a registry type the projection
+        // has no step for, and it used to fall into `other =>` — whose sentence reads
+        // `"switch" does not project onto a step`, an `unknown_node_type` error for a type
+        // the palette itself offered and the author had just dragged onto the canvas.
+        //
+        // The palette offers it because the registry advertises it, and the criteria in this
+        // REQ put a switch in the node-types v1 list (docs/requests/REQ-004, "one branch per
+        // case + default"). So this is not a card to delete from the palette — it is a card
+        // whose limitation has to be **said**, at save time, with words the author can act on.
+        // The panel already renders `finding.message` and tags `data-finding={code}`, so the
+        // finding carries this all the way to the problems panel.
+        //
+        // What it must never be is `unknown_node_type`: that code means "I have no such
+        // type", and for a key the palette just handed the author it is always false. The
+        // sentence names the real limit and the real alternative — a condition, which the
+        // engine does run — because "not supported yet" with no next step is the answer
+        // that teaches people to ignore the problems panel.
+        "switch" => Err(WorkflowError::invalid(
+            "switch_not_executable",
+            format!(
+                "{:?} is a switch and the engine runs one condition per step, not one arm per \
+                 case — put a Condition on the canvas and chain them, or wait for the \
+                 multi-arm step.",
+                name
+            ),
+        )),
         other => Err(WorkflowError::invalid(
             "unknown_node_type",
             format!("{other:?} does not project onto a step"),
@@ -2135,6 +2170,154 @@ mod tests {
         assert_eq!(err2.code(), err.code());
     }
 
+
+    #[test]
+    fn every_node_type_the_palette_offers_projects_onto_a_step() {
+        // **The registry and the projection are two hand-maintained lists, and nothing
+        // checked that they agree.** `step_for` has arms for `end`, `wait`, `condition`,
+        // `approval`, `http_request`, `transform`, `sub_workflow` and `action` — and
+        // `switch`, the one branching node an author reaches for when a condition is not
+        // enough, is in neither `step_for`'s match nor its `other =>` refusal list that the
+        // registry advertises.
+        //
+        // The consequence is a card the palette and the canvas both offer, which validates
+        // clean, saves, shows up in the list as a working rule — and is refused the moment
+        // it is projected, with a sentence about a *node type* that is plainly on screen.
+        // `unknown_node_type` reads like a typo, so the author's first thought is that the
+        // platform lost it.
+        //
+        // This asserts the two lists are equal in the direction that matters: every type the
+        // registry offers (minus the inert decoration and the triggers, which correctly
+        // contribute no step) reaches an arm in `step_for`. It is written as a loop over the
+        // registry rather than as a list of names, because a list is exactly what let the two
+        // drift.
+        // **`end` is excluded too, and for a reason that is the whole point of this test.** `end`
+        // exports NO output port — that is what makes it the end. So it cannot be the middle
+        // node of a two-node spine, and a fixture that tries wires an edge off a port the
+        // type does not have, which `validate` reports as `unknown_source_port` *before*
+        // the projection is reached. The assertion would then be measuring the port check
+        // rather than the thing it was written for. `end` is not a gap: it projects to a
+        // `stop` step, and `Graph::starter`'s own test already covers it.
+        let projecting: Vec<&str> = NODE_TYPES
+            .iter()
+            .map(|node_type| node_type.key)
+            .filter(|key| {
+                // `key` is `&&str` inside a filter over a `&str` iterator, and every one of
+                // these comparisons needs the deref. Writing it once at the top is cheaper
+                // than three call sites that each have to be right about their own depth.
+                let key = *key;
+                !find_node_type(key).is_some_and(|node_type| node_type.inert)
+                    && !is_trigger_type(key)
+                    && !key.ends_with(".end")
+                    && key != "end"
+            })
+            .collect();
+        assert!(
+            projecting.contains(&"switch"),
+            "the fixture must exercise the type this test is about"
+        );
+
+        let mut refused: Vec<&str> = Vec::new();
+        for key in projecting {
+            let graph = Graph {
+                nodes: vec![node("trigger", "trigger.manual"), sample_node(key), node("end", "end")],
+                edges: vec![
+                    Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "n1".to_owned() },
+                    Edge { id: "e1".to_owned(), source: "n1".to_owned(), source_port: first_followed_port(key), target: "end".to_owned() },
+                ],
+            };
+            match project(&graph) {
+                Ok(_) => {}
+                Err(error) => {
+                    // The claim: a type the palette offers is never refused as a type the
+                    // platform does not know. It has two ways to be refused legitimately —
+                    // a parameter the fixture could not fill, or a type the v0 engine has no
+                    // step for — and both have to carry their own code, so the panel can say
+                    // which. `unknown_node_type` is the code that reads like a typo, and for
+                    // a card the author just dropped on the canvas it is always wrong.
+                    assert_ne!(
+                        error.code(),
+                        "unknown_node_type",
+                        "{key:?} is offered by the palette and refused as a type the platform \
+                         does not know. Write its arm in `step_for`, or refuse it with its own \
+                         code and its own sentence — a palette card that cannot run is not a \
+                         thing the panel may offer."
+                    );
+                    refused.push(key);
+                }
+            }
+        }
+
+        // **The list is asserted as a list, because "no type is refused as unknown" is a
+        // weaker claim than "I know which types the engine cannot run".** If a future
+        // release teaches the engine a second branch, `refused` grows and this assertion
+        // is what says whether that was intended or accidental. `switch` is in it because
+        // the v0 engine executes ONE branch step and a switch declares one arm per case —
+        // there is no projection for it, and there never was.
+        assert_eq!(
+            refused,
+            vec!["switch"],
+            "the set of registry types the engine cannot project is a product decision, not \
+             an accident: every entry needs an arm in `step_for` or a named refusal. {refused:?}"
+        );
+    }
+
+    /// The first port out of `key` that the linear walk follows, so a generated fixture
+    /// wires itself the way the palette would.
+    fn first_followed_port(key: &str) -> String {
+        find_node_type(key)
+            .expect("a registry type")
+            .outputs
+            .iter()
+            .map(|port| port.key)
+            .find(|key| follows(key))
+            .unwrap_or_else(|| panic!("{key:?} exports no walked port"))
+            .to_owned()
+    }
+
+    /// A registry node type with every required parameter filled, so the assertion is about
+    /// the projection and not about the parameter check that runs beside it.
+    fn sample_node(key: &str) -> Node {
+        let mut node = node("n1", key);
+        node.params = find_node_type(key)
+            .expect("a registry type")
+            .params
+            .iter()
+            .map(|field| (field.key.to_owned(), sample_param(field)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        node
+    }
+
+    /// A legal value **for the field's declared kind**, not for its name.
+    ///
+    /// The first draft filled every free-text field with `"sample"`, which is the shape that
+    /// broke the test three ways at once: `wait` wants a *number* of seconds, `action` wants
+    /// its `parameters` to parse as JSON, and `sub_workflow` wants a rule id that exists.
+    /// All three then answered `invalid_parameter`, so the note would have read "three more
+    /// types the engine cannot run" when the truth was that the fixture could not fill them.
+    ///
+    /// The rule is the general one: **a fixture that cannot satisfy its own assertions is
+    /// indistinguishable from a defect, so the fixture has to be built from the schema the
+    /// code under test reads** — the registry's own `kind`, which is the same field the
+    /// inspector's input element is chosen from.
+    fn sample_param(field: &ParamField) -> Value {
+        if !field.options.is_empty() {
+            return Value::String(field.options[0].to_owned());
+        }
+        match field.kind {
+            "number" => json!(1),
+            "boolean" => Value::Bool(false),
+            // The two that parse or resolve. A JSON body for anything that reads one, and a
+            // rule id for the node that names another rule.
+            "json" | "code" | "textarea_json" => json!({}),
+            _ => match field.key {
+                "parameters" => json!({}),
+                "workflow_id" | "rule_id" => Value::String(uuid::Uuid::nil().to_string()),
+                _ => Value::String("sample".to_owned()),
+            },
+        }
+    }
 
     #[test]
     fn a_second_trigger_is_refused_by_name() {
