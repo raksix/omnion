@@ -1512,6 +1512,107 @@ async function runProjectsDepth(page, report) {
     steps.lastOwnerTitle = (await lastOwnerRemove.getAttribute("title").catch(() => "")) || "";
   }
 
+  // 6b · the limits screen (REQ-133 slice 4). The bars are the REQ's acceptance 9 and its
+  //       "usage bars with the instance default as a placeholder", and the CSV is its acceptance
+  //       10 -- so the assertions are about the SENTENCES, not the widgets: a bar rendered
+  //       without "Unlimited" for a 0 cap is the defect this step exists to catch, and a bar drawn
+  //       for `max_credentials` (which has no counter on this branch) is the second.
+  await page.goto(`${URL_ADMIN}/automation/projects/${project.id}/limits`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.limitsBars = await page.locator("[data-limit-bar]").count();
+  // Recorded in the inventory only now that the screen actually rendered: a route that renders its
+  // not-found state has not been visited, and a fabricated uuid in the route list would claim it
+  // had been.
+  // NOT `skipped(...)`: that helper says "the route filter left this out", and a screen that
+  // failed to render was not filtered out -- it was looked at and did not load. Recording it as
+  // skipped is how a broken screen reads as an unvisited one.
+  report.pages.push(
+    steps.limitsBars > 0
+      ? { path: `/automation/projects/${project.id}/limits`, name: "project-limits", ok: true }
+      : {
+          path: `/automation/projects/${project.id}/limits`,
+          name: "project-limits",
+          ok: false,
+          steps: 0,
+          reason: `no bar rendered (${steps.limitsBars}); the screen did not load`,
+        },
+  );
+  steps.limitsInputs = await page.locator("[data-limit-input]").count();
+  steps.limitsWarnInput = (await page.locator("[data-limit-warn]").count()) > 0;
+  steps.limitsSavePresent = (await page.locator("[data-limits-save]").count()) > 0;
+  steps.limitsExportPresent = (await page.locator("[data-limits-export]").count()) > 0;
+  // Every cap must render either a number pair or the word "Unlimited" -- never a bare bar whose
+  // number the reader has to guess. The assertion walks the bars and reads their labels.
+  steps.limitBarLabels = (await page.locator("[data-limit-bar]").allInnerTexts()).join(" | ");
+  steps.limitsExplainZero =
+    /unlimited/i.test(steps.limitBarLabels) || /0 for unlimited/i.test(await page.locator("body").innerText());
+  // `max_credentials` must be rendered as unknown rather than as zero.
+  steps.credentialsBarIsExplicit = /no counter on this build/i.test(steps.limitBarLabels);
+  steps.limitsStateFlags = (await page
+    .locator("[data-limit-bar]")
+    .evaluateAll((els) => els.map((el) => el.getAttribute("data-limit-state"))))
+    .join(",");
+  await shot(page, "page-project-limits");
+
+  // 6c · the project audit screen (REQ-133 slice 4). The claim is that the trail is filtered by
+  //       PROJECT, so the assertion is the filter control and the empty state, which are the two
+  //       things that differ from the instance audit screen.
+  await page.goto(`${URL_ADMIN}/automation/projects/${project.id}/audit`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.auditFilterPresent = (await page.locator("[data-project-audit-filter]").count()) > 0;
+  report.pages.push(
+    steps.auditFilterPresent
+      ? { path: `/automation/projects/${project.id}/audit`, name: "project-audit", ok: true }
+      : {
+          path: `/automation/projects/${project.id}/audit`,
+          name: "project-audit",
+          ok: false,
+          steps: 0,
+          reason: "the filter control never rendered; the screen did not load",
+        },
+  );
+  steps.auditRows = await page.locator("[data-project-audit-row]").count();
+  steps.auditEmptyState = (await page.locator("[data-project-audit-empty]").count()) > 0;
+  steps.auditExportPresent = (await page.locator("[data-project-audit-export]").count()) > 0;
+  // The empty state must distinguish "no rows for this filter" from "no rows at all" when it is
+  // showing the filtered one; on a fresh project the unfiltered sentence is the correct one.
+  steps.auditEmptyText = ((await page.locator("[data-project-audit-empty]").allInnerTexts()).join(" ") || "").slice(0, 160);
+  await shot(page, "page-project-audit");
+
+  // 6d · the two-confirmation handover (REQ-133 acceptance 12). Opened, both boxes present, and
+  //       the confirm button DISABLED until both are ticked -- a dialog that lets either be
+  //       skipped exists to send a request the API refuses with a 400.
+  await page.goto(`${URL_ADMIN}/automation/projects/${project.id}`, {
+    waitUntil: "domcontentloaded",
+  }).catch(() => {});
+  await page.waitForTimeout(1200);
+  steps.transferButton = (await page.locator("[data-project-transfer-ownership]").count()) > 0;
+  if (steps.transferButton) {
+    const enabled = await page
+      .locator("[data-project-transfer-ownership]")
+      .isEnabled()
+      .catch(() => false);
+    steps.transferEnabledWithOneMember = enabled;
+    if (enabled) {
+      await page.locator("[data-project-transfer-ownership]").click();
+      await page.waitForTimeout(600);
+      steps.transferDialogOpen = (await page.locator("[data-transfer-dialog]").count()) > 0;
+      steps.transferConfirmOwnerBox = (await page.locator("[data-transfer-confirm-owner]").count()) > 0;
+      steps.transferConfirmAuditBox = (await page.locator("[data-transfer-confirm-audit]").count()) > 0;
+      steps.transferDisabledBeforeConfirm = await page
+        .locator("[data-transfer-confirm]")
+        .isDisabled()
+        .catch(() => false);
+      await shot(page, "page-project-transfer-dialog");
+      await page.locator("[data-transfer-close]").first().click().catch(() => {});
+      await page.waitForTimeout(300);
+    }
+  }
+
   // 7 · the not-found state. A made-up uuid must render the API's own words, and must NOT say
   //     anything about permission: the 404 is chosen precisely so the panel cannot confirm that
   //     a project exists.
