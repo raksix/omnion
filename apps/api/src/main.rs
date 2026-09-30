@@ -27,6 +27,42 @@ const SERVICE: &str = "omnion-api";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Two subcommands, both read-only and both needed by a container image (REQ-128, slice 1).
+    // A distroless runtime has no shell, no `wget` and no `curl`, so a `HEALTHCHECK` that shells
+    // out to one of them cannot work at all; the binary asks itself over HTTP instead. Without
+    // this the image would carry a healthcheck that always fails, which reads as "unhealthy"
+    // and is worse than none — an orchestrator would restart a perfectly good API forever.
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("{} {}", SERVICE, env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Some("--healthcheck") => {
+            return match healthcheck().await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(message) => {
+                    eprintln!("omnion-api healthcheck: {message}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("--migrate-only") => {
+            return match migrate_only().await {
+                Ok(report) => {
+                    println!("{report}");
+                    ExitCode::SUCCESS
+                }
+                Err(message) => {
+                    eprintln!("omnion-api --migrate-only: {message}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // Any other argument is left to the boot path, which reads its configuration from the
+        // environment; refusing unknown flags here would break a deployment that passes one.
+        _ => {}
+    }
+
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -34,6 +70,89 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Probe the process this binary is running in, from inside the container.
+///
+/// `/readyz` is the right endpoint and not `/healthz`: an image is healthy when it can serve
+/// traffic, and a liveness answer that says "the process exists" would report a container whose
+/// database is gone as healthy and let a rollout finish on top of it. The target host and port
+/// are read from the same environment the server binds, so a probe cannot drift onto a different
+/// port than the one in use.
+async fn healthcheck() -> Result<(), String> {
+    let port = std::env::var("OMNION_PORT").unwrap_or_else(|_| "8080".to_string());
+    let host = std::env::var("OMNION_HEALTHCHECK_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let url = format!("http://{host}:{port}/readyz");
+
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|err| format!("{url} did not answer: {err}"))?;
+
+    // The status is the contract: `503` during shutdown and on an unreachable dependency is a
+    // correct answer from a working process, and it must fail the probe.
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("{url} answered {status}"))
+    }
+}
+
+/// Apply the embedded migrations and exit, without binding a listener.
+///
+/// The production stack runs this as a one-shot job that the API waits on
+/// (`depends_on: migrate: condition: service_completed_successfully`). Migrating at API boot is
+/// convenient in development and wrong in production: with replicas rolling, whichever one wins
+/// the migration race serves traffic against a schema the others are still moving, and a failed
+/// migration surfaces as a rollout that "mostly worked".
+///
+/// It is a mode of the API binary rather than a second binary so the migration code in the job
+/// and in the server can never diverge: the same image, the same embedded `sqlx::migrate!`, the
+/// same advisory lock.
+async fn migrate_only() -> Result<String, String> {
+    let config = Config::from_env().map_err(|err| err.to_string())?;
+    let db = Db::connect(&config.database)
+        .await
+        .map_err(|err| format!("could not connect to the database: {err}"))?;
+
+    let before = db
+        .migration_status()
+        .await
+        .map_err(|err| format!("could not read the migration state: {err}"))?;
+
+    if before.is_up_to_date() {
+        return Ok(format!(
+            "database is up to date ({} migrations applied)",
+            before.applied.len()
+        ));
+    }
+
+    let pending = before.pending.len();
+    db.migrate()
+        .await
+        .map_err(|err| format!("migration failed: {err}"))?;
+
+    let after = db
+        .migration_status()
+        .await
+        .map_err(|err| format!("could not confirm the migration state: {err}"))?;
+
+    // Confirm rather than assume: `migrate()` returning `Ok` is SQLx's promise, and a
+    // one-shot job that exits 0 on that promise is the only thing between a rolled-back
+    // migration and a stack that comes up on a half-migrated schema. A status that is still
+    // behind after a successful call is a hard failure, not a warning.
+    if !after.is_up_to_date() {
+        return Err(format!(
+            "{pending} migration(s) were reported pending, `migrate()` returned, and {} are still pending",
+            after.pending.len()
+        ));
+    }
+
+    Ok(format!(
+        "applied {pending} migration(s); {} of {} are now recorded",
+        after.applied.len(),
+        after.total()
+    ))
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
