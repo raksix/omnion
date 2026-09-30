@@ -75,16 +75,20 @@ pub struct BackupBody {
     /// Whether the prune sweep leaves it alone.
     pub protected: bool,
     /// When the prune sweep may remove it.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub retain_until: Option<OffsetDateTime>,
     /// Why it failed.
     pub error: Option<String>,
     /// Who started it.
     pub created_by: Option<Uuid>,
     /// When it was asked for.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When it began.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
     /// When it stopped.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     /// The title the screen shows: the label, or the instant when there is no label.
     pub title: String,
@@ -189,6 +193,7 @@ pub struct BackupDetail {
 #[derive(Debug, Serialize)]
 pub struct StatusBody {
     /// When the last run that produced artifacts finished, and which one it was.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_successful_at: Option<OffsetDateTime>,
     /// That run's id, so the card links to a specific row rather than to the list.
     pub last_successful_id: Option<Uuid>,
@@ -201,6 +206,7 @@ pub struct StatusBody {
     /// How many backups the prune sweep will never remove.
     pub protected: i64,
     /// The nearest schedule that is due.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub next_scheduled_at: Option<OffsetDateTime>,
     /// The destination's health, from the last probe or from a fresh one.
     pub destination: DestinationBody,
@@ -245,6 +251,7 @@ pub struct SettingsBody {
     /// Whether a run re-reads its own artifacts.
     pub verify_after_backup: bool,
     /// When it was last saved.
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -289,8 +296,10 @@ pub struct ListQuery {
     /// Restrict to one destination.
     pub destination: Option<String>,
     /// Only runs created at or after this.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_after: Option<OffsetDateTime>,
     /// Only runs created at or before this.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_before: Option<OffsetDateTime>,
     /// Page size.
     #[serde(default)]
@@ -374,8 +383,10 @@ pub struct ScheduleBody {
     /// Whether it is active.
     pub enabled: bool,
     /// When it last ran.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub last_run_at: Option<OffsetDateTime>,
     /// When it next runs.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub next_run_at: Option<OffsetDateTime>,
     /// The run it produced last.
     pub last_backup_id: Option<Uuid>,
