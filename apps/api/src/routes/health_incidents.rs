@@ -387,6 +387,24 @@ pub async fn patch_incident(
         }
     }
     .map_err(map_store)?;
+    // Announced on **acknowledge** only, not on `resolve`. The request's Events section lists
+    // `health.incident.acknowledged` and no "resolved" name, and that omission is deliberate in
+    // the same way the breach window is: a hand-resolved incident is an operator closing the
+    // book on something that recovered during a maintenance window, so the recovery event that
+    // matters was already sent — or, in the suppressed case, deliberately was not.
+    //
+    // The row that is announced is the one the store returned, not the id from the path: a
+    // takeover keeps the previous operator's claim in the note, so "who looked" is the field
+    // on the row rather than whatever was in the URL.
+    if body.action == "acknowledge" {
+        crate::health_events::announce_acknowledgement(
+            state.db().pool(),
+            &row,
+            actor,
+            body.note.as_deref().unwrap_or(""),
+        )
+        .await;
+    }
     Ok(Json(IncidentBody::from(&row)))
 }
 

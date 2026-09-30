@@ -8331,3 +8331,87 @@ condition is on `main` too, so this loop reports it rather than editing it.
 migration, numbered above the 0196 cross-worktree high-water, then `/deployment/artifacts` and
 `/deployment/install`. The tag workflow (`.github/workflows/release.yml`) ships after its dry-run
 mode is proven, which it now is.
+
+## Tick 84 — REQ-014 slice 4: the two legs that needed a real dependency, and a fourth empty writer
+
+Four slices closed with a sentence in the request that no walk could reach, because every walk in
+this suite points the probe at `redis://127.0.0.1:1` — a port that was never open — and at a `NULL`
+organization. That fixture is *correct* for what it claimed (a closed port is `down`, and a
+`NULL` organization leaks nothing), and it made two acceptance criteria unreachable **by
+construction** while every gate stayed green. So this tick built the thing the criteria were
+actually about: a dependency that can be stopped, and a receiver that can receive.
+
+**`a_stopped_dependency_recovers_and_resolves_its_incident`** starts a throwaway `redis-server` on a
+reserved port, stops it, and starts it again *through the same client handle*. The same handle is
+the whole point: `RedisClient::connection()` caches a `ConnectionManager`, and a cached manager to a
+server that went away is exactly how a panel says `down` for ever after the server returns. The walk
+asserts the stored samples (not just the returned `ProbeResult`), that the outage opens exactly one
+incident, that a steady outage opens no second, and that the recovery resolves *that* incident.
+
+**`a_degradation_reaches_the_endpoints_that_subscribed_to_health`** creates a real organization, a
+real enabled endpoint subscribed to `health`, and a second tenant subscribed to `content.published`,
+then reads `webhook_deliveries`. Reading the `events` row instead would have proved nothing:
+`enqueue_fanout` returns `0` for an event with no organization, so "five names recorded, delivered
+to nobody" passes a `select count(*) from events`. Both negatives are asserted too.
+
+### A fourth empty writer, one level down
+
+The recovery walk failed on its first run, and the failure was the product, not the walk:
+
+```
+assertion `left == right` failed: the *stored* sample says down
+  left: Some("healthy")   right: Some("down")
+```
+
+`report_of` derives `health_samples` rows from a probe's `metrics`, and **both** `ProbeResult::down`
+and `finish` left `metrics` empty for a non-healthy outcome. So an outage wrote *no row at all*: the
+overview was honest (it probes live) and the 24 h trend drew one straight healthy line straight
+through the outage — the chart an operator opens *afterwards* to see how long it lasted.
+
+This is the same class as the three already recorded for this REQ — a reader with no writer, a
+setting nobody reads, a sentence nobody runs — and the class has a name worth keeping: **the writer
+writes nothing for the case that matters most.** A fix in only one of the two constructors would
+have left the other a hole, so both carry the reading, and the unit is `ms (timeout)` rather than
+`ms` because 3000 means "nothing answered after 3 s", not "a round trip took 3 s".
+
+### Three walks that were red before this tick, and one that hid them
+
+The first regression run reported four failures. Three were the disk (`No space left on device` at
+scratch-database creation), one was mine. Re-running with 8 GB free showed that three walks had been
+red **since they were committed** and the disk error had been reported in their place:
+
+- `a_series_comes_back_oldest_first` inserted 30 @ −3 min, 10 @ −1 min, 20 @ −2 min and asserted
+  `[10, 20, 30]` — that is *newest*-first. It would have passed an `order by id desc` and failed the
+  query's own `order by sampled_at asc`.
+- `a_populated_window…` asserted 2 samples in a 24 h window over a fixture that inserts 3, and its
+  comment said "both samples". `(10+20+30)/3` and `(10+30)/2` are both `20.0`, so the mean could not
+  tell the two fixtures apart — only the count could, which is the argument for asserting the count.
+- `retention_leaves_the_windows…` asserted the survivor's `min` was `1.0`, and `1.0` is the 45-day-old
+  sample the same walk had just proven was **pruned**.
+
+Two of my own new assertions were also wrong before the product was: `duration_seconds()` returns
+`Option` and truncates to whole seconds, and a local `redis-server` can genuinely go down and back
+inside one second, so `> 0` was a claim about how fast this box starts a process. And a local named
+`organization` shadowed the helper of the same name, so the second call did not compile.
+
+**Proof**
+
+```
+cargo test -p omnion-health --lib            70 passed
+health_probes      10 passed    health_history   9 passed
+health_incidents    8 passed    health_workers   6 passed
+health_recovery     2 passed    (live PostgreSQL + a real redis-server)
+tsc -p apps/admin/tsconfig.json --noEmit     exit 0
+```
+
+**The disk, again.** `/mnt/apopic` reached **100% with 0 bytes free**, which stalled PostgreSQL into a
+`D`-state WAL replay for 16 minutes. Three stale `CARGO_TARGET_DIR`s on the volume (`w4build`,
+`w7-target`, `w8build`, 7.1 GB) were unheld — proved by `/proc/*/cwd` **and** `/proc/*/environ` for
+every pid, plus 0 open fds — and `w5-target` was left alone because live processes named it in their
+environ. The live w8 build writes to `/dev/shm/w8-target`, so its on-disk twin was stale by
+construction. 17 orphaned `omnion_health*` test databases (235 MB) came from panicking walks; only
+mine were dropped — w2 had a live cargo, so every sibling's database was left untouched.
+
+**Still open:** the browser pass (`scripts/qa/run.sh`) has still not run on this box — the QA slot
+was held by a live w3 pass for the whole tick, so the only remaining box in this REQ's checklist is
+the one this loop cannot claim until a slot frees.
