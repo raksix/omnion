@@ -183,6 +183,9 @@ pub const DEFAULT_BACKUP_SWEEP_MAX_TENANTS: i64 = 50;
 /// The same bound as a `u64`, for the same reason as [`DEFAULT_RETENTION_MAX_SITES_U64`].
 const DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64: u64 = 50;
 
+/// How often the schedule worker looks for a backup whose time has come: every minute.
+pub const DEFAULT_BACKUP_SCHEDULE_POLL_MS: u64 = 60_000;
+
 /// Default SMTP host the email action sends through (`OMNION_SMTP_HOST`): Mailpit in the
 /// development stack, which is where `infra/compose/mailpit.yml` publishes it.
 pub const DEFAULT_SMTP_HOST: &str = "127.0.0.1";
@@ -570,8 +573,16 @@ pub struct RetentionConfig {
     /// without cost — and an installation that has just restored something and wants the
     /// space back does not have to wait for a manual sweep to be offered in the panel.
     pub backup_sweep_poll_ms: u64,
-    /// How many tenants one backup sweep may walk (`OMNION_BACKUP_SWEEP_MAX_TENANTS`).
+    /// How many tenants one backup sweep may walk (`OMNION_BACKUP_SWUP_MAX_TENANTS`).
     pub backup_sweep_max_tenants: i64,
+    /// Delay between two schedule checks (`OMNION_BACKUP_SCHEDULE_POLL_MS`).
+    ///
+    /// A minute, and for a different reason than the sweep's six hours: the sweep's interval
+    /// comes from the feature (retention is measured in days, so a tick that finds nothing
+    /// changes no answer), while a schedule's is measured in minutes — an hourly schedule that
+    /// fires at :37 because the worker happened to wake at :37 is a schedule the operator did
+    /// not write, and every operator notices.
+    pub backup_schedule_poll_ms: u64,
 }
 
 impl Default for RetentionConfig {
@@ -583,6 +594,7 @@ impl Default for RetentionConfig {
             backup_sweep_enabled: true,
             backup_sweep_poll_ms: DEFAULT_BACKUP_SWEEP_POLL_MS,
             backup_sweep_max_tenants: DEFAULT_BACKUP_SWEEP_MAX_TENANTS,
+            backup_schedule_poll_ms: DEFAULT_BACKUP_SCHEDULE_POLL_MS,
         }
     }
 }
@@ -1039,6 +1051,16 @@ impl Config {
                 DEFAULT_BACKUP_SWEEP_MAX_TENANTS_U64,
             )?)
             .unwrap_or(DEFAULT_BACKUP_SWEEP_MAX_TENANTS),
+            // No `enabled` flag of its own: the schedule worker is the thing an installation
+            // with no schedules wants off, and an installation with no schedules pays one
+            // grouped query a minute for it. `OMNION_BACKUP_SCHEDULE_POLL_MS` is the lever —
+            // set it to an hour and the worker costs nothing measurable, and every schedule
+            // still fires within the hour.
+            backup_schedule_poll_ms: read_positive(
+                &read,
+                "OMNION_BACKUP_SCHEDULE_POLL_MS",
+                DEFAULT_BACKUP_SCHEDULE_POLL_MS,
+            )?,
         };
 
         let crm_autoresponder = CrmAutoresponderConfig {
