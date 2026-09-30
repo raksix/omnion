@@ -7423,3 +7423,67 @@ this tick can claim, and the next tick should watch it when the box is quieter.
 died with `clicks.jsonl ENOENT` when `/mnt/apopic` hit 100% and the artifact directory was trimmed out
 from under it. That is now survivable (`25dddf5c`), and the two limiter screens are walked on desktop
 and at 390px, so the next tick is where the boxes naming a screen can be ticked.
+
+## 2026-09-30 · Tick 37 — the criterion that was unreachable by construction (REQ-064 acceptance 18)
+
+**What.** Three in-progress requests were all blocked on one thing: the shared QA slot, held by a live
+sibling (`971702`, holder `1067556`, both alive) at box load 84–97 with three writer stacks building.
+So instead of spending a fourth tick on the blocker, this tick queued the `--only=block-editor` pass
+against committed code and went looking for work that does not need the slot. It found that acceptance
+18 of REQ-064 — *"all new screens render at 390 px without horizontal scroll"* — **could never have
+been closed**, for a reason that has nothing to do with scheduling.
+
+`/members` and `/members/settings` were in **neither** the walkthrough's desktop route inventory **nor**
+its 390 px mobile list. `grep 'path: "/'` found `/comments`, `/newsletter`, `/menus`, `/seo`, `/themes`
+— and nothing for members, despite `runMembersDepth` being 370 lines long and driving both screens
+through a dedicated entry point. So no pass had ever opened either route at any width. This is the same
+class as REQ-063's criterion 17, where `setViewportSize` appeared zero times in 880 lines: the claim
+was never contradicted because **nothing was ever measured**.
+
+The second half is worse, and it is the one that survives the fix if you stop one layer early.
+`runMembersDepth` *did* have a `noHorizontalScrollAt390` — and it took it while sitting on
+`/members/settings`. That screen's body is a policy form: no table, no filter row, no drawer, no
+dialogs. It is the narrowest layout in the module, and it was publishing that number as the answer for
+the screen with a seven-column table. The two are genuinely different layouts — the table is
+`hidden overflow-x-auto sm:block` with `min-w-[760px]`, the cards are `sm:hidden` — so measuring one
+tells you nothing about the other, and 390 px is exactly the width the cards exist for.
+
+**Three things fixed that are each a different mistake.** The readiness marker is demanded **before**
+the overflow number (`data-members-state="ready"`), because an error shell and a loading skeleton also
+report no horizontal scroll. Which layout is on screen is **recorded** (`membersLayoutAt390`) rather
+than assumed, because a pass that measured an empty page would also report no scroll. And the drawer is
+measured **against the viewport**, not the document: it is a fixed overlay whose width comes from its
+own class, so one running off the edge of a phone creates no `scrollWidth` at all and the original probe
+cannot see it however wide the table is.
+
+The retained `noHorizontalScrollAt390` now carries `noHorizontalScrollAt390IsAbout` — the finding here
+is not that a name was ambiguous, it is that a *summary* was asked to stand for a screen it had never
+visited. A step that says which screen it measured is a step a later reader can trust.
+
+**One bug of my own, caught before it ran.** The conditional `required.push("drawerOpenedAt390", …)`
+referenced `memberSteps` above its `const` declaration — a temporal dead zone crash on the first
+`--only=members` run, in the exact path this tick exists to repair. `node --check` cannot see it (it is
+valid syntax), so it was found by reading the diff rather than by the gate.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `node --check scripts/qa/walkthrough.cjs` | **exit 0** |
+| `apps/admin` `tsc --noEmit` | **exit 0** |
+| New keys absent from the old file (load-bearing check, via `git stash`) | 0 in old, **3 in new** — the demand is real |
+| Both routes present in desktop inventory **and** mobile list | `/members`, `/members/settings` in both |
+| `merge origin/main` | `ff227100` — BUILD-LOG spliced by `merge-build-log.py`, heading check green, `EXTRA` empty |
+
+**Not run, and recorded as unrun.** `--only=block-editor` is queued (pid 1411196, log
+`/tmp/w2-pass-tick37.log`, printed the slot suite 15/15 first so the wiring works in a real pass) and
+`--only=members` is what should run next. Neither has a number. **No acceptance box is ticked by this
+tick and none should be**: this removes the reason criterion 18 had no verdict, which is not the same
+as the verdict.
+
+**Next.** (a) Read `qa-artifacts/<newest>/summary.json` from the block-editor pass for
+`editorNarrowAt1440`, `editorNoHorizontalScrollAt390`, `noPublishControlAt390`, `canvasDrawnAt390` and
+`publicRendered`; tick REQ-063 criterion 17 only when both halves are green. (b) `--only=members` for
+the four new 390 px keys. (c) REQ-062 acceptance 15's render half. Note for the next tick: the
+invariants file still says to build in `/dev/shm/w2-target`, which is now 82% full with eight siblings'
+targets — tick 36 established `/mnt/apopic/omnion-w2-target` and that line needs rewriting.
