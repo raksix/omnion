@@ -27,6 +27,7 @@ pub mod failover;
 pub mod guardrails;
 pub mod health;
 pub mod health_store;
+pub mod identity;
 pub mod loop_engine;
 pub mod model;
 pub mod protocol;
@@ -71,6 +72,11 @@ pub use tools::{
 };
 pub use failover::{
     Attempt, Plan, Progress, chain_of, final_error, is_retryable, next, pinned_provider, plan,
+};
+pub use identity::{
+    AiIdentity, GrantEffect, IdentityChanges, MAX_DESCRIPTION_CHARS as IDENTITY_DESCRIPTION_CHARS,
+    MAX_KEY_CHARS as IDENTITY_KEY_CHARS, MAX_NAME_CHARS as IDENTITY_NAME_CHARS, NewIdentity,
+    Resolution, ResolutionReason, resolve as resolve_tool_grant,
 };
 pub use model::{
     AiModel, ApiKeyChange, DEFAULT_PROTOCOL, DiscoveryAction, DiscoveryDiff, DiscoveryLine,

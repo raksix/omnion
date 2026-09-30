@@ -1,5 +1,10 @@
 //! Errors of the AI Hub.
 
+/// `Uuid` is needed for [`AiHubError::IdentityNotFound`], which names the id the caller asked
+/// for. The message has to carry it: "no identity in this organization" tells an operator
+/// nothing when they were editing one they can see, while the id points straight at the row.
+use uuid::Uuid;
+
 /// What can go wrong while the AI Hub talks to a provider — or while the platform reads its own
 /// rows.
 ///
@@ -113,6 +118,28 @@ pub enum AiHubError {
     /// that exists must be found, and a key that never existed must not be.
     #[error("no tool `{0}` in the registry")]
     ToolNotFound(String),
+    /// An AI identity's key, name, description or grant map is not acceptable (REQ-100).
+    ///
+    /// Its own code, for the same reason `InvalidTool` has one: the refusal belongs on a
+    /// specific field of the identity form or of one matrix cell, and a client that maps it
+    /// onto `invalid_tool` would tell an operator their *identity* is invalid when the thing
+    /// that is invalid is a key they typed. Every message names the field and its rule.
+    #[error("invalid identity: {0}")]
+    InvalidIdentity(String),
+    /// No identity carries that id in this organization.
+    ///
+    /// `NotFound` rather than a 403, and that is a tenancy property rather than a preference:
+    /// an id that exists in another tenant must not be confirmable by the status code, or the
+    /// identity list becomes an existence oracle for the whole installation's AI permissions.
+    #[error("no identity `{0}` in this organization")]
+    IdentityNotFound(Uuid),
+    /// An identity with that key already exists in this scope.
+    ///
+    /// A `409`, not a `400`, because the request is valid and the *state* is what refuses it —
+    /// the folded unique index is doing its job, and the panel resolves it by offering a
+    /// different key rather than by rewriting the user's input.
+    #[error("{0}")]
+    IdentityConflict(String),
     /// The request needs a capability the model does not claim.
     ///
     /// The refusal happens before any call leaves the process, so a caller that asked for a
@@ -184,6 +211,13 @@ impl AiHubError {
             Self::SkillConflict(_) => "skill_conflict",
             Self::InvalidTool(_) => "invalid_tool",
             Self::ToolNotFound(_) => "tool_not_found",
+            // The identity codes (REQ-100 slice 2). Distinct from `invalid_tool` on purpose: the
+            // refusal belongs on a field of the identity form or of one matrix cell, and a client
+            // that mapped it onto the tool's code would print "the tool is invalid" above a
+            // permission cell.
+            Self::InvalidIdentity(_) => "invalid_identity",
+            Self::IdentityNotFound(_) => "identity_not_found",
+            Self::IdentityConflict(_) => "identity_conflict",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",
