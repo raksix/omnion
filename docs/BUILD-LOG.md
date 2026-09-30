@@ -7252,3 +7252,42 @@ scripts invoked by path are `chmod`'d together now.
 
 **Next.** (a) The w5 pass outcome, with the mode bit in place. (b) REQ-017's browser gate,
 which this tick finally unblocks. (c) Only then the next REQ in the wave.
+
+### Tick 75 · the w5 pass, and what its 21 "high" findings actually are
+
+The pass ran on the private stack (`QA_STACK=w5`, ports 18084/3104/3204, database
+`omnion_qa_w5`) and completed the walkthrough: **31 screenshots, 34 clicks, 21 pages, 0
+page-level defects** — `diagnostics.json` reports an empty list for every one of
+`brokenImages`, `emptyInteractives`, `unlabeledInputs`, `duplicateIds`, `lowContrast`,
+`tinyTargets`, `offscreen` and `scrollable`, on all 21 pages. `environments` was visited and
+clicked, 39 interactive elements.
+
+**But the headline number is 21 high, and it is not 21 defects.** Grouping
+`summary.json` by what actually failed: **6 + 2 × `GET /api/v1/environments` → 401** and
+**`POST /api/v1/auth/logout` → 403** on the main phase, the same 401 twice more on mobile, plus
+`/qa-sample` → 404 on the public renderer. That is one root cause wearing five costumes, and it
+is a **harness** failure, not a product one:
+
+`apps/admin/next.config.ts` puts the API origin into `rewrites()`, and `rewrites()` is resolved
+at **build** time — a Next config value, not a runtime env read. `run.sh` passes
+`OMNION_API_URL` only in the pm2 start environment (line 207), so a dev server that was already
+running keeps the origin it was built with, and the panel's `/api/*` forwarder points wherever
+that build was aimed. The symptom is a signed-in session whose every API call comes back 401,
+and a panel that renders an empty table while looking perfectly healthy: `environments` reported
+`ok: false — "/environments rendered no rows at all"`, which is the *correct* reading of a page
+whose data never arrived.
+
+**So the REQ-017 gate is still red, and the honest reason is now a name instead of a
+hypothesis.** Three ticks of "the box" and three of "the slot" were both partly true; the
+measurement is finally pointing at something specific. The fix belongs in `run.sh`: the admin and
+web dev servers must be (re)started with the env *inside* the process that evaluates
+`next.config.ts`, or the pass must pass an explicit origin that the config reads at config-load
+time. That is next tick's first slice — it is worth more than any REQ-017 code, because until the
+forwarder points at the right API, every screen in the panel is being measured empty.
+
+**One more thing the pass proved about the harness itself.** `cargo-slot.sh`'s exec bit
+(`81a670f2`) is what let this pass run at all: the previous attempt died on `Permission denied`
+*while holding a slot*. And the cold build took **59 minutes** on a box running four other
+writers' rustc, so the build target was moved to `/root/w5target` — `/mnt/apopic` sat at 98% with
+1.6 G free and `/dev/shm` at 99% with eight siblings' targets on it. Reclaim only your own
+artifacts, and check an open fd, a recent write and a live cwd before deleting anything.
