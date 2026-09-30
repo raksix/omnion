@@ -557,6 +557,63 @@ pub async fn authenticate(
     Ok(AuthenticatedToken { token: row.token })
 }
 
+/// Authenticate a token whose caller cannot name its organization.
+///
+/// The headless content surface (REQ-019 slice 2) authenticates with **no session at all** — that
+/// is the feature: the caller is a frontend outside the organization. It therefore cannot supply
+/// the `organization_id` [`authenticate`] requires, and the correct value is the one the row
+/// already carries.
+///
+/// This is not a tenant-scope bypass, and the reason is worth stating because it looks like one:
+///
+/// * `prefix` is unique per **installation** (`unique` on the column, not per organization), so
+///   there is exactly one row a presented prefix can name. There is no second tenant's token to
+///   be confused with.
+/// * Everything the caller is then allowed to see comes off that row — its `site_id` filter and
+///   its `scopes`. A token scoped to one site cannot read another site whichever entry point it
+///   arrives through, and the cross-tenant walk in `content_read_surface.rs` proves the
+///   organization boundary by seeding two organizations and reading across them.
+/// * The panel route keeps the strict [`authenticate`], where the session *does* name a tenant
+///   and a mismatch is a real signal worth answering `invalid_token`.
+///
+/// Delegating rather than duplicating is the point: the digest comparison, the constant-time
+/// check, the expiry and revocation verdicts and the `last_used_at` write all stay in one place,
+/// so this entry point cannot drift into a version that forgets one of them.
+pub async fn authenticate_any_organization(
+    pool: &PgPool,
+    presented: &str,
+) -> std::result::Result<AuthenticatedToken, AuthFailure> {
+    let Some((prefix, secret)) = split_token(presented) else {
+        return Err(AuthFailure::Invalid);
+    };
+    let row = sqlx::query_as::<_, TokenForAuth>(&format!(
+        "select {LIST_COLUMNS}, token_hash from api_tokens where prefix = $1"
+    ))
+    .bind(&prefix)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| AuthFailure::Invalid)?;
+    let Some(row) = row else {
+        return Err(AuthFailure::Invalid);
+    };
+    if !constant_time_eq(&hash_secret(&secret), &row.token_hash) {
+        return Err(AuthFailure::Invalid);
+    }
+    if row.token.revoked_at.is_some() {
+        return Err(AuthFailure::Revoked);
+    }
+    if let Some(expiry) = row.token.expires_at {
+        if OffsetDateTime::now_utc() >= expiry {
+            return Err(AuthFailure::Expired);
+        }
+    }
+    let _ = sqlx::query("update api_tokens set last_used_at = now() where id = $1")
+        .bind(row.token.id)
+        .execute(pool)
+        .await;
+    Ok(AuthenticatedToken { token: row.token })
+}
+
 /// The authenticated row, which is the only place the digest is ever read.
 ///
 /// A second row type rather than a nullable field on [`ApiToken`]: the list, the panel payload and

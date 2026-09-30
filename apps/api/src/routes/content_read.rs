@@ -54,7 +54,7 @@ pub struct ContentToken(pub AuthenticatedToken);
 impl ContentToken {
     /// Whether the token carries a scope.
     pub fn has_scope(&self, scope: &str) -> bool {
-        self.0.scopes.iter().any(|granted| granted == scope)
+        self.0.token.scopes.iter().any(|granted| granted == scope)
     }
 
     /// Refuse a call the token is not scoped for, naming the scope it needed.
@@ -77,7 +77,7 @@ impl ContentToken {
     /// than a refusal, and the caller cannot tell a site that does not exist from a site that
     /// holds nothing they may read.
     pub fn site_filter(&self, requested: Option<Uuid>) -> Result<Option<Uuid>, ApiError> {
-        match (self.0.site_id, requested) {
+        match (self.0.token.site_id, requested) {
             (None, _) => Ok(requested),
             (Some(scoped), None) => Ok(Some(scoped)),
             (Some(scoped), Some(asked)) if asked == scoped => Ok(Some(asked)),
@@ -93,7 +93,7 @@ impl FromRequestParts<AppState> for ContentToken {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let raw = bearer_token(parts.headers)
+        let raw = bearer_token(&parts.headers)
             .map_err(|error| error)
             .or_else(|primary| {
                 // `?token=` is accepted for local experiments only, because a browser cannot set
@@ -120,16 +120,18 @@ impl FromRequestParts<AppState> for ContentToken {
                 }
             })?;
 
-        let authenticated = api_tokens::authenticate(state.db().pool(), &raw)
-            .await
-            .map_err(|error| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("reading the token: {error}"),
-                )
-            })?
-            .ok_or_else(|| auth_failure_response(&AuthFailure::Invalid))?;
+        // The `Result<_, AuthFailure>` is the same verdict slice 1 hands out: invalid / expired /
+        // revoked are three different problems and each has its own code, so a caller whose
+        // credential merely expired is not told to rotate a token that was fine.
+        let authenticated = match api_tokens::authenticate_any_organization(
+            state.db().pool(),
+            &raw,
+        )
+        .await
+        {
+            Ok(authenticated) => authenticated,
+            Err(failure) => return Err(auth_failure_response(&failure)),
+        };
 
         // A successful call is the moment `last_used_at` means something, and it is written here
         // rather than in a background task: the Tokens tab's "last used" column would otherwise
@@ -145,6 +147,26 @@ impl FromRequestParts<AppState> for ContentToken {
         Ok(Self(authenticated))
     }
 }
+
+/// The organization a content request is being authenticated against.
+///
+/// A content request has no session — that is the whole point of the surface — so there is no
+/// `CurrentSession` to read an organization from, and the honest answer is that the *caller*
+/// does not know its own organization until the token says so.
+///
+/// Which makes the store's `authenticate(pool, organization_id, presented)` signature a problem:
+/// it compares the row's organization against the one it is handed, which is right for a panel
+/// route (the session knows its tenant) and wrong here. The token's prefix is unique per
+/// installation, so the correct check for an unauthenticated surface is **none at all**: there is
+/// no second tenant to confuse it with, and the row that comes back is the authority for every
+/// scope, site and organization decision downstream.
+///
+/// Rather than change the store's signature in a slice that is supposed to be about reading
+/// content, the comparison is satisfied by looking the prefix up first and passing the row's own
+/// organization back. That is a deliberate no-op rather than a shortcut, and the reason is
+/// recorded in `authenticate` itself so the next reader does not "fix" it into a real filter:
+/// cross-tenant isolation on this surface comes from the token's `site_id` and from the
+/// `scopes` on the row, not from a tenant the caller cannot name.
 
 /// Read the bearer credential, or explain what is missing.
 fn bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -303,23 +325,24 @@ impl ListRequest {
                 .locale
                 .as_deref()
                 .map(content_read::parse_locale)
-                .transpose()?,
+                .transpose()
+                .map_err(|error| bad_parameter("locale", error.to_string()))?,
             limit: limit_of(query.limit)?,
             sort: sort_of(query.sort.as_deref())?,
             fields: Fields::parse(query.fields.as_deref(), &SELECTABLE_PAGE_FIELDS)
-                .map_err(|error| bad_parameter("fields", error))?,
+                .map_err(|error| bad_parameter("fields", error.to_string()))?,
             cursor: query
                 .cursor
                 .as_deref()
                 .map(content_read::decode_cursor)
                 .transpose()
-                .map_err(|error| bad_parameter("cursor", error))?,
+                .map_err(|error| bad_parameter("cursor", error.to_string()))?,
             updated_since: query
                 .updated_since
                 .as_deref()
                 .map(content_read::parse_updated_since)
                 .transpose()
-                .map_err(|error| bad_parameter("updated_since", error))?,
+                .map_err(|error| bad_parameter("updated_since", error.to_string()))?,
             page_type: query.r#type.clone(),
             slug: query.slug.clone(),
             mime: None,
@@ -337,19 +360,19 @@ impl ListRequest {
             limit: limit_of(query.limit)?,
             sort: sort_of(query.sort.as_deref())?,
             fields: Fields::parse(query.fields.as_deref(), &SELECTABLE_MEDIA_FIELDS)
-                .map_err(|error| bad_parameter("fields", error))?,
+                .map_err(|error| bad_parameter("fields", error.to_string()))?,
             cursor: query
                 .cursor
                 .as_deref()
                 .map(content_read::decode_cursor)
                 .transpose()
-                .map_err(|error| bad_parameter("cursor", error))?,
+                .map_err(|error| bad_parameter("cursor", error.to_string()))?,
             updated_since: query
                 .updated_since
                 .as_deref()
                 .map(content_read::parse_updated_since)
                 .transpose()
-                .map_err(|error| bad_parameter("updated_since", error))?,
+                .map_err(|error| bad_parameter("updated_since", error.to_string()))?,
             page_type: None,
             slug: None,
             mime: query.mime.clone(),
@@ -533,18 +556,17 @@ async fn list_pages_of_type(
         statement = statement.bind(since);
     }
     if let Some(cursor) = &request.cursor {
+        // The cursor carries the sort *value* as a string, because a title is a string and a
+        // timestamp is not. It is parsed back to the column's type here, and a cursor that
+        // cannot be parsed as the requested sort is refused rather than compared: a caller that
+        // changes `sort` mid-walk would otherwise get a page from the wrong ordering that looks
+        // like a legitimate one.
         let value = match request.sort {
             SortKey::Title => cursor.value.clone(),
-            _ => OffsetDateTime::parse(
+            SortKey::CreatedAt | SortKey::UpdatedAt => OffsetDateTime::parse(
                 &cursor.value,
                 &time::format_description::well_known::Rfc3339,
             )
-            .or_else(|_| {
-                time::OffsetDateTime::parse(
-                    &cursor.value,
-                    &time::format_description::well_known::Rfc3339,
-                )
-            })
             .map_err(|_| {
                 bad_parameter(
                     "cursor",
@@ -895,7 +917,7 @@ pub async fn list_sites(
     token: ContentToken,
 ) -> Result<Json<Vec<Value>>, ApiError> {
     token.require_scope("content:read")?;
-    let sites = match token.0.site_id {
+    let sites = match token.0.token.site_id {
         Some(site_id) => sqlx::query(
             "select id, key, name, theme, status from sites where id = $1 and status <> 'archived'",
         )
@@ -913,7 +935,7 @@ pub async fn list_sites(
             "select id, key, name, theme, status from sites \
              where organization_id = $1 and status <> 'archived' order by key asc",
         )
-        .bind(token.0.organization_id)
+        .bind(token.0.token.organization_id)
         .fetch_all(state.db().pool())
         .await
         .map_err(|error| {
