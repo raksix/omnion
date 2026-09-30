@@ -24,6 +24,7 @@ use omnion_identity::sites;
 use omnion_identity::users::{self, NewUser};
 use omnion_permissions::model::{Effect, NewBinding, NewRole, RolePermissionInput, Scope};
 use omnion_permissions::{bindings, roles as role_store, seed};
+use omnion_security::RatePolicy;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -36,7 +37,7 @@ const ADMIN_PERMISSIONS: [&str; 3] = ["cdn.read", "cdn.manage", "cdn.purge"];
 struct TestResponse {
     status: StatusCode,
     /// The `Set-Cookie` value, when the response set one.
-    set_cookie: Option<String>,
+    set_cookie: String,
     body: Value,
 }
 
@@ -53,9 +54,11 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     // like sixteen product failures instead of one broken helper.
     let set_cookie = response
         .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join("; ");
     let bytes = response
         .into_body()
         .collect()
@@ -74,10 +77,66 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
     }
 }
 
-fn request(method: Method, uri: &str, token: Option<&str>, body: Option<Value>) -> Request<Body> {
+/// A signed-in account's cookie jar, in the shape a browser actually holds.
+///
+/// `login()` used to return the session token alone. Sign-in issues a session **and** a CSRF
+/// token, so a suite that keeps the first has built a client the platform is right to refuse
+/// — and since this file's state carried no secret at all, the layer answered
+/// `csrf_unavailable` and every mutation here was refused before its handler.
+///
+/// `Deref<Target = str>` keeps the fix to one function: the twenty-nine `&token_a` sites,
+/// the `&str` parameters and every `format!("{token}")` compile unchanged while the second
+/// cookie travels with the first. A session without its token is now unrepresentable rather
+/// than merely unlikely. `Debug` is hand-written to print `<redacted>`, because deriving it
+/// would write a live session token into every CI log.
+#[derive(Clone)]
+struct Credentials {
+    session: String,
+    csrf: Option<String>,
+}
+
+impl std::ops::Deref for Credentials {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.session
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("session", &"<redacted>")
+            .field("csrf", &self.csrf.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+fn request(
+    method: Method,
+    uri: &str,
+    credentials: Option<&Credentials>,
+    body: Option<Value>,
+) -> Request<Body> {
     let builder = Request::builder().method(method).uri(uri);
-    let builder = match token {
-        Some(token) => builder.header(header::COOKIE, format!("omnion_session={token}")),
+    // Both cookies go out, plus the matching `x-omnion-csrf` header — which is what a browser
+    // does, and what this file did not. The state below used to carry no CSRF secret at all,
+    // so `refuse_if_needed` answered every mutation with `403 csrf_unavailable` **before the
+    // handler ran**. A suite in that state passes every read half and silently measures
+    // nothing about writes: it is the same green a build that never implemented the route
+    // would produce. This is the sixth file to need the fix.
+    let builder = match credentials {
+        Some(credentials) => {
+            let mut cookies = format!("omnion_session={}", credentials.session);
+            let builder = match &credentials.csrf {
+                Some(csrf) => {
+                    cookies.push_str(&format!("; omnion_csrf={csrf}"));
+                    builder.header("x-omnion-csrf", csrf.as_str())
+                }
+                None => builder,
+            };
+            builder.header(header::COOKIE, cookies)
+        }
         None => builder,
     };
     match body {
@@ -95,7 +154,12 @@ fn test_storage() -> omnion_storage::Storage {
 }
 
 async fn live_state() -> Option<(AppState, Db)> {
-    let config = Config::from_env().ok()?;
+    let mut config = Config::from_env().ok()?;
+    // The secret goes on the **config**, not through the environment. Sign-in only issues a
+    // token when the running state carries one, and a suite that relies on
+    // `OMNION_CSRF_SECRET` being exported in the shell is a suite that silently stops
+    // testing writes the moment it is not.
+    config.csrf = omnion_core::config::CsrfSecret::new(Some("cdn-suite-csrf-key".to_owned()));
     let db = match Db::connect(&config.database).await {
         Ok(db) => db,
         Err(err) => {
@@ -112,6 +176,7 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
+    give_the_suite_its_own_rate_limit(&state);
     Some((state, db))
 }
 
@@ -121,11 +186,38 @@ struct Fixture {
     db: Db,
     site_a: Uuid,
     site_b: Uuid,
-    token_a: String,
-    token_b: String,
+    token_a: Credentials,
+    token_b: Credentials,
     admin_a: Uuid,
     accounts: Vec<Uuid>,
     organizations: Vec<Uuid>,
+}
+
+/// Raise the `sign_in` ceiling for this suite.
+///
+/// This file builds a fresh `Fixture` per walk and each one signs two accounts in, so fifteen
+/// walks are thirty-plus sign-ins against a budget of ten per five minutes. The surplus
+/// failures arrive as `429 rate_limited` in the middle of an assertion about cache rules —
+/// and the walk that adds a cross-tenant toggle to the cross-tenant test was the one that
+/// finally tripped it, which is why a suite that had been green for a dozen walks went red
+/// on an unrelated line. This is the FIFTH file to need it, after `media.rs`, `tenancy.rs`,
+/// `tenancy_members`, `tenancy_departments`, `tenancy_limits` and `cdn_purge.rs`.
+///
+/// Only `sign_in` is raised. The other ceilings are the ones a deployment ships, and a suite
+/// that lifts those becomes the reason a genuinely over-budget request stops being refused.
+fn give_the_suite_its_own_rate_limit(state: &AppState) {
+    let policies: Vec<RatePolicy> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            if policy.scope == "sign_in" {
+                policy.limit = 10_000;
+            }
+            policy
+        })
+        .collect();
+    let _ = omnion_api::rate_limit_middleware::install(
+        omnion_api::rate_limit_middleware::RateLimiter::new(state, policies),
+    );
 }
 
 impl Fixture {
@@ -246,7 +338,7 @@ async fn create_admin(
     organization_id: Uuid,
     suffix: &str,
     state: &AppState,
-) -> (Uuid, String) {
+) -> (Uuid, Credentials) {
     let email = format!("cdn-admin-{suffix}-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
         db.pool(),
@@ -301,7 +393,7 @@ async fn create_admin(
 }
 
 /// Sign an account in and return the raw session token.
-async fn login(state: &AppState, email: &str) -> String {
+async fn login(state: &AppState, email: &str) -> Credentials {
     let response = call(
         state,
         request(
@@ -318,22 +410,34 @@ async fn login(state: &AppState, email: &str) -> String {
         "login body: {}",
         response.body
     );
-    // Read the token out of the cookie, not out of `body["token"]`: the login response has
-    // no such field, so the old helper reported a successful sign-in as a failed fixture.
-    response
-        .set_cookie
-        .expect("login must set the session cookie")
-        .split(';')
-        .next()
-        .expect("the cookie has a value")
-        .split_once('=')
-        .expect("the cookie is name=value")
-        .1
-        .to_string()
+    // `get_all`, not `get`: sign-in sends TWO Set-Cookie headers, and reading one is
+    // indistinguishable from a deployment that issues no CSRF token at all.
+    let set_cookie = response.set_cookie.clone();
+    assert!(
+        !set_cookie.is_empty(),
+        "login must set the session cookie; sent: {set_cookie:?}"
+    );
+    // Name each cookie: a missing one must be visible HERE, naming which cookie the platform
+    // did not send, instead of surfacing three layers away as a 403.
+    let cookie_value = |name: &str| -> Option<String> {
+        set_cookie
+            .split(';')
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(cookie, _)| *cookie == name)
+            .map(|(_, value)| value.to_owned())
+    };
+    let session = cookie_value("omnion_session")
+        .unwrap_or_else(|| panic!("login must set the omnion_session cookie; sent: {set_cookie}"));
+    let csrf = cookie_value("omnion_csrf");
+    assert!(
+        csrf.is_some(),
+        "login must set the omnion_csrf cookie beside the session one; sent: {set_cookie}"
+    );
+    Credentials { session, csrf }
 }
 
 /// The rules of a site, in the order the API returns them.
-async fn rules_of(state: &AppState, token: &str, site_id: Uuid) -> Vec<Value> {
+async fn rules_of(state: &AppState, token: &Credentials, site_id: Uuid) -> Vec<Value> {
     let response = call(
         state,
         request(
@@ -695,6 +799,59 @@ async fn another_organizations_rule_is_neither_readable_nor_writable() {
     )
     .await;
     assert_eq!(write.status, StatusCode::FORBIDDEN);
+
+    // ...nor flip its live flag, which is the one this test did not cover until the store
+    // was fixed. `POST /rules/{id}/toggle` took a `site_id` from the *body* and used the path
+    // id alone in its `WHERE` clause, then compared the row it had already written against
+    // the caller's site and answered `403`. So a caller in A who named a rule id belonging to
+    // B got a refusal **and** changed B's cache rule -- the audit trail recorded the attempt
+    // and the other tenant's rules were off anyway. The `403` is what made the test suite
+    // call this endpoint guarded.
+    //
+    // The assertion that catches it is the *state*, not the status: a walk that stopped at
+    // "the caller was refused" passes against a build that refuses after writing. So the
+    // flag is read back through B's own list, which is the only reading that can see it.
+    let before = theirs[0]["enabled"].clone();
+    let toggle = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/cdn/rules/{id}/toggle"),
+            Some(&fixture.token_a),
+            Some(json!({ "site_id": fixture.site_a, "enabled": !before.as_bool().unwrap_or(true) })),
+        ),
+    )
+    .await;
+    assert!(
+        toggle.status == StatusCode::NOT_FOUND || toggle.status == StatusCode::FORBIDDEN,
+        "a cross-tenant toggle must be refused, not applied: {}",
+        toggle.body
+    );
+    let afterwards = rules_of(&fixture.state, &fixture.token_b, fixture.site_b).await;
+    let theirs_now = afterwards
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some(id.as_str()))
+        .expect("B's rule is still there")
+        .clone();
+    assert_eq!(
+        theirs_now["enabled"], before,
+        "the refusal must not have changed the other organization's rule"
+    );
+
+    // The same id under B's own site_id is the ordinary success, so the test above is
+    // measuring the scope and not a route that never works.
+    let own = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/cdn/rules/{id}/toggle"),
+            Some(&fixture.token_b),
+            Some(json!({ "site_id": fixture.site_b, "enabled": false })),
+        ),
+    )
+    .await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+    assert_eq!(own.body["enabled"], false);
 
     // ...nor name its site at all.
     let list = call(

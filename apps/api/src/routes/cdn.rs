@@ -331,22 +331,21 @@ pub async fn toggle_rule(
     Json(input): Json<ToggleInput>,
 ) -> Result<Json<RuleBody>, ApiError> {
     site_in_scope(&state, &current, input.site_id).await?;
-    let row = store::set_rule_enabled(state.db().pool(), rule_id, input.enabled)
+    // The site's own predicate is inside the statement, so the check below is gone rather
+    // than moved: an id belonging to another tenant now matches no row, which is the same
+    // `None` a nonexistent id produces and therefore the same `404`. That is deliberate — the
+    // old shape answered `403` for a foreign id and `404` for a missing one, which is an
+    // existence oracle for other tenants' rules, and it answered `403` *after* writing.
+    let row = store::set_rule_enabled(state.db().pool(), rule_id, input.site_id, input.enabled)
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| {
             ApiError::new(
                 axum::http::StatusCode::NOT_FOUND,
                 "cache_rule_not_found",
-                "no cache rule with that id exists",
+                "no cache rule with that id exists on this site",
             )
         })?;
-    if row.site_id != input.site_id {
-        return Err(ApiError::forbidden(
-            "permission_denied",
-            "that cache rule belongs to another site",
-        ));
-    }
 
     audit(
         &state,

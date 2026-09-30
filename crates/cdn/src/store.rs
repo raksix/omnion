@@ -222,18 +222,35 @@ pub async fn update_rule(pool: &PgPool, id: Uuid, rule: &CacheRule) -> Result<Ru
 }
 
 /// Set a rule's live flag, without touching the rest of the row.
+///
+/// The site is part of the `WHERE` clause, not a check the caller makes afterwards.
+///
+/// It used to be `where id = $1` with the route comparing `row.site_id` to the caller's site
+/// once the row had already come back — so a caller who named another tenant's rule id
+/// **flipped that tenant's rule** and was then told `403 permission_denied`. The refusal was
+/// real and the damage was already written, which is the worst order of the two: the audit
+/// trail records the attempt and the other tenant's cache rules changed anyway. This is the
+/// same read-then-check mistake `update_rule` and `delete_rule` do not make, and it is why the
+/// scope belongs in the statement: a predicate that can be forgotten is a predicate that will
+/// be.
+///
+/// `None` therefore means *no row of this site had that id*, and the route answers `404` from
+/// it directly — a cross-tenant id and a nonexistent id are the same answer, which is the
+/// property that stops this endpoint being an existence oracle for other tenants' rules.
 pub async fn set_rule_enabled(
     pool: &PgPool,
     id: Uuid,
+    site_id: Uuid,
     enabled: bool,
 ) -> Result<Option<RuleRow>, CdnError> {
     sqlx::query_as::<_, RuleRow>(
-        "update cdn_cache_rules set enabled = $2 where id = $1 \
+        "update cdn_cache_rules set enabled = $3 where id = $1 and site_id = $2 \
          returning id, site_id, name, priority, path_pattern, methods, edge_ttl_seconds, \
                    browser_ttl_seconds, swr_seconds, cache_key, bypass, enabled, created_by, \
                    created_at, updated_at",
     )
     .bind(id)
+    .bind(site_id)
     .bind(enabled)
     .fetch_optional(pool)
     .await
