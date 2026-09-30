@@ -7389,3 +7389,44 @@ pass with the fix** (`git stash push -- scripts/qa/walkthrough.cjs` → red, pop
 That unfiltered pass was killed mid-walk and a fresh focused one started; the three reliability
 screens are the ones this tick is waiting on. **The close box stays UNTICKED until that pass
 reports** — the same reason as tick 30, and the reason it is the last box in the file.
+
+### The focused pass, and the 1,477 "high findings" that are one lost session
+
+The fixed filter did what it exists for: `focused pass: 3/52 routes — reliability-intake,
+reliability-retries, reliability-breakers`, `3 route/pass name(s) walked, 0 unmatched`, 76
+clicks and 81 shots, versus the unfiltered walk's 52 routes and ~1 h. The three screens
+the tick owes are the three screens that ran.
+
+**What the pass proves about the intake screen** (`/mnt/apopic/omnion-w6/qa-artifacts/20260930-151345/`):
+
+* the route renders — `title: "Inbound intake · Omnion Admin"`, `h1Count: 1`, no horizontal
+  overflow at 1440 px, no broken images, no duplicate ids, no offscreen nodes;
+* the empty state is real (`rows: 0, cards: 0, hasEmptyState: true`) rather than a spinner;
+* the declare dialog has **10 of 10 fields labelled** — the labelled-input rule, measured;
+* mobile at 390 px reports `overflowPx: 3`, under the reporting threshold, and a `Retry`
+  control at 35×20 px which is the one small-target finding this screen has.
+
+**What the 1,477 high findings are.** The raw counter is not a defect list. Grouping the
+findings by URL and status: **717 of them are HTTP 403**, and they are spread across
+`/backups`, `/observability/alerts`, `/settings/iam/*`, `/settings/reliability/retries` and
+`/settings/reliability/breakers` — screens this branch has never touched, in writers I do not
+own. The report carries its own explanation: `mobileLogin: false`, `reLogin: false`,
+`signOut.reachedLogin: false`. **The pass lost its session after the sign-out step**, and every
+subsequent request and subresource fetch answered 403 — including the 434 attached to the
+intake page, which are its own `fetch()` calls, not the page: the page itself rendered with a
+title and an h1 while its fetches were refused.
+
+So the honest reading is **one environmental finding (the session does not survive
+`signOut` in a focused pass) that happens to express itself as 742 page-level 403s**, and it
+is not caused by this tick's change. It is also not fixable from here: the sign-out step
+belongs to the shared harness, and `/settings/reliability/retries` and `.../breakers` were
+measured landing on `/login` for the same reason.
+
+**The close box stays UNTICKED for the third tick, and the reason is now specific rather
+than "the pass has not run":** the pass has run, the intake screen is clean on every
+diagnostic, and the two remaining screens were never actually measured because the session
+died before them. Ticking the box on a pass that measured one of three screens and then
+mis-attributed a lost session to two of them would be the same box-ticking this request has
+already been wrong about twice. The next pass re-orders the sign-out step behind the depth
+passes (or runs the reliability screens before it), which is a harness change and belongs to
+whoever owns `walkthrough.cjs` on main.
