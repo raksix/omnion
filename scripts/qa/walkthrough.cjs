@@ -8774,20 +8774,31 @@ async function main() {
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
 
+  // A route that threw is recorded WITHOUT `diagnostics` (see the `route-failed` push above), and
+  // the roll-up used to dereference it directly — so one page that failed on a dead tab, a
+  // navigation timeout or an `interact` throw destroyed every OTHER page's findings and the
+  // report the run wrote. The cost is not one missing screen: it is the whole suite, silently,
+  // at the exact moment the box is unhealthy enough to make routes fail. A route failure is
+  // itself a finding, so it is now raised as one and the loop moves on.
   for (const p of report.pages) {
-    const d = p.diagnostics;
-    if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
-    if (d.offscreen.length) pushFindings("high", "offscreen", `${p.name}: ${d.offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(d.offscreen[0])}`);
-    if (d.brokenImages.length) pushFindings("high", "broken-image", `${p.name}: ${d.brokenImages.join(", ")}`);
-    if (d.emptyInteractives.length) pushFindings("medium", "unlabeled-control", `${p.name}: ${d.emptyInteractives.length} control(s) with no accessible name`);
-    if (d.unlabeledInputs.length) pushFindings("medium", "unlabeled-input", `${p.name}: ${d.unlabeledInputs.length} input(s) without a label`);
-    if (d.lowContrast.length) pushFindings("medium", "low-contrast", `${p.name}: ${d.lowContrast.length} text node(s) under WCAG AA, e.g. ${JSON.stringify(d.lowContrast[0])}`);
-    if (d.duplicateIds.length) pushFindings("low", "duplicate-id", `${p.name}: duplicate ids ${d.duplicateIds.join(", ")}`);
-    if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
+    if (p.failed) {
+      pushFindings("high", "route-failed", `${p.name}: ${p.failed}`);
+      continue;
+    }
+    const d = p.diagnostics || {};
+    const { horizontalOverflow, scrollWidth, viewport, offscreen, brokenImages, emptyInteractives, unlabeledInputs, lowContrast, duplicateIds, h1Count } = d;
+    if (horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${scrollWidth}px > ${viewport?.w}px)`);
+    if (offscreen?.length) pushFindings("high", "offscreen", `${p.name}: ${offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(offscreen[0])}`);
+    if (brokenImages?.length) pushFindings("high", "broken-image", `${p.name}: ${brokenImages.join(", ")}`);
+    if (emptyInteractives?.length) pushFindings("medium", "unlabeled-control", `${p.name}: ${emptyInteractives.length} control(s) with no accessible name`);
+    if (unlabeledInputs?.length) pushFindings("medium", "unlabeled-input", `${p.name}: ${unlabeledInputs.length} input(s) without a label`);
+    if (lowContrast?.length) pushFindings("medium", "low-contrast", `${p.name}: ${lowContrast.length} text node(s) under WCAG AA, e.g. ${JSON.stringify(lowContrast[0])}`);
+    if (duplicateIds?.length) pushFindings("low", "duplicate-id", `${p.name}: duplicate ids ${duplicateIds.join(", ")}`);
+    if (h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
   }
   for (const m of report.mobile) {
-    if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
-    if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
+    if (m.diagnostics?.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
+    if (m.diagnostics?.offscreen?.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
   }
   // The switcher sheet's own claims, read above: a sheet that opens but does not cover the
   // screen, rows a thumb cannot reach, or a page that scrolls sideways underneath it are the
