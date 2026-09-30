@@ -797,6 +797,14 @@ mod tests {
     fn every_schema_is_a_closed_object() {
         for spec in specs() {
             let schema = (spec.input_schema)();
+            // Every tool schema must be a schema the validator actually implements. A `$ref` or a
+            // `oneOf` in a tool's schema is a gate that does not gate, and it would only be found
+            // the day a call hit that branch.
+            assert!(
+                crate::schema::supported(&schema),
+                "{} uses a JSON-Schema keyword the validator does not implement",
+                spec.key
+            );
             assert_eq!(schema["type"], "object", "{} is not an object schema", spec.key);
             // `additionalProperties = false` is the request's "unknown fields are refused, not
             // ignored", and it is the difference between a tool that validates its input and a
