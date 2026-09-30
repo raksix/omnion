@@ -9460,3 +9460,65 @@ this entry**, and REQ-051 stays `in-progress`.
 formerly-failing state steps answer, the mobile and keyboard boxes have their
 evidence and REQ-051 can close; if the board still does not draw, the crash moved
 rather than died and the screenshot says where.
+
+## Tick 51 — wave 4 · REQ-052 slice 4c: the hand-off that had two halves and a writer for neither
+
+**Picked.** REQ-051 is still `in-progress` and its one unticked box needs a browser pass,
+which is queued behind a live `omnion-w3` holder (pid 542657, `/proc/542657/cwd` =
+`omnion-w3`, walkthrough still writing at 1,033 shots). A held slot is contention only
+when the holder is real, and it was — so this tick took the **slot-free** half of the
+queue instead of burning the tick on a wait: REQ-052's one unticked box that no browser
+can answer.
+
+**What it found.** That box has been open since slice 4a carrying an honest note —
+"REQ-054 is not built, `external_id`/`external_url` are columns this module writes nobody
+into." **REQ-054 then shipped, in this same branch, and nothing connected the two.**
+`grep -rn external_id modules/ apps/api/src/routes/` returns reads and a `None` in a test
+fixture and **no writer in the workspace**. So `state = 'issued'` — the state
+`0057_sales_order_reservations.sql`'s own check constraint describes
+(`state <> 'issued' or external_id is not null`) — was a state no code path could reach,
+and `/sales/orders/{id}` had been rendering `invoice.external_url` as "Open the invoice"
+behind a condition that was permanently false. A dead control wearing a live one's markup.
+
+**What shipped.** `settle_sales_handoff` in `modules/accounting/src/invoices.rs`, called
+from `send_invoice` and mirrored in `void_invoice`.
+
+* **Accounting writes it, not sales.** Sales raises a *request* to be invoiced; only the
+  module that issues a number knows which number it was. The other direction means sales
+  polls for a document nobody told it about.
+* **On `send`, not on `create`** — a draft is not a document yet. The walk asserts the
+  handoff is *still* un-settled after the conversion, so the send assertion means
+  something instead of following a state change that was always going to happen.
+* **Both halves of the order move in the same transaction** as the handoff: `invoice_state`
+  on the row and `state`/`external_id`/`external_url`/`settled_at` on the handoff. They
+  render on one screen; two widgets on one screen disagreeing is worse than either alone.
+* **Void releases rather than marks void.** `void` on a handoff means the delivery was
+  abandoned — that is what a *cancelled order* writes. A withdrawn invoice puts it back to
+  `draft` with the link cleared, because a link to a voided document is a link that sends
+  the sales desk to a document saying it was cancelled. The reason stays on the invoice.
+* **The URL is a path, not a stored host** (`/accounting/invoices/{id}`), so it survives
+  the panel being mounted elsewhere. `settled_at` is the time of the issue, not of the read.
+* **The screen now says when**, because a link with no date against it answers "is it
+  done?" but not "how long has it been waiting?".
+
+**Proof.**
+
+- `cargo test -p omnion-api --test accounting_invoices` → **19/19** (872 s), including
+  `issuing_the_invoice_settles_the_sales_handoff_and_voiding_it_releases_the_link`.
+- **Proven to fail**: the settle call reverted, the same walk goes red at line 1340 —
+  `left: "draft" right: "issued"`. It is measuring the fix, not the fixture.
+- `cargo test -p omnion-module-accounting --lib` → **67/67**;
+  `cargo test -p omnion-module-sales --lib` → **178/178**;
+  `pnpm turbo run typecheck` → **2/2**.
+- The walk asserts the **invoice's** grand total equals the **order's** to the cent, which
+  is the half of the box slice 4a could not reach (it had only the sales module's own frozen
+  copy to compare against itself), and that a replacement invoice re-settles the same
+  handoff onto the **new** document.
+
+**Honest remainder.** REQ-052 still has one unticked box — mobile 390×844, list / builder /
+public page, totals footer staying visible while lines scroll. That one is genuinely a
+browser question and it stays unticked. REQ-051's empty/loading/error box is still waiting
+on the queued CRM pass.
+
+**Next.** Harvest the CRM pass (pid 3223614, log `/tmp/w4-qa-tick50b.log`) for
+`crmDeals.boardRendered`. Whichever slot frees first takes REQ-052's mobile box.
