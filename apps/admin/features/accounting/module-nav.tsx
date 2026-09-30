@@ -19,7 +19,7 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Banknote, BookOpen, Percent, ReceiptText, ScrollText } from "lucide-react";
+import { Banknote, BarChart3, BookOpen, Percent, ReceiptText, ScrollText } from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: typeof BookOpen }[] = [
   { href: "/accounting/journal", label: "Journal", icon: ScrollText },
@@ -29,6 +29,8 @@ const LINKS: { href: string; label: string; icon: typeof BookOpen }[] = [
   // Added with slice 3, in the order money moves: you raise an invoice, then the money arrives
   // against it. A payments tab before the invoices one would read backwards.
   { href: "/accounting/payments", label: "Payments", icon: Banknote },
+  // Last, because reports are what you open once the month's work is done.
+  { href: "/accounting/reports", label: "Reports", icon: BarChart3 },
 ];
 
 export function AccountingModuleNav() {

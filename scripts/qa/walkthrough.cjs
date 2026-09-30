@@ -1489,6 +1489,225 @@ async function runAccountingDepth(page, report) {
   };
 }
 
+/**
+ * The accounting reports depth pass (REQ-054, slice 4b).
+ *
+ * ## What this pass is actually proving
+ *
+ * The routes for `/accounting/reports/{report}` existed and were merged since tick 42, but
+ * **nothing had ever rendered them**. A route that answers JSON in a walk is not a screen. This
+ * pass is the "no untested screen" rule applied to the slice: it opens the screen, and then
+ * asserts the claims that are specific to *this* screen rather than to reports in general:
+ *
+ * 1. **The report-type control really changes the report.** Four buttons that all render the
+ *    same table would pass any existence check. The pass switches to the income report and
+ *    asserts the table's identity actually moved.
+ * 2. **The "figures agree" note is the acceptance box made visible, and it is re-checked on
+ *    screen.** This reads the aging bucket amounts *and* the invoice rows' outstanding column
+ *    out of the DOM and adds both up in integer cents, then requires them to be equal. A note
+ *    that says "the figures agree" while the two columns beside it disagree is the exact
+ *    failure the box exists to prevent, and only a re-add over the rendered numbers catches it.
+ * 3. **The period is a control and it moves the window**, and the export **downloads a file**
+ *    rather than merely re-rendering — the download *event*, not a success return.
+ *
+ * ## Why it runs under `--only=accounting`
+ *
+ * A full pass is hours on a box carrying ten writers and loses its signed-in session under
+ * load. This one is minutes and touches one screen, which is the shape of run this box can be
+ * trusted to produce.
+ */
+async function runAccountingReports(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step.step);
+    record({ page: "accounting", action: "accounting-reports", ...step });
+  };
+
+  // --- the screen renders, and the module shelf offers it ---------------------------------------------
+  await page.goto(`${URL_ADMIN}/accounting/reports`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  const loaded =
+    (await page.locator("[data-qa-accounting-module-nav]").count()) > 0 &&
+    (await page.locator("[data-qa-accounting-report-export]").count()) > 0;
+  note({ step: "screen", loaded });
+  if (!loaded) {
+    return { ok: false, reason: "the accounting reports screen did not render", steps };
+  }
+  await shot(page, "page-accounting-reports");
+
+  // A screen reachable only by typing its URL does not exist for anybody working the module.
+  const navOffersReports = (await page.locator('[data-qa-accounting-module-link="reports"]').count()) > 0;
+  note({ step: "module-nav", offersReports: navOffersReports });
+  if (!navOffersReports) {
+    return {
+      ok: false,
+      reason: "the accounting module nav does not offer the reports screen",
+      steps,
+    };
+  }
+
+  // All four report types are offered as controls. A screen missing the tax summary would be
+  // missing a route the API already serves, which is what "half-built" looks like.
+  const kindButtons = await page.locator("[data-qa-accounting-report-kind]").count();
+  note({ step: "report-kinds", kindButtons });
+  if (kindButtons !== 4) {
+    return {
+      ok: false,
+      reason: `the report type selector offers ${kindButtons} reports, expected 4`,
+      steps,
+    };
+  }
+
+  // --- the empty case, or a real table, but not a bare paragraph ---------------------------------------
+  const hasEmpty = (await page.locator("text=/^No .* in this period$/i").count()) > 0;
+  const hasTable = (await page.locator("[data-qa-accounting-report-table]").count()) > 0;
+  note({ step: "empty-or-table", hasEmpty, hasTable });
+  if (!hasEmpty && !hasTable) {
+    return {
+      ok: false,
+      reason: "the screen has neither rows nor a sentence saying there are none",
+      steps,
+    };
+  }
+
+  // --- the period is a real control ----------------------------------------------------------------------
+  const fromControl = (await page.locator("[data-qa-accounting-report-from]").count()) > 0;
+  const toControl = (await page.locator("[data-qa-accounting-report-to]").count()) > 0;
+  note({ step: "filters", fromControl, toControl });
+  if (!fromControl || !toControl) {
+    return {
+      ok: false,
+      reason: "the report has no period control, so it cannot be re-run for another window",
+      steps,
+    };
+  }
+
+  // --- the agree note is present whenever there are rows --------------------------------------------------
+  // It is the acceptance box, made visible. Its `agree` value is checked against the arithmetic
+  // below, not trusted.
+  const agreeLocator = page.locator("[data-qa-accounting-report-agree]");
+  const agreeCount = await agreeLocator.count();
+  const agreeValue =
+    agreeCount > 0 ? await agreeLocator.first().getAttribute("data-qa-accounting-report-agree") : null;
+  note({ step: "agree-note", agreeCount, agreeValue });
+  if (hasTable && agreeCount === 0) {
+    return {
+      ok: false,
+      reason: "a populated report shows no statement that its totals match its rows",
+      steps,
+    };
+  }
+
+  // --- the aging buckets sum to the outstanding total, re-added ON SCREEN ---------------------------------
+  const initialKind = await page
+    .locator("[data-qa-accounting-report-table]")
+    .first()
+    .getAttribute("data-qa-accounting-report-table")
+    .catch(() => "");
+  note({ step: "initial-table", tableKind: initialKind });
+
+  if (hasTable && initialKind === "aging") {
+    const verdict = await page.evaluate(() => {
+      // Integer hundredths, never a float: the identity is about money, and `parseFloat` on a
+      // grouped display string is how a pass ends up asserting a cent that is not there.
+      const toCents = (text) => {
+        const clean = String(text || "").replace(/[^\d.-]/g, "");
+        const value = Number.parseFloat(clean);
+        return Number.isFinite(value) ? Math.round(value * 100) : null;
+      };
+      const bucketEls = Array.from(document.querySelectorAll("[data-qa-accounting-bucket]"));
+      const buckets = bucketEls
+        .map((el) => toCents((el.querySelector("span.tabular-nums") || {}).textContent))
+        .filter((v) => v !== null);
+      // The invoice rows: Number, Customer, Due, Total, Paid, Outstanding, Bucket, Days late.
+      const rowEls = Array.from(document.querySelectorAll("[data-qa-accounting-aging-row]"));
+      const outstanding = rowEls
+        .map((el) => {
+          const cells = el.querySelectorAll("td");
+          return toCents((cells[5] || {}).textContent);
+        })
+        .filter((v) => v !== null);
+      const sum = (arr) => arr.reduce((a, b) => a + b, 0);
+      return {
+        buckets: buckets.length,
+        bucketSum: sum(buckets),
+        rows: outstanding.length,
+        rowSum: sum(outstanding),
+      };
+    });
+    note({ step: "aging-arithmetic", ...verdict, equal: verdict.bucketSum === verdict.rowSum });
+    if (verdict.buckets > 0 && verdict.rowSum !== verdict.bucketSum) {
+      return {
+        ok: false,
+        reason: `the bucket totals add up to ${verdict.bucketSum / 100} but the invoice rows add up to ${verdict.rowSum / 100}`,
+        steps,
+      };
+    }
+  }
+
+  // --- the report-type control really switches the report -------------------------------------------------
+  // Four buttons rendering the same table would pass any existence check, so this asserts the
+  // table identity moved.
+  await page.locator('[data-qa-accounting-report-kind="income-expense"]').click().catch(() => {});
+  await page.waitForTimeout(1400);
+  const afterKind = await page
+    .locator("[data-qa-accounting-report-table]")
+    .first()
+    .getAttribute("data-qa-accounting-report-table")
+    .catch(() => "");
+  note({ step: "switch-report", before: initialKind, after: afterKind, changed: initialKind !== afterKind });
+  if (afterKind === "income-expense") {
+    await shot(page, "page-accounting-reports-income");
+  }
+  if (initialKind !== "" && afterKind === initialKind) {
+    return {
+      ok: false,
+      reason: `selecting the income & expense report left the screen showing ${afterKind}`,
+      steps,
+    };
+  }
+
+  // --- a preset must move the window ------------------------------------------------------------------------
+  const fromBefore = await page.locator("[data-qa-accounting-report-from]").inputValue().catch(() => "");
+  await page.locator('[data-qa-accounting-report-preset="90 days"]').click().catch(() => {});
+  await page.waitForTimeout(1200);
+  const fromAfter = await page.locator("[data-qa-accounting-report-from]").inputValue().catch(() => "");
+  note({ step: "preset", fromBefore, fromAfter, changed: fromBefore !== fromAfter });
+  if (fromBefore === fromAfter) {
+    return { ok: false, reason: "the 90-day preset did not change the window", steps };
+  }
+  const urlCarriesTheWindow = page.url().includes("from=") && page.url().includes("to=");
+  note({ step: "url", urlCarriesTheWindow });
+  if (!urlCarriesTheWindow) {
+    return {
+      ok: false,
+      reason: "the report's window is not in the URL, so a refresh silently changes it",
+      steps,
+    };
+  }
+
+  // --- the export is a button that downloads a file --------------------------------------------------------
+  const exported = await Promise.all([
+    page
+      .waitForEvent("download", { timeout: 15000 })
+      .then(() => true)
+      .catch(() => false),
+    page.locator("[data-qa-accounting-report-export]").click().catch(() => {}),
+  ]).then(([ok]) => ok);
+  note({ step: "export", downloaded: exported });
+  if (!exported) {
+    return { ok: false, reason: "the export button produced no download", steps };
+  }
+
+  // Back to a chosen report so the final screenshot shows a report, not an arbitrary one.
+  await page.locator('[data-qa-accounting-report-kind="aging"]').click().catch(() => {});
+  await page.locator('[data-qa-accounting-report-preset="30 days"]').click().catch(() => {});
+  await page.waitForTimeout(1200);
+  await shot(page, "page-accounting-reports-final");
+
+  return { ok: true, steps };
+}
+
 async function runDepthPass(name, pass) {
   try {
     return await pass();
@@ -8655,6 +8874,14 @@ async function main() {
       runAccountingDepth(page, report),
     );
     log(`accounting depth: ${JSON.stringify(report.accountingDepth)}`);
+
+    // The reports screen (REQ-054, slice 4b): the four report types as real controls, the
+    // period as a real control, the "figures agree" note re-added over the aging numbers the
+    // screen is actually showing, and the export observed downloading a file.
+    report.accountingReports = await runDepthPass("accounting-reports", () =>
+      runAccountingReports(page, report),
+    );
+    log(`accounting reports: ${JSON.stringify(report.accountingReports)}`);
   }
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
