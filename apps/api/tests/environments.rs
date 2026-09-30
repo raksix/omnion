@@ -3559,8 +3559,14 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
     // The theme selection is a column on `sites`, not a row, so "copied" for it is a fact about
     // the environment's own record rather than a count — and the runner prices it as 1 when the
     // organization has a site, so the job's own numbers should agree.
-    let job: (String, serde_json::Value, Option<i32>) = sqlx::query_as(
-        "select status, areas, items_done from environment_clone_jobs \
+    // The per-area counts live in `area_counts jsonb`; `areas text[]` is the *request* (which
+    // areas the operator ticked), and it is a list of names rather than a map. The walk read
+    // `areas` into a `serde_json::Value` and indexed it like a map, which is why it had never
+    // run: a walk that has never executed carries no evidence about the schema, and this one
+    // was written against a table that does not exist. The assertion it was reaching for —
+    // "the theme selection was priced and copied" — is about the counts, so it reads those.
+    let job: (String, serde_json::Value, i32) = sqlx::query_as(
+        "select status, area_counts, items_done from environment_clone_jobs \
          where environment_id = $1 order by created_at desc limit 1",
     )
     .bind(environment_id)
@@ -3568,8 +3574,36 @@ async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
     .await
     .unwrap();
     assert_eq!(job.0, "done", "the clone finished");
-    let theme_priced = job.1["theme"].as_i64().unwrap_or_default();
-    assert_eq!(theme_priced, 1, "the theme selection was priced and copied: {}", job.1);
+    // The theme is a column on the shared `sites` row, so the honest claim is not "the theme was
+    // copied" — it is that the job **does not claim to have copied it**. `Area::copies()` has said
+    // `false` for Theme since the tick that turned three silently-empty areas into disclosed
+    // boundaries, and a pricing map listing `theme: 1` would be exactly the defect that fix
+    // closed: an area priced like a promise and copying nothing. This walk asserted the opposite
+    // and had never run, so nothing contradicted it.
+    assert!(
+        !job.1.as_object().expect("area_counts is a map").contains_key("theme"),
+        "the theme was priced as a copy, but it copies nothing: {}",
+        job.1
+    );
+    // What it must price is the three areas that really copy — and this environment was created
+    // through the API with exactly those ticked, so each is present with a count of at least one.
+    for area in ["pages", "translations", "workflows"] {
+        let count = job.1[area].as_i64().unwrap_or_default();
+        assert!(count >= 1, "the {} area was asked for and copies nothing: {}", area, job.1);
+    }
+    // And the job's own total agrees with the counts it is a total of — a self-consistent
+    // runner that reported 3 of 3 while having copied nothing is the shape this catches.
+    let summed: i64 = job.1
+        .as_object()
+        .expect("area_counts is a map of area name to a count")
+        .values()
+        .filter_map(|value| value.as_i64())
+        .sum();
+    assert_eq!(
+        job.2 as i64, summed,
+        "the job's items_done ({}) disagrees with its own area counts ({})",
+        job.2, job.1
+    );
 
     // ---- The negative, stated as a schema fact -----------------------------------------------
     // Media has no `environment_id` column, so "staging shares production's media" is not a
