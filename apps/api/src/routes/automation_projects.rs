@@ -232,6 +232,17 @@ fn sql(err: sqlx::Error) -> ApiError {
 }
 
 /// Resolve the caller's role in a project they can see, or `403` naming what they would need.
+///
+/// **Acceptance 6 hangs on this function, so it asks [`projects::effective_role`] and not
+/// [`projects::role_of`].** They differ for exactly one caller — someone who may see the project's
+/// default without being a member of it — and the difference is the whole feature: asking
+/// `role_of` here answers `None` for that account, and a `None` that becomes a `404` is a project
+/// its own organization's members cannot open. Asking `effective_role` answers `viewer`, which is
+/// a refusal for a write and a success for a read.
+///
+/// The admin short-circuit above it is unchanged and still first: an instance administrator is
+/// not "the last owner" that slice 4's removal check counts, and that check reads the membership
+/// table rather than this answer.
 async fn require_capability(
     state: &AppState,
     current: &CurrentSession,
@@ -247,7 +258,7 @@ async fn require_capability(
         // check counts — that check reads the membership table, not this answer.
         return Ok(ProjectRole::Owner);
     }
-    let role = projects::role_of(state.db().pool(), project_id, current.user.id)
+    let role = projects::effective_role(state.db().pool(), organization_id, project_id, caller)
         .await
         .map_err(ApiError::from)?
         .ok_or_else(not_found)?;
