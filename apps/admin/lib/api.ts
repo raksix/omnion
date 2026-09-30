@@ -6179,3 +6179,242 @@ export function saveBackupSettings(input: {
     body: JSON.stringify(input),
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// AI workflow builder (docs/requests/REQ-046) — the draft console
+// ---------------------------------------------------------------------------------------------
+
+/** One draft as the console list renders it. */
+export type AiWorkflowDraft = {
+  id: string;
+  title: string;
+  status: string;
+  model_key: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  workflow_id: string | null;
+  has_definition: boolean;
+  error: string | null;
+  tokens: number;
+};
+
+/** One step of a draft's definition, as the review screen draws it. */
+export type AiWorkflowStep = {
+  position: number;
+  name: string;
+  kind: string;
+  action: string | null;
+  params: unknown;
+};
+
+/** One draft as the review screen renders it. */
+export type AiWorkflowDraftDetail = AiWorkflowDraft & {
+  organization_id: string;
+  site_id: string | null;
+  prompt: string;
+  rationale: string | null;
+  definition: unknown;
+  tokens_input: number;
+  tokens_output: number;
+  revision_note: string | null;
+  revision_count: number;
+  decided_by: string | null;
+  decision_reason: string | null;
+  steps: AiWorkflowStep[];
+  decided_at: string | null;
+};
+
+/** One page of drafts, with the vocabulary the console renders itself from. */
+export type AiWorkflowDraftList = {
+  drafts: AiWorkflowDraft[];
+  total: number;
+  statuses: string[];
+  page_size: number;
+};
+
+/** One action of the engine's closed registry. */
+export type AiWorkflowAction = {
+  action: string;
+  summary: string;
+  host: boolean;
+};
+
+/** One worked example the empty state offers. */
+export type AiWorkflowExample = {
+  title: string;
+  prompt: string;
+  note: string;
+};
+
+/** The examples and the action vocabulary. */
+export type AiWorkflowVocabulary = {
+  examples: AiWorkflowExample[];
+  actions: AiWorkflowAction[];
+};
+
+/** The "created by" select's options. */
+export type AiWorkflowAuthor = { id: string; drafts: number };
+
+/** Every list filter is a query parameter, because the console keeps them in the URL. */
+export type AiWorkflowDraftQuery = {
+  status?: string[];
+  q?: string;
+  by?: string;
+  siteId?: string;
+  organizationId?: string;
+  offset?: number;
+  limit?: number;
+};
+
+/** The query string a filter set produces, with empty values omitted. */
+function draftQueryString(query: AiWorkflowDraftQuery): string {
+  const params = new URLSearchParams();
+  if (query.status && query.status.length > 0) {
+    params.set("status", query.status.join(","));
+  }
+  if (query.q && query.q.trim()) params.set("q", query.q.trim());
+  if (query.by) params.set("by", query.by);
+  if (query.siteId) params.set("site_id", query.siteId);
+  if (query.organizationId) params.set("organization_id", query.organizationId);
+  if (query.offset) params.set("offset", String(query.offset));
+  if (query.limit) params.set("limit", String(query.limit));
+  return params.toString();
+}
+
+/** One page of drafts. */
+export function fetchAiWorkflowDrafts(
+  query: AiWorkflowDraftQuery = {},
+): Promise<AiWorkflowDraftList> {
+  const search = draftQueryString(query);
+  return request<AiWorkflowDraftList>(
+    `/api/v1/ai/workflows/drafts${search ? `?${search}` : ""}`,
+  );
+}
+
+/** One draft, with its definition and its step list. */
+export function fetchAiWorkflowDraft(draftId: string): Promise<AiWorkflowDraftDetail> {
+  return request<AiWorkflowDraftDetail>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`,
+  );
+}
+
+/** The authors this organization's drafts carry. */
+export function fetchAiWorkflowAuthors(organizationId?: string): Promise<AiWorkflowAuthor[]> {
+  const search = organizationId ? `?organization_id=${encodeURIComponent(organizationId)}` : "";
+  return request<AiWorkflowAuthor[]>(`/api/v1/ai/workflows/drafts/authors${search}`);
+}
+
+/** The empty state's examples and the engine's closed action registry. */
+export function fetchAiWorkflowVocabulary(): Promise<AiWorkflowVocabulary> {
+  return request<AiWorkflowVocabulary>("/api/v1/ai/workflows/examples");
+}
+
+/** Delete a draft. Never the workflow it produced. */
+export function removeAiWorkflowDraft(draftId: string): Promise<null> {
+  return request<null>(`/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** One stage of a generation, as the progress panel draws it. */
+export type AiWorkflowStage = "plan" | "validate" | "repair";
+
+/** What a finished generation reports. */
+export type AiWorkflowDone = {
+  draft_id: string;
+  status: string;
+  repaired: boolean;
+  attempts: number;
+  tokens: number;
+};
+
+/**
+ * Generate a draft, streaming.
+ *
+ * The API answers `text/event-stream` with `stage` frames (what the platform is doing),
+ * a `done` frame carrying the stored draft's id, or an `error` frame with a stable code. It
+ * carries **no prose**: the answer is validated before `done`, so a client that rendered
+ * deltas would be rendering a definition that may still be refused. A `409` before the first
+ * frame is the console's no-provider state, which is raised here as an `ApiError` so the
+ * caller handles one shape either way.
+ *
+ * `signal` is the Cancel button: aborting closes the stream, and the draft row keeps the
+ * `generating` status its own cleanup answers — nothing is written from the client side.
+ */
+export async function streamGenerateWorkflowDraft(
+  input: { prompt: string; model?: string; siteId?: string; organizationId?: string },
+  handlers: {
+    onStage?: (stage: AiWorkflowStage) => void;
+    onDone?: (done: AiWorkflowDone) => void;
+  } = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch("/api/v1/ai/workflows/generate", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      // The METHOD is what makes this a mutating call; passing only `{ signal }` would read as
+      // a `GET`, send no token, and this stream would be the one screen whose save answers
+      // `403 csrf_failed` while every other write on the platform works.
+      ...csrfHeader({ method: "POST" }),
+    },
+    body: JSON.stringify({
+      prompt: input.prompt,
+      model: input.model && input.model.trim() ? input.model.trim() : null,
+      site_id: input.siteId || null,
+      organization_id: input.organizationId || null,
+    }),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const payload = (await readJson(response)) as ErrorBody | null;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "unknown_error",
+      payload?.error?.message ?? `The API answered with status ${response.status}.`,
+    );
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      boundary = buffer.indexOf("\n\n");
+
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+
+      const payload = JSON.parse(data) as Record<string, unknown>;
+      if (event === "stage") {
+        handlers.onStage?.(payload.stage as AiWorkflowStage);
+      } else if (event === "done") {
+        handlers.onDone?.(payload as unknown as AiWorkflowDone);
+        return;
+      } else if (event === "error") {
+        throw new ApiError(
+          502,
+          (payload.code as string) ?? "generation_failed",
+          (payload.message as string) ?? "The generation did not finish.",
+        );
+      }
+    }
+  }
+}

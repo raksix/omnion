@@ -6,7 +6,7 @@
  */
 import { useState, type ReactNode } from "react";
 
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, HardDriveDownload, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, Workflow, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Scale, ScrollText, ShieldCheck, HardDriveDownload, SlidersHorizontal, Sparkles, Timer, UserCog, UsersRound, Webhook, WandSparkles, Workflow, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -37,6 +37,10 @@ const NAV = [
   { href: "/webhooks", label: "Webhooks", icon: Webhook },
   { href: "/sites", label: "Sites", icon: Globe },
   { href: "/ai", label: "AI Hub", icon: Sparkles },
+  // The draft console (REQ-046). It sits directly UNDER the AI Hub rather than beside it:
+  // an operator who asked a model to write a rule is answering a question the Hub started,
+  // and burying the console under Automations would make it look like a separate product.
+  { href: "/ai/workflows", label: "AI workflows", icon: WandSparkles },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
