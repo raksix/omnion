@@ -859,7 +859,10 @@ function TransferDetail({
         ) : null}
       </div>
 
-      <dl className="grid grid-cols-2 gap-2 text-xs text-muted-foreground sm:grid-cols-4">
+      {/* `sm:` on the 2 — two timestamps per row on a phone, four from `sm`. The base is one
+          column, so the widest step (4) still needs a prefix of its own; a `grid-cols-2` without
+          one is a two-up row at 390px, which is the layout the mobile box rules out. */}
+      <dl className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
         <div>
           <dt className="font-medium text-foreground">Written</dt>
           <dd><RelativeTime at={transfer.created_at} /></dd>

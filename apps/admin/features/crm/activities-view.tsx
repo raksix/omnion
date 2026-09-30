@@ -501,7 +501,11 @@ export function ActivitiesView() {
               className="mt-1 w-full rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] text-ink"
             />
           </label>
-          <div className="grid grid-cols-2 gap-2">
+          {/* One column on a phone, two from `sm`. Without the prefix this pair — "Hangs off" and
+              "Record id" — stays side by side at 390px, which is the form the mobile box says must
+              be single-column. A form whose fields are technically two-up is a form nobody can fill
+              on a phone, so the layout has to be stated rather than assumed to fall back. */}
+          <div className="grid gap-2 sm:grid-cols-2">
             <label className="block text-[12px] text-muted">
               Hangs off
               <select

@@ -400,7 +400,10 @@ export function StockListView() {
                 <p className="text-[12px] text-muted">
                   {row.sku} · {row.warehouse_code}/{row.location_code}
                 </p>
-                <dl className="mt-2 grid grid-cols-3 gap-2 text-[12px]">
+                {/* `sm:grid-cols-3` — three quantities side by side is the point at desktop, and at
+                    390px each cell is ~110px wide, which is narrow enough to wrap "Available" and
+                    leave the number orphaned under it. The prefix makes it one column on a phone. */}
+                <dl className="mt-2 grid gap-2 text-[12px] sm:grid-cols-3">
                   <div>
                     <dt className="text-muted">On hand</dt>
                     <dd>

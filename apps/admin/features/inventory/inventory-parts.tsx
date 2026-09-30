@@ -359,14 +359,24 @@ export function AdjustDrawer({
             />
           </label>
 
-          {/* The preview, and the refusal, in the same place: the operator reads one box. */}
+          {/* The preview, and the refusal, in the same place: the operator reads one box.
+
+              The preview's three figures are one column on a phone (`sm:grid-cols-3` from 640px):
+              "On hand now / After this / Status" is a comparison a person reads across, and at
+              390px three cells of ~110px leave the figures competing for the same line.
+
+              The comment sits out here rather than inside the `preview ? (…)` branch below, because
+              a ternary arm has to be a single expression and a comment is not one — and it must not
+              quote a brace-comment token verbatim either, because that closes *this* comment at the
+              first `*` slash and the rest of the paragraph parses as JSX text. Typecheck caught
+              both on the way in, which is the argument for running it before the commit. */}
           <div className="mt-4 rounded border bg-stone-50 px-3 py-2" data-qa-inventory-drawer-preview>
             {previewError ? (
               <p className="text-[12.5px] text-red-700" data-qa-inventory-drawer-refusal>
                 {previewError}
               </p>
             ) : preview ? (
-              <dl className="grid grid-cols-3 gap-2 text-[12px]">
+              <dl className="grid gap-2 text-[12px] sm:grid-cols-3">
                 <div>
                   <dt className="text-muted">On hand now</dt>
                   <dd className="font-mono tabular-nums">{preview.on_hand_before}</dd>
