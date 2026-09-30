@@ -1,4 +1,71 @@
 
+## 2026-09-30 — omnion-w6 tick 29 — REQ-127 slice 3, the scheduler · and the walk that caught a duplicate send
+
+Slice 3 was half done: `retry_store` and `breaker_store` shipped last tick with ten walks green,
+and what was missing was the piece between them. A ledger can *persist* a next-attempt time and a
+state machine can *decide* what one attempt does, but nothing ran anything — so "a restarted
+worker resumes exactly once" was a property of a column rather than of the platform.
+
+**`crates/reliability/src/scheduler.rs`** (migration `0184_reliability_scheduler_lease.sql`, one
+column and one partial index). Four decisions, each of which is a property of the schema rather
+than a promise:
+
+- `due_sequences` is `distinct on (subject_kind, subject_id) … order by attempt desc` — the NEWEST
+  row per subject. Claiming the middle of a sequence would replay an attempt the timeline already
+  shows.
+- `claim_sequence` is a compare-and-swap on **one `row_id`**, not on a `(subject_kind, subject_id,
+  attempt)` predicate. PostgreSQL has no `UPDATE … ORDER BY`, so the predicate version either
+  needs a subquery or claims every row that matches — and the second is how a scheduler writes
+  attempt 4 three times. My first draft had the `ORDER BY` in it and the compiler's SQL layer is
+  what caught it.
+- The claim is a **lease**, not a lock. A permanent claim turns a worker that dies mid-attempt into
+  a job nobody runs again, which is the one failure this subsystem exists to prevent.
+- `elapsed_ms` is measured from the sequence's FIRST row. A restarted worker handing every resumed
+  sequence a fresh budget is how a policy outlives the job it belongs to.
+
+**The walk found the bug this slice existed to prevent.** `a_sequence_is_due_once_and_then_stops_
+being_due` failed with `a succeeded sequence is still being offered` — and the machine was right
+and the SQL was wrong. The `where next_attempt_at is not null` sat in the SAME query as the
+`distinct on`, so the terminal row of a finished sequence was filtered out FIRST, and "newest per
+subject" then resolved to the last row that still owed an attempt. A delivery that succeeded on
+attempt four would have been offered a fifth: a **duplicate send, from a subsystem whose entire
+purpose is to prevent exactly that**. Fixed by picking the newest row in a subquery and filtering
+it outside, and `due_count` — the panel's backlog number — carried the same shape, so it had the
+same bug and now has the same fix.
+
+That is the third walk in three ticks that failed against the machine rather than passing it, and
+it is the reason this tier exists: the column, the index and the query all looked right in review.
+
+**Also shipped:** `apps/api/src/routes/reliability_retries.rs` (nine routes, including
+`POST /breakers/{key}/observe` — the outbound gate, which is where `provider_unavailable` stops
+being a status a handler invents and becomes `breaker::admit` refusing *before* the call), the two
+screens (`/settings/reliability/retries`, `/settings/reliability/breakers`), the API client, and
+two walkthrough depth passes. The force-open pass asserts the confirm button is **disabled while
+the reason is empty** and then CANCELS — a pass that pressed it would leave the QA stack refusing
+a live provider.
+
+**Proof.**
+- `cargo test -p omnion-reliability --lib` → **116 passed / 0 failed** (114 before, +2 scheduler).
+- `cargo test -p omnion-api --lib` → **281 passed / 0 failed** (276 before, +5 route tests).
+- `pnpm typecheck` (admin) → clean.
+- `cargo test -p omnion-api --test reliability_scheduler -- --test-threads=1` against
+  `omnion_w6_dev` → **8 walks, 7 green and 1 red on the first run** (the duplicate send), then
+  **8/0** after the fix. Run one at a time: the box is at load 60-99 with 8 sibling writers.
+
+**Merge.** `origin/main` was 5 ahead at tick start. Only `docs/BUILD-LOG.md` conflicted, and the
+multiset merge passed: 101 blocks, **0 dropped**, main's `Tick 74` preserved, two blocks both
+editors had touched resolved newest-wins. The multiset recipe needed a correction worth writing
+down — a FLAT Counter over both parents counts every shared-base block twice and reports the entire
+shared history as "missing". The correct claim for an append-only log is a **union plus content
+identity**: nothing dropped, and a block only one parent has is byte-identical to that parent's
+version.
+
+**Still owed for slice 3:** the focused QA browser pass (`QA_ONLY=reliability-retries,reliability-
+breakers`, now possible and now the last gate before intake).
+
+**Next:** the intake guard (slice 4) — HMAC verification, tolerance, replay defence, size caps and
+the sanitisation profile — then the focused pass, then close REQ-127.
+
 ## 2026-09-29 — REQ-016 slice 2 (endpoints + delivery operations) · the part that makes a webhook operable
 
 build webhooks: endpoints, redelivery, rotation, the stats that do not flatter you
