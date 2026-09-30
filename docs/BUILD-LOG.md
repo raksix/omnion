@@ -9033,3 +9033,49 @@ exit code is now honest enough to be believed.
 76 with six writers on the box — the `--quiet` log stayed 0 bytes for the whole of it, which reads
 as a hung build and was not). `bash scripts/qa/void-pass-classifier-probe.sh` → **12/12**,
 `node --check walkthrough.cjs` OK, `bash -n run.sh` OK, `turbo run typecheck` **2/2**.
+
+
+## tick 48 — the QA semaphore could not give a writer its own lock back (2026-09-30)
+
+**What.** `scripts/qa/qa-slot.sh` reaped stale places exactly once, before its wait loop. A place is
+only reclaimed when its **holder** pid is gone, so a pass that took a place and was then killed
+leaves a place nobody owns — and a writer already past that single `reap` can never learn it went
+stale. It re-read the same file every 15 s, counted it as busy, and sat out the whole
+`QA_SLOT_WAIT`. On this box that is 3600 s, so the cost of one sibling pass being SIGKILLed at
+load 88 is an hour of a writer's tick spent waiting on a semaphore that had been free since the
+crash. Observed twice this tick: a dead holder (pid 3338826) whose place survived it, and a live
+one 30 s later.
+
+**The fix** (`034048f4c`) is one line — `reap` moved inside the wait loop — and the risk it
+introduces is the one that matters: reaping a place whose holder is *alive* would let two browser
+passes run at once, on the box whose exhausted RAM is the entire reason this semaphore exists.
+So the probe leads with the negatives.
+
+**Proof.** `scripts/qa/qa-slot-reap-probe.sh` (**5/5**) runs the real script as a subprocess
+against a private `QA_SLOT_DIR` across five states: empty semaphore, dead holder, live holder,
+live holder below the age grace, and a live holder **killed mid-wait**. The last is the
+regression — a reaper that ran once before the loop has already decided that place is busy. Run
+against the pre-fix script the probe is **3/5**: both reclaim cases fail with
+`no place after 2s/20s, proceeding without one`, so it can tell the two shapes apart instead of
+being green either way. The two `ok` lines it prints against the old code are the cases the fix
+does not touch, which is the point of printing them.
+
+**Also this tick.** The first pass attempt died with `could not write output to
+target/debug/deps/…: No such file or directory` and `couldn't create a temp dir (os error 2)` —
+os error 2 on a path that existed, i.e. a sibling writer deleted this worktree's `target/` while
+cargo was writing into it. The build now runs on a private `CARGO_TARGET_DIR=/mnt/apopic/w4build`
+with `CARGO_INCREMENTAL=0`, which is the shape the box's memory already records for w2. The pass
+itself is still queued: load average 87.9 on 6 cores with six writers compiling, and both the pass
+and `cargo test -p omnion-module-crm --lib` are waiting on cargo's shared package-cache lock.
+**No acceptance box is ticked by this commit** — the CRM pass has still not produced a
+`summary.json` this branch can believe.
+
+**Gates.** `bash -n scripts/qa/qa-slot.sh` OK, `bash -n scripts/qa/qa-slot-reap-probe.sh` OK,
+`bash scripts/qa/qa-slot-reap-probe.sh` → **5/5**, and the same probe against the pre-fix script
+→ **3/5** (the "proven to fail" direction). `cargo test -p omnion-module-crm --lib` and the
+browser pass are queued on the box, not green and not red.
+
+**Next.** Read `summary.json` off the private-target pass and tick the 390×844 and keyboard boxes
+on whatever it actually measured — `runCrmKeyboardAndMobile` is the leg that has to answer for
+four ticks now. If the pass is void again, `passIsVoid()`'s exit 4 says which leg lost its
+evidence, and that is the sentence to act on rather than another re-queue.
