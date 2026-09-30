@@ -139,6 +139,78 @@ fn error_count(findings: &[graph::Finding]) -> usize {
     findings.iter().filter(|finding| finding.is_error()).count()
 }
 
+/// **WHICH GRAPH A VALIDATION IS ABOUT, AND THEREFORE WHETHER IT MAY BE REMEMBERED.**
+///
+/// `validation_error` is one column with two readers that must not be confused: the rule
+/// list's "invalid" chip, and `engine::admit_to_run`, which turns a non-empty column into
+/// `workflow_not_runnable` — the guard that stops a rule from running when it cannot. Both are
+/// statements about the rule as **stored**.
+///
+/// The route serves a second caller, and it is the toolbar's own Validate button: it posts
+/// the author's **unsaved draft** (`{nodes, edges}`) so the problems panel can answer while
+/// they are still typing. That graph has never been saved, so a verdict about it says nothing
+/// about the rule on the server — and writing it there anyway has three faces, all from one
+/// root. The draft can be a **superset** of what is stored (a card is half-drawn), a
+/// **subset** (the broken edge was deleted and not saved), or **unrelated** (a different
+/// rule's graph validated through this id). In every one of them the stored row's verdict is
+/// overwritten by a graph nobody is running, and the run-time guard then refuses — or, worse,
+/// admits — the rule on the strength of an edit that was never saved.
+#[derive(Debug, Clone, Copy)]
+struct Validated<'a> {
+    /// The graph the caller supplied, if any. `None` means "the stored one".
+    supplied: Option<&'a GraphInput>,
+}
+
+impl<'a> Validated<'a> {
+    /// Decide, once, from **the shape of the request** — never from anything the caller
+    /// claims about itself.
+    ///
+    /// The body IS the draft: its presence is the whole distinction between "check this
+    /// graph" and "check the rule", and it is the same distinction this handler's own doc
+    /// comment already promises the caller ("validates that graph without storing it"). The
+    /// decision is written once here and read at the single place that writes, so a second
+    /// copy of the rule elsewhere cannot drift from this one.
+    #[must_use]
+    fn for_request(body: Option<&'a GraphInput>) -> Self {
+        Self { supplied: body }
+    }
+
+    /// Whether the verdict may be written to the rule row.
+    ///
+    /// Only a request that named no graph is about the stored rule. A request that carries
+    /// one is a question about a draft, and the honest answer to a question about a draft is
+    /// the findings — returned in the body, drawn in the panel, and stored nowhere.
+    #[must_use]
+    fn may_record(self) -> bool {
+        self.supplied.is_none()
+    }
+
+    /// Record the verdict, if this request is entitled to.
+    ///
+    /// **The write is a method, and that is the whole fix.** The first version left the
+    /// decision as `if may_record()` at the call site and tested `may_record` directly — and
+    /// the test was green with the call-site guard removed, because a test of a pure function
+    /// cannot see whether its one caller used it. An assertion nobody has watched fail is a
+    /// comment. Routing the write through here means the only path to the column already
+    /// carries the decision, so "the route writes a draft's verdict" stops being expressible
+    /// rather than being merely discouraged, and the same test now covers the route.
+    ///
+    /// `None` is what a request about a draft records — and *clears* a stale reason, because
+    /// a draft's verdict is not evidence about the stored graph, so the column must keep
+    /// saying whatever the last real validation said.
+    async fn record_verdict(
+        self,
+        pool: &sqlx::PgPool,
+        workflow_id: Uuid,
+        first_error: Option<&str>,
+    ) -> omnion_workflows::Result<()> {
+        if !self.may_record() {
+            return Ok(());
+        }
+        graph_store::record_validation(pool, workflow_id, first_error).await
+    }
+}
+
 /// A graph as the panel writes it.
 #[derive(Debug, Deserialize)]
 pub struct GraphInput {
@@ -517,8 +589,12 @@ pub async fn validate_graph(
 ) -> Result<Json<ValidationBody>, ApiError> {
     let workflow = workflow_in_scope(&state, &current, workflow_id).await?;
 
-    let graph = match body {
-        Some(Json(input)) => input.graph,
+    // **DECIDE ONCE, FROM THE REQUEST'S SHAPE, WHETHER THIS VERDICT MAY BE REMEMBERED.**
+    // See `Validated`: a body is the builder's unsaved draft, and only a request that named no
+    // graph is a statement about the rule on the server.
+    let requested = Validated::for_request(body.as_ref().map(|Json(input)| input));
+    let graph = match requested.supplied {
+        Some(input) => input.graph.clone(),
         None => graph_store::find_graph(state.db().pool(), workflow.id)
             .await?
             .map(|definition| definition.graph)
@@ -537,9 +613,20 @@ pub async fn validate_graph(
         .iter()
         .find(|finding| finding.is_error())
         .map(|finding| finding.message.clone());
-    graph_store::record_validation(state.db().pool(), workflow.id, first_error.as_deref()).await?;
 
-    if first_error.is_some() {
+    // **A DRAFT'S VERDICT IS ANSWERED, NOT STORED.** Everything in this block — the column
+    // write, the list chip and the `workflow.validation_failed` event — is a statement about the
+    // rule **as stored**, because `admit_to_run` reads that column to decide whether a run may
+    // start. Writing a draft's findings there moved that guard on an edit that was never
+    // saved: an author who removed the broken edge saw the panel go green and their *saved*
+    // rule become unrunnable, and an author with a card half-drawn took a healthy rule down
+    // with them. The findings still go back in the body and still render in the panel — which
+    // is the whole question this endpoint was asked.
+    requested
+        .record_verdict(state.db().pool(), workflow.id, first_error.as_deref())
+        .await?;
+
+    if requested.may_record() && first_error.is_some() {
         bus::emit(
             state.db().pool(),
             NewEvent::new("workflow.validation_failed")
@@ -727,6 +814,69 @@ mod tests {
             errors,
             all.len(),
             "a list with a warning in it must not report every entry as an error"
+        );
+    }
+
+    /// **A VALIDATION OF A DRAFT MUST NOT BE WRITTEN ONTO THE STORED RULE.**
+    ///
+    /// `POST /validate` serves two callers from one handler: the rule list's chip, which is
+    /// about the **stored** graph, and the builder toolbar's Validate button, which posts the
+    /// author's **unsaved draft**. The handler derived its verdict from whichever graph it was
+    /// given and then wrote it to the rule row *unconditionally* — so the draft's verdict
+    /// overwrote the stored rule's.
+    ///
+    /// The consequence is not cosmetic, and `engine::admit_to_run` is why: it turns a
+    /// non-empty `validation_error` into `workflow_not_runnable`. So an author who deletes the
+    /// broken edge in the canvas and presses Validate sees the panel go green — and has
+    /// **marked their saved rule unrunnable**, because the green draft was written over the
+    /// stored graph that still has the defect. The rule stops firing on its schedule, and the
+    /// stored defect is still there. The mirror case is just as bad: press Validate with a
+    /// half-drawn card and a stored rule that is perfectly fine becomes unrunnable.
+    ///
+    /// Neither of these needs a race or two tabs. One tab, one button, and the guard whose
+    /// whole job is "do not run this" is moved by an edit that was never saved.
+    ///
+    /// **Why the fix is a decision about the request's shape and not a version check.** The
+    /// tempting alternative is to compare the draft against `graph_version` and store only on
+    /// a match — but the builder sends `{nodes, edges}` with no version at all, and a draft
+    /// that happens to equal the stored graph is still a draft. Presence of the body is the
+    /// only signal that distinguishes the two callers, and this handler's own doc comment
+    /// already promises it.
+    #[test]
+    fn a_validation_of_an_unsaved_draft_is_answered_but_not_remembered() {
+        let draft = GraphInput {
+            graph: starter_graph(Some("page.published")),
+            ui_state: None,
+            graph_version: 0,
+        };
+
+        // The draft case: findings are returned, nothing is recorded.
+        let answered = Validated::for_request(Some(&draft));
+        assert!(
+            !answered.may_record(),
+            "a request carrying a graph is asking about THAT graph — it is the builder's live \
+             draft and has never been saved, so its verdict must not touch the rule row"
+        );
+
+        // **The control, and it is the half that says the fix is not "never record".** A
+        // request with no body validates the stored graph, and that verdict is exactly what
+        // the rule list's chip and `admit_to_run` need. A fix that silenced this branch would
+        // leave every rule permanently looking valid and every unrunnable rule admitted —
+        // strictly worse than the defect, and green in the half a test that only checks the
+        // draft case would pass.
+        let stored = Validated::for_request(None);
+        assert!(
+            stored.may_record(),
+            "a request with no body IS about the stored rule; refusing to record it would \
+             strip the 'invalid' chip and hand `admit_to_run` a column nothing ever writes"
+        );
+
+        // And the two are different requests, not two views of one.
+        assert_ne!(
+            (answered.supplied.is_some(), stored.may_record()),
+            (false, true),
+            "one request supplied a graph and the other did not; the decision reads that, not \
+             anything else about them"
         );
     }
 
