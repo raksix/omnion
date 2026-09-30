@@ -510,6 +510,35 @@ pub async fn totals(
     Ok((row.0.unwrap_or(0), row.1, row.2))
 }
 
+/// When this tenant's newest **succeeded** run finished.
+///
+/// The security posture check asks "how old is the last backup" and it has to ask a question
+/// that can be answered, so this lives beside the other summaries rather than being
+/// re-derived by each consumer.
+///
+/// **The terminal state filter is not decoration.** `totals` above answers the same question
+/// for the overview card, and it filters on `status = 'succeeded'` for the same reason this
+/// does: a run that produced a database export and *failed* on media is a `partial` run, and
+/// an operator told "your last backup was 2 minutes ago" by a partial run learns that from
+/// the panel only when they try to restore it.
+///
+/// The `is not distinct from` comparison treats the platform row (`organization_id is null`)
+/// as a real tenant, which is what a single-tenant installation is: filtering it away would
+/// leave exactly the installation with a live database answering "no backup has ever run".
+pub async fn last_succeeded_at(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<Option<OffsetDateTime>> {
+    sqlx::query_scalar(
+        "select max(finished_at) from backups \
+         where organization_id is not distinct from $1 and status = 'succeeded'",
+    )
+    .bind(organization_id)
+    .fetch_one(pool)
+    .await
+    .map_err(BackupError::from)
+}
+
 /// How many protected backups exist — the number the prune screen shows as "never removed".
 pub async fn protected_backup_count(pool: &PgPool, organization_id: Option<Uuid>) -> Result<i64> {
     sqlx::query_scalar(

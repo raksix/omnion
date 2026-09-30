@@ -79,6 +79,14 @@ const RESTORER_PERMISSIONS: [&str; 4] = [
     "backup.restore",
 ];
 
+/// The key the **security posture** screen needs, and nothing else.
+///
+/// A walk that reads the posture overview through an account holding every key proves the
+/// screen works for an account nobody has. The one key is also what makes this suite's
+/// subject the backup centre's *consumer*: `security.read` with no backup key at all is the
+/// shape of the operator who is told "your backups are stale" and cannot take one.
+const POSTURE_PERMISSIONS: [&str; 1] = ["security.read"];
+
 /// The pieces of one in-process response the assertions need.
 struct TestResponse {
     status: StatusCode,
@@ -222,6 +230,9 @@ struct Fixture {
     reader_email: String,
     /// The only account in this organization that may overwrite live data.
     restorer_email: String,
+    /// An account holding `security.read` and no backup key -- the operator who is told
+    /// "your backups are stale" and cannot take one.
+    posture_email: String,
     stranger_email: String,
     org: Uuid,
     other_org: Uuid,
@@ -288,6 +299,14 @@ impl Fixture {
             &RESTORER_PERMISSIONS,
         )
         .await;
+        let (posture_id, posture_email) = bind_role(
+            &db,
+            org,
+            platform_id,
+            "Backup Posture Reader",
+            &POSTURE_PERMISSIONS,
+        )
+        .await;
         // A stranger in another organization. It holds **every** key the restorer holds,
         // `backup.restore` included, so the 404 below is about the tenancy boundary and not
         // about a missing permission. A stranger without the restore key would be refused at
@@ -317,6 +336,7 @@ impl Fixture {
             operator_email,
             reader_email,
             restorer_email,
+            posture_email,
             stranger_email,
             org,
             other_org: other,
@@ -325,6 +345,7 @@ impl Fixture {
                 operator_id,
                 reader_id,
                 restorer_id,
+                posture_id,
                 stranger_id,
             ],
             organizations: vec![org, other],
@@ -3507,11 +3528,20 @@ async fn a_queued_restore_can_be_cancelled_before_it_writes_and_leaves_nothing_b
         db_refused.body
     );
 
-    let queued_after_refusals: i64 =
-        sqlx::query_scalar("select count(*) from backup_restore_jobs")
-            .fetch_one(fixture.db.pool())
-            .await
-            .expect("the job table must read");
+    // Scoped to **this** tenant, and the scoping is the fix rather than a nicety. The count was
+    // `select count(*) from backup_restore_jobs` with no `where`, in a database every suite in
+    // `apps/api/tests` shares — so a row any *other* walk had left behind (a killed run, a
+    // concurrent suite, the two restore walks in this file) failed this assertion with "a
+    // refused queue wrote a row", naming the wrong writer. The first version of this walk was
+    // a statement about the whole platform's job table wearing the sentence about this
+    // tenant's refusals; the sentence is only true of rows this walk could have written.
+    let queued_after_refusals: i64 = sqlx::query_scalar(
+        "select count(*) from backup_restore_jobs where organization_id = $1",
+    )
+    .bind(fixture.org)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the job table must read");
     assert_eq!(
         queued_after_refusals, 0,
         "a refused queue wrote a row: the operator would see a restore that never happens"
@@ -4077,5 +4107,192 @@ async fn the_worker_restores_a_queued_job_and_skips_one_that_was_cancelled() {
     assert!(
         reason.contains("confirmation phrase"),
         "the refusal must name the rule, not say \"failed\": {reason}"
+    );
+}
+
+// --------------------------------------------------------------------------------------------
+// The consumer: does the security posture screen actually SEE these backups?
+// --------------------------------------------------------------------------------------------
+
+/// The `backup_healthy` row on the security posture screen, for the account named.
+async fn backup_check(state: &AppState, email: &str, fixture: &Fixture) -> (String, Value) {
+    let (token, csrf) = fixture.session(email).await;
+    let response = call(
+        state,
+        request(Method::GET, "/api/v1/security/overview", Some(&token), Some(&csrf), None),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the posture overview must answer for an account holding security.read: {}",
+        response.message()
+    );
+    let row = response.body["checks"]
+        .as_array()
+        .expect("the overview carries its rows")
+        .iter()
+        .find(|row| row["key"] == "backup_healthy")
+        .cloned()
+        .expect("the registry registers backup_healthy on every run");
+    let verdict = row["state"].as_str().expect("a state").to_owned();
+    (verdict, row["detail"].clone())
+}
+
+/// Age one finished run back by `hours`, straight in PostgreSQL.
+///
+/// A run that finished four days ago has to *have finished* four days ago: the
+/// `0157` check constraint refuses a `succeeded` run with no `finished_at`, and a walk that
+/// only set `created_at` would be pricing the age of a different column than the one the
+/// check reads.
+async fn age_a_run_back(pool: &sqlx::PgPool, id: Uuid, hours: i64) {
+    sqlx::query(
+        "update backups set finished_at = finished_at - make_interval(hours => $2::int) \
+         where id = $1",
+    )
+    .bind(id)
+    .bind(hours as i32)
+    .execute(pool)
+        .await
+        .expect("the run must be aged");
+}
+
+/// REQ-013's status-card criterion, proved from the other end.
+///
+/// The criterion says the card's age is *consumed by the security overview check*, and the
+/// half that could not be true was the consumption: `backup_age` in the security routes read
+/// `backup_runs` — a table **no migration has ever created** — so `fetch_optional` answered
+/// `Err`, `Err` flattened into "no backup", and `backup_healthy` sat at `fail` on every
+/// installation for ever. The screen looked right, the message named the right rule, and the
+/// check was unreachable: the one row in the registry that could never go green.
+///
+/// **Why no test caught it, and what would have.** A unit test on `backup_healthy` passes a
+/// hand-built `Environment` and never touches a database, so the query was never run. An
+/// integration test that asserted "no backup → fail" would have passed against the broken
+/// reader forever, because the broken reader *is* a permanent no-backup. Only a walk that
+/// takes a real backup, then reads the posture screen, can tell those two worlds apart: in
+/// one the row is `fail` because the platform is unprotected, in the other because the code
+/// cannot see the platform at all.
+///
+/// The second half is the one a first fix gets wrong. Scoping the read to the tenant is not
+/// decoration: an unscoped read answers "fresh backup" from *a stranger's* run, which is a
+/// false green on the check whose false green is the expensive direction. So the stranger
+/// takes a fresh backup and the reader — who has taken nothing — must still read `fail`, and
+/// must say the reason is the absence of a backup rather than the age of somebody else's.
+#[tokio::test]
+async fn the_security_posture_check_sees_a_real_backup_and_only_this_tenants() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let (token, csrf) = fixture.session(&fixture.operator_email).await;
+
+    // Before anything has run: the honest red, with the honest reason.
+    let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
+    assert_eq!(
+        verdict, "fail",
+        "an installation with no backup must fail the check, and say so: {detail}"
+    );
+    assert!(
+        detail["summary"].as_str().unwrap_or_default().contains("ever"),
+        "the no-backup verdict must name the absence, not the age of nothing: {detail}"
+    );
+
+    // A stranger takes a fresh backup. The reader has taken nothing, and the reader's own
+    // check must be unchanged: a reader that could see this run would be reporting a false
+    // green, and that is the direction this screen is not allowed to fail in.
+    let stranger = fixture.session(&fixture.stranger_email).await;
+    let stranger_run = take_backup(
+        &fixture.state,
+        &stranger.0,
+        &stranger.1,
+        &["database", "configuration"],
+    )
+    .await;
+    assert_eq!(stranger_run.status, StatusCode::CREATED, "body: {}", stranger_run.body);
+    let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
+    assert_eq!(
+        verdict, "fail",
+        "another tenant's backup must not make this check pass: {detail}"
+    );
+
+    // This tenant takes one. The row has to move, and it has to move for the *stated* reason.
+    let created = take_backup(&fixture.state, &token, &csrf, &["database", "configuration"]).await;
+    assert_eq!(created.status, StatusCode::CREATED, "body: {}", created.body);
+    let id = Uuid::parse_str(created.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+    let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
+    assert_eq!(
+        verdict, "pass",
+        "a backup this tenant has just taken must clear the check: {detail}"
+    );
+    assert!(
+        detail["fact"].as_i64().is_some_and(|hours| hours < 1),
+        "a run finished seconds ago must be read as under an hour, not as missing: {detail}"
+    );
+
+    // The line the check draws is 48h, and the age is the age -- not the creation time, and
+    // not the row that merely exists. A reader that ignored `finished_at` and looked at
+    // `created_at` would pass this first assertion too, so the run is aged well past the line
+    // and the verdict has to turn with it.
+    age_a_run_back(fixture.db.pool(), id, 96).await;
+    let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
+    assert_eq!(
+        verdict, "fail",
+        "a backup older than the line must fail, which is the whole point of reading an age: {detail}"
+    );
+    assert_eq!(
+        detail["fact"].as_i64(),
+        Some(96),
+        "the row must report the age in hours it actually measured: {detail}"
+    );
+    assert_eq!(
+        detail["stale_after_hours"].as_i64(),
+        Some(48),
+        "and the line it crossed, so the detail can name its own rule: {detail}"
+    );
+
+    // A `partial` run is not a successful one. A run that wrote the database export and lost
+    // the media copy is exactly the run an operator must not be told is fresh, and the schema
+    // records it as its own state for that reason.
+    let partial_id: Uuid = sqlx::query_scalar(
+        "insert into backups (organization_id, kind, scopes, status, storage_prefix, size_bytes, \
+           finished_at, started_at) \
+         values ($1, 'manual', array['database','media'], 'partial', $2, 10, now(), now()) returning id",
+    )
+    .bind(fixture.org)
+    .bind(format!("partial/{}", Uuid::new_v4().simple()))
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the partial row must insert");
+    age_a_run_back(fixture.db.pool(), partial_id, 1).await;
+    let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
+    assert_eq!(
+        verdict, "fail",
+        "a fresh partial run must not reset a stale backup's age, or 'partial' would mean \
+         'as good as new': {detail}"
+    );
+    assert_eq!(
+        detail["fact"].as_i64(),
+        Some(96),
+        "and the age reported is the succeeded run's, not the partial's: {detail}"
+    );
+
+    // Now a genuinely newer **succeeded** run, one hour old. The check must go green, which
+    // is the assertion that the partial above did not poison the read: a reader that took
+    // `max(finished_at)` over *any* finished row would have gone green at the partial already
+    // and would still be green here for the wrong reason.
+    let fresh = take_backup(&fixture.state, &token, &csrf, &["configuration"]).await;
+    assert_eq!(fresh.status, StatusCode::CREATED, "body: {}", fresh.body);
+    let fresh_id =
+        Uuid::parse_str(fresh.body["backup"]["id"].as_str().expect("an id")).expect("uuid");
+    age_a_run_back(fixture.db.pool(), fresh_id, 1).await;
+    let (verdict, detail) = backup_check(&fixture.state, &fixture.posture_email, &fixture).await;
+    assert_eq!(
+        verdict, "pass",
+        "a succeeded run inside the line must clear the check whatever else is on the shelf: {detail}"
+    );
+    assert_eq!(
+        detail["fact"].as_i64(),
+        Some(1),
+        "and the age is the newest succeeded run's, so the number can be trusted as a number: {detail}"
     );
 }

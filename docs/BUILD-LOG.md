@@ -4539,6 +4539,418 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
+
+## Tick 71 — REQ-013 slice 3: the schedule that could never fire
+
+**What.** `backup_schedules` shipped in slice 1 with a `next_run_at` column, and
+`next_due_schedules` shipped with it. Nothing wrote the column. Nothing called the query. A
+schedule could be created, listed, and rendered with a cadence sentence — "Every day at 02:00" —
+beside an empty next-run cell, for ever. It is the uncalled `prune_candidates` defect one
+table over, and the shape deserves a name: **a table with a column, a query that reads it, and
+no writer is a feature that looks complete in every screenshot and does nothing.**
+
+Three pieces closed it.
+
+**1. `crates/backup/src/cadence.rs` — `Cadence::next_after`, pure, 18 unit tests.**
+
+The wall clock is local and the stored instant is UTC. Istanbul 02:00 is `23:00Z` the day
+before; New York 02:00 is `07:00Z` the same day. The next run is strictly *after* now, so a
+schedule created at 02:00:30 with a time of day of 02:00 does not answer a moment in the past
+and get claimed on every tick. An unknown zone is refused by name, not defaulted to UTC.
+
+**2. Daylight saving, decided by round-tripping rather than by asking the zone table.**
+`get_offset_local` answers `Some` for `02:30` on a spring-forward morning — a reading that
+never happened — and never answers `Ambiguous` for the hour that happens twice in autumn.
+Both were found by three zone tests failing against a version that trusted it. So each
+candidate offset is proposed and re-checked: an offset that survives its own trip back to the
+wall clock is real. A gap moves the run forward by the gap; a fold runs **once, at the
+earlier** of its two readings, because running on both gives two runs an hour apart for one
+instruction and `retention_count` would hold two of the same backup.
+
+**3. `apps/api/src/backup_schedule_runner.rs` + four write routes + the panel.** Polls every
+minute — the sweep's six hours comes from the feature (retention is measured in days) while a
+schedule's is measured in minutes. The worker calls the same `produce_all` the create route
+calls. The key split is the interesting half: editing is `backup.manage`, **"run now" is
+`backup.create`** — it produces a backup and changes nothing else, so an operator who may take
+a backup must be able to test that their schedule works. A manual run does not advance
+`next_run_at`: testing a 03:00 schedule at 09:00 must not consume tomorrow's slot.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **150/0** (was 132: +18 cadence) |
+| `omnion-core --lib` | **39/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `cargo build -p omnion-api` | Finished, 0 errors |
+| `scripts/qa/walkthrough.cjs` | `node --check` OK |
+| QA browser pass | **deferred** — see below |
+
+**Three of my own bugs, all the shortcut that reads well and does not run.**
+
+*Hourly truncated after adding instead of before.* `(after + 1h).replace_minute(0)` takes
+15:30 to 16:30 and truncates that back to 16:00 — right by coincidence — but I had written a
+test asserting 14:59:30 lands on **16:00**, which it must not. Truncating first is correct by
+construction; the test was wrong and the fix is in both.
+
+*Two DST expectations written from memory, and both were wrong while the code was right.*
+London's clocks move at **01:00 UTC**, so the reading that does not exist in spring is
+01:00–01:59 *local*, not 02:30 as I had it. I then "fixed" the test to 01:30 and the spring
+case still disagreed by an hour, because after the transition London is **on BST for the
+quarter** — 01:30 local on 30 March is 00:30 UTC, not 01:30 UTC. The resolution was to stop
+reasoning from memory and print the table: London's 2026 transitions are 29 March and
+25 October, and New York's are 8 March and 1 November. A DST test written from a
+half-remembered rule is a test of the author's memory, and it fails for the wrong reason,
+which is the worst kind of red.
+
+*`to_offset` is not the conversion.* `OffsetDateTime::new_utc(date, 02:00).to_offset(+03:00)`
+is `02:00+03:00` — the **same instant** as `02:00Z`. A scheduler that does this stores 02:00 UTC
+and runs every backup nine hours late, while every test that only checks "the hour field is
+02:00" passes. The instant is moved by *subtracting* the offset. The three zone tests exist
+because that was the first version.
+
+**`time-tz` turned out to be the wrong tool for the question, and that is the finding.** Its
+`OffsetResult` has an `Ambiguous` arm and a `None` arm for exactly these two cases, and it
+returns `Some` for both. Round-tripping the candidates is more code than calling the API and
+is the version that is actually right. Worth remembering before reaching for a library's
+convenience arm.
+
+**Toolchain.** A sibling deleted the shared `target/` mid-build and the api build died with
+`failed to move dependency graph ... No such file or directory (os error 2)` — the sibling
+signature, not a disk-full error; the two look identical in the log and are not.
+`CARGO_TARGET_DIR=/dev/shm/omnion-build-target` plus `CARGO_INCREMENTAL=0` makes the build
+immune. `cargo fmt -p omnion-backup` rewrote **seven** files I had not touched this time
+(78 lines in `apply.rs` alone); reverted on exactly the foreign seven with `git checkout --`,
+and `lib.rs` re-derived from `git show HEAD:` so the reordering did not ride along.
+`time::macros::format_description!` is the only way to get a const format — the older
+`format_description::parse` returns a `Result` and does not satisfy `Parsable`.
+
+**QA pass: deferred, and reported as deferred.** The single slot is held by a live sibling
+(pid 3355724) and the box is at load 26 with three other stacks compiling `omnion-api`
+simultaneously. `runBackupSchedules` is written and committed, and its load-bearing assertion
+is aimed straight at this tick's defect — the next-run **cell** must carry a real date and the
+zone, not a dash. A deferred pass with nothing written would be a screen nobody has looked
+at; a pass that barges into a live sibling's slot steals rather than fixes.
+
+**Next.** (a) The browser pass, when the slot is free. (b) The four-frequency form needs a
+walkthrough leg for each — the panel branches the conditional fields and only the shape
+assertions are written. (c) Slice 2c, the queued/abortable worker, is still the honest home
+for a real abort: a cancel that cannot undo a half-written library is a dead control.
+
+## 2026-09-30 · tick 72 · the nine-element array
+
+**REQ-013** (slice continuation). Not a new screen this tick: a defect that made six screens
+wrong at once, found while auditing the uncommitted diff left behind by tick 71.
+
+**What the defect was.** `time`'s `Serialize for OffsetDateTime` has two arms — a formatted
+string for a human-readable serializer, and a **nine-element tuple** as the fallback. The
+string arm is gated on the crate feature `serde-human-readable`. The workspace declares
+`serde-well-known`, which enables `serde`, `formatting` and `parsing` and *leaves
+`serde-human-readable` off*. So the arm that ships is the tuple. Proved rather than recalled,
+against the vendored crate's own source and then against a scratch binary:
+
+```
+bare  = {"created_at":[2026,273,1,39,51,668190318,0,0,0],"maybe":null}
+rfc   = {"created_at":"2026-09-30T01:39:51.668190318Z"}
+```
+
+**Why it survived this long.** Nothing above the serialiser objects. `apps/admin/lib/api.ts`
+declares `expires_at: string`, so `tsc` is green; `formatTimestamp` guards with
+`Number.isNaN` and returns `"—"`; `new Date([2026,273,…])` is `Invalid Date`, so the guard
+fires and swallows it. The result is that a share link which expires renders no expiry, a
+scan run shows no time, a retention run shows no window, a delivery shows no attempt, and the
+schedule table's next-run cell sits empty beside a cadence sentence. **An em dash for "this has
+not happened yet" is pixel-identical to an em dash for "this value was lost"**, and every one
+of these screens has legitimate reasons to show the first. That is the whole defect class: a
+loss that renders exactly like a designed answer.
+
+**Scope found by scanning, not by memory.** Twenty-eight fields across seven route modules —
+`backups`, `commands`, `media_files`, `media_retention`, `media_scan`, `media_shares`,
+`webhooks` — covering `BackupBody`, `StatusBody`, `SettingsBody`, `ScheduleBody`, `ShareBody`,
+`RunBody`, `ScanRunBody`, `QuarantineBody`, `RecentItemBody`, `DeliveryBody`,
+`RetentionRunBody`, `SweepBody`, plus the two list-query filters.
+
+**The half that nearly shipped in the same commit.** `#[serde(with = "…::option")]` on a
+**query** field makes serde *require the key*. The fix for "the date filter returns 400"
+turns every ordinary unfiltered list — `{}` — into `400 missing field created_after`, so the
+obvious improvement would have broken every screen that filters. The annotation needs `default`
+alongside it, and the absence case is the one that has to be asserted:
+
+```
+with_only   absent -> Err("missing field `created_after`")
+with_default absent -> Ok
+```
+
+**A third finding, from the test rather than the code.** `axum::extract::Query` deserialises
+**snake_case** query parameters, and `ListQuery` carries no `rename_all`. My first draft of the
+test sent `createdAfter`, it parsed without error, and the assertion "the filter parsed" passed
+for a filter that was never applied — an unmatched key is ignored rather than refused. The test
+now asserts the snake_case name binds *and* that the camelCase spelling does not, because
+"parsed" and "parsed into nothing" are the same green.
+
+| Gate | Result |
+| --- | --- |
+| `wire_dates` | **4/0** (new suite) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `no_serialised_struct_carries_a_bare_instant` | **negative-proved** — removing one attribute turns the suite red with `ShareBody.created_at serialised as [2026,273,2,0,0,0,0,0,0]` and names `media_shares.rs:71` |
+| QA browser pass | **deferred** — the single slot is a live w3 pass (holder pid 3355724, alive), load 12–28 with sibling stacks compiling |
+
+**Three of my own bugs, all from trusting a shape I did not read.** (1) The patcher added a
+second `#[serde(with = …)]` under a four-line `#[serde(with = …, skip_serializing_if = …)]`,
+producing `duplicate serde attribute` and then a cascade of six `E0277`s from the derive — the
+one-line lookback that skipped an existing annotation is the same lookback the *gate* was
+written with, so the gate got the same bug and had it fixed before it ever ran. (2) Every
+struct literal in the new test was written from memory: `ScheduleBody` has no `updated_at`,
+`RunBody` has no `dry_run` or `purged_files`, `StatusBody` nests a `StatusTotals`, and
+`ScanRunBody` has `kind`/`outcome`/`flagged` rather than `status`/`clean`/`infected`. Twenty
+`E0560`s, all of them mine. A test whose fixtures are invented is a test of the author.
+(3) My first assertion helper treated a `None` instant as a failure, so it demanded a string
+from a field whose correct wire value is `null`. The array is the failure; the null is the
+answer, and they render identically — which is the reason the defect survived.
+
+**Toolchain.** `cargo fmt -p omnion-api` reformatted **nine files I had not touched** and, worse,
+85 unrelated lines *inside* `backups.rs` — a file I do own, so the usual "revert the foreign
+set" habit does not catch it. The commit was rebuilt from `git show HEAD:apps/api/src/routes/
+backups.rs` plus only the eleven attributes, which is why the diff is 11 added lines and zero
+elsewhere. The invariant generalises: *owning the file is not the same as having written the
+line.* `cargo fmt` is not run at the crate level in a ten-worktree workspace.
+
+**Next.** (a) The browser pass, when the slot is free — `runBackupSchedules` asserts the
+next-run cell carries a date and the zone, and this tick explains why that cell was blank even
+with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
+belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
+this tick looked at.
+
+## Tick 73 · REQ-013 slice 2c — the restore you can still stop
+
+**What.** The one acceptance criterion REQ-013 had been carrying since slice 2b is closed:
+*aborting before the import starts cancels cleanly and leaves the platform untouched.* Slice
+2b's answer — a restore inside the `POST`, no cancel, and a panel that says why — was correct
+and **incomplete**, and the criterion said so: *"a genuine abort belongs with a queued
+restore"*. This is the queued restore.
+
+`backup_restore_jobs` (migration `0177`), `crates/backup/src/restore_jobs.rs`,
+`apps/api/src/routes/restore_jobs.rs`, `apps/api/src/restore_job_runner.rs`, and a
+**Queue it (can be stopped)** control beside the immediate one. The immediate restore keeps
+its refusal and keeps its explanation; the queued one is the shape with a real window, and the
+window is **before the first write**.
+
+**The three decisions, and the shortcut each one refuses.**
+
+* **The window is a state the schema names.** `queued` is the only cancellable status and
+  `cancellable` is a **field on the wire**, not a derivation the panel makes — a panel that
+  re-derives it is one edit away from offering Stop on a running restore, which would discard
+  the safety backup the operator was told they had.
+* **A cancel is an intent, then a transition.** `cancel_requested` is a flag, because a cancel
+  can land while the worker is reading the index and a `status = 'aborted'` write *then* is a
+  lie the constraint refuses. The worker is the only thing that may turn the flag into an
+  abort. The cancel route settles a still-queued row **synchronously**; leaving it to the
+  next tick shows a Stop control on a row the operator already stopped, and a control that
+  appears not to work is worse than none.
+* **A job nobody claims is `aborted`, not `failed`.** `failed` requires a start by the
+  schema's own constraint, and loosening it would stop `failed` meaning what it says. The
+  state that already meant "stopped before the first write" is the honest one.
+
+**The defect the walk found, which reading could not have.** `0177` shipped with **two
+constraints that contradicted each other**: the main status check required `started_at IS NOT
+NULL` for `aborted`, and the abort-specific check required `IS NULL`. A worker *does* stamp
+`started_at` when it claims a job and may then find the flag, so the real transition needs the
+column cleared — and **every cancellation would have been refused by the database.** Nothing
+else in the platform writes that table, so the only place it could ever surface is the first
+cancel in a walk, and a walk that did not cancel would have shipped it. The two are now one
+consistent pair, with `aborted` the one terminal state permitted to have no start.
+
+**The second defect, in my own first draft of the worker.** It read the queue through the
+**tenant-scoped** reader with `None`, and `is not distinct from null` matches rows whose
+`organization_id` *is* null — the platform's own jobs. Every tenant's restore would have sat
+`queued` for ever while the tick reported a clean pass. A background worker is *supposed* to
+cross tenants, and the scoping that protects a request is exactly what hides a tenant's work
+from the thing that has to perform it; `all_queued_restore_jobs` and `queued_restore_jobs` are
+now two functions with two names, so the unsafe form cannot be reached by passing the wrong
+argument. Same silence as the uncalled `next_due_schedules` one feature over.
+
+**The preview is now built in ONE place.** The third caller forced a refactor that found a
+live disagreement: the preview route substituted zeros when the live media library could not
+be counted and rendered a reassuring "you lose nothing", while the restore **refused** on the
+same failure. Both defensible alone; together they are the defect — one price on the screen
+and another in the effect. `rebuild_preview` reports `live_comparison_failed` and each caller
+decides what to *do* about a fact the function only *reports*.
+
+**A third finding, from the walk rather than from the code.** The fixture's run is a
+**media-only** one, so `database` is refused as `part_not_in_run` — the run-check comes first,
+and it is the better answer because it names what the run *can* offer. My table of expected
+refusals asserted `part_not_restorable` and was **wrong**; the deeper rule needed a run that
+really produced the part, and the walk now builds one. Two refusals that are both right, and a
+test that asserted the wrong one.
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **153/0** (was 150; +3 for the queue's own rules) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `apps/api --test backups` | see the run below — the suite found two real defects, both fixed and both now covered |
+| QA browser pass | **ran, and got through `/backups`** (visited, 39 interactive elements) before my own `timeout 1500` killed the walkthrough mid-run. The whole route list is longer than 25 minutes on this box, and every later step reported `Target page, context or browser has been closed` — the tab dying under memory pressure, not a finding. **No report was written, so no finding count is claimed**: the queue controls were not exercised in a browser, and this REQ is **not** closed on this |
+
+**The environment fought this tick and the wins are worth writing down.** `/mnt/apopic` hit
+100% mid-tick, so the first `cargo test` died with `No space left on device (os error 28)` and
+**the walk passed in 0.01 s** — the fixture's `Fixture::new()` returns `None` when PostgreSQL
+is unreachable and the test body simply returns. That is a green that measures nothing, and it
+is the same class as the em dash: a loss and a designed answer, pixel-identical. Two things
+gave it away and both are now habits: **0.01 s is not a walk that takes a backup**, and the
+database it named did not exist. Moving the target to `/root` produced `ld terminated with
+signal 7 [Bus error]` — a **linker** OOM, not a Rust one, on a box with 7 GB available. Only
+my own artifacts were ever deleted; the siblings' `target`s were left alone.
+
+**The suite then hung, and the hang was the second defect — a real one.** It stalled with a
+job sitting in **`running`** and no query outstanding: `not granted` locks **0**, no non-idle
+backend, no filesystem activity, the main thread in `futex`. Reading the row named the bug:
+`fail_stale_restore_jobs` swept only `queued`, and **nothing else can move a `running` job** —
+the queue read is the only thing that advances one, a worker killed mid-restore is by
+definition not going to, and the partial unique index refuses a new restore of that run while
+the row stands. So **one deploy in the middle of a restore costs that run its restore point
+for ever**, and the panel draws it as in progress the whole time. The sweep now covers
+`running`, and a reclaimed `running` job becomes **`failed`, never `aborted`**: it was
+claimed, so it probably already took a safety backup and may have written objects, and
+"nothing was written" about it would be the exact lie this feature exists to avoid. The
+reason string says what is *unknown* and names the backup to go back to.
+
+**The first defect the suite found was in a test, and it is the tick-72 wire-format fix
+coming back.** `a_backup_of_all_five_parts…` asserted that `last_successful_at` **is an
+array**, with a comment explaining that `OffsetDateTime` serialises as a tuple. That is true
+only of `time` with its `serde-human-readable` feature *off* — the same feature gap tick 72
+diagnosed — so the line **documented the defect as if it were the contract**, and the fix made
+the test fail. A test that pins the bug is worse than no test: it is a green that trains the
+next reader to distrust the code instead of the test, and it makes a fix look like a
+regression. It now asserts the JSON **type** is a string and that the value looks like
+RFC 3339, which is the only assertion that tells a *lost* timestamp apart from a designed one.
+
+**A third finding, from my own walk's bookkeeping.** The new worker walk queued a second job
+to prove the run was restorable again — and then queued a third, which the partial unique
+index refused, because the walk's own leftover was still live. A self-inflicted failure that
+reads exactly like a product bug; the leftover is now cancelled at once.
+
+**The browser pass, and what it did and did not prove.** The QA slot was **free** this tick
+and the disk had recovered to 9.8 GB, so the pass ran — three ticks of "the slot is held"
+turned out to be the wait, not the gate. It reset `omnion_qa`, brought up the API on :18080
+and the panel on :3100, and walked 22 routes including `/backups` with 39 interactive
+elements, **before my own `timeout 1500` killed it mid-run**. The later steps all reported
+`Target page, context or browser has been closed`: the browser tab dying under this box's
+memory pressure, the same pattern the loop's own lessons record, and not a finding. **So the
+queue controls are not yet exercised in a browser and the REQ stays open** — the honest
+number is "the screen renders and is reachable", not "zero high findings". The next tick runs
+it with a longer ceiling, or with the route list trimmed, because a pass that is killed by
+its own timeout has verified nothing about the pages after the cut.
+
+**Next.** (a) The browser pass with a ceiling longer than the route list (three ticks of
+"the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
+UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
+rather than a test alone. (c) Slice 4, encryption.
+## Tick 70 — the destructive half, and a fixture that could not reach the guard it was written for
+
+**REQ-013 slice 2b.** `POST /api/v1/backups/{id}/restore` behind `backup.restore`, the object
+loop in `crates/backup/src/restore_objects.rs`, the plan in `crates/backup/src/apply.rs`, the
+restore control on the preview panel, and the walkthrough driving it. The decisions are split
+the way the crate's header asks for: `apply.rs` is **pure** (selection, phrase, ordering, the
+refusals) and `restore_objects.rs` is the loop that touches a store, so the rules are
+unit-tested with nothing running and the bytes are proved over the real router.
+
+**A defect in shipped code, and it is a new instance of the shape this crate keeps finding.**
+`build_preview` computed the age inside the warning's `if` and then wrote a literal
+`age_days: 0` into the struct — so the panel's age tile read **`0d`** next to a warning that
+said *"this restore point is 23 days old"*. Two halves of one fact, computed twice, with one
+of them hardcoded: a screen contradicting itself on the single number an operator uses to
+choose between two restore points. The unit tests passed because each asserted on one half.
+One number now feeds both and a test holds them together.
+
+**The refusal half is the load-bearing half, and only a walk can prove it.** `build_plan` is
+pure, so its six refusals are unit-tested; what no unit test can see is that a *refused*
+restore writes **nothing**. The walk fires four refusals in a row — wrong phrase, a part the
+run never produced, a name outside the five, an empty selection — and then asserts the run
+count, the media rows and the audit are exactly where they were. A destructive route that
+takes its safety backup and *then* refuses is a route that mints a protected, undeletable
+backup every time somebody fat-fingers a phrase; the refusal would still be correct, and the
+operator would never know. So every refusal is proven to happen **before** the safety backup,
+which is why the `database` refusal sits above it too: taking a backup of a restore that is
+going to be refused is a run nobody asked for.
+
+**The safety backup calls `produce_all` — the same function `POST /api/v1/backups` calls.**
+A "quick safety backup" as its own loop looks shorter and is strictly worse: a second set of
+rules about what a part is, a second writer for the destination, a second place for the media
+copy to be wrong, on the one path nobody watches because it is supposed to be automatic. It
+carries the run's own scopes rather than all five, and an **incomplete** safety run is a
+refusal rather than a warning: "you may restore, just know there is no way back" is not an
+offer anybody should be able to accept.
+
+**The `database` part is refused by name, and this is the honest answer rather than a gap.**
+`document_database` writes a row COUNT per table. That is an inventory, not a dump, and
+restoring it would replace the platform's own schema with an inventory of it — the counting
+defect this crate was written to remove, in its most expensive form. The route says so in a
+sentence an operator can act on rather than quietly doing nothing. The line is therefore
+**partly open** and says so: the other four parts are recorded and priced, not applied, and
+the panel names the difference between "restored" and "reported".
+
+**A third instance of the same class, in a test rather than in shipped code — and the one that
+taught me something.** The walk for the index-version guard rewrote the media index to
+`version: 99` and expected the restore to refuse on the version. It refused — on the *size*,
+one layer up, because serialising `99` instead of `1` changes the file's length and the
+media part's recorded size no longer matches. **The right answer, from the wrong check, and
+the fixture was asserting the wrong thing.** Two things came out of it:
+
+* the obvious fixture is not merely inconvenient, it is **unreachable**, so the guard needs a
+  *length-preserving* rewrite — and a first attempt padded by doubling and gave up on the
+  overshoot, which proved the size check twice and the version guard not at all. A pad that
+  overshoots is not a failed attempt; it is the loop trying again one character shorter. The
+  walk is now two phases, and phase one asserts the thing that is actually true: an edited
+  index is not offered and **no phrase is issued** for it.
+* a check one layer up can make a check one layer down unreachable, and that is a *fact about
+  the design* rather than a test problem. The two together mean an edited index cannot produce
+  a phrase, which is the property worth having.
+
+**Two more of my own, both the shortcut that reads well and does not run.** `select count(*),
+max(metadata)` looks like the tidy way to read an audit row and dies with *function max(jsonb)
+does not exist* — jsonb has no ordering, so the walk was failing on a function the test
+invented rather than on the thing it meant to check. And the stranger in the tenancy walk held
+`OPERATOR_PERMISSIONS`, which does not include `backup.restore`, so the guard answered `403`
+and a `404` assertion failed **for the right reason at the wrong layer**; the stranger now
+holds every key the restorer holds, which is what makes the `404` evidence about the boundary
+and nothing else. A walk that asserts `404` against a `403` proves nothing.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **132/0** (103 before: +13 plan, +16 restore) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `apps/api --test backups` | 6 new walks, **6/0** in isolation |
+
+The corrupt-object walk is the one that needed the real router: it truncates a real file on
+the destination, restores with the **right** phrase, and asserts the live store still holds
+its own bytes — compared as bytes, because a length check passes by accident on an overwrite.
+The index walk is two-phase for the reason above. The panel's refusal path is extended into
+`scripts/qa/walkthrough.cjs`, including pressing a *wrong* phrase first, because a Rust walk
+can prove the API refuses and only a browser can prove the **panel shows** it rather than
+swallowing it into a spinner.
+
+**Toolchain, two facts.** `cargo fmt -p omnion-backup` rewrote five files I had not touched
+(whitespace only) and they were reverted with `git checkout --` on exactly the foreign five.
+And the toolchain linter reports `async fn is not permitted in Rust 2015` on every `async` in
+the crate — it does not pass the edition, and `cargo build` is the authority; `node --check`
+passes the walkthrough, `bun build` only fails on the missing `playwright-core` module.
+
+**The suite, honestly.** The full `--test backups` run (21 walks) **stalled twice** with an
+idle PostgreSQL and a `futex_do_wait` on the test process while the box sat at load 14–20 with
+four sibling stacks. That is contention, not a defect — the same shape the ledger records for
+the earlier ticks — so the six new walks were each run to completion **in isolation** against a
+disposable `omnion_build_70` and the result above is 6/6, not a claim about the whole file.
+
+**Next.** (a) The `partial` box is still unticked: a run where one part fails needs a fault
+injected into the drawer, not a test. (b) The abort criterion is now argued rather than
+built: a cancel that cannot undo a half-written library is a dead control, so the real form
+belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
+walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
+run the moment the box has room.
 ## Tick 69 — the restore preview, and the two rules three ticks of unit tests had passed
 
 **REQ-013 slice 2a.** `GET /api/v1/backups/{id}/restore-preview` plus the panel that reads it.
@@ -7176,112 +7588,6 @@ which half is waiting on that pass.
 **Next.** (a) the project switcher and its URL state (acceptance 3); (b) the member-role-takes-effect
 -next-request proof (15), which is a permission-cache question; (c) deactivation blocking (14);
 (d) REQ-118 slice 1a's acceptance 16, still the longest-standing open claim on this branch.
-## Tick 70 — the destructive half, and a fixture that could not reach the guard it was written for
-
-**REQ-013 slice 2b.** `POST /api/v1/backups/{id}/restore` behind `backup.restore`, the object
-loop in `crates/backup/src/restore_objects.rs`, the plan in `crates/backup/src/apply.rs`, the
-restore control on the preview panel, and the walkthrough driving it. The decisions are split
-the way the crate's header asks for: `apply.rs` is **pure** (selection, phrase, ordering, the
-refusals) and `restore_objects.rs` is the loop that touches a store, so the rules are
-unit-tested with nothing running and the bytes are proved over the real router.
-
-**A defect in shipped code, and it is a new instance of the shape this crate keeps finding.**
-`build_preview` computed the age inside the warning's `if` and then wrote a literal
-`age_days: 0` into the struct — so the panel's age tile read **`0d`** next to a warning that
-said *"this restore point is 23 days old"*. Two halves of one fact, computed twice, with one
-of them hardcoded: a screen contradicting itself on the single number an operator uses to
-choose between two restore points. The unit tests passed because each asserted on one half.
-One number now feeds both and a test holds them together.
-
-**The refusal half is the load-bearing half, and only a walk can prove it.** `build_plan` is
-pure, so its six refusals are unit-tested; what no unit test can see is that a *refused*
-restore writes **nothing**. The walk fires four refusals in a row — wrong phrase, a part the
-run never produced, a name outside the five, an empty selection — and then asserts the run
-count, the media rows and the audit are exactly where they were. A destructive route that
-takes its safety backup and *then* refuses is a route that mints a protected, undeletable
-backup every time somebody fat-fingers a phrase; the refusal would still be correct, and the
-operator would never know. So every refusal is proven to happen **before** the safety backup,
-which is why the `database` refusal sits above it too: taking a backup of a restore that is
-going to be refused is a run nobody asked for.
-
-**The safety backup calls `produce_all` — the same function `POST /api/v1/backups` calls.**
-A "quick safety backup" as its own loop looks shorter and is strictly worse: a second set of
-rules about what a part is, a second writer for the destination, a second place for the media
-copy to be wrong, on the one path nobody watches because it is supposed to be automatic. It
-carries the run's own scopes rather than all five, and an **incomplete** safety run is a
-refusal rather than a warning: "you may restore, just know there is no way back" is not an
-offer anybody should be able to accept.
-
-**The `database` part is refused by name, and this is the honest answer rather than a gap.**
-`document_database` writes a row COUNT per table. That is an inventory, not a dump, and
-restoring it would replace the platform's own schema with an inventory of it — the counting
-defect this crate was written to remove, in its most expensive form. The route says so in a
-sentence an operator can act on rather than quietly doing nothing. The line is therefore
-**partly open** and says so: the other four parts are recorded and priced, not applied, and
-the panel names the difference between "restored" and "reported".
-
-**A third instance of the same class, in a test rather than in shipped code — and the one that
-taught me something.** The walk for the index-version guard rewrote the media index to
-`version: 99` and expected the restore to refuse on the version. It refused — on the *size*,
-one layer up, because serialising `99` instead of `1` changes the file's length and the
-media part's recorded size no longer matches. **The right answer, from the wrong check, and
-the fixture was asserting the wrong thing.** Two things came out of it:
-
-* the obvious fixture is not merely inconvenient, it is **unreachable**, so the guard needs a
-  *length-preserving* rewrite — and a first attempt padded by doubling and gave up on the
-  overshoot, which proved the size check twice and the version guard not at all. A pad that
-  overshoots is not a failed attempt; it is the loop trying again one character shorter. The
-  walk is now two phases, and phase one asserts the thing that is actually true: an edited
-  index is not offered and **no phrase is issued** for it.
-* a check one layer up can make a check one layer down unreachable, and that is a *fact about
-  the design* rather than a test problem. The two together mean an edited index cannot produce
-  a phrase, which is the property worth having.
-
-**Two more of my own, both the shortcut that reads well and does not run.** `select count(*),
-max(metadata)` looks like the tidy way to read an audit row and dies with *function max(jsonb)
-does not exist* — jsonb has no ordering, so the walk was failing on a function the test
-invented rather than on the thing it meant to check. And the stranger in the tenancy walk held
-`OPERATOR_PERMISSIONS`, which does not include `backup.restore`, so the guard answered `403`
-and a `404` assertion failed **for the right reason at the wrong layer**; the stranger now
-holds every key the restorer holds, which is what makes the `404` evidence about the boundary
-and nothing else. A walk that asserts `404` against a `403` proves nothing.
-
-**Proof.**
-
-| Gate | Result |
-| --- | --- |
-| `omnion-backup --lib` | **132/0** (103 before: +13 plan, +16 restore) |
-| `omnion-api --lib` | **220/0** |
-| `apps/admin` `tsc --noEmit` | clean |
-| `apps/api --test backups` | 6 new walks, **6/0** in isolation |
-
-The corrupt-object walk is the one that needed the real router: it truncates a real file on
-the destination, restores with the **right** phrase, and asserts the live store still holds
-its own bytes — compared as bytes, because a length check passes by accident on an overwrite.
-The index walk is two-phase for the reason above. The panel's refusal path is extended into
-`scripts/qa/walkthrough.cjs`, including pressing a *wrong* phrase first, because a Rust walk
-can prove the API refuses and only a browser can prove the **panel shows** it rather than
-swallowing it into a spinner.
-
-**Toolchain, two facts.** `cargo fmt -p omnion-backup` rewrote five files I had not touched
-(whitespace only) and they were reverted with `git checkout --` on exactly the foreign five.
-And the toolchain linter reports `async fn is not permitted in Rust 2015` on every `async` in
-the crate — it does not pass the edition, and `cargo build` is the authority; `node --check`
-passes the walkthrough, `bun build` only fails on the missing `playwright-core` module.
-
-**The suite, honestly.** The full `--test backups` run (21 walks) **stalled twice** with an
-idle PostgreSQL and a `futex_do_wait` on the test process while the box sat at load 14–20 with
-four sibling stacks. That is contention, not a defect — the same shape the ledger records for
-the earlier ticks — so the six new walks were each run to completion **in isolation** against a
-disposable `omnion_build_70` and the result above is 6/6, not a claim about the whole file.
-
-**Next.** (a) The `partial` box is still unticked: a run where one part fails needs a fault
-injected into the drawer, not a test. (b) The abort criterion is now argued rather than
-built: a cancel that cannot undo a half-written library is a dead control, so the real form
-belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
-walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
-run the moment the box has room.
-
 ## 2026-09-30 · wave8 tick 34 — the merge, and what the merge tool got wrong five times
 
 **What.** `main` had moved (seven backup-restore commits), so this tick began with
@@ -7594,188 +7900,6 @@ built: a cancel that cannot undo a half-written library is a dead control, so th
 belongs with a queued restore in slice 3's worker. (c) The browser pass is still queued; the
 walkthrough now drives the button, the part ticks and a wrong phrase, so there is something to
 run the moment the box has room.
-
-## Tick 71 — REQ-013 slice 3: the schedule that could never fire
-
-**What.** `backup_schedules` shipped in slice 1 with a `next_run_at` column, and
-`next_due_schedules` shipped with it. Nothing wrote the column. Nothing called the query. A
-schedule could be created, listed, and rendered with a cadence sentence — "Every day at 02:00" —
-beside an empty next-run cell, for ever. It is the uncalled `prune_candidates` defect one
-table over, and the shape deserves a name: **a table with a column, a query that reads it, and
-no writer is a feature that looks complete in every screenshot and does nothing.**
-
-Three pieces closed it.
-
-**1. `crates/backup/src/cadence.rs` — `Cadence::next_after`, pure, 18 unit tests.**
-
-The wall clock is local and the stored instant is UTC. Istanbul 02:00 is `23:00Z` the day
-before; New York 02:00 is `07:00Z` the same day. The next run is strictly *after* now, so a
-schedule created at 02:00:30 with a time of day of 02:00 does not answer a moment in the past
-and get claimed on every tick. An unknown zone is refused by name, not defaulted to UTC.
-
-**2. Daylight saving, decided by round-tripping rather than by asking the zone table.**
-`get_offset_local` answers `Some` for `02:30` on a spring-forward morning — a reading that
-never happened — and never answers `Ambiguous` for the hour that happens twice in autumn.
-Both were found by three zone tests failing against a version that trusted it. So each
-candidate offset is proposed and re-checked: an offset that survives its own trip back to the
-wall clock is real. A gap moves the run forward by the gap; a fold runs **once, at the
-earlier** of its two readings, because running on both gives two runs an hour apart for one
-instruction and `retention_count` would hold two of the same backup.
-
-**3. `apps/api/src/backup_schedule_runner.rs` + four write routes + the panel.** Polls every
-minute — the sweep's six hours comes from the feature (retention is measured in days) while a
-schedule's is measured in minutes. The worker calls the same `produce_all` the create route
-calls. The key split is the interesting half: editing is `backup.manage`, **"run now" is
-`backup.create`** — it produces a backup and changes nothing else, so an operator who may take
-a backup must be able to test that their schedule works. A manual run does not advance
-`next_run_at`: testing a 03:00 schedule at 09:00 must not consume tomorrow's slot.
-
-**Proof.**
-
-| Gate | Result |
-| --- | --- |
-| `omnion-backup --lib` | **150/0** (was 132: +18 cadence) |
-| `omnion-core --lib` | **39/0** |
-| `apps/admin` `tsc --noEmit` | clean |
-| `cargo build -p omnion-api` | Finished, 0 errors |
-| `scripts/qa/walkthrough.cjs` | `node --check` OK |
-| QA browser pass | **deferred** — see below |
-
-**Three of my own bugs, all the shortcut that reads well and does not run.**
-
-*Hourly truncated after adding instead of before.* `(after + 1h).replace_minute(0)` takes
-15:30 to 16:30 and truncates that back to 16:00 — right by coincidence — but I had written a
-test asserting 14:59:30 lands on **16:00**, which it must not. Truncating first is correct by
-construction; the test was wrong and the fix is in both.
-
-*Two DST expectations written from memory, and both were wrong while the code was right.*
-London's clocks move at **01:00 UTC**, so the reading that does not exist in spring is
-01:00–01:59 *local*, not 02:30 as I had it. I then "fixed" the test to 01:30 and the spring
-case still disagreed by an hour, because after the transition London is **on BST for the
-quarter** — 01:30 local on 30 March is 00:30 UTC, not 01:30 UTC. The resolution was to stop
-reasoning from memory and print the table: London's 2026 transitions are 29 March and
-25 October, and New York's are 8 March and 1 November. A DST test written from a
-half-remembered rule is a test of the author's memory, and it fails for the wrong reason,
-which is the worst kind of red.
-
-*`to_offset` is not the conversion.* `OffsetDateTime::new_utc(date, 02:00).to_offset(+03:00)`
-is `02:00+03:00` — the **same instant** as `02:00Z`. A scheduler that does this stores 02:00 UTC
-and runs every backup nine hours late, while every test that only checks "the hour field is
-02:00" passes. The instant is moved by *subtracting* the offset. The three zone tests exist
-because that was the first version.
-
-**`time-tz` turned out to be the wrong tool for the question, and that is the finding.** Its
-`OffsetResult` has an `Ambiguous` arm and a `None` arm for exactly these two cases, and it
-returns `Some` for both. Round-tripping the candidates is more code than calling the API and
-is the version that is actually right. Worth remembering before reaching for a library's
-convenience arm.
-
-**Toolchain.** A sibling deleted the shared `target/` mid-build and the api build died with
-`failed to move dependency graph ... No such file or directory (os error 2)` — the sibling
-signature, not a disk-full error; the two look identical in the log and are not.
-`CARGO_TARGET_DIR=/dev/shm/omnion-build-target` plus `CARGO_INCREMENTAL=0` makes the build
-immune. `cargo fmt -p omnion-backup` rewrote **seven** files I had not touched this time
-(78 lines in `apply.rs` alone); reverted on exactly the foreign seven with `git checkout --`,
-and `lib.rs` re-derived from `git show HEAD:` so the reordering did not ride along.
-`time::macros::format_description!` is the only way to get a const format — the older
-`format_description::parse` returns a `Result` and does not satisfy `Parsable`.
-
-**QA pass: deferred, and reported as deferred.** The single slot is held by a live sibling
-(pid 3355724) and the box is at load 26 with three other stacks compiling `omnion-api`
-simultaneously. `runBackupSchedules` is written and committed, and its load-bearing assertion
-is aimed straight at this tick's defect — the next-run **cell** must carry a real date and the
-zone, not a dash. A deferred pass with nothing written would be a screen nobody has looked
-at; a pass that barges into a live sibling's slot steals rather than fixes.
-
-**Next.** (a) The browser pass, when the slot is free. (b) The four-frequency form needs a
-walkthrough leg for each — the panel branches the conditional fields and only the shape
-assertions are written. (c) Slice 2c, the queued/abortable worker, is still the honest home
-for a real abort: a cancel that cannot undo a half-written library is a dead control.
-
-## 2026-09-30 · tick 72 · the nine-element array
-
-**REQ-013** (slice continuation). Not a new screen this tick: a defect that made six screens
-wrong at once, found while auditing the uncommitted diff left behind by tick 71.
-
-**What the defect was.** `time`'s `Serialize for OffsetDateTime` has two arms — a formatted
-string for a human-readable serializer, and a **nine-element tuple** as the fallback. The
-string arm is gated on the crate feature `serde-human-readable`. The workspace declares
-`serde-well-known`, which enables `serde`, `formatting` and `parsing` and *leaves
-`serde-human-readable` off*. So the arm that ships is the tuple. Proved rather than recalled,
-against the vendored crate's own source and then against a scratch binary:
-
-```
-bare  = {"created_at":[2026,273,1,39,51,668190318,0,0,0],"maybe":null}
-rfc   = {"created_at":"2026-09-30T01:39:51.668190318Z"}
-```
-
-**Why it survived this long.** Nothing above the serialiser objects. `apps/admin/lib/api.ts`
-declares `expires_at: string`, so `tsc` is green; `formatTimestamp` guards with
-`Number.isNaN` and returns `"—"`; `new Date([2026,273,…])` is `Invalid Date`, so the guard
-fires and swallows it. The result is that a share link which expires renders no expiry, a
-scan run shows no time, a retention run shows no window, a delivery shows no attempt, and the
-schedule table's next-run cell sits empty beside a cadence sentence. **An em dash for "this has
-not happened yet" is pixel-identical to an em dash for "this value was lost"**, and every one
-of these screens has legitimate reasons to show the first. That is the whole defect class: a
-loss that renders exactly like a designed answer.
-
-**Scope found by scanning, not by memory.** Twenty-eight fields across seven route modules —
-`backups`, `commands`, `media_files`, `media_retention`, `media_scan`, `media_shares`,
-`webhooks` — covering `BackupBody`, `StatusBody`, `SettingsBody`, `ScheduleBody`, `ShareBody`,
-`RunBody`, `ScanRunBody`, `QuarantineBody`, `RecentItemBody`, `DeliveryBody`,
-`RetentionRunBody`, `SweepBody`, plus the two list-query filters.
-
-**The half that nearly shipped in the same commit.** `#[serde(with = "…::option")]` on a
-**query** field makes serde *require the key*. The fix for "the date filter returns 400"
-turns every ordinary unfiltered list — `{}` — into `400 missing field created_after`, so the
-obvious improvement would have broken every screen that filters. The annotation needs `default`
-alongside it, and the absence case is the one that has to be asserted:
-
-```
-with_only   absent -> Err("missing field `created_after`")
-with_default absent -> Ok
-```
-
-**A third finding, from the test rather than the code.** `axum::extract::Query` deserialises
-**snake_case** query parameters, and `ListQuery` carries no `rename_all`. My first draft of the
-test sent `createdAfter`, it parsed without error, and the assertion "the filter parsed" passed
-for a filter that was never applied — an unmatched key is ignored rather than refused. The test
-now asserts the snake_case name binds *and* that the camelCase spelling does not, because
-"parsed" and "parsed into nothing" are the same green.
-
-| Gate | Result |
-| --- | --- |
-| `wire_dates` | **4/0** (new suite) |
-| `omnion-api --lib` | **220/0** |
-| `apps/admin` `tsc --noEmit` | clean |
-| `no_serialised_struct_carries_a_bare_instant` | **negative-proved** — removing one attribute turns the suite red with `ShareBody.created_at serialised as [2026,273,2,0,0,0,0,0,0]` and names `media_shares.rs:71` |
-| QA browser pass | **deferred** — the single slot is a live w3 pass (holder pid 3355724, alive), load 12–28 with sibling stacks compiling |
-
-**Three of my own bugs, all from trusting a shape I did not read.** (1) The patcher added a
-second `#[serde(with = …)]` under a four-line `#[serde(with = …, skip_serializing_if = …)]`,
-producing `duplicate serde attribute` and then a cascade of six `E0277`s from the derive — the
-one-line lookback that skipped an existing annotation is the same lookback the *gate* was
-written with, so the gate got the same bug and had it fixed before it ever ran. (2) Every
-struct literal in the new test was written from memory: `ScheduleBody` has no `updated_at`,
-`RunBody` has no `dry_run` or `purged_files`, `StatusBody` nests a `StatusTotals`, and
-`ScanRunBody` has `kind`/`outcome`/`flagged` rather than `status`/`clean`/`infected`. Twenty
-`E0560`s, all of them mine. A test whose fixtures are invented is a test of the author.
-(3) My first assertion helper treated a `None` instant as a failure, so it demanded a string
-from a field whose correct wire value is `null`. The array is the failure; the null is the
-answer, and they render identically — which is the reason the defect survived.
-
-**Toolchain.** `cargo fmt -p omnion-api` reformatted **nine files I had not touched** and, worse,
-85 unrelated lines *inside* `backups.rs` — a file I do own, so the usual "revert the foreign
-set" habit does not catch it. The commit was rebuilt from `git show HEAD:apps/api/src/routes/
-backups.rs` plus only the eleven attributes, which is why the diff is 11 added lines and zero
-elsewhere. The invariant generalises: *owning the file is not the same as having written the
-line.* `cargo fmt` is not run at the crate level in a ten-worktree workspace.
-
-**Next.** (a) The browser pass, when the slot is free — `runBackupSchedules` asserts the
-next-run cell carries a date and the zone, and this tick explains why that cell was blank even
-with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
-belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
-this tick looked at.
 
 ## Tick 73 · REQ-013 slice 2c — the restore you can still stop
 
@@ -8116,3 +8240,247 @@ pass was started rather than start an unreliable one.
 every instance-wide endpoint returns `403` to them from direct calls*) is the next unticked line
 this branch can build; the `owner`-only caller and the instance-wide surface list are both
 already enumerable here.
+## Tick 73 · REQ-013 slice 2c — the restore you can still stop
+
+**What.** The one acceptance criterion REQ-013 had been carrying since slice 2b is closed:
+*aborting before the import starts cancels cleanly and leaves the platform untouched.* Slice
+2b's answer — a restore inside the `POST`, no cancel, and a panel that says why — was correct
+and **incomplete**, and the criterion said so: *"a genuine abort belongs with a queued
+restore"*. This is the queued restore.
+
+`backup_restore_jobs` (migration `0177`), `crates/backup/src/restore_jobs.rs`,
+`apps/api/src/routes/restore_jobs.rs`, `apps/api/src/restore_job_runner.rs`, and a
+**Queue it (can be stopped)** control beside the immediate one. The immediate restore keeps
+its refusal and keeps its explanation; the queued one is the shape with a real window, and the
+window is **before the first write**.
+
+**The three decisions, and the shortcut each one refuses.**
+
+* **The window is a state the schema names.** `queued` is the only cancellable status and
+  `cancellable` is a **field on the wire**, not a derivation the panel makes — a panel that
+  re-derives it is one edit away from offering Stop on a running restore, which would discard
+  the safety backup the operator was told they had.
+* **A cancel is an intent, then a transition.** `cancel_requested` is a flag, because a cancel
+  can land while the worker is reading the index and a `status = 'aborted'` write *then* is a
+  lie the constraint refuses. The worker is the only thing that may turn the flag into an
+  abort. The cancel route settles a still-queued row **synchronously**; leaving it to the
+  next tick shows a Stop control on a row the operator already stopped, and a control that
+  appears not to work is worse than none.
+* **A job nobody claims is `aborted`, not `failed`.** `failed` requires a start by the
+  schema's own constraint, and loosening it would stop `failed` meaning what it says. The
+  state that already meant "stopped before the first write" is the honest one.
+
+**The defect the walk found, which reading could not have.** `0177` shipped with **two
+constraints that contradicted each other**: the main status check required `started_at IS NOT
+NULL` for `aborted`, and the abort-specific check required `IS NULL`. A worker *does* stamp
+`started_at` when it claims a job and may then find the flag, so the real transition needs the
+column cleared — and **every cancellation would have been refused by the database.** Nothing
+else in the platform writes that table, so the only place it could ever surface is the first
+cancel in a walk, and a walk that did not cancel would have shipped it. The two are now one
+consistent pair, with `aborted` the one terminal state permitted to have no start.
+
+**The second defect, in my own first draft of the worker.** It read the queue through the
+**tenant-scoped** reader with `None`, and `is not distinct from null` matches rows whose
+`organization_id` *is* null — the platform's own jobs. Every tenant's restore would have sat
+`queued` for ever while the tick reported a clean pass. A background worker is *supposed* to
+cross tenants, and the scoping that protects a request is exactly what hides a tenant's work
+from the thing that has to perform it; `all_queued_restore_jobs` and `queued_restore_jobs` are
+now two functions with two names, so the unsafe form cannot be reached by passing the wrong
+argument. Same silence as the uncalled `next_due_schedules` one feature over.
+
+**The preview is now built in ONE place.** The third caller forced a refactor that found a
+live disagreement: the preview route substituted zeros when the live media library could not
+be counted and rendered a reassuring "you lose nothing", while the restore **refused** on the
+same failure. Both defensible alone; together they are the defect — one price on the screen
+and another in the effect. `rebuild_preview` reports `live_comparison_failed` and each caller
+decides what to *do* about a fact the function only *reports*.
+
+**A third finding, from the walk rather than from the code.** The fixture's run is a
+**media-only** one, so `database` is refused as `part_not_in_run` — the run-check comes first,
+and it is the better answer because it names what the run *can* offer. My table of expected
+refusals asserted `part_not_restorable` and was **wrong**; the deeper rule needed a run that
+really produced the part, and the walk now builds one. Two refusals that are both right, and a
+test that asserted the wrong one.
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **153/0** (was 150; +3 for the queue's own rules) |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| `apps/api --test backups` | see the run below — the suite found two real defects, both fixed and both now covered |
+| QA browser pass | **ran, and got through `/backups`** (visited, 39 interactive elements) before my own `timeout 1500` killed the walkthrough mid-run. The whole route list is longer than 25 minutes on this box, and every later step reported `Target page, context or browser has been closed` — the tab dying under memory pressure, not a finding. **No report was written, so no finding count is claimed**: the queue controls were not exercised in a browser, and this REQ is **not** closed on this |
+
+**The environment fought this tick and the wins are worth writing down.** `/mnt/apopic` hit
+100% mid-tick, so the first `cargo test` died with `No space left on device (os error 28)` and
+**the walk passed in 0.01 s** — the fixture's `Fixture::new()` returns `None` when PostgreSQL
+is unreachable and the test body simply returns. That is a green that measures nothing, and it
+is the same class as the em dash: a loss and a designed answer, pixel-identical. Two things
+gave it away and both are now habits: **0.01 s is not a walk that takes a backup**, and the
+database it named did not exist. Moving the target to `/root` produced `ld terminated with
+signal 7 [Bus error]` — a **linker** OOM, not a Rust one, on a box with 7 GB available. Only
+my own artifacts were ever deleted; the siblings' `target`s were left alone.
+
+**The suite then hung, and the hang was the second defect — a real one.** It stalled with a
+job sitting in **`running`** and no query outstanding: `not granted` locks **0**, no non-idle
+backend, no filesystem activity, the main thread in `futex`. Reading the row named the bug:
+`fail_stale_restore_jobs` swept only `queued`, and **nothing else can move a `running` job** —
+the queue read is the only thing that advances one, a worker killed mid-restore is by
+definition not going to, and the partial unique index refuses a new restore of that run while
+the row stands. So **one deploy in the middle of a restore costs that run its restore point
+for ever**, and the panel draws it as in progress the whole time. The sweep now covers
+`running`, and a reclaimed `running` job becomes **`failed`, never `aborted`**: it was
+claimed, so it probably already took a safety backup and may have written objects, and
+"nothing was written" about it would be the exact lie this feature exists to avoid. The
+reason string says what is *unknown* and names the backup to go back to.
+
+**The first defect the suite found was in a test, and it is the tick-72 wire-format fix
+coming back.** `a_backup_of_all_five_parts…` asserted that `last_successful_at` **is an
+array**, with a comment explaining that `OffsetDateTime` serialises as a tuple. That is true
+only of `time` with its `serde-human-readable` feature *off* — the same feature gap tick 72
+diagnosed — so the line **documented the defect as if it were the contract**, and the fix made
+the test fail. A test that pins the bug is worse than no test: it is a green that trains the
+next reader to distrust the code instead of the test, and it makes a fix look like a
+regression. It now asserts the JSON **type** is a string and that the value looks like
+RFC 3339, which is the only assertion that tells a *lost* timestamp apart from a designed one.
+
+**A third finding, from my own walk's bookkeeping.** The new worker walk queued a second job
+to prove the run was restorable again — and then queued a third, which the partial unique
+index refused, because the walk's own leftover was still live. A self-inflicted failure that
+reads exactly like a product bug; the leftover is now cancelled at once.
+
+**The browser pass, and what it did and did not prove.** The QA slot was **free** this tick
+and the disk had recovered to 9.8 GB, so the pass ran — three ticks of "the slot is held"
+turned out to be the wait, not the gate. It reset `omnion_qa`, brought up the API on :18080
+and the panel on :3100, and walked 22 routes including `/backups` with 39 interactive
+elements, **before my own `timeout 1500` killed it mid-run**. The later steps all reported
+`Target page, context or browser has been closed`: the browser tab dying under this box's
+memory pressure, the same pattern the loop's own lessons record, and not a finding. **So the
+queue controls are not yet exercised in a browser and the REQ stays open** — the honest
+number is "the screen renders and is reachable", not "zero high findings". The next tick runs
+it with a longer ceiling, or with the route list trimmed, because a pass that is killed by
+its own timeout has verified nothing about the pages after the cut.
+
+**Next.** (a) The browser pass with a ceiling longer than the route list (three ticks of
+"the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
+UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
+rather than a test alone. (c) Slice 4, encryption.
+
+---
+
+## Tick 74 — the check that had been red since the request was written
+
+**What.** A criterion left open since tick 1 — *the status card's age is consumed by the security
+overview check* — turned out to be hiding a defect that had been in the platform since the
+request was written, and the reading of it is the whole tick. `backup_age` in
+`apps/api/src/routes/security.rs` asked **`backup_runs`** for the last successful run. **No
+migration in this repository has ever created `backup_runs`.** The table is `backups`
+(`0157`); the name was guessed when the request predated the schema and never revisited when the
+schema landed. A missing table makes `fetch_optional` answer `Err`, `Err` was flattened into "no
+backup", and `backup_healthy` answered **`fail` on every installation, for ever** — the one
+check in the registry that could never go green, on a platform that had taken a backup every night
+for a year, with a detail that named the right rule for entirely the wrong reason.
+
+**Why nothing caught it, and why that is the interesting half.** `backup_healthy` is a pure
+function of a hand-built `Environment`, so no unit test ever executed the query. An integration
+test asserting "no backup → `fail`" would have stayed green for ever, because **the broken reader
+*is* a permanent no-backup.** The two worlds are indistinguishable from inside the code and only
+distinguishable from outside it: the walk has to take a real backup and then read the screen.
+This is the second time in two features that the missing thing was a caller — `next_due_schedules`
+shipped with a column and a query and no writer, and `prune_candidates` shipped with four
+documented exemptions and nothing calling it. A predicate nothing evaluates is a comment.
+
+**The second defect surfaced only because the walk signed in as a restricted account.** Every walk
+that had ever read the posture screen signed in as an account holding *both* keys — the platform
+owner's role is granted everything, and a walk that also touches analytics needs them. So the
+security centre had been written **inside the `analytics_reports` router builder**, whose
+`route_layer(require("analytics.read"))` reaches every route declared on it. `/security/overview`
+carried its own, correct `security.read` guard on the handler *and* an `analytics.read` guard it
+never declared: an account holding `security.read` and nothing else was refused with `403 this
+action requires the "analytics.read" permission` — on the screen whose entire purpose is to be
+readable by the person doing the diagnosing. A deployment granting the least would have found the
+security centre unreadable, and the natural response to that is to grant more. **A guard that is
+only ever satisfied is not a guard that was checked.** The group now has its own `Router::new()`
+and its own `merge`, and the comment states the rule for the next group added there.
+
+**A third defect, in a test, of the family this suite keeps finding.** The cancel walk asserted
+`select count(*) from backup_restore_jobs` — no `where` — in a database every suite in
+`apps/api/tests` shares. A row any other walk had left behind (a killed run, a concurrent suite)
+failed it with *"a refused queue wrote a row"*: a sentence about this tenant's refusals, read off
+the whole platform's table. It is now scoped to its own tenant. Same shape as the media-part leak
+one feature ago — a test that creates fixtures for exactly one organization cannot tell "the whole
+deployment" from "my own" apart.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| `omnion-backup --lib` | **153/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/api --test backups` | **26/26** over a live database, each walk run in its own process |
+| `apps/admin` `tsc --noEmit` | clean |
+| Load-bearing | the posture walk is **red** when the reader is reverted to counting any finished row, **green** on the fix |
+
+**The suite cannot be run as one process, and the reason is the suite's own design.**
+`cargo test -p omnion-api --test backups` in parallel gave **18 passed / 8 failed**; the same eight
+walks pass individually, and `--test-threads=1` hung in the ninth with a live process, no query
+outstanding, `not granted` locks 0 and a main thread in `futex`. Every walk builds a `Fixture`
+that **opens a scratch database per test**, and 26 of them at once exhaust the shared pool's
+`max_connections = 100` — the same finding the w5 loop recorded, one suite over. A contention
+failure that reports itself as `FAILED` with no panic message is the expensive kind: it reads as a
+product regression and sends the next tick hunting a defect that is not there. The pass that
+counts is 26 walks in 26 processes, and the number worth reporting is that, not the parallel one.
+
+**Next.** (a) The browser pass — the QA slot was held by a sibling for the whole tick, and the
+route list is longer than the 25 minutes the harness's own ceiling allows, so it needs the
+trimmed-route variant rather than a longer `timeout`. (b) The `partial`-run UI. (c) Slice 4,
+encryption.
+
+## Tick 75 — 2026-09-30 — REQ-012 slice 3 (rate limiting + lockout), plus the harness that had to be fixed to run it
+
+**What.** The security centre's two limiter screens (`/security/rate-limits`,
+`/security/sign-in-protection`) had never been opened by anything. Four commits:
+
+| Commit | Change |
+|---|---|
+| `1ded0b5c` | `--only` narrows a pass to named routes/depth passes; both screens walked on desktop and at 390px; the QA API now gets an `OMNION_CSRF_SECRET` |
+| `5ca68087` | a QA-slot holder file with two pids on one line deadlocked the pass queue |
+| `9e91f2c9` | the QA API could not reach its own database — a masked `***` password |
+| `669d584d` | the account lockout was unreachable behind the address lockout |
+| `25dddf5c` | a pass died when its click stream could not be written |
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/admin` `tsc --noEmit` | clean |
+| The lockout, measured | before: `403 address_blocked` x10, `429 rate_limited` x2, `users.failed_sign_in_count` = **0**, `locked_until` = never |
+| The slot deadlock | `reap` resolved `2332198 2332152` -> `2332152`, found it dead, freed the place |
+| The database credential | `psql` over TCP with the exact string `run.sh` hands the process returns `1` |
+| The click stream | `record()` against a missing directory warns once, keeps all 3 clicks |
+
+**The finding worth the tick.** The account lock and the address lock were compared against the
+**same number** (`lockout_attempts`). From one address the address rule therefore fired on the
+exact attempt that would have incremented the account counter, so the counter never moved, no
+account was ever locked, and the "currently locked accounts" table had no possible content. The
+module doc above `sign_in` states that the two dimensions exist for different reasons; the code
+gave them one value. The address threshold is now `lockout_attempts * 3`.
+
+**Three harness defects the pass had been hiding behind.**
+
+1. *The QA API had no `OMNION_CSRF_SECRET`.* Every cookie-authenticated write was refused with
+   `csrf_unavailable` before its handler ran — so every save, upload and backup in every pass
+   was recorded as a screen that "works" while the API answered 403 throughout. The refusal is
+   the documented behaviour of a deployment *without* a secret, which is why it read as the
+   product being correct.
+2. *The QA API's database password was `***`* — a masking artifact, committed long enough to
+   look deliberate. It survived a previous check because that check ran `docker exec psql`, which
+   uses the container's unix socket and never authenticates; the path that actually uses it (TCP
+   to `127.0.0.1:5433`) had never worked. Two paths, one of which nobody exercised.
+3. *The pass queue could not drain.* `reap()` handed a whole holder line to `kill -0`, which
+   wants one pid; a two-pid line answers false, so the place is judged ownerless -- reclaimed
+   while its owner walks, and unreclaimable by the owner whose trap then kills a string.
+
+**Next.** Re-run `--only=security` now that the harness survives its own failures; tick the boxes
+naming the two screens. Then REQ-013's `partial`-run UI, then REQ-012 slice 4 (IP access).
