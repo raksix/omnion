@@ -9799,3 +9799,60 @@ The CRM screens therefore remain un-observed and no line here claims otherwise.
 catalogue on REQ-008 (`commerce_products` in zero migrations across all nine worktrees). The
 dead-caller detector that found this, re-run across the CRM and workflows surfaces now that its
 two false-positive bugs are fixed, is the cheapest next defect-hunt on this branch.
+
+---
+
+## TICK 47 (2026-09-30) — the transform that was in the vocabulary and did nothing
+
+**What.** `scripts/qa/dead-callers.py` turned the branch's recurring signature defect into a
+committed report, and the report named a real one on its first honest run: `split_full_name`.
+
+**Proof.** `omnion-module-crm-intake --lib` **168/168**; `run-crm-name-split.sh` **5/5 and PROVEN
+TO FAIL at 3/5** with the split branch disabled — the three failures quote the defect verbatim
+(`left: Some("ada lovelace")`, `left: Some("ada   lovelace")`, `left: Some("ada")`) and the two
+survivors are the negative controls. Admin `tsc --noEmit` exit 0.
+
+**The defect.** The transform has been in `mapping::TRANSFORMS` since the module's first migration,
+validated by `is_transform`, offered by the mapping editor, and documented on the function as the
+answer to "a form with one name field is the common case". `apply_transforms` answered it with
+`value` — an identity — under a comment reading *"Unreachable: `apply` validates every name before
+running"*, which is true and irrelevant: validation asks whether the name is **known**, not whether
+the branch **does** anything. Every lead from every one-name form was written with the whole name in
+`first_name` and `last_name` NULL, and nothing failed — the surname is not in
+`crm_leads_contactable_check` and no screen renders the pair together.
+
+**Why twenty ticks of green found nothing.** `split_full_name_fills_both_halves` calls
+`split_full_name` **directly**. A test that calls the leaf proves the leaf works; only a test that
+goes through the entry point can say whether the leaf is *reached*. This is the same lesson as
+`run-move-reindex.sh` (a fixture performed away the only step under test), and it is worth stating
+as a rule: **a test whose subject is a callee is not a test of its caller.**
+
+**The rules the fix had to settle, because a two-output transform is the first one here.** The
+symmetric partner was written, measured and rejected — it stores `"ada lovelace"` as
+`last_name: Ada, first_name: Lovelace` on every lead, with nothing failing, which is the same defect
+with the halves swapped. `split_partner` is a constant; a split written against any other target is
+refused by name at both entry points, because `apply` is public and the save-time validation only
+runs on the two write paths. A split satisfies a required `last_name` without a line of its own
+(the plain "no line means unsatisfied" rule refused the exact mapping the split exists to express),
+and two lines writing one column are refused by name because `apply` resolves that by map insertion
+order — one name half the time, the other half the other time.
+
+**The detector, and its four false positives.** Candidates fell 665 → 497 → 59 → 40 across four
+fixes, and every drop was a bug in the detector rather than in the product: an O(lines²) test-region
+test (three-minute scans), `#[tokio::test]` and `tests/` files not recognised as test code, a plain
+block nested inside a test block popping the test marker, and functions passed **as values**
+(`permits(…, ProjectRole::can_run)`) reading as uncalled — which briefly reported the entire project
+capability matrix as dead, including `can_administer`, which is called in production at
+`projects.rs:1118`. **A detector for this defect class will report well-called functions; the only
+defence is having its false positives on record next to its findings**, which is why the script is
+committed with them in its docstring.
+
+**Not claimed.** No browser pass: the QA slot is held by w4's live pass (holder pid alive in
+`/tmp/omnion-qa-slot-holders`, cwd `/mnt/apopic/omnion-w4`) and the box rebooted mid-tick (uptime was
+~9 min, load 78 across ten writers). The CRM screens remain un-walked and no line here says
+otherwise. `cargo build -p omnion-api` was still compiling the dependency graph into a cold
+`/dev/shm/w8-target` when the slice was committed; the module and its own suite are green and the
+API build is left to the next tick rather than claimed here.
+
+**Next.** The same detector over `apps/admin` (TypeScript) is the obvious extension — the same
+signature defect in a language this one has never swept.
