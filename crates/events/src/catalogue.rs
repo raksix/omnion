@@ -413,6 +413,18 @@ catalogue! {
     "workflow.run.failed", "workflows", Reserved,
     "A workflow run stopped on a step that failed.",
     [("workflow_id", Uuid, req), ("run_id", Uuid, req), ("error", String, opt)];
+    // The AI workflow builder's own facts (docs/requests/REQ-046). `generated` rather than
+    // `created`, because the row is created before the provider is called and a receiver that
+    // subscribes to "created" would be told a draft exists before anybody can open it — the
+    // name the platform records is the one a person can act on. Identifiers only: never the
+    // prompt, never the definition, never a provider key.
+    "ai.workflow_draft.generated", "workflows", Live,
+    "A prompt became a generated workflow draft waiting for review.",
+    [("draft_id", Uuid, req), ("title", String, req), ("model_key", String, opt),
+     ("repaired", Boolean, opt), ("attempts", Integer, opt)];
+    "ai.workflow_draft.failed", "workflows", Live,
+    "A generation ran out of answers and the draft carries the reason.",
+    [("draft_id", Uuid, req), ("reason", String, req)];
 
     // ---- Webhooks ------------------------------------------------------------------------------
     "webhook.endpoint.created", "webhooks", Live,

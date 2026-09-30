@@ -70,6 +70,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
+pub mod ai_workflows;
 pub mod analytics;
 pub mod auth;
 pub mod automation;
@@ -803,6 +804,39 @@ pub fn router(state: AppState) -> Router {
     let ai_model = patch(ai::update_model).layer(guards::require(&state, "ai.providers.manage"));
 
     let ai_chat = post(ai::chat).layer(guards::require(&state, "ai.chat"));
+
+    // The AI workflow builder's console (docs/requests/REQ-046). The permission choices are
+    // borrowed rather than invented, and each one is a decision:
+    //
+    // * `workflows.read` for the list and the detail — a draft belongs to the workflow
+    //   surface, and an auditor who can read the rules that run must be able to read the
+    //   drafts that proposed them.
+    // * `ai.chat` for `generate` — it spends tokens, exactly as the chat route does, and a
+    //   new key would be carried by no role until an administrator visited the catalogue,
+    //   which silently means "nobody".
+    // * `workflows.manage` for the delete — a draft is an automation object and removing it is
+    //   an automation change.
+    let ai_workflow_drafts =
+        get(ai_workflows::list_drafts).layer(guards::require(&state, "workflows.read"));
+
+    let ai_workflow_generate =
+        post(ai_workflows::generate).layer(guards::require(&state, "ai.chat"));
+
+    let ai_workflow_authors = get(ai_workflows::list_authors)
+        .layer(guards::require(&state, "workflows.read"));
+
+    // The vocabulary the console renders itself from, and the empty state's prompts. `ai.chat`
+    // rather than `workflows.read` because the examples ARE generation prompts: showing them
+    // to somebody who cannot spend a generation hands out a button that answers 403.
+    let ai_workflow_examples =
+        get(ai_workflows::examples).layer(guards::require(&state, "ai.chat"));
+
+    let ai_workflow_draft = get(ai_workflows::get_draft)
+        .layer(guards::require(&state, "workflows.read"))
+        .merge(
+            delete(ai_workflows::delete_draft)
+                .layer(guards::require(&state, "workflows.manage")),
+        );
 
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
@@ -1573,6 +1607,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/models", ai_models)
         .route("/ai/models/{id}", ai_model)
         .route("/ai/chat", ai_chat)
+        .route("/ai/workflows/drafts", ai_workflow_drafts)
+        .route("/ai/workflows/generate", ai_workflow_generate)
+        .route("/ai/workflows/examples", ai_workflow_examples)
+        .route("/ai/workflows/drafts/authors", ai_workflow_authors)
+        .route("/ai/workflows/drafts/{id}", ai_workflow_draft)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)
