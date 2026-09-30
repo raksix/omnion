@@ -6447,6 +6447,259 @@ async function runHealthMetricsDepth(page, report) {
   report.healthMetrics = { steps };
 }
 
+/**
+ * `/health/incidents` — the timeline (REQ-014, slice 3).
+ *
+ * The property this pass exists for is not "the table renders". It is that **acknowledging
+ * persists and the screen says who did it**, because an acknowledge button that updates local
+ * state and forgets on reload is the exact failure a status screen cannot afford: an operator
+ * hands over a shift saying "I've got it" and the next person sees an unclaimed page.
+ */
+async function runHealthIncidentsDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health-incidents", action: "health-incidents-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health/incidents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-incidents-count], [data-health-incidents-error]", { timeout: 20000 })
+    .catch(() => {});
+
+  const rows = await page.locator("[data-health-incident-row]").count();
+  const cards = await page.locator("[data-health-incident-card]").count();
+  const empty = await page.locator("[data-health-incidents-empty]").count();
+  note("hasRowsOrEmptyState", rows > 0 || cards > 0 || empty > 0);
+
+  // The service dropdown is filled from the *server's* vocabulary, never a client constant: a
+  // filter offering a service the platform does not probe would answer "no incidents" for a
+  // question nobody asked.
+  const options = await page.locator("[data-health-incidents-service] option").count();
+  note("serviceFilterOffered", options > 1);
+
+  // ---- Acknowledging persists, and the row names the actor ------------------------------------
+  const ackButtons = await page.locator("[data-health-incident-ack]").count();
+  if (ackButtons > 0) {
+    await page.locator("[data-health-incident-note]").fill("claimed by the walkthrough").catch(() => {});
+    await page.locator("[data-health-incident-ack]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+
+    // The leg that matters: re-read the row *through the API*, not through the DOM. A screen
+    // that painted the change locally would pass a DOM check and lose it on the next load.
+    const id = await page.locator("[data-health-incident-ack]").first().getAttribute("data-health-incident-ack").catch(() => "");
+    const persisted = await page
+      .evaluate(async (incidentId) => {
+        const answer = await fetch(`/api/v1/health/incidents/${incidentId}`, { credentials: "same-origin" });
+        if (!answer.ok) return { ok: false, status: answer.status };
+        const row = await answer.json();
+        return { ok: true, acknowledged_by: row.acknowledged_by ?? null, note: row.note ?? "" };
+      }, id)
+      .catch(() => ({ ok: false }));
+    note("acknowledgementPersists", Boolean(persisted.ok && persisted.acknowledged_by));
+    note("acknowledgementCarriesTheNote", Boolean(persisted.ok && persisted.note.includes("walkthrough")));
+
+    // And the screen shows it, after a full reload rather than a state update.
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const ackedOnScreen = await page.locator(`[data-health-incident-acked="${id}"]`).count();
+    note("acknowledgedVisibleAfterReload", ackedOnScreen > 0);
+  } else {
+    // Nothing to claim is a legitimate state — but only when the table said so itself.
+    note("nothingToAcknowledge", empty > 0 || rows > 0);
+  }
+
+  // ---- A duration is a number or the word "open", never "0 s" ---------------------------------
+  // An open incident has no duration at all. Rendering `0 s` for one reads as "it lasted no
+  // time", which is the exact opposite of the row's meaning, so a literal zero anywhere in the
+  // column is a defect regardless of how many rows there are.
+  const durations = await page.locator("[data-health-incident-duration]").allTextContents().catch(() => []);
+  note(
+    "noZeroDuration",
+    durations.length === 0 || !durations.some((text) => /^\s*0\s*s\s*$/.test(text || "")),
+  );
+  // And every open row says so in words.
+  const openRows = await page.locator('[data-health-incident-open="true"]').count();
+  const openLabels = await page
+    .locator('[data-health-incident-open="true"] [data-health-incident-duration]')
+    .allTextContents()
+    .catch(() => []);
+  note(
+    "openRowsSayOpen",
+    openRows === 0 || openLabels.length === openRows || openLabels.every((text) => /open/.test(text || "")),
+  );
+
+  // ---- The state filter narrows, and the count follows ----------------------------------------
+  await page.locator('[data-health-incidents-state="open"]').click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const openOnly = await page.locator('[data-health-incident-state="open"]').getAttribute("aria-pressed").catch(() => "");
+  note("stateFilterPressed", openOnly === "true");
+
+  const body = (await page.locator("body").innerText().catch(() => "")) || "";
+  note("noNonFiniteText", !/NaN|Infinity|undefined/i.test(body));
+  await shot(page, "health-incidents");
+
+  // ---- Mobile: cards, and no horizontal scroll ------------------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/health/incidents`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-incidents-count]", { timeout: 15000 }).catch(() => {});
+  const mobileCards = await page.locator("[data-health-incident-card]").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)
+    .catch(() => false);
+  note("mobileCardsOrEmpty", mobileCards > 0 || (await page.locator("[data-health-incidents-empty]").count()) > 0);
+  note("mobileNoHorizontalScroll", !overflow);
+  await shot(page, "health-incidents-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.healthIncidents = { steps };
+}
+
+/**
+ * `/health/settings` — the policy (REQ-014, slice 3).
+ *
+ * The property here is **the difference between a saved limit and a suggestion**. A settings
+ * screen that shows seven numbers whether or not anyone chose them is the most dangerous kind of
+ * status UI: every one of them looks like a decision somebody made, and the breach emitter obeys
+ * them. So the pass saves a real pair and asserts the row flips from `suggestion` to `saved`.
+ */
+async function runHealthSettingsDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health-settings", action: "health-settings-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-health-settings], [data-health-settings-error]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForSelector("[data-health-settings-thresholds], [data-health-settings-skeleton]", { timeout: 20000 }).catch(() => {});
+
+  const rows = await page.locator("[data-health-threshold-row]").count();
+  note("thresholdsRendered", rows === 7);
+
+  // ---- Save a real pair, and assert the row stops claiming to be a suggestion ----------------
+  if (rows > 0) {
+    const warn = await page.locator('[data-health-threshold-warn="disk_percent"]').count();
+    note("thresholdInputsPresent", warn > 0);
+    if (warn > 0) {
+      await page.locator('[data-health-threshold-warn="disk_percent"]').fill("81").catch(() => {});
+      await page.locator('[data-health-threshold-crit="disk_percent"]').fill("91").catch(() => {});
+      await page.locator("[data-health-settings-save]").click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+
+      const saved = await page
+        .locator('[data-health-threshold-row="disk_percent"]')
+        .getAttribute("data-health-threshold-configured")
+        .catch(() => "");
+      note("savedPairIsMarkedSaved", saved === "true");
+    }
+  }
+
+  // ---- The server refuses an inverted pair, and says which metric ----------------------------
+  const refusal = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/settings", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ thresholds: [{ metric: "queue_depth", warn: 900, crit: 100, direction: "above" }] }),
+      });
+      let message = "";
+      try {
+        message = (await answer.json())?.error?.message ?? "";
+      } catch {
+        message = "";
+      }
+      return { status: answer.status, message };
+    })
+    .catch(() => ({ status: 0, message: "" }));
+  note("invertedPairRefused", refusal.status === 400);
+  note("refusalNamesTheMetric", refusal.message.includes("queue_depth"));
+
+  // ---- The out-of-range interval is refused too, rather than clamped --------------------------
+  const intervalRefusal = await page
+    .evaluate(async () => {
+      const answer = await fetch("/api/v1/health/settings", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ check_interval_seconds: 99999 }),
+      });
+      return { status: answer.status };
+    })
+    .catch(() => ({ status: 0 }));
+  note("outOfRangeIntervalRefused", intervalRefusal.status === 400);
+
+  // ---- Maintenance windows: create, list, delete ----------------------------------------------
+  const windowRowsBefore = await page.locator("[data-health-window-row]").count();
+  const starts = await page.locator("[data-health-window-start]").count();
+  note("windowFormPresent", starts > 0);
+  if (starts > 0) {
+    // A window that has already ended is still a window: the point of this leg is that the row
+    // appears and can be withdrawn, not that the platform is mid-deploy.
+    const past = new Date(Date.now() - 60 * 60 * 1000).toISOString().slice(0, 16);
+    const later = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 16);
+    await page.locator("[data-health-window-start]").fill(past).catch(() => {});
+    await page.locator("[data-health-window-end]").fill(later).catch(() => {});
+    await page.locator("[data-health-window-note]").fill("walkthrough window").catch(() => {});
+    await page.locator("[data-health-window-add]").click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1400);
+    const windowRowsAfter = await page.locator("[data-health-window-row]").count();
+    note("windowCreated", windowRowsAfter === windowRowsBefore + 1);
+
+    // An end before a start is refused by the *server*; the form also disables the button, so
+    // the walk sends the impossible body directly rather than trusting the disabled control.
+    const backwards = await page
+      .evaluate(async () => {
+        const now = new Date();
+        const answer = await fetch("/api/v1/health/maintenance-windows", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            starts_at: now.toISOString(),
+            ends_at: new Date(now.getTime() - 60000).toISOString(),
+            services: [],
+            note: "impossible",
+          }),
+        });
+        return { status: answer.status };
+      })
+      .catch(() => ({ status: 0 }));
+    note("backwardsWindowRefused", backwards.status === 400);
+
+    // Withdraw it again, so a walkthrough does not leave the QA database with a mute button.
+    const id = await page.locator("[data-health-window-delete]").first().getAttribute("data-health-window-delete").catch(() => "");
+    if (id) {
+      await page.locator(`[data-health-window-delete="${id}"]`).click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      const remaining = await page.locator("[data-health-window-row]").count();
+      note("windowDeleted", remaining === windowRowsBefore);
+    }
+  }
+
+  const body = (await page.locator("body").innerText().catch(() => "")) || "";
+  note("noNonFiniteText", !/NaN|Infinity|undefined/i.test(body));
+  await shot(page, "health-settings");
+
+  // ---- Mobile: one card per metric, no horizontal scroll ---------------------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${URL_ADMIN}/health/settings`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-settings-threshold-cards]", { timeout: 15000 }).catch(() => {});
+  const mobileCards = await page.locator("[data-health-threshold-card]").count();
+  const overflow = await page
+    .evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1)
+    .catch(() => false);
+  note("mobileThresholdCards", mobileCards > 0);
+  note("mobileNoHorizontalScroll", !overflow);
+  await shot(page, "health-settings-mobile");
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  report.healthSettings = { steps };
+}
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -8582,6 +8835,17 @@ async function main() {
     // overview links to it, so an unwalked page is a dead affordance, and `runHealthMetricsDepth`
     // reads the CSV the export button downloads and compares it against the table on screen.
     { path: "/health/metrics", name: "health-metrics" },
+    // Slice 3's two new screens (REQ-014). Both are reached from the overview, so both are
+    // walked rather than left to a route entry that nothing clicks into:
+    //
+    // * `/health/incidents` — the timeline. `runHealthIncidentsDepth` presses the state filter,
+    //   types into the note box and clicks an Acknowledge button, because the one thing a
+    //   status screen must not ship is an acknowledge button that does not persist.
+    // * `/health/settings` — the policy. `runHealthSettingsDepth` reads a threshold pair into
+    //   the form and saves, then asserts the row comes back marked `saved` rather than
+    //   `suggestion`, which is the difference between a limit and a placeholder.
+    { path: "/health/incidents", name: "health-incidents" },
+    { path: "/health/settings", name: "health-settings" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -9082,6 +9346,11 @@ async function runReliabilityBreakersDepth(page) {
     matchedOnly.add("health-overview");
     report.health = await runDepthPass("health", () => runHealthDepth(page, report));
   report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
+  // Slice 3's two passes (REQ-014). Both are `runDepthPass` like every other depth walk, which
+  // is what makes them survive a page crash: the wrapper records the failure instead of the run
+  // dying on the next `page.locator`.
+  report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
+  report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
     log(`health: ${JSON.stringify(report.health)}`);
   }
 

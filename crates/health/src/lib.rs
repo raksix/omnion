@@ -62,6 +62,7 @@
 
 pub mod error;
 pub mod history;
+pub mod incidents;
 pub mod model;
 pub mod probes;
 pub mod registry;
@@ -72,6 +73,14 @@ pub use error::{HealthError, Result};
 pub use history::{
     CSV_HEADER, DEFAULT_RANGE, MetricSummary, RANGE_KEYS, Range, RollupDay, daily_rollup,
     metric_summaries, sparkline_values, summaries_to_csv,
+};
+pub use incidents::{
+    BreachCheck, BREACH_WINDOW_SECONDS, HealthSettings, Incident, IncidentFilter, IncidentOutcome,
+    IncidentPage, MAX_CHECK_INTERVAL_SECONDS, MAX_WORKER_STALE_SECONDS,
+    MIN_CHECK_INTERVAL_SECONDS, MIN_WORKER_STALE_SECONDS, SettingsUpdate, THRESHOLD_METRICS,
+    Threshold, Thresholds, Transition, acknowledge, apply, breach_count, breach_window, clear_breach,
+    detect, incident, is_suppressed, list_incidents, load_settings, metric_unit, open_incident,
+    parse_thresholds, record_breach, resolve, save_settings, suggested_thresholds, thresholds,
 };
 pub use model::{
     CheckDescription, HealthBanner, HealthOverview, HostMetric, NewSample, Sample, ServiceReport,
