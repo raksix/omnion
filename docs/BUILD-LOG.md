@@ -7524,3 +7524,39 @@ because twelve walks serialise on a `tokio::sync::Mutex` and the whole suite as 
 module's own `PricedLine.tax_amount`: the detail read recomputes it from `line_total` while the
 writer stored it, and those two have to be the same number — the PDF arrives in slice 3 or 4 and
 will be the first place anybody notices if they are not.
+
+**Where this ended, since the tick's own first draft of this section is now behind it.** The suite
+was built and run rather than left committed-and-unproven, and it found what that shape of defect
+always finds: **0/18 on the first real run**, then 12/18, then 17/18. Eight defects, and they divide
+into two families worth keeping apart.
+
+*The ones a real database could see and a compiler never would.* `accounting_invoices` has **no
+`customer_name` column** — 0167 gave the invoice `company_id` and `contact_id` and nothing to print,
+so every create answered 500. Migration `0171` (the union high-water across all ten worktrees was
+0170) adds it, with the rule it encodes stated in the file: **the CRM owns the current name, the
+invoice owns the name it was issued under**, or renaming a company rewrites a document the customer
+already received. And `crm_contacts` has `first_name` and `last_name`, **not** a `full_name` column —
+both joins and the search predicate named a column that has never existed in this repository.
+
+*The ones I introduced while fixing the first kind.* `gross_of` was `net + tax + discount` where the
+gross is `net + discount`, so a 100.00 line at 20% reported a **subtotal of 120.00** — a figure no
+line on the invoice carries. That one is worth naming twice: it was introduced **while replacing a
+back-solve**, which is the dangerous moment, because a fix that rewrites arithmetic carries whatever
+the writer had wrong into the new code. A converted invoice also had no customer (the order row
+already spells one, and asking the caller to re-type it is a second source of truth), the second-send
+refusal said "already Sent" and stopped rather than naming void-and-duplicate as its own docs
+promise, a test helper built `/invoices&overdue_only=true` with no `?` and got a 404 that read like
+a product defect, and one assertion compared `tax_percent` to the string the **form** typed (`20`)
+rather than the string the column holds (`20.00`).
+
+**Final state, stated exactly.** `cargo test -p omnion-module-accounting --lib` **32/32**;
+`cargo build -p omnion-api` green; the invoice suite reached **17/18 against a live PostgreSQL**, and
+the eighteenth was the `tax_percent` assertion — fixed in `edf65fd0` and **not yet re-run**. The box
+deleted this worktree's `target/` **five times** during the tick and the root filesystem went to
+100% and then to `os error 28`, so the last confirmation could not be executed. That is an
+environment fact and not a code blocker: every fix is committed, pushed, and one assertion short of
+green.
+
+**Next tick, first command.** `bash scripts/qa/target-guard.sh`, then rebuild and run
+`apps/api/tests/accounting_invoices` against a fresh `omnion_t_inv` database, **one test at a time
+with `--test-threads=1`**. Then the invoice screens and the walkthrough routes, then the PDF.
