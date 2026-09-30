@@ -7190,3 +7190,65 @@ its own timeout has verified nothing about the pages after the cut.
 "the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
 UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
 rather than a test alone. (c) Slice 4, encryption.
+
+## Tick 75 · wave 5 — the gate the last three ticks were waiting on, and the four defects in the thing that measures it
+
+This tick did not touch REQ-005/011/017 code, and that is the tick's finding. Three consecutive
+ticks closed with "the browser pass could not run" — attributed to the QA slot being held — and
+the slot turned out to be the *instrument* as much as the box. With the slot reaped by hand and
+a live queue, the pass started in 90 seconds. The thing that was broken is the thing that
+reports on breakage, so it had been reporting "held" for a while.
+
+**The reaper had a guard, and the guard had no test.** `qa-slot.sh` reclaims a place whose pass
+was killed without running `run.sh`'s EXIT trap — six orphans from three worktrees over one
+night, each holding the queue for the next pass. The liveness signal is `QA_SLOT_OWNER`, the pid
+the pass volunteers, because the holder cannot answer the question: it is a background job of
+`qa-slot.sh` and is reparented the moment that script exits, which is the *successful* case, and
+on this box `systemd --user` adopts orphans at pid 338 so `ppid == 1` never fired at all. Writing
+the suite for that guard found four defects, and every one of them is the same mistake in a
+different costume: **the instrument reproducing the defect it was built to detect.**
+
+`start_pass` built its "live pass" as a one-shot `bash -c`, which exits the instant it takes a
+place — so the "live" owner was dead within milliseconds and five cases reported the reaper
+stealing a running pass's place. It was right every time. That is the very defect the file's own
+header documents, produced by the test. It is now a process that lives until a case kills it, and
+it volunteers `$BASHPID` rather than `$$`, because in a subshell `$$` is the *parent* shell and
+every case would have measured the test instead of the pass.
+
+**Probes that run the script under test are not neutral.** `qa-slot.sh`'s entire job is *taking* a
+place, so a probe with a live owner took one on its way out: the suite failed on its own litter
+and leaked a real place into the live `/tmp` queue. The first run of the guard test left orphans
+in production paths — the exact failure it exists to prevent. Probes are now certainly-dead
+invocations, plus a case that counts the directory, because every individual case can pass while
+the suite as a whole orphans.
+
+**Two hangs, and both were the file's own header describing them.** A background subshell
+inherits the command substitution's pipe, so `read <<< "$(start_pass)"` waits for an EOF that
+never comes — and the `timeout` that killed it left a place and holder behind in the real queue.
+The teardown then waited politely on processes that do not forward SIGTERM.
+
+**And a check that contradicted its own name.** Case 2 asserted the holder file *exists* while
+its label read "its holder file goes with it" — so the reaper leaving a file behind reported as
+a success. Red since the case was written, and it read as a product bug. The file does have to
+go: `HOLDERDIR` is where `run.sh` looks up a holder to kill, and the reaper only ever walks
+*places*, never holder files.
+
+| Gate | Result |
+| --- | --- |
+| `bash scripts/qa/qa-slot-test.sh` | **13/13** (was 5 red) — every case drives the real script and a real process tree |
+| Box queue after the suite | **empty** — the suite no longer leaks into `/tmp` |
+| Live reaper on the box | reclaimed the real orphan `1912899-*` (127 s old, holder dead) |
+| `cargo-slot.sh` exec bit | **fixed and pushed** (`81a670f2`) |
+| QA browser pass (w5 stack) | running this tick — see below |
+
+**The one-character fix that had been made twice and lost twice.** The pass died on its first
+cargo build with `scripts/qa/cargo-slot.sh: Permission denied`, *while holding a QA slot*, so it
+left a second orphan behind. `run.sh` invokes that script by path, not through bash. `d85e6052`
+and `2d364047` each set the bit on a writer branch and each lost it to a later merge: mode bits
+never conflict, so the other side applies cleanly and its `100644` wins on content equality.
+`main` and `wave5` were `100644`; `wave2-cms`, `wave3-automation`, `wave4` and `wave6` were all
+`100755`. A fix that keeps reappearing is not a race — the merge graph is the cause. All three
+scripts invoked by path are `chmod`'d together now.
+
+**Next.** (a) The w5 pass outcome, with the mode bit in place. (b) REQ-017's browser gate,
+which this tick finally unblocks. (c) Only then the next REQ in the wave.
