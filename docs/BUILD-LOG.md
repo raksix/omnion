@@ -8722,3 +8722,52 @@ mechanism.
 
 **Next.** Run the queued browser pass and tick the mobile/empty/loading boxes on what it proves;
 then the ⌘K / global-search box and the audit-row assertion. PDF export stays deliberately unbuilt.
+
+## Tick 44 — REQ-051: the keyboard contract, and the two screens that had none of it
+
+**What.** `/crm/activities` and `/crm/leads` answered none of the keys the module's shared shortcut
+sheet advertises. Both draw their own rows rather than rendering `CrmShell`, and the bindings were
+written out **inside** the shell — so the sheet (`crm-parts.tsx`, printing `/`, `j`/`k`, `Enter`,
+`e`, `n`, `g then …`, `?`) was a claim about the section that was false for two of its six screens.
+The fix is structural rather than additive: the contract becomes `useCrmKeyboard`, `CrmShell`
+consumes it, and a screen with its own frame calls the same hook, so the two paths cannot drift.
+`CrmShortcutSheet` and `crmListItemCursor` come out of the frame for the same reason.
+
+**Why it is not a cosmetic refactor.** `Enter`/`e` answer *this screen's* question. On the activity
+feed they open the record the activity is about (contact → company → deal); on the lead inbox they
+open the record the submission became (contact → deal → company), keyed by the **event id**, because
+the inbox is the bus's log and a uuid there would resolve to nothing. Where there is no record the
+screen says so in a sentence: a free-standing note, and a submission that became *nothing*, are
+exactly the rows this inbox exists to explain. The leads inbox also loses its local `/` binding
+(now the module's) and keeps Escape, which the hook deliberately does not own.
+
+**Proof.** `cargo test -p omnion-module-crm --lib` **172/172** · `pnpm turbo run typecheck`
+**2/2** · `node --check scripts/qa/walkthrough.cjs` OK · the module builds clean with
+`CARGO_INCREMENTAL=0`. The browser leg is written (`19ae394b`) and **has not run**.
+
+**Not run, and why.** `/mnt/apopic` reached 100% (92 MB free) at load 86–93; that is what killed the
+queued accounting pass, not a defect in it. Reclaiming **my own** cold build cache — `lsof +D`
+empty and no writes in 30 minutes on both `omnion-w4-target` and `/dev/shm/w4-target` — freed
+7.8 GB of `/dev/shm` and 1.9 GB of `/mnt/apopic`, which is 97% now. A sibling writer's pass still
+holds the single QA slot, so the keyboard leg is queued rather than barged for.
+
+**Next.** Run the browser pass and read the new keyboard leg plus the 390×844 box on what it proves.
+
+### Lessons
+
+1. **A shared claim is only as true as its narrowest consumer.** The shortcut sheet was one list in
+   one file, so it looked module-wide; the bindings behind it lived in a component two of six
+   screens never render. When a spec says "the section", grep which screens *actually* mount the
+   thing that serves it — not the screens that exist.
+2. **`grep -c 'keyboard={{'` across the section's screens found the defect in one command.** The
+   pass already pressed `e` on four screens; the two it missed were exactly the two without a
+   binding. A per-screen contract check has to be per-screen, and the enumeration comes first.
+3. **Extracting a hook is a mechanical edit that will still find you with three ordering bugs** —
+   a `const` used above its declaration, a setter the caller can no longer reach, and a wrapper
+   re-derived by two callers. `tsc --noEmit` caught all three; `git checkout --` on the file first,
+   because a botched index-slicing rewrite silently duplicated 300 lines and still *looked* right.
+4. **An empty database is not a broken screen.** Every new step leaves itself **unset** when the
+   list has no rows. A step that reports `false` because there was nothing to press trains people to
+   ignore it.
+5. **Disk, again.** Ten writers at load 90+ means a queue, not a stall — and the failure looks like
+   a timeout. Reclaim only your own cold cache (`lsof +D` + `find -newermt`), never a sibling's.
