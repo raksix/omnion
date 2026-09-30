@@ -707,26 +707,56 @@ async fn copy_area_once(
             // so bounding it is what bounds the area. A site with 50 000 translation rows is the
             // shape this batching was written for — the page area's own count is a fraction of
             // the real work in a translated site.
+            //
+            // The `is null or` in the window clause is the same fix the pages arm needed and the
+            // one this arm was missing: `t.id > $3` with a NULL `$3` is NULL — neither true nor
+            // false — so the first and only batch of a site with fewer translations than the
+            // batch size copied nothing and the job reported `done`. All three heavy areas are
+            // fixed together, or the fourth one becomes next week's bug report.
+            //
+            // **And the `resource_id` is remapped, not copied.** That is a second, independent
+            // defect, and it is the one that kept the translation count at zero even after the
+            // window was right.
+            //
+            // The page arm mints a **fresh id** per staging page (migration 0148: a shared id
+            // would make a revision, a translation and an analytics row ambiguous across
+            // environments), so the production `resource_id` this row carries names a page that
+            // does not exist in staging. The revision statements above already solve the same
+            // problem by joining on the natural key `(site_id, slug)`; this one now does the
+            // same, which is what makes a staging translation a translation *of the staging
+            // page* rather than a row pointing back at production.
+            //
+            // Copying the id verbatim was not neutral either: it passed `on conflict do nothing`
+            // by being a genuinely new `(resource_id, environment_id)` pair, so nothing failed
+            // and nothing warned. The row was simply attached to nothing — and the one walk in
+            // the repo that ever asserted a translation landed found it.
             let clause = match bound {
                 Some(_) => "and t.id > $3 and t.id <= $4",
-                None => "and $3::uuid is not null and t.id > $3 and t.id <= $4",
+                None => "and ($3::uuid is null or t.id > $3) and t.id <= $4",
             };
-            sqlx::query(&format!(
+            let copied = sqlx::query(&format!(
                 "insert into translations (id, organization_id, resource_type, resource_id, language, \
                      field, value, created_by, created_at, updated_at, environment_id) \
-                 select gen_random_uuid(), t.organization_id, t.resource_type, t.resource_id, t.language, t.field, \
+                 select gen_random_uuid(), t.organization_id, t.resource_type, dst.id, t.language, t.field, \
                         t.value, t.created_by, t.created_at, t.updated_at, $2 \
-                 from translations t where t.environment_id = $1 {clause} \
-                 on conflict (resource_type, resource_id, environment_id, language, field) do nothing"
+                 from translations t \
+                 join pages src on src.id = t.resource_id and src.environment_id = $1 \
+                 join pages dst on dst.site_id = src.site_id \
+                               and dst.environment_id = $2 \
+                               and dst.slug = src.slug \
+                 where t.environment_id = $1 {clause} \
+                 on conflict (resource_type, resource_id, environment_id, language, field) do nothing \
+                 returning id"
             ))
             .bind(source)
             .bind(target)
             .bind(bound.map(|w| w.after))
             .bind(bound.map(|w| w.through))
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await
             .map_err(store_err)?
-            .rows_affected()
+            .len() as u64;
+            copied
         }
         // Menus and site settings are the same table in this platform, and copying both areas
         // would insert the same rows twice. The second one is therefore a no-op that reports
@@ -749,9 +779,13 @@ async fn copy_area_once(
             // request's data model: this table has `trigger_kind`/`steps`, not `key`/`definition`,
             // and a copy statement written from a spec's nouns fails on the first run with a
             // column error that names the column rather than the mismatch.
+            // Same shape as the translations arm above, and the same reason: this arm kept the
+            // `w.id > $3` form, so a site with fewer workflow definitions than the batch size
+            // copied none of them and the job reported `done`. The three heavy areas are fixed
+            // together or the fourth one is a bug report.
             let clause = match bound {
                 Some(_) => "and w.id > $3 and w.id <= $4",
-                None => "and $3::uuid is not null and w.id > $3 and w.id <= $4",
+                None => "and ($3::uuid is null or w.id > $3) and w.id <= $4",
             };
             sqlx::query(&format!(
                 "insert into workflows (id, organization_id, site_id, name, description, enabled, \

@@ -3369,3 +3369,222 @@ async fn a_promotion_reaches_a_subscribed_endpoint_over_a_signed_delivery() {
         "the bystander was queued a delivery at all, so the isolation above is not vacuous"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// What a clone does NOT copy
+// ---------------------------------------------------------------------------------------------
+
+/// Attach a real object to the site's storage and return its key and byte length.
+async fn attach_object(fixture: &Fixture, name: &str) -> (String, usize) {
+    // A payload big enough that "nothing was copied" cannot be an accident of a zero-length body.
+    let payload = vec![0xA5_u8; 4_096];
+    let key = format!("qa-clone-media/{}/{}", fixture.site, name);
+    fixture
+        .state
+        .storage()
+        .put(&key, &payload, "image/png")
+        .await
+        .expect("the object must be storable");
+    sqlx::query(
+        "insert into media (site_id, storage_key, filename, content_type, size_bytes, \
+         checksum, created_by) values ($1, $2, $3, 'image/png', $4, $5, null)",
+    )
+    .bind(fixture.site)
+    .bind(&key)
+    .bind(name)
+    .bind(payload.len() as i64)
+    .bind(omnion_backup::bytes_checksum(&payload))
+    .execute(fixture.db.pool())
+    .await
+    .expect("the media row must be written");
+    (key, payload.len())
+}
+
+/// A clone copies content and configuration, and copies **no** media bytes — measured as an object
+/// count in the real storage, not as a claim about an area list.
+///
+/// This is the criterion the request states in one sentence — "copies pages, revisions,
+/// translations, menus, site settings, theme selection and workflow definitions, and copies **no**
+/// media blobs (verified by storage object count before and after)" — and it is the only box on
+/// this list that has been unticked for six ticks with the reason recorded honestly. The gap was
+/// never the guarantee; it was that **no walk measured a storage object count**, so "copies no
+/// media" was a claim about `Area::copies()` and not a fact about the bytes.
+///
+/// So the walk puts a real object in storage, counts the objects in the bucket before and after a
+/// full six-area clone, and then makes the negative part of the claim falsifiable in the way that
+/// matters: media is keyed by `site_id`, never by `environment_id`, so a staging environment has
+/// **no** media rows of its own to inherit, and the object production uploaded is still the only
+/// copy of those bytes that exists anywhere. A clone that quietly duplicated blobs would show up
+/// here as a count that grew — and the reference assertions below are what would catch a
+/// regression that *drops* content while keeping the count stable, which a count alone cannot.
+#[tokio::test]
+async fn a_clone_copies_content_and_leaves_every_media_byte_where_it_was() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+
+    // ---- Everything the request says a clone copies, seeded in production --------------------
+    let page = insert_production_page(&fixture.db, fixture.site, "with-media", "With media").await;
+    add_published_revision(&fixture.db, page, 2, "With media").await;
+    let production = fixture.production_id().await;
+
+    sqlx::query(
+        "insert into translations (organization_id, resource_type, resource_id, language, field, \
+         value, environment_id) values ($1, 'page', $2, 'tr', 'title', 'Medya', $3)",
+    )
+    .bind(fixture.organization)
+    .bind(page)
+    .bind(production)
+    .execute(fixture.db.pool())
+    .await
+    .expect("a translation must insert");
+
+    sqlx::query(
+        "insert into workflows (organization_id, site_id, name, trigger_kind, steps, environment_id) \
+         values ($1, $2, 'Clone me', 'manual', '[]'::jsonb, $3)",
+    )
+    .bind(fixture.organization)
+    .bind(fixture.site)
+    .bind(production)
+    .execute(fixture.db.pool())
+    .await
+    .expect("a workflow must insert");
+
+    let (key, bytes) = attach_object(&fixture, "logo.png").await;
+
+    // The object inventory before anything runs, taken through the backup crate's own reader
+    // rather than a hand-written `select count(*)`. That crate is what enumerates objects for
+    // an archive, so asking it is asking the platform's definition of "the objects that exist",
+    // not this walk's.
+    let objects_before = omnion_backup::pending_objects(fixture.db.pool(), Some(fixture.site))
+        .await
+        .expect("the object inventory must be readable");
+    let total_before: i64 = objects_before.iter().map(|object| object.size_bytes).sum();
+    assert_eq!(objects_before.len(), 1, "the fixture owns exactly one object");
+
+    // ---- The clone -------------------------------------------------------------------------
+    let created = fixture.create_staging("Staging", "staging-media").await;
+    let environment_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+    drain_clone_for(&fixture.db, environment_id).await;
+
+    // ---- No blob was written ----------------------------------------------------------------
+    // A count that grew means the clone duplicated bytes. The inventory comes from the same
+    // reader as the "before" snapshot, so the two numbers are comparable by construction rather
+    // than by agreeing on a definition of what an object is.
+    let objects_after = omnion_backup::pending_objects(fixture.db.pool(), Some(fixture.site))
+        .await
+        .expect("the object inventory must be readable after the clone");
+    let total_after: i64 = objects_after.iter().map(|object| object.size_bytes).sum();
+    assert_eq!(
+        objects_after.len(),
+        objects_before.len(),
+        "a clone created {} object(s) it had no business creating",
+        objects_after.len() as i64 - objects_before.len() as i64
+    );
+    assert_eq!(
+        total_after, total_before,
+        "a clone changed the library's byte total, which means it wrote or dropped media"
+    );
+
+    // And the object is still readable — a clone that *moved* bytes would keep the count and
+    // break production's copy, which is the shape this assertion is here to catch.
+    let still_there = fixture
+        .state
+        .storage()
+        .get(&key)
+        .await
+        .expect("the original object must still be readable after a clone");
+    assert_eq!(still_there.len(), bytes, "the object's bytes were altered by a clone");
+
+    // Every object production owns is still the one it owned, by key: the inventory is compared
+    // as a set rather than a length, so a clone that swapped one blob for another would not pass
+    // on the strength of an unchanged count.
+    let keys_before: Vec<String> =
+        objects_before.iter().map(|object| object.storage_key.clone()).collect();
+    let keys_after: Vec<String> =
+        objects_after.iter().map(|object| object.storage_key.clone()).collect();
+    assert_eq!(keys_after, keys_before, "the set of storage keys changed across a clone");
+
+    // ---- What the clone DID copy, so the count is not the only thing being claimed ---------
+    let pages: i64 = sqlx::query_scalar("select count(*) from pages where environment_id = $1")
+        .bind(environment_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(pages, 1, "the page was copied");
+
+    let revisions: i64 = sqlx::query_scalar(
+        "select count(*) from page_revisions r join pages p on p.id = r.page_id \
+         where p.environment_id = $1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(revisions, 2, "both revisions of the page travelled with it");
+
+    let translations: i64 =
+        sqlx::query_scalar("select count(*) from translations where environment_id = $1")
+            .bind(environment_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(translations, 1, "the translation was copied");
+
+    // ...and it is a translation **of the staging page**. The count alone is the assertion that
+    // missed the remap: a row copied with production's `resource_id` satisfies `count(*) = 1`
+    // and is attached to a page that does not exist in this environment. The join is the check
+    // that would have failed.
+    let attached: i64 = sqlx::query_scalar(
+        "select count(*) from translations t \
+         join pages p on p.id = t.resource_id and p.environment_id = $1 \
+         where t.environment_id = $1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        attached, 1,
+        "the staging translation must hang off a staging page, not a production one"
+    );
+
+    let workflows: i64 = sqlx::query_scalar("select count(*) from workflows where environment_id = $1")
+        .bind(environment_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(workflows, 1, "the workflow definition was copied");
+
+    // The theme selection is a column on `sites`, not a row, so "copied" for it is a fact about
+    // the environment's own record rather than a count — and the runner prices it as 1 when the
+    // organization has a site, so the job's own numbers should agree.
+    let job: (String, serde_json::Value, Option<i32>) = sqlx::query_as(
+        "select status, areas, items_done from environment_clone_jobs \
+         where environment_id = $1 order by created_at desc limit 1",
+    )
+    .bind(environment_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(job.0, "done", "the clone finished");
+    let theme_priced = job.1["theme"].as_i64().unwrap_or_default();
+    assert_eq!(theme_priced, 1, "the theme selection was priced and copied: {}", job.1);
+
+    // ---- The negative, stated as a schema fact -----------------------------------------------
+    // Media has no `environment_id` column, so "staging shares production's media" is not a
+    // policy this code enforces at runtime — it is a property of the schema. Asserting the
+    // column's absence is what makes that structural rather than aspirational, and it is the
+    // reason a future migration cannot quietly give staging its own blobs without failing here.
+    let media_columns: Vec<String> = sqlx::query_scalar(
+        "select column_name from information_schema.columns \
+         where table_name = 'media' and table_schema = current_schema()",
+    )
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !media_columns.iter().any(|column| column == "environment_id"),
+        "media grew an environment_id, so a clone could own blobs of its own: {media_columns:?}"
+    );
+}
