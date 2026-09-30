@@ -347,6 +347,13 @@ pub async fn execute_with_sink(
     // Everything else follows the engine's status, and the error text is the engine's own: a run
     // that failed carries the provider's complaint, and a run that was stopped carries nothing
     // (a person pressing stop is not an error message).
+    //
+    // The open steps are closed **before** the run row is written, and only for a run that has
+    // actually ended. A run parked on an approval deliberately leaves its step `running`: that is
+    // the state `resume_point` reads as "a tool may already have fired", and a parked run is
+    // exactly the case where that question is open. `finish_run` recomputes the run's totals from
+    // its *completed* steps, so closing them first is what makes the stored numbers equal the
+    // recomputed ones the panel shows next to them.
     if outcome.status == "awaiting_approval" {
         let _ = run_store::park_run(
             pool,
@@ -355,6 +362,7 @@ pub async fn execute_with_sink(
         )
         .await;
     } else {
+        let _ = run_store::close_open_steps(pool, run.id).await;
         let status = StepStatus::parse(&outcome.status).unwrap_or(StepStatus::Failed);
         // A run that stopped because somebody pressed stop carries no error text: the reason
         // `cancelled` already says it, and an `error` column on a deliberate stop is what makes a

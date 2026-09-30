@@ -616,24 +616,22 @@ async fn a_cancelled_run_is_told_to_stop_while_it_is_still_running() {
 
     // And the partial trace is still on disk — a stopped run's steps are what the person reads.
     //
-    // Asserted against what `begin_step` actually writes, not against the shape I assumed: the
-    // persister hands the whole event to `arguments` and leaves the step `running`, because a
-    // cancelled run's steps are closed by the runner's `finish_run` and the trace screen is what
-    // decides how to render them. The tool lives inside the payload; `tool` stays null.
+    // A cancelled run's step is left `running` on purpose: the loop stopped between steps, so
+    // the step it had begun did not finish, and `resume_point` reads exactly that as "this tool
+    // may already have fired". Closing it here would be the runner's decision to make, not the
+    // persister's, and it is made in `close_open_steps` when the run's outcome is known.
     let steps = list_steps(&store.pool, run.id)
         .await
         .expect("read");
+    // The tool's name is the `tool` column of its own step row — not a field inside a json blob.
+    // `ai_run_steps_tool_only_for_tool_kinds` exists to insist a tool kind carries its tool, and
+    // this assertion is what would notice a writer that stopped filling it in.
     assert!(
         steps
             .iter()
-            .any(|step| {
-                step.arguments
-                    .as_ref()
-                    .and_then(|value| value.get("tool"))
-                    .and_then(|tool| tool.as_str())
-                    == Some("page.search")
-            }),
-        "the work done before the stop must survive it"
+            .any(|step| step.kind() == Some(StepKind::ToolResult)
+                && step.tool.as_deref() == Some("page.search")),
+        "the work done before the stop must survive it, and name the tool it did: {steps:?}"
     );
     store.dispose().await;
 }
@@ -707,9 +705,22 @@ async fn a_loop_event_lands_in_the_same_trace_the_panel_renders() {
     .await
     .expect("the event must be written");
 
+    // An event is folded into the trace row for **its own step**, and the row is created for it
+    // when the loop's `StepStarted` has not arrived yet. Asserted on the row's own vocabulary
+    // rather than on a serialized event: the first implementation wrote every event as a `note`
+    // holding the whole event as json, which is the shape the panel cannot render.
     let steps = list_steps(&store.pool, run.id).await.expect("the trace must read");
     assert_eq!(steps.len(), 1, "an event is a trace row, not a side channel");
-    assert_eq!(steps[0].kind(), Some(StepKind::Note));
+    assert_eq!(steps[0].kind(), Some(StepKind::Message), "the model's text is a message");
+    assert_eq!(
+        steps[0]
+            .result
+            .as_ref()
+            .and_then(|result| result.get("text"))
+            .and_then(serde_json::Value::as_str),
+        Some("working"),
+        "the text is readable as text, which is what the accordion and the transcript both read"
+    );
     store.dispose().await;
 }
 

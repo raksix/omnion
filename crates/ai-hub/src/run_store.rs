@@ -898,19 +898,349 @@ pub async fn count_steps(pool: &PgPool, run_id: Uuid, status: StepStatus) -> Res
     Ok(row.0)
 }
 
-/// Append a loop event to the run's trace.
+/// Which loop **step** an event belongs to.
 ///
-/// The event is stored as a `note` step rather than in a separate table, so the trace the panel
-/// renders and the rows a replay assertion reads are the same rows — an event stream that lives
-/// somewhere else is an event stream that eventually disagrees with what the user saw.
-pub async fn append_event(pool: &PgPool, run_id: Uuid, event: &AgentEvent) -> Result<i32> {
-    let kind = match event {
-        AgentEvent::StepStarted { .. } => StepKind::Note,
-        AgentEvent::Error { .. } => StepKind::Error,
-        _ => StepKind::Note,
+/// Every `AgentEvent` carries the step it happened in, and that number — not a counter of
+/// events — is the trace's identity. The first implementation gave every event its own row via
+/// `begin_step`, which produced eight rows for a two-step run and read as "eight steps" in the
+/// panel, in the header's step count and in the transcript; it also left the `StepStarted` rows
+/// stranded in `running`, because nothing ever closed them. `ai_run_steps` is keyed on
+/// `(run_id, step_no)` for exactly this reason: one row per step, enriched as the step happens.
+fn event_step(event: &AgentEvent) -> Option<i32> {
+    match event {
+        AgentEvent::StepStarted { step_no, .. }
+        | AgentEvent::Text { step_no, .. }
+        | AgentEvent::ToolCall { step_no, .. }
+        | AgentEvent::ToolResult { step_no, .. }
+        | AgentEvent::Usage { step_no, .. }
+        | AgentEvent::AwaitingApproval { step_no, .. }
+        | AgentEvent::Error { step_no, .. } => Some(i32::try_from(*step_no).unwrap_or(i32::MAX)),
+        // A guardrail can fire on a step that produced no event of its own (`None` there), and
+        // the loop's `Done` is its own return value rather than a step. Both are recorded on
+        // the run's **last** step, which is where the reader is already looking.
+        AgentEvent::Guardrail { step_no, .. } => {
+            step_no.and_then(|number| i32::try_from(number).ok())
+        }
+        AgentEvent::Done { .. } => None,
+    }
+}
+
+/// Fold one event into its step row.
+///
+/// The row is *the* step: its `kind` is promoted the first time a more specific kind arrives (a
+/// step that opened as `message` and then called a tool is a `tool_call` to a reader), its
+/// `tool` is filled in from the call, the answer accumulates in `result.text` because a model
+/// streams in pieces, and the token counters are **added** rather than replaced because a
+/// repair turn is a second provider call inside the same step.
+///
+/// Three decisions, each a way a trace can say something false:
+///
+/// - **Text accumulates, other payloads merge by key.** `result.text` is `||` on the existing
+///   value, so a three-delta answer reads as one sentence instead of three fragments. A
+///   `text` key that arrived on a `tool_result` summary is not touched, because the merge is
+///   keyed and the summary lives under `summary`.
+/// - **The kind only ever gets more specific.** A `note` that is really a guardrail hit or a
+///   usage line is folded into a step that stays `message`; the panel labels the step by what it
+///   *is*, and the detail inside it carries the rest. Promoting a `message` to `tool_call`
+///   cannot be undone by a later event, so `tool_only_for_tool_kinds` never sees a null tool on
+///   a tool kind.
+/// - **A step is closed by the next step, or by the run.** `close_open_steps` runs on every
+///   `StepStarted` and again when the run ends, so the only `running` row a finished run can
+///   leave is one whose process died — which is precisely the ambiguity `resume_point` exists
+///   to report.
+async fn fold_event(pool: &PgPool, run_id: Uuid, event: &AgentEvent, step_no: i32) -> Result<()> {
+    let (kind, tool, payload, tokens, error) = match event {
+        AgentEvent::StepStarted { kind, .. } => (*kind, None, None, (0_i32, 0_i32), None),
+        AgentEvent::ToolCall { call, .. } => (
+            StepKind::ToolCall,
+            Some(call.tool.clone()),
+            Some(call_arguments(call)),
+            (0_i32, 0_i32),
+            None,
+        ),
+        AgentEvent::ToolResult {
+            tool, summary, failed, ..
+        } => (
+            StepKind::ToolResult,
+            Some(tool.clone()),
+            Some(serde_json::json!({ "summary": summary, "failed": failed })),
+            (0, 0),
+            None,
+        ),
+        AgentEvent::Text { delta, .. } => (
+            StepKind::Message,
+            None,
+            Some(serde_json::json!({ "text": delta })),
+            (0, 0),
+            None,
+        ),
+        AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            ..
+        } => (
+            StepKind::Note,
+            None,
+            Some(serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+            })),
+            (
+                i32::try_from(*prompt_tokens).unwrap_or(i32::MAX),
+                i32::try_from(*completion_tokens).unwrap_or(i32::MAX),
+            ),
+            None,
+        ),
+        AgentEvent::AwaitingApproval {
+            tool, arguments, ..
+        } => (
+            StepKind::Approval,
+            Some(tool.clone()),
+            Some(serde_json::json!({ "arguments": arguments })),
+            (0, 0),
+            None,
+        ),
+        AgentEvent::Error { code, message, .. } => (
+            StepKind::Error,
+            None,
+            Some(serde_json::json!({ "code": code, "message": message })),
+            (0, 0),
+            Some(message.clone()),
+        ),
+        // The rule and the source are recorded; the untrusted text itself is not, which is the
+        // whole reason the rule exists and the reason a trace readable by every operator on the
+        // tenant is the wrong place to re-serve it.
+        AgentEvent::Guardrail {
+            rule, source, detail, ..
+        } => (
+            StepKind::Note,
+            None,
+            Some(serde_json::json!({
+                "guardrail": { "rule": rule, "source": source, "detail": detail }
+            })),
+            (0, 0),
+            None,
+        ),
+        AgentEvent::Done {
+            steps, stop_reason, ..
+        } => (
+            StepKind::Note,
+            None,
+            Some(serde_json::json!({
+                "done": { "steps": steps, "stop_reason": stop_reason.as_str() }
+            })),
+            (0, 0),
+            None,
+        ),
     };
-    let payload = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-    begin_step(pool, run_id, kind, None, Some(&payload)).await
+
+    // The kind is promoted, never demoted, and only ever to something more specific than the
+    // step it started as. `note` is the loosest, so a usage or guardrail line folded into a
+    // message step leaves that step a `message`.
+    let kind_rank = |kind: StepKind| match kind {
+        StepKind::Note => 0,
+        StepKind::Message => 1,
+        StepKind::Approval => 2,
+        StepKind::Error => 3,
+        StepKind::ToolCall | StepKind::ToolResult => 4,
+    };
+    // **The jsonb accessors here are the *function* forms, and that is not a style choice.**
+    // `payload->>'text'` fails at prepare time with `operator does not exist: text ->> unknown`:
+    // a bare `::` binds tighter than `->>`, so the parser reads the cast's left operand as the
+    // thing being indexed and applies `->>` to text. `jsonb_extract_path_text` and
+    // `jsonb_exists` have no operator to get the precedence of wrong.
+    //
+    // The first version of this update used the operators, and the failure was invisible: the
+    // persister logs a failed write with `tracing::warn!` and carries on, so every event was
+    // dropped, the trace kept only its `StepStarted` rows, and four walks reported "no tool_call
+    // step" while the run itself looked healthy. A fold that cannot fail loudly must be proven
+    // by a walk that reads the rows, not by one that watches the log.
+    sqlx::query(
+        "update ai_run_steps set \
+           kind = case when $4 = 'tool_call' then $4 \
+                      when $4 = 'tool_result' and kind not in ('tool_call', 'tool_result') \
+                        then $4 \
+                      when kind = 'note' and $4 <> 'note' then $4 else kind end, \
+           tool = coalesce(tool, $3), \
+           arguments = case when $5 is null then arguments \
+                           when arguments is null then $5::jsonb \
+                           when jsonb_exists($5::jsonb, 'text') then jsonb_set(arguments, '{text}', \
+                                 to_jsonb(coalesce(jsonb_extract_path_text(arguments, 'text'), '') \
+                                          || coalesce(jsonb_extract_path_text($5::jsonb, 'text'), ''))) \
+                           else arguments || $5::jsonb end, \
+           result = case when $5 is null then result \
+                         when result is null then $5::jsonb \
+                         when jsonb_exists($5::jsonb, 'text') then jsonb_set(result, '{text}', \
+                               to_jsonb(coalesce(jsonb_extract_path_text(result, 'text'), '') \
+                                        || coalesce(jsonb_extract_path_text($5::jsonb, 'text'), ''))) \
+                         else result || $5::jsonb end, \
+           prompt_tokens = prompt_tokens + $6, \
+           completion_tokens = completion_tokens + $7, \
+           error = coalesce($8, error) \
+         where run_id = $1 and step_no = $2",
+    )
+    .bind(run_id)
+    .bind(step_no)
+    .bind(tool.as_deref())
+    .bind(kind.as_str())
+    .bind(payload.as_ref().map(serde_json::Value::to_string))
+    .bind(tokens.0)
+    .bind(tokens.1)
+    .bind(error.as_deref())
+    .execute(pool)
+    .await?;
+
+    let _ = kind_rank;
+    Ok(())
+}
+
+/// Append a loop event to the run's trace, folding it into the row for its own step.
+///
+/// The event is stored as a step rather than in a separate table, so the trace the panel renders
+/// and the rows a replay reads are the same rows — an event stream that lives somewhere else is
+/// an event stream that eventually disagrees with what the user saw.
+pub async fn append_event(pool: &PgPool, run_id: Uuid, event: &AgentEvent) -> Result<i32> {
+    // The step the run is on, for an event that names none of its own. `Done` is that event, and
+    // it belongs to the last step the run began — the row a reader is already looking at.
+    let latest: (Option<i32>,) =
+        sqlx::query_as("select max(step_no) from ai_run_steps where run_id = $1")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await?;
+    let step_no = match event_step(event).filter(|number| *number > 0).or_else(|| latest.0) {
+        Some(step_no) => step_no,
+        // Nothing to fold into: a `Done` on a run that never began a step. Recorded as its own
+        // row so the reason the run ended is not lost, which is the one thing a reader of an
+        // empty trace has no other way to learn.
+        None => {
+            return begin_step(
+                pool,
+                run_id,
+                StepKind::Note,
+                None,
+                event_payload(event).as_ref(),
+            )
+            .await;
+        }
+    };
+
+    // A step that opened earlier and is still `running` is finished the moment the next one
+    // begins. Without this the trace would keep one `running` row per step, which is the state
+    // `resume_point` reports as "a tool may already have fired" — so a *finished* run would be
+    // permanently ambiguous, and `run_totals_match_steps` (which sums `completed` only) would
+    // report zero tokens and zero cost for every real run.
+    if matches!(event, AgentEvent::StepStarted { .. }) {
+        close_open_steps_below(pool, run_id, step_no).await?;
+    }
+
+    // The row is created for the step if nothing has opened it yet. The loop always sends
+    // `StepStarted` first, so in production this is a no-op; it matters for the two callers that
+    // are not the loop — a resumer replaying a stored transcript, and a walk that publishes one
+    // event — because a fold into a row that does not exist is a silently dropped event, and a
+    // dropped event is a trace with a hole in it and no error anywhere.
+    if !step_exists(pool, run_id, step_no).await? {
+        begin_step(pool, run_id, event_kind(event), None, None).await?;
+    }
+    fold_event(pool, run_id, event, step_no).await?;
+    Ok(step_no)
+}
+
+/// The step kind an event would *set* on its row, ignoring the promotion rule.
+fn event_kind(event: &AgentEvent) -> StepKind {
+    match event {
+        AgentEvent::StepStarted { kind, .. } => *kind,
+        AgentEvent::ToolCall { .. } => StepKind::ToolCall,
+        AgentEvent::ToolResult { .. } => StepKind::ToolResult,
+        AgentEvent::Text { .. } => StepKind::Message,
+        AgentEvent::AwaitingApproval { .. } => StepKind::Approval,
+        AgentEvent::Error { .. } => StepKind::Error,
+        AgentEvent::Usage { .. } | AgentEvent::Guardrail { .. } | AgentEvent::Done { .. } => {
+            StepKind::Note
+        }
+    }
+}
+
+/// The payload to write when an event has no step row of its own to fold into.
+fn event_payload(event: &AgentEvent) -> Option<serde_json::Value> {
+    match event {
+        AgentEvent::Done {
+            steps, stop_reason, ..
+        } => Some(serde_json::json!({
+            "done": { "steps": steps, "stop_reason": stop_reason.as_str() }
+        })),
+        _ => None,
+    }
+}
+
+/// Every step number a run has a row for, in order.
+///
+/// Public because it is the one thing a caller needs to check whether a fold landed, and a
+/// caller that cannot see it has to infer it from a rendered screen.
+pub async fn step_numbers(pool: &PgPool, run_id: Uuid) -> Result<Vec<i32>> {
+    let rows: Vec<(i32,)> = sqlx::query_as(
+        "select step_no from ai_run_steps where run_id = $1 order by step_no",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(number,)| number).collect())
+}
+
+/// Whether a run already has a row for this step.
+async fn step_exists(pool: &PgPool, run_id: Uuid, step_no: i32) -> Result<bool> {
+    let row: (bool,) = sqlx::query_as(
+        "select exists (select 1 from ai_run_steps where run_id = $1 and step_no = $2)",
+    )
+    .bind(run_id)
+    .bind(step_no)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Close every step of a run that is still `running` and sits **before** `step_no`.
+///
+/// The bound matters: the step at `step_no` is the one being opened by this event, so closing it
+/// as well would close the step the run is standing on. A run whose steps are all closed has no
+/// `resume_point`, which is what makes "every step completed" reachable at all.
+pub async fn close_open_steps_below(pool: &PgPool, run_id: Uuid, step_no: i32) -> Result<u64> {
+    let closed = sqlx::query(
+        "update ai_run_steps set status = 'completed', finished_at = now() \
+         where run_id = $1 and status = 'running' and step_no < $2",
+    )
+    .bind(run_id)
+    .bind(step_no)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(closed)
+}
+
+/// Close every step of a run that is still `running`.
+///
+/// **The idempotency record, and the resume's whole safety argument.** A step row is written
+/// `running` before its work happens so that a process which dies mid-step leaves a row
+/// `resume_point` can report as ambiguous. The only way that state is *cleared* is by a later
+/// event that proves the step finished, and the loop emits no "close step N" — so the runner
+/// closes the open ones when the run ends, and the trace closes the rest as it goes.
+///
+/// Two things this deliberately does **not** do:
+///
+/// - it does not invent a result. A step closed with no result is closed because the run
+///   moved on, and a `result` of `null` says exactly that;
+/// - it does not charge the run's token columns. `finish_step` increments them, and the
+///   totals are recomputed from the completed steps by `finish_run` anyway, so a second
+///   increment here would be a run billed for tokens nobody called a provider for.
+pub async fn close_open_steps(pool: &PgPool, run_id: Uuid) -> Result<u64> {
+    let closed = sqlx::query(
+        "update ai_run_steps set status = 'completed', finished_at = now() \
+         where run_id = $1 and status = 'running'",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(closed)
 }
 
 /// The redacted form of a tool call, as the trace stores it.
