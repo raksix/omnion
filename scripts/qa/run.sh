@@ -73,6 +73,12 @@ wait_http() { # url, seconds
 # One pass at a time on this box: it is the difference between load 20 and load 6.
 QA_SLOT_PID=""
 if [ "${QA_SLOTS:-1}" != "0" ]; then
+  # The slot's own regression test, before the pass waits on the slot. It is a handful of seconds
+  # and it is the only thing in the harness that can tell us the semaphore still works: every
+  # other symptom (a pass that never starts, a pass that starts with no place) is silent, and both
+  # look identical to a box that is simply too loaded to walk anything.
+  step "testing the QA slot"
+  bash "$(dirname "${BASH_SOURCE[0]}")/test-qa-slot.sh" || echo "[qa] slot test reported failures (continuing: a broken test is not a reason to skip a pass)"
   step "waiting for a QA slot (max ${QA_SLOTS:-1} concurrent pass)"
   QA_SLOT_PID="$(QA_SLOT_WAIT="${QA_SLOT_WAIT:-1800}" bash "$(dirname "${BASH_SOURCE[0]}")/qa-slot.sh" | tail -n 1)"
   export QA_SLOT_PID
