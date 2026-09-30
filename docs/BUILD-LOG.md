@@ -7004,3 +7004,64 @@ reaching the assertions for the first time, so the next failure is a *product* f
 acted on. (b) Run `a_clone_copies_content_and_leaves_every_media_byte_where_it_was`, which has
 never executed; it closes the last unticked non-browser criterion on REQ-017. (c) Then the
 environment chip and the non-dismissible banner, which are the two remaining browser claims.
+
+## tick 74 — the chip and the banner did not exist, and a walk that had never run was wrong twice
+
+**The headline is a `grep` that took four seconds and would have taken them any tick.** Three
+consecutive REQ notes said the environment chip and the staging banner "owe the browser pass",
+which reads as *built and unmeasured*. `grep -rln "EnvironmentChip|StagingBanner"` over
+`apps/admin/` found **nothing**. They had never been written. This is a different kind of gap
+from a red gate, and the REQ's own prose is what hid it: "the chip appears in the panel header
+while staging is active" describes a screen as though it existed, so every tick read its own
+non-tick as *deferred measurement* rather than *unbuilt product*. **A checkbox is evidence about
+a tick, and a criterion's prose is evidence about the repository only when you go and look.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-environment --lib` | **59/0** |
+| `apps/api --test environments` (the five the shared run failed) | **5/5 PASS in isolation** — `a_new_organization_has_exactly_one_production_environment`, `a_clone_is_idempotent`, `a_clone_copies_content_and_leaves_production_byte_identical`, `a_derived_environment_without_a_clone_source_refuses_to_be_compared`, `a_failure_midway_through_the_apply_leaves_production_unchanged` |
+| `a_clone_copies_content_and_leaves_every_media_byte_where_it_was` | **PASS, 8.3s** — after two fixes, below |
+| `apps/admin` `tsc --noEmit` | clean |
+| QA browser pass, `QA_ONLY=environments` | **not run**: the slot is held by `/mnt/apopic/omnion-w3` and has rotated main → w3 across this tick. `QA_SLOT_WAIT=2400` is queued. Not claimed as anything. |
+
+### The media walk, executed for the first time, was wrong twice
+
+`a_clone_copies_content_and_leaves_every_media_byte_where_it_was` was written and **committed**
+last tick without ever running. Running it exposed two faults, both in the walk:
+
+1. It decoded `environment_clone_jobs.areas` into a `serde_json::Value` and indexed it as a map.
+   `areas` is `text[]` — the *request*, a list of ticked area names. The counts are in
+   `area_counts jsonb`. sqlx's error names a **Rust type** ("Rust type `Value` (as SQL type
+   `JSONB`) is not compatible with SQL type `TEXT[]`"), which points at the decoder rather than
+   at the column, and reads as a product bug for as long as you do not open the migration.
+2. With the right column, it asserted the theme area was *priced and copied* (`theme == 1`). That
+   is **the exact defect tick 67 closed** — `Area::copies()` returns `false` for Menus,
+   SiteSettings and Theme — asserted back into existence by a test that had never run and so was
+   never contradicted. The claim is now the true one: the job must **not** list `theme`, the three
+   copying areas must each be present, and `items_done` must equal the sum of `area_counts`.
+
+**The class, stated once: a test that has never run is a guess about the schema, and nothing in
+a green build contradicts a guess.** The gates that *did* exist (`--lib` 59/0, `tsc` clean) were
+green on the same tick that shipped a test asserting a column's type and a pricing map's
+contents, because neither gate executes the test file. `cargo test --lib` cannot reach
+`apps/api/tests/*.rs` at all — that is the third and least obvious gate, and the one that makes
+"the crate is green" and "the walk exists" look like the same claim.
+
+### The chip is a control, because a caption in a header is noise
+
+The word doing the work in that criterion is **active**. Everything else in REQ-017 is about a
+*named* environment, so the chip could have been ten minutes of reading the URL — and would have
+been right on one screen and wrong on the other forty. The selection is explicit and owned
+(`lib/active-environment.tsx`): production is the default *and* the reset, the stored id is
+per tenant and falls back to production when it is no longer in the list, and an **archived**
+staging environment is deliberately not "in staging" because its content is read-only. The
+banner has **no dismiss control at all** — no ✕, no hide preference, no `localStorage` flag —
+because a dismissable staging banner is dismissed once on a screen where the answer is not what
+you are working on, and is then gone for the rest of the session.
+
+**Next.** The pass, when the slot frees: it is queued with the full wait budget and the harness
+now measures the chip and the banner end to end (list opens → chip flips to staging → banner
+names the host → no dismiss control → banner survives a navigation to another screen →
+selection survives it → the link reaches the changes tab → the banner goes only when production
+is chosen again), all of it **before** the archive step, because an archived environment is
+defined to report production and measuring after it would prove the opposite.

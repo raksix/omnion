@@ -6906,7 +6906,11 @@ async function runEnvironmentsDepth(page, report) {
     const chipProductionBefore = await page
       .locator('[data-env-chip][data-env-chip="production"]')
       .count();
+    // No banner before a staging environment is selected. It is recorded as a step rather than
+    // dropped: a chip and a banner that both appear for a production session make the staging
+    // banner mean nothing, and the only way to know is to have measured production first.
     const bannerBefore = await page.locator("[data-qa-staging-banner]").count();
+    steps.bannerBeforeSelectingStaging = bannerBefore;
     await shot(page, "environments-chip-production");
 
     await page.click("[data-env-chip]").catch(() => {});
