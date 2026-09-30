@@ -31,6 +31,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
+pub mod cadence;
 pub mod destination;
 pub mod error;
 pub mod media;
@@ -38,9 +40,15 @@ pub mod part;
 pub mod preview;
 pub mod purge;
 pub mod restore;
+pub mod restore_objects;
 pub mod store;
 pub mod sweep;
 
+pub use apply::{
+    ArchiveFacts, MAX_MEDIA_OBJECTS, MAX_SELECTED_PARTS, PlanError, PlanRefusal, RestorePlan,
+    RestoreRequest, build_plan,
+};
+pub use cadence::Cadence;
 pub use destination::{
     DestinationReport, PROBE_FILENAME, local_path_for, local_root_for, probe_local, storage_key,
     storage_prefix,
@@ -63,6 +71,11 @@ pub use purge::{
     run_directory,
 };
 pub use preview::{LiveComparison, MAX_MATCHED_KEYS, compare_database, compare_media};
+pub use restore_objects::{
+    ArchiveReader, Boxed, LibraryWriter, MediaRestoreReport, RestoreFailure, RowToucher,
+    MAX_REPORTED_FAILURES as MAX_REPORTED_RESTORE_FAILURES, archived_sites, index_objects, read_index,
+    restore_objects, restore_row,
+};
 pub use restore::{
     LiveCounts, MAX_REPORTED_SITES, PartEvidence, RestoreMode, RestorePreview, RestoreWarning,
     RestoreWarningCode, STALE_AFTER_DAYS, WarningSeverity, build_preview, confirm_phrase,

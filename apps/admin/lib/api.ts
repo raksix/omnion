@@ -124,6 +124,7 @@ import type {
   BackupPurge,
   BackupPurgeFailure,
   BackupSweepReport,
+  RestoreOutcome,
   RestorePreview,
   BackupVerification,
   MediaRetentionRunList,
@@ -6235,6 +6236,24 @@ export function verifyBackup(id: string): Promise<BackupVerification> {
  */
 export function previewRestore(id: string): Promise<RestorePreview> {
   return request<RestorePreview>(`/api/v1/backups/${id}/restore-preview`, { method: "GET" });
+}
+
+/**
+ * Perform a restore of the ticked parts.
+ *
+ * The API takes the parts the operator **left ticked**, not "everything available": an empty
+ * array is a refusal naming the parts on offer, because a panel that posted nothing and got
+ * the whole archive back would be a panel that restored more than it showed.
+ */
+export function restoreBackup(
+  id: string,
+  parts: string[],
+  confirmation: string,
+): Promise<RestoreOutcome> {
+  return request<RestoreOutcome>(`/api/v1/backups/${id}/restore`, {
+    method: "POST",
+    body: JSON.stringify({ parts, confirmation }),
+  });
 }
 
 /**
