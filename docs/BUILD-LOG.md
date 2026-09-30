@@ -8258,3 +8258,50 @@ which is the only thing missing) and read `hash_secret(secret)` against the stor
 process. Then decide whether the `.map_err` swallow is fixed or the digest comparison is at fault
 — the two are distinguishable the moment the probe prints both. Then slice 3: the explorer with
 real calls, Redis metering, the rate limiter with `429`/`Retry-After`, and the usage tab.
+
+## 2026-09-30 — REQ-019 slice 2: five defects the measurement found
+
+**What shipped.** `4c20918a` (the token lookup and the refusal that kept its class), `f1f36642`
+(the cross-site read, plus two round trips that never closed and four stale YAML assertions),
+`f7e23f55` (the missing over-fetch).
+
+**Proof — what ran.**
+
+- `cargo test -p omnion-content --lib` — **304/0**.
+- `cargo test -p omnion-api --lib` — **252/0**, from **248/4** at the start of the tick. The four
+  were last tick's own: three asserted a hand-chosen block layout the emitter never promised, and
+  one listed `content:read` as a "safe plain scalar" while the function's own doc comment says a
+  colon disqualifies it. **The tests were wrong and the emitter was right.**
+- `cargo test -p omnion-api --test content_read_surface` — **11 ok**, from **0/13**. One test
+  (`the_cursor_walks_a_set_exactly_once`) still fails; it is recorded as failing, not as passing.
+
+**The headline is not a number, it is what 0/13 was hiding.** Five defects, four of them in the
+product, and the reason each survived a green unit suite is the same reason in every case: the
+test asserted the thing *adjacent* to the defect rather than the thing itself.
+
+| Defect | The test that should have caught it | What it actually asserted |
+|---|---|---|
+| Token never authenticates | prefix/secret round trip | each half's shape, separately |
+| Cross-site read | the value the SQL binds | the value `site_filter` returns |
+| `next_cursor` always null | a walk | a single page's `count` |
+| Cursor timestamp format | a round trip | neither end of it |
+| `updated_since` self-refusal | round trip | a hardcoded string |
+
+**The lesson worth carrying.** `fetch_limit` is the clearest case. The doc comment directly above
+it said *"The `limit + 1` a keyset read fetches, so `Page::new` can tell 'full' from 'last'"* and
+the body said `self.limit`. **A comment stating the intended behaviour is not a test**, and this
+one had been sitting above a defect since the slice was written. Every page the API ever returned
+was individually correct, which is why no single-page assertion could see it; only a walk that
+expects more pages than the first can.
+
+Second, smaller and costlier: `Uuid::nil()` was doing duty as an "out of scope" sentinel, and two
+call sites removed it before the query ran. **A sentinel is only safe if nothing downstream can
+remove it** — and mine was three call sites deep, each one written to strip it. The replacement is
+not a better sentinel but a value that cannot be stripped by accident.
+
+**Next.** The cursor walk. `next_cursor` is populated and the timestamp format agrees at both ends,
+but the second request has not been *observed* to return a page, and the shared box will not let a
+full 13-test run finish inside one tick — three attempts hit their timeouts with one or two tests
+outstanding, which is the reason this entry says "11 ok" and not a pass count. Next tick runs that
+walk alone on a fresh database and reads the second response's body. Then slice 3: the explorer
+with real calls, Redis metering, the rate limiter with `429`/`Retry-After`, and the usage tab.

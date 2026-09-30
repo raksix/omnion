@@ -1,40 +1,38 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 2 BUILT and COMMITTED; the `/content-api/docs` tab shipped this
-> tick as `02a6f329` — generated from the server's OpenAPI document rather than from a list kept
-> beside it, with both JSON and YAML downloads (`?format=yaml` as a *parameter*, because two
-> routes means two documents eventually), a pagination guide with real request examples, the
-> error-code table, the rate-limit contract and the rebuild-on-change pattern. Two fixture defects
-> were found and fixed (`52646b67`, `4e907f4a`): a page seeded with two rows that point at each
-> other outside a transaction, and a login that sent the CSRF *cookie* without the header the
-> middleware derives its expectation from — twelve identical `403 csrf_unavailable` failures whose
-> message named an environment variable rather than a missing header.
-> **No acceptance box is ticked by this tick, and one real product defect is still open.**
-> `apps/admin` `tsc --noEmit` is **exit 0**. The 13-walk suite does not pass, and the number is
-> measured rather than assumed:
+> **Status:** in-progress (slice 2's read surface is now MEASURED, and measuring it found
+> five product defects rather than confirming the slice). The suite that stood at 0/13 is at
+> **11 ok** with the cursor walk still failing, and `omnion-api --lib` went 248/4 -> **252/0**.
 >
-> - `VersionMismatch(38)` on the shared dev database — a stale `_sqlx_migrations` row from the
->   0038→0039 renumber. Fixed by running against a disposable database (`omnion_t42_read`); the
->   suite must never share one.
-> - With that fixed, every walk failed at the same line: `403 csrf_unavailable`. Cause: the suite
->   ran without `OMNION_CSRF_SECRET`, and that middleware **refuses before it ever looks at the
->   header** — so the fixture's missing `x-omnion-csrf` was invisible behind a message about an
->   environment variable. Both are now fixed (the header is echoed, and the suite sets the
->   variable), and the mint call answers **201**.
-> - **OPEN, real:** the minted token then fails to authenticate — `401 invalid_token` where 200 is
->   expected, in every walk that reads the content surface. Probing the store directly narrowed it
->   to inside `api_tokens::authenticate_any_organization`: `split_token` accepts the value, the
->   `SELECT … where prefix = $1` returns the row, the same 13-column decode succeeds when run by
->   hand, and `hash_secret` of the secret half does **not** equal the stored digest for a row this
->   process minted itself. Something between the create response and the authenticate call
->   transforms one of the two halves. **`authenticate`'s `.map_err(|_| AuthFailure::Invalid)` is
->   what made this a whole tick instead of one message** — it converts every database and decode
->   failure into "your token is invalid", so a caller cannot distinguish "wrong credential" from
->   "the database is down". That swallow is itself a defect worth fixing whatever the root cause
->   turns out to be.
-> Next: print the create response's `plaintext` beside the stored `prefix`/`token_hash` in one
-> process (the `mint_then_authenticate` probe, four lines from being run), then slice 3.)
-> **Source:** owner brief — platform feature pool (2026-09-25)
+> **Defects found and fixed this tick** — `4c20918a`, `f1f36642`, `f7e23f55`:
+> 1. **No token ever authenticated.** `fresh_material` stores the *namespaced* prefix
+>    (`omn_1a2b3c4d`, the form the `^omn_[0-9a-f]{8}$` check constraint is written against) while
+>    `split_token` returns the *bare* 8 characters, and both lookups bound the bare form. Every
+>    minted token answered `invalid_token` while every unit test was green, because each covered
+>    one half and none made a round trip.
+> 2. **A site-scoped token could read the site it is not scoped to.** `site_filter` answered
+>    out-of-scope with `Uuid::nil()` and both call sites stripped it with
+>    `.filter(|site| *site != Uuid::nil())` before binding — turning "match nothing" into "no site
+>    predicate". The other site's published pages came back with a `200`. `SITE_OUT_OF_SCOPE`
+>    replaces the sentinel and the test now asserts the `ListRequest` field the query reads, not
+>    the value `site_filter` returns.
+> 3. **Pagination never paged.** `fetch_limit` returned `self.limit` while the comment above it
+>    promised the over-fetch, so `fetched > limit` was never true and every list response claimed
+>    it was the last page.
+> 4. **A cursor's timestamp was written in one format and read in another** (`to_string()` on the
+>    way out, `Rfc3339` on the way in), so every page after the first would have answered `400`.
+> 5. **`updated_since` refused the API's own `updated_at` rendering** — the surface does not round
+>    trip its own output, which is an integrator trap and is now covered by a test.
+>
+> The `.map_err(|_| AuthFailure::Invalid)` that hid defect 1 is gone: a pool timeout, a closed
+> pool and a decode mismatch are `StoreUnavailable { source }`, the route answers `503` +
+> `Retry-After` for them and `401` only for credential problems. The content crate has no logger,
+> so returning the class was the only way to keep it.
+>
+> **Still open:** the cursor walk does not complete. `next_cursor` is now populated and the
+> round trip is closed, but the second request has not been observed to return a page, and the
+> suite is too slow on the shared box to prove it inside one tick (three runs hit their timeouts
+> with 1-2 tests outstanding). It is measured as failing, not as passing.
 
 ## Request
 
