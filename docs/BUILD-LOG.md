@@ -5821,3 +5821,83 @@ its `csrf_unavailable` rows are history, not this pass.
 across the media screens and the retention tab's own states. Run `bash scripts/qa/run.sh` with
 `QA_ONLY=media,media-retention` on a quieter box, then close REQ-010 and move to REQ-014 (system
 health, still `pending`).
+
+
+## 2026-09-30 · wave7 · tick 33 — REQ-100's permission-mapping criterion, and the false claim behind it
+
+**What.** Merged `origin/main` (24 commits) and then closed REQ-100's second acceptance criterion
+— *"for each tool, the declared permission equals the permission of the HTTP route it wraps"* — by
+finding that the criterion had been ticked green against a claim that was not true.
+
+**The defect.** The implementation was a hand-written `route_permission(key)` match in
+`catalogue.rs`, and its test compared that match against `spec.permission`. Both halves of the
+equality lived in one file, so no test in the suite could fail when the real route's guard
+changed. The keys were worse than a bad convention: **16 of 25 tools named permissions
+`crates/permissions` has never carried** — `content.read`, `site.read`, `theme.read`,
+`plugin.read`, `workflow.start`, `logs.read`, `health.read`, `seo.analyze`. The test written to
+catch exactly this checked membership in `KNOWN_PERMISSION_KEYS`, a list written by the same
+hand in the same file, so it agreed with itself and went green.
+
+The runtime shape is worse than a typo. `role_permissions.permission_key` references
+`permissions(key)`, and `permissions` is populated at boot by
+`omnion_permissions::seed::ensure`. Those tools were therefore **ungrantable**: an operator
+opens the matrix, sees the permission the tool needs, and no role can ever be handed it. Every
+agent holding one was denied permanently by a switch the panel displays.
+
+**The fix.** `crates/ai-hub/src/ops_binding.rs`. `RouteBinding::Live { path, method, permission }`
+and `RouteBinding::Planned { reason }` split the two claims the table blurred; 11 tools are
+`Planned` because the theme, plugin, deployment, log, health and seo surfaces are documented but
+not built. A `Planned` tool ships `requires_approval = true` whatever its risk, so the panel
+cannot invite somebody to enable an action with no endpoint. `AI_ROUTE_GUARDS` mirrors the
+router and `include_str!`s its source, so a guard renamed upstream fails *this crate's* test.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` → **427 passed; 0 failed** (was 421, +6).
+- `cargo build -p omnion-api` → clean, 15 pre-existing warnings.
+- `ai_tool_execution::every_seeded_tool_names_a_permission_the_platform_can_grant` → **ok**
+  (247.9 s), against `omnion_qa_w7`. All 25 tools' declared keys are accepted by the real
+  `role_permissions.permission_key` foreign key.
+- `ai_tool_execution::a_seeded_tool_answered_as_wired_names_its_rows_own_permission` → **ok**
+  (49.8 s): a `live: true` answer carries the row's own permission; every planned tool is gated.
+- `bash -n scripts/qa/run.sh` → clean. `bun build scripts/qa/walkthrough.cjs --target node
+  --external playwright-core` → bundles.
+
+**Three of the new unit tests failed on the first run, and each failure was correct.** The users
+route is `/iam/users`, not `/iam/subjects`. `deployment.preview` is `Risk::Low` and correctly
+so — a preview publishes nothing — so "every unwired ops tool is high risk" is *false*; the rule
+that is true is narrower and is keyed on the codebase's own `idempotent = false`, meaning "this
+changes something". And the gate is a function of wiring rather than of risk, which is why
+`default_requires_approval_for(spec, wired)` is a separate function instead of a branch inside
+the risk predicate the warning stripe reads. A stripe whose value depended on route wiring would
+change meaning the day a route is added.
+
+**The merge.** Four conflicts, none resolved by picking a side. `docs/BUILD-LOG.md` went through
+`scripts/qa/merge-build-log.py`, whose gate is a per-entry heading check — a hand merge is not
+available for an append-only log, because git's markers land mid-entry. `main.rs` was an import
+union. `run.sh` kept delete-then-start: main's side re-introduced `pm2 restart` together with a
+second CSRF block that duplicates the start command below it, and a restart does not re-read the
+recorded environment, so main's new `OMNION_CSRF_SECRET` would have been ignored on every run
+after the first. The walkthrough kept this branch's six AI depth passes and twelve AI routes and
+took main's per-name `--only` filter, with area names expanded so the spelling every loop prompt
+already uses keeps working.
+
+**Next.** The ops-tool service-layer criterion: register an ops tool whose arguments are the real
+ones (environment/command), assert a raw-command argument is refused by the schema before any
+service call, and that the row it would have read belongs to another organization. Then the
+closing gate — `cargo test --workspace`, `pnpm build`, and a w7 QA pass at zero high findings.
+
+**Not done, and said so rather than implied.** The falsification of the new grantability walk was
+started and **did not finish inside this tick**: the `execute_code` cell that was to restore
+`catalogue.rs` timed out at 300 s, so the file was left holding the deliberately fictional
+`content.read` and was restored from git afterwards. The walk's own green is therefore
+established (it passed with the real keys) but its red has not been observed. One recompile of
+`omnion-ai-hub` under this box's current load — 93 average, six sibling `rustc` processes
+competing, `/` oscillating between 98 % and 100 % — took over nine minutes and was abandoned. That
+is the falsification to run first next tick, and it is cheap: put the one key back and expect
+`no_tool_names_a_permission_the_platform_cannot_grant` to name it.
+
+**Disk.** `/` reached 100 % (673 M) mid-tick and the API test binary's link crawled for eight
+minutes. Reclaiming only my own `/root/w7target` stale `rlib`/`rmeta` duplicates — skipping every
+artifact a live process held open — freed 0.66 GB and brought it to 98 %. A sibling's or a live
+QA process's target was never touched, and the `ai_tool_execution` binary the run was using was
+held out of the sweep by an `lsof` check.
