@@ -13,7 +13,7 @@ use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
     crm_autoresponder_runner, crm_sla_runner, event_retention_runner, event_runner,
-    project_limit_runner, search_runner, workflow_runner,
+    project_limit_runner, restore_job_runner, search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -155,6 +155,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // schedule could be created, listed and rendered with an empty next-run cell for ever.
     // This is the tick that gives both a writer and a reader.
     let _backup_schedules = backup_schedule_runner::spawn(state.clone());
+    // The queued-restore worker. Deliberately ungated: a restore queued by an operator is a
+    // person watching a screen, and a feature that only runs when a flag is set is a restore
+    // that silently never happens on the installation that forgot to set it. It is cheap —
+    // one indexed query per poll, and a tick that finds nothing costs nothing.
+    let _restore_jobs = restore_job_runner::spawn(state.clone());
 
     if state.config().retention.backup_sweep_enabled {
         let _backup_sweep = backup_sweep_runner::spawn(state.clone());

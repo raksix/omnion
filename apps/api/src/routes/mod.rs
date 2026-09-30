@@ -75,6 +75,7 @@ pub mod auth;
 pub mod automation;
 pub mod automation_projects;
 pub mod backups;
+pub mod restore_jobs;
 pub mod commands;
 pub mod content;
 pub mod crm_assignment;
@@ -834,6 +835,17 @@ pub fn router(state: AppState) -> Router {
         post(backups::restore).layer(guards::require(&state, "backup.restore"));
     let backups_sweep: MethodRouter<AppState, Infallible> =
         post(backups::sweep).layer(guards::require(&state, "backup.manage"));
+    // Slice 2c. Three routes, and the key split is the point: queueing and cancelling are
+    // `backup.restore` (the same authority as pressing the button — a permission that lets an
+    // operator *un*press something they could never press is a way to deny the service to
+    // somebody who can only see the job), while *listing* the jobs is `backup.read`, because
+    // seeing that a restore is queued changes nothing.
+    let backups_restore_queue: MethodRouter<AppState, Infallible> =
+        post(restore_jobs::queue_restore).layer(guards::require(&state, "backup.restore"));
+    let backups_restore_jobs: MethodRouter<AppState, Infallible> =
+        get(restore_jobs::list_jobs).layer(guards::require(&state, "backup.read"));
+    let restore_job_cancel: MethodRouter<AppState, Infallible> =
+        post(restore_jobs::cancel_job).layer(guards::require(&state, "backup.restore"));
     let backup_schedules_read: MethodRouter<AppState, Infallible> =
         get(backups::list_schedules).layer(guards::require(&state, "backup.read"));
     // Editing a schedule is `backup.manage`, the same key as the settings screen: both are
@@ -1739,6 +1751,12 @@ pub fn router(state: AppState) -> Router {
         .route("/backups/{id}/manifest", backups_manifest)
         .route("/backups/{id}/restore-preview", backups_restore_preview)
         .route("/backups/{id}/restore", backups_restore)
+        .route("/backups/{id}/restore-queue", backups_restore_queue)
+        .route("/backups/{id}/restore-jobs", backups_restore_jobs)
+        // A SEPARATE prefix, not `/backups/{id}/…`, because a cancel is addressed by the
+        // JOB's id and not the run's — two different resources, and a route that accepted
+        // either would let a cancel for one run's job stop another run's restore.
+        .route("/restore-jobs/{id}/cancel", restore_job_cancel)
         .route("/backups/{id}/verify", backups_verify)
         .route("/backup-schedules", backup_schedules_read)
         .route("/backup-schedules", backup_schedules_write)
