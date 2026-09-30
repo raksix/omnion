@@ -213,6 +213,18 @@ Migration `0012_environments.sql` (number is a placeholder — renumber to the n
   still owed by the depth pass below)*
 - [ ] The QA walkthrough visits `/environments`, `/environments/new` and `/environments/[id]` with zero high findings.
   *(`?tab=changes` and `?tab=promotions` are visited and clicked by `runEnvironmentsDepth` as well — the tab strip is a real navigation and an untested tab is an untested screen. **This box stays open because the pass still has not been executed.** Tick 73 established that the five prior ticks' "a sibling held the slot / the disk was at 100%" story was wrong on every count once the harness was actually run: `runEnvironmentsDepth` had never executed a line of its own body. Tick 74 fixed the chip and the banner, extended the pass to measure them, and still could not run it — so the deferral is now the *only* remaining explanation and is recorded as one fact rather than three.)*
+  *(**tick 85: the spec names a route the product does not have.** This line has said
+  `/environments/new` for twenty-odd ticks and the panel has no such route — the wizard is a
+  modal the list opens with `data-env-new`, and `/environments/[id]` is only reachable with a
+  real id that a route-list entry cannot carry. So two of the three screens in this criterion
+  have never been walkable *by path*, and the wizard's phone layout ("below `lg` the wizard
+  becomes a single scrolling form") has never been measured at all: the depth pass drives it,
+  at 1280px. The wizard's open state now lives in the URL beside the filters (`?wizard=1`,
+  `9213e49d`), which is what makes it linkable, Back-button-correct and measurable at 390px,
+  and the mobile route entry carries `expect: "[data-env-wizard]"` so a deep link the view
+  ignores is a finding rather than a second screenshot of the list. The detail route is still
+  opened by the depth pass with a real id, which is right and unchanged. The box stays open:
+  the pass has still not run, and the next scoped run is the environments one.)*
 
 ### QA plan
 
