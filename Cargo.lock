@@ -1370,6 +1370,7 @@ dependencies = [
  "omnion-events",
  "omnion-identity",
  "omnion-media",
+ "omnion-module-ai",
  "omnion-module-analytics",
  "omnion-notifications",
  "omnion-onboarding",

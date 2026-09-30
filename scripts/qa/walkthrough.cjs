@@ -1847,6 +1847,218 @@ async function runMediaStorage(page, report) {
   };
 }
 
+// -------------------------------------------------- AI workflow builder (REQ-046, slice 3)
+
+/**
+ * Drive the AI workflow builder's console the way an operator does.
+ *
+ * The QA stack has **no AI provider connected**, and that is the state this pass measures
+ * first — not as a fallback, as the feature. The console's spec has a no-provider state, and a
+ * screen that is only ever walked with a model behind it has proved nothing about the state an
+ * installation is in on the day it is installed. What the pass asserts there is specific: the
+ * form is **replaced** (not merely disabled) and the link to the AI Hub is present, because a
+ * visible-but-broken form teaches the operator the button is unreliable rather than that
+ * nothing is connected.
+ *
+ * The review screen (`/ai/workflows/[id]`) is a route whose path carries an id, so it cannot
+ * appear in the static routes list — the same reason `/media/files/[id]` is opened by a depth
+ * pass. A draft is therefore **written straight into the table** and the screen opened by its
+ * real id. That is a fixture rather than a walk, and the reason it is acceptable is specific:
+ * the generation itself needs a live provider, which the box has no key for, so the only two
+ * things this pass can honestly measure are (a) the console's own behaviour and (b) the review
+ * screen's rendering of a stored row. The generation path is proved by the API suite
+ * (`cargo test -p omnion-api --test ai_workflow_builder`) against a mock provider, not here.
+ */
+async function runAiWorkflowConsole(page, report) {
+  const steps = {};
+  const note = (step) => {
+    Object.assign(steps, step);
+    record({ page: "ai-workflows", action: "ai-workflow-console", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/ai/workflows`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(2200);
+
+  // The console reached one of its two honest states: the no-provider panel, or the form.
+  const noProvider = (await page.locator("[data-no-provider]").count()) > 0;
+  const hasForm = (await page.locator("[data-ai-workflow-prompt]").count()) > 0;
+  note({ state: noProvider ? "no-provider" : hasForm ? "form" : "unknown", noProvider, hasForm });
+  if (!noProvider && !hasForm) {
+    steps.reason =
+      "the console rendered neither the generate form nor the no-provider panel — it did not " +
+      "reach a state it has a design for";
+    await shot(page, "page-ai-workflows-unknown");
+    return steps;
+  }
+
+  // In the no-provider state the form must be GONE, not greyed out, and the link to the Hub
+  // must be a real link to `/ai` — a button that is disabled and says "AI Hub" is the
+  // "coming soon" the platform's own rules forbid.
+  if (noProvider) {
+    const prompt = (await page.locator("[data-ai-workflow-prompt]").count()) > 0;
+    const hubLink = await page
+      .locator('[data-no-provider] a[href="/ai"]')
+      .first()
+      .getAttribute("href")
+      .catch(() => null);
+    note({ formHidden: !prompt, hubLink });
+    steps.ok = !prompt && hubLink === "/ai";
+    if (!steps.ok) {
+      steps.reason = prompt
+        ? "the no-provider state kept the form visible"
+        : "the no-provider state has no link to the AI Hub";
+    }
+  } else {
+    // With a model behind it, the form's own contract: the counter reads the server's bound,
+    // and a too-short prompt is refused by the CLIENT with a field-level message (the server
+    // owns everything else, and this is the one bound the form is told about).
+    const counter = (await page.locator("[data-prompt-counter]").first().innerText().catch(() => "")) || "";
+    note({ counter });
+
+    await page.fill("[data-ai-workflow-prompt]", "short");
+    await page.click("[data-generate-draft]");
+    await page.waitForTimeout(900);
+    const refused = (await page.locator("[data-prompt-error]").count()) > 0;
+    note({ clientRefusedShortPrompt: refused, counterAfter: (await page.locator("[data-prompt-counter]").first().innerText().catch(() => "")) || "" });
+    if (!refused) {
+      steps.reason = "a five-character prompt was not refused by the form";
+    }
+
+    // The examples are click-to-fill: pressing one fills the field, and it is the SPEC's
+    // "three click-to-fill examples" rather than static text.
+    const examples = await page.locator("[data-example]").count();
+    if (examples > 0) {
+      await page.locator("[data-example]").first().click();
+      await page.waitForTimeout(400);
+      const filled = await page.inputValue("[data-ai-workflow-prompt]").catch(() => "");
+      note({ examples, exampleFilledChars: filled.length });
+      if (filled.length < 10) {
+        steps.reason = `clicking an example filled ${filled.length} characters`;
+      }
+    }
+
+    // The status chips are a multi-select and they are the ONLY filter, so one of them has to
+    // narrow the list. The URL is read afterwards: a filter that is not in the URL is a
+    // filter a reload throws away, which is the spec's own acceptance criterion.
+    const chip = page.locator("[data-status-chip]").first();
+    if ((await chip.count()) > 0) {
+      const status = await chip.getAttribute("data-status-chip");
+      await chip.click();
+      await page.waitForTimeout(900);
+      const url = page.url();
+      note({ chipStatus: status, urlHasStatus: url.includes("status=") });
+      if (!url.includes("status=")) {
+        steps.reason = "a status chip did not write itself into the URL";
+      }
+      await page.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(1200);
+    }
+  }
+
+  await shot(page, "page-ai-workflows");
+
+  // ---- the review screen, opened by a REAL id -------------------------------------------------
+  // A fixture, for the reason in the doc comment: the generation needs a live provider the
+  // box has no key for. The row is written in the shape `apply_answer` leaves it in — status
+  // `draft`, a definition the engine's own validator accepts — so the screen is reading the
+  // same thing a real answer would leave behind.
+  const org = qaSql(
+    "select organization_id from ai_workflow_drafts limit 1" ) === ""
+    ? qaSql("select id from organizations order by created_at desc limit 1")
+    : qaSql("select organization_id from ai_workflow_drafts limit 1");
+  const definition = JSON.stringify({
+    trigger: { kind: "manual" },
+    steps: [
+      { name: "summarise", kind: "task", action: "ai.prompt", params: { prompt: "Summarise {{steps.1.output.text}}", max_tokens: 2000 } },
+    ],
+  });
+  const rationale = "The first step asks a model to summarise the record, so the rule works on text the platform did not author.";
+  const seeded = qaSql(
+    `insert into ai_workflow_drafts (organization_id, title, prompt, rationale, definition, status, model_key, tokens_input, tokens_output, created_by)
+     values ('${org}', 'QA console draft',
+             'Summarise each new support ticket and file it under the right topic.',
+             ${JSON.stringify(rationale).replace(/'/g, "''")},
+             '${definition.replace(/'/g, "''")}'::jsonb,
+             'draft', 'qa/mock-model', 42, 17,
+             (select id from users order by created_at desc limit 1))
+     returning id`,
+  );
+  const draftId = (seeded || "").split("\n").pop().trim();
+  note({ seededDraft: Boolean(draftId) });
+  if (!draftId) {
+    steps.reason = "the review fixture could not be written — is migration 0174 applied?";
+    return steps;
+  }
+
+  await page.goto(`${URL_ADMIN}/ai/workflows/${draftId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+
+  const title = (await page.locator("[data-draft-title]").first().innerText().catch(() => "")) || "";
+  const prompt = (await page.locator("[data-draft-prompt]").first().innerText().catch(() => "")) || "";
+  const rationaleText = (await page.locator("[data-draft-rationale]").first().innerText().catch(() => "")) || "";
+  const steps_ = await page.locator("[data-step]").count();
+  const definitionBox =
+    (await page.locator("[data-definition-editor]").first().innerText().catch(() => "")) || "";
+  const aiStep = (await page.locator("[data-ai-step]").count()) > 0;
+  note({
+    title,
+    promptChars: prompt.length,
+    rationaleChars: rationaleText.length,
+    stepRows: steps_,
+    aiStepFlagged: aiStep,
+    definitionChars: definitionBox.length,
+  });
+
+  // The screen's own claims: the title, the prompt, the rationale, ONE step row, the same
+  // definition as JSON, and a host-action step flagged as asking a model. A screen that
+  // rendered the title alone would pass a route-only check.
+  steps.ok = Boolean(
+    steps.ok !== false &&
+      title.includes("QA console draft") &&
+      prompt.length > 20 &&
+      rationaleText.length > 20 &&
+      steps_ === 1 &&
+      definitionBox.includes("ai.prompt") &&
+      aiStep,
+  );
+  if (!steps.ok && !steps.reason) {
+    steps.reason =
+      `the review screen rendered title=${Boolean(title)} prompt=${prompt.length} ` +
+      `rationale=${rationaleText.length} steps=${steps_} definition=${definitionBox.length} aiStep=${aiStep}`;
+  }
+  await shot(page, "page-ai-workflow-review");
+
+  // The step's parameters are shown, not summarised: a reviewer approving a rule that asks a
+  // model something has to be able to read WHAT it asks.
+  const params = (await page.locator('[data-step-params="1"]').first().innerText().catch(() => "")) || "";
+  note({ stepParamsChars: params.length });
+  if (params.length > 0 && !params.includes("Summarise")) {
+    steps.ok = false;
+    steps.reason = "the step's parameters do not read as the parameters the draft stored";
+  }
+
+  // The mobile pass: the list is cards, not a scrolled table, and the review screen is legible.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(900);
+  await shot(page, "page-ai-workflow-review-mobile");
+  const cards = (await page.locator("[data-draft-card]").count()) > 0;
+  await page.goto(`${URL_ADMIN}/ai/workflows`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const mobileCards = (await page.locator("[data-draft-card]").count()) > 0;
+  const mobileTable = (await page.locator("[data-draft-row]").count()) > 0;
+  note({ mobileCards, mobileTable });
+  steps.ok = steps.ok !== false && mobileCards && !mobileTable;
+  if (!steps.ok) {
+    steps.reason = mobileTable
+      ? "the draft list still renders the table at 390 px — a five-column table is a horizontal scroll, not a narrow screen"
+      : "the draft list rendered no cards at 390 px";
+  }
+  await shot(page, "page-ai-workflows-mobile");
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  return steps;
+}
+
 async function runMediaFileDetail(page, report) {
   const steps = [];
   const note = (step) => {
@@ -6077,6 +6289,11 @@ async function main() {
     { path: "/backups", name: "backups" },
     { path: "/sites", name: "sites" },
     { path: "/ai", name: "ai" },
+    // The AI workflow builder's console (REQ-046, slice 3). It is walked here so a screen that
+    // only ever existed in a route table still gets screenshotted; the depth pass below opens a
+    // REAL draft, which is the only way the review screen (`/ai/workflows/[id]`, a route whose
+    // path carries an id) is ever visited — the same reason `/media/[id]` is not in this list.
+    { path: "/ai/workflows", name: "ai-workflows" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -6197,6 +6414,14 @@ async function main() {
     runMediaFileDetail(page, report),
   );
   log(`media file detail: ${JSON.stringify(report.mediaFileDetail)}`);
+
+  // The AI workflow builder's console and its review screen (REQ-046, slice 3). Run right
+  // after the media passes because it writes a fixture row: the pass that follows wants a
+  // database whose shape it did not have to guess at.
+  report.aiWorkflowConsole = await runDepthPass("ai-workflow-console", () =>
+    runAiWorkflowConsole(page, report),
+  );
+  log(`ai workflow console: ${JSON.stringify(report.aiWorkflowConsole)}`);
 
   report.mediaPresets = await runDepthPass("media-presets", () => runMediaPresets(page, report));
   log(`media presets: ${JSON.stringify(report.mediaPresets)}`);
