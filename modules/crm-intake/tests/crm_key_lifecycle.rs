@@ -162,11 +162,14 @@ async fn rotating_a_form_bound_source_is_refused_and_writes_no_key() {
     let org = fresh_org(&pool, "rotate form").await;
     let source_id = form_source(&pool, org).await;
 
+    // The outcome is matched rather than inspected for its value, because the *shape* is the
+    // assertion: the caller must not learn the refusal through the `Ok(None)` channel, which
+    // the handler reads as a missing source. `the_refusal_does_not_report_a_missing_source`
+    // then says the same thing with the three arms named, so a reader who wants the detail
+    // has one test that reads as a list.
     let outcome = store::rotate_key(&pool, org, source_id).await;
-
-    let refused = matches!(outcome, Err(_));
     assert!(
-        refused,
+        outcome.is_err(),
         "rotating a source with no key must be refused; the doc comment on `rotate_key` \
          promises exactly this and the refusal did not exist"
     );
