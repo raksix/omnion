@@ -47,11 +47,22 @@ publish then succeeds), and **a restore appends** (three rows afterwards, revisi
 there, the restored row badged). It also refuses a hostile token value at the panel, not with
 a 400 three lines later.
 
-**Not yet proved.** The pass has not completed: at tick start the QA slot was held by a live
-sibling and the volume was at **99% (864 MB free)**, and a pass started into a full disk is a
-pass that dies halfway and reports nothing — the lesson from the last tick, respected rather
-than re-learned. The volume came back to 88% (7.0 GB) while this tick ran and the pass is
-queued behind the slot.
+**Not yet proved, and the reason is more interesting than "the box was busy".** The pass was
+started immediately and queued honestly behind the QA slot. It waited **47 minutes** for a
+sibling's FULL pass to finish (w8's, `--url 127.0.0.1:3107`, started 23:13 and still walking at
+00:12). It never got the slot. And the volume, which had recovered to 88% when the pass was
+started, climbed back to **99% (811 MB free)** while it waited — because the sibling's pass was
+what was consuming it. So the pass was killed rather than let to time out and proceed: a pass
+that reaches its `QA_SLOT_WAIT` and starts anyway on a volume with 811 MB free dies halfway and
+reports nothing, which is precisely the failure the last tick already paid for once.
+
+The lesson is about ORDER, not patience: **a shared resource that a queued job depends on can be
+consumed by the very process it is queued behind.** Waiting for the slot is not the same as
+having the box. The cheap check is the one the invariants file already insists on — read the
+free space at the moment the slot is *granted*, not at the moment the pass is *started*.
+
+`disk-guard.sh` reclaimed 3.1 GB afterwards (94%, 3.7 GB free), and the pass left nothing
+behind: no orphan process, no `omnion-qa-*-w2` pm2 entry, and the slot itself untouched.
 
 **Next.** (a) The pass result, then acceptance 6-9 can be ticked on its evidence rather than on
 the store's. (b) REQ-062 slice 3 — the builder on REQ-063's editor, slot reset, and the
