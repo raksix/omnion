@@ -61,17 +61,73 @@ const STEP_MS = Number(arg("step-ms", "380"));
  *   --only=iam     the identity screens and their depth passes
  *   --only=analytics  the analytics screens and their depth passes
  */
-const ONLY = (process.argv.find((a) => a.startsWith("--only=")) || "").split("=")[1] || "";
-/** Whether a named area is in scope. An empty scope means everything, as it always did. */
-const inScope = (area) => !ONLY || ONLY === area;
+/**
+ * `--only=a,b` narrows the pass to the named routes and depth passes, and the default is
+ * everything.
+ *
+ * The route list plus thirty depth passes is more work than one pass can finish inside the
+ * ceiling a browser pass is given, so a full pass started getting cut off partway through —
+ * and a pass that is cut off has proven nothing about the screens after the cut, while still
+ * looking like a pass in the log. Three requests (REQ-010, REQ-012, REQ-013) sat unverified
+ * for exactly that reason: the harness that was supposed to accept them could not reach their
+ * screens inside its own budget.
+ *
+ * A timeout is therefore the wrong instrument: the honest instrument is the budget. `--only`
+ * lets a loop spend one pass on the screens it just built, and every focused pass still walks
+ * its own routes, runs its own depth passes and writes the same report — it just does not
+ * pretend to cover the rest. The default (`--only=all`) walks everything, unchanged.
+ *
+ * A name that matches nothing is a finding rather than a silent no-op: a typo in a filter would
+ * otherwise produce an empty, entirely green report, which is the worst output this file can
+ * emit.
+ *
+ * **An AREA name is still accepted.** `--only=ai`, `=media`, `=iam` and `=analytics` are the
+ * spellings this file's own comments and every loop prompt have used since the flag existed, and
+ * an area is a *group* of names rather than a single pass. They are expanded here, once, against
+ * the same table the routes and the depth passes are named in, so a caller who learned the flag
+ * as an area keeps working and the unmatched-filter finding still fires on a genuine typo.
+ * `AREA_NAMES` is declared before `AREAS` so the expansion is not a forward reference.
+ */
+const AREA_NAMES = ["ai", "media", "iam", "analytics"];
+const AREAS = {
+  ai: (name, route) => route.path.startsWith("/ai") || name === "ai" || name.startsWith("ai-"),
+  media: (name, route) => route.path.startsWith("/media") || name.startsWith("media"),
+  iam: (name, route) =>
+    route.path.startsWith("/settings/iam") || name.startsWith("iam") || route.path === "/settings/search",
+  analytics: (name, route) => route.path.startsWith("/analytics") || name.startsWith("analytics"),
+};
+const ONLY = (arg("only", "all") || "all")
+  .split(",")
+  .map((name) => name.trim())
+  .filter(Boolean);
+const ONLY_ALL = ONLY.includes("all");
+/**
+ * Whether one route or depth-pass NAME is in scope.
+ *
+ * The `route` argument is optional and only used to expand an area name: a depth pass has no
+ * path, so a depth pass that carries the area's own prefix is the only thing that can match
+ * `--only=ai`. Passing `undefined` is therefore the normal call and it must not throw.
+ */
+const wants = (name, route) => {
+  if (ONLY_ALL) return true;
+  if (ONLY.includes(name)) return true;
+  if (route) return ONLY.some((f) => AREAS[f]?.(name, route));
+  return ONLY.some((f) => {
+    const area = AREAS[f];
+    return area ? area(name, { path: "" }) : false;
+  });
+};
+/** Whether a named AREA is in scope — the `inScope()` this file used before per-name filters. */
+const inScope = (area) => !ONLY.length || ONLY_ALL || ONLY.includes(area);
 /** The same area naming for the mobile loop, which carries its own route list. */
 const mArea = (path, name) => {
-  if (name === "ai" || path.startsWith("/ai")) return "ai";
-  if (name.startsWith("media") || path.startsWith("/media")) return "media";
-  if (name.startsWith("iam") || path.startsWith("/settings/iam") || path === "/settings/search") return "iam";
-  if (name.startsWith("analytics") || path.startsWith("/analytics")) return "analytics";
+  for (const area of AREA_NAMES) if (AREAS[area](name, { path })) return area;
   return "core";
 };
+/** Every route/depth-pass name this pass actually walked, so an unmatched filter is visible. */
+const matchedOnly = new Set();
+/** `mobile:<name>` is a valid filter spelling; `MOBILE_NAMES` keeps the roll-up from calling it unknown. */
+const MOBILE_NAMES = new Set();
 /**
  * The disposable QA database, used only by the analytics fixture (REQ-007): the pass posts a
  * synthetic beacon batch through the public collect endpoint and then spreads a slice of those
@@ -230,9 +286,25 @@ const clickLines = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
+let warnedAboutStream = false;
 function record(entry) {
   clickLines.push(entry);
-  fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  // The event stream is written for durability -- a killed pass should leave its clicks behind
+  // -- but it is a SECONDARY record: `clickLines` above is the one the report is built from. So
+  // a write that fails must not end the pass. It used to: this box runs a disk guard that trims
+  // QA artifacts, and when the guard's window landed mid-pass the output directory was gone,
+  // `appendFileSync` threw ENOENT, and the exception unwound the whole run. The pass had already
+  // walked seven screens and every one of them was thrown away because a cache file could not be
+  // appended to. A report written from memory and a report written from disk are the same report;
+  // only the forensic stream is lost, and it says so rather than pretending.
+  try {
+    fs.appendFileSync(path.join(OUT, "clicks.jsonl"), JSON.stringify(entry) + "\n");
+  } catch (error) {
+    if (!warnedAboutStream) {
+      warnedAboutStream = true;
+      console.error(`[walk] the click stream is unwritable (${error.code || error.message}); the report continues without it`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- browser
@@ -2350,6 +2422,87 @@ async function runBackups(page, report) {
           refused: refusalText.trim().length > 0,
           refusal: refusalText.trim(),
           safetyBackupNamed: /[0-9a-f]{8}-[0-9a-f]{4}/i.test(safetyId),
+        });
+      }
+    }
+    // ---- The queued restore (REQ-013 slice 2c) ---------------------------------------------
+    // The one control in this file that exists to be *pressed and then un-pressed*, so the
+    // order is the order a nervous operator would use: read the state, press Stop, and read
+    // the state again. The load-bearing assertion is the LAST one — that a Stop control is
+    // gone once the job is no longer cancellable. A panel that keeps offering "Stop" on a
+    // finished restore is inviting an operator to press it, and a control that appears not to
+    // work is worse than no control at all.
+    const queueButton = page.locator('[data-testid="restore-queue"]');
+    const queueOffered = (await queueButton.count()) > 0;
+    const queueDisabled = queueOffered ? await queueButton.first().isDisabled() : null;
+    const queueHint = await page
+      .locator('[data-testid="restore-queue-hint"]')
+      .innerText()
+      .catch(() => "");
+    note({
+      step: "restore-queue-button",
+      offered: queueOffered,
+      disabledWithAnOutcomeShown: queueDisabled,
+      // The difference between the two buttons must be IN WORDS on the screen, not inferred
+      // from colour: the hint is what stops somebody in a hurry pressing the wrong one.
+      hintNamesStoppability: /stop/i.test(queueHint),
+      hint: queueHint.trim().slice(0, 200),
+    });
+
+    // The jobs list, before anything is queued. The empty state is a real state and it is
+    // asserted, because "nothing here" and "this list could not be read" render the same and
+    // only the wording tells them apart.
+    const jobsEmpty = await page
+      .locator('[data-testid="restore-jobs-empty"]')
+      .count();
+    note({ step: "restore-jobs-empty", offered: jobsEmpty > 0 });
+
+    if (queueOffered && !queueDisabled) {
+      await queueButton.first().click().catch(() => {});
+      await page
+        .waitForSelector('[data-testid^="restore-job-"]', { timeout: 30000 })
+        .catch(() => {});
+      await page.waitForTimeout(1500);
+
+      const queuedRows = await page
+        .locator('[data-testid^="restore-job-queued"], [data-testid^="restore-job-running"]')
+        .allInnerTexts();
+      const stopButtons = page.locator('[data-testid^="restore-job-stop-"]');
+      const stopCount = await stopButtons.count();
+      note({
+        step: "restore-queued",
+        rows: queuedRows.length,
+        firstRow: queuedRows[0] ? queuedRows[0].split("\n")[0].trim() : "",
+        stopButtonsOffered: stopCount,
+      });
+
+      if (stopCount > 0) {
+        await stopButtons.first().click().catch(() => {});
+        await page
+          .waitForSelector('[data-testid="restore-job-aborted"]', { timeout: 30000 })
+          .catch(() => {});
+        await page.waitForTimeout(1200);
+        const abortedText = await page
+          .locator('[data-testid="restore-job-aborted"]')
+          .first()
+          .innerText()
+          .catch(() => "");
+        // The Stop control must be GONE. `cancellable` is the API's own field rather than a
+        // derivation the panel makes, so this also proves the panel is reading it.
+        const stopAfter = await page.locator('[data-testid^="restore-job-stop-"]').count();
+        note({
+          step: "restore-aborted",
+          shown: abortedText.trim().length > 0,
+          // An abort is a success and says so in words. If this reads as a failure the
+          // operator stopped the right thing and believes it went wrong.
+          saysNothingWasChanged: /nothing/i.test(abortedText),
+          stopButtonsRemaining: stopAfter,
+          text: abortedText.trim().slice(0, 240),
+        });
+      } else {
+        note({
+          step: "restore-aborted",
+          reason: "the job left the queue before the Stop control could be pressed",
         });
       }
     }
@@ -6692,6 +6845,201 @@ async function runSecurityDepth(page, report) {
     await shot(page, "security-headers-restored");
   }
 
+  // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
+  //
+  // This screen and the sign-in one below had a rule engine, a policy editor, a live counter
+  // and a test console behind them, and no walk had ever opened either of them. A screen that
+  // is never rendered is not "mostly tested"; it is untested, and the two that ship first are
+  // the two whose failure is silent — a limit nobody can read is a limit nobody knows is set.
+  //
+  // The console is the interesting half: it answers "would THIS request be refused", which no
+  // screenshot of a form can show. So the pass asks a question the tester can see the answer
+  // to, and then edits a limit and asks it again — the policy must answer differently, or the
+  // editor is a text box with a save button.
+  await page.goto(`${URL_ADMIN}/security/rate-limits`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-rate-limits="ready"]', { timeout: 15000 }).catch(() => {});
+  const limitsReady = (await page.locator('[data-rate-limits="ready"]').count()) > 0;
+  note({ step: "rate-limits-loaded", rendered: limitsReady });
+  if (!limitsReady) {
+    note({ step: "rate-limits-missing", reason: "/security/rate-limits did not render its ready state" });
+  } else {
+    const limitRows = await page.locator("[data-rate-limit-row]").count();
+    note({ step: "rate-limit-rows", rows: limitRows });
+    if (limitRows < 1) {
+      note({ step: "rate-limit-registry-empty", reason: "no scope rendered a limit row" });
+    }
+    await shot(page, "security-rate-limits");
+
+    // Every row must say what its scope is allowed, not just how much: a number without a
+    // window is a number nobody can compare against anything.
+    const rowLabels = await page.$$eval("[data-rate-limit-row]", (nodes) =>
+      nodes.map((node) => ({
+        scope: node.getAttribute("data-rate-limit-row"),
+        inputs: node.querySelectorAll("input").length,
+      })),
+    );
+    note({ step: "rate-limit-row-shape", rows: rowLabels });
+    const inputless = rowLabels.filter((row) => row.inputs === 0);
+    if (inputless.length) {
+      note({ step: "rate-limit-row-not-editable", rows: inputless.map((r) => r.scope) });
+    }
+
+    // The tester: the screen's whole claim is "would THIS request be refused", and the answer
+    // comes from the server's own `decide` — the same function the middleware runs. So the pass
+    // asks a question through the real endpoint, with a counter no sane ceiling allows, and
+    // requires a verdict of `limited` plus the key it counted and the retry it would send.
+    //
+    // The endpoint is `POST /security/rate-limits/test` (`security.read`), the body is
+    // `{ method, path, client_ip, count, machine_key }` and the verdict is NESTED under
+    // `verdict`, beside `counter_identity`/`counter_key`. Guessing any of those — an invented
+    // `/probe` path, a flat `limited` boolean — produces a request that 404s or a read of
+    // `undefined` that compares false, and the step is then a green line that proves nothing.
+    //
+    // The CSRF header is the fourth thing a hand-written fetch gets wrong, and it is the one
+    // that fails *green*. A cookie-authenticated mutation with no `x-omnion-csrf` is refused
+    // with `csrf_unavailable` before the handler ever runs, so a pass that skipped it would
+    // record "the tester refused this request" about a screen that works perfectly in the hand
+    // above it. The token is the readable `omnion_csrf` cookie the panel's own client echoes.
+    const probe = await page.evaluate(async () => {
+      const csrf = document.cookie
+        .split(";")
+        .map((part) => part.trim())
+        .find((part) => part.startsWith("omnion_csrf="))
+        ?.slice("omnion_csrf=".length);
+      const answer = await fetch("/api/v1/security/rate-limits/test", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "content-type": "application/json",
+          ...(csrf ? { "x-omnion-csrf": decodeURIComponent(csrf) } : {}),
+        },
+        body: JSON.stringify({
+          method: "POST",
+          path: "/api/v1/auth/login",
+          client_ip: "203.0.113.7",
+          count: 400,
+          machine_key: false,
+        }),
+      });
+      return {
+        status: answer.status,
+        body: await answer.json().catch(() => null),
+        hadCsrf: Boolean(csrf),
+      };
+    });
+    note({
+      step: "rate-limit-test-endpoint",
+      status: probe?.status,
+      hadCsrf: probe?.hadCsrf,
+      scope: probe?.body?.verdict?.scope,
+      limited: probe?.body?.verdict?.limited,
+      ceiling: probe?.body?.verdict?.ceiling,
+      counterKey: probe?.body?.counter_key,
+      retryAfter: probe?.body?.verdict?.retry_after,
+    });
+    if (probe?.status !== 200) {
+      note({
+        step: "rate-limit-test-unreachable",
+        status: probe?.status,
+        code: probe?.body?.error?.code,
+        reason: "the tester endpoint did not answer 200",
+      });
+    } else if (probe.body?.verdict?.limited !== true) {
+      note({ step: "rate-limit-test-not-limited", reason: "a counter of 400 was not reported as limited" });
+    }
+
+    // Now the tester button on the screen itself, which is what a human uses: the same request
+    // has to survive the form, the client and the render.
+    await page.locator("[data-rate-limit-probe-count]").fill("400").catch(() => {});
+    await page.waitForTimeout(200);
+    await page.locator("[data-rate-limit-probe-run]").click({ timeout: 8000 }).catch(() => {});
+    await page
+      .waitForSelector('[data-rate-limit-probe-result]:not([data-rate-limit-probe-result="none"])', {
+        timeout: 20000,
+      })
+      .catch(() => {});
+    const probeVerdict = await page
+      .locator("[data-rate-limit-probe-result]")
+      .getAttribute("data-rate-limit-probe-result")
+      .catch(() => null);
+    note({ step: "rate-limit-console-verdict", verdict: probeVerdict });
+    if (!probeVerdict || probeVerdict === "none") {
+      note({ step: "rate-limit-console-silent", reason: "the tester ran and reported no verdict" });
+    }
+    await shot(page, "security-rate-limits-probe");
+
+    // An out-of-range limit must be refused by the FORM before it reaches the server — the
+    // field message is the whole point of validating here rather than on save.
+    const firstInput = page.locator("[data-rate-limit-input]").first();
+    const hadInput = (await firstInput.count()) > 0;
+    if (hadInput) {
+      await firstInput.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-rate-limits-local-error]").count()) > 0;
+      note({ step: "rate-limit-zero-refused", refused: localError });
+      if (!localError) {
+        note({ step: "rate-limit-zero-accepted", reason: "a limit of 0 was accepted by the form" });
+      }
+      await shot(page, "security-rate-limits-invalid");
+      // Put the field back so this pass cannot leave the policy disabled for a sibling's pass.
+      await firstInput.fill("");
+      await page.waitForTimeout(300);
+    }
+  }
+
+  // ---- The sign-in protection policy (REQ-012, slice 2) -------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/security/sign-in-protection`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page.waitForSelector('[data-sign-in-protection="ready"]', { timeout: 15000 }).catch(() => {});
+  const protectionReady = (await page.locator('[data-sign-in-protection="ready"]').count()) > 0;
+  note({ step: "sign-in-protection-loaded", rendered: protectionReady });
+  if (!protectionReady) {
+    note({ step: "sign-in-protection-missing", reason: "the screen did not render its ready state" });
+  } else {
+    const lockedCount = await page
+      .locator("[data-locked-count]")
+      .first()
+      .innerText()
+      .catch(() => null);
+    note({ step: "locked-accounts", count: lockedCount });
+    await shot(page, "security-sign-in-protection");
+
+    // The policy has five fields; each must be editable and each must survive a save. A
+    // policy editor that renders read-only inputs still LOOKS like the security centre.
+    const fields = ["window_seconds", "attempts", "lockout_minutes", "base_delay_seconds", "progressive_delay"];
+    const present = [];
+    for (const field of fields) {
+      present.push([field, (await page.locator(`[data-lockout-field="${field}"]`).count()) > 0]);
+    }
+    note({ step: "lockout-fields", fields: present });
+    const missingFields = present.filter(([, ok]) => !ok).map(([name]) => name);
+    if (missingFields.length) {
+      note({ step: "lockout-field-missing", fields: missingFields });
+    }
+
+    // The reset_on_success switch is a boolean where every other field is a number: a form
+    // that validates all five the same way will either refuse a checkbox or accept nonsense.
+    const resetSwitch = await page.locator('[data-lockout-field="reset_on_success"]').count();
+    note({ step: "lockout-reset-switch", present: resetSwitch > 0 });
+
+    // An out-of-range attempts value must be refused with a field message, not saved.
+    const attempts = page.locator('[data-lockout-field="attempts"]').first();
+    if ((await attempts.count()) > 0) {
+      const before = await attempts.inputValue().catch(() => "");
+      await attempts.fill("0");
+      await page.waitForTimeout(400);
+      const localError = (await page.locator("[data-sign-in-protection-local-error]").count()) > 0;
+      note({ step: "lockout-zero-refused", refused: localError, before });
+      if (!localError) {
+        note({ step: "lockout-zero-accepted", reason: "attempts = 0 was accepted by the form" });
+      }
+      await shot(page, "security-sign-in-protection-invalid");
+      await attempts.fill(before);
+      await page.waitForTimeout(300);
+    }
+  }
+
   return { ok: true, steps };
 }
 
@@ -8166,6 +8514,12 @@ async function main() {
     { path: "/analytics/realtime", name: "analytics-realtime", area: "analytics" },
     { path: "/analytics/settings", name: "analytics-settings", area: "analytics" },
   ];
+  // `--only` narrows the route list; the default walks every entry above, unchanged.
+  const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
+  for (const route of walkedRoutes) matchedOnly.add(route.name);
+  if (!ONLY_ALL) {
+    log(`focused pass: ${walkedRoutes.length}/${routes.length} routes — ${ONLY.join(", ")}`);
+  }
   // The route loop is per-route isolated for the same reason the depth passes are: a crashed
   // tab (`Page crashed`, which several concurrent passes can cause by exhausting the box's
   // memory) used to end the entire run, so every route after the crash and every depth pass

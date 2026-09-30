@@ -105,6 +105,13 @@ fi
 # begins from a clean set and the box is not carrying yesterday's processes.
 stop_stack() {
   pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+  # Turbopack leaves a build cache behind when the server is killed, and the cache is
+  # the largest thing any worktree holds: ten stacks held 13 GB of it and filled the
+  # disk twice. The next pass rebuilds what it needs, so this is pure waste — but only
+  # drop it when the pass actually ran, so a stack that failed to start keeps its cache.
+  if [ "${QA_KEEP_NEXT:-0}" != "1" ]; then
+    rm -rf "$ROOT/apps/admin/.next" "$ROOT/apps/web/.next" 2>/dev/null || true
+  fi
 }
 # One trap, both cleanups: a second trap would replace the first and leave the slot held.
 release() {
@@ -113,7 +120,10 @@ release() {
   return 0
 }
 trap release EXIT INT TERM
-stop_stack
+# Only the exit path drops the build cache: the pre-pass call below is here to clear
+# stale servers, and deleting .next there would throw away a warm cache every tick and
+# turn each QA pass into a cold Turbopack build.
+QA_KEEP_NEXT=1 stop_stack
 
 step "resetting the QA database"
 bash scripts/qa/reset-db.sh
@@ -148,7 +158,10 @@ fi
 # Delete-then-start, never restart. `pm2 restart` re-executes the path pm2 recorded when the
 # process was first started, so a process left over from an earlier pass keeps running the
 # binary that existed then — which is how this file was fixed, the pass ran, and the API still
-# panicked on a route that had been corrected two hours earlier.
+# panicked on a route that had been corrected two hours earlier. The delete below is also what
+# makes main's `OMNION_CSRF_SECRET` argument survive: a restart does NOT re-read the recorded
+# environment, so an env var added to this script after the first pass is silently ignored by
+# every subsequent run, and the write routes answer 403 for a reason the pass cannot see.
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 delete "$API_NAME" >/dev/null
 fi
@@ -188,8 +201,18 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" ${QA_ONLY:+--only="$QA_ONLY"}
+# `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
+# them, which is the right thing for a full acceptance run and the wrong thing for a loop that
+# has just built two screens and needs them proven before the tick ends. It is a filter on the
+# walk, never on the harness around it: the stack, the reset, the vision review and the report
+# all run exactly as they do for a full pass. The array is built unconditionally because
+# `"${QA_ONLY:+--only=$QA_ONLY}"` expands to a single word with a space in the value, which the
+# walkthrough reads as a route name that does not exist.
+QA_ONLY_ARGS=()
+[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
+
+step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
 # The vision review reads the whole shot set and judges it against the product's visual rules.
 # On a scoped pass that set is a fraction of the screens, so its verdicts describe a product
