@@ -8036,6 +8036,10 @@ async function main() {
     // are exactly the kind of thing that only fails when it is actually opened.
     { path: "/settings/reliability/retries", name: "reliability-retries" },
     { path: "/settings/reliability/breakers", name: "reliability-breakers" },
+    // REQ-127 slice 4's screen. The tester dialog and the removal confirmation are the two
+    // things on it that can be wrong while the list looks perfect, and neither is visible until
+    // it is opened -- which is exactly what this pass does.
+    { path: "/settings/reliability/intake", name: "reliability-intake" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -8426,6 +8430,12 @@ async function runReliabilityBreakersDepth(page) {
     matchedOnly.add("reliability-breakers");
     report.reliabilityBreakers = await runDepthPass("reliability-breakers", () =>
       runReliabilityBreakersDepth(page),
+    );
+  }
+  if (wants("reliability-intake")) {
+    matchedOnly.add("reliability-intake");
+    report.reliabilityIntake = await runDepthPass("reliability-intake", () =>
+      runReliabilityIntakeDepth(page),
     );
   }
 
@@ -9728,4 +9738,180 @@ async function runIamAuthenticationDepth(page, report) {
   await shot(page, "page-iam-authentication-empty");
 
   report.iamAuthentication = { steps };
+}
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 slice 4 — the inbound intake screen, driven end to end.
+// ---------------------------------------------------------------------------------------------
+//
+// What this pass is really checking is the ONE thing a Rust test cannot see: that an operator
+// can answer "is my signature right, and what did the platform refuse?" without leaving the
+// page. Four steps, each of which has a failure mode that reads like a working screen:
+//
+// * The tester runs the PLATFORM'S guard, so the pass types a sample and a deliberately wrong
+//   signature and expects a refusal WITH A REASON. A tester that answered "valid" here would
+//   be a tester with its own HMAC implementation, which is the whole bug this action exists to
+//   avoid.
+// * A refusal must never show the key. The pass searches the dialog's text for the secret it
+//   cannot know, and asserts the dialog has no "reveal"-shaped control at all — a button whose
+//   label contains the word is enough, and it is the cheapest possible future leak.
+// * The declare dialog is opened and CLOSED without saving. A pass that saved would leave a
+//   declaration in the QA database that the next run's list assertions then trip over, and the
+//   symptom is a flaky pass rather than a wrong form.
+// * The removal dialog is opened and CANCELLED, and the pass asserts the confirm is disabled
+//   while the reason is empty. Removing a declaration turns a guarded door into an open one,
+//   and an unconfirmed removal is the one action on this screen with no undo.
+// ---------------------------------------------------------------------------------------------
+async function runReliabilityIntakeDepth(page) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "reliability-intake-depth", action: "intake", ...step });
+  };
+
+  await page.goto(`${URL_ADMIN}/settings/reliability/intake`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page
+    .waitForSelector("[data-view=\"reliability-intake\"], [role=\"alert\"]", { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const rendered = await page.locator("[data-view=\"reliability-intake\"]").count();
+  const rows = await page.locator("[data-intake]").count();
+  const cards = await page.locator("[data-intake-card]").count();
+  const emptyText = await page
+    .locator("[data-view=\"reliability-intake\"]")
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "screen",
+    rendered,
+    rows,
+    cards,
+    hasEmptyState: /No inbound endpoint is declared/i.test(emptyText),
+  });
+  await shot(page, "page-reliability-intake");
+
+  // ---- The tester, on the first declared endpoint -----------------------------------------
+  const verifyButton = page.locator("button", { hasText: "Verify sample" }).first();
+  const hasEndpoint = (await verifyButton.count()) > 0;
+  if (hasEndpoint) {
+    await verifyButton.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[aria-label=\"Verify a signature sample\"]", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    await page
+      .locator("[aria-label=\"Verify a signature sample\"] textarea")
+      .first()
+      .fill('{"event":"qa.sample"}')
+      .catch(() => {});
+    await page
+      .locator("[aria-label=\"Verify a signature sample\"] input")
+      .first()
+      .fill("v1,qa:0000")
+      .catch(() => {});
+    await page
+      .locator("[aria-label=\"Verify a signature sample\"] button", { hasText: "Verify" })
+      .first()
+      .click({ timeout: 8000 })
+      .catch(() => {});
+    await page.waitForSelector("[data-verdict]", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    const verdict = await page.locator("[data-verdict]").first().getAttribute("data-verdict").catch(() => null);
+    const dialogText = await page
+      .locator("[aria-label=\"Verify a signature sample\"]")
+      .first()
+      .innerText()
+      .catch(() => "");
+    // A tester with its own HMAC implementation would answer `valid` for a body the platform
+    // refuses, and the operator would chase a signing key that was never wrong.
+    note({
+      step: "verify-sample",
+      verdict,
+      refused: verdict === "invalid",
+      namesTheReason: /Refused:/.test(dialogText),
+      // The screen has no way to reveal a key, so there is nothing to look for. Asserted as an
+      // ABSENCE of a control, not as an absence of a value: a value nobody can reach is fine,
+      // a button is not.
+      noRevealControl: !/reveal|show secret|show key/i.test(dialogText),
+    });
+    await shot(page, "page-reliability-intake-verify");
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  } else {
+    note({ step: "verify-sample", skipped: "no declared endpoint to test against" });
+  }
+
+  // ---- The declare dialog: opened, validated, closed WITHOUT saving ------------------------
+  await page.locator("button", { hasText: "Declare" }).first().click({ timeout: 8000 }).catch(() => {});
+  await page.waitForSelector("[aria-label=\"Declare intake endpoint\"]", { timeout: 10000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const fields = await page
+    .locator("[aria-label=\"Declare intake endpoint\"] input, [aria-label=\"Declare intake endpoint\"] select, [aria-label=\"Declare intake endpoint\"] textarea")
+    .count();
+  // Every control carries a VISIBLE label. A placeholder-only field is the panel's own rule and
+  // it is checked here rather than assumed: an unlabelled number input is indistinguishable
+  // from a tolerance window and from a byte cap.
+  const labelled = await page.evaluate(() => {
+    const dialog = document.querySelector('[aria-label="Declare intake endpoint"]');
+    if (!dialog) return { total: 0, withLabel: 0 };
+    const controls = dialog.querySelectorAll("input, select, textarea");
+    let withLabel = 0;
+    for (const control of controls) {
+      if (control.type === "checkbox") {
+        withLabel += 1;
+        continue;
+      }
+      const id = control.getAttribute("id");
+      const wrapped = control.closest("label");
+      const aria = control.getAttribute("aria-label");
+      if ((id && dialog.querySelector(`label[for="${id}"]`)) || wrapped || aria) withLabel += 1;
+    }
+    return { total: controls.length, withLabel };
+  });
+  note({ step: "declare-dialog", fields, ...labelled });
+  await shot(page, "page-reliability-intake-declare");
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(300);
+
+  // ---- The removal confirmation: empty reason must not confirm -----------------------------
+  const removeButton = page.locator("button", { hasText: "Remove" }).first();
+  if ((await removeButton.count()) > 0) {
+    await removeButton.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[aria-label=\"Remove intake endpoint\"]", { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    const confirmDisabled = await page
+      .locator("[aria-label=\"Remove intake endpoint\"] button", { hasText: /^Remove$/ })
+      .first()
+      .isDisabled()
+      .catch(() => null);
+    const dialogText = await page
+      .locator("[aria-label=\"Remove intake endpoint\"]")
+      .first()
+      .innerText()
+      .catch(() => "");
+    note({
+      step: "remove-confirm",
+      // The API refuses an empty reason, so the button must too — a control that sends a
+      // request the server will reject teaches the operator that the dialog is decorative.
+      confirmDisabled: confirmDisabled === true,
+      asksForAReason: /reason/i.test(dialogText),
+    });
+    await shot(page, "page-reliability-intake-remove");
+    await page.locator("[aria-label=\"Remove intake endpoint\"] button", { hasText: "Cancel" }).first().click().catch(() => {});
+    await page.waitForTimeout(300);
+  }
+
+  // ---- Mobile: the table becomes cards, nothing scrolls sideways ---------------------------
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  const overflow = await page.evaluate(() => {
+    const el = document.scrollingElement || document.documentElement;
+    return Math.max(0, el.scrollWidth - el.clientWidth);
+  });
+  const mobileCards = await page.locator("[data-intake-card]").count();
+  note({ step: "mobile", overflowPx: overflow, cards: mobileCards });
+  await shot(page, "page-reliability-intake-mobile");
+  await page.setViewportSize({ width: 1280, height: 900 });
+
+  return steps.length;
 }
