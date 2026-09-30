@@ -310,7 +310,11 @@ pub async fn generate(
     let mut tokens = DraftTokens::default();
     let mut transcript: Vec<ChatMessage> = Vec::new();
     let mut refused: Option<String> = None;
-    let mut turn = user;
+    // Not `mut`, deliberately: the opening user turn is the SAME message on every round, and
+    // the repair appends to `transcript` rather than replacing this. An earlier version cleared
+    // it before the repair, which sent an empty user message and made the one round-trip this
+    // request is built around unreachable.
+    let turn = user;
 
     for round in 0..MAX_ATTEMPTS {
         let answer = match chat(&plan.target, &request_for(&plan, &turn, &transcript)).await {
@@ -361,6 +365,17 @@ pub async fn generate(
                 // The reason itself is quoted with the answer: "that answer was refused, fix
                 // it" is a refusal to act on, and an empty "Your answer:" section is the same
                 // refusal with a blank where the evidence was.
+                //
+                // `turn` is NOT emptied. It is the *opening* user message, and the repair
+                // follows it as history: [system, user(prompt), assistant(refused),
+                // user(repair)]. Blanking it sent [system, user(""), …] and the provider
+                // refused the request with "chat messages may not be empty" — so the one
+                // round-trip the whole request is built around cost a second provider call
+                // and produced a *provider* error instead of the second refusal. The
+                // acceptance criterion it failed is the request's own headline: an
+                // unvalidatable answer must trigger exactly one repair, and it triggered
+                // none. A draft whose repair is unreachable fails for a reason that has
+                // nothing to do with the answer being wrong.
                 transcript.push(ChatMessage {
                     role: ChatRole::Assistant,
                     content: answer.clone(),
@@ -369,7 +384,6 @@ pub async fn generate(
                     role: ChatRole::User,
                     content: repair_prompt(&answer, &error),
                 });
-                turn = String::new();
             }
             Fold::Failed(message) => {
                 return Err(AiWorkflowError::invalid("generation_failed", message));
@@ -685,6 +699,72 @@ mod tests {
         assert_eq!(request.messages[1].content, "second try");
         assert_eq!(request.messages[2].content, "first");
         assert_eq!(request.messages[4].content, "that was refused");
+    }
+
+    /// The repair round-trip asks a question, and the question is never empty.
+    ///
+    /// **This is the test the bug needed.** The loop used to clear the opening user turn before
+    /// spending a repair, so the second provider call carried `[system, user(""), …]`. Every
+    /// provider refuses that — "chat messages may not be empty" — so the single repair the
+    /// whole request is built around never happened: the draft failed with a *provider* error
+    /// and the repair policy was unreachable in production. The unit test above passed the whole
+    /// time, because it calls `request_for` with an explicit non-empty turn and never exercises
+    /// the value the loop actually holds.
+    ///
+    /// The assertion is on the **wire shape**, not on a variable: a mock that returns
+    /// `Err(ProviderError::InvalidRequest)` for an empty `user` is what the provider does, and
+    /// a test that checks "is the string empty" would pass while the request still carried one.
+    #[test]
+    fn a_repair_round_trip_never_sends_an_empty_user_message() {
+        let plan = GenerationPlan {
+            target: ProviderTarget {
+                id: uuid::Uuid::nil(),
+                name: "test".to_owned(),
+                protocol: "openai_compatible".to_owned(),
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                api_key: None,
+            },
+            model: "test-model".to_owned(),
+            model_id: "test/test-model".to_owned(),
+            system: "system".to_owned(),
+        };
+
+        // The loop's own invariant: the opening turn survives every repair, and the refused
+        // answer plus the reason are appended as history.
+        let prompt = "the operator's sentence".to_owned();
+        let transcript = vec![
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "the refused answer".to_owned(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: "that was refused, fix it".to_owned(),
+            },
+        ];
+
+        let request = request_for(&plan, &prompt, &transcript);
+        let user_turns: Vec<&ChatMessage> = request
+            .messages
+            .iter()
+            .filter(|message| message.role == ChatRole::User)
+            .collect();
+        assert!(
+            user_turns
+                .iter()
+                .all(|message| !message.content.trim().is_empty()),
+            "every user turn must carry text: {:?}",
+            user_turns
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        // And the opening turn is still the prompt, not a blank: the model revises *its answer*
+        // against the original request, so the request itself has to remain in the transcript.
+        assert_eq!(
+            user_turns[0].content, prompt,
+            "the repair keeps the original request in front of the model"
+        );
     }
 
     fn valid_answer() -> String {
