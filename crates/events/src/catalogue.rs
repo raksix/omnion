@@ -291,6 +291,43 @@ catalogue! {
     "A model request could not be resolved to a usable model by any rule.",
     [("decision_id", Uuid, req), ("task", String, req), ("rule", String, opt),
      ("feature", String, opt), ("requested", String, opt), ("requirements", Json, opt)];
+    // The tool registry (REQ-100). `ai.tool.denied` is the one an operator subscribes to: it
+    // is the signal that a model tried to reach something it was not granted, which is the
+    // visible form of a probing agent. The rest are the panel's own audit trail — a registry
+    // whose limits and gates changed is a registry nobody could explain after an incident.
+    "ai.tool.registered", "ai", Live,
+    "A tool from the compiled catalogue was seeded into the registry.",
+    [("tool_key", String, req), ("class", String, req), ("seed_version", Integer, opt)];
+    "ai.tool.updated", "ai", Live,
+    "A tool's limits, gate or enabled state changed.",
+    [("tool_key", String, req), ("changed", Json, opt)];
+    "ai.tool.disabled", "ai", Live,
+    "A tool was switched off while agents still referenced it.",
+    [("tool_key", String, req), ("agents", Json, opt)];
+    "ai.tool.grant_changed", "ai", Live,
+    "An identity's grant for one tool changed.",
+    [("identity_id", Uuid, req), ("tool_key", String, req), ("effect", Boolean, req),
+     ("changed_by", Uuid, opt)];
+    "ai.tool.denied", "ai", Live,
+    "An agent named a tool its identity does not grant. The alert hook for a probing agent.",
+    [("run_id", Uuid, opt), ("step_id", Uuid, opt), ("tool_key", String, req),
+     ("identity_id", Uuid, opt), ("reason", String, opt)];
+    "ai.tool.failed", "ai", Live,
+    "A tool call ran and failed.",
+    [("run_id", Uuid, opt), ("step_id", Uuid, opt), ("tool_key", String, req),
+     ("error_code", String, opt), ("duration_ms", Integer, opt)];
+    "ai.tool.limited", "ai", Live,
+    "A run hit a tool's per-run call cap.",
+    [("run_id", Uuid, opt), ("tool_key", String, req), ("cap", Integer, opt)];
+    "ai.identity.created", "ai", Live,
+    "An AI identity — a named set of tool grants — was created.",
+    [("identity_id", Uuid, req), ("key", String, req)];
+    "ai.identity.updated", "ai", Live,
+    "An AI identity's details or default flag changed.",
+    [("identity_id", Uuid, req), ("key", String, req), ("changed", Json, opt)];
+    "ai.identity.removed", "ai", Live,
+    "An AI identity was removed along with its grants.",
+    [("identity_id", Uuid, req), ("key", String, req)];
     "media.duplicate_merged", "media", Live,
     "A duplicate item was merged into the one that was kept.",
     [("kept_media_id", Uuid, req), ("merged_media_id", Uuid, req), ("affected", Integer, opt)];
@@ -942,6 +979,62 @@ mod tests {
         let live = live_names();
         assert!(live.contains(&"page.published"));
         assert!(!live.contains(&"order.created"));
+    }
+
+    #[test]
+    fn the_tool_registry_names_are_live_and_typed() {
+        // REQ-100's event table, asserted rather than assumed. The drift test walks the sources
+        // for `NewEvent::new("…")` and fails on a name the table does not carry, so a name added
+        // here is the *permission* to emit it — this test is what makes that permission and the
+        // payload shape agree.
+        for (name, required_field, kind) in [
+            ("ai.tool.registered", "tool_key", FieldKind::String),
+            ("ai.tool.updated", "tool_key", FieldKind::String),
+            ("ai.tool.disabled", "tool_key", FieldKind::String),
+            ("ai.tool.grant_changed", "tool_key", FieldKind::String),
+            ("ai.tool.denied", "tool_key", FieldKind::String),
+            ("ai.tool.failed", "tool_key", FieldKind::String),
+            ("ai.tool.limited", "tool_key", FieldKind::String),
+            ("ai.identity.created", "key", FieldKind::String),
+            ("ai.identity.updated", "key", FieldKind::String),
+            ("ai.identity.removed", "key", FieldKind::String),
+        ] {
+            let entry = lookup(name).unwrap_or_else(|| panic!("{name} must be in the catalogue"));
+            assert_eq!(entry.status, Status::Live, "{name} is emitted today, not reserved");
+            assert_eq!(entry.area, "ai", "{name} belongs to the AI area");
+            let field = entry
+                .payload_fields
+                .iter()
+                .find(|candidate| candidate.name == required_field)
+                .unwrap_or_else(|| panic!("{name} must declare {required_field}"));
+            assert!(field.required, "{name}.{required_field} is required");
+            assert_eq!(field.kind, kind, "{name}.{required_field} has the wrong kind");
+        }
+    }
+
+    #[test]
+    fn a_denied_call_names_the_run_and_the_step_it_was_refused_in() {
+        // `ai.tool.denied` is the alert hook. A denial with no `run_id` and no `reason` is not
+        // actionable, so both must be *optional* (a denial outside a run is real — the execution
+        // path also enforces a named tool) rather than required and wrong.
+        let entry = lookup("ai.tool.denied").expect("listed");
+        let required: Vec<&str> = entry.required_fields().iter().map(|f| f.name).collect();
+        assert_eq!(required, vec!["tool_key"], "a denial must always name the tool");
+        for optional in ["run_id", "step_id", "identity_id", "reason"] {
+            assert!(
+                entry.payload_fields.iter().any(|f| f.name == optional && !f.required),
+                "ai.tool.denied must carry {optional} as optional"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_change_says_which_way_it_moved_and_who_moved_it() {
+        let entry = lookup("ai.tool.grant_changed").expect("listed");
+        // `effect` is required because the whole event is the direction of the change: a payload
+        // that could carry "no change" would be an event nobody could alert on.
+        assert!(entry.required_fields().iter().any(|f| f.name == "effect" && f.kind == FieldKind::Boolean));
+        assert!(entry.payload_fields.iter().any(|f| f.name == "changed_by" && !f.required));
     }
 
     #[test]

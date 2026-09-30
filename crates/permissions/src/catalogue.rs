@@ -176,6 +176,37 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "ai",
         description: "Create, edit, enable and attach skills",
     },
+    // The tool registry (REQ-100 slice 1). The read/write split is sharper than it looks: reading
+    // the registry shows *what the installation's AI is able to do and under which permission*,
+    // which is already a map of the platform's own capabilities, while `ai.tools.manage` is the
+    // power to change what a model will be permitted to do — the switch that un-gates
+    // `deployment.deploy` or raises a timeout. `ai.tools.manage` is therefore the key an
+    // installation reviews when it asks "who can widen what the agents may touch".
+    PermissionDef {
+        key: "ai.tools.read",
+        category: "ai",
+        description: "Read the AI tool registry, its limits and its usage",
+    },
+    PermissionDef {
+        key: "ai.tools.manage",
+        category: "ai",
+        description: "Enable, gate, limit and time out AI tools",
+    },
+    // The AI identity registry (REQ-100 slice 2). An identity is a *named set of tool grants* a
+    // run borrows, so managing identities is a strictly stronger act than managing tools: the
+    // registry says what a tool costs, an identity says what a particular borrower may reach.
+    // Keeping them apart means the installations that want "anyone may inspect the catalogue,
+    // nobody may hand out grants" can say exactly that.
+    PermissionDef {
+        key: "ai.identities.read",
+        category: "ai",
+        description: "Read AI identities and their tool grants",
+    },
+    PermissionDef {
+        key: "ai.identities.manage",
+        category: "ai",
+        description: "Create, edit and remove AI identities and their grants",
+    },
     // Workflows (docs/requests/REQ-003): the automation surface — definitions, their runs and
     // the steps a run left behind.
     PermissionDef {

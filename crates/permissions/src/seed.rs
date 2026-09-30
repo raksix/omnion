@@ -96,6 +96,12 @@ const BASE_ROLES: &[BaseRole] = &[
             // tools, which is a separate decision from configuring what an agent may do.
             "ai.agents.read",
             "ai.agents.manage",
+            // The tool registry, read-only. An agent manager configures what agents may do, so
+            // they need to SEE which tools exist and what each costs — but granting a tool, or
+            // un-gating `deployment.deploy`, is the owner's call, not the agent manager's. The
+            // read/manage split is what lets this row be honest instead of convenient.
+            "ai.tools.read",
+            "ai.identities.read",
             "workflows.read",
             "workflows.manage",
             "workflows.run",
