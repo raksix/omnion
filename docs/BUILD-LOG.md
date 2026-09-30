@@ -8254,3 +8254,80 @@ on a build box, then the migration for `release_artifacts` / `release_manifests`
 worktrees, per the shared-namespace rule), then `/deployment/artifacts` and
 `/deployment/install`. Slice 2's two remaining Kubernetes lines still need a cluster this box
 does not have.
+
+## 2026-09-30 · omnion-wave6 tick 39 · REQ-128 slice 3 (the pipeline decision layer)
+
+**What.** `release/lib/pipeline.py` — `plan` · `gates` · `dry-run` · `publish-check` — the half of
+the release that decides whether a manifest may be PUBLISHED, plus
+`release/tests/test_release_pipeline.py` (60 tests), `scripts/qa/release-pipeline.sh` (51 checks,
+12 mutations), a CI step for both, and one change to `manifest.py` that reports every missing
+digest in a single refusal.
+
+**Proof.**
+- `bash scripts/qa/release-pipeline.sh` → **51 passed, 0 failed, 12/12 mutations caught**.
+- `python3 release/tests/test_release_pipeline.py` → **60 tests, OK**.
+- `python3 release/tests/test_release_manifest.py` → 46 tests, OK.
+- `bash scripts/qa/release-manifest.sh` → 42 passed, 19/19 mutations (unchanged; still red on
+  the `themes/minimal` finding below).
+- `bash scripts/qa/helm-chart.sh` → 70 passed, 0 failed.
+- `cargo check -p omnion-api --tests` clean · `pnpm typecheck` 2/2.
+- A dry run on this box: **3 of 17 stages produced a real artifact** — the chart (packed, repacked,
+  content digests equal) and both compose stacks (rendered by compose's own parser). The other 14
+  are blocked and carry no digest.
+
+**The property the slice is built around: a blocked stage contributes NO digest.** A dry run that
+supplied a placeholder for the stages it cannot run would produce a complete-looking manifest
+listing four images that were never built — and the manifest builder cannot tell a real digest from
+a fabricated one. `publish-check` reads the absence, refuses synthetic facts outright, and reports
+EVERY reason at once. Mutation 1 breaks exactly this: a mutant that marks a blocked image stage
+`verified` with a `sha256:` is caught.
+
+**`helm package` embeds wall-clock mtimes, so the chart's sha256 changes on every repack.** Not
+assumed — two packs of the same tree, two seconds apart, gave different tarball digests and
+identical member content. So the chart stage packs, repacks and compares a CONTENT digest before
+it will report verified, and the facts carry both digests: bytes for an operator verifying a
+download, contents for proving a rebuild is the same chart.
+
+**Five defects in the credential scanner, and the scanner is the one thing in this slice whose job
+is to stop a credential shipping.** Every one is a check that was not checking, and the first two
+made it report both compose stacks clean while matching nothing:
+- the key pattern used `\b` word boundaries, and `_` is a word character, so it could never match
+  `OMNION_DB_PASSWORD` — the shape every credential key in this repository has;
+- it asked about the KEY only, so `DATABASE_URL: postgres://admin:leaked@db:5432/x` passed, and
+  the pattern's own `DSN` alternative never matched the repo's `OMNION_DATABASE_URL`;
+- the first userinfo rule was too STRICT, which is the more dangerous direction: it flagged this
+  repository's own compose file, which composes `postgres://${USER}:${PASSWORD}@postgres`. A
+  hard-coded username is not a secret, and a check that fires on correct code gets switched off by
+  whoever it annoys;
+- compose's own `${VAR:?message}` form was judged a literal, flagging six correct assignments;
+- a RENDERED document was scanned like a source one. Compose emits flow style
+  (`environment: {A=1, B=2}`), so a line scanner reads the whole block as one pair — 100+ false
+  positives on a clean render, every one a real string from the file and none of it a credential.
+
+**Five more in the gate itself, which is the second half of the story.** A `str.replace` in the
+mutation harness whose target did not exist is a silent no-op, so the harness reported "the rule is
+too weak" when the mutation had never happened — the edit now asserts its own effect. The
+**mutation polarity was inverted**: the harness reads exit 0 as "the rule held", and three bodies
+were written backwards, so mutations that were caught perfectly well reported as SURVIVED. The
+mutations were correct throughout; the harness was reading them upside down. One body evaluated a
+comprehension guarded by `if False` and so asserted about an empty list — a mutation "caught" by a
+check that measured nothing. One was `sys.exit(1 if found else 1)`, which fails either way. One
+raised `NameError` on a missing `import json` and reported as a content failure. Two mutations
+could not fail at all and were deleted rather than kept as decoration.
+
+**`manifest.py`: one missing digest at a time became all of them.** The builder raised on the
+first absence, so a build with no facts named one artifact out of sixteen and the operator learned
+about the other fifteen by re-running it fifteen times. A partial build is the NORMAL state of a
+dry run, so the common case was the slowest one.
+
+**NOT claimed.** No image was built — 14 of 17 stages are blocked because a release build needs
+CPU this box does not have, and they are reported blocked with that reason rather than attempted.
+No tag pipeline, no SBOM, no attestation, no registry digest, and no `/deployment/artifacts` screen.
+The gate stays RED on one real finding: `themes/minimal` declares 0.1.1 while the platform
+releases 0.1.0, and that theme is copied into the shipped admin image. It belongs to wave 2 and the
+condition is on `main` too, so this loop reports it rather than editing it.
+
+**Next.** The `release_artifacts` / `release_manifests` / `environment_bundles` / `upgrade_plans`
+migration, numbered above the 0196 cross-worktree high-water, then `/deployment/artifacts` and
+`/deployment/install`. The tag workflow (`.github/workflows/release.yml`) ships after its dry-run
+mode is proven, which it now is.

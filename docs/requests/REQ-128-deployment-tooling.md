@@ -1,11 +1,14 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slices 1 and 2a shipped previously; **slice 3's manifest half
-> shipped** in `4b477907`: a fake tag produces a 16-artifact manifest, verified by 42 gate
-> checks with 19/19 mutations caught and 46 unit tests. The slice is NOT done — no image was
-> built, no tag pipeline exists and there is no `/deployment/artifacts` screen. The gate is
-> currently RED on one real repository finding: `themes/minimal` declares 0.1.1 while the
-> platform releases 0.1.0, and that theme is copied into the shipped admin image. **slice 2b — the Helm chart — is
+> **Status:** in-progress (slice 3 is now **pipeline + manifest**: the manifest from `4b477907`,
+> and this tick's `release/lib/pipeline.py` adds the decision layer — a plan derived from the
+> repository, a dry run that reports what it could not build, and a publish check that refuses
+> every reason at once. **51 gate checks with 12/12 mutations caught, 60 unit tests.** The slice
+> is still NOT done: no image was built (14 of 17 stages are blocked on a box that cannot do a
+> release build), no tag pipeline exists, and there is no `/deployment/artifacts` screen — those
+> need the `release_manifests` migration REQ-129 owns the number for. The gate remains RED on
+> one real repository finding: `themes/minimal` declares 0.1.1 while the platform releases
+> 0.1.0, and that theme is copied into the shipped admin image. **slice 2b — the Helm chart — is
 > now complete and PROVEN RENDERED**, after the previous tick's chart turned out not to render at
 > all and its stated reason for shipping it unverified was wrong: helm 3.16.3 IS installed here.
 > The images have still NOT been built — a Rust release build needs CPU this box does not have —
@@ -214,6 +217,66 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
   `.github/workflows/release.yml` tag pipeline itself is NOT in this commit: it builds and
   pushes, and a pipeline that cannot be exercised on this box is exactly what the request's
   own risk note warns about shipping unverified. It is slice 3's remaining work.
+
+  **The pipeline's decision layer now ships too** (`release/lib/pipeline.py`, same slice):
+  `plan` · `gates` · `dry-run` · `publish-check`. The plan is **derived from the repository** —
+  the Dockerfiles' runtime stages, `manifest.CLI_PLATFORMS`, the chart, the compose stacks — so
+  a fourth image or a sixth CLI platform appears without anyone editing the file, and the gate
+  cross-checks the plan's image set against `dockerfile_targets()` in both directions.
+
+  **A blocked stage contributes NO digest, and that is the property the whole slice is
+  written around.** A dry run that supplied a placeholder for the fourteen stages it cannot
+  run would produce a complete-looking manifest listing four images that were never built, and
+  the manifest builder cannot tell a real digest from a fabricated one — so `publish-check`
+  reads the absence, and a synthetic facts document is refused outright. Fabricating is the most
+  consequential thing a release pipeline can do, and the mutation suite exists to prove it does
+  not: a mutant that marks a blocked image stage `verified` with a `sha256:` is caught.
+
+  **`helm package` embeds wall-clock mtimes, so a chart's sha256 changes on every repack.**
+  Verified rather than assumed: two packs of the same tree, two seconds apart, produced
+  different tarball digests and identical member content. So the chart stage packs, repacks and
+  compares a **content** digest (names, modes, contents — no mtimes) before it will report
+  `verified`, and the facts carry BOTH digests: bytes for an operator verifying a download,
+  contents for proving a rebuild is the same chart. Publishing only the byte digest makes the
+  chart's digest unreproducible by construction.
+
+  **Gate.** `scripts/qa/release-pipeline.sh` — **51 passed, 0 failed, 12/12 mutations caught**.
+  `release/tests/test_release_pipeline.py` — **60 tests**. `release-manifest.sh` 42 (19/19
+  mutations, unchanged). `helm-chart.sh` 70/70. `cargo check -p omnion-api --tests` clean,
+  `pnpm typecheck` clean. Wired into CI on every commit.
+
+  **Five defects the gate found in its own subject, and five in the gate.** The subject's were
+  the credential scanner — it is worth listing because every one is a check that was not
+  checking, in a scan whose job is to stop a credential shipping:
+
+  - **The key pattern used `\b` word boundaries**, so it never matched `OMNION_DB_PASSWORD`:
+    `_` is a word character, so there is no boundary between `DB_` and `PASSWORD`. Every
+    credential key in this repository has an underscore, so the scan matched **nothing** in
+    either compose stack and reported both clean.
+  - **It asked about the KEY only**, so `DATABASE_URL: postgres://admin:leaked@db:5432/x` —
+    a shipped password — passed, while the pattern's own `DSN` alternative never matched the
+    repository's `OMNION_DATABASE_URL`. The value is now checked structurally.
+  - **The first userinfo rule was too strict, and that direction is the dangerous one:** it
+    flagged this repository's own compose file, which composes
+    `postgres://${USER}:${PASSWORD}@postgres`. A hard-coded *username* is not a secret. The rule
+    became "is the PASSWORD component literal", and a pinned username is legal — a check that
+    fires on correct code gets switched off by whoever it annoys, and then the real leak ships.
+  - **Compose's own `${VAR:?message}` form was judged a literal**, flagging six correct
+    credential assignments in the two stacks. The shell operator's argument is the operator's
+    sentence, not a hard-coded value.
+  - **A rendered document was scanned like a source one.** Compose emits flow style
+    (`environment: {A=1, B=2}`), so a line scanner reads the whole block as one pair: **100+
+    false positives on a clean render**, every one a real string from the file and none of it a
+    credential.
+
+  The gate's own five: a `str.replace` in the mutation harness whose target did not exist was a
+  silent no-op, so it reported "the rule is too weak" when the mutation had never happened; the
+  **mutation polarity was inverted** (the harness reads exit 0 as "the rule held", and three
+  bodies were written backwards — the mutations were correct throughout); one check body
+  evaluated a comprehension guarded by `if False` and so asserted about an empty list; a
+  `sys.exit(1 if found else 1)` that failed either way; and a missing `import json` in a check
+  that therefore raised `NameError` and was reported as a content failure.
+
 - [ ] `/deployment/artifacts` shows digests and checksums that match the published artifacts byte for byte.
 - [ ] A generated compose bundle boots on a clean host from its own files, and a generated Helm values file installs the chart unmodified.
 - [ ] Generated bundles contain secret **references** only — a test greps every generated file for the fixture value and for common secret-shaped strings and finds none.
@@ -356,6 +419,15 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
    tag-driven pipeline itself (`.github/workflows/release.yml`), which builds, pushes and
    attests — none of which can be exercised on a build box, so it ships last and only after
    its dry-run mode exists.
+
+   **The pipeline half shipped too** (`51f04848`, `bcf27509`): `release/lib/pipeline.py`
+   (`plan` · `gates` · `dry-run` · `publish-check`), `release/tests/test_release_pipeline.py`
+   (60 tests) and `scripts/qa/release-pipeline.sh` (**51 checks, 12/12 mutations caught**),
+   both wired into CI. The dry-run mode the previous tick's note said the tag workflow was
+   waiting on now exists and is exercised on every CI run: on this box **3 of 17 stages
+   produce a real artifact** (the chart, packed and repacked to prove reproducibility, and
+   both compose stacks rendered by compose's own parser) and the other 14 are reported
+   blocked with the tool and the reason.
 
    **Why the manifest came before the screens.** The screens render whatever the manifest
    says, so building them first would have meant rendering a hand-written fixture and calling
