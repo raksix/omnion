@@ -139,7 +139,7 @@ const GO_DESTINATIONS: Record<string, string> = Object.fromEntries(
  * several ticks while no listener existed anywhere in the module; they are now real navigations
  * and are exercised by the keyboard pass.)
  */
-const LIST_SHORTCUTS: Shortcut[] = [
+export const LIST_SHORTCUTS: Shortcut[] = [
   { keys: "/", what: "Focus the search" },
   { keys: "j / k", what: "Move to the next / previous row" },
   { keys: "Enter", what: "Open the selected row" },
@@ -151,6 +151,195 @@ const LIST_SHORTCUTS: Shortcut[] = [
   { keys: "g then s", what: "Go to Settings" },
   { keys: "?", what: "Show or hide this sheet" },
 ];
+
+/**
+ * The keyboard contract, as a hook rather than a body inside the frame.
+ *
+ * It used to be written out inside `CrmShell`, which is why `/crm/activities` and `/crm/leads` have
+ * none of it: neither renders the shell (the activity feed is a form with a list beneath it, the
+ * lead inbox carries its own settings), so the contract was reachable only by the screens that
+ * happened to sit inside the one component that inlined it. The shortcut sheet is the **module's**
+ * claim about what a CRM screen listens for, and it was untrue of half the module's screens.
+ *
+ * So the bindings live here once, and a screen that draws its own rows calls this hook. What stays
+ * with the screen is what a row *means*: `onOpen` and `onEdit` are its own functions, because this
+ * hook cannot know what a lead's id is. `Enter` and `e` are both required and are deliberately
+ * allowed to be the same call — a deal on a board has no separate view route, so on every CRM
+ * screen opening a row and editing it are one action, and the sheet promises two keys for it.
+ *
+ * `g` is the "go" prefix: the first key arms it and the second chooses the destination. It is
+ * deliberately **not** a bare letter, because a bare `c`/`o`/`d` has to type into a search box and
+ * edit a row, and a sheet that claims a bare letter nobody listens for is the dead list this file
+ * exists to prevent.
+ */
+export function useCrmKeyboard(props: {
+  /** The rows the cursor may land on, in display order — `j`/`k` count exactly these. */
+  rowIds: string[];
+  /** A ref for the search field, so `/` and the palette can both focus it. */
+  searchRef: React.RefObject<HTMLInputElement | null>;
+  /** Open the row the cursor is on. */
+  onOpen: (id: string) => void;
+  /** Edit the row the cursor is on. */
+  onEdit: (id: string) => void;
+  /** Open the create form. */
+  onCreate: () => void;
+}): {
+  /** The row the cursor is on. */
+  selectedIndex: number;
+  /** Move the cursor to an absolute position. */
+  setSelectedIndex: (value: number) => void;
+  /** Move the cursor by a delta, wrapping at both ends. */
+  select: (delta: number) => void;
+  /** `true` when the sheet is showing. */
+  showShortcuts: boolean;
+  /** Show or hide the sheet — the toolbar's keyboard button calls this. */
+  toggleShortcuts: () => void;
+} {
+  const { rowIds, searchRef, onOpen, onEdit, onCreate } = props;
+  const router = useRouter();
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [pendingG, setPendingG] = useState(false);
+
+  // `j`/`k` wrap at the ends, because a list that stops at the last row leaves a person unsure
+  // whether the list ended or the shortcut did. The toolbar's "move by N" uses this too, so the
+  // wrap rule lives in one place instead of being re-derived by a second caller.
+  const select = useCallback(
+    (delta: number) =>
+      setSelectedIndex((index) =>
+        rowIds.length === 0 ? 0 : (index + delta + rowIds.length) % rowIds.length,
+      ),
+    [rowIds.length],
+  );
+
+  useEffect(() => {
+    if (!pendingG) return;
+    const timer = window.setTimeout(() => setPendingG(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [pendingG]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const typing =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      if (event.key === "/" && !typing) {
+        event.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
+      if (typing) {
+        return;
+      }
+      // The armed `g` is answered before anything else, so a pending prefix cannot leave `d`
+      // looking like an unhandled key.
+      if (pendingG) {
+        const destination = GO_DESTINATIONS[event.key.toLowerCase()];
+        setPendingG(false);
+        if (destination) {
+          event.preventDefault();
+          router.push(destination);
+        }
+        return;
+      }
+      if (event.key === "g") {
+        event.preventDefault();
+        setPendingG(true);
+        return;
+      }
+      if (event.key === "?") {
+        event.preventDefault();
+        setShowShortcuts((open) => !open);
+        return;
+      }
+      if (event.key === "j" || event.key === "ArrowDown") {
+        event.preventDefault();
+        select(1);
+        return;
+      }
+      if (event.key === "k" || event.key === "ArrowUp") {
+        event.preventDefault();
+        select(-1);
+        return;
+      }
+      if (event.key === "n") {
+        event.preventDefault();
+        onCreate();
+        return;
+      }
+      if (event.key === "e") {
+        const id = rowIds[selectedIndex];
+        if (id) {
+          event.preventDefault();
+          onEdit(id);
+        }
+        return;
+      }
+      if (event.key === "Enter") {
+        const id = rowIds[selectedIndex];
+        if (id) {
+          event.preventDefault();
+          onOpen(id);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCreate, onEdit, onOpen, pendingG, router, rowIds, searchRef, select, selectedIndex]);
+  // A filter that leaves no row must not leave the keyboard pointing at a row that is gone.
+  useEffect(() => {
+    if (rowIds.length === 0) {
+      setSelectedIndex(0);
+    } else if (selectedIndex >= rowIds.length) {
+      setSelectedIndex(rowIds.length - 1);
+    }
+  }, [rowIds, selectedIndex]);
+
+  const toggleShortcuts = useCallback(() => setShowShortcuts((open) => !open), []);
+
+  return { selectedIndex, setSelectedIndex, select, showShortcuts, toggleShortcuts };
+}
+
+/** The sheet the `?` key opens, drawn identically by every frame in the module. */
+export function CrmShortcutSheet() {
+  return (
+    <div data-qa="crm-shortcut-sheet" className="border-b border-line bg-canvas/60 px-4 py-3">
+      <p className="pb-2 text-[11.5px] font-medium text-muted">Keyboard</p>
+      <ul className="grid gap-1.5 sm:grid-cols-2">
+        {LIST_SHORTCUTS.map((shortcut) => (
+          <li key={shortcut.keys} className="flex items-center gap-2 text-[12px]">
+            <kbd className="rounded border border-line bg-surface px-1.5 py-0.5 font-mono text-[11px]">
+              {shortcut.keys}
+            </kbd>
+            <span className="text-muted">{shortcut.what}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/** The cursor props for a frame that renders `<li>` rows rather than table rows. */
+export function crmListItemCursor(selected: boolean): {
+  "data-qa-crm-cursor": "true" | "false";
+  "aria-selected": true | undefined;
+  className: string;
+} {
+  return selected
+    ? {
+        "data-qa-crm-cursor": "true",
+        "aria-selected": true,
+        className: "bg-accent-soft/50 ring-1 ring-inset ring-accent/30",
+      }
+    : { "data-qa-crm-cursor": "false", "aria-selected": undefined, className: "" };
+}
 
 /** What the toolbar and the list need from the frame. */
 export type CrmListState = {
@@ -287,8 +476,22 @@ export function CrmShell(props: CrmShellProps) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const searchRef = useRef<HTMLInputElement | null>(null);
-  const [showShortcuts, setShowShortcuts] = useState(false);
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  // The bindings themselves live in `useCrmKeyboard`, because they are the module's claim rather
+  // than this frame's: `/crm/activities` and `/crm/leads` draw their own rows and answer to the
+  // same sheet, and an earlier version inlined the whole contract here, which left those two
+  // screens silently un-keyboardable while the sheet still promised them keys.
+  const requestCreate = useCallback(() => {
+    keyboard.onCreate();
+  }, [keyboard]);
+
+  const { selectedIndex, setSelectedIndex, select, showShortcuts, toggleShortcuts } =
+    useCrmKeyboard({
+      rowIds,
+      searchRef,
+      onOpen: keyboard.onOpen,
+      onEdit: keyboard.onEdit,
+      onCreate: requestCreate,
+    });
   const [columnMenuOpen, setColumnMenuOpen] = useState(false);
 
   const search = searchParams.get("search") ?? "";
@@ -333,9 +536,6 @@ export function CrmShell(props: CrmShellProps) {
   // did not carry. That is the shape of a dead control: it is declared, it is typed, it is put on
   // the context where a reader would look for it, and nothing ever reads it. `n` used to set it
   // *and* call `onCreate`, so the create form opened twice over on any screen that also read it.
-  const requestCreate = useCallback(() => {
-    keyboard.onCreate();
-  }, [keyboard]);
 
   // `Enter` and `e` are the same call: a deal on a board has no separate view route, so opening a
   // row and editing it are one action, and a contacts list routes both to its own editor.
@@ -355,108 +555,6 @@ export function CrmShell(props: CrmShellProps) {
     },
     [columns, setParam],
   );
-
-  // `g` is the "go" prefix the spec asks for (`g c` contacts, `g d` deals): the first key arms the
-  // prefix and the second key chooses the destination. It is deliberately **not** a bare letter,
-  // because a bare `c`/`o`/`d` has to type into a search box and edit a row, and a sheet that
-  // claimed a bare letter nobody listens for is exactly the dead list this file just stopped
-  // printing. The arm expires after a moment, so an abandoned prefix does not swallow the next
-  // keystroke of a person who typed `g` by accident.
-  const [pendingG, setPendingG] = useState(false);
-  useEffect(() => {
-    if (!pendingG) return;
-    const timer = window.setTimeout(() => setPendingG(false), 1200);
-    return () => window.clearTimeout(timer);
-  }, [pendingG]);
-
-  // The keyboard contract. `j`/`k` wrap at the ends, because a list that stops at the last row
-  // leaves a person unsure whether the list ended or the shortcut did.
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const typing =
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.tagName === "SELECT" ||
-          target.isContentEditable);
-      if (event.metaKey || event.ctrlKey || event.altKey) {
-        return;
-      }
-      if (event.key === "/" && !typing) {
-        event.preventDefault();
-        searchRef.current?.focus();
-        return;
-      }
-      if (typing) {
-        return;
-      }
-      // The armed `g` is answered before anything else, so a pending prefix cannot leave `d`
-      // looking like an unhandled key.
-      if (pendingG) {
-        const destination = GO_DESTINATIONS[event.key.toLowerCase()];
-        setPendingG(false);
-        if (destination) {
-          event.preventDefault();
-          router.push(destination);
-        }
-        return;
-      }
-      if (event.key === "g") {
-        event.preventDefault();
-        setPendingG(true);
-        return;
-      }
-      if (event.key === "?") {
-        event.preventDefault();
-        setShowShortcuts((open) => !open);
-        return;
-      }
-      if (event.key === "j" || event.key === "ArrowDown") {
-        event.preventDefault();
-        setSelectedIndex((index) => (rowIds.length === 0 ? 0 : (index + 1) % rowIds.length));
-        return;
-      }
-      if (event.key === "k" || event.key === "ArrowUp") {
-        event.preventDefault();
-        setSelectedIndex((index) =>
-          rowIds.length === 0 ? 0 : (index - 1 + rowIds.length) % rowIds.length,
-        );
-        return;
-      }
-      if (event.key === "n") {
-        event.preventDefault();
-        requestCreate();
-        return;
-      }
-      if (event.key === "e") {
-        const id = rowIds[selectedIndex];
-        if (id) {
-          event.preventDefault();
-          keyboard.onEdit(id);
-        }
-        return;
-      }
-      if (event.key === "Enter") {
-        const id = rowIds[selectedIndex];
-        if (id) {
-          event.preventDefault();
-          keyboard.onOpen(id);
-        }
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [keyboard, pendingG, requestCreate, router, rowIds, selectedIndex]);
-
-  // A filter that leaves no row must not leave the keyboard pointing at a row that is gone.
-  useEffect(() => {
-    if (rowIds.length === 0) {
-      setSelectedIndex(0);
-    } else if (selectedIndex >= rowIds.length) {
-      setSelectedIndex(rowIds.length - 1);
-    }
-  }, [rowIds, selectedIndex]);
 
   // Move the cursor into view, so `j` past the bottom of the screen follows the eye. `nearest`
   // scrolls only when the row is actually out of view, which is what keeps a person reading the
@@ -498,10 +596,7 @@ export function CrmShell(props: CrmShellProps) {
     columns,
     setColumns: (next) => setParam("columns", next.join(",")),
     statuses,
-    select: (delta) =>
-      setSelectedIndex((index) =>
-        rowIds.length === 0 ? 0 : (index + delta + rowIds.length) % rowIds.length,
-      ),
+    select,
     selectedIndex,
     setSelectedIndex,
     requestCreate,
@@ -652,7 +747,7 @@ export function CrmShell(props: CrmShellProps) {
 
             <button
               type="button"
-              onClick={() => setShowShortcuts((open) => !open)}
+              onClick={toggleShortcuts}
               aria-label="Keyboard shortcuts"
               className="rounded-lg border border-line p-2 text-muted transition hover:text-ink"
             >
@@ -672,24 +767,7 @@ export function CrmShell(props: CrmShellProps) {
           </div>
         </div>
 
-        {showShortcuts ? (
-          <div
-            data-qa="crm-shortcut-sheet"
-            className="border-b border-line bg-canvas/60 px-4 py-3"
-          >
-            <p className="pb-2 text-[11.5px] font-medium text-muted">Keyboard</p>
-            <ul className="grid gap-1.5 sm:grid-cols-2">
-              {LIST_SHORTCUTS.map((shortcut) => (
-                <li key={shortcut.keys} className="flex items-center gap-2 text-[12px]">
-                  <kbd className="rounded border border-line bg-surface px-1.5 py-0.5 font-mono text-[11px]">
-                    {shortcut.keys}
-                  </kbd>
-                  <span className="text-muted">{shortcut.what}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
+        {showShortcuts ? <CrmShortcutSheet /> : null}
 
         {children}
 
