@@ -1585,15 +1585,17 @@ pub fn router(state: AppState) -> Router {
         // Conversion is its own key, not `crm.leads.manage`: turning a lead into a contact,
         // an opportunity and eventually a customer is a promise to somebody outside the
         // panel, and a support agent who may edit a lead row has no business making that
-        // promise. The flow read is `crm.leads.read` — a panel that cannot ask "what can
-        // this deployment do" renders a stepper nobody can act on.
+        // promise.
+        //
+        // There is deliberately no `/crm/leads/flow` here. It answered "which of the flow's
+        // modules is installed" as a second read, and the stepper never made it: the lead
+        // detail already returns the four steps computed, each `Blocked` step naming the
+        // module it is waiting for. A second read of the same fact is a second place the
+        // answer and the screen can disagree, and a client free to prefer it is a client
+        // free to render a stepper the server did not write.
         .route(
             "/crm/leads/{id}/convert",
             post(crm_intake::convert).layer(guards::require(&state, "crm.leads.convert")),
-        )
-        .route(
-            "/crm/leads/flow",
-            get(crm_intake::flow).layer(guards::require(&state, "crm.leads.read")),
         )
         // The hand-over roster. `crm.leads.read`, not `crm.leads.assign`: the inbox already
         // shows who owns what, and a screen that shows an owner column while hiding the list

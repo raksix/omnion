@@ -124,13 +124,6 @@ export type LeadConversion = {
   deal_skipped: string | null;
 };
 
-/** Which of the documented flow's modules this deployment actually has. */
-export type LeadFlow = {
-  crm: boolean;
-  sales: boolean;
-  commerce: boolean;
-};
-
 /** One page of the inbox, with the counters from the same read. */
 export type LeadInbox = {
   leads: Lead[];
@@ -407,11 +400,6 @@ export type LeadOwner = {
  */
 export function fetchLeadOwners(): Promise<LeadOwner[]> {
   return request<LeadOwner[]>("/api/v1/crm/leads/owners");
-}
-
-/** What this deployment can do with the documented flow, so the stepper can say so. */
-export function fetchLeadFlow(): Promise<LeadFlow> {
-  return request<LeadFlow>("/api/v1/crm/leads/flow");
 }
 
 /** Refuse a lead, keeping the row and the reason the API demands. */

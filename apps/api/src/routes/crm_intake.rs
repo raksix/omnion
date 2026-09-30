@@ -1089,10 +1089,7 @@ pub async fn get_lead(
     // itself would be the second place the two can disagree. The plan is taken *before*
     // `LeadDetailBody::from` consumes the row — a `From` impl that owns its input cannot
     // lend it back, which is the same half-move trap its own body documents.
-    let availability = omnion_module_crm_intake::Availability {
-        sales: table_exists(pool, "sales_quotes").await,
-        commerce: table_exists(pool, "commerce_customers").await,
-    };
+    let availability = module_availability(pool).await;
     let steps = omnion_module_crm_intake::step_plan(&lead, availability)
         .into_iter()
         .map(|step| StepBody {
@@ -1421,29 +1418,23 @@ impl From<LeadOwner> for LeadOwnerBody {
     }
 }
 
-/// Which of the documented flow's modules this deployment actually has.
+/// Whether the modules the documented flow's *later* steps need are on this installation.
 ///
-/// The stepper asks this rather than asserting what it can do. The answer is read from the
-/// database — the CRM tables are REQ-051's and live on another branch, so "is the CRM
-/// installed" is a question about the installation, not a constant.
-#[derive(Debug, Serialize)]
-pub struct FlowAvailability {
-    /// Whether `crm_contacts` exists.
-    pub crm: bool,
-    /// Whether the sales module (REQ-052) exists.
-    pub sales: bool,
-    /// Whether the commerce module (REQ-008) exists.
-    pub commerce: bool,
-}
-
-impl FlowAvailability {
-    /// The module's own [`Availability`], for the pure step plan.
-    #[must_use]
-    pub fn to_module(self) -> omnion_module_crm_intake::Availability {
-        omnion_module_crm_intake::Availability {
-            sales: self.sales,
-            commerce: self.commerce,
-        }
+/// The stepper does not ask for this as its own read: `GET /api/v1/crm/leads/{id}` already
+/// returns the four steps **computed**, each carrying a note that names the missing module, so
+/// a client assembling the stepper would be a second place the answer and the screen can
+/// disagree. This is the one place that answer is built, and it is built twice over — once
+/// here for the step plan and once for the `Blocked` note's wording — from the same
+/// `table_exists` lookups, because a `Blocked` step whose text names a module the plan did
+/// not consider is the one inconsistency an operator cannot act on.
+///
+/// The `crm` field is the deliberate asymmetry: `crm_contacts` is this module's own table and
+/// `convert` writes it, so its absence is a deployment error to repair rather than a feature
+/// to route around, and no step degrades on it.
+async fn module_availability(pool: &sqlx::PgPool) -> omnion_module_crm_intake::Availability {
+    omnion_module_crm_intake::Availability {
+        sales: table_exists(pool, "sales_quotes").await,
+        commerce: table_exists(pool, "commerce_customers").await,
     }
 }
 
@@ -1647,25 +1638,6 @@ pub async fn owners(
         .await
         .map_err(map_store)?;
     Ok(Json(rows.into_iter().map(LeadOwnerBody::from).collect()))
-}
-
-/// `GET /api/v1/crm/leads/flow` — which steps of the documented flow this deployment can run.
-///
-/// The stepper used to be four hard-coded strings saying the buttons do not exist, which is
-/// the "a disabled control without explanation" the QA plan forbids: the panel could not tell
-/// "not built yet" from "not installed here". This answers it from the database.
-pub async fn flow(
-    State(state): State<AppState>,
-    // The extractor is what makes the route authenticated — dropping it would turn a
-    // tenant-shape probe into a public endpoint. The session itself is not read: the
-    // answer is about the deployment, not about the caller.
-    _session: CurrentSession,
-) -> Result<Json<FlowAvailability>, ApiError> {
-    Ok(Json(FlowAvailability {
-        crm: table_exists(state.db().pool(), "crm_contacts").await,
-        sales: table_exists(state.db().pool(), "sales_quotes").await,
-        commerce: table_exists(state.db().pool(), "commerce_customers").await,
-    }))
 }
 
 /// `true` when a table is there.

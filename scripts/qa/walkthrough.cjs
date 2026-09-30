@@ -5534,25 +5534,19 @@ async function runCrmIntakeDepth(page, report) {
     opportunityState === "done" ||
     (opportunityState === "current" && /not installed|no sales pipeline/i.test(steps.convertResult));
 
-  // The flow probe, which is what makes the stepper's `blocked` state truthful: it answers
-  // from the database whether the CRM, sales and commerce tables are there, and the
-  // stepper's note must agree with it. A stepper that says "not installed" over an
-  // installed module (or the reverse) is a panel telling the operator something false.
-  const flow = await page.evaluate(() =>
-    fetch("/api/v1/crm/leads/flow", { credentials: "same-origin" })
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null),
-  );
-  steps.flow = flow;
-  steps.stepperAgreesWithFlow = await page.evaluate((crm) => {
-    const opportunity = document.querySelector(
-      '[data-conversion-stepper] [data-step=opportunity]',
-    );
-    const note = opportunity?.textContent ?? "";
-    // With the CRM absent the opportunity cannot complete, and the stepper must not claim it
-    // did; with it present the conversion produces a deal and the step reads `done`.
-    return crm ? true : !/Deal created/.test(note);
-  }, Boolean(flow?.crm));
+  // The stepper's `blocked` state is only truthful if it says *what* it is waiting for. This
+  // used to be cross-checked against `GET /crm/leads/flow` — a second read of the same fact,
+  // which the stepper never made and which has been removed along with the duplication. A
+  // probe that answers `null` for an endpoint that no longer exists would leave the assertion
+  // vacuously true, so it is replaced with the property the endpoint was standing in for: a
+  // step the server blocks must name the module that would unblock it, because "Blocked" with
+  // no remedy is a disabled control without an explanation.
+  steps.flow = null;
+  steps.blockedStepsNameTheirModule = await page.evaluate(() => {
+    const blocked = [...document.querySelectorAll("[data-conversion-stepper] [data-state=blocked]")];
+    if (blocked.length === 0) return false; // a pass that never sees a blocked step proves nothing
+    return blocked.every((el) => /REQ-\d+|not installed|module/i.test(el.textContent ?? ""));
+  });
 
   // 6. The duplicate queue. A second source with the `reject_duplicate` policy files the row
   //    instead of linking it, which is the only way a row reaches this screen.
