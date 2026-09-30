@@ -5238,3 +5238,60 @@ inline result. The drawer rows are now *provable by a walk* rather than by a bro
 deliveries exist — so the next quiet-box tick should run `bash scripts/qa/run.sh` with
 `QA_ONLY=notifications,notifications-outbox,notifications-settings`, then close REQ-021 and move
 to REQ-014 (system health, still `pending`).
+
+## Tick 77 addendum — the box ran out of disk mid-verification (named, not worked around)
+
+The 8/8 green run above is real and was measured. Everything red *after* it, in this tick and
+across two re-runs, is the same environmental failure and no product defect:
+
+```
+could not create directory "base/12250615": No space left on device
+code 53100, could not extend file "base/12245557/12250419"
+```
+
+`df` at that moment:
+
+| Filesystem | Size | Avail | Use% |
+|---|---|---|---|
+| `/` (PostgreSQL's `data_directory` = `/var/lib/postgresql/16/main`) | 123G | 3.0G | **98%** |
+| `/mnt/apopic` (all ten writers' worktrees and `target`s) | 60G | **0** | **100%** |
+
+**This is shared, so it is reported and not worked around.** Reclaiming it means deleting build
+output that nine sibling writers are compiling *right now* — the loop discipline is explicit that
+a writer may only reclaim its own `target`, and my own `target/debug/incremental` is 58M, which
+would not change a 3.0G/0-byte situation. The 14 orphaned `omnion_notifdel_*` scratch databases
+that earlier walks left behind when a run was interrupted mid-`dispose` are already gone (the
+walks do drop them; the ones that leaked were killed by the box, not by a missing cleanup).
+
+**What this costs the next tick, stated plainly:** `notification_delivery` is green on the code
+as committed and re-runs will stay red until the disk recovers, so *the walk is not a usable gate
+on this box unt
+## Tick 77 addendum — the box ran out of disk mid-verification (named, not worked around)
+
+The 8/8 green run above is real and was measured. Everything red *after* it, in this tick and
+across two re-runs, is the same environmental failure and no product defect:
+
+```
+could not create directory "base/12250615": No space left on device
+code 53100, could not extend file "base/12245557/12250419"
+```
+
+`df` at that moment:
+
+| Filesystem | Size | Avail | Use% |
+|---|---|---|---|
+| `/` (PostgreSQL's `data_directory` = `/var/lib/postgresql/16/main`) | 123G | 3.0G | **98%** |
+| `/mnt/apopic` (all ten writers' worktrees and `target`s) | 60G | **0** | **100%** |
+
+**This is shared, so it is reported and not worked around.** Reclaiming it means deleting build
+output that nine sibling writers are compiling *right now*; the loop discipline is explicit that
+a writer may only reclaim its own `target`, and this tick reclaimed only its own
+`target/debug/incremental` (58M, after the three checks: no open file descriptors, no write in
+the last 20 minutes, its own directory). The 14 orphaned `omnion_notifdel_*` scratch databases
+are already gone — the walks do drop them; the ones that leaked were killed by the box mid-run,
+not by a missing cleanup, and the next run found zero of them.
+
+**What this costs the next tick, stated plainly:** `notification_delivery` is green on the code
+as committed, but re-runs stay red until the disk recovers, so **the walk is not a usable gate on
+this box until then** — treat a `53100` as environmental and read the assertion line above it for
+the real verdict. `omnion-notifications --lib` (90/0) needs no database and is unaffected.
