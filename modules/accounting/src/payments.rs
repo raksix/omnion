@@ -434,11 +434,18 @@ pub async fn record_payment(
     let mut requested: Vec<(Uuid, Amount)> = Vec::new();
     for line in &new.allocations {
         // `amount` is a `String`, not an `Option<String>`: serde already let a missing field go as
-        // the empty string, so there is nothing to `as_deref()` here — an empty row is the empty
-        // row the recorder's grid leaves behind and it is dropped.
-        let Some(raw) = line.amount.trim().is_empty().then_some(()).map(|_| line.amount.trim()) else {
+        // the empty string, so there is nothing to `as_deref()` here. A row whose amount is blank
+        // is **dropped**, not refused — the recorder's grid leaves one behind every time a picker
+        // is cleared, and an empty row should not block the real one next to it.
+        //
+        // Written with an `if`, not `bool::then_some`: the question "is this row blank?" and the
+        // `continue` that follows it are two separate statements, and a one-liner combining them
+        // inverts silently — which is exactly what the first run of this walk caught, as 12
+        // failures all carrying the same "no allocations" message.
+        let raw = line.amount.trim();
+        if raw.is_empty() {
             continue;
-        };
+        }
         let value = parse_required_amount(Some(raw), "payment_allocation", "amount")?;
         if value.is_zero() {
             continue;
@@ -1005,7 +1012,7 @@ pub async fn get_payment(
 ) -> Result<PaymentView> {
     let row = sqlx::query(
         "select p.id, p.number, p.customer_name, p.paid_on, p.method, p.amount::text as amount, \
-                p.currency, p.reference, p.journal_entry_id, p.reversed_at, p.recorded_by, \
+                p.currency, p.reference, p.journal_entry_id, p.reversed_at, p.created_by, \
                 p.created_by, p.created_at, \
                 coalesce((select sum(a.amount)::text from accounting_payment_allocations a \
                           where a.payment_id = p.id), '0') as allocated, \
@@ -1047,12 +1054,14 @@ pub async fn get_payment(
         allocation_state: AllocationState::Unallocated,
         journal_entry_id: row.get("journal_entry_id"),
         reversed: row.get::<Option<OffsetDateTime>, _>("reversed_at").is_some(),
-        // `created_by` is the recording user on every row; `recorded_by` is the migration's name
-        // for the same thing. Both are read so a row written by either version names somebody,
-        // and the type is annotated because `.or_else()` cannot infer it from the two `get`s.
-        recorded_by: row
-            .get::<Option<Uuid>, _>("created_by")
-            .or(row.get::<Option<Uuid>, _>("recorded_by")),
+        // Only `created_by` exists on this table: the REQ's data model names the field
+        // `recorded_by` and migration `0167` wrote `created_by`, and I had hedged by reading both
+        // "so a row written by either version names somebody". **A hedge over a column that was
+        // never two columns is a panic, not a compatibility layer** — `row.get` on an alias the
+        // SELECT does not list is `ColumnNotFound` at runtime, not `None`, and it took the whole
+        // suite down with one line. The type annotation is here because the plain `row.get` has
+        // nothing to infer from.
+        recorded_by: row.get::<Option<Uuid>, _>("created_by"),
         created_at: row.get("created_at"),
     };
     summary.unallocated = remaining_text(&summary.amount, &summary.allocated)?;
@@ -1129,7 +1138,7 @@ pub async fn list_payments(
     // already written further down.
     let mut query = sqlx::QueryBuilder::<Postgres>::new(
         "select p.id, p.number, p.customer_name, p.paid_on, p.method, p.amount::text as amount, \
-                p.currency, p.reference, p.journal_entry_id, p.reversed_at, p.recorded_by, \
+                p.currency, p.reference, p.journal_entry_id, p.reversed_at, p.created_by, \
                 p.created_by, p.created_at, \
                 coalesce((select sum(a.amount)::text from accounting_payment_allocations a \
                           where a.payment_id = p.id), '0') as allocated \
