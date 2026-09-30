@@ -9168,3 +9168,52 @@ and the tick was spent on the check that found the red instead.
 --test health_probes` against a live PostgreSQL, then the browser pass when the QA slot frees.
 Slice 3 (incidents + thresholds) is untouched.
 
+
+
+### What the void verdict finally named (tick 48, second half)
+
+The pass that ran on the private target dir did what tick 47 built it to do: it refused to report
+a result, and it left behind the one thing five ticks of queueing had been missing — a *reason*.
+`summary.json` had a single field:
+
+```
+fatal: Error: page.goto: Navigation to "http://127.0.0.1:3103/login" is interrupted
+        by another navigation to "http://127.0.0.1:3103/"
+```
+
+Five writers' passes had queued for five ticks on "the QA slot is held" and on a null pass, and
+the actual blocker was a missing `.catch(() => {})` on **one** of 157 navigations. Playwright
+raises an interrupted navigation as **fatal**, not as a recoverable timeout, so `run.sh` recorded
+the run, the walk produced no screenshots and no results, and `passIsVoid()`'s exit 1 was the
+only honest thing left to say. It was honest and it was **inert**: a verdict that cannot name the
+leg is a verdict that sends the next tick back to the queue.
+
+**Fixed** (`10800224`): the `/login` hop in `ensureSignedIn` and the `/` hop in `runWizard` — the
+two navigations the app's own router redirects — now tolerate losing. The two *reachability*
+probes (`admin/login` at line 8965, the public site at 9707) keep their errors on purpose, because
+a pass whose every navigation is swallowed cannot report a dead stack at all. That distinction is
+the whole rule, and it is why the check is not "every `goto` is caught".
+
+**Proof.** `scripts/qa/walkthrough-navigation-probe.cjs` reads the shipped file and classifies all
+**157** navigations: 4/4 PASS, including "every non-probe navigation (155) tolerates an
+interrupted redirect" and "the pass still has a reachability probe whose error it can report".
+Against the pre-fix file the same probe is **2 failures naming lines 601 and 740** — the exact
+lines, not approximations.
+
+**The probe needed three versions, and the two dead ends are the lesson.** v1 scanned line by
+line and reported four phantom failures, three of which were guarded on the *next* line. v2 kept a
+running paren buffer across the file and reported **64 of 154** navigations — a checker that has
+lost most of what it is checking will happily go green: v2 passed the pre-fix file 4/4, which is
+the worst possible result for a probe. v3 reads each call **forwards** from its own line until its
+parentheses balance. The check that caught it was not a test case but running the probe against
+the broken file: a checker that cannot fail is not a checker, and the moment to run it against the
+broken input is before it is trusted, not after.
+
+**Gates.** `node --check scripts/qa/walkthrough.cjs` OK, `node --check
+scripts/qa/walkthrough-navigation-probe.cjs` OK, the probe 4/4 (and 2 failures pre-fix),
+`cargo test -p omnion-module-crm --lib` **172 passed; 0 failed**, `pnpm turbo run typecheck` **2/2**.
+
+**Next.** The pass re-ran on the fix; if it produces a `summary.json` with results rather than a
+`fatal`, the 390×844 and keyboard boxes can be read off it. The ledger's standing warning applies
+to this tick's own evidence: the probes are static checks of structure, and a structural check is
+not a screenshot. The walk is still the only thing that can tick those two boxes.
