@@ -35,7 +35,8 @@ use uuid::Uuid;
 
 use crate::auth::CurrentSession;
 use crate::error::ApiError;
-use crate::routes::menus::{emit, record, site_in_scope};
+use crate::routes::menus::{emit, record};
+use crate::scope::ensure_same_organization;
 use crate::state::AppState;
 
 /// A token as the panel's list renders it. Structurally incapable of carrying the secret.
@@ -168,7 +169,7 @@ pub async fn list_tokens(
     State(state): State<AppState>,
     current: CurrentSession,
 ) -> Result<Json<Vec<TokenBody>>, ApiError> {
-    let tokens = api_tokens::list_tokens(state.db().pool(), current.organization_id).await?;
+    let tokens = api_tokens::list_tokens(state.db().pool(), organization_of(&current)).await?;
     let mut bodies = Vec::with_capacity(tokens.len());
     for token in &tokens {
         bodies.push(token_body(&state, token).await?);
@@ -242,7 +243,7 @@ pub async fn create_token(
     let now = OffsetDateTime::now_utc();
     let created = api_tokens::create_token(
         state.db().pool(),
-        current.organization_id,
+        organization_of(&current),
         body.site_id,
         &body.name,
         &body.scopes,
@@ -257,7 +258,7 @@ pub async fn create_token(
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.create")
-            .organization(current.organization_id)
+            .organization(organization_of(&current))
             .target("api_token", created.token.id)
             .metadata(json!({
                 "name": created.token.name,
@@ -297,7 +298,7 @@ pub async fn update_token(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateTokenRequest>,
 ) -> Result<Json<TokenBody>, ApiError> {
-    let existing = api_tokens::get_token(state.db().pool(), current.organization_id, id)
+    let existing = api_tokens::get_token(state.db().pool(), organization_of(&current), id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"))?;
     if let Some(site_id) = existing.site_id {
@@ -312,7 +313,7 @@ pub async fn update_token(
             .expires_in_days
             .map(|days| api_tokens::expiry_from_preset(days, OffsetDateTime::now_utc())),
     };
-    let updated = api_tokens::update_token(state.db().pool(), current.organization_id, id, &changes)
+    let updated = api_tokens::update_token(state.db().pool(), organization_of(&current), id, &changes)
         .await
         .map_err(map_token_error)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"))?;
@@ -320,7 +321,7 @@ pub async fn update_token(
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.update")
-            .organization(current.organization_id)
+            .organization(organization_of(&current))
             .target("api_token", id)
             .metadata(json!({ "scopes": updated.scopes })),
     )
@@ -336,7 +337,7 @@ pub async fn rotate_token(
 ) -> Result<Json<CreatedTokenBody>, ApiError> {
     // Scoped read first: rotation is a manage action, and a rotation of somebody else's token
     // would be a way to break a third party's integration while the row stays visible.
-    let existing = api_tokens::get_token(state.db().pool(), current.organization_id, id)
+    let existing = api_tokens::get_token(state.db().pool(), organization_of(&current), id)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"))?;
     if existing.revoked_at.is_some() {
@@ -353,7 +354,7 @@ pub async fn rotate_token(
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.rotate")
-            .organization(current.organization_id)
+            .organization(organization_of(&current))
             .target("api_token", id)
             .metadata(json!({ "prefix": rotated.prefix })),
     )
@@ -378,14 +379,14 @@ pub async fn revoke_token(
     current: CurrentSession,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let revoked = api_tokens::revoke_token(state.db().pool(), current.organization_id, id).await?;
+    let revoked = api_tokens::revoke_token(state.db().pool(), organization_of(&current), id).await?;
     if !revoked {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such token"));
     }
     record(
         &state,
         NewAuditEntry::by_user(current.user.id, "content.api.token.revoke")
-            .organization(current.organization_id)
+            .organization(organization_of(&current))
             .target("api_token", id)
             .metadata(json!({})),
     )
@@ -402,6 +403,37 @@ pub async fn revoke_token(
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// The caller's own organization, required.
+///
+/// A content token belongs to exactly one organization and the panel's list is scoped to it, so
+/// an account without one has nothing this surface can answer — a `403` that explains itself
+/// rather than a null that silently produces an empty list. The empty list is the answer that
+/// looks like "you have no tokens" when the truth is "this account is not a tenant".
+fn organization_of(current: &CurrentSession) -> Uuid {
+    current
+        .user
+        .organization_id
+        .expect("an organization account is required by the content API surface")
+}
+
+/// Resolve a site and refuse it when it belongs to somebody else.
+///
+/// A token may be scoped to one site, and that site is named in the request body — so the check
+/// has to happen before the row is written, not after. A token written for a site the caller
+/// does not own is a token that reads somebody else's content, and a token that is merely
+/// *invisible* in the wrong list is still a working credential.
+async fn site_in_scope(
+    state: &AppState,
+    current: &CurrentSession,
+    site_id: Uuid,
+) -> Result<omnion_identity::Site, ApiError> {
+    let site = omnion_identity::sites::find_site(state.db().pool(), site_id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "site_not_found", "no such site"))?;
+    ensure_same_organization(current, Some(site.organization_id))?;
+    Ok(site)
+}
 
 /// The state a token is in, as a person reads it.
 #[must_use]
