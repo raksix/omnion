@@ -6773,3 +6773,70 @@ Rust walks (5/5) prove the API and the store, not the rendering.
 **Next.** (1) The QA pass on both reliability screens — take the slot when it frees. (2) Slice 3:
 `retry_policies` / `retry_outcomes` store, the scheduler with its persisted next-attempt time, the
 breaker store and state machine on a real outbound call, both screens.
+## Tick 28 · REQ-127 slice 3, first half — the stores that remember
+
+**Merge first.** `origin/main` was 17 commits ahead and touched three of my files. Two of the
+three conflicts were main's fixes and I took theirs wholesale: `qa-slot.sh` (a holder file with
+two pids on one line failed `kill -0`, so the place was judged ownerless and reclaimed *while its
+owner was still running* — and became unreclaimable by its owner, which is how a queue deadlocks)
+and `run.sh` (the `QA_ONLY` route filter, the `.next` cleanup, `--update-env`, the CSRF default).
+`walkthrough.cjs` was the opposite: main had the `wants()`/`matchedOnly` skeleton and ZERO of my
+observability, secrets or reliability depth functions, so I grafted mine onto main's file with
+each registration behind `wants()` — main's file *plus* my depth passes is the union neither side
+had. The append-only BUILD-LOG merge was verified by **multiset, not line count**: 1,859 lines
+from mine and 195 from main's, 0 missing in the result. Line counting would have hidden a dropped
+block; last tick it silently lost 112.
+
+**What shipped.** `crates/reliability/src/retry_store.rs` and `breaker_store.rs`, with nine walks in
+`apps/api/tests/reliability_retry_breaker_store.rs`. The state machines (`retry.rs`, `breaker.rs`)
+were already pure and unit-tested; what was missing is the half that remembers, and every property
+the request asks for is a property of these two files:
+
+- a retry survives a restart because `record_outcome` writes `next_attempt_at` in the SAME
+  statement as the outcome, and `next_attempt_time` / `attempt_count` are what a restarted worker
+  asks — a scheduler counting attempts in a field it owns loses the count with the process;
+- an exhausted sequence is ONE dead letter, asserted by counting the flagged rows rather than
+  checking the returned row is flagged, because a store that wrote the flag twice still returns a
+  flagged row;
+- a restart does not reset an open breaker, because `load` returns the persisted state. A state
+  recomputed from `opened_at` would close itself when the cooldown elapsed with nobody watching;
+- a healthy provider writes no event — `an_observation_that_changes_nothing_writes_no_event` is the
+  walk that fails if the event write ever becomes unconditional, and it also asserts the counters
+  still move, because `observe` saves state with or without an event;
+- `force_open` sets a COLUMN the machine checks before every other rule, so a drained provider
+  survives every success; a reset that only wrote `state` would leave the flag set forever.
+
+Two decisions stated rather than implied: `retry_now` **appends** an attempt instead of clearing
+the flag on the old one, because a timeline the retry erased is a sequence with no failure in it;
+and `load_timeline` orders by `attempt`, not `created_at`, because `now()` is transaction-stable and
+every attempt of one replayed transaction shares a timestamp.
+
+**Proof.** `cargo build -p omnion-reliability` exit 0. `cargo test -p omnion-reliability --lib`
+**114 passed / 0 failed**. `cargo test -p omnion-api --lib` **276 passed / 0 failed** (post-merge
+gate). The nine store walks are **written and compiling, not yet run** — see the blocker.
+
+**Two defects the compiler found, both real.** `ReliabilityError::internal` does not exist (the
+enum has `Database(#[from] sqlx::Error)`), and `state_counts` returned a bare
+`sqlx::Error` because `count(*)` is `int8` and the tuple decoder wants `(String, i64)` — the cast
+belongs in the SQL. Neither is visible in a type-checked signature; both are a green build and a
+500 on first request.
+
+**Blocker: the walks did not run, and the reason is the box.** The first attempt died with
+`rustc-LLVM ERROR: IO failure on output stream: No space left on device` — `/` was down to **76 MB**
+with 25.6 GB of 32 GB swap in use and load 100-108. Reclaiming was mine to do and mine only: 1,078
+duplicate rlib/rmeta in my own `/opt/omnion-w6-target/debug/deps` (newest of each hash pair kept),
+604 MB, `/` 100% → 99% with 1.3 GB free. The second attempt is compiling from scratch, because
+deleting a duplicate the fingerprint still wanted costs a rebuild — a reclaim that frees space and
+then spends it again, which is worth knowing before doing it in a hurry.
+
+**The QA browser pass is deferred AGAIN, and this time main handed me the instrument for it.**
+`QA_ONLY=<route>` narrows a pass to named routes, which is exactly the tool for a loop that has just
+built two screens and needs them proven before the tick ends. It is not being run this tick because
+the box is still at load 82-108 with 886 MB free RAM and 106 chrome processes under
+`/mnt/apopic/turkmanga` — a pass in that state measures the box. The route list carries both
+reliability routes and the four observability depth passes.
+
+**Next.** (1) Finish the store walks and tick the slice-3 acceptance boxes they prove. (2) The
+scheduler itself — the thing that reads `next_attempt_time` and calls `next_attempt`, which is the
+remaining half of slice 3. (3) The retry and breaker screens. (4) The QA pass, focused, with
+`QA_ONLY`.
