@@ -5893,3 +5893,18 @@ retry storm to 11 last tick).
 whose only defect is a switch, asserting the panel names the Condition alternative rather than
 "does not project onto a step". Then the `listener` row and `tab-walk`'s `reachedAnEdge:false`,
 both of which need a node selected first.
+
+**The pass reached the walkthrough after four blocked ticks, and is stalling in a box that has no
+memory left.** `omnion_api` built (8m48s), the stack came up on the private ports, the wizard ran,
+and the walk walked `overview → pages → media → automations → … → media-settings`. From there it
+made no progress for ~25 minutes: `page.screenshot: Timeout 15000ms exceeded` on every shot, and
+`page.evaluate: Execution context was destroyed` on `media-trash`. `free -g` reads **31 used /
+32 total, 0 available** throughout — sibling writers' cargo builds, not this change. The builder
+routes the pass still has to reach (`/workflows/[id]/builder`, Table mode) are therefore **not
+measured this tick**, and nothing in this tick's commit is claimed on a browser reading.
+
+This tick's change is a **route-only** fix with no UI surface, which is worth saying plainly: the
+screens it can affect are the ones whose Validate button writes the column, and the behaviour
+difference is "a draft no longer overwrites the saved verdict" — invisible on a screen until
+someone presses Validate against an unsaved edit. The gate that measures it is the one that was
+proved to bite (neuter `may_record`, one test red), not a screenshot.
