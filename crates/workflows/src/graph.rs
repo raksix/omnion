@@ -1204,48 +1204,83 @@ pub fn reachable_from<'a>(graph: &'a Graph, start: &'a str) -> BTreeSet<&'a str>
 /// Iterative depth-first search with an explicit stack: a 200-node graph is fine, and a
 /// recursive walk on a graph that is *allowed* to be a cycle is a stack overflow waiting for
 /// the one definition an author drew by accident.
+///
+/// **Every outgoing edge is followed, not the first one.** The previous version resolved a
+/// single `next` per node with `find_map`, which is a correct walk of a *list* and a broken
+/// walk of a *graph*: any node with two leaves — a condition, a switch, an action with an
+/// `error` branch — was only ever followed one way, so a loop closing on the other port was
+/// invisible to validation and to the projection. That is not a rare shape; it is what
+/// "retry until done" looks like, and the rule would have been stored, shown as valid, and
+/// hung the first time the retry branch fired.
+///
+/// The stack therefore holds a *cursor* per node rather than a node id, so a node stays on
+/// the path while its remaining edges are still to be tried — which is also what makes the
+/// reported ring the one that actually closes, instead of the first ring a left-to-right
+/// scan happened to touch.
 #[must_use]
 pub fn find_cycle(graph: &Graph) -> Option<Vec<String>> {
     let mut index: HashMap<&str, usize> = HashMap::new();
     for (position, node) in graph.nodes.iter().enumerate() {
         index.insert(node.id.as_str(), position);
     }
+    // Edges out of each node, as positions in `graph.edges`. Resolved once so the walk is not
+    // re-filtering the whole edge list at every step of every path.
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); graph.nodes.len()];
+    for (edge_position, edge) in graph.edges.iter().enumerate() {
+        if let Some(&source) = index.get(edge.source.as_str()) {
+            outgoing[source].push(edge_position);
+        }
+    }
+
     // 0 = unvisited, 1 = on the current path, 2 = done.
     let mut state = vec![0u8; graph.nodes.len()];
     for start in 0..graph.nodes.len() {
         if state[start] != 0 {
             continue;
         }
-        let mut path: Vec<usize> = vec![start];
+        // (node, how many of its edges have been tried) — the cursor is what lets a node with
+        // several children be visited once and then *resumed*, rather than restarted from each
+        // child and never reaching the sibling that closes the loop.
+        let mut path: Vec<(usize, usize)> = vec![(start, 0)];
         let mut positions: HashMap<usize, usize> = HashMap::new();
         positions.insert(start, 0);
         state[start] = 1;
 
-        while let Some(&current) = path.last() {
-            let next = graph
-                .edges
-                .iter()
-                .filter(|edge| edge.source == graph.nodes[current].id)
-                .find_map(|edge| index.get(edge.target.as_str()).copied());
-
-            match next {
-                Some(target) if state[target] == 1 => {
-                    let start_at = positions[&target];
-                    let cycle: Vec<String> = path[start_at..]
-                        .iter()
-                        .map(|position| graph.nodes[*position].id.clone())
-                        .collect();
-                    return Some(cycle);
+        while let Some(&mut (current, ref mut cursor)) = path.last_mut() {
+            // The next untried edge out of this node, or None when they are all used up.
+            let target = outgoing[current]
+                .get(*cursor)
+                .and_then(|edge_position| {
+                    index.get(graph.edges[*edge_position].target.as_str()).copied()
+                });
+            match target {
+                Some(target) => {
+                    *cursor += 1;
+                    match state[target] {
+                        // Back onto the path: everything from where that node was entered to
+                        // the node holding this edge is the loop.
+                        1 => {
+                            let start_at = positions[&target];
+                            let cycle: Vec<String> = path[start_at..]
+                                .iter()
+                                .map(|(node, _)| graph.nodes[*node].id.clone())
+                                .collect();
+                            return Some(cycle);
+                        }
+                        0 => {
+                            state[target] = 1;
+                            positions.insert(target, path.len());
+                            path.push((target, 0));
+                        }
+                        // Already finished elsewhere: this edge goes nowhere, try the next one.
+                        _ => {}
+                    }
                 }
-                Some(target) if state[target] == 0 => {
-                    state[target] = 1;
-                    positions.insert(target, path.len());
-                    path.push(target);
-                }
-                _ => {
-                    state[current] = 2;
-                    positions.remove(&current);
-                    path.pop();
+                None => {
+                    // Every edge out of this node has been tried, so it is finished.
+                    let (node, _) = path.pop().expect("the frame came off the stack");
+                    state[node] = 2;
+                    positions.remove(&node);
                 }
             }
         }
@@ -1855,6 +1890,49 @@ mod tests {
         // And a graph with a cycle cannot be stored, rather than stored and hanging at run time.
         let error = project(&graph).expect_err("a cycle does not project");
         assert_eq!(error.code(), "graph_invalid");
+    }
+
+    #[test]
+    fn a_loop_that_closes_on_a_branch_is_still_a_loop() {
+        // The reported case: the walk takes the FIRST outgoing edge of each node, so a node
+        // with two leaves is only ever followed one way. A condition whose `false` branch
+        // points back up the graph — the shape a "retry until done" rule has — closed a ring
+        // the validator could not see, because `false` is never the edge it followed.
+        let mut graph = Graph {
+            nodes: vec![
+                node("trigger", "trigger.manual"),
+                node("cond", "condition.if"),
+                action("a1"),
+                node("end", "end"),
+            ],
+            edges: vec![
+                Edge { id: "e0".to_owned(), source: "trigger".to_owned(), source_port: "out".to_owned(), target: "cond".to_owned() },
+                // Drawn first, so the walk reaches `a1` — and then stops there.
+                Edge { id: "e1".to_owned(), source: "cond".to_owned(), source_port: "true".to_owned(), target: "a1".to_owned() },
+                Edge { id: "e2".to_owned(), source: "a1".to_owned(), source_port: "success".to_owned(), target: "end".to_owned() },
+                // The loop closes on the port nobody looks at twice.
+                Edge { id: "e3".to_owned(), source: "cond".to_owned(), source_port: "false".to_owned(), target: "trigger".to_owned() },
+            ],
+        };
+        let finding = validate(&graph)
+            .into_iter()
+            .find(|finding| finding.code == "graph_cycle")
+            .expect("a branch-closing loop is a loop");
+        // The finding must name the node the author can jump to, and the other end of the ring.
+        assert!(
+            finding.node_id.is_some(),
+            "the finding is addressable: {:?}",
+            finding.node_id
+        );
+        assert!(
+            finding.related_node_id.is_some(),
+            "the finding names where it closes: {:?}",
+            finding.related_node_id
+        );
+        assert!(
+            project(&graph).is_err(),
+            "and a graph that loops cannot be stored, rather than stored and hanging at run time"
+        );
     }
 
     #[test]
