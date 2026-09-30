@@ -1,6 +1,6 @@
 # REQ-046 — AI Workflow Builder *(headline)*
 
-> **Status:** in-progress (slice 4 · `f3943740` (the decision bar: approve materialises a **disabled** workflow with `enabled: false` written at the call site, approval is refused when the *approver* lacks a permission a step needs, `revise` streams like `generate`, and `test-run` provably dispatches nothing — plus the two refusals that were correct and useless: `reject` told the operator the status instead of naming the builder, and the "already a rule" message named no path), `a600e272` (the end-to-end probe), `61f227c6` (three criteria closed), `c63a6a1b` (**the approval bar was dead on every draft** — `has_definition` was declared in the TypeScript type and never sent by the API, so `approvable` was permanently `false` and every decision button was disabled; only the probe clicking the screen could find it, and the same commit fixed the psql `returning`-id bug that had the walkthrough reporting a visit it never made) · slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815`, `375da98c`; slice 2 · `06f28399`; slice 1 · `b6392a80`)
+> **Status:** in-progress (slice 4 · `7efa7989` (**the last criterion, run for real** — a workflow containing an `ai.prompt` step is driven through `engine::tick` against the mock provider and the run is read back out of the database; the later step is a **branch** on `steps.1.text` because `{{steps.1.output.text}}` is not a thing this engine has — the `{{ }}` namespace is `event` — and the retry had to be measured on the provider's call counter on a step that names `max_attempts`, since the default is `one` and a step that never asked to be retried lands in `failed` at attempt 1) · `f3943740`· slice 3 · `65af45f5`, `b97661e0`, `54fb8c91`, `a7a70815`, `375da98c`; slice 2 · `06f28399`; slice 1 · `b6392a80`)
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -151,11 +151,18 @@ only: never the prompt body, never the definition, never a provider key.
       one the generation path runs, so the secret rule covers an operator's edit too — before any
       write, and the store's update is conditional on `draft`; `an_edited_definition_is_
       revalidated_and_an_invalid_save_changes_nothing`.*
-- [ ] `ai.prompt` runs as an ordinary task step: a run passes a template through the model, later
+- [x] `ai.prompt` runs as an ordinary task step: a run passes a template through the model, later
       steps read the output, and a provider failure is retried by the existing step backoff.
-      *(Partly proven: the action is a registry host action with a bounded budget, it is wired
-      to the AI Hub router, and its output shape (`text`) is what a later step reads. The run
-      itself needs a connected provider — slice 4's probe.)*
+      — *`apps/api/tests/ai_prompt_step_run.rs`, two walks against the in-process mock provider
+      and the real engine (`engine::tick`, the background runner's own entry point). The run is
+      driven to a **terminal** status, because a step that never fires leaves the run `pending`
+      forever and that reads as "still working" in every screen. The later step is a **branch**
+      on `steps.1.text`, which is the engine's own vocabulary for reading an earlier step's
+      output — `{{steps.1.output.text}}` is **not** one: the `{{ }}` namespace is `event` and
+      nothing else, because bindings resolve when the run is materialised from the recorded
+      event and a placeholder naming a step does not exist at that moment. The retry is measured
+      on the provider's call counter (2 calls) and not inferred from the step row, because a step
+      that gave up and a step that retried both end in a terminal status.*
 - [x] Test-run performs no external side effects — asserted by “no events emitted during the test
       run”. — *true by construction rather than by assertion: a run row needs a `workflow_id`
       (`not null`), and a draft under review has none, so there is nothing to dispatch. The

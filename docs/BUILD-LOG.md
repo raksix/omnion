@@ -7108,3 +7108,64 @@ been exercised by a full pass.
 **Next.** Re-run the QA pass (the fixture now yields a real draft id), then the `ai.prompt` run
 criterion — a manual run of a workflow containing an `ai.prompt` step, showing the output
 visible in the execution's step rows.
+
+## 2026-09-30 · tick 35 · REQ-046 — the last criterion was a claim about a *shape*
+
+**What.** Merged `origin/main` (14 commits) and closed the REQ-046 criterion that had sat at
+"partly proven" since slice 2: **`ai.prompt` runs as an ordinary task step**. Slice 2 proved
+the shape — a registry host action, a bounded budget, the AI Hub router as its client, an
+output key a later step can read. A shape nobody executes is a shape, so `apps/api/tests/
+ai_prompt_step_run.rs` drives a workflow containing an `ai.prompt` step through the real
+engine (`engine::tick` — the background runner's own entry point, not a private helper)
+against the in-process mock provider, and reads the run back out of the database.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-api --test ai_prompt_step_run` | **2 passed / 0 failed** (362 s) |
+| `cargo test -p omnion-workflows -p omnion-automation -p omnion-events` | **146 passed / 0 failed** |
+| Commit | `7efa7989` |
+
+**The engine's vocabulary is not the one the criterion is written in, and that was the bug
+in the test rather than in the platform.** The criterion says "later steps read the output",
+and the obvious spelling — `{{steps.1.output.text}}` in a later step — is **not a thing this
+engine has**. The `{{ }}` binding namespace is `event` and nothing else: `binding::
+validate_bindings` refuses any other expression, because bindings resolve when the run is
+*materialised* from the recorded event, and a placeholder naming a step does not exist at that
+moment. A step reads an earlier step's output through the **branch** vocabulary instead —
+`steps.<number>.<field>`, evaluated against the run's own scope. The first version of the
+fixture used the template anyway and the walk came back `completed`, the run green, every
+assertion before it satisfied — and the second step's recorded value was the literal string
+`{{steps.1.output.text}}`. **A step that interpolates nothing and a step that interpolates
+correctly are both `succeeded`**; only the recorded value separates them, which is why the
+assertion is on the value.
+
+**The retry criterion was about to be "proved" against the default.** `StepDefinition::
+max_attempts` serialises with `#[serde(default = "one")]`: a step that does not name it is
+allowed exactly one attempt, and the backoff is never reached. The first run of that walk saw
+the scripted `502` land the step in `failed` at `attempts = 1` — a result that reads exactly
+like "the engine does not retry provider failures" and is in fact "this step never asked to be
+retried". A criterion about the retry path has to be proved on a step that opted into it;
+proving it on a step that did not would have measured the default and filed it as a defect.
+The retry is now measured on the provider's **call counter** (2 calls), because a step that
+gave up and a step that retried *both* end in a terminal status and the counter is the only
+number that separates them.
+
+**The merge was the other half of the tick, and it had two silent failures.** `scripts/qa/
+run.sh` came back `UU` with **no conflict markers in the file** — git merged the hunks cleanly
+and dropped my one edit, leaving main's version, which no longer passes `QA_SLOT_OWNER_PID`.
+That is the fix from tick 24, where a SIGKILLed pass held the one QA place for 1 h 48 m with
+seventeen writers queued behind it. Main had the variable, my branch had the call site, and a
+conflict-free merge would have quietly reverted it. And cutting a conflict hunk with a script
+also eats the lines *after* the marker: taking main's `for (const route of …)` header with the
+hunk left `mobileRoutes` undefined — a runtime `ReferenceError` in a pass that only runs at
+390 px, which `node --check` passes happily. BUILD-LOG itself is append-only and 7 000 lines
+long, so it was spliced with `difflib` and verified with a **multiset** check: `Counter(ours) -
+Counter(merged)` and `Counter(theirs) - Counter(merged)` both came back 0. A line count
+balances on a merge that duplicated a block; only the multiset sees duplication.
+
+**Next.** The other open criterion is the one that needs a browser: the QA pass on the w3
+stack, which must reach `ai-workflows` and click the approval bar now that the walkthrough
+fixture yields a real draft id. This tick's work changed no screen, so the pass is the REQ-close
+gate rather than a gate for the change itself.
