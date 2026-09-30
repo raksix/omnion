@@ -7694,6 +7694,29 @@ barge in. REQ-005's last box is therefore still **unticked**: it names `cargo te
 `pnpm typecheck && pnpm build` and a walkthrough with zero high findings, and a scoped pass
 cannot honestly tick it.
 
-**Next.** Land the workspace gate when cargo finishes, run `pnpm build`, then take the slot for a
-REQ-005 pass. `04bc7e73`'s new count-match instruments give REQ-011's two boxes a pass they have
+**The workspace gate, and why it is still red.** `cargo test --workspace` finished with exit
+101 — and the summary line is a lie about the cause. The tail reads `error: linking with 'cc'
+failed` on `omnion-api (test "media_settings")`, which reads like a defect in that test file. The
+two lines that matter sit above it: `rustc-LLVM ERROR: IO failure on output stream: No space left
+on device` and `collect2: fatal error: ld terminated with signal 7 [Bus error]`. A bus error is
+the *kernel* failing a write. At that moment `/` was at **100% (311 M free)** and the box at
+**0 free RAM, 26 G of 32 G used, load 71** with six other writers compiling.
+
+`CARGO_TARGET_DIR=/root/w5target` put 2.7 G of rebuildable artifacts on the root filesystem,
+which is why this writer hit the wall first. Reclaimed from *this worktree only*: 31 finished
+test binaries (1.14 GB) and a 72 M orphan `.tmp` from the killed link → `/` back to 1.2 G free.
+(While checking, `lsof +D` reported 6 holders of the target dir and all six were my own `lsof`/
+`head`/`python` calls sitting in it — a liveness probe run *from* the directory it probes lists
+itself.)
+
+`cargo test --workspace --lib` is running as the honest narrower gate; it is still queued behind
+six writers' rustc (all 7 live rustc processes belong to other worktrees — none to this one).
+The QA slot is still **w3's** (holder alive, cwd `/mnt/apopic/omnion-w3`); `QA_SLOTS=1`, so the
+pass waits rather than barging in. REQ-005's last box therefore stays **unticked**: it names
+`cargo test --workspace`, `pnpm typecheck && pnpm build` and a walkthrough with zero high
+findings, and swapping in a narrower command to make it tick would be the same green lie.
+
+**Next.** Land the workspace gate when the box has room for the link, then `pnpm build`, then
+take the slot for a REQ-005 pass. `04bc7e73`'s count-match instruments give REQ-011's two boxes a
+pass they have never had. `04bc7e73`'s new count-match instruments give REQ-011's two boxes a pass they have
 never had.
