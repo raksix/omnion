@@ -414,7 +414,7 @@ pub async fn create_project(
     .await
     .map_err(ApiError::from)?;
 
-    omnion_audit::record(
+    omnion_audit::record_for_project(
         state.db().pool(),
         NewAuditEntry::by_user(current.user.id, "automation.project.created")
             .organization(organization_id)
@@ -423,6 +423,7 @@ pub async fn create_project(
                 "key": project.key,
                 "owner_user_id": owner_user_id,
             })),
+        project.id,
     )
     .await?;
 
@@ -490,12 +491,13 @@ pub async fn update_project(
         changed.push("icon");
     }
 
-    omnion_audit::record(
+    omnion_audit::record_for_project(
         state.db().pool(),
         NewAuditEntry::by_user(current.user.id, "automation.project.updated")
             .organization(organization_id)
             .target("automation_project", project_id)
             .metadata(json!({ "changed_keys": changed })),
+        project_id,
     )
     .await?;
 
@@ -587,7 +589,7 @@ async fn set_status(
         ));
     }
 
-    omnion_audit::record(
+    omnion_audit::record_for_project(
         state.db().pool(),
         NewAuditEntry::by_user(
             current.user.id,
@@ -599,6 +601,7 @@ async fn set_status(
         .organization(organization_id)
         .target("automation_project", project_id)
         .metadata(json!({ "key": project.key })),
+        project_id,
     )
     .await?;
 
@@ -677,12 +680,13 @@ pub async fn upsert_member(
     .await
     .map_err(ApiError::from)?;
 
-    omnion_audit::record(
+    omnion_audit::record_for_project(
         state.db().pool(),
         NewAuditEntry::by_user(current.user.id, "automation.project.member.set")
             .organization(organization_id)
             .target("automation_project", project_id)
             .metadata(json!({ "user_id": input.user_id, "role": role.as_str() })),
+        project_id,
     )
     .await?;
 
@@ -736,12 +740,13 @@ pub async fn remove_member(
         return Err(not_found());
     }
 
-    omnion_audit::record(
+    omnion_audit::record_for_project(
         state.db().pool(),
         NewAuditEntry::by_user(current.user.id, "automation.project.member.removed")
             .organization(organization_id)
             .target("automation_project", project_id)
             .metadata(json!({ "user_id": user_id })),
+        project_id,
     )
     .await?;
 
@@ -1021,6 +1026,103 @@ async fn build_limits_body(
         series,
         warnings: serde_json::Value::Object(warnings),
     }))
+}
+
+// Project-scoped audit (REQ-133 slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// Query of `GET /api/v1/projects/{id}/audit`.
+#[derive(Debug, Deserialize)]
+pub struct ProjectAuditQuery {
+    /// Organization the project belongs to.
+    pub organization_id: Uuid,
+    /// Narrow to one action name; absent or empty means every action.
+    #[serde(default)]
+    pub action: String,
+    /// How many rows; clamped below.
+    #[serde(default = "default_audit_limit")]
+    pub limit: i32,
+}
+
+const fn default_audit_limit() -> i32 {
+    200
+}
+
+/// `GET /api/v1/projects/{id}/audit` — the project trail, filtered by project.
+///
+/// **The project is resolved through `find_visible` before a single row is read**, so a caller who
+/// may not see the project cannot read its history by guessing the id. The store filter is
+/// `project_id`, never `organization_id`: a project and the rest of the tenant share an
+/// `organization_id`, so the narrower one is the only column that is a boundary rather than a
+/// coincidence.
+pub async fn project_audit(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(project_id): Path<Uuid>,
+    Json(input): Json<ProjectAuditQuery>,
+) -> Result<Json<ProjectAuditBody>, ApiError> {
+    let organization_id = resolve_organization(&current, Some(input.organization_id))?;
+    require_capability(
+        &state,
+        &current,
+        organization_id,
+        project_id,
+        ProjectRole::can_read,
+        "read the project's audit trail",
+    )
+    .await?;
+
+    let project = projects::find_visible(
+        state.db().pool(),
+        organization_id,
+        project_id,
+        caller_for(&state, &current, organization_id).await,
+    )
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(not_found)?;
+
+    let action = input.action.trim();
+    let limit = i64::from(input.limit.clamp(1, 500));
+    let entries = omnion_audit::for_project(
+        state.db().pool(),
+        project_id,
+        if action.is_empty() { None } else { Some(action) },
+        limit,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    // The action vocabulary the screen offers, taken from what this project actually holds rather
+    // than from a hard-coded list. A filter list that lists an action nobody performed invites the
+    // reader to conclude a missing event was filtered out when it never happened.
+    //
+    // Read WITHOUT the action filter, so the vocabulary does not change shape as the reader
+    // filters -- a filter whose options are the rows it already filtered to is a filter with one
+    // option.
+    let unfiltered = omnion_audit::for_project(state.db().pool(), project_id, None, 500)
+        .await
+        .map_err(ApiError::from)?;
+    let mut all_actions: Vec<String> = unfiltered.into_iter().map(|entry| entry.action).collect();
+    all_actions.sort();
+    all_actions.dedup();
+
+    Ok(Json(ProjectAuditBody {
+        key: project.key,
+        entries,
+        actions: all_actions,
+    }))
+}
+
+/// What the project audit screen renders.
+#[derive(Debug, Serialize)]
+pub struct ProjectAuditBody {
+    /// The project's key, so the export and the screen name the same thing.
+    pub key: String,
+    /// The trail, newest first.
+    pub entries: Vec<omnion_audit::AuditEntry>,
+    /// Every action this project's trail actually holds, for the filter.
+    pub actions: Vec<String>,
 }
 
 /// Body of `POST /api/v1/projects/{id}/transfer-ownership`.

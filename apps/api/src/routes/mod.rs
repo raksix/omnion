@@ -206,6 +206,16 @@ fn automation_projects_surface(state: &AppState) -> Router<AppState> {
             post(automation_projects::transfer_ownership)
                 .layer(guards::require(state, "projects.manage")),
         )
+        // The project audit stream. `projects.audit.read` rather than `projects.read`: reading a
+        // project's history is what an auditor is for, and a project owner who is not an auditor
+        // can manage the project without being able to read everybody else's actions in it.
+        // Inside the handler the project is resolved through `find_visible` first, so the id is
+        // not a way to read another tenant's trail.
+        .route(
+            "/projects/{id}/audit",
+            get(automation_projects::project_audit)
+                .layer(guards::require(state, "projects.audit.read")),
+        )
         .route(
             "/projects/{id}/members",
             post(automation_projects::upsert_member)
