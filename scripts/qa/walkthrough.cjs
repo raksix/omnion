@@ -563,14 +563,51 @@ async function clickAction(page) {
   return primaryClick(page);
 }
 
+/**
+ * How far the installation actually is, asked of the panel rather than guessed from the URL.
+ *
+ * The URL cannot answer this. The owner step ends with a redirect to `/login` — the panel has no
+ * session for a half-built installation — and the previous version read that redirect as "the
+ * installation already exists" and returned. It did not. The owner was written, the organization
+ * and the site were not, and the pass went on to measure screens against a tenant that did not
+ * exist: `organizations=0`, and every org-scoped fixture feeding `''` into a uuid column, which
+ * surfaces as `invalid input syntax for type uuid: ""` and reads like a broken product.
+ *
+ * `in_progress: true` with `steps.owner: true, steps.organization: false` is a half-built
+ * installation, and the answer that matters is "keep going", not "skip".
+ */
+async function installationState() {
+  const response = await fetch(`${URL_ADMIN}/api/v1/onboarding`, { headers: { accept: "application/json" } }).catch(
+    () => null,
+  );
+  if (!response || !response.ok) return null;
+  const body = await response.json().catch(() => null);
+  return body && typeof body.steps?.owner === "boolean" ? body : null;
+}
+
 async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(900);
   const url = page.url();
+  // The setup screen is reachable by URL even when the app sends the browser somewhere else, so
+  // the decision is made on the onboarding steps and not on where the app happened to land. A
+  // completed installation still short-circuits: nothing to seed, and the walk must not spend a
+  // pass re-running a wizard the owner already finished.
+  const before = await installationState();
+  if (!url.includes("/setup") && before?.completed) {
+    log(`wizard: installation already complete (${url})`);
+    return { ran: false, url, completed: true };
+  }
   if (!url.includes("/setup")) {
-    log(`wizard: not in setup (${url}) — installation already exists`);
-    return { ran: false, url };
+    log(`wizard: not in setup (${url}) — resuming an installation that is ${before?.completed ? "complete" : "half built"}`);
+    await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(900);
+    // A completed installation redirects away from /setup again; that is the only case where the
+    // walk really has nothing to do.
+    if (!page.url().includes("/setup")) {
+      return { ran: false, url: page.url(), completed: true };
+    }
   }
   report.steps.push({ step: 0, url, action: "reached /setup" });
   await shot(page, "01-setup-step-1");
@@ -621,6 +658,21 @@ async function runWizard(page, report) {
       await page.waitForTimeout(900);
       report.steps.push({ index: i, action: "open-panel", url: page.url() });
       break;
+    }
+    // The owner step answers with a redirect to `/login`, because a half-built installation has no
+    // session to keep — and that redirect used to end the loop (`if (!now.includes("/setup")) break`).
+    // The wizard then never created the organization or the site, and the pass measured every
+    // org-scoped screen against an empty tenant. Leaving `/setup` is only the end of the wizard
+    // when the installation actually says it is finished; otherwise the step is resumable and the
+    // walk goes back in. Bounded, so a screen that bounces the browser cannot spin the pass.
+    if (!now.includes("/setup") && !finished) {
+      const state = await installationState();
+      if (state && !state.completed) {
+        log(`wizard: left /setup for ${now} with the installation at ${JSON.stringify(state.steps)} — resuming`);
+        await page.goto(`${URL_ADMIN}/setup`, { waitUntil: "domcontentloaded" });
+        await page.waitForTimeout(900);
+        continue;
+      }
     }
     if (!now.includes("/setup")) break;
   }
