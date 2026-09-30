@@ -6584,3 +6584,62 @@ batches, but no walk crosses a batch boundary, so the ceiling and the progress r
 are unverified. (c) Large-host Postgres contention needs a per-writer connection budget rather
 than a shared 100 — a walk suite that opens a scratch database per test is a different shape of
 load from a crate's unit tests, and it competes with six sibling writers for the same pool.
+
+---
+
+## Tick 69 — REQ-017 slice 4: large-site batching (the code did not exist)
+
+**What.** `docs/requests/REQ-017`'s Risks section has said, since the request was written, that
+"the runner batches by area with a configurable page size, writes progress after each batch, and
+refuses to clone beyond a configured row ceiling". The last two clauses were true. The middle
+one was not: `copy_area` was one `insert … select` per area inside one transaction, with no
+chunking anywhere in the crate. So the tick's work was to write the batching — and the honest
+headline is that **writing it surfaced three defects that twenty-odd existing walks all passed**,
+all of one family, and all invisible to the shape of assertion the suite already had.
+
+**The family.** Each is a value that is self-consistent and describes rows that are not there.
+The clone job records `items_done` as the sum of what every batch reported inserting, so it
+agrees with the runner even when the rows never landed — the walk that found all three asserts
+the total **on disk** instead, and reads the job row only to make the failure *name* itself.
+
+1. **The emptying `delete` ran on every batch.** `copy_area_once` opened with "empty the target",
+   and a batch is a call. With a batch of 2 and 7 pages, batch 2 deleted batch 1's committed
+   rows, batch 3 deleted batch 2's, and the job closed `done` holding the last batch's two pages
+   while the bar reported a sum that matched nothing. The delete is now keyed on `bound.is_none()`,
+   and the reasoning is written at the delete rather than at the call site that has to remember it.
+2. **The first window's lower bound was `id > $3` with `$3` bound to NULL.** `id > NULL` is NULL,
+   which is not true, so the first batch copied nothing and every row below the first window's
+   upper bound was skipped. The form is now `($3::uuid is null or id > $3)` — "everything from
+   the start" when there is no lower bound, which is what the first window means.
+3. **`next_batch_key` used `limit 1 offset <limit-1>`, which skips the final partial batch.** It
+   asks for the *limit*-th row after the cursor and gets nothing once fewer than *limit* rows
+   remain, so the loop exited cleanly having never looked at the tail: **7 pages at a batch of 2
+   copied 6 and reported `done`**. It now measures what remains and takes the window's last row
+   whether that is the *limit*-th or the final one.
+
+**Proof.** `omnion-environment --lib` **57/0** (51 before; six new unit tests over the window's
+shape, the batch ceiling, the "every area that copies has a table to batch over" mapping that
+would otherwise fail inside a worker) · `omnion-api --lib` **263/0** ·
+`a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once` **1/0** · the thirteen
+`--test-threads=1` clone walks green · `pnpm typecheck` 2/2.
+
+The walk earns its place three times over: it was red **against the batching as first written**
+(2 of 7), and each of the three fixes was made because it stayed red with a *different* number
+each time. 2 → 4 → 6 → 7 is the shape of three separate bugs, and a walk that had asserted the
+job's own `items_done` would have been green at 2.
+
+**Blocker, fifth tick running, unchanged and not worked around.** The **browser gate** did not
+run: the QA slot is held by a live sibling (`omnion-w8`, holder alive, `run.sh` pid 1490007),
+`/mnt/apopic` is at 93% with 4.1 GB free, load 10.5 and 11 Chromium live. The full 37-walk
+environments suite also did not complete: runs report `PoolTimedOut` at the shared IAM seed with
+`pg_stat_activity` at 38–39 of 100 and **zero ungranted locks**, which is contention across seven
+writer suites and not a deadlock and not a product fault. The clone walks re-run serially and
+are green; **the other walks are unverified this tick and that is what keeps the slice open.**
+
+**Next.** (a) The browser gate: the four `runEnvironmentsDepth` claims plus five for the clone
+areas have still never executed, and a screen nobody has opened is not a screen that works.
+(b) `promotion.*` reaching a subscribed webhook endpoint end to end — the events are emitted and
+the row is written; the delivery half is REQ-016's runner and is not yet proven from here.
+(c) Per-writer connection budgets rather than a shared pool of 100 — a walk suite that opens a
+scratch database per test is a different load shape from a crate's unit tests and competes with
+six siblings for the same 100 connections.

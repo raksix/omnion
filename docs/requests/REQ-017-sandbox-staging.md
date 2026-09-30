@@ -1,6 +1,15 @@
 # REQ-017 — Sandbox / Staging
 
-> **Status:** in-progress (slices 3–4; tick 67 fixed the clone-wizard contract — three of the six
+> **Status:** in-progress (slices 3–4; **tick 69 closed large-site batching, and the code
+ it closed did not exist** — the Risks section had promised "the runner batches by area with a
+ configurable page size" since the request was written and `runner.rs` held one unbatched
+ `insert … select` per area. Writing it surfaced **three** defects that every existing walk
+ passed, all of the same family: a value that was self-consistent and matched nothing on disk
+ (the per-batch `delete` wiping the previous batch; the first window's `id > NULL` lower bound
+ copying nothing; and `limit 1 offset n-1` skipping the final partial batch, so a 7-page clone
+ at a batch of 2 reported `done` with 6 pages and an `items_done` that agreed with itself). The
+ walk `a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once` is the first thing in
+ this suite that crosses a boundary, and it is what found all three; tick 67 fixed the clone-wizard contract — three of the six
 > clone areas copied nothing while being labelled and priced like the three that do, and the
 > panel's guard counted ticked boxes where the runner requires an area that actually copies, so a
 > staging environment could be created empty through the browser. `Area::copies()`/`Area::note()`
@@ -226,16 +235,24 @@ approved, applied atomically, visible in history, and emitted to a subscribed en
    last leg of the `noindex` walk for the consequence: a released host stops being staging by
    *ceasing* to answer as one, not by being told to. Clone cancel was already covered by
    `cancelling_a_clone_leaves_the_environment_out_of_active`; **large-site batching remains**
-   unproven — the runner batches, but no walk crosses the batch boundary, so the ceiling and the
-   progress reporting past it are unverified. The slice stays open, and with it the REQ: a
-   REQ closes on its last slice, not on the one that is easiest to prove.
+   **closed in tick 69** — `a_clone_that_crosses_a_batch_boundary_copies_every_row_exactly_once`
+   runs seven pages at a batch of two, which is four windows, and asserts the total **on disk**,
+   each page's own revision count, and that production kept its rows. Reading the row count off
+   the job row instead is what every earlier walk did, and it is the reason all three defects
+   survived: the job's `items_done` is the sum of what each batch reported inserting, so it agrees
+   with the runner even when the rows are not there. The slice stays open on its one remaining
+   item — the **browser gate** — and with it the REQ: a REQ closes on its last slice, not on the
+   one that is easiest to prove.
 
 ### Risks / notes
 
 - Honesty in the UI matters more than features here: staging is a *content* environment inside one installation. The wizard and banner say so; claiming infrastructure isolation would be
   a lie.
-- Clone cost grows with site size: the runner batches by area with a configurable page size, writes progress after each batch, and refuses to clone beyond a configured row ceiling (with
-  a clear message) instead of locking the database.
+- Clone cost grows with site size: the runner batches by area with a configurable page size
+  (`OMNION_CLONE_BATCH_ROWS`, default 5 000), writes progress after each batch, and refuses to
+  clone beyond a configured row ceiling (with a clear message) instead of locking the database.
+  *(tick 69: this line described code that did not exist. It does now, and the walk that proves
+  it found three defects in its first version — see the slice-4 note.)*
 - Media is referenced, not duplicated — staging shows the same files. Editing a media *record* in staging is allowed; replacing the underlying file is not part of this request.
 - Promotion conflicts are expected, not exotic; the UI must lead with them rather than hiding them behind a failure toast.
 - Concurrent promotions on one environment are serialized: a second request while one is `running` is refused with a named error.
