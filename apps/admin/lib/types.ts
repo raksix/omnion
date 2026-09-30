@@ -2170,6 +2170,109 @@ export interface Project {
 /** What a member may do inside a project. */
 export type ProjectRole = "owner" | "editor" | "operator" | "viewer";
 
+/** One day of a project's usage counters. */
+export interface ProjectUsageDay {
+  /** The day, as `YYYY-MM-DD`. */
+  usage_date: string;
+  /** Runs started. */
+  runs: number;
+  /** Runs that failed. */
+  failures: number;
+  /** Total compute time in milliseconds. */
+  compute_ms: number;
+}
+
+/** A limit, with the number it is measured against. */
+export interface ProjectLimitReading {
+  /** How much is used. */
+  current: number;
+  /** The cap. `0` is unlimited and never appears here. */
+  limit: number;
+  /** The percent at which the bar turns amber. */
+  warn_at_percent: number;
+  /** Whether usage is at or over the cap. */
+  exceeded: boolean;
+}
+
+/**
+ * The limits screen's whole payload, in one read.
+ *
+ * `warnings` is computed by the API from the store's own predicate, so the panel does not hold a
+ * second copy of "80 percent" — the copy that drifts is the one nobody tests.
+ */
+export interface ProjectLimits {
+  /** The project's own id. */
+  project_id: string;
+  /** Maximum workflows; `0` is unlimited. */
+  max_workflows: number;
+  /** Maximum credentials; `0` is unlimited. */
+  max_credentials: number;
+  /** Maximum runs per day; `0` is unlimited. */
+  max_runs_per_day: number;
+  /** Maximum runs in flight; `0` is unlimited. */
+  max_concurrent_runs: number;
+  /** Percent at which a bar warns. */
+  warn_at_percent: number;
+  /** Who last changed the limits. */
+  updated_by: string | null;
+  /** When they last changed. */
+  updated_at: string;
+  /** Today's counters. */
+  today: ProjectUsageDay;
+  /** Runs in flight right now. */
+  concurrent_runs: number;
+  /** Workflows the project holds. */
+  workflow_count: number;
+  /** The daily series, oldest first. */
+  series: ProjectUsageDay[];
+  /** Per-limit warnings, keyed by the same names the save body uses. */
+  warnings: Partial<Record<LimitName, ProjectLimitReading>>;
+}
+
+/** The four caps, by the names both the save body and the warnings map use. */
+export type LimitName =
+  | "max_workflows"
+  | "max_credentials"
+  | "max_runs_per_day"
+  | "max_concurrent_runs";
+
+/** What `PUT /projects/{id}/limits` accepts. */
+export type ProjectLimitsSave = Record<LimitName, number> & { warn_at_percent: number };
+
+/** One row of the project audit stream. */
+export interface ProjectAuditEntry {
+  /** Creation order. */
+  id: number;
+  /** The tenant the action belongs to. */
+  organization_id: string | null;
+  /** Who did it. */
+  actor_user_id: string | null;
+  /** `user`, `agent`, `service` or `system`. */
+  actor_type: string;
+  /** The action's stable name. */
+  action: string;
+  /** What it happened to. */
+  target_type: string | null;
+  /** Which one. */
+  target_id: string | null;
+  /** Structured detail. Never carries secrets. */
+  metadata: Record<string, unknown>;
+  /** The actor's address, when known. */
+  ip_address: string | null;
+  /** When it was recorded. */
+  created_at: string;
+}
+
+/** The project audit screen's payload: the trail plus its own filter vocabulary. */
+export interface ProjectAudit {
+  /** The project's key, so the screen and the export name the same thing. */
+  key: string;
+  /** The trail, newest first. */
+  entries: ProjectAuditEntry[];
+  /** Every action this project actually holds. */
+  actions: string[];
+}
+
 /** One row of the membership table, with the person's name resolved. */
 export interface ProjectMember {
   /** The member's account. */

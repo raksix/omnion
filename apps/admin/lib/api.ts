@@ -29,6 +29,9 @@ import type {
   WebhookDeliveryFilters,
   WebhookDeliveryPage,
   Project,
+  ProjectAudit,
+  ProjectLimits,
+  ProjectLimitsSave,
   ProjectMember,
   ProjectRole,
   WebhookEndpoint,
@@ -537,6 +540,81 @@ export function moveWorkflow(
       organization_id: organizationId,
       to_project_id: toProjectId,
       dry_run: dryRun,
+    }),
+  });
+}
+
+/**
+ * The limits screen's payload: caps, today's counters, the series and the warnings (REQ-133
+ * slice 4).
+ *
+ * One read rather than four. The screen renders bars, a series and warnings that must agree with
+ * each other, and four reads would let a run land between them — a bar at 3 of 5 beside a series
+ * that says 2, with nothing on the page to explain the difference.
+ */
+export function fetchProjectLimits(
+  projectId: string,
+  organizationId?: string,
+  days = 30,
+): Promise<ProjectLimits> {
+  const query = new URLSearchParams({ days: String(days) });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<ProjectLimits>(`/api/v1/projects/${projectId}/limits?${query.toString()}`);
+}
+
+/**
+ * Replace a project's limit overrides.
+ *
+ * `0` means unlimited, and the API says so in its own refusal when a negative value arrives, so
+ * this client does not re-validate: a second copy of the rule is a second copy that can disagree.
+ */
+export function saveProjectLimits(
+  projectId: string,
+  body: ProjectLimitsSave,
+  organizationId?: string,
+): Promise<ProjectLimits> {
+  return request<ProjectLimits>(`/api/v1/projects/${projectId}/limits`, {
+    method: "PUT",
+    body: JSON.stringify({ ...body, organization_id: organizationId }),
+  });
+}
+
+/**
+ * The project-scoped audit trail (REQ-133 slice 4).
+ *
+ * `action` is passed to the API rather than filtered here: the server owns the filter, and a
+ * client-side filter over a truncated page would quietly report "nothing happened" for the rows
+ * the page never fetched.
+ */
+export function fetchProjectAudit(
+  projectId: string,
+  action: string,
+  organizationId?: string,
+  limit = 200,
+): Promise<ProjectAudit> {
+  const query = new URLSearchParams({ action, limit: String(limit) });
+  if (organizationId) query.set("organization_id", organizationId);
+  return request<ProjectAudit>(`/api/v1/projects/${projectId}/audit?${query.toString()}`);
+}
+
+/**
+ * Hand the project to a new owner, with both confirmations.
+ *
+ * The two booleans are the REQ's two sentences, and the API refuses a request that carries only
+ * one — so the dialog's checkboxes are a convenience and this is the rule.
+ */
+export function transferProjectOwnership(
+  projectId: string,
+  toUserId: string,
+  organizationId?: string,
+): Promise<{ previous_owner_user_id: string | null; owner_user_id: string | null; key: string }> {
+  return request(`/api/v1/projects/${projectId}/transfer-ownership`, {
+    method: "POST",
+    body: JSON.stringify({
+      organization_id: organizationId,
+      to_user_id: toUserId,
+      confirm_owner: true,
+      confirm_audit: true,
     }),
   });
 }
