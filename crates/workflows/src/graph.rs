@@ -1539,6 +1539,14 @@ pub fn project_walk_with_plugins(
             }
         }
 
+        // **Invariant: `validate` above has already refused a node with two walkable ports,
+        // so exactly one of these edges can exist here.** The `find` is not a choice between
+        // branches — it is the only edge on a followed port, and the guarantee is the
+        // `ambiguous_branch` finding rather than anything this loop could check itself.
+        //
+        // That guarantee is why the two pieces of code must stay together: if the check above
+        // is ever relaxed to a warning, this silently becomes the first-edge-wins guess it
+        // used to be, and a rule that runs the wrong branch still validates clean.
         let next = graph
             .edges
             .iter()
