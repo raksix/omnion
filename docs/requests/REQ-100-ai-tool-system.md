@@ -1,6 +1,8 @@
 # REQ-100 — AI Tool System & Permission Matrix
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + `crates/permissions`
+> **Status:** in-progress (slice 1's pure half: `catalogue.rs` + `schema.rs`, `ec4cb46` / `dac6fc7` —
+> the migration, the seeder and both screens are outstanding) ·
+> **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + `crates/permissions`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request

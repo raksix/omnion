@@ -4723,3 +4723,72 @@ scoped-pass tooling, not REQ-099, and it is not ticked off.
 REQ-099 on the two boxes that are genuinely its own, then REQ-100 — the AI tool system, first in
 the queue with no prior commits, and the natural owner of the tool catalogue REQ-099's agent editor
 already references.
+
+## 2026-09-30 · wave 7 · tick 25 — the scoped pass had never been wired to the runner (`df9c56c`, `7a2455b`, `ec4cb46`, `dac6fc7`)
+
+**The QA slot was busy for 65 minutes; the tick's real work was a red gate that had been red since
+a merge.** `scripts/qa/probe-pass-scope.cjs` sits at 5/7, and the previous tick recorded it as "a
+known pre-existing failure, not mine to fix quietly". That note was wrong on both counts. It came
+from this branch's own `acb73eb`, and it had been failing since `b5b1d96` merged `main` into
+`wave7`.
+
+**Two real defects, both in the scoped-pass tooling.**
+
+1. **`run.sh` never forwarded `QA_ONLY`.** The scoped pass exists in `walkthrough.cjs`, in its own
+   header, in six asserts — and in nothing else, because `run.sh` built the walkthrough's argv from
+   three fixed flags and dropped the rest. `QA_ONLY=ai bash scripts/qa/run.sh` ran a **full** pass.
+   The feature had been tested the whole time by a probe that reads **the walkthrough's argv**,
+   which proves the flag is well-formed, never that anything passes it. Wiring now happens in
+   `run.sh`, and the vision review is skipped when a scope is set — it judges the whole shot set
+   against the product's visual rules, and on a scoped pass that set is a fraction of the screens,
+   so its verdicts describe a product state that does not exist. That is the seventh assert.
+
+2. **A merge dropped a scope guard.** The analytics settings/privacy pass sat at four-space indent
+   with its `if (inScope("analytics")) { … }` wrapper gone, so it ran on **every** scoped pass
+   regardless of area — including its purge-and-erase half. Its `log()` was still 40 lines below its
+   own call. Restored, and the stray `log()` moved up to where it prints.
+
+**REQ-100 slice 1, first half, committed while the pass queued.**
+
+- `crates/ai-hub/src/catalogue.rs` — the 23 tools the request names, each with its class, risk,
+  single permission, closed argument schema and example. Three properties are **compiled** rather
+  than documented: every named permission must exist in the catalogue; the declared permission must
+  equal the permission its HTTP route enforces, checked in **both** directions; every example
+  validates against its own schema. High risk ships gated, and `users.create` / `plugin.install` are
+  asserted by name. `ToolSpec::to_row` deliberately omits `enabled` / `timeout_ms` /
+  `max_calls_per_run` / `requires_approval` — a seeder that *can* write them is how a gated tool
+  comes back ungated after a restart.
+- `crates/ai-hub/src/schema.rs` — the JSON-Schema subset, run before any service call, with the
+  refusal naming the field in **both** halves (`path` for the trace, `message` for the model).
+  `supported()` refuses a tool schema using a keyword the validator does not implement, wired into
+  the catalogue's test.
+
+Two of my own tests were wrong and said so. The validator's first test pinned *which* of two errors
+comes first, in two different forms; both failed because serde_json walks fields in map order and
+map order is not a contract. It now asserts the set. And `unknown_field` / `missing_required` were
+leaving `path` empty — the prose named the field for the model while the structured half said
+nothing; that was a defect in the code, found by the test, fixed in the code.
+
+**Proof.** `cargo test -p omnion-ai-hub --lib` → **374 passed, 0 failed** (346 at the start of the
+tick: 13 catalogue, 15 schema). `pnpm typecheck` → **2/2**. `node --check scripts/qa/walkthrough.cjs`
+→ OK. `bash -n scripts/qa/run.sh` → OK. `node scripts/qa/probe-pass-scope.cjs` → **7/7** (was 5/7).
+The `${QA_ONLY:+--only="$QA_ONLY"}` expansion was checked in both directions: unset → no flag, `ai`
+→ `--only=ai`, and the walkthrough parses it back to `inScope("ai") == true`,
+`inScope("media") == false`.
+
+**The box filled up again, and the commit gate was one file away from silently doing nothing.**
+`/` was at **100 %** (700 MB free) when the tick started writing. On a full disk `git commit` fails
+while `git status` and `git diff` keep working, so a tick can look clean and commit nothing.
+Reclaimed `/root/w10-build` (1.3 GB, 21 h cold, zero env/cwd holders and zero open file
+descriptors) → 1.8 GB. `/root/w4-target` (2.2 GB) was **left alone**: it has no holder but was
+written 3127 times in the last 6 h, and "nobody holds it" is a different question from "nobody is
+about to".
+
+**Also this tick: a pass of mine was blocked inside `run.sh` while I edited `run.sh`.** Bash reads
+a script by byte offset as it executes, so pid 2030148 — parked at `waiting for a QA slot` — would
+have resumed into the middle of edited text. Killed rather than trusted.
+
+**Next.** The AI-scoped pass (`QA_STACK=w7 … QA_ONLY=ai`) has been queued 65 minutes; w8 holds the
+single slot and is genuinely advancing, with w2, w3 and w9 behind it. When it lands: close REQ-099
+on `runAiAgentsDepth`, then finish REQ-100 slice 1 (the `ai_tools` migration, the seeder with edit
+preservation, `/ai/tools` and `/ai/tools/[key]`).
