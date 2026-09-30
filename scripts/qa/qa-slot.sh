@@ -80,4 +80,18 @@ while :; do
     exit 0
   fi
   sleep 15
+  # Reap **again** here, not only before the first check.
+  #
+  # The one-shot reap at the top of this script is correct for a pass that starts into a clean
+  # queue, and useless for a pass that waits. A waiting pass is blocked on a place whose owner
+  # was killed — a timeout, a `timeout 1400` that fired, a writer that was interrupted — and
+  # killing the pass does not run `run.sh`'s EXIT trap, so the place and its holder file stay
+  # behind with a dead pid. Nothing else in the loop can clear it either: the reaper only runs
+  # when a *new* pass starts, and the only pass here is the one already waiting. The symptom is
+  # a queue that never moves, one "waiting for a QA slot" line, and a pass that dies at its own
+  # timeout having measured nothing.
+  #
+  # The check is cheap — a handful of `kill -0` calls per 15 s — and it is the difference between
+  # a queue that drains and one that needs a human to delete a file out of /tmp.
+  reap
 done
