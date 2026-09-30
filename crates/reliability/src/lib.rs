@@ -33,6 +33,7 @@
 //! agreeing with it today, and it is why every module here is testable without a database.
 
 pub mod breaker;
+pub mod breaker_store;
 pub mod error;
 pub mod idempotency;
 pub mod idem_store;
@@ -40,6 +41,7 @@ pub mod intake;
 pub mod limiter_redis;
 pub mod limits;
 pub mod retry;
+pub mod retry_store;
 pub mod store;
 pub mod vocabulary;
 
