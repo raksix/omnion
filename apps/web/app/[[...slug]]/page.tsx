@@ -25,6 +25,12 @@ export const dynamic = "force-dynamic";
 const HOME_SLUG = "home";
 
 type RouteParams = { params: Promise<{ slug?: string[] }> };
+type RouteSearch = { searchParams?: Promise<Record<string, string | string[] | undefined>> };
+
+/** The `?site=` hint on this request, read the one way both callers must read it. */
+async function siteHintOf(search: RouteSearch["searchParams"]): Promise<string | string[] | undefined> {
+  return (await search)?.site;
+}
 
 /** The slug a request addresses; `null` for a path that cannot be a page. */
 function slugOf(segments: string[] | undefined): string | null {
@@ -55,21 +61,23 @@ async function viewportOf() {
   });
 }
 
-export async function generateMetadata({ params }: RouteParams): Promise<Metadata> {
+export async function generateMetadata({ params, searchParams }: RouteParams & RouteSearch): Promise<Metadata> {
   const slug = slugOf((await params).slug);
   if (!slug) {
     return { title: "Not found" };
   }
   // Metadata does not depend on the viewport: a title the phone hides is a title the crawler
-  // would miss, and the block system has no opinion on a page's name.
-  const content = await getPublishedPage(slug);
+  // would miss, and the block system has no opinion on a page's name. It DOES depend on the
+  // site, though: the same slug can exist on two sites with two different titles, so a title
+  // resolved without the `?site=` hint would be the other site's name.
+  const content = await getPublishedPage(slug, "desktop", await siteHintOf(searchParams));
   return content ? metadataFor(content) : { title: "Not found" };
 }
 
-export default async function Page({ params }: RouteParams) {
+export default async function Page({ params, searchParams }: RouteParams & RouteSearch) {
   const slug = slugOf((await params).slug);
   const viewport = await viewportOf();
-  const content = slug ? await getPublishedPage(slug, viewport) : null;
+  const content = slug ? await getPublishedPage(slug, viewport, await siteHintOf(searchParams)) : null;
   if (!content) {
     notFound();
   }

@@ -14,6 +14,16 @@ const apiOrigin = process.env.OMNION_API_URL?.replace(/\/+$/, "") ?? "http://127
  * Site hint for installations where several sites share one renderer: `OMNION_SITE` (a site
  * key like `main`, or one of its domains) wins. Without it the visitor's own host is forwarded
  * — the same signal the API resolves domains with.
+ *
+ * A `?site=` on the page's own URL is honoured first, and only as a hint. Host resolution is
+ * the right default and stays the default; what a hint is *for* is an address that cannot
+ * resolve one — a loopback preview (`127.0.0.1:3200`, where `visitorHost` returns `null` and
+ * the API is asked for a page with no site at all), and a shareable multi-site link. Without
+ * it, `http://127.0.0.1:3200/about?site=main` 404s on a multi-site installation while the same
+ * slug renders on its own domain, which reads as the page being gone rather than as the
+ * renderer not knowing which site it is drawing. A visitor can name any site this way, so the
+ * hint only ever selects *which* site to read; the API still applies the site's own publication
+ * and draft rules, and a slug the named site does not have is a 404 there too.
  */
 const configuredSite = process.env.OMNION_SITE?.trim();
 
@@ -32,8 +42,9 @@ const configuredSite = process.env.OMNION_SITE?.trim();
 export async function getPublishedPage(
   slug: string,
   viewport: Viewport = "desktop",
+  siteHint?: string | string[],
 ): Promise<PublishedPage | null> {
-  const site = configuredSite || (await visitorHost());
+  const site = normalizeSiteHint(siteHint) || configuredSite || (await visitorHost());
   const query = new URLSearchParams();
   if (site) {
     query.set("site", site);
@@ -111,6 +122,28 @@ async function visitorHost(): Promise<string | null> {
     return null;
   }
   return host;
+}
+
+/**
+ * The `?site=` the visitor put on the page's own URL, or `null` when they put nothing usable.
+ *
+ * Bounded on purpose. This string is forwarded to the API as a query parameter, and an
+ * unbounded one would let a URL name a hundred-kilobyte "site", so it is trimmed and cut to
+ * the shape a site key or domain actually has: letters, digits, dots and dashes, at most 64
+ * characters. Anything else is not a site this renderer will ask for — `?site=<script>` is a
+ * 404, which is the correct answer for an address that is not a site, and it keeps the value
+ * that reaches the API a token rather than arbitrary text.
+ */
+function normalizeSiteHint(value: string | string[] | undefined): string | null {
+  const first = Array.isArray(value) ? value[0] : value;
+  if (typeof first !== "string") {
+    return null;
+  }
+  const trimmed = first.trim().toLowerCase();
+  if (!trimmed || trimmed.length > 64 || !/^[a-z0-9.-]+$/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
 }
 
 /** Drop the port (and any proxy list) from a host value. */
