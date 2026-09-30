@@ -309,6 +309,26 @@ async fn read_revision(
     Ok(revision)
 }
 
+/// The tokens a visitor actually renders with, or `None` for a site that has published nothing.
+///
+/// A package export needs this and not `settings_view().draft.tokens`, because a package is
+/// what the far site will render: exporting an unpublished draft installs a look the source
+/// site never showed anyone. The theme's own defaults are the caller's business, not this
+/// function's — `None` means "publish something", and folding defaults in here would make an
+/// unconfigured site indistinguishable from a configured one in an exported package.
+pub async fn published_tokens(pool: &PgPool, site_id: Uuid) -> Result<Option<Value>> {
+    let published_id: Option<Uuid> = sqlx::query_scalar(
+        "select revision_id from theme_settings_published where site_id = $1",
+    )
+    .bind(site_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(revision) = read_revision(pool, published_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(revision.tokens))
+}
+
 /// One revision by its number, for the history screen's detail route.
 pub async fn revision(
     pool: &PgPool,

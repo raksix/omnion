@@ -184,7 +184,11 @@ pub async fn update_page(
         // edit that touches anything else keeps the base revision's tree.
         let blocks = match &changes.blocks {
             Some(payload) => {
-                let report = crate::blocks::validate(payload);
+                // One path, not three: `blocks::prepare_tree` validates, sanitises and
+                // normalises in the order every other writer of a block tree uses. This code
+                // used to spell the sequence out itself, which is how a pattern save and a
+                // page save ended up producing different stored shapes for the same input.
+                let (normalized, report) = crate::blocks::prepare_tree(payload.clone())?;
                 // Only a payload the store cannot hold is refused here. An unfinished block —
                 // a heading with no text yet, an image with no alternative text — saves as a
                 // draft exactly like a half-written body does, because an author is allowed to
@@ -197,16 +201,7 @@ pub async fn update_page(
                         issue.code, issue.path, issue.message
                     )));
                 }
-                let mut parsed = crate::blocks::parse_blocks(payload)?;
-                // Raw HTML is sanitised on the way *into* storage, not on the way to the screen:
-                // once a value is stored it is already safe, so a theme override, a cache, an
-                // export or a future renderer cannot resurrect markup that was only stripped for
-                // the one page that happened to draw it.
-                let _sanitized = crate::blocks::sanitize_tree(&mut parsed);
-                for block in &mut parsed {
-                    let _ = crate::blocks::normalize(block);
-                }
-                crate::blocks::blocks_to_value(&parsed)
+                normalized
             }
             None => base.blocks.clone(),
         };

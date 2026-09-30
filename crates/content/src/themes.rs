@@ -237,8 +237,17 @@ pub async fn gallery(
 ) -> Result<GalleryView> {
     let active_key = active_theme_key(pool, site_id).await?;
     let rows = sqlx::query_as::<_, GalleryRow>(
-        "select t.id, t.organization_id, t.key, t.name, t.version, t.source, t.manifest, \
-                t.storage_key, t.checksum, t.installed_by, t.installed_at, \
+        // Every column from `t` carries the `theme_` prefix `GalleryRow` declares, because a
+        // JOIN has two `id`s, two `key`s and two `theme_key`s and sqlx resolves a row field by
+        // COLUMN NAME, not by position. Without the aliases this route answered 500
+        // ("no column found for name: theme_id") the first time a walk asked the gallery for a
+        // site — which is the only way the route is ever used, so the slice-1 gallery was
+        // unreachable end to end and its own walk never noticed.
+        "select t.id as theme_id, t.organization_id as theme_organization_id, \
+                t.key as theme_key_value, t.name as theme_name, t.version as theme_version, \
+                t.source as theme_source, t.manifest as theme_manifest, \
+                t.storage_key as theme_storage_key, t.checksum as theme_checksum, \
+                t.installed_by as theme_installed_by, t.installed_at as theme_installed_at, \
                 s.theme_key as active_key, s.previous_theme_key as rollback_key \
          from themes t \
          left join site_themes s on s.site_id = $1 \
