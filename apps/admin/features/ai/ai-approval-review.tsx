@@ -34,6 +34,7 @@ import {
   CircleSlash,
   Clock,
   Loader2,
+  RefreshCw,
   RotateCcw,
   ShieldAlert,
   TriangleAlert,
@@ -46,6 +47,7 @@ import {
   type AiApprovalAuditRow,
   approveAiApproval,
   fetchAiApproval,
+  rePreviewAiApproval,
   rejectAiApproval,
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
@@ -273,6 +275,11 @@ export function AiApprovalReviewScreen() {
   const [confirmation, setConfirmation] = useState("");
   const [reason, setReason] = useState("");
   const [showUnchanged, setShowUnchanged] = useState<Record<number, boolean>>({});
+  // The stale banner's own state. It is raised by a `stale` refusal from the decide call and
+  // survives `load()` — a reload that cleared it would hide the very reason Approve is
+  // disabled, and the reviewer would be left with a dead button and no explanation.
+  const [stale, setStale] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
 
   const load = useCallback(() => {
     setError(null);
@@ -315,6 +322,45 @@ export function AiApprovalReviewScreen() {
     [approval],
   );
 
+  /**
+   * Re-preview: recompute the diff against the target as it is now.
+   *
+   * Three answers, three screens, and the distinction is the point:
+   *
+   * * `refreshed` — a new frozen preview was written. Clear the banner, keep the typed phrase
+   *   (the reviewer is still deciding the same operation) and re-render from the returned row.
+   * * `unchanged` — the recomputed plan is identical, so the staleness was something else (a
+   *   mapping change, or a banner raised by an approve attempt that raced a fix). The banner
+   *   stays up with the refusal's own text, because telling the reviewer "nothing changed" while
+   *   Approve is still disabled is the one answer that helps nobody.
+   * * an error — the message is the API's, and the banner stays up. A re-preview that failed is
+   *   exactly when the reviewer most needs to know the target is no longer previewable.
+   */
+  const rePreview = async () => {
+    if (!approval) return;
+    setPreviewing(true);
+    setError(null);
+    try {
+      const result = await rePreviewAiApproval(approval.id);
+      setApproval(result.approval);
+      setStale(false);
+      setNotice(
+        result.refreshed
+          ? "Re-previewed against the current revision. Approve now decides on what this screen shows."
+          : "Nothing changed: the recomputed diff is identical to the frozen one, so the row was left as it was.",
+      );
+      setReloadToken((token) => token + 1);
+    } catch (cause: unknown) {
+      setError(
+        cause instanceof ApiError
+          ? cause.message
+          : "The preview could not be recomputed.",
+      );
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
   const canDecide = !missing.includes(DECIDE_KEY);
   const decided = approval ? !approval.decidable : false;
   const expired =
@@ -337,6 +383,8 @@ export function AiApprovalReviewScreen() {
           : await rejectAiApproval(approval.id, reason.trim());
       setApproval(result.approval);
       if (result.changed) {
+        // A taken decision is not a stale row any more; the banner must not outlive it.
+        setStale(false);
         setNotice(
           kind === "approve"
             ? "Approved. The parked run resumes and applies exactly what was previewed."
@@ -357,12 +405,16 @@ export function AiApprovalReviewScreen() {
     } catch (cause: unknown) {
       if (cause instanceof ApiError) {
         // `stale` is its own branch: the resource moved under the preview, and the screen's
-        // answer is to say so rather than to show a generic failure.
-        setError(
-          cause.code === "stale"
-            ? "The resource changed since this preview was taken. Re-read it before deciding."
-            : cause.message,
-        );
+        // answer is to say so rather than to show a generic failure — and to raise the banner,
+        // which is what disables Approve and offers Re-preview. The banner is *state*, not a
+        // rendering of the error: a later `load()` that clears the error must not silently
+        // re-enable a button whose decision is still going to be refused.
+        if (cause.code === "stale") {
+          setStale(true);
+          setError(null);
+        } else {
+          setError(cause.message);
+        }
       } else {
         setError("The decision did not go through.");
       }
@@ -530,6 +582,40 @@ export function AiApprovalReviewScreen() {
             was released without the effect.
           </p>
         ) : null}
+        {/* The stale banner. Distinct from the error banner on purpose: an error is something
+            that went wrong, this is the *known* state of a request whose target moved — and its
+            remedy is a button, not a retry. Approve is disabled while it is up because the
+            decision would be refused with `stale` anyway, and a reviewer who clicks a button
+            that cannot work learns to distrust the screen. */}
+        {stale ? (
+          <div
+            data-approval-stale-banner
+            className="flex flex-col gap-2 border-b border-line bg-caution-soft px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+          >
+            <p className="flex items-start gap-1.5 text-[12.5px] text-caution">
+              <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+              <span>
+                The resource changed since this preview was taken, so this diff may no longer be
+                what would happen. Approving now is refused; re-preview against the current
+                revision first.
+              </span>
+            </p>
+            <button
+              type="button"
+              onClick={() => void rePreview()}
+              disabled={previewing}
+              data-approval-repreview
+              className="flex w-fit shrink-0 items-center gap-1.5 rounded-lg border border-caution/40 bg-surface px-3 py-1.5 text-[12.5px] font-medium text-caution transition hover:bg-caution-soft disabled:opacity-50"
+            >
+              {previewing ? (
+                <Loader2 className="size-3.5 animate-spin" aria-hidden />
+              ) : (
+                <RefreshCw className="size-3.5" aria-hidden />
+              )}
+              Re-preview against the current revision
+            </button>
+          </div>
+        ) : null}
 
         {/* The proposed operations: the frozen diff, never a client-side re-preview. */}
         <div className="flex flex-col gap-2 px-4 py-4">
@@ -615,6 +701,12 @@ export function AiApprovalReviewScreen() {
             refuses the same call with a 403 naming it.
           </p>
         ) : null}
+        {stale ? (
+          <p data-approval-stale-note className="text-[12px] text-caution">
+            Approve is disabled while this banner is up. Re-preview the diff first, then decide on
+            what the screen shows.
+          </p>
+        ) : null}
         {decided && !expired ? (
           <p data-approval-already-decided className="flex items-center gap-1.5 text-[12px] text-muted">
             <CircleSlash className="size-3.5" aria-hidden />
@@ -636,7 +728,7 @@ export function AiApprovalReviewScreen() {
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            disabled={!canDecide || decided || busy}
+            disabled={!canDecide || decided || busy || stale || previewing}
             onClick={() => void decide("approve")}
             data-approval-approve
             className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-medium text-white transition hover:bg-accent-strong disabled:bg-quiet-soft disabled:text-muted"

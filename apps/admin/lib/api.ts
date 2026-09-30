@@ -4649,6 +4649,28 @@ export function approveAiApproval(
   });
 }
 
+/**
+ * Recompute a request's diff against the target as it is **now**.
+ *
+ * No body on purpose. The server rebuilds the operation from the frozen preview and reads the
+ * row itself — a re-preview that accepted a client-supplied diff would be a diff nobody
+ * approved. The answer is the row, so the screen re-renders from the same object the server
+ * wrote rather than from a second read that could be a different instant.
+ *
+ * `refreshed: false` with `code: "unchanged"` is the refusal the request asks for: the
+ * recomputed plan is identical, so nothing was written.
+ */
+export function rePreviewAiApproval(id: string): Promise<{
+  refreshed: boolean;
+  code: string | null;
+  approval: AiApproval;
+}> {
+  return request(`/api/v1/ai/approvals/${encodeURIComponent(id)}/preview`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
 /** Reject one request. The reason is mandatory server-side; a blank one is refused there. */
 export function rejectAiApproval(
   id: string,
