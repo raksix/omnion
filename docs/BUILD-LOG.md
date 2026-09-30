@@ -7188,3 +7188,75 @@ Run the w7 pass (`QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3
 three new routes, then tick the boxes the pass proves: the empty/loading/error states, the
 disabled-and-named decision controls, and the review screen's diff. Slice 2 (the shared
 preview/apply module, base revisions, stale detection at the API level) is untouched.
+
+## 2026-09-30 · REQ-101 slice 2, the shared preview/apply mapping (tick 38, omnion-w7)
+
+**What**
+
+`crates/ai-hub/src/approvals/plan.rs` — the field mapping the request says must be *one*
+implementation, made into data rather than code. `plan()` resolves an operation against a
+`FieldSpec` list into a hashable `Plan`; `writes()` turns that plan into the column writes the
+apply performs. Both read the same specs, so a spec whose `field` changed moves the previewed
+column and the written column together, and neither half contains a field name, a limit or a
+coercion of its own.
+
+Three decisions worth their reasons:
+
+- **Coercion happens in the preview, before the hash.** The diff carries the *coerced* value, so
+  the reviewer sees what will be written and an over-long value is a refusal at preview time
+  instead of a failed apply. Coercing after the hash would also make `{"title":"A"}` and
+  `{"title":"A "}` hash differently, which would invalidate a decision for a spelling nobody can
+  see on screen.
+- **The hash covers the resolved diff, not the arguments.** Key order, mapping declaration order
+  and a restated trimmed value all leave the hash alone; a written value, a target or a base
+  revision all move it. Hashing the request would have made a re-typed identical edit look like
+  a changed one.
+- **A stored preview from another mapping is refused, not applied.** `writes()` has no fallback
+  column, because guessing one is precisely the drift the module exists to prevent.
+
+**Proof**
+
+```
+cargo fmt -p omnion-ai-hub                        (then reverted: see below)
+cargo test -p omnion-ai-hub --lib                 470 passed, 0 failed  (22 new)
+pnpm typecheck                                    2 successful, 2 total
+```
+
+**Two things this tick cost, and both are traps worth writing down.**
+
+`cargo fmt -p omnion-ai-hub` reformatted **24 unrelated files** (1277 lines) — the whole crate,
+not the file I added. The tree was clean when the tick started, so the dirt was all mine, and
+none of it belonged to a slice. Reverted with `git checkout --` on the modified set; the commit
+carries only `plan.rs` and the one-line module registration. **Format one file
+(`rustfmt crates/ai-hub/src/approvals/plan.rs`), not the crate.**
+
+The box was at 100% with 427 MB free when the first write failed with `No space left on
+device`, and it left a **0-byte `crates/ai-hub/src/approvals/.hermes-tmp.t9VXB1`** behind — the
+documented partial-write trap, showing up again. Both were cleared by deleting my own
+`apps/*/.next` (no live process referenced them); a sibling finished mid-tick and the box
+recovered to 8.6 GB on its own. **After a failed write, look for the `.hermes-tmp` file before
+believing the write failed.**
+
+**The QA pass did not run, and the reason is new.**
+
+The slot's holder pid 542657 (w3) was alive at tick start, so the pass was not started. The
+holder then died and the place was left behind — and because `qa-slot.sh` runs its reaper
+*once, before* the wait loop, a pass that arrives after a crash finds a stale place and waits
+`QA_SLOT_WAIT` (3600s on this box) for a queue that will never move. I killed my own pass,
+verified the holder was dead by pid **and** `/proc/pid/cwd`, removed the stale place, and
+relaunched. It was then correctly refused the slot by a **live w3 pass** (holder 973982,
+`/proc/973982/cwd` = `/mnt/apopic/omnion-w3`), so it is queued. Two lessons:
+
+- **`| tail -60` on a 20-minute pass hides exactly the line that would have told me it was
+  stuck.** The pipe buffers everything and the "waiting for a QA slot" line never appeared.
+  Write the pass to a log file and tail the *file*.
+- **A pass that is "running" is not a pass that is working.** After 22 minutes with no cargo
+  process and no listener on any of 18086/3106/3206, it was waiting, not building. `ss -tlnp`
+  on your own three ports is the cheap liveness check.
+
+**Next**
+
+The w7 pass runs on the first tick that finds the slot free; then tick the boxes it proves
+(empty/loading/error states, the disabled-and-named decision controls, the review diff). Slice 2
+is not closed: the reader, the apply through `content::pages` and the stale check at the API
+level are still unwritten, and the `stale` box stays unticked until they are.
