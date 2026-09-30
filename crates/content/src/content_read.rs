@@ -280,10 +280,16 @@ impl Fields {
 /// read of the text, and the timestamp is already what the cache would have compared. The
 /// timestamp is normalised to milliseconds because PostgreSQL's microsecond precision would
 /// otherwise produce a different ETag for the same row read twice.
+///
+/// The id goes in **whole**. A 48-bit prefix is plenty for a random v4 in production and looks
+/// tidier in a header, but it is not a property the function can claim: any id scheme that shares
+/// a prefix across rows (a counter, a per-tenant sequence, a test's `from_u128`) collapses to one
+/// ETag, and two different items would then revalidate each other's cache entry. A unit test that
+/// builds ids as `from_u128(n)` catches exactly that, which is why it is here.
 #[must_use]
 pub fn etag_for(updated_at: OffsetDateTime, id: Uuid) -> String {
     let millis = updated_at.unix_timestamp_nanos() / 1_000_000;
-    format!("W/\"{millis:x}-{}\"", &id.simple().to_string()[..12])
+    format!("W/\"{millis:x}-{}\"", id.simple())
 }
 
 /// The ETag of a whole list response, over the items it contains.
