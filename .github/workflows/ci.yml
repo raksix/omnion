@@ -531,6 +531,8 @@ jobs:
         run: python3 release/tests/test_release_manifest.py
       - name: Release pipeline unit tests
         run: python3 release/tests/test_release_pipeline.py
+      - name: Environment bundle unit tests
+        run: python3 release/tests/test_release_bundle.py
       # The gate mutates the manifest nineteen ways and requires every one to be caught. A
       # green run therefore means two things at once: the builder works, and the checks are
       # capable of failing.
@@ -542,5 +544,12 @@ jobs:
       # findable after the fact once a tag has been pushed under a name people trust.
       - name: Release pipeline gate (with mutations)
         run: bash scripts/qa/release-pipeline.sh
+      # The bundle generator: three kinds of install file, the acceptance criterion that none
+      # of them carries a credential, and the refusals for a caller who passes one. It runs
+      # on the commit rather than on the download, because a bundle is generated at the moment
+      # an operator is about to trust it — the worst possible time to discover it carries a
+      # secret-shaped string.
+      - name: Environment bundle gate (with mutations)
+        run: bash scripts/qa/release-bundle.sh
       - name: Chart renders and lints
         run: bash scripts/qa/helm-chart.sh
