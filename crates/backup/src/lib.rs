@@ -40,6 +40,7 @@ pub mod part;
 pub mod preview;
 pub mod purge;
 pub mod restore;
+pub mod restore_jobs;
 pub mod restore_objects;
 pub mod store;
 pub mod sweep;
