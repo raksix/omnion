@@ -7282,3 +7282,50 @@ reason.
 **Next.** (a) Read that pass's `summary.json` for the new 390/1440 steps and `publicRendered`; tick
 17 only when both halves are green. (b) REQ-064's open slices. (c) REQ-062 acceptance 15's render
 half — the scaffolder compiles a theme but has never been watched drawing one.
+
+## 2026-09-30 · Tick 36 — QA harness: the slot reaper ran once, before the wait (REQ-063 criterion 17 still open)
+
+**What.** The pass this branch queued last tick for criterion 17 spent its whole wait asleep
+behind a place whose owner had already died. `qa-slot.sh` reaped stale places exactly once,
+*before* the wait loop — so a pass that queued while a sibling was healthy could not notice the
+sibling crashing later, and sat on the corpse until its own `QA_SLOT_WAIT` expired. Here that is
+1800 s in `run.sh` and 3600 s in the writer loops: every queued pass on the box pays the full
+timeout, then proceeds with no place, which is two Chromiums instead of one. `reap` now runs on
+every turn of the loop, and the grace period inside it is what makes that safe (a place younger
+than `QA_SLOT_REAP_GRACE` is never judged).
+
+The slot had no test at all, and every one of its failure modes is silent: a pass that never
+starts and a pass that starts without a place both look like a box too loaded to walk anything.
+`scripts/qa/test-qa-slot.sh` covers five cases against real files, real pids and real clocks —
+grant and holder liveness, a live place blocking a second pass until its deadline, a crashed
+pass's place being reclaimed, **reaping during the wait rather than before it**, and the grace
+period not eating a place that was taken a moment ago. `run.sh` runs it before it waits.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `bash scripts/qa/test-qa-slot.sh` (fixed) | **15 passed, 0 failed** |
+| same test against the pre-fix `qa-slot.sh` (`git stash`) | **2 failures in case 4** — "the reaper never ran during the wait", "the pass gave up on a place it could have reclaimed (waited 50s)" |
+| `bash -n` on `run.sh`, `qa-slot.sh`, `test-qa-slot.sh` | clean |
+| live queue untouched | the test's every case runs in its own `mktemp -d`; it never names `/tmp/omnion-qa-slot` |
+
+**The regression test earned its keep three times before it went green, and every failure was
+in the test.** Case 4 first planted no place at all, so the pass was granted one in 0 s and its
+"it did not time out" assertion passed without the wait ever happening. It then failed for a
+second unmeasured reason: the real grace is 120 s, longer than the 40 s the case allowed, so a
+freshly written place could never be reaped inside that window. And the marker recording "the
+owner died" was written *into* the lock directory — where a file with no holder is by definition
+an orphaned place, so the script under test deleted the evidence the assertion then read. The
+case only measures the loop now if it asserts that the pass waited **and** that the owner died
+while it waited; both are checked before the verdict that depends on them.
+
+**No acceptance box is ticked.** This is harness work: it removes the reason criterion 17 has
+had no verdict for two ticks, but the verdict itself has to come from a browser pass. The pass
+queued in tick 35 was granted the place at 07:58 with 7.8 GB free (above the 6 GB floor) and is
+in its API build now.
+
+**Next.** (a) Read `qa-artifacts/20260930-071633/summary.json` for `editorNarrowAt1440`,
+`editorNoHorizontalScrollAt390`, `noPublishControlAt390`, `canvasDrawnAt390` and
+`publicRendered`; tick 17 only when both halves are green. (b) REQ-064's open slices. (c)
+REQ-062 acceptance 15's render half.
