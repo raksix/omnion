@@ -9572,32 +9572,23 @@ async function main() {
   report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
   log(`security: ${JSON.stringify(report.security)}`);
 
-  // The system health centre (REQ-014, slice 1). It runs after the security pass
+  // The system health centre (REQ-014, slices 1 and 3). It runs after the security pass
   // because both screens run live probes, and running them in the other order
   // would have the health screen's own PostgreSQL probe read the connection pool
   // the security scan is still holding.
-  if (wants("health-overview")) {
-    matchedOnly.add("health-overview");
-    report.health = await runDepthPass("health", () => runHealthDepth(page, report));
+  //
+  // Two writers had added to this one region and the merge left BOTH copies of the block, so a
+  // full pass ran `runHealthDepth` twice — the second run re-probed every service and overwrote
+  // the first run's report with its own, and the `if (wants("health-overview"))` wrapper meant a
+  // pass scoped to `health-incidents` alone ran none of these. The scope is now `runDepthPass`'s
+  // job alone: it already tests `wants(name)`, records `matchedOnly` from inside that test, and
+  // wraps the call so a crashed tab cannot take the next statement with it. A second hand-written
+  // `if (wants(...))` around the block could only ever narrow the scope, never widen it.
+  report.health = await runDepthPass("health", () => runHealthDepth(page, report));
   report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
-    log(`health: ${JSON.stringify(report.health)}`);
-  }
-
-  // The system health centre (REQ-014, slice 1). It runs after the security pass
-  // because both screens run live probes, and running them in the other order
-  // would have the health screen's own PostgreSQL probe read the connection pool
-  // the security scan is still holding.
-  if (wants("health-overview")) {
-    matchedOnly.add("health-overview");
-    report.health = await runDepthPass("health", () => runHealthDepth(page, report));
-  report.healthMetrics = await runDepthPass("health-metrics", () => runHealthMetricsDepth(page, report));
-  // Slice 3's two passes (REQ-014). Both are `runDepthPass` like every other depth walk, which
-  // is what makes them survive a page crash: the wrapper records the failure instead of the run
-  // dying on the next `page.locator`.
   report.healthIncidents = await runDepthPass("health-incidents", () => runHealthIncidentsDepth(page, report));
   report.healthSettings = await runDepthPass("health-settings", () => runHealthSettingsDepth(page, report));
-    log(`health: ${JSON.stringify(report.health)}`);
-  }
+  log(`health: ${JSON.stringify(report.health)}`);
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
