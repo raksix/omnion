@@ -20,6 +20,12 @@ import type {
   HealthMetricRow,
   HealthMetricsReport,
   HealthRangeKey,
+  HealthIncident,
+  HealthIncidentPage,
+  HealthIncidentAction,
+  HealthMaintenanceWindow,
+  HealthSettings,
+  HealthThreshold,
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
@@ -5211,4 +5217,141 @@ export async function downloadHealthMetricsCsv(
   const rows = Math.max(0, text.split("\n").filter((line) => line.trim() !== "").length - 1);
 
   return { rows, blob, filename: match?.[1] ?? `omnion-health-${served}.csv`, range: served };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incidents and threshold policy (REQ-014, slice 3)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `GET /api/v1/health/incidents` — a page of the timeline.
+ *
+ * The filters go out as query parameters and the server **refuses** a malformed instant rather
+ * than ignoring it: a `from=` that silently widens to "no lower bound" is the kind of filter
+ * that makes an incident screen agree with itself while showing the wrong week.
+ */
+export function fetchHealthIncidents(
+  filter: {
+    service?: string | null;
+    state?: string | null;
+    from?: string | null;
+    to?: string | null;
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<HealthIncidentPage> {
+  const query = new URLSearchParams();
+  if (filter.service) query.set("service", filter.service);
+  if (filter.state) query.set("state", filter.state);
+  if (filter.from) query.set("from", filter.from);
+  if (filter.to) query.set("to", filter.to);
+  if (filter.limit !== undefined) query.set("limit", String(filter.limit));
+  if (filter.offset !== undefined) query.set("offset", String(filter.offset));
+  const suffix = query.toString();
+  return request<HealthIncidentPage>(
+    `/api/v1/health/incidents${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** `GET /api/v1/health/incidents/{id}` — one incident with its own detail. */
+export function fetchHealthIncident(id: string): Promise<HealthIncident> {
+  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
+    cache: "no-store",
+  });
+}
+
+/**
+ * `PATCH /api/v1/health/incidents/{id}` — acknowledge with a note, or resolve by hand.
+ *
+ * One endpoint for both, because they are one decision: an operator looking at an incident
+ * either claims it or closes it.
+ */
+export function patchHealthIncident(
+  id: string,
+  action: HealthIncidentAction,
+  note?: string,
+): Promise<HealthIncident> {
+  return request<HealthIncident>(`/api/v1/health/incidents/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ action, note: note ?? "" }),
+  });
+}
+
+/** `GET /api/v1/health/settings` — the policy, its bounds and its suggestions. */
+export function fetchHealthSettings(): Promise<HealthSettings> {
+  return request<HealthSettings>("/api/v1/health/settings", { cache: "no-store" });
+}
+
+/**
+ * `PUT /api/v1/health/settings` — save intervals, pairs and toggles.
+ *
+ * `thresholds` is omitted entirely when the caller did not change a pair, so a save of one
+ * interval cannot silently reset every threshold to whatever the form's placeholders say. That
+ * is why the argument is `null`-able rather than an empty array: an empty array is a request to
+ * erase the policy.
+ */
+export function saveHealthSettings(update: {
+  check_interval_seconds?: number;
+  worker_stale_seconds?: number;
+  thresholds?: HealthThreshold[] | null;
+  notifications?: Record<string, boolean>;
+}): Promise<HealthSettings> {
+  const body: Record<string, unknown> = {};
+  if (update.check_interval_seconds !== undefined) {
+    body.check_interval_seconds = update.check_interval_seconds;
+  }
+  if (update.worker_stale_seconds !== undefined) {
+    body.worker_stale_seconds = update.worker_stale_seconds;
+  }
+  if (update.thresholds !== undefined && update.thresholds !== null) {
+    body.thresholds = update.thresholds.map((row) => ({
+      metric: row.metric,
+      warn: row.warn,
+      crit: row.crit,
+      direction: row.direction,
+    }));
+  }
+  if (update.notifications !== undefined) body.notifications = update.notifications;
+  return request<HealthSettings>("/api/v1/health/settings", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** `GET /api/v1/health/maintenance-windows` — the windows, newest first. */
+export function fetchHealthMaintenanceWindows(): Promise<HealthMaintenanceWindow[]> {
+  return request<HealthMaintenanceWindow[]>("/api/v1/health/maintenance-windows", {
+    cache: "no-store",
+  });
+}
+
+/**
+ * `POST /api/v1/health/maintenance-windows` — create one.
+ *
+ * An empty `services` array is the deploy case and covers every service; that is a real choice
+ * the form makes explicitly rather than a default the API invents.
+ */
+export function createHealthMaintenanceWindow(input: {
+  starts_at: string;
+  ends_at: string;
+  services?: string[];
+  note?: string;
+}): Promise<HealthMaintenanceWindow> {
+  return request<HealthMaintenanceWindow>("/api/v1/health/maintenance-windows", {
+    method: "POST",
+    body: JSON.stringify({
+      starts_at: input.starts_at,
+      ends_at: input.ends_at,
+      services: input.services ?? [],
+      note: input.note ?? "",
+    }),
+  });
+}
+
+/** `DELETE /api/v1/health/maintenance-windows/{id}` — withdraw a window. */
+export function deleteHealthMaintenanceWindow(id: string): Promise<void> {
+  return request<void>(`/api/v1/health/maintenance-windows/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
 }
