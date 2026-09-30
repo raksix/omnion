@@ -918,7 +918,12 @@ pub fn router(state: AppState) -> Router {
     // The usage chart is a read of the same call log the detail screen lists, so it stays
     // `ai.tools.read` — a separate key would be a permission an operator has to remember for a
     // sum of columns they could add up themselves.
-    let ai_tool_usage =
+    //
+    // Named `ai_tool_registry_usage`, not `ai_tool_usage`: the binding above already belongs to
+    // REQ-099's `/ai/agents/{id}/tool-usage`, and two `let`s of one name in one function is
+    // E0283 — "type annotations needed for MethodRouter" — which names neither of the two
+    // routes that caused it.
+    let ai_tool_registry_usage =
         get(ai_tools::tool_usage_route).layer(guards::require(&state, "ai.tools.read"));
     let ai_runs = get(ai_agents::list_runs_route).layer(guards::require(&state, "ai.agents.read"));
     let ai_run = get(ai_agents::get_run_route).layer(guards::require(&state, "ai.agents.read"));
@@ -1692,7 +1697,7 @@ pub fn router(state: AppState) -> Router {
         // segment over a capture, so the static path keeps its own handler instead of being
         // read as a tool whose key is "classes".
         .route("/ai/tools/classes", ai_tool_classes)
-        .route("/ai/tools/{key}/usage", ai_tool_usage)
+        .route("/ai/tools/{key}/usage", ai_tool_registry_usage)
         .route("/ai/tools", ai_tools)
         .route("/ai/tools/{key}", ai_tool)
         .route("/ai/agents/{id}/skills", ai_agent_skills)

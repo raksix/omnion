@@ -160,7 +160,12 @@ pub async fn list_tools_route(
     // The needle is lowercased once, outside the loop, and the search covers the key *and* the
     // description: an operator who remembers "the thing that publishes" is not typing
     // `content.publish`.
-    let needle = list.q.as_deref().map(str::to_trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+    let needle = list
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_lowercase);
 
     let mut tools = Vec::new();
     for row in &rows {

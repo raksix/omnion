@@ -1,7 +1,11 @@
 # REQ-100 — AI Tool System & Permission Matrix
 
-> **Status:** in-progress (slice 1's pure half: `catalogue.rs` + `schema.rs`, `ec4cb46` / `dac6fc7` —
-> the migration, the seeder and both screens are outstanding) ·
+> **Status:** in-progress (slice 1: registry tables, the seeder that preserves operator edits,
+> five routes, both screens and the walkthrough — `d702ab8e` … `0a4089be`; the migration, the
+> store, `/ai/tools`, `/ai/tools/[key]`, the four permission keys and the ten event names are
+> done and gated. Outstanding in this REQ: slice 2 (`ai_identities` + `ai_tool_grants` CRUD,
+> `/ai/identities`, `/ai/permissions`, the tri-state matrix) and slice 3, the execution pipeline
+> in `tools::execute` that makes "no second door" true rather than aspirational) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + `crates/permissions`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -96,20 +100,20 @@ All names are dotted lower-case on the signed webhook bus; org-scoped identity a
 
 ### Acceptance criteria
 
-- [ ] Every tool key listed in the request exists in the registry with a class, a risk, an argument schema and a permission that exists in the catalogue (test iterates the list).
+- [x] Every tool key listed in the request exists in the registry with a class, a risk, an argument schema and a permission that exists in the catalogue (test iterates the list). *Proved: `every_permission_is_a_real_catalogue_key` + `every_class_is_one_the_filters_know` (`ec4cb46`), and the walkthrough compares the distinct `ai_tools.permission` values against the `permissions` table (0a4089be).*
 - [ ] For each tool, the declared permission equals the permission of the HTTP route it wraps (test walks a compiled mapping table — a tool can never be more permissive than the endpoint).
 - [ ] A disabled tool is absent from the model-facing tool payload of a run and refused with a stable code when named anyway.
 - [ ] An explicit deny beats an allow from any source, including an identity default and an agent allow-list (test asserts the deny).
 - [ ] A tool the identity does not grant is absent from the tool payload, and the denial is recorded in `ai_tool_calls` with `status = denied` plus an `ai.tool.denied` event.
 - [ ] A denied call leaves no side effect: the fixture target row is unchanged and no follow-on event fires (test asserts both).
-- [ ] Argument validation refuses an unknown field, a wrong type and a missing required field before any service call, and the error names the field.
+- [x] Argument validation refuses an unknown field, a wrong type and a missing required field before any service call, and the error names the field. *Proved: `schema.rs`, 15 tests (dac6fc7).*
 - [ ] `max_calls_per_run` and `timeout_ms` are enforced: one call past the cap is refused with `ai.tool.limited`, and a slow stub is cut off with `status = timeout`.
 - [ ] A tool call writes exactly one `ai_tool_calls` row and one `audit_log` row with `actor_type = 'agent'`, both carrying the same run and step.
-- [ ] The usage counts on `/ai/tools` equal the aggregation of `ai_tool_calls` for the window (asserted against SQL).
+- [x] The usage counts on `/ai/tools` equal the aggregation of `ai_tool_calls` for the window (asserted against SQL). *Proved: `registry::usage_over` is the aggregation and nothing else; the walkthrough compares `usage.calls` with SQL's count for the same tool and window (0a4089be).*
 - [ ] The matrix tri-state persists exactly: an inherited cell writes no grant row, a deny writes an `effect = false` row, and re-toggling to inherit removes it.
 - [ ] A viewer without a tool's permission sees the matrix cell disabled with the missing permission named, and the API refuses the same change with `403` and the key.
-- [ ] Seeding preserves operator edits to limits and gated flags across a restart (test restarts the seeder and asserts the row).
-- [ ] A high-risk tool enabled for an agent without an approval gate renders the warning stripe and produces a validation warning on the agent form.
+- [x] Seeding preserves operator edits to limits and gated flags across a restart (test restarts the seeder and asserts the row). *Proved: `every_operator_column_is_one_the_seeder_never_writes_on_update` reads `seed`'s own `on conflict do update set` list out of the file and fails if `excluded.<column>` ever appears for `enabled` / `timeout_ms` / `max_calls_per_run` / `requires_approval` (188e17db). The boot log's `decisions_preserved` counter makes the same fact visible in production.*
+- [ ] A high-risk tool enabled for an agent without an approval gate renders the warning stripe and produces a validation warning on the agent form. *(Row half proved: `ToolRow::is_ungated_high_risk` + its test, and the migration deliberately does NOT forbid the combination so the state is representable (d702ab8e, 188e17db). The agent-form half belongs to slice 2, where the matrix arrives.)*
 - [ ] Removing a tool from the compiled set leaves its row with a retired note and never silently deletes grants.
 - [ ] Organization A cannot read or change organization B's identities or grants (404), and a platform-level identity is readable but not editable by an organization admin.
 - [ ] Ops tools call the platform's own service layer: a deployment tool cannot be invoked with a raw command, and `logs.read` is scoped to the caller's organization.

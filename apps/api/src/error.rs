@@ -1113,6 +1113,17 @@ impl From<AiHubError> for ApiError {
             AiHubError::SkillConflict(message) => {
                 Self::new(StatusCode::CONFLICT, "skill_conflict", message)
             }
+            // The tool registry (REQ-100). Same shape as the skills above and for the same
+            // reasons: a limit or a key the panel cannot use is a `400` whose message names the
+            // field, and a tool key that is not in the registry is a `404` so a stale bookmark
+            // reads as a stale bookmark. A *retired* tool is still found on purpose — the detail
+            // screen has to be able to open one and say why it retired.
+            AiHubError::InvalidTool(message) => Self::bad_request("invalid_tool", message),
+            AiHubError::ToolNotFound(key) => Self::new(
+                StatusCode::NOT_FOUND,
+                "tool_not_found",
+                format!("no tool `{key}` in the registry"),
+            ),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code
