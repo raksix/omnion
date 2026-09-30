@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::error::{Result, WorkflowError};
 
 /// Columns of `automation_projects` for one `select`, in [`Project`] order.
-const PROJECT_COLUMNS: &str = "id, organization_id, key, name, description, color, icon, is_default, status, owner_user_id, \
-     created_by, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, organization_id, key, name, description, color, icon, is_default, status, \
+     default_member_role, owner_user_id, created_by, created_at, updated_at";
 
 /// What a member may do inside a project.
 ///
@@ -158,6 +158,14 @@ pub struct Project {
     pub is_default: bool,
     /// `active` or `archived`.
     pub status: String,
+    /// Role a caller who is not a member holds here anyway (REQ-133 acceptance 6).
+    ///
+    /// The default is `viewer`, and that default is the decision: the organization's default
+    /// project is where automations with no explicit project accumulate, so "you are not a
+    /// member" must not read as "you may edit and run everything everybody built". The column
+    /// rather than a constant, because a deployment that *does* want its operators to run
+    /// default-project automations should be able to say so without a code change.
+    pub default_member_role: String,
     /// Account that owns the project (delegated administration, slice 4).
     pub owner_user_id: Option<Uuid>,
     /// Account that created it.
@@ -339,11 +347,24 @@ pub async fn find_visible(
     project_id: Uuid,
     caller: ProjectCaller,
 ) -> Result<Option<Project>> {
+    // The `p.is_default` arm is the defect this tick's gate found, and it is the same sentence as
+    // the one in [`visible_project_ids`]: the organization's default project is visible to every
+    // account in the tenant, because it is where every resource created without an explicit
+    // project lands. Before this, only the LIST carried that clause — so a member of the
+    // organization saw the default project in the switcher, in `GET /projects`, and in every
+    // scoped workflow list, and then got `404` from `GET /projects/{id}` for the very project the
+    // list had just named. Two functions answering "can this caller see this project" with
+    // different answers is the failure mode this module keeps meeting, and the gate caught it in
+    // its first run.
+    //
+    // `resolve_target` and `can_see` build on this, so they inherit the fix: a create with no
+    // explicit project resolves the default, and `can_see(default)` now agrees with the list.
     let sql = format!(
         "select {PROJECT_COLUMNS} from automation_projects p \
          where p.id = $1 and p.organization_id = $2 \
-           and ($3 or exists (select 1 from automation_project_members m \
-                              where m.project_id = p.id and m.user_id = $4))"
+           and ($3 or p.is_default \
+                or exists (select 1 from automation_project_members m \
+                           where m.project_id = p.id and m.user_id = $4))"
     );
     let row = sqlx::query_as::<_, Project>(&sql)
         .bind(project_id)
@@ -596,7 +617,71 @@ pub async fn role_of(
     Ok(raw.as_deref().and_then(ProjectRole::parse))
 }
 
-/// Whether the caller may see the project at all — the question a *read* asks.
+/// The role a caller holds in a project **for a capability decision** — REQ-133 acceptance 6.
+///
+/// This is [`role_of`] plus the one rule the membership table cannot express: a caller who may
+/// see the project's **default** without being a member of it (the visibility rule in
+/// [`visible_project_ids`] admits the default for every account) holds that project's
+/// `default_member_role` instead of nothing.
+///
+/// Why the function exists rather than a call to [`role_of`] at each handler: acceptance 6 says
+/// a role change must bite on **the very next request**, and the whole difference between a rule
+/// that bites and a rule that does not is *which function the write path asks*. `role_of`
+/// answers "is there a membership row" — used by the members screen and by the last-owner
+/// check, where a non-member's answer genuinely has to be `None` (an administrator with no
+/// membership is not "the last owner"). A capability check needs the opposite: a non-member in a
+/// visible project is not "nobody", they are a `viewer` unless the project says otherwise.
+/// Conflating the two is how a viewer ends up with owner rights or a non-member with none.
+///
+/// **The freshness property is structural, not cached.** One indexed primary-key lookup, re-run
+/// per call, no memo anywhere on this branch (`crates/permissions/src/groups.rs` states it
+/// outright: "resolution never caches"). There is therefore nothing to invalidate, which is why
+/// migration 0181 adds no revision counter: a number read by nobody would be the greenest
+/// possible lie. `scripts/qa/run-project-role-freshness.sh` proves the property — a grant and a
+/// revoke, with the *same* caller and the *same* session between the two assertions.
+///
+/// [`Organization members`] are still visible in the project when they are not in it, so this
+/// is the answer for writes, never for the roster.
+pub async fn effective_role(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+) -> Result<Option<ProjectRole>> {
+    if caller.is_instance_admin {
+        // The instance administrator administers everything, and — deliberately — reads this as
+        // `None` at the *membership* level only. Here it is `Owner`, because a capability check
+        // that answered `None` for an administrator would make every project route 404 for the
+        // one account that exists to reach them.
+        return Ok(Some(ProjectRole::Owner));
+    }
+    if let Some(role) = role_of(pool, project_id, caller.user_id).await? {
+        return Ok(Some(role));
+    }
+    // No membership row. Visible-by-default is the only way to have got this far, so the
+    // project's own answer governs — and `find_visible` is re-read rather than assumed, because
+    // a caller who is a member of NO project at all must still answer `None`.
+    let project = find_visible(pool, organization_id, project_id, caller).await?;
+    Ok(project
+        .and_then(|p| ProjectRole::parse(&p.default_member_role)))
+}
+
+/// Whether a caller may do `capability` in this project, and the role that answered.
+///
+/// `Ok(false)` names the role in the store's error so the handler can build the sentence; the
+/// handler owns the wording because it is the layer the screen reads.
+pub async fn permits(
+    pool: &PgPool,
+    organization_id: Uuid,
+    project_id: Uuid,
+    caller: ProjectCaller,
+    capability: fn(ProjectRole) -> bool,
+) -> Result<(bool, Option<ProjectRole>)> {
+    let role = effective_role(pool, organization_id, project_id, caller).await?;
+    Ok((role.is_some_and(capability), role))
+}
+
+/// Whether a caller may see the project at all — the question a *read* asks.
 pub async fn can_see(
     pool: &PgPool,
     organization_id: Uuid,
