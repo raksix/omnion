@@ -1,3 +1,88 @@
+## 2026-09-30 — REQ-014 slice 2 (history) · the export that has to match the screen
+
+feat(health) + feat(admin): named ranges, real aggregates, per-row sparklines, and a CSV the
+server renders from the same list the table renders from.
+
+Slice 1 answered "is it up right now", which is the only question a health screen can answer on
+its own. This slice adds the question the operator asks *after* the alarm — how long has it been
+like this, and has it been like this before.
+
+**The range is a name, and that is the whole design.** `Range::Hour/Day/Week` with keys
+`1h`/`24h`/`7d`; `Range::parse("168")` is a **400** that names what is offered. The tempting
+shape — read `hours`, clamp it, answer — produces a table labelled `7d` holding a day. The part
+that makes it dangerous rather than merely wrong is that the CSV is rendered from the same
+clamped query, so **the export matches the table perfectly while both are wrong**: the
+acceptance criterion "CSV export matches the range shown" would pass on the exact implementation
+that made the screen lie. That is why the walk asks for `?range=168` directly and requires the
+refusal, and why the refusal is worth more than the happy-path legs.
+
+**An empty window has no numbers, not zeros.** `avg()` over no rows is `NULL`. The failing
+implementation is `coalesce(avg(value), 0)`, and it passes every count assertion and every
+"there is a row" assertion while making a metric nobody has ever measured the calmest row in the
+export. The walk asserts the empty case *and* the populated case **through the same function**,
+because a read that returned nothing for everybody would pass the empty leg alone.
+
+**One fixture that straddles a window boundary, deliberately.** Three samples at 2 h, 1 h and
+30 min, values 10/20/30. A fixture whose every sample sits inside every range cannot distinguish
+a window-aware query from one that ignores the window — so the same three rows give `24h` a mean
+of 20 and `1h` a mean of 30, and the assertion is that they differ. The retention walk asserts
+the same crossing from the other end: retention is 30 days and the widest range is 7, so if the
+two ever met, the `7d` view would silently become an empty one a month after launch.
+
+**A single point draws a dot.** A polyline through one point has no length and renders as
+nothing, which the table reads as "no samples" on a row that has one. And the sparkline is
+scaled between the row's own min and max rather than from zero: a queue sitting at 40 and peaking
+at 60 is 50% busier, and a zero-based chart draws that as a hairline.
+
+**What this cost the tick, stated plainly.** The browser pass has still not run — `qa-slot.sh` is
+held by a sibling writer (`/mnt/apopic/omnion-w6`), the box sat at load 101 with 0 free RAM and
+`/mnt/apopic` at 94%. `runHealthMetricsDepth` is written, wired into the route list, the mobile
+list and the depth-pass registration, and it is **unrun**: the range switch, the click-through
+from the overview, the CSV-vs-table comparison and the 390 px leg are all unproven in a browser.
+
+Proof for what did run:
+
+```
+omnion-health --lib                 40 passed; 0 failed   (29 in slice 1, +11 here)
+admin tsc -p tsconfig.json --noEmit  exit 0
+node --check walkthrough.cjs        syntax ok
+```
+
+**The important part: `omnion-api` did not compile, and it was slice 1 that broke it.** The
+final `cargo check -p omnion-api` of this tick reported five errors, and **none of them were in
+slice 2's code** — they were at lines 254, 278, 322, 375 and 403, which is slice 1's
+`context()` and its four `run_and_record` call sites:
+
+* `config.storage.driver()` — **`Config` has no `storage` field.** The object store's settings
+  live in `omnion_storage`'s own `StorageConfig`, and the code reached for a field that was never
+  there. It compiled on tick 79 because `omnion-health`'s crate tests never compile
+  `omnion-api`, and the tick-79 proof was `omnion-health --lib` + `tsc` + `node --check`.
+* `?` on `run_and_record(...).await` — **`ApiError` has no `From<HealthError>`**, so the `?` had
+  no conversion. Four occurrences, one per handler.
+
+**The lesson is about which gate you run, not about how long it takes.** Three gates were green
+on tick 79 and the crate did not build: the health *crate's* unit tests (which do not compile the
+API), the admin's `tsc` (which cannot see Rust), and `node --check` on the walkthrough. Every one
+of them was correct about the thing it checked — and not one of them included
+`apps/api` in its dependency graph. **A per-tick gate must compile the crate you edited.** I had
+written in my own ledger that "`cargo test --lib` caught a crate's bugs in 0.8 s" and treated that
+as the cheap gate; it is cheap because it is *narrow*, and the tick that only ran it did not learn
+whether the file next door compiled. The cost of the full check is the thing to budget, not the
+thing to avoid.
+
+Both are fixed in `1a4e0d47`: the driver name is read through
+`StorageConfig::from_env()` — the same source the live handle was built from, so the probe and the
+client it probes cannot disagree — and the four `?`s map through the module's existing
+`map_store`. `health_probes.rs` could not have caught either one: it exercises the crate's
+functions directly and never builds a router.
+
+**The 8-walk `health_history` suite still has not run** — it needs a ~14 minute link on this box
+and the tick was spent on the check that found the red instead.
+
+**Next:** run `cargo test -p omnion-api --test health_history` and `cargo test -p omnion-api
+--test health_probes` against a live PostgreSQL, then the browser pass when the QA slot frees.
+Slice 3 (incidents + thresholds) is untouched.
+
 ## 2026-09-30 — REQ-014 slice 1 (probes + overview) · the screen whose job is not to reassure you
 
 feat(health): the probe registry, the versioned surface, `/health` and its drill-down

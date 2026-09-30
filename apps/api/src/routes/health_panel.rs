@@ -251,7 +251,21 @@ fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
         pool: state.db().pool(),
         redis: state.redis(),
         storage: state.storage(),
-        storage_driver: config.storage.driver().as_str().to_string(),
+        // `Config` has no `storage` field — the object store's settings live in
+        // `omnion_storage`'s own `StorageConfig`, read here through `from_env`
+        // rather than through a field that does not exist. That is the same
+        // source the running storage handle was built from, so the probe and the
+        // client it probes can never disagree about which driver is live.
+        //
+        // An unreadable environment falls back to the default driver *name* only:
+        // the probe is being asked what to call itself in a sentence, and refusing
+        // to run the whole registry over a label would be a worse answer than a
+        // label that is probably right.
+        storage_driver: omnion_storage::StorageConfig::from_env()
+            .map(|storage| storage.driver.as_str().to_string())
+            .unwrap_or_else(|_| {
+                omnion_storage::StorageConfig::default().driver.as_str().to_string()
+            }),
         build: state.build(),
         environment: config.env.as_str().to_string(),
         worker_stale_seconds: 120,
@@ -275,7 +289,7 @@ pub async fn overview(
     State(state): State<AppState>,
 ) -> Result<Json<OverviewBody>, ApiError> {
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let sample_count = omnion_health::sample_count(state.db().pool())
         .await
         .map_err(map_store)?;
@@ -319,7 +333,7 @@ pub async fn service(
         ));
     }
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let report = overview
         .services
         .iter()
@@ -372,7 +386,7 @@ pub async fn service(
 /// and a badge that says otherwise is the exact claim this screen must not make.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<SummaryBody>, ApiError> {
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     Ok(Json(summary_of(&overview)))
 }
 
@@ -400,7 +414,7 @@ pub async fn host_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let host = overview
         .services
         .iter()
