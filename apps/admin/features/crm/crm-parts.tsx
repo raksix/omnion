@@ -392,13 +392,34 @@ export type CrmListState = {
 
 const CrmListContext = createContext<CrmListState | null>(null);
 
-/** The toolbar's state from inside a list. */
+/**
+ * The toolbar's state from inside a list — `null` when there is no frame around it.
+ *
+ * The frame is not optional in the list screens, but a component that is drawn **inside** a
+ * `CrmShell` may also be drawn as a bare body, and `deals-view` is exactly that case: its board
+ * is the screen's whole body, and it reads the keyboard cursor out of the frame when the frame is
+ * there and carries on without it when the board is rendered on its own. This used to throw
+ * instead, which is a much louder and much worse answer: `/crm/deals` rendered its board *above*
+ * the shell it is a child of, so the hook ran before any provider existed and **the whole route
+ * threw on every load**. The board did not draw, the deals depth pass read `boardColumns: 0`, and
+ * the state sweep read the deals error state as empty — two acceptance boxes failing for one line
+ * of a hook that had a documented `null` contract nobody implemented.
+ *
+ * The throw was correct for the toolbar (a toolbar outside a list is a wiring mistake worth
+ * hearing about) and wrong for the cursor (a cursor outside a list is simply a cursor that is
+ * not moving yet). So the optional form is its own export and the toolbar keeps the loud one.
+ */
 export function useCrmList(): CrmListState {
   const value = useContext(CrmListContext);
   if (!value) {
     throw new Error("useCrmList must be used inside <CrmShell>");
   }
   return value;
+}
+
+/** {@link useCrmList}, for a component that is drawn both inside and outside the frame. */
+export function useOptionalCrmList(): CrmListState | null {
+  return useContext(CrmListContext);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -774,7 +795,7 @@ export function CrmShell(props: CrmShellProps) {
         <div className="flex items-center justify-between border-t border-line px-4 py-2.5">
           <span className="text-[11.5px] text-muted">
             {total} {entity}
-            {total === 1 || entity === "deals" ? "" : "s"} match
+            {total === 1 ? "" : "s"} match
           </span>
           {nextCursor ? (
             <button

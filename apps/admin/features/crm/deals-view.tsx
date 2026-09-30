@@ -43,7 +43,7 @@ import {
   type CrmPipeline,
 } from "@/lib/crm";
 
-import { CrmAvatar, CrmRow, CrmShell, CrmTag, useCrmList } from "./crm-parts";
+import { CrmAvatar, CrmRow, CrmShell, CrmTag, useOptionalCrmList } from "./crm-parts";
 import { useCrmTenant } from "./crm-tenant";
 
 /** What the deal form holds while it is open. */
@@ -502,9 +502,11 @@ export function DealsView() {
   // so the board's ring follows it. A one-way sync would leave the two disagreeing the moment
   // either side moved first, and `Enter` would open one deal while the ring sat on another.
   //
-  // `useCrmList` answers null outside the frame, and the board is also rendered as a bare body in
-  // the deals depth pass, so the guard is real rather than theoretical.
-  const frame = useCrmList();
+  // `useOptionalCrmList` answers null outside the frame, and the board is also rendered as a bare
+  // body in the deals depth pass, so the guard is real rather than theoretical. The throwing
+  // `useCrmList` is the wrong hook here: this component is drawn **above** the `CrmShell` it is a
+  // child of, so the throwing form took the whole route down on every load.
+  const frame = useOptionalCrmList();
   useEffect(() => {
     const id = frame ? dealIds[frame.selectedIndex] : null;
     if (id) setFocusedCard(id);
