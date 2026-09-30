@@ -140,17 +140,28 @@ only: never the prompt body, never the definition, never a provider key.
       step fields, and the API's filled defaults asserted separately.*
 - [x] An unvalidatable answer triggers exactly one repair round-trip; a second failure lands the
       draft in `failed` with a readable `error`.
-- [ ] Approval materialises a **disabled** workflow with the draft's steps (enabling it is a
-      separate action); a second approve answers `409` naming the workflow id.
-- [ ] An edited definition is revalidated server-side; an invalid save changes nothing and returns
-      a field-level message.
+- [x] Approval materialises a **disabled** workflow with the draft's steps (enabling it is a
+      separate action); a second approve answers `409` naming the workflow id. — *`enabled:
+      false` is written at the call site, not inherited, because `POST /workflows` arms a new
+      rule by default; asserted by reading the stored rule back (`approval_materialises_a_
+      disabled_workflow_with_the_drafts_steps`) and by `a_second_approve_answers_409_naming_
+      the_workflow_it_already_created`.*
+- [x] An edited definition is revalidated server-side; an invalid save changes nothing and returns
+      a field-level message. — *the save runs the module's own `definition::validate` — the same
+      one the generation path runs, so the secret rule covers an operator's edit too — before any
+      write, and the store's update is conditional on `draft`; `an_edited_definition_is_
+      revalidated_and_an_invalid_save_changes_nothing`.*
 - [ ] `ai.prompt` runs as an ordinary task step: a run passes a template through the model, later
       steps read the output, and a provider failure is retried by the existing step backoff.
       *(Partly proven: the action is a registry host action with a bounded budget, it is wired
       to the AI Hub router, and its output shape (`text`) is what a later step reads. The run
       itself needs a connected provider — slice 4's probe.)*
-- [ ] Test-run performs no external side effects — asserted by “no events emitted during the test
-      run”.
+- [x] Test-run performs no external side effects — asserted by “no events emitted during the test
+      run”. — *true by construction rather than by assertion: a run row needs a `workflow_id`
+      (`not null`), and a draft under review has none, so there is nothing to dispatch. The
+      handler projects the definition step by step and the organization event feed is asserted
+      to be unchanged; the screen says so in words instead of implying a rule was exercised
+      (`a_test_run_reports_a_plan_and_emits_no_event_and_writes_no_run`).*
 - [x] Permission keys hold — *generate without `ai.chat` is `403` and never reaches the provider
       (the call counter proves zero calls), a reader holding only `workflows.read` reads the list and
       the detail, another organization sees an empty list and `404` on a direct fetch and on a
