@@ -6973,3 +6973,160 @@ export function forceOpenReliabilityBreaker(
     { method: "POST", body: JSON.stringify({ reason }) },
   );
 }
+
+// Every function here talks to `/api/v1/reliability/intake` and `/api/v1/reliability/intake/*`
+// (REQ-127, slice 4). The screen is the one an integrator opens after a provider says `401` and
+// the platform says the signature is invalid, so three shapes in this block are NOT
+// interchangeable and the UI must not blur them:
+//
+// - `has_secret: true` with a `secret_id` is a **reference**, never a value. Nothing in this
+//   file can return a signing key, because nothing in the API can: a client that could show the
+//   key is a client every future bug in this area can exfiltrate through.
+// - `reason_counts` is the whole-table rollup and the `rejections` list is one page of it. They
+//   are rendered from the same call so a chip can never claim a different number than the log
+//   beneath it — a screen where those two disagree sends the operator to the wrong filter.
+// - `detail` on a `SampleVerdict` is a sentence written for a person. It never carries the
+//   payload and never carries the secret, and that is a property of the route rather than a
+//   promise this client makes.
+
+export interface ReliabilityIntakeEndpoint {
+  id: string;
+  path: string;
+  name: string;
+  hmac_scheme: string;
+  signature_header: string;
+  timestamp_header: string | null;
+  tolerance_seconds: number;
+  secret_id: string | null;
+  /** Whether a secret is referenced. The VALUE is never on this surface. */
+  has_secret: boolean;
+  max_payload_bytes: number;
+  sanitize_profile: string;
+  enabled: boolean;
+  created_at: string;
+  rejection_count: number;
+  last_rejection_at: string | null;
+}
+
+export interface ReliabilityIntake {
+  endpoints: ReliabilityIntakeEndpoint[];
+  schemes: string[];
+  profiles: string[];
+  reasons: string[];
+  reason_counts: [string, number][];
+}
+
+export interface ReliabilityIntakeRejection {
+  id: number;
+  endpoint_id: string | null;
+  /** The declared path, resolved on read so a renamed endpoint does not orphan its log. */
+  path: string | null;
+  reason: string;
+  source_ip: string | null;
+  request_id: string | null;
+  body_bytes: number;
+  created_at: string;
+}
+
+export interface ReliabilityIntakeSample {
+  valid: boolean;
+  /** One of the declared reasons, or `null` for an accepted sample. */
+  reason: string | null;
+  detail: string;
+  /** What the sanitisation pass would change, or `null` when the sample was refused first. */
+  changes: string[] | null;
+  body_bytes: number;
+}
+
+export function fetchReliabilityIntake(): Promise<ReliabilityIntake> {
+  return request<ReliabilityIntake>("/api/v1/reliability/intake", { cache: "no-store" });
+}
+
+export function fetchReliabilityIntakeRejections(params: {
+  endpointId?: string;
+  reason?: string;
+  limit?: number;
+}): Promise<{ rejections: ReliabilityIntakeRejection[]; reasons: string[] }> {
+  const query = new URLSearchParams();
+  if (params.endpointId) query.set("endpoint_id", params.endpointId);
+  if (params.reason) query.set("reason", params.reason);
+  if (params.limit) query.set("limit", String(params.limit));
+  const suffix = query.toString();
+  return request<{ rejections: ReliabilityIntakeRejection[]; reasons: string[] }>(
+    `/api/v1/reliability/intake/rejections${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" },
+  );
+}
+
+/** Declare a path. The only fields required are the ones the guard cannot default. */
+export function createReliabilityIntakeEndpoint(input: {
+  path: string;
+  name: string;
+  hmac_scheme: string;
+  signature_header: string;
+  timestamp_header?: string | null;
+  tolerance_seconds?: number;
+  secret_id?: string | null;
+  max_payload_bytes?: number;
+  sanitize_profile?: string;
+  enabled?: boolean;
+}): Promise<ReliabilityIntakeEndpoint> {
+  return request<ReliabilityIntakeEndpoint>("/api/v1/reliability/intake", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Every field is optional, so the form sends what changed and nothing else. */
+export function updateReliabilityIntakeEndpoint(
+  id: string,
+  input: Partial<{
+    path: string;
+    name: string;
+    hmac_scheme: string;
+    signature_header: string;
+    timestamp_header: string | null;
+    tolerance_seconds: number;
+    secret_id: string | null;
+    max_payload_bytes: number;
+    sanitize_profile: string;
+    enabled: boolean;
+  }>,
+): Promise<ReliabilityIntakeEndpoint> {
+  return request<ReliabilityIntakeEndpoint>(
+    `/api/v1/reliability/intake/${encodeURIComponent(id)}`,
+    { method: "PATCH", body: JSON.stringify(input) },
+  );
+}
+
+/**
+ * Remove a declaration. The reason is required by the API and by the dialog: removing a
+ * declaration turns a guarded door into an open one, and that is a change somebody reading the
+ * audit log has to be able to explain.
+ */
+export function deleteReliabilityIntakeEndpoint(
+  id: string,
+  reason: string,
+): Promise<void> {
+  return request<void>(`/api/v1/reliability/intake/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/**
+ * Ask the platform whether a signature is right.
+ *
+ * This is the SAME guard the request path runs — that is the entire value of the action, and it
+ * is why the client sends the payload to the server rather than computing an HMAC in the
+ * browser. A tester that verifies locally would need the secret in the browser.
+ */
+export function verifyReliabilityIntakeSample(
+  id: string,
+  input: { payload: string; signature: string },
+): Promise<ReliabilityIntakeSample> {
+  return request<ReliabilityIntakeSample>(
+    `/api/v1/reliability/intake/${encodeURIComponent(id)}/verify-sample`,
+    { method: "POST", body: JSON.stringify(input) },
+  );
+}
