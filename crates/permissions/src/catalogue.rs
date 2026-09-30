@@ -76,6 +76,20 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "content",
         description: "Create and edit page templates",
     },
+    // The headless content API (REQ-019). Reading tokens is separated from managing them on
+    // purpose: a person who may read the list may also read the per-token usage breakdown (both
+    // are "who is calling us"), while minting, rotating and revoking are what grant a stranger
+    // read access to published content and belong to a different person.
+    PermissionDef {
+        key: "content.api.read",
+        category: "content",
+        description: "View content API tokens and usage",
+    },
+    PermissionDef {
+        key: "content.api.manage",
+        category: "content",
+        description: "Create, rotate and revoke content API tokens",
+    },
     // The CMS depth pack (REQ-064, slice 1). Menus and scheduled publishing are two separate
     // powers: an account that may publish a page does not thereby gain the right to rewrite the
     // site's header, and an account that may edit the header may not schedule a post. The
@@ -917,6 +931,9 @@ mod tests {
             "content.blocks.read",
             "content.patterns.manage",
             "content.templates.manage",
+            // A manager can see which integrations are calling the site; minting a new one is
+            // not in the same hand, because a token outlives the session that made it.
+            "content.api.read",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),

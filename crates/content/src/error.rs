@@ -41,6 +41,9 @@ pub enum ContentError {
     /// A free-text field is too long (REQ-063 slice 3).
     #[error("invalid text: {0}")]
     InvalidText(String),
+    /// A content API token name is already taken in this organization (REQ-019).
+    #[error("a token named \"{0}\" already exists")]
+    TokenNameTaken(String),
     /// A lifecycle state is not one of the documented values.
     #[error("invalid status: {0}")]
     InvalidStatus(String),
@@ -418,6 +421,11 @@ impl ContentError {
             Self::ThemeBundledCannotBeRemoved(_) => "theme_bundled_cannot_be_removed",
             Self::ThemeInUse(_) => "theme_in_use",
             Self::ThemePackageTooLarge(_) => "theme_package_too_large",
+            // The content API token store (REQ-019 slice 1). Its own code rather than a generic
+            // "invalid", because the panel's create dialog branches on it: a name that is taken
+            // is a field the person typed, and a name that is malformed is the same field with a
+            // different mistake. Both answer 409/400 with `name_taken` / `invalid_parameter`.
+            Self::TokenNameTaken(_) => "name_taken",
         }
     }
 }
