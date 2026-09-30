@@ -554,11 +554,40 @@ async function clickAction(page) {
 async function runWizard(page, report) {
   log("wizard: detecting first-run state");
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(900);
-  const url = page.url();
+
+  // The redirect into the wizard is a CLIENT-side `router.replace("/setup")`, so the URL only
+  // settles after hydration and — on a cold `next dev` — after Turbopack compiles the `/` route
+  // and `/login`'s `fetchOnboarding()` effect runs. A fixed sleep asked the question once and
+  // got "not a first run" from a server-rendered `/` or `/login`, returned `ran: false`, and the
+  // pass carried on into a tenant that did not exist: `ensureSignedIn` then reached `/setup`
+  // seconds later, with warm modules, and its generic submit pressed "Create account" with
+  // every field still empty. The API refused that correctly, and the run went on to answer
+  // every org-scoped screen with 403 — 729 of them, reported as 1,477 findings about a product
+  // that was never measured. Asking again is the whole fix.
+  let url = page.url();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (url.includes("/setup") || url.includes("/login")) break;
+    await page.waitForTimeout(500);
+    url = page.url();
+  }
   if (!url.includes("/setup")) {
-    log(`wizard: not in setup (${url}) — installation already exists`);
-    return { ran: false, url };
+    // A sign-in screen here is a first run whose redirect never landed: the panel would send
+    // it to `/setup` once its modules were warm, which is exactly the state the pass used to
+    // walk away from. Only an installation that has already been set up is a genuine skip.
+    const settled = url.includes("/login")
+      ? await page
+          .waitForURL(/\/setup/, { timeout: 15000 })
+          .then(() => true)
+          .catch(() => false)
+      : false;
+    if (settled) {
+      url = page.url();
+      log(`wizard: reached /setup after the redirect settled (${url})`);
+    } else {
+      log(`wizard: not in setup (${url}) — installation already exists`);
+      report.steps.push({ action: "wizard-skipped", url, reason: "not a first run" });
+      return { ran: false, url, skippedBecause: "already-installed" };
+    }
   }
   report.steps.push({ step: 0, url, action: "reached /setup" });
   await shot(page, "01-setup-step-1");
@@ -583,6 +612,16 @@ async function runWizard(page, report) {
       await page.waitForTimeout(250);
     }
     const filled = await fillWizardStep(page);
+    // A step with nothing in it is a step the walk could not fill, not a step the platform
+    // refused. Submitting it anyway produces a 400 that reads like a product defect while
+    // saying nothing about the product — which is precisely how this run came to charge
+    // 1,477 findings to a tenant that simply did not exist. Record the gap and move on.
+    const wrote = (filled || []).filter((entry) => entry && entry.value);
+    if (stepKey !== "theme" && wrote.length === 0) {
+      report.steps.push({ index: i, stepKey, filled: [], clicked: null, reason: "nothing to fill" });
+      log(`wizard: step ${stepKey} has no fillable input — not submitting an empty form`);
+      break;
+    }
     const clicked = await clickAction(page);
     // The step's own POST can still be in flight: wait for the step to move (or the screen to say
     // the installation is ready) instead of clicking the same button into a second submission,
@@ -631,6 +670,15 @@ async function ensureSignedIn(page, report) {
   }
   await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(800);
+  // Landing on `/setup` here means the first run is still open. The wizard is `runWizard`'s
+  // job, and its steps each have their own form; a generic submit here presses "Create account"
+  // with empty fields and the platform answers 400 — a refusal the report then reads as a
+  // defect. Go to the real sign-in form instead of the wizard.
+  if (page.url().includes("/setup")) {
+    log("sign-in: the first run is still open — using the login form, not the wizard");
+    await page.goto(`${URL_ADMIN}/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(700);
+  }
   if (!/\/login|\/setup/.test(page.url()) && (await page.locator('nav[aria-label="Sections"]').count()) > 0) {
     return true; // already signed in — the wizard created the session
   }
