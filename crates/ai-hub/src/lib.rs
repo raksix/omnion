@@ -31,6 +31,7 @@ pub mod loop_engine;
 pub mod model;
 pub mod protocol;
 pub mod provider_model;
+pub mod registry;
 pub mod resolve_path;
 pub mod router;
 pub mod routing;

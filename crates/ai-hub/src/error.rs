@@ -97,6 +97,22 @@ pub enum AiHubError {
     /// The skill key is taken, or the attachment already exists.
     #[error("{0}")]
     SkillConflict(String),
+    /// A tool limit, key or argument set is not acceptable (REQ-100).
+    ///
+    /// Its own code, for the same reason `InvalidSkill` has one: the refusal belongs on a
+    /// specific field of the tool's Limits section, and a client that maps it onto `invalid_tool`
+    /// prints "the tool is invalid" above a timeout field. The message names the field and the
+    /// range, because the ranges are the request's (1000–300000 ms, 1–200 calls) and an
+    /// operator who is told the range can fix it without reading this crate.
+    #[error("invalid tool: {0}")]
+    InvalidTool(String),
+    /// No tool carries that key in the registry.
+    ///
+    /// `NotFound` rather than a 403-style refusal, including for a retired row's key: the
+    /// detail screen has to be able to open a retired tool and show why it retired, so a key
+    /// that exists must be found, and a key that never existed must not be.
+    #[error("no tool `{0}` in the registry")]
+    ToolNotFound(String),
     /// The request needs a capability the model does not claim.
     ///
     /// The refusal happens before any call leaves the process, so a caller that asked for a
@@ -166,6 +182,8 @@ impl AiHubError {
             Self::SkillNotFound(_) => "skill_not_found",
             Self::SkillReadOnly(_) => "skill_read_only",
             Self::SkillConflict(_) => "skill_conflict",
+            Self::InvalidTool(_) => "invalid_tool",
+            Self::ToolNotFound(_) => "tool_not_found",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",
             Self::InvalidChatRequest(_) => "invalid_chat_request",
             Self::Transport(_) => "provider_unreachable",
