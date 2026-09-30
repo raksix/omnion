@@ -7417,3 +7417,43 @@ and both are small. `edge-delete` still reports "the click missed the curve", `s
 those four share a shape worth reading next: each needs a card or a curve selected first, and a probe
 that selects nothing reports a screen nobody looked at. Run the same focused pass for
 `ai-workflow-console`, which is one tenant away from being measurable for the same reason this one was.
+
+## Tick 38 — the fifth validation class was a real traversal bug; the banner was not
+
+Two rows out of the tick-37 focused pass were both recorded as product defects. One was a defect and one
+was the probe reading a node it had already destroyed, and the two are worth separating because the
+pass had no way to.
+
+**`cycle.found: false` was the product (`1d7213df`).** The probe's graph was a correct loop, and the
+server had been able to report it all along: `find_cycle` resolved a single target per node with
+`find_map`. That is a correct walk of a *list* and a broken walk of a *graph* — any node with two
+leaves (a condition, a switch, an action with an `error` branch) was followed one way only, so a ring
+closing on the other port was invisible to both `validate` and `project`. The rule would have been
+stored, listed as valid, and hung the first time the retry branch fired. The walk now carries a cursor
+per stack frame, so a node with several children is visited once and then resumed rather than restarted
+from each child, and the ring reported is the one that actually closes.
+
+**`namesVersion: false` was the probe (`88810166`).** The banner renders `state.message` verbatim and
+that message ends "(it is now at version 10)" — but the probe read the banner **after** clicking "keep
+mine". The click resolves the conflict and the banner leaves the tree, so `catch()` returned `""` and the
+note recorded an empty string that should have been read as the tell. This is the fifth probe-ordering
+defect in this file and the same shape as the other four: the instrument was measured, not the product.
+The reading now happens above the click.
+
+The `cycleOnABranch` row is kept separate from `cycle` on purpose. The plain cycle passed while the
+branch-closing one failed, so folding two loop shapes into one row would hide exactly the case that
+broke — the same reason the original probe was split per class.
+
+**Proof.** `cargo test -p omnion-workflows --lib` 147 passed / 0 failed (the new
+`a_loop_that_closes_on_a_branch_is_still_a_loop` was written first and failed against the old
+traversal; reverting the fix to one-edge-per-node turns exactly that test red and nothing else).
+`pnpm typecheck` 2/2. `node --check scripts/qa/walkthrough.cjs` clean.
+
+**The box.** Load 102 on six cores, 152 chrome processes, `/mnt/apopic` at 99 % with 911 MB free, two
+live QA place holders (w6, w4) and 24 waiters. The pass is queued with `QA_SLOT_WAIT=3600` and its
+artifacts on `/dev/shm` (8.2 G free) so a 99 %-full `/mnt/apopic` cannot kill it mid-tree the way it
+did at the end of tick 37.
+
+**Next.** Read `validate-classes.cycleOnABranch` off the queued pass — the unit gate proved the
+traversal, only the server proves the wire. Then the four probes that select nothing
+(`edge-delete`, `step-trace`, `run-from-here`, `listener`) as one defect rather than four.
