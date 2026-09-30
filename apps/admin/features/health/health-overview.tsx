@@ -496,6 +496,24 @@ export function HealthOverviewScreen() {
                   />
                 ))}
               </div>
+              {/*
+                The host cards show *now*. The history — what each metric has done
+                over a named window, with the CSV export of the same rows — is its
+                own screen, and this is the only link to it: a screen nobody can
+                reach from the product is a screen the definition of done calls a
+                hidden feature, and a hidden screen is exactly what a QA pass
+                cannot find.
+              */}
+              <p className="pt-1 text-[12.5px]">
+                <Link
+                  href="/health/metrics"
+                  data-health-metrics-link
+                  className="inline-flex items-center gap-1 text-muted hover:text-ink"
+                >
+                  Metric history, trends and CSV export
+                  <ChevronRight aria-hidden className="h-3.5 w-3.5" />
+                </Link>
+              </p>
             </section>
           ) : null}
         </>

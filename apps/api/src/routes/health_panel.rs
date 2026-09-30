@@ -251,7 +251,21 @@ fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
         pool: state.db().pool(),
         redis: state.redis(),
         storage: state.storage(),
-        storage_driver: config.storage.driver().as_str().to_string(),
+        // `Config` has no `storage` field — the object store's settings live in
+        // `omnion_storage`'s own `StorageConfig`, read here through `from_env`
+        // rather than through a field that does not exist. That is the same
+        // source the running storage handle was built from, so the probe and the
+        // client it probes can never disagree about which driver is live.
+        //
+        // An unreadable environment falls back to the default driver *name* only:
+        // the probe is being asked what to call itself in a sentence, and refusing
+        // to run the whole registry over a label would be a worse answer than a
+        // label that is probably right.
+        storage_driver: omnion_storage::StorageConfig::from_env()
+            .map(|storage| storage.driver.as_str().to_string())
+            .unwrap_or_else(|_| {
+                omnion_storage::StorageConfig::default().driver.as_str().to_string()
+            }),
         build: state.build(),
         environment: config.env.as_str().to_string(),
         worker_stale_seconds: 120,
@@ -275,7 +289,7 @@ pub async fn overview(
     State(state): State<AppState>,
 ) -> Result<Json<OverviewBody>, ApiError> {
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let sample_count = omnion_health::sample_count(state.db().pool())
         .await
         .map_err(map_store)?;
@@ -319,7 +333,7 @@ pub async fn service(
         ));
     }
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let report = overview
         .services
         .iter()
@@ -372,7 +386,7 @@ pub async fn service(
 /// and a badge that says otherwise is the exact claim this screen must not make.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<SummaryBody>, ApiError> {
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     Ok(Json(summary_of(&overview)))
 }
 
@@ -400,7 +414,7 @@ pub async fn host_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
     let ctx = context(&state);
-    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await?;
+    let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let host = overview
         .services
         .iter()
@@ -460,6 +474,181 @@ pub async fn samples(
             })
             .collect(),
     ))
+}
+
+/// `GET /health/metrics` — the aggregated metric table for the current range.
+///
+/// **A range is a name, not a number of hours.** `?range=7d` is accepted and
+/// `?range=168` is refused with a message naming what *is* offered. The
+/// tempting shape — read `hours`, clamp it, and answer — is what produces a
+/// table labelled `7d` holding a day, and the CSV exported from it matches that
+/// table perfectly, so the export-matches-the-screen criterion passes while both
+/// are wrong. A silent clamp here is a lie with two independent witnesses.
+///
+/// The rows come from `omnion_health::metric_summaries`, the same list
+/// `GET /health/metrics.csv` renders, so the screen and the download cannot
+/// disagree about which window they cover.
+pub async fn metrics(
+    State(state): State<AppState>,
+    Query(query): Query<RangeQuery>,
+) -> Result<Json<MetricsBody>, ApiError> {
+    let range = resolve_range(query.range.as_deref())?;
+    let now = time::OffsetDateTime::now_utc();
+    let summaries =
+        omnion_health::metric_summaries(state.db().pool(), range, now).await.map_err(map_store)?;
+
+    // Each row carries its own series, because the sparkline is the point of the table and a
+    // client that had to fetch one series per row would make this screen issue a request per
+    // metric on every range switch. The `series` read is bounded by the range, not by uptime —
+    // and when it fails, the row still renders with its aggregates rather than being dropped,
+    // because a metric with a number and no line is a better answer than no row.
+    let mut rows = Vec::with_capacity(summaries.len());
+    for summary in &summaries {
+        let mut row = MetricRowBody::from(summary);
+        row.series = omnion_health::sparkline_values(
+            state.db().pool(),
+            &summary.service,
+            &summary.metric,
+            range,
+            now,
+        )
+        .await
+        .unwrap_or_default();
+        rows.push(row);
+    }
+
+    Ok(Json(MetricsBody {
+        range: range.key().to_string(),
+        ranges: omnion_health::RANGE_KEYS.iter().map(|key| (*key).to_string()).collect(),
+        metrics: rows,
+        total_samples: summaries.iter().map(|summary| summary.samples).sum(),
+    }))
+}
+
+/// `GET /health/metrics.csv` — the same rows, as a download.
+///
+/// **Rendered from the list the table rendered**, which is the mechanism behind
+/// "CSV export matches the range shown". It re-runs the same query rather than
+/// taking rows from a client, because a client-supplied export is a client-chosen
+/// file — the client decides what the export says.
+///
+/// Two response headers carry the contract: `Content-Disposition` names the file
+/// with the range in it (`omnion-health-7d.csv`), and the `X-Health-Range`
+/// header repeats the window for a client that wants to assert the file matches
+/// what it drew. A download whose name says `24h` and whose contents are a week
+/// is the defect this endpoint exists to make impossible.
+pub async fn metrics_csv(
+    State(state): State<AppState>,
+    Query(query): Query<RangeQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let range = resolve_range(query.range.as_deref())?;
+    let summaries =
+        omnion_health::metric_summaries(state.db().pool(), range, time::OffsetDateTime::now_utc())
+            .await
+            .map_err(map_store)?;
+    let body = omnion_health::summaries_to_csv(&summaries, range);
+    let filename = format!("omnion-health-{}.csv", range.key());
+    let headers = [
+        (
+            axum::http::header::CONTENT_TYPE,
+            "text/csv; charset=utf-8".to_owned(),
+        ),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        ),
+        (
+            axum::http::HeaderName::from_static("x-health-range"),
+            range.key().to_owned(),
+        ),
+    ];
+    let mut response = axum::response::Response::new(axum::body::Body::from(body));
+    for (name, value) in headers {
+        // `HeaderValue::from_str` rather than `from`: a name that came from a
+        // client's query is not yet known to be a legal header value, and
+        // `from` panics on one that is not. The range is already a closed
+        // vocabulary by this point, so this is belt and braces — a panic in a
+        // status screen's export is the worst place for one to happen.
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    Ok(response)
+}
+
+/// The query both metric endpoints accept.
+#[derive(Debug, Deserialize)]
+pub struct RangeQuery {
+    /// Which window. Omitted means [`omnion_health::DEFAULT_RANGE`]; an
+    /// unrecognised value is an error rather than a fallback.
+    #[serde(default)]
+    pub range: Option<String>,
+}
+
+/// The range the client asked for, or the default.
+fn resolve_range(requested: Option<&str>) -> Result<omnion_health::Range, ApiError> {
+    match requested {
+        None => Ok(omnion_health::DEFAULT_RANGE),
+        Some(key) => omnion_health::Range::parse(key).map_err(map_store),
+    }
+}
+
+/// The metric table's answer.
+#[derive(Debug, Serialize)]
+pub struct MetricsBody {
+    /// The window these rows cover.
+    pub range: String,
+    /// Every window the client may switch to, in display order.
+    pub ranges: Vec<String>,
+    /// One row per metric with samples in the window.
+    pub metrics: Vec<MetricRowBody>,
+    /// How many samples the rows cover between them.
+    pub total_samples: i64,
+}
+
+/// One row of the metric table.
+#[derive(Debug, Serialize)]
+pub struct MetricRowBody {
+    /// Which service measured it.
+    pub service: String,
+    /// Which metric.
+    pub metric: String,
+    /// The unit the values are in.
+    pub unit: String,
+    /// How many samples fall in the window.
+    pub samples: i64,
+    /// The newest value. `None` on a row with no samples, never `0`.
+    pub current: Option<f64>,
+    /// The smallest value in the window.
+    pub min: Option<f64>,
+    /// The mean over the window.
+    pub avg: Option<f64>,
+    /// The largest value in the window.
+    pub max: Option<f64>,
+    /// The newest sample's state.
+    pub state: String,
+    /// When the newest sample was taken.
+    pub last_sample_at: Option<String>,
+    /// The metric's values over the window, oldest first, for the row's sparkline.
+    pub series: Vec<f64>,
+}
+
+impl From<&omnion_health::MetricSummary> for MetricRowBody {
+    fn from(summary: &omnion_health::MetricSummary) -> Self {
+        Self {
+            service: summary.service.clone(),
+            metric: summary.metric.clone(),
+            unit: summary.unit.clone(),
+            samples: summary.samples,
+            current: summary.current,
+            min: summary.min,
+            avg: summary.avg,
+            max: summary.max,
+            state: summary.state.clone(),
+            last_sample_at: summary.last_sample_at.clone(),
+            series: Vec::new(),
+        }
+    }
 }
 
 /// `POST /health/maintenance/prune` — drop raw samples past the retention window.
