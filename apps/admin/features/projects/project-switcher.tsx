@@ -93,11 +93,20 @@ export function ProjectSwitcher() {
   // render, because the switcher reads it exactly once per open.
   const [urlProject, setUrlProject] = useState<string | null>(null);
 
+  // Read the link on mount as well as on open, and hand it to the request. A shared link is a
+  // *request to look at something* that has to survive the first paint: reading it only on open
+  // meant the header showed the recipient's own selection while the address bar named the
+  // sender's project, with nothing on the screen saying which of the two was in force.
+  //
+  // The id is *not* also kept in state. A second copy of the URL's truth is a second thing to go
+  // stale, and every reader of it would need the same "did the link change under me" handling;
+  // `load` reads the address bar once, per request, which is the only moment the question exists.
   const load = useCallback(async () => {
     if (!scoped) return;
     setError(null);
     try {
-      setData(await fetchProjectSwitcher());
+      const linked = projectFromUrl(new URLSearchParams(window.location.search));
+      setData(await fetchProjectSwitcher(undefined, linked));
     } catch (cause) {
       setData(null);
       setError(cause instanceof ApiError ? cause.message : "your projects could not be read");
@@ -172,7 +181,19 @@ export function ProjectSwitcher() {
   // What the button names. The URL wins over the stored selection, because a link is a request to
   // look at something — but the stored one is the fallback, so a plain navigation lands you where
   // you last were.
-  const activeId = urlProject ?? data?.selected ?? null;
+  //
+  // **A link you may not see names nothing.** `data.linked.visible === false` means the sender
+  // pointed at a project this reader is not in, and falling back to their own selection would
+  // show them a project while the address bar names another — the exact confusion a shared link
+  // exists to remove. "Unavailable" is the honest label, and the strip below says why.
+  //
+  // **One clause, and it is the only reachable one.** The tempting second clause is "or the
+  // answer never arrived, so treat an unanswered link as refused" — and it cannot fire: `load`
+  // clears `data` when the request fails, and a component with no `data` returns the error pill
+  // before this line is ever read. An unreachable fallback is worse than no fallback, because the
+  // next reader trusts it exists. If the reload fails, the error pill is the answer.
+  const linkRefused = data?.linked != null && !data.linked.visible;
+  const activeId = linkRefused ? null : (urlProject ?? data?.selected ?? null);
   const active = entries.find((entry) => entry.id === activeId) ?? null;
 
   const choose = useCallback(
@@ -183,7 +204,13 @@ export function ProjectSwitcher() {
         // The server's answer replaces the local one rather than being merged into it: the recents
         // it ranks are the fact, and a client that patched its own list would have to reproduce
         // the demotion the store just did.
-        setData(await selectProject(projectId));
+        //
+        // The link is carried through the write so the response can answer it with the same
+        // function the read used. Choosing "All projects" while standing on somebody else's link
+        // must clear the link's effect without deleting the parameter the *sender* put there —
+        // and, per the store's own contract, without touching this person's stored selection.
+        const linked = projectFromUrl(new URLSearchParams(window.location.search));
+        setData(await selectProject(projectId, undefined, linked));
         setOpen(false);
         setQuery("");
 
@@ -240,7 +267,11 @@ export function ProjectSwitcher() {
         className="flex items-center gap-2 rounded-lg border border-line bg-surface px-2.5 py-1.5 text-[12.5px] transition hover:bg-quiet-soft"
       >
         <FolderKanban className="size-3.5 text-muted" aria-hidden />
-        {active ? (
+        {linkRefused ? (
+          <span className="max-w-32 truncate font-medium text-danger" data-testid="project-switcher-current">
+            Unavailable
+          </span>
+        ) : active ? (
           <span className="max-w-32 truncate font-medium" data-testid="project-switcher-current">
             {active.name}
           </span>
@@ -261,6 +292,36 @@ export function ProjectSwitcher() {
           className="absolute right-0 top-full z-40 mt-1.5 w-72 rounded-lg border border-line bg-surface p-2.5 text-[12px] text-muted"
         >
           {error}
+        </p>
+      ) : null}
+
+      {linkRefused ? (
+        /* The one sentence a shared link needs when it cannot be honoured. It is NOT an error
+           strip: the link worked, the reader simply is not in that project, and a red banner for
+           a permission boundary trains people to expect red for "wrong" rather than "denied". */
+        <p
+          role="status"
+          data-testid="project-switcher-link-refused"
+          className="absolute right-0 top-full z-40 mt-1.5 w-72 rounded-lg border border-line bg-surface p-2.5 text-[12px] text-muted"
+        >
+          This link points to a project you are not a member of. Ask the owner for access, or{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => {
+              // Dropping the parameter is the remedy, and it must not touch the stored selection:
+              // following a colleague's link must never change what the reader lands on next time.
+              const params = new URLSearchParams(window.location.search);
+              params.delete(PROJECT_PARAM);
+              const suffix = params.toString() ? `?${params.toString()}` : "";
+              setUrlProject(null);
+              router.replace(`${pathname ?? "/"}${suffix}`);
+              void load();
+            }}
+          >
+            view all projects
+          </button>
+          .
         </p>
       ) : null}
 

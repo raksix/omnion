@@ -1305,6 +1305,41 @@ pub async fn stored_selection(pool: &PgPool, user_id: Uuid) -> Result<Option<Uui
     Ok(row)
 }
 
+/// What a shared link's `?project=` actually resolves to, and why.
+///
+/// Acceptance 3 says the selection "is encoded in URLs so a shared link reproduces the view". The
+/// switcher **writes** that parameter and, before this function, nothing on the branch **read** it
+/// — a twelfth instance of this module's signature defect, and the first where the dead thing was
+/// the *reader* rather than the writer. The consequence is specific and silent: a colleague who
+/// opens your link sees their own stored selection, not the project you sent them, and the header
+/// still reads "All projects" while the URL says otherwise.
+///
+/// Three answers, and the third is the one a boolean cannot carry:
+///
+/// * `Some((id, true))` — the link names a project this caller may see, and the panel scopes to it.
+/// * `Some((id, false))` — the link names a project this caller may **not** see. The id is
+///   returned rather than `None` so the panel can say "you do not have access to this project"
+///   instead of silently falling back to the caller's own selection, which reads as the link being
+///   broken. [`find_visible`] is the only thing consulted, so "may see" means exactly what it means
+///   everywhere else on this surface — one answer per question, not two.
+/// * `None` — no project named. That is "All projects", which is a different state from a link
+///   pointing somewhere you may not go, and conflating them is how an access refusal becomes a
+///   404-looking empty screen.
+pub async fn resolve_linked_project(
+    pool: &PgPool,
+    organization_id: Uuid,
+    linked: Option<Uuid>,
+    caller: ProjectCaller,
+) -> Result<Option<(Uuid, bool)>> {
+    let Some(linked) = linked else {
+        return Ok(None);
+    };
+    let visible = find_visible(pool, organization_id, linked, caller)
+        .await?
+        .is_some();
+    Ok(Some((linked, visible)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

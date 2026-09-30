@@ -437,9 +437,16 @@ export async function fetchOrganizations(): Promise<Organization[]> {
  * answers `/api/v1/projects` does not carry, so a client-side filter would have had to reconstruct
  * all three — and would have drifted the first time an instance administrator opened it.
  */
-export async function fetchProjectSwitcher(organizationId?: string): Promise<ProjectSwitcher> {
+export async function fetchProjectSwitcher(
+  organizationId?: string,
+  linkedProjectId?: string | null,
+): Promise<ProjectSwitcher> {
   const query = new URLSearchParams({ mine: "1" });
   if (organizationId) query.set("organization_id", organizationId);
+  // The shared link's project travels with the request so the SERVER can say whether this person
+  // may see it. Deciding visibility in the browser would mean comparing an id against a list the
+  // browser already has, which is a second answer to a question the store answers once.
+  if (linkedProjectId) query.set("project", linkedProjectId);
   return request<ProjectSwitcher>(`/api/v1/projects/switcher?${query.toString()}`);
 }
 
@@ -453,9 +460,13 @@ export async function fetchProjectSwitcher(organizationId?: string): Promise<Pro
 export function selectProject(
   projectId: string | null,
   organizationId?: string,
+  linkedProjectId?: string | null,
 ): Promise<ProjectSwitcher> {
   const query = new URLSearchParams();
   if (organizationId) query.set("organization_id", organizationId);
+  // Sent on the write as well as the read, so both handlers resolve the link through ONE function.
+  // Two handlers each deciding for themselves is how the button and the address bar disagree.
+  if (linkedProjectId) query.set("project", linkedProjectId);
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return request<ProjectSwitcher>(`/api/v1/projects/switcher${suffix}`, {
     method: "POST",

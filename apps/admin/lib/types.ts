@@ -2390,4 +2390,13 @@ export interface ProjectSwitcher {
   projects: ProjectSwitcherEntry[];
   /** The stored selection, or `null` when this person has never chosen one. */
   selected: string | null;
+  /**
+   * What a shared link's `?project=` resolved to for THIS person, or `null` when the link names
+   * no project.
+   *
+   * `visible: false` is the case a boolean at the call site gets wrong: the link pointed
+   * somewhere real, this person may not go there, and answering `null` would make a colleague's
+   * link look broken while silently dropping them on their own selection.
+   */
+  linked: { id: string; visible: boolean } | null;
 }

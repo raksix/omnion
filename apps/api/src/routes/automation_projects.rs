@@ -309,6 +309,13 @@ pub struct ProjectListQuery {
     pub organization_id: Option<Uuid>,
     /// Only projects the caller is a member of.
     pub mine: Option<String>,
+    /// A shared link's `?project=` — the project the *sender* was looking at.
+    ///
+    /// **Not** the caller's selection, and the distinction is the whole of this parameter. A link
+    /// is a request to look at something; a stored selection is a preference. Collapsing them means
+    /// opening a colleague's link overwrites your own default, which is the one outcome a shared
+    /// link must never have.
+    pub project: Option<Uuid>,
 }
 
 /// `GET /api/v1/projects?mine=1` — the switcher's rows, recents first, with this person's
@@ -340,15 +347,33 @@ pub async fn switcher(
         .await
         .map_err(ApiError::from)?;
 
+    // The shared link's project, resolved against *this* caller's visibility rather than the
+    // sender's. Without this the link carries an id nothing checks, and a colleague opens it to
+    // find their own selection — the twelfth instance of this branch's signature defect, and the
+    // first whose dead half was the reader rather than the writer.
+    //
+    // The tuple is mapped to the wire shape here, at the one layer that owns the JSON: the store
+    // answers a question ("may this caller see it?") and has no opinion about how it is spelled.
+    let linked = projects::resolve_linked_project(
+        state.db().pool(),
+        organization_id,
+        query.project,
+        caller,
+    )
+    .await
+    .map_err(ApiError::from)?
+    .map(|(id, visible)| LinkedProject { id, visible });
+
     Ok(Json(SwitcherResponse {
         projects: entries,
         selected: projects::selected_project(state.db().pool(), organization_id, caller)
             .await
             .map_err(ApiError::from)?,
+        linked,
     }))
 }
 
-/// The switcher's answer: the rows, and the selection separately.
+/// The switcher's answer: the rows, the selection separately, and the link's resolution.
 ///
 /// The selection is repeated outside the rows on purpose. "Which project am I in" is answerable
 /// when **every** row is filtered out or none of them is marked, and a client that has to infer it
@@ -359,6 +384,22 @@ pub struct SwitcherResponse {
     pub projects: Vec<projects::SwitcherEntry>,
     /// The caller's stored selection, or `None` when they have never chosen.
     pub selected: Option<Uuid>,
+    /// What the shared link's `?project=` resolved to: `(id, may the caller see it)`, or `None`
+    /// when the link names no project.
+    ///
+    /// **`false` is not a `404`.** The link pointed somewhere real; this caller may not go there.
+    /// Answering `None` would make a colleague's link look like a broken one and silently drop
+    /// them on their own selection, which is the outcome the link was sent to prevent.
+    pub linked: Option<LinkedProject>,
+}
+
+/// A shared link's project and whether this caller may see it.
+#[derive(Debug, Serialize)]
+pub struct LinkedProject {
+    /// The project the link names.
+    pub id: Uuid,
+    /// Whether the caller may see that project.
+    pub visible: bool,
 }
 
 /// `POST /api/v1/projects/selection` — switch into a project.
@@ -422,6 +463,19 @@ pub async fn set_selection(
         selected: projects::selected_project(state.db().pool(), organization_id, caller)
             .await
             .map_err(ApiError::from)?,
+        // A write is the caller acting on their own switcher, so there is no link to resolve —
+        // and answering `Some` here would leave the panel believing a URL it just replaced is
+        // still in force. The same query parameter the read honours is read here too, so a
+        // `?project=` in the address bar is answered by the same function in both handlers.
+        linked: projects::resolve_linked_project(
+            state.db().pool(),
+            organization_id,
+            query.project,
+            caller,
+        )
+        .await
+        .map_err(ApiError::from)?
+        .map(|(id, visible)| LinkedProject { id, visible }),
     }))
 }
 
