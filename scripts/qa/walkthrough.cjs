@@ -7573,7 +7573,9 @@ async function main() {
   // The permissions tab (REQ-010, slice 4): the narrowing rule stated on the screen, the
   // chain a file inherits from, a deny refused when it names nothing, and a real deny that
   // names its subject by name rather than by uuid.
-  report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
+  if (inScope("core")) {
+    report.mediaGrants = await runDepthPass("media-grants", () => runMediaGrants(page, report));
+  }
   log(`media grants: ${JSON.stringify(report.mediaGrants)}`);
 
   // The duplicate report (REQ-010, slice 3): two identical uploads form a group, the Merge button
@@ -7590,8 +7592,12 @@ async function main() {
   // the purge-inside-the-restore-window refusal is visible *before* the save, a run reports a
   // sentence and writes a log row even when it found nothing, and the file's hold switch is on
   // the tab where the file's other facts are.
-  report.backups = await runDepthPass("backups", () => runBackups(page, report));
-  report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
+  if (inScope("core")) {
+    report.backups = await runDepthPass("backups", () => runBackups(page, report));
+  }
+  if (inScope("core")) {
+    report.mediaRetention = await runDepthPass("media-retention", () => runMediaRetention(page, report));
+  }
   log(`media retention: ${JSON.stringify(report.mediaRetention)}`);
 
   // The palette is global chrome: it has to open from anywhere, search for real and open a screen.
@@ -7631,43 +7637,57 @@ async function main() {
   // a grouped line filtering the list, a bulk action reporting what it changed, the keyboard
   // path, and the three states. It runs after the analytics passes because it emits into the
   // signed-in account's own inbox and would otherwise add rows to a list a later pass counts.
-  report.notifications = await runNotificationsDepth(page, report);
+  if (inScope("core")) {
+    report.notifications = await runNotificationsDepth(page, report);
+  }
   log(`notifications: ${JSON.stringify(report.notifications)}`);
 
   // The event console (REQ-016, slice 1): the feed, its filters, the payload inspector and the
   // catalogue. It runs after the notification passes because it publishes a page, and the
   // content screens' own passes are ordered after it in the file.
-  report.events = await runDepthPass("events-console", () => runEventsDepth(page, report));
+  if (inScope("core")) {
+    report.events = await runDepthPass("events-console", () => runEventsDepth(page, report));
+  }
   log(`events: ${JSON.stringify(report.events)}`);
 
   // The webhook endpoints and their delivery operations (REQ-016, slice 2). It runs right after
   // the events pass because it points an endpoint at a real receiver and reads what the
   // receiver actually accepted, which is the one claim on this screen no API status code can
   // make on its own.
-  report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
+  if (inScope("core")) {
+    report.webhooks = await runDepthPass("webhooks", () => runWebhooksDepth(page, report));
+  }
   log(`webhooks: ${JSON.stringify(report.webhooks)}`);
 
   // The bus's own retention (REQ-016, slice 3). It runs after the events and webhook passes —
   // both of which count rows on the bus — because a sweep deletes, and a pass that deleted
   // first would make their numbers wrong for a reason that has nothing to do with them.
-  report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
+  if (inScope("core")) {
+    report.retention = await runDepthPass("event-retention", () => runRetentionDepth(page, report));
+  }
   log(`retention: ${JSON.stringify(report.retention)}`);
 
   // The security centre (REQ-012, slice 1). It runs after the events and webhook passes
   // because a scan counts the findings those passes have already written, and a scan that ran
   // first would report a posture that the rest of the pass then invalidates.
-  report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
+  if (inScope("core")) {
+    report.security = await runDepthPass("security", () => runSecurityDepth(page, report));
+  }
   log(`security: ${JSON.stringify(report.security)}`);
 
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.
-  report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  if (inScope("core")) {
+    report.notificationSettings = await runNotificationSettingsDepth(page, report);
+  }
   log(`notification settings: ${JSON.stringify(report.notificationSettings)}`);
   // The outbox and routing pass (REQ-021, slice 3). It runs after the list and preferences
   // passes because it emits into the same inbox, and it cleans up every row it creates — a QA
   // database that grows a notification per pass is one whose counts stop meaning anything.
-  report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  if (inScope("core")) {
+    report.notificationOutbox = await runNotificationOutboxDepth(page, report);
+  }
   log(`notification outbox: ${JSON.stringify(report.notificationOutbox)}`);
 
   // The role-depth pass (REQ-006, slice 1): create a role, cycle a matrix cell three ways,
