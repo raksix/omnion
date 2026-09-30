@@ -1779,6 +1779,130 @@ async function runBackups(page, report) {
     notRestorable: notRestorable > 0,
   });
 
+  // ---- The restore control (REQ-013 slice 2b) ------------------------------------------------
+  //
+  // The panel ships a real button this tick, and the harness is extended rather than the
+  // screen exempted. The walk deliberately drives it in the order a cautious operator would:
+  // look at the button **before** typing the phrase, so the disabled state is recorded, then
+  // with a wrong phrase, so the refusal is recorded, and only then with the right one.
+  //
+  // The middle step is the point of doing this in a browser at all. A Rust walk can prove the
+  // API refuses; it cannot prove the *panel* shows the refusal rather than swallowing it into
+  // a spinner — and a destructive control that fails silently is the worst shape this screen
+  // could take.
+  const runButton = page.locator('[data-testid="restore-run"]');
+  const buttonOffered = (await runButton.count()) > 0;
+  const disabledBefore = buttonOffered ? await runButton.first().isDisabled() : null;
+  const disabledReason = await page
+    .locator('[data-testid="restore-confirm-state"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  note({
+    step: "restore-button",
+    offered: buttonOffered,
+    disabledBeforeTyping: disabledBefore,
+    disabledReason: disabledReason.trim(),
+  });
+
+  // The part checkboxes. Every AVAILABLE part is ticked by default, because "restore the
+  // whole archive" is the common case; a panel that made an operator tick five boxes to undo
+  // one mistake is a panel they will not use.
+  const partChecks = page.locator('[data-testid^="restore-part-check-"]');
+  const checkCount = await partChecks.count();
+  const checkedByDefault = await partChecks.evaluateAll((nodes) =>
+    nodes.filter((node) => !node.disabled && node.checked).length,
+  );
+  const enabledChecks = await partChecks.evaluateAll(
+    (nodes) => nodes.filter((node) => !node.disabled).length,
+  );
+  note({
+    step: "restore-part-ticks",
+    checkboxes: checkCount,
+    tickedByDefault: checkedByDefault,
+    selectable: enabledChecks,
+    everySelectableTicked: checkedByDefault === enabledChecks,
+  });
+
+  // A wrong phrase must be refused *visibly*. The refusal is the API's own sentence, so the
+  // assertion is that a `[role=alert]` appears and that it is not empty.
+  const phraseField = page.locator('[data-testid="restore-confirm-input"]');
+  if ((await phraseField.count()) > 0 && buttonOffered) {
+    await phraseField.first().fill("RESTORE 00000000");
+    await page.waitForTimeout(250);
+    const enabledWithWrongPhrase = !(await runButton.first().isDisabled());
+    note({
+      step: "restore-wrong-phrase-button",
+      enabledWithWrongPhrase,
+    });
+    // Only press it if the client let us: clicking a disabled button is a no-op, and the
+    // walk must not record a refusal it did not cause.
+    if (enabledWithWrongPhrase) {
+      await runButton.first().click().catch(() => {});
+      await page.waitForTimeout(1500);
+      const alert = await page.locator('[data-testid="restore-error"]').innerText().catch(() => "");
+      note({
+        step: "restore-wrong-phrase",
+        refused: alert.trim().length > 0,
+        message: alert.trim(),
+      });
+    } else {
+      note({
+        step: "restore-wrong-phrase",
+        refused: true,
+        message: "the button is disabled for a wrong phrase, so the request was never sent",
+      });
+    }
+
+    // And now the real thing. A QA stack is disposable by construction, which is the only
+    // reason the REQ allows the destructive path to be exercised at all.
+    const offered = await page
+      .locator('[data-testid="restore-confirm-input"]')
+      .first()
+      .getAttribute("placeholder")
+      .catch(() => null);
+    if (offered) {
+      await phraseField.first().fill(offered);
+      await page.waitForTimeout(250);
+      const enabledWithRightPhrase = !(await runButton.first().isDisabled());
+      note({ step: "restore-right-phrase-button", enabledWithRightPhrase });
+      if (enabledWithRightPhrase) {
+        await runButton.first().click().catch(() => {});
+        await page
+          .waitForSelector('[data-testid="restore-outcome"], [data-testid="restore-error"]', {
+            timeout: 120000,
+          })
+          .catch(() => {});
+        await page.waitForTimeout(1500);
+        const outcomeText = await page
+          .locator('[data-testid="restore-outcome"]')
+          .innerText()
+          .catch(() => "");
+        const refusalText = await page
+          .locator('[data-testid="restore-error"]')
+          .innerText()
+          .catch(() => "");
+        const safetyId = await page
+          .locator('[data-testid="restore-safety-id"]')
+          .innerText()
+          .catch(() => "");
+        note({
+          step: "restore-run",
+          restored: outcomeText.trim().length > 0,
+          summary: outcomeText.trim().split("\n")[0],
+          refused: refusalText.trim().length > 0,
+          refusal: refusalText.trim(),
+          safetyBackupNamed: /[0-9a-f]{8}-[0-9a-f]{4}/i.test(safetyId),
+        });
+      }
+    }
+  } else {
+    note({
+      step: "restore-button",
+      reason: "the run is not restorable, so the control is correctly absent",
+    });
+  }
+
   // The list shows the run, and its state pill is the run's own state.
   await page.waitForTimeout(500);
   const rows = await page.locator('[data-testid="backup-row"]').count();

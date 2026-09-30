@@ -458,11 +458,17 @@ pub fn build_preview(
     // The one that decides whether an operator should be reaching for a different archive at
     // all. It is a `notice` and not a `danger` because the operator knows their incident, and
     // a preview that second-guesses them into a dialog they cannot dismiss is not a guard.
+    // The age is computed **once** and both the warning and the struct read it. The first
+    // version computed it inside this `if` and then wrote `age_days: 0` into the struct, so
+    // the panel's age tile read "0d" next to a warning that said "this restore point is 23
+    // days old" — a screen contradicting itself, on the one number an operator uses to
+    // decide between two restore points. A unit test below asserts the two agree.
+    let age_days = finished_at
+        .as_deref()
+        .and_then(parse_epoch)
+        .map_or(0, |then| (now - then).max(0) / 86_400);
+
     if restorable {
-        let age_days = finished_at
-            .as_deref()
-            .and_then(parse_epoch)
-            .map_or(0, |then| (now - then).max(0) / 86_400);
         if age_days >= STALE_AFTER_DAYS {
             warnings.push(warn(
                 WarningSeverity::Caution,
@@ -493,7 +499,7 @@ pub fn build_preview(
         backup_id: backup_id.to_owned(),
         label: label.to_owned(),
         finished_at,
-        age_days: 0,
+        age_days,
         parts,
         warnings,
         restorable_bytes,
@@ -829,6 +835,56 @@ mod tests {
                 "at {days} days"
             );
         }
+    }
+
+    /// The age the panel reads and the age the warning quotes are ONE number. The first
+    /// version computed the age inside the warning's `if` and wrote a literal `0` into the
+    /// struct, so the screen showed "0d" beside "this restore point is 9 days old" — a
+    /// panel contradicting itself on the number that decides between two restore points.
+    #[test]
+    fn the_reported_age_is_the_age_the_warning_quotes() {
+        let parts = vec![done("database", 5, 10)];
+        let finished = "2026-09-20T21:00:00Z";
+        // `now` comes from the crate's own parser rather than a literal. The module
+        // hand-rolls its day count precisely so it can read the text the run recorded, and
+        // a test that hard-coded an epoch would go red the day that arithmetic changed
+        // while the behaviour it is testing stayed correct.
+        let now = parse_epoch("2026-09-29T21:00:00Z").expect("a parsable stamp");
+        let preview = build_preview(
+            "0199abcd-1234-7000-8000-000000000001",
+            "aged",
+            &manifest(parts.clone()),
+            &[evidence(parts[0].clone(), LiveCounts::default())],
+            Some(finished.to_owned()),
+            now,
+        );
+        assert_eq!(preview.age_days, 9, "the panel's tile reads this number");
+        let warning = preview
+            .warnings
+            .iter()
+            .find(|w| w.code == RestoreWarningCode::StaleArchive)
+            .expect("a stale warning");
+        assert!(
+            warning.message.contains("9 days"),
+            "the warning must quote the same number: {}",
+            warning.message
+        );
+    }
+
+    /// A run with no finish time has no age, and the honest answer is zero rather than the
+    /// number of days since the epoch.
+    #[test]
+    fn a_run_that_never_finished_has_no_age() {
+        let parts = vec![done("database", 5, 10)];
+        let preview = build_preview(
+            "0199abcd-1234-7000-8000-000000000001",
+            "unfinished",
+            &manifest(parts.clone()),
+            &[evidence(parts[0].clone(), LiveCounts::default())],
+            None,
+            1_800_000_000,
+        );
+        assert_eq!(preview.age_days, 0);
     }
 
     /// The mode is a property of the part. A caller cannot ship `database` as advisory and

@@ -801,6 +801,13 @@ pub fn router(state: AppState) -> Router {
     // they were agreeing to.
     let backups_restore_preview: MethodRouter<AppState, Infallible> =
         get(backups::restore_preview).layer(guards::require(&state, "backup.read"));
+    // The destructive call, and the only route in this file behind `backup.restore`. The
+    // preview stays under `backup.read` because reading a warning changes nothing; pressing
+    // the button overwrites live data, so it needs the key that means that. A platform
+    // where the schedule editor can also overwrite content is one where the nightly job and
+    // an operator's button are the same authority.
+    let backups_restore: MethodRouter<AppState, Infallible> =
+        post(backups::restore).layer(guards::require(&state, "backup.restore"));
     let backups_sweep: MethodRouter<AppState, Infallible> =
         post(backups::sweep).layer(guards::require(&state, "backup.manage"));
     let backup_schedules_read: MethodRouter<AppState, Infallible> =
@@ -1694,6 +1701,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backups/{id}", backups_delete)
         .route("/backups/{id}/manifest", backups_manifest)
         .route("/backups/{id}/restore-preview", backups_restore_preview)
+        .route("/backups/{id}/restore", backups_restore)
         .route("/backups/{id}/verify", backups_verify)
         .route("/backup-schedules", backup_schedules_read)
         .route("/backup-settings", backup_settings_read)
