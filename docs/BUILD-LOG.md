@@ -5276,3 +5276,62 @@ pass at zero high findings) wants a quiet box. So the next slice is **REQ-100 sl
 matrix over migration `0173` (already shipped by slice 1; there is no store or route yet).
 
 ---
+
+---
+
+## Tick 30 — REQ-100 slice 2: the identities and the matrix
+
+**What.** The data half of the AI identity system. `crates/ai-hub/src/identity.rs` reads and
+writes `ai_identities` and `ai_tool_grants` over migration `0173` (shipped by slice 1, so no new
+migration was needed). Ten routes in `apps/api/src/routes/ai_identities.rs`, `/ai/identities`
+and `/ai/permissions`, the nav entries (the tool registry was never in the nav at all), and the
+walkthrough depth pass that reads the tri-state out of the TABLE.
+
+**The decision worth writing down.** The screen has three states and the database has two.
+`effect` is a NOT NULL boolean and **inherit is the absence of a row**. A nullable column would
+carry the third state in the database and force every read to remember `effect is not null` —
+the same class of bug the platform's `null = built-in` convention exists to prevent. Every walk
+therefore asserts on the raw `ai_tool_grants` row, because a store that filtered
+`effect is not null` would report the correct tri-state while leaving the row behind. That
+failure mode is the worst one this feature has: a deny alive in the table that no screen shows
+any more, refusing a call its operator un-refused last Tuesday.
+
+`identity::resolve` is a **pure** function over three inputs, so the ordering that *is* the
+security claim is testable without a database: disabled beats everything, then an explicit deny,
+then the agent's own allow-list, and an identity's allow can never push a tool into an agent that
+never listed it. Sharing one identity must not be able to hand `deployment.deploy` to an agent
+its author never reviewed for it.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --quiet` — **401 passed** (was 384; +17 from `identity.rs`).
+- `cargo test -p omnion-api --test ai_identities` — **17 passed**: the tri-state, the bulk
+  replace, the folded indexes, the tenancy reads and the retired tool.
+- `tsc --noEmit -p apps/admin/tsconfig.json` — clean, 0 errors.
+- **Falsified before committing:** a bulk replace written as a MERGE instead of a delete turns
+  `a_bulk_replace_drops_the_cells_the_client_removed` red, and a resolver that let an identity's
+  allow precede the agent's list turns two unit walks red.
+
+**Two build-gate facts this tick paid for again.**
+1. `cargo build -p omnion-api` can be green while `cargo test -p omnion-ai-hub` is RED. The new
+   error variants compiled fine; the `--lib` test binary is the only place that matches every
+   variant exhaustively in `AiHubError::code`. That match is a second place to update a variant
+   and nothing but the `--lib` run tells you.
+2. `/` hit **100%** mid-build under ten-writer contention: the first build died in the linker
+   with a bus error, and the retry under `/mnt/apopic/w7build` ran out of space compiling
+   `apps/api/tests/analytics.rs`. My own `debug/incremental` (1.5G) was the reclaimable part.
+   **A workspace-wide test run needs its own disk budget** — it links a binary per test file,
+   and the per-crate gates this loop runs every tick are the ones that fit beside nine other
+   writers. (The QA pass gets the slot discipline; the workspace test run does not.)
+
+**A note on appending to this file.** Ten writers append to this log, so a read-modify-write
+through `read_file` is unsafe: that call is line-capped, and this tick it silently returned 1200
+of 5278 lines. `git diff --numstat` showed `47 insertions, 4079 deletions` and the whole history
+went. Reverted with `git checkout`, and the entry is appended with a heredoc instead. **A capped
+read is not a read** — check the line count against the file before writing one back.
+
+**Next.** REQ-100 slice 3 — the execution pipeline in `tools::execute`: resolve the identity →
+look the tool up → grant → required permission → schema → per-run cap and timeout → execute
+through the service layer → write `ai_tool_calls` and `audit_log`. It calls `identity::resolve`
+rather than re-deriving the ordering, and it is the slice that makes "no second door" true. The
+per-tool grant replacement (`PUT /ai/tools/{key}/grants`) and the warning stripe's agent-form
+half come with it.

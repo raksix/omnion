@@ -1,11 +1,11 @@
 # REQ-100 — AI Tool System & Permission Matrix
 
 > **Status:** in-progress (slice 1: registry tables, the seeder that preserves operator edits,
-> five routes, both screens and the walkthrough — `d702ab8e` … `0a4089be`; the migration, the
-> store, `/ai/tools`, `/ai/tools/[key]`, the four permission keys and the ten event names are
-> done and gated. Outstanding in this REQ: slice 2 (`ai_identities` + `ai_tool_grants` CRUD,
-> `/ai/identities`, `/ai/permissions`, the tri-state matrix) and slice 3, the execution pipeline
-> in `tools::execute` that makes "no second door" true rather than aspirational) ·
+> five routes, both screens and the walkthrough — `d702ab8e` … `0a4089be`; slice 2: the identity
+> store, the grant CRUD, the ten identity/matrix routes, `/ai/identities`, `/ai/permissions` and
+> the tri-state matrix — `783ff646` … `878c139c`. Outstanding in this REQ: slice 3, the execution
+> pipeline in `tools::execute` that makes "no second door" true rather than aspirational, plus
+> the per-tool grant replacement, the cap/timeout enforcement and the pruning tick) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + `crates/permissions`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
@@ -110,12 +110,12 @@ All names are dotted lower-case on the signed webhook bus; org-scoped identity a
 - [ ] `max_calls_per_run` and `timeout_ms` are enforced: one call past the cap is refused with `ai.tool.limited`, and a slow stub is cut off with `status = timeout`.
 - [ ] A tool call writes exactly one `ai_tool_calls` row and one `audit_log` row with `actor_type = 'agent'`, both carrying the same run and step.
 - [x] The usage counts on `/ai/tools` equal the aggregation of `ai_tool_calls` for the window (asserted against SQL). *Proved: `registry::usage_over` is the aggregation and nothing else; the walkthrough compares `usage.calls` with SQL's count for the same tool and window (0a4089be).*
-- [ ] The matrix tri-state persists exactly: an inherited cell writes no grant row, a deny writes an `effect = false` row, and re-toggling to inherit removes it.
-- [ ] A viewer without a tool's permission sees the matrix cell disabled with the missing permission named, and the API refuses the same change with `403` and the key.
+- [x] The matrix tri-state persists exactly: an inherited cell writes no grant row, a deny writes an `effect = false` row, and re-toggling to inherit removes it. *Proved against the raw row, not the store's read-back: `an_inherited_cell_writes_no_row_at_all`, `a_deny_writes_a_false_row_and_a_re_toggle_removes_it`, `an_allow_toggled_to_a_deny_replaces_the_row_rather_than_adding_one` and `a_bulk_replace_drops_the_cells_the_client_removed` (17 walks, `fc1ed0b8`), plus the walkthrough's `inheritDeletedTheRow` / `noRowRemains` / `inheritSurvivedTheReload`, which read `ai_tool_grants` through SQL after every toggle (878c139c).*
+- [ ] A viewer without a tool's permission sees the matrix cell disabled with the missing permission named, and the API refuses the same change with `403` and the key. *Half proved: the matrix endpoint sends `viewer_permissions` and `viewer_missing[tool_key]`, and the cell renders disabled with the key named in its title (`ai-permissions.tsx`). The `403` half is the execution path's gate and belongs with slice 3's `tools::execute`, which is where the change is actually refused.*
 - [x] Seeding preserves operator edits to limits and gated flags across a restart (test restarts the seeder and asserts the row). *Proved: `every_operator_column_is_one_the_seeder_never_writes_on_update` reads `seed`'s own `on conflict do update set` list out of the file and fails if `excluded.<column>` ever appears for `enabled` / `timeout_ms` / `max_calls_per_run` / `requires_approval` (188e17db). The boot log's `decisions_preserved` counter makes the same fact visible in production.*
 - [ ] A high-risk tool enabled for an agent without an approval gate renders the warning stripe and produces a validation warning on the agent form. *(Row half proved: `ToolRow::is_ungated_high_risk` + its test, and the migration deliberately does NOT forbid the combination so the state is representable (d702ab8e, 188e17db). The agent-form half belongs to slice 2, where the matrix arrives.)*
-- [ ] Removing a tool from the compiled set leaves its row with a retired note and never silently deletes grants.
-- [ ] Organization A cannot read or change organization B's identities or grants (404), and a platform-level identity is readable but not editable by an organization admin.
+- [x] Removing a tool from the compiled set leaves its row with a retired note and never silently deletes grants. *Proved: `a_retired_tool_keeps_its_row_so_its_grants_survive` retires a tool the way the seeder does and asserts the deny row is still there — the FK is on `tool_key` precisely so a grant keeps pointing at a real, possibly-retired, tool (fc1ed0b8).*
+- [x] Organization A cannot read or change organization B's identities or grants (404), and a platform-level identity is readable but not editable by an organization admin. *Proved: `an_identity_in_another_organization_is_not_found_and_not_refused` (a cross-tenant read is `None`, never a 403, so the status code is not an existence oracle) and `a_second_platform_level_identity_with_the_same_key_is_refused` (the folded index that stops every tenant claiming the platform default). The read-only half is `ensure_writable` in `ai_identities.rs`, called on every mutating route (50f534af).*
 - [ ] Ops tools call the platform's own service layer: a deployment tool cannot be invoked with a raw command, and `logs.read` is scoped to the caller's organization.
 - [ ] Every screen has empty, loading and error states with a real call to action; no dead control and no placeholder text.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
@@ -132,6 +132,13 @@ The visual check must see: the tri-state cells visually distinct and not colour-
    *Done when:* every tool is listed with a working schema, an unknown argument is refused with the field named, and limits survive a restart.
 2. **Execution pipeline and identities** — `ai_identities`, `ai_tool_grants`, the resolve-authorize-execute path, the model-facing payload filter, `ai_tool_calls`, audit rows, the identity screens.
    *Done when:* a denied tool is invisible and refused, a permitted call performs the real operation through the service layer, and usage counts match the recorded rows.
+   - **Data half landed (783ff646, 50f534af, c85d3fb1):** both tables are read and written, the
+     tri-state persists exactly, the deny ordering is a pure function, the identity and matrix
+     screens ship, and 17 walks plus the tri-state walkthrough prove the row, not the render.
+   - **Execution half still open:** `ai_tool_calls`, the audit rows, the model-facing payload
+     filter and the actual `resolve → authorize → execute` path land with slice 3's pipeline.
+     `identity::resolve` is the decision function they will call; it is deliberately pure so the
+     pipeline inherits a rule that is already tested rather than writing a second one.
 3. **Matrix, limits and telemetry** — `/ai/permissions`, per-tool grant replacement, per-agent allow-lists, caps and timeouts, the warning stripe, the usage view and pruning.
    *Done when:* the matrix round-trips every state, a cap breach and a timeout are both visible on the tool detail, and the pruning tick trims only old rows.
 
