@@ -11449,14 +11449,35 @@ note({
     // no startable node and every row under it reported nothing.
     const cardCount = await settleCanvasCards(page);
     const cards = page.locator("[data-node-id]");
-    const cardOrder = await page
-      .evaluate(() =>
-        Array.from(document.querySelectorAll("[data-node-id]")).map((card) => ({
-          id: card.getAttribute("data-node-id"),
-          type: card.getAttribute("data-node-type"),
-        })),
-      )
-      .catch(() => []);
+    // Re-enumerate INSIDE the retry, and assert the two readings agree before scanning.
+    //
+    // `settleCanvasCards` was supposed to make this race impossible, and it did not: it polls
+    // `[data-node-id]` until the count repeats, then the enumeration below ran as a separate
+    // read. Between them the canvas painted the rest of the graph, so `cardCount` said 6 and
+    // the scan saw 1 — and the one card it saw was the trigger, whose `canStart` is "true"
+    // (re-running a rule from the top is a real thing an operator wants). The scan therefore
+    // chose the trigger, a run started from the top skips nothing, and `skipped: 0`,
+    // `pillsPainted: 0` and `step-trace.panelFound: false` all followed from a race rather
+    // than from the product.
+    //
+    // The fix is to make the disagreement impossible to read past: enumerate, and if the list
+    // is shorter than the settled count, settle again and re-read. A probe that enumerates
+    // once and then *reports both numbers* has already published a contradiction; publishing
+    // the contradiction is what made this cost a tick.
+    const enumerateCards = () =>
+      page
+        .evaluate(() =>
+          Array.from(document.querySelectorAll("[data-node-id]")).map((card) => ({
+            id: card.getAttribute("data-node-id"),
+            type: card.getAttribute("data-node-type"),
+          })),
+        )
+        .catch(() => []);
+    let cardOrder = await enumerateCards();
+    for (let attempt = 0; attempt < 5 && cardOrder.length !== cardCount; attempt += 1) {
+      await settleCanvasCards(page, 150, 12);
+      cardOrder = await enumerateCards();
+    }
     const scan = [];
     let chosenId = null;
     for (const card of cardOrder) {
@@ -11467,8 +11488,17 @@ note({
         .first()
         .getAttribute("data-can-start")
         .catch(() => null);
-      scan.push({ id: card.id, type: card.type, canStart: canStartHere });
-      if (canStartHere === "true" && card.type !== "trigger") {
+      // "Is this the trigger?" is a question about the node type, and the registry's trigger
+      // types are `trigger.event` / `trigger.manual` / `trigger.cron` — there has never been
+      // a bare `trigger` type. So the comparison `type !== "trigger"` was true for EVERY card
+      // on the canvas, including the trigger itself, and the "skip the trigger" half of this
+      // scan was dead code that looked like it was filtering. It matched no type the platform
+      // can produce, so it could not be caught by looking at a graph: the prefix rule is the
+      // same prefix the product uses (`startsWith("trigger.")` in `run-from-here.ts`), and a
+      // second copy of a rule in another language is a rule with no compiler.
+      const isTriggerType = typeof card.type === "string" && card.type.startsWith("trigger.");
+      scan.push({ id: card.id, type: card.type, canStart: canStartHere, isTriggerType });
+      if (canStartHere === "true" && !isTriggerType) {
         chosenId = card.id;
         break;
       }

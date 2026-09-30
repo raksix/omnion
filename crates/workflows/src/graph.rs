@@ -2622,4 +2622,80 @@ mod tests {
             "the branch-closing ring is found and the node type is real: {codes:?}"
         );
     }
+
+    /// The QA walkthrough decides "is this the trigger?" with its own copy of the rule, in
+    /// another language, in a file nothing compiles. It compared `type !== "trigger"`, and the
+    /// registry has **never** had a bare `trigger` type — the trigger types are
+    /// `trigger.event` / `trigger.manual` / `trigger.cron`. So the comparison was true for
+    /// every card on the canvas, including the trigger, and the "skip the trigger" half of the
+    /// `run-from-here` scan was dead code shaped like a filter.
+    ///
+    /// It stayed invisible for the obvious reason: the wrong answer *looks right*. The
+    /// trigger's `canStart` is genuinely `"true"` (re-running a rule from the top is a real
+    /// thing an operator wants), so choosing it produced a run — a whole run, with nothing
+    /// skipped — rather than a crash. Every row underneath then read `skipped: 0`,
+    /// `pillsPainted: 0`, `panelFound: false`, and all of them pointed at the product.
+    ///
+    /// This test reads the walkthrough's source and fails if it compares a node type against a
+    /// bare `trigger` literal again. A guard is only worth its weight once you have seen it
+    /// bite, and the generalisable lesson is the one from the fixture above: **a rule copied
+    /// into a probe is a rule with no compiler** — the type registry, the port names and now
+    /// the trigger prefix each have a home in this file, and every JavaScript literal that
+    /// stands in for one is a place the two can drift apart silently.
+    #[test]
+    fn the_qa_run_from_here_scan_uses_the_real_trigger_prefix() {
+        // `cargo test` runs with the CWD at the *package* root, not the workspace root, so
+        // `scripts/qa/walkthrough.cjs` does not resolve from here. `CARGO_MANIFEST_DIR` is
+        // `crates/workflows`, and the path is walked up from it — written out rather than
+        // discovered, because a test that silently reads a *different* file than the one the
+        // pass runs is worse than no test at all.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/walkthrough.cjs"))
+            .unwrap_or_else(|e| panic!("the walkthrough is the thing being guarded: {e}"));
+
+        // The bare-literal comparison is the defect itself: `!== "trigger"` can never be
+        // false for a real node type, so it never excluded anything.
+        assert!(
+            !source.contains(r#"card.type !== "trigger""#)
+                && !source.contains(r#"card.type != "trigger""#),
+            "the run-from-here scan is comparing a node type against a bare `trigger` literal; \
+             the registry's trigger types are `trigger.*`, so this excludes nothing"
+        );
+
+        // And the prefix rule must be spelled the way the product spells it, so the two sides
+        // of the same question cannot drift into different answers.
+        assert!(
+            source.contains(r#"card.type.startsWith("trigger.")"#),
+            "the scan should recognise the trigger by the same `trigger.` prefix \
+             `run-from-here.ts` uses; if the product's rule moves, move this with it"
+        );
+
+        // A trigger node really is one of these keys, and none of them is a bare `trigger`.
+        // Derived from the registry rather than listed by hand: the first draft of this
+        // assertion listed `trigger.event` / `trigger.manual` / `trigger.cron`, and `cron` is
+        // not a key — the real third one is `trigger.schedule`. A hand-written list of the
+        // other language's literals is the same defect as the one this test exists to catch,
+        // one level up, so the list is read rather than typed. Only the *absence* of a bare
+        // `trigger` is asserted directly, because that is the property the probe's comparison
+        // depended on, and it is the one that cannot be satisfied by adding a type.
+        let trigger_keys: Vec<&str> = NODE_TYPES
+            .iter()
+            .map(|spec| spec.key)
+            .filter(|key| key.starts_with("trigger"))
+            .collect();
+        assert!(
+            !trigger_keys.is_empty(),
+            "the canvas offers trigger types; a registry with none would make every assertion \
+             in this test vacuous"
+        );
+        assert!(
+            !NODE_TYPES.iter().any(|spec| spec.key == "trigger"),
+            "a bare `trigger` node type does not exist — which is why the probe's comparison \
+             excluded nothing, and why the run-from-here scan chose the trigger every time. \
+             The trigger types that do exist are {trigger_keys:?}"
+        );
+    }
 }
