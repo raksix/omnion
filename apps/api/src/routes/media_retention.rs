@@ -241,8 +241,10 @@ pub struct RunBody {
     /// What stopped the run; empty when nothing did.
     pub error: String,
     /// When it started.
+    #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     /// When it finished; null while it is running.
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     /// One sentence — a number without a word is not an answer an operator can act on.
     pub summary: String,
