@@ -383,6 +383,58 @@ pub async fn reject(
     Ok(Json(result))
 }
 
+/// `POST /ai/approvals/{id}/preview` — recompute the diff against the current revision.
+///
+/// # The permission is `read`, and that is not a slip
+///
+/// The spec's own table gives this route `ai.approvals.read`, and the reason is worth stating
+/// because "re-preview rewrites a row" sounds like a decision: **it is not one.** Nothing is
+/// approved, no run resumes and no resource changes. What it writes is a *newer description of
+/// the same proposal* — the reviewer has not decided it yet, so there is nothing to overwrite.
+/// Gating it behind `act` would make the banner's own remedy unavailable to exactly the people
+/// who can see the request but cannot decide it, which is how a stale row becomes one nobody
+/// can clear.
+///
+/// The body is ignored rather than rejected: a client that posts the diff it computed should
+/// get the server's answer, not a `400` for offering. The server's value is the only one used,
+/// which is the same rule the decision path follows.
+pub async fn re_preview(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(scope): Query<OrgQuery>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<RePreviewResult>, ApiError> {
+    let organization = resolve_organization(&current, scope.organization_id)?;
+
+    let outcome = io::re_preview(state.db().pool(), organization, id)
+        .await
+        .map_err(ApiError::from)?;
+
+    let (refreshed, approval) = match outcome {
+        io::RePreview::Refreshed(approval) => (true, *approval),
+        io::RePreview::Unchanged(approval) => (false, *approval),
+    };
+
+    Ok(Json(RePreviewResult {
+        refreshed,
+        code: (!refreshed).then_some("unchanged"),
+        approval: ApprovalView::of(approval, time::OffsetDateTime::now_utc()),
+    }))
+}
+
+/// What a re-preview answers.
+///
+/// `changed: false` with `code: "unchanged"` is the refusal the request asks for ("refuses when
+/// the hash already matches"), expressed the same way the decision endpoints express a race:
+/// a `200` the screen reads rather than an error it paints over a row that is fine.
+#[derive(Debug, Clone, Serialize)]
+pub struct RePreviewResult {
+    /// Whether a **new** preview was written.
+    pub refreshed: bool,
+    pub code: Option<&'static str>,
+    pub approval: ApprovalView,
+}
+
 /// `POST /ai/approvals/{id}/apply` — run the frozen preview.
 ///
 /// This is the half that makes the request's "the apply reads the same module the preview

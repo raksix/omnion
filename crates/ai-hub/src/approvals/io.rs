@@ -604,6 +604,119 @@ async fn decide<R: RevisionReader + ?Sized>(
     }
 }
 
+/// What a re-preview changed.
+///
+/// A **new type rather than a bool**, because "did the hash move" and "what may I write" are
+/// two different questions and the caller needs both: the screen re-renders on the row and
+/// writes a new `preview`, and refuses on `unchanged`. Returning the row in the `changed` arm
+/// is what stops the route from re-reading it and showing a different instant than the one it
+/// computed against.
+#[derive(Debug, Clone)]
+pub enum RePreview {
+    /// The target moved, or never matched: the row now carries a fresh preview.
+    Refreshed(Box<Approval>),
+    /// The recomputed plan is byte-identical to the stored one, so nothing was written.
+    ///
+    /// Refusing is the point. A re-preview that "succeeded" on an unchanged target would hand
+    /// back a new `previewed_at` and a fresh hash for a diff nobody re-read — and the reviewer
+    /// would be invited to re-decide on a row whose contents never moved. It also gives the
+    /// endpoint a stable answer: two calls on a still row agree.
+    Unchanged(Box<Approval>),
+}
+
+/// Re-preview one request against the target as it is **now**.
+///
+/// The server owns the recomputation end to end, for the same reason the decision path reads
+/// the revision itself: a re-preview whose diff came from the client would be a preview nobody
+/// read. So this takes no values at all — it reads the stored plan, rebuilds the operation, and
+/// runs [`target::preview`] over a fresh read of the row.
+///
+/// # Errors
+///
+/// `Err(ApprovalNotFound)` when the id is not in this organization, and whatever the preview
+/// refuses — a target that has since been deleted, an argument the current mapping no longer
+/// knows, a preview whose recomputation now changes nothing. A row that cannot be re-previewed
+/// is left exactly as it was: the write happens only after the new plan has resolved.
+pub async fn re_preview(pool: &PgPool, organization_id: Uuid, id: Uuid) -> Result<RePreview> {
+    let row = read(pool, organization_id, id)
+        .await?
+        .ok_or(AiHubError::ApprovalNotFound(id))?;
+
+    // Only a row somebody can still act on may be re-previewed. A decided row's preview is the
+    // record of what was decided, and rewriting it would rewrite the evidence — the reviewer
+    // approved *that* diff.
+    if row.status != "pending" {
+        return Err(AiHubError::InvalidApproval(format!(
+            "approval {id} is `{}`; a request that has been decided is a record, not a draft",
+            row.status
+        )));
+    }
+
+    let mapping = super::target::mapping_for(
+        row.resource_type
+            .as_deref()
+            .ok_or_else(|| {
+                AiHubError::InvalidApproval(format!("approval {id} names no resource type"))
+            })?,
+    )?;
+    let stored = super::plan::Plan::from_preview(&row.preview)?;
+    let operation = stored.operation(mapping)?;
+    let fresh = super::target::preview(pool, mapping, &operation).await?;
+
+    // The two comparisons are the whole contract, and they are deliberately different
+    // comparisons:
+    //
+    // * **Hash first.** The hash covers the resolved diff *and* the base revision, so an
+    //   unchanged target reproduces the stored hash exactly. That is the `unchanged` answer.
+    // * **Base revision second, as the safety net.** If a mapping change or a preview-format
+    //   change ever made the hash collide while the target had moved, the row would still be
+    //   refused for a revision that disagrees. Comparing one of the two alone trusts one
+    //   invariant; comparing both refuses unless both agree.
+    if fresh.hash == row.preview_hash && fresh.base_revision == row.base_revision.clone().unwrap_or_default() {
+        return Ok(RePreview::Unchanged(Box::new(row)));
+    }
+
+    let sql = format!(
+        "update ai_approvals set preview = $3, preview_hash = $4, base_revision = $5 \
+         where id = $1 and organization_id = $2 and status = 'pending' \
+         returning {APPROVAL_COLUMNS}"
+    );
+    let updated: Option<Approval> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(organization_id)
+        .bind(fresh.to_preview(mapping))
+        .bind(fresh.hash.clone())
+        .bind(fresh.base_revision.clone())
+        .fetch_optional(pool)
+        .await?;
+
+    // Somebody decided it between the read and the write. The `where status = 'pending'` makes
+    // zero rows, and the answer is the *decided* row rather than a fresh preview of a decision.
+    let Some(updated) = updated else {
+        let current = read(pool, organization_id, id)
+            .await?
+            .ok_or(AiHubError::ApprovalNotFound(id))?;
+        return Ok(RePreview::Unchanged(Box::new(current)));
+    };
+
+    audit(
+        pool,
+        organization_id,
+        &updated,
+        "ai.approval.repreviewed",
+        None,
+        json!({
+            "previous_preview_hash": row.preview_hash,
+            "preview_hash": updated.preview_hash,
+            "previous_base_revision": row.base_revision,
+            "base_revision": updated.base_revision,
+        }),
+    )
+    .await?;
+
+    Ok(RePreview::Refreshed(Box::new(updated)))
+}
+
 /// Mark an approval applied, and write its audit row.
 ///
 /// Called **after** the write it records, never before. The order is the whole retry story: if

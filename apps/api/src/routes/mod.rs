@@ -1022,6 +1022,12 @@ pub fn router(state: AppState) -> Router {
         .layer(guards::require(&state, "ai.approvals.act"));
     let ai_approval_sweep =
         post(ai_approvals::sweep).layer(guards::require(&state, "ai.approvals.act"));
+    // Re-preview carries the *read* key, not `act`. It decides nothing, resumes nothing and
+    // writes nothing but a newer description of a proposal nobody has decided yet — so gating it
+    // on the decision authority would leave the stale banner's own remedy unavailable to the
+    // readers who can see it. The handler documents the argument at length.
+    let ai_approval_repreview = post(ai_approvals::re_preview)
+        .layer(guards::require(&state, "ai.approvals.read"));
     // The policy screen reads under the *read* key on purpose: an installation has to be able to
     // show "these six classes are all gated" to somebody who cannot change it, or the screen is
     // only visible to the people who already trust it.
@@ -1979,6 +1985,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/approvals/{id}/approve", ai_approval_approve)
         .route("/ai/approvals/{id}/reject", ai_approval_reject)
         .route("/ai/approvals/{id}/apply", ai_approval_apply)
+        .route("/ai/approvals/{id}/preview", ai_approval_repreview)
         .route("/ai/agents/{id}/tools", ai_agent_tool_set)
         .route("/ai/agents/{id}/skills", ai_agent_skills)
         .route("/ai/agents/{id}/skills/{key}", ai_agent_skill)
