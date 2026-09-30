@@ -291,6 +291,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("the retention worker is disabled (OMNION_RETENTION_RUNNER=false)");
     }
 
+    // The health runner publishes this process's heartbeat and runs the scheduled probes
+    // (REQ-014, slice 4). Both halves of it were missing before: `worker_heartbeats` had a
+    // reader and no writer, so the `n/m` worker card could only ever say "no worker has
+    // registered a heartbeat", and `run_and_record` was reached from the four route handlers
+    // and nowhere else, so samples existed only while somebody was looking at the panel.
+    let _health = omnion_api::health_runner::spawn(state.clone());
+
     // The backup retention sweep removes expired runs from the destination, artifacts first
     // (REQ-013, slice 3). It is gated by its own flag rather than by `OMNION_RETENTION_RUNNER`
     // because the two sweep different things: an installation that keeps every backup for
@@ -402,7 +409,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let platform = omnion_api::reliability_middleware::PlatformLimiter::from_store(&state, fail_mode).await;
     let _ = omnion_api::reliability_middleware::install(platform);
 
-    let app = routes::router(state.clone());
+    // The runner spawns above each got a clone; this one is kept so the shutdown path can still
+    // reach `state` after `router(state)` has taken the original by value. Three callers need it
+    // after the listener is gone — the final telemetry sweep, the health heartbeat's clean stop,
+    // and nothing else — which is why the drain below reads it rather than capturing a bare
+    // `Arc<Pool>` and losing the config the drain timeout comes from.
+    let state_for_runners = state.clone();
+    let app = routes::router(state);
+
     // The graceful shutdown sequence (REQ-126, slice 4). The order is the contract and it lives
     // in `omnion_telemetry::lifecycle`:
     //
@@ -435,16 +449,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .with_graceful_shutdown(shutdown);
     let server_result = server.await;
 
-    // The drain, the flush and the summary. `state.db().pool()` is passed so the final sweep
-    // can fold the drop counter and the health chip back into their rows — the same sweep the
-    // loop runs, not a second one that could drift from it.
+    // The drain, the flush and the summary. `state_for_runners.db().pool()` is passed so the
+    // final sweep can fold the drop counter and the health chip back into their rows — the same
+    // sweep the loop runs, not a second one that could drift from it.
+    //
+    // The heartbeat stop comes FIRST and for a reason that is not tidiness: the drain can wait
+    // for a termination grace period, and every second of that wait used to be a panel reading
+    // this worker as healthy while it is refusing connections. Stopping the heartbeat before the
+    // wait means "draining" is the state an operator sees, which is the state they are in.
+    omnion_api::health_runner::stopped(&state_for_runners).await;
+
     let summary = omnion_telemetry::lifecycle::drain_and_flush(
         &lifecycle,
-        Some(state.db().pool()),
+        Some(state_for_runners.db().pool()),
         std::time::Duration::from_millis(
             // From the config, not the constant: the drain has to fit inside the deployment's
             // termination grace period, and only the operator knows what that is set to.
-            state.config().telemetry.drain_timeout_ms,
+            state_for_runners.config().telemetry.drain_timeout_ms,
         ),
     )
     .await;

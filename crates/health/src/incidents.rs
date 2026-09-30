@@ -250,6 +250,20 @@ pub fn suggested_thresholds() -> Thresholds {
 // Settings
 // ---------------------------------------------------------------------------------------------
 
+/// The interval the runner probes at when the settings row has never been saved.
+///
+/// Named rather than left as the literal `60` inside [`HealthSettings::default`] because the
+/// API reads this value when the settings row cannot be read at all, and a fallback that
+/// spells its own number is two constants that can drift: the row says 60, the fallback says
+/// 60, and a later edit moves one of them.
+pub const DEFAULT_CHECK_INTERVAL_SECONDS: i32 = 60;
+
+/// After how long a silent worker counts as stale when the settings row cannot be read.
+///
+/// Same reasoning as [`DEFAULT_CHECK_INTERVAL_SECONDS`]: this is the value `health_settings`
+/// defaults to, and the probe context's fallback reads it from here rather than restating it.
+pub const DEFAULT_WORKER_STALE_SECONDS: i32 = 120;
+
 /// The platform's health policy, as stored.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct HealthSettings {
@@ -273,8 +287,8 @@ impl Default for HealthSettings {
     fn default() -> Self {
         Self {
             id: 1,
-            check_interval_seconds: 60,
-            worker_stale_seconds: 120,
+            check_interval_seconds: DEFAULT_CHECK_INTERVAL_SECONDS,
+            worker_stale_seconds: DEFAULT_WORKER_STALE_SECONDS,
             thresholds: serde_json::json!({}),
             notifications: serde_json::json!({}),
             updated_by: None,
@@ -1212,21 +1226,50 @@ mod tests {
 
     #[test]
     fn the_breach_window_is_computed_not_derived_at_insert_time() {
-        // Two moments either side of a 15-minute boundary must land in different windows, and
-        // two moments inside one must land in the same one — the property a per-insert
-        // `now()` calculation cannot hold at a boundary.
+        // Two moments inside one window must land in the same one, and two either side of a
+        // boundary must not — the property a per-insert `now()` calculation cannot hold.
+        //
+        // Windows are multiples of `BREACH_WINDOW_SECONDS` measured from the **epoch**, so with
+        // a 15-minute window the boundaries land at 0, 900, 1800 … and the sample seconds in
+        // this test are chosen to sit unambiguously on either side of 900: 870 and 899 are
+        // inside the first window, 960 is inside the second.
+        //
+        // (The first version of this test asserted `window.unix_timestamp() == 15 * 60` for an
+        // input of 870 seconds. 870 is *below* 900, so `div_euclid` floors it to 0, and the
+        // assertion was failing on a red build for a week. The comment above it said "14:30",
+        // which is 870 — correct arithmetic, wrong expectation about which window that is in.
+        // Both numbers were right and the pair meant the opposite of what it looked like.)
         let base = OffsetDateTime::UNIX_EPOCH;
-        let window = breach_window(base + time::Duration::seconds(870)); // 14:30
-        assert_eq!(window.unix_timestamp(), 15 * 60);
+
         assert_eq!(
             breach_window(base + time::Duration::seconds(870)).unix_timestamp(),
+            0,
+            "14:30 is inside the first window, which starts at the epoch"
+        );
+        assert_eq!(
             breach_window(base + time::Duration::seconds(880)).unix_timestamp(),
+            breach_window(base + time::Duration::seconds(870)).unix_timestamp(),
             "two moments inside one window share it"
+        );
+        assert_eq!(
+            breach_window(base + time::Duration::seconds(899)).unix_timestamp(),
+            0,
+            "14:59 is the last second of that window"
+        );
+        assert_eq!(
+            breach_window(base + time::Duration::seconds(900)).unix_timestamp(),
+            900,
+            "and 15:00 opens the next one"
+        );
+        assert_eq!(
+            breach_window(base + time::Duration::seconds(960)).unix_timestamp(),
+            900,
+            "16:00 is inside the second window"
         );
         assert_ne!(
             breach_window(base + time::Duration::seconds(870)).unix_timestamp(),
             breach_window(base + time::Duration::seconds(960)).unix_timestamp(),
-            "two moments either side of a boundary do not"
+            "two moments either side of a boundary do not share one"
         );
     }
 

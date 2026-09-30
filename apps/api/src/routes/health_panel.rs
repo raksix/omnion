@@ -249,14 +249,36 @@ fn overview_body(overview: &HealthOverview, sample_count: i64) -> OverviewBody {
 /// The probe context the registry is handed.
 ///
 /// Built per request from the handles the request path already holds, so a status
-/// screen can never be the thing that opens a new pool or a new connection. The
-/// `worker_stale_seconds` is read from the settings row, with the migration's
-/// default when the row is unreadable — and the fallback is *silent on purpose*,
-/// because a settings read that fails must not stop the probes from running: the
-/// screen's job is to report the platform, and a missing setting is a panel
-/// problem, not a platform one.
-fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
+/// screen can never be the thing that opens a new pool or a new connection.
+///
+/// **Asynchronous, and the `await` is the point.** This used to be a plain function
+/// that hard-coded `worker_stale_seconds: 120` under a comment claiming the value
+/// "is read from the settings row". It was not. The field is the only thing that
+/// decides whether a quiet worker is called stale, the settings form writes it (30–3600),
+/// and the migration's default happens to be 120 — so an operator who typed 600 was
+/// looking at a panel that had decided, silently, to start calling their worker dead
+/// after two minutes. A comment describing a read that does not happen is worse than no
+/// comment: it is what stops the next person from looking.
+///
+/// The read failing falls back to the migration's default rather than refusing, because
+/// a settings read that fails must not stop the probes from running: the screen's job is
+/// to report the platform, and a missing setting is a panel problem, not a platform one.
+/// The fallback is logged, because it is now a *deviation* from what the operator saved
+/// and silence would make it indistinguishable from being obeyed.
+pub(crate) async fn probe_context(
+    state: &AppState,
+) -> omnion_health::ProbeContext<'_> {
     let config = state.config();
+    let worker_stale_seconds = match omnion_health::load_settings(state.db().pool()).await {
+        Ok(settings) => i64::from(settings.worker_stale_seconds),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the worker staleness limit could not be read; using the migration default"
+            );
+            i64::from(omnion_health::incidents::DEFAULT_WORKER_STALE_SECONDS)
+        }
+    };
     omnion_health::ProbeContext {
         pool: state.db().pool(),
         redis: state.redis(),
@@ -278,7 +300,7 @@ fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
             }),
         build: state.build(),
         environment: config.env.as_str().to_string(),
-        worker_stale_seconds: 120,
+        worker_stale_seconds,
     }
 }
 
@@ -298,7 +320,7 @@ fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
 pub async fn overview(
     State(state): State<AppState>,
 ) -> Result<Json<OverviewBody>, ApiError> {
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let sample_count = omnion_health::sample_count(state.db().pool())
         .await
@@ -342,7 +364,7 @@ pub async fn service(
             format!("{key} is not a service this platform probes"),
         ));
     }
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let report = overview
         .services
@@ -413,7 +435,7 @@ pub async fn service(
 /// `unknown`, because a platform nobody has looked at is not a healthy platform
 /// and a badge that says otherwise is the exact claim this screen must not make.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<SummaryBody>, ApiError> {
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     Ok(Json(summary_of(&overview)))
 }
@@ -441,7 +463,7 @@ fn summary_of(overview: &HealthOverview) -> SummaryBody {
 pub async fn host_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let host = overview
         .services
