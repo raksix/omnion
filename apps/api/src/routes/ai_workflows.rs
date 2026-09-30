@@ -194,6 +194,18 @@ pub struct DraftBody {
     pub decision_reason: Option<String>,
     /// The read-only step list the review screen draws, straight from the definition.
     pub steps: Vec<StepSummary>,
+    /// Whether there is something to decide.
+    ///
+    /// **This field exists because the review screen's approval bar is derived from it, and
+    /// the client cannot derive it itself.** The bar's `approvable` reads
+    /// `draft.has_definition`, and the TypeScript type declared the field as a `boolean`
+    /// while the wire never sent it — so the value was `undefined` at runtime, `approvable`
+    /// was permanently `false`, and **every button in the decision bar was disabled on a
+    /// draft that was perfectly approvable**. TypeScript was the only thing that disagreed
+    /// with the compiler here: a declared type is an assertion about the wire, and nothing
+    /// checks it against the server except a person clicking the screen.
+    #[serde(default)]
+    pub has_definition: bool,
     /// When it was created.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -277,6 +289,8 @@ impl DraftBody {
             decided_by: draft.decided_by,
             decision_reason: draft.decision_reason.clone(),
             steps,
+            // The decision bar is drawn from this; see the field's doc comment.
+            has_definition: draft.has_definition(),
             created_at: draft.created_at,
             updated_at: draft.updated_at,
             decided_at: draft.decided_at,

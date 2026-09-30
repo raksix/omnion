@@ -1983,8 +1983,18 @@ async function runAiWorkflowConsole(page, report) {
              (select id from users order by created_at desc limit 1))
      returning id`,
   );
-  const draftId = (seeded || "").split("\n").pop().trim();
-  note({ seededDraft: Boolean(draftId) });
+  // **The last line of a psql `insert … returning` is the command tag, not the row.** With
+  // `-t -A` the `returning` value is printed FIRST and `INSERT 0 1` LAST, so `.pop()` handed
+  // this walkthrough the string "INSERT 0 1" — truthy, so `seededDraft: true` was recorded and
+  // the next line opened `/ai/workflows/INSERT 0 1`, a route that does not exist. The review
+  // screen therefore reported itself as visited while nothing had been visited. The shape
+  // check is the fix, and it is the same one the focused probe uses: a fixture that cannot
+  // fail is not a fixture.
+  const seededLine = (seeded || "").split("\n")[0].trim();
+  const draftId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(seededLine)
+    ? seededLine
+    : "";
+  note({ seededDraft: Boolean(draftId), seededRaw: (seeded || "").slice(0, 80) });
   if (!draftId) {
     steps.reason = "the review fixture could not be written — is migration 0174 applied?";
     return steps;

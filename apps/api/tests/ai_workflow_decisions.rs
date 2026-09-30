@@ -45,6 +45,8 @@ use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_core::config::{Config, DatabaseConfig};
 use omnion_core::{BuildInfo, Db, RedisClient};
+use omnion_api::rate_limit_middleware::RateLimiter;
+use omnion_security::RatePolicy;
 use omnion_permissions::model::{NewBinding, Scope};
 use omnion_permissions::bindings;
 use serde_json::{Value, json};
@@ -261,6 +263,10 @@ impl Harness {
             omnion_storage::Storage::from_config(&omnion_storage::StorageConfig::default())
                 .expect("the default storage configuration is valid"),
         );
+
+        // The sign-in budget is raised for this process, once, before any walk runs — see
+        // `give_the_suite_its_own_sign_in_budget`.
+        give_the_suite_its_own_sign_in_budget(&state);
 
         Some(Self {
             state,
@@ -572,6 +578,34 @@ async fn generate_draft(harness: &Harness, token: &str, organization_id: Uuid) -
 /// documents: no platform role expresses "may approve a draft but may not spend a
 /// generation", and a fixture that reached for one would either die with `RowNotFound` or
 /// start passing the day somebody added a role that quietly inherited `ai.chat`.
+/// Raise **only** the `sign_in` ceiling for this process.
+///
+/// Twelve walks that each sign in an owner and a member exceed the shipped `sign_in` budget
+/// (10 per 5 minutes) inside a single run, and the limiter is a process-wide cell — so the
+/// suite died on `429 rate_limited` at a `member_with` sign-in, on a line that has nothing to
+/// do with what it was testing. The failure names a rate limit on a suite that was never
+/// testing rate limits, and the obvious reading ("the limiter is too strict") is the opposite
+/// of the truth.
+///
+/// It surfaced only after this tick added a twelfth walk, which is what makes it worth writing
+/// down: **a shared, process-wide budget means test N+1 is the one that reports the problem**,
+/// and the report lands on whichever test happens to sign in last. The other ceilings are left
+/// exactly as a deployment ships them, so nothing here can be the reason a genuinely
+/// over-budget request stops being refused, and the limiter's own suite installs and asserts
+/// its own numbers regardless.
+fn give_the_suite_its_own_sign_in_budget(state: &AppState) {
+    let policies: Vec<RatePolicy> = RatePolicy::defaults()
+        .into_iter()
+        .map(|mut policy| {
+            if policy.scope == "sign_in" {
+                policy.limit = 10_000;
+            }
+            policy
+        })
+        .collect();
+    omnion_api::rate_limit_middleware::install(RateLimiter::new(state, policies));
+}
+
 async fn member_with(
     harness: &Harness,
     organization_id: Uuid,
@@ -641,6 +675,81 @@ async fn member_with(
         signed_in.body
     );
     token_of(&signed_in)
+}
+
+/// The detail wire carries `has_definition`, and it is **true** for a decided-able draft.
+///
+/// This is the regression test for a bug that made the entire approval bar dead, and it is
+/// worth stating what the bug was: the admin client's `AiWorkflowDraft` type declared
+/// `has_definition: boolean`, the review screen derived `approvable` from it, and the API's
+/// `DraftBody` **never sent the field**. So at runtime the value was `undefined`, `approvable`
+/// was permanently `false`, and Approve / Reject / Ask for changes / Test run were all disabled
+/// on a draft that was perfectly approvable.
+///
+/// TypeScript agreed with nobody. The type was an assertion about the wire that nothing checked
+/// against the server, the eleven walks were green because they call the *routes*, and the
+/// screen rendered correctly — it just rendered a disabled bar. **A declared type is a claim
+/// about a wire, and only a person clicking the screen was ever going to test it.** The probe
+/// found it by clicking; this keeps it fixed.
+#[tokio::test]
+async fn the_detail_wire_carries_has_definition_so_the_decision_bar_can_open() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+    let mock = MockProvider::start(Script::of(&[GOOD_DEFINITION])).await;
+    let (_, token, organization_id) = owner_with_tenant(&harness).await;
+    connect(&harness, &token, &mock).await;
+    let draft_id = generate_draft(&harness, &token, organization_id).await;
+
+    let fetched = harness
+        .call(get(
+            &format!("/api/v1/ai/workflows/drafts/{draft_id}"),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(fetched.status, StatusCode::OK, "{:?}", fetched.body);
+    assert_eq!(
+        fetched.body["has_definition"],
+        json!(true),
+        "the detail body must say a stored definition is there: {}",
+        fetched.text
+    );
+
+    // A draft with no definition yet must say `false` and not merely omit the key — the
+    // screen distinguishes "nothing to decide" from "the server did not answer", and an
+    // omitted key is the second one wearing the first one's shape.
+    //
+    // `created_by` is nullable (`on delete set null`), so this needs no second account: the
+    // row belongs to the **same** organization, and the assertion is about the wire shape
+    // rather than about tenancy — which is the whole lesson of the field above. The first
+    // version of this test built a second tenant with the owner wizard, which is
+    // once per installation and answered `409 already_installed`; the second version built one
+    // with `account()` and then had to grant it a role to read anything at all. **A test that
+    // needs a second tenant to assert a boolean is testing more than it means to.**
+    let pending_id: Uuid = sqlx::query_scalar(
+        "insert into ai_workflow_drafts (organization_id, title, prompt, status)
+         values ($1, 'Generating draft', 'something', 'generating')
+         returning id",
+    )
+    .bind(organization_id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("a definition-less draft must be storable");
+    let pending = harness
+        .call(get(
+            &format!("/api/v1/ai/workflows/drafts/{pending_id}"),
+            Some(&token),
+        ))
+        .await;
+    assert_eq!(pending.status, StatusCode::OK, "{:?}", pending.body);
+    assert_eq!(
+        pending.body["has_definition"],
+        json!(false),
+        "a draft with no definition must say so explicitly: {}",
+        pending.text
+    );
+
+    harness.dispose().await;
 }
 
 /// Approval materialises a **disabled** workflow carrying the draft's own steps.
