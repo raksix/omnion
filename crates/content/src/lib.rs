@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blockdiff;
+pub mod block_media;
 pub mod blocks;
 pub mod comments;
 pub mod error;
@@ -34,6 +35,10 @@ pub mod translations;
 pub mod validation;
 
 pub use blockdiff::{BlockChange, BlockDiff, BlockDiffEntry, PropChange, diff_blocks, headline};
+pub use block_media::{
+    BlockMediaRef, BlockMediaStore, FileState, MAX_MEDIA_FILTER, TreeMediaReport,
+    collect_media_refs, degrade_tree, media_ids, parse_media_filter, states_for_render,
+};
 pub use blocks::{
     Block, BlockDefinition, BlockIssue, BlockValidationReport, CATEGORIES, HIDE_ON_VALUES,
     MAX_BLOCKS, MAX_DEPTH, PropDef, PropDefault, PropKind, REGISTRY, REGISTRY_VERSION, ReadOn,
