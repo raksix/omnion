@@ -6617,3 +6617,58 @@ before the walkthrough gained the move step.
 **Next.** (a) The limits screen: usage bars with the instance default as a placeholder, the warning at 80,
 the CSV export, and the two-confirmation transfer dialog. (b) The project-scoped audit screen. (c) REQ-118
 slice 1a's acceptance 16, still the longest-standing open claim on this branch.
+
+## 2026-09-30 · wave8 tick 33 — slice 5 (limits screen, project audit, two confirmations)
+
+**What.** The three REQ-133 sentences that slice 4 left as "the panel's half", plus the defect
+underneath them: **migration 0164 added `audit_log.project_id` and no writer on this branch ever
+wrote it.** The column is nullable, the five project mutations named eight insert columns, and the
+"project audit screen is that stream filtered" had nothing to filter on.
+
+**The shape that had to be rejected first, and why it is the interesting part of this tick.** The
+obvious implementation is a `project_id: Option<Uuid>` field on `omnion_audit::NewAuditEntry`. It
+compiles and it is wrong twice: (a) the meaningful fact is not "this entry has no project" but
+"this entry has *this* project", and a null cannot carry that distinction; (b) **it breaks every
+struct-literal construction of the entry in the workspace** — `apps/api/src/routes/backups.rs` and
+`apps/api/src/routes/crm_intake.rs` both build one, and both are **another wave's files**. A change
+that makes wave-6 and wave-2's merges fail is a merge hazard dressed as an audit decision. The
+shipped shape is `record_for_project(pool, entry, project_id)` — a second entry point over one
+private `write` — so the platform's own rows keep their null and no other wave's code changes.
+
+**Proof.**
+- `scripts/qa/run-project-audit.sh` → **5/5**, and **PROVEN TO FAIL at 1/5** with the project binding
+  replaced by `None`: four fail, and **the survivor is the visibility test, which never touches the
+  column.** That is what shows the gate names this defect and not its neighbourhood.
+- `cargo test -p omnion-workflows --lib` → **56/56**; `-p omnion-api --lib` → **251/251**;
+  `-p omnion-audit --lib` → **2/2**; `pnpm typecheck` in `apps/admin` → **exit 0**; `node --check`
+  on the walkthrough → parses. Clippy: clean on every file this slice touched.
+
+**Three display traps, each of which a reasonable client falls into.**
+- **The warning is rendered from the API's `warnings` map, not recomputed.** `Limits::warns` is the
+  store's predicate; the handler calls it, the screen reads the answer. A panel re-implementing
+  "80 percent" is a second copy of a threshold, and the copy that drifts is the one nobody tests.
+- **A cap of `0` renders as "Unlimited", never as an empty track.** An empty bar beside an
+  unlabelled `0` is how a project stops working and nobody works out that the cap is not the reason.
+- **`max_credentials` renders as "no counter on this build", not at zero.** There is no
+  `credentials` table until wave 7's REQ-099, so the value is *unknown*, not `0` — and a bar at
+  zero is a claim this branch cannot make. The input is still there, because the column and the cap
+  are real.
+
+**The CSV is built from the series already on screen.** The REQ asks the export to "reproduce the
+on-screen series"; a re-queried export would agree with the bars only until the next run landed.
+
+**The handover asks twice, and the server is the authority.** The two acknowledgements are different
+facts — the previous owner is demoted to editor and *keeps* access, and the change is audited under
+its own action name — and `POST /transfer-ownership` answers `ownership_transfer_unconfirmed` when
+either flag is absent, so a hand-written request cannot skip one. The dialog's checkboxes are a
+convenience; the refusal is the rule.
+
+**Not claimed.** The three screens are typechecked and driven by the walkthrough, but **no completed
+pass has observed them**: the run in flight when this tick started (23:13) died with `Target page,
+context or browser has been closed` and wrote no `diagnostics.json`. Acceptance 9 (the warning's
+once-ness), 10 (the CSV) and 12 (the confirmations) each say in the REQ which half is proved and
+which half is waiting on that pass.
+
+**Next.** (a) the project switcher and its URL state (acceptance 3); (b) the member-role-takes-effect
+-next-request proof (15), which is a permission-cache question; (c) deactivation blocking (14);
+(d) REQ-118 slice 1a's acceptance 16, still the longest-standing open claim on this branch.
