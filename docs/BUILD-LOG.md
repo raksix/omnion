@@ -8352,3 +8352,151 @@ exist and no screen has been rendered by anything), the **PDF** export half of t
 assertion. The empty/loading/error and mobile boxes stay unticked until a browser pass runs —
 load 78–88 across ten writers this tick, which is the same condition under which earlier passes
 reported UI defects that did not exist.
+
+### Tick 75, continued — what the lockout fix actually cost to prove
+
+`669d584d` shipped a fix and a walk, and the walk was **green with the fix reverted**. Reverting
+one line — `address_failure_limit` back to `lockout_attempts` — left the test passing. That is the
+outcome a regression test exists to prevent, and the reason was structural rather than accidental:
+
+`ClientAddress` and the rate-limit middleware both read `ConnectInfo<SocketAddr>` out of the request
+extensions, and `into_make_service_with_connect_info` is the only thing that puts it there. A request
+driven through `router().oneshot()` arrives with **no address**, and with no address the per-address
+refusal cannot run at all. The walk was skipping the very rule a brute-force walk is meant to test.
+Absence of input is not a neutral default; it is the branch that skips the code.
+
+Installing the extension (`7865076d`) then broke two walks that had been passing for the wrong
+reason, both the same mistake one layer up:
+
+- **The limiter counted walks against each other.** Every walk shared `127.0.0.1` and the `sign_in`
+  ceiling is 10, so the sign-in round trip was refused `429` by a counter it never incremented.
+  `test_peer()` now allocates a loopback address per walk — the same shared-state mistake as an
+  unscoped `select count(*)`, one layer up.
+- **The sign-out walk had never signed out.** `post_logout` sent no CSRF token and this file's state
+  carried no secret, so sign-in issued no `omnion_csrf` cookie and the POST was refused `403`. That
+  assertion had been failing in CI since the CSRF layer landed. It took three fixes: the suite's own
+  secret on its own state, the token read out of the sign-in response, and `get_all(SET_COOKIE)`
+  instead of `get(SET_COOKIE)` — sign-in sends TWO cookies, so "no CSRF cookie was issued" was
+  concluded about a platform that had issued one.
+
+**Gates, final state.**
+
+| Gate | Result |
+|---|---|
+| `omnion-security --lib` | **137/0** |
+| `omnion-api --lib` | **220/0** |
+| `omnion-identity --lib` | **113/0** (the new threshold-invariant test is in this number) |
+| `apps/api --test auth` | **7/7** in 8.8s, over a live PostgreSQL + Redis |
+| `apps/admin` `tsc --noEmit` | clean |
+
+**Not proved, and named.** The lockout walk could not be shown **red** with the fix reverted: the
+reverted run died on a Redis connect timeout before reaching its assertion, because the box ran at
+load 80–107 with four sibling writers. The walk is green with the fix and the walk demonstrably
+cannot see the address rule without `ConnectInfo` (which is why it passed with the fix reverted),
+so the two together are strong evidence — but "the revert was watched going red" is not something
+this tick can claim, and the next tick should watch it when the box is quieter.
+
+**The browser pass still has not reported.** It ran for twenty minutes, walked seven screens and then
+died with `clicks.jsonl ENOENT` when `/mnt/apopic` hit 100% and the artifact directory was trimmed out
+from under it. That is now survivable (`25dddf5c`), and the two limiter screens are walked on desktop
+and at 390px, so the next tick is where the boxes naming a screen can be ticked.
+
+## 2026-09-30 — Tick 76 · REQ-010, the audit criterion (the entry that was never missing, and the one that was)
+
+REQ-010 is the first request in wave order that is not `done`, and it had two open boxes. One of
+them was the browser pass, which had not run in two ticks. The other was a sentence in its own
+acceptance list that read:
+
+> The one criterion left open in this line is the *replace* audit entry, which lands with slice 3's
+> CDN purge hook.
+
+**That sentence was wrong, and the error was worth more than the fix underneath it.**
+`media.version_created` has been written by `apps/api/src/routes/media_versions.rs` since slice 2,
+and `apps/api/tests/media.rs:2053` has read it back out of `audit_log` after a real replace. Rather
+than believe the file, this tick measured all nine actions the criterion names — writer present,
+and a walk that reads the row back:
+
+| Action | Writer | Walk asserts | Walk *performs* the action |
+|---|---|---|---|
+| `media.uploaded` | 1 | 1 | yes |
+| `media.version_created` | 1 | 1 | yes |
+| `media.folder_moved` | 1 | 1 | yes |
+| `media.deleted` | 2 | 3 | yes |
+| `media.restored` | 1 | 1 | yes |
+| `media.purged` | 1 | 1 | yes |
+| `media.grant_changed` | 1 | 2 | yes |
+| `media.share_created` / `share_revoked` | 1 / 1 | 3 / 1 | yes |
+| `media.scan_released` | 1 | 1 | yes |
+
+Nine of nine. A "still open" note in a checklist is not evidence, and this one had been carried
+forward across slices until it described a defect that had never existed.
+
+**The defect that did exist was in the same sentence.** `media.retention_applied` was emitted onto
+the event bus and **nowhere else** (`apps/api/src/routes/media_retention.rs:758`) — the `audit()`
+helper in that file is only ever called for the five *policy* actions, never for a run. So the one
+purge in this module that runs **unattended**, and the most destructive thing it does, left no
+record at all, while `Empty trash` next door wrote `media.trash_emptied` for the same deletion.
+That asymmetry is the shape of the defect: a person could see what they had done, the nightly worker
+could not, and an event bus nobody subscribed to is not a record.
+
+`09a0c25d` writes the entry before the event — for the same reason the event is recorded as a run
+error rather than a failed request, since the rows are already gone and a failure would tell an
+operator to re-run a sweep that already happened. The actor is the account that asked when there is
+one and the platform itself when the runner started it: an unattended deletion must not carry
+somebody's name.
+
+**The walk proves the branch nothing covered.** `an_unattended_sweep_audits_itself_as_the_platform`
+drives `run_once` with `actor: None` rather than the HTTP route, because the route always has a
+signed-in account and could never reach the system-actor path. It also asserts that a sweep which
+removed *nothing* writes nothing, or the log is a heartbeat rather than a record.
+
+**It was watched going red.** Reverting only the source change (the test file kept) and rebuilding:
+
+```
+test result: FAILED. 0 passed; 1 failed; 6 filtered out
+an_unattended_sweep_audits_itself_as_the_platform ... FAILED
+  assertion `left == right` failed: exactly one entry for the one run that removed something: []
+    left: 0   right: 1
+```
+
+`[]` — not a wrong actor, not a wrong count, **no row at all**, which is the shape the defect
+actually had. Restored via `git stash pop` and byte-compared against the pre-revert copy
+(`diff` clean) before the suite was re-run.
+
+**The first run of the walk failed for a reason that was not the code.** It read `purged: 0` and the
+assertion blamed the audit entry that came after it. The fixture was wrong: the seeded default keeps
+a file for **30** days and only purges it two days after that, so ageing a deletion 40 days reaches
+the *trash* window and leaves the purge window 30 days behind. The walk now tightens the policy first,
+exactly as `a_sweep_keeps_the_served_version_and_purges_what_is_past_its_window` does. The lesson is
+in the walk's own comment, because it is expensive to learn twice.
+
+**Proof.**
+
+| Gate | Result |
+|---|---|
+| `apps/api --test media_retention` | **7 passed / 0 failed** (277.95 s, live PostgreSQL + Redis, 7/7 including the new walk) |
+| the same walk, fix reverted | **FAILED** — `[]`, 0 rows |
+| `omnion-media --lib` | **199 passed / 0 failed** |
+| `pnpm typecheck` | 2/2 successful (admin rebuilt, web cached) |
+| `rustfmt --check` on both files | clean for the added code; the two remaining diffs are pre-existing (`bfe46c3e`, `b0b45428`) |
+
+**Pre-existing red, not mine, and named rather than quietly left.** `cargo fmt --all -- --check` fails
+on `backup_schedule_runner.rs`, `backup_sweep_runner.rs`, `restore_job_runner.rs`, `routes/backups.rs`,
+`lib.rs`, `main.rs`, `rate_limit_middleware.rs`, and `tests/support/walk_auth.rs`; `cargo clippy -p
+omnion-api --all-targets -- -D warnings` fails in `omnion-events` (4 errors) and `omnion-identity`
+(`too_many_arguments` ×2). `git status crates/` is clean, so none of it is in files this tick
+touched. Reformatting the workspace to green would rewrite files nine sibling writers are actively
+editing, so it is reported rather than done.
+
+**The browser pass is still the thing standing between this REQ and `done`.** Measured this tick:
+the QA slot queue is **37 deep with entries up to 23 hours old**, one place is held by a live
+`omnion-w5` walkthrough, and the box sat at load 80–89 with 8 concurrent `rustc` processes. A pass
+was queued (`QA_ONLY=media,media-duplicates,media-trash,media-settings,media-retention`) and left
+waiting; on this box that is not a usable instrument, so the tick spent itself on a defect that a
+walk could find instead. `/tmp/omnion-qa-pass.log` is from **yesterday** (mtime 2026-09-29 17:14) and
+its `csrf_unavailable` rows are history, not this pass.
+
+**Next.** Two boxes remain, both naming the same missing browser pass: the empty/loading/error states
+across the media screens and the retention tab's own states. Run `bash scripts/qa/run.sh` with
+`QA_ONLY=media,media-retention` on a quieter box, then close REQ-010 and move to REQ-014 (system
+health, still `pending`).
