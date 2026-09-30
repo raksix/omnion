@@ -4846,3 +4846,73 @@ its own timeout has verified nothing about the pages after the cut.
 "the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
 UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
 rather than a test alone. (c) Slice 4, encryption.
+
+---
+
+## Tick 74 — the check that had been red since the request was written
+
+**What.** A criterion left open since tick 1 — *the status card's age is consumed by the security
+overview check* — turned out to be hiding a defect that had been in the platform since the
+request was written, and the reading of it is the whole tick. `backup_age` in
+`apps/api/src/routes/security.rs` asked **`backup_runs`** for the last successful run. **No
+migration in this repository has ever created `backup_runs`.** The table is `backups`
+(`0157`); the name was guessed when the request predated the schema and never revisited when the
+schema landed. A missing table makes `fetch_optional` answer `Err`, `Err` was flattened into "no
+backup", and `backup_healthy` answered **`fail` on every installation, for ever** — the one
+check in the registry that could never go green, on a platform that had taken a backup every night
+for a year, with a detail that named the right rule for entirely the wrong reason.
+
+**Why nothing caught it, and why that is the interesting half.** `backup_healthy` is a pure
+function of a hand-built `Environment`, so no unit test ever executed the query. An integration
+test asserting "no backup → `fail`" would have stayed green for ever, because **the broken reader
+*is* a permanent no-backup.** The two worlds are indistinguishable from inside the code and only
+distinguishable from outside it: the walk has to take a real backup and then read the screen.
+This is the second time in two features that the missing thing was a caller — `next_due_schedules`
+shipped with a column and a query and no writer, and `prune_candidates` shipped with four
+documented exemptions and nothing calling it. A predicate nothing evaluates is a comment.
+
+**The second defect surfaced only because the walk signed in as a restricted account.** Every walk
+that had ever read the posture screen signed in as an account holding *both* keys — the platform
+owner's role is granted everything, and a walk that also touches analytics needs them. So the
+security centre had been written **inside the `analytics_reports` router builder**, whose
+`route_layer(require("analytics.read"))` reaches every route declared on it. `/security/overview`
+carried its own, correct `security.read` guard on the handler *and* an `analytics.read` guard it
+never declared: an account holding `security.read` and nothing else was refused with `403 this
+action requires the "analytics.read" permission` — on the screen whose entire purpose is to be
+readable by the person doing the diagnosing. A deployment granting the least would have found the
+security centre unreadable, and the natural response to that is to grant more. **A guard that is
+only ever satisfied is not a guard that was checked.** The group now has its own `Router::new()`
+and its own `merge`, and the comment states the rule for the next group added there.
+
+**A third defect, in a test, of the family this suite keeps finding.** The cancel walk asserted
+`select count(*) from backup_restore_jobs` — no `where` — in a database every suite in
+`apps/api/tests` shares. A row any other walk had left behind (a killed run, a concurrent suite)
+failed it with *"a refused queue wrote a row"*: a sentence about this tenant's refusals, read off
+the whole platform's table. It is now scoped to its own tenant. Same shape as the media-part leak
+one feature ago — a test that creates fixtures for exactly one organization cannot tell "the whole
+deployment" from "my own" apart.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| `omnion-backup --lib` | **153/0** |
+| `omnion-api --lib` | **220/0** |
+| `apps/api --test backups` | **26/26** over a live database, each walk run in its own process |
+| `apps/admin` `tsc --noEmit` | clean |
+| Load-bearing | the posture walk is **red** when the reader is reverted to counting any finished row, **green** on the fix |
+
+**The suite cannot be run as one process, and the reason is the suite's own design.**
+`cargo test -p omnion-api --test backups` in parallel gave **18 passed / 8 failed**; the same eight
+walks pass individually, and `--test-threads=1` hung in the ninth with a live process, no query
+outstanding, `not granted` locks 0 and a main thread in `futex`. Every walk builds a `Fixture`
+that **opens a scratch database per test**, and 26 of them at once exhaust the shared pool's
+`max_connections = 100` — the same finding the w5 loop recorded, one suite over. A contention
+failure that reports itself as `FAILED` with no panic message is the expensive kind: it reads as a
+product regression and sends the next tick hunting a defect that is not there. The pass that
+counts is 26 walks in 26 processes, and the number worth reporting is that, not the parallel one.
+
+**Next.** (a) The browser pass — the QA slot was held by a sibling for the whole tick, and the
+route list is longer than the 25 minutes the harness's own ceiling allows, so it needs the
+trimmed-route variant rather than a longer `timeout`. (b) The `partial`-run UI. (c) Slice 4,
+encryption.
