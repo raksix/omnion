@@ -6204,6 +6204,80 @@ async function runHealthDepth(page, report) {
             reason: "neither a metric row nor the 'no samples yet' sentence rendered",
           });
         }
+
+        // ---- The 24 h trend line the request asks this screen to have -----------------------
+        // Counted rather than eyeballed, and the count is the assertion: a table of current
+        // values with no chart column is exactly the state this leg exists to catch, and it
+        // renders perfectly happily — a heading that says "last 24 h" and rows that never
+        // draw anything. Every metric row must account for a trend: a line, a single point,
+        // or the sentence saying the window is empty. A row that accounts for none of the
+        // three is a column that was added to the header and not to the body.
+        const detailSparks = await page.$$eval(
+          "[data-health-detail-metric]",
+          (rows) =>
+            rows.map((row) => {
+              const spark = row.querySelector("[data-health-spark]");
+              return {
+                metric: row.getAttribute("data-health-detail-metric"),
+                kind: spark ? spark.getAttribute("data-health-spark") : null,
+                points: spark ? spark.getAttribute("data-health-spark-points") : null,
+                min: spark ? spark.getAttribute("data-health-spark-min") : null,
+                max: spark ? spark.getAttribute("data-health-spark-max") : null,
+              };
+            }),
+        );
+        const drawn = detailSparks.filter((row) => row.kind === "line" || row.kind === "point");
+        const saidEmpty = detailSparks.filter((row) => row.kind === "empty");
+        note({
+          step: "detail-trend-lines",
+          rows: detailSparks.length,
+          drawn: drawn.length,
+          saidEmpty: saidEmpty.length,
+        });
+        if (metrics > 0) {
+          const undrawn = detailSparks.filter((row) => row.kind === null);
+          if (undrawn.length > 0) {
+            note({
+              step: "detail-trend-column-empty",
+              undrawn: undrawn.map((row) => row.metric),
+              reason: "a metric row rendered no trend line and no 'no samples' sentence",
+            });
+          }
+          if (drawn.length === 0 && saidEmpty.length === 0) {
+            note({
+              step: "detail-has-no-trend-at-all",
+              reason: "the screen has metric rows but nothing that answers 'over 24 h'",
+            });
+          }
+          // A line claims a series, so the point count must be a real number above one.
+          // A `line` drawn with one point is the polyline-through-a-single-point failure,
+          // which renders as nothing and reads as an empty window.
+          const badLines = drawn.filter(
+            (row) => row.kind === "line" && Number(row.points) < 2,
+          );
+          if (badLines.length > 0) {
+            note({
+              step: "detail-line-with-fewer-than-two-points",
+              badLines,
+              reason: "a polyline through fewer than two points has no length and draws nothing",
+            });
+          }
+          // A flat series (min === max) is honest — the scale just has no span — but the
+          // marker must still say so, because a pass that only counts elements cannot tell
+          // a flat line from a scaled one and that is exactly the claim being made.
+          note({
+            step: "detail-trend-carries-its-bounds",
+            bounded: drawn.filter((row) => row.min !== null && row.max !== null).length,
+          });
+        }
+        // No non-finite text on a numbers screen, here as on the metric table.
+        const detailBody = (await page.locator("body").innerText().catch(() => "")) || "";
+        if (/NaN|Infinity|undefined/i.test(detailBody)) {
+          note({
+            step: "detail-non-finite-text",
+            reason: "the detail page rendered NaN, Infinity or undefined",
+          });
+        }
         await shot(page, "health-service-detail");
         // Back to the overview, so the next leg does not start from the detail page.
         await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});

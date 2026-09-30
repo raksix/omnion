@@ -1,4 +1,3 @@
-
 ## 2026-09-30 — omnion-w6 tick 29 — REQ-127 slice 3, the scheduler · and the walk that caught a duplicate send
 
 Slice 3 was half done: `retry_store` and `breaker_store` shipped last tick with ten walks green,
@@ -65,6 +64,112 @@ breakers`, now possible and now the last gate before intake).
 
 **Next:** the intake guard (slice 4) — HMAC verification, tolerance, replay defence, size caps and
 the sanitisation profile — then the focused pass, then close REQ-127.
+
+## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
+
+feat(health): the service detail page draws a 24 h trend. fix(health): the health
+walks did not compile, and had been committed that way.
+
+**Slice 2 was one screen short, and it was short in the way that looks the least
+broken.** The request names the drill-down's contents: "current state, checks table,
+**a 24 h trend chart**, recent failures". The screen listed current values in four
+columns and drew no line. Nothing about it errored — the route resolved, the values
+were right, the heading was right — and "a table with no chart in it" is not a
+defect any compiler, type checker or linter in this workspace has an opinion about.
+
+Three things made it a chart rather than a decoration:
+
+| | |
+|---|---|
+| one window per response | `SERVICE_TREND_RANGE` is read once, before the loop, so every row covers the same 24 h. A per-row `now()` gives row one a fraction of a second more than row nine, and two lines on one screen that end at different instants cannot be compared. |
+| an empty window speaks | a row with no samples draws "no samples in the last 24 h", because an empty box on a numbers screen reads as a chart that failed to load. |
+| one point draws a dot | a polyline through one point has zero length and renders as nothing at all — which the table reads as "no data" on a row that has one. |
+
+**The sparkline was extracted, not copied.** Both screens now assert
+`data-health-spark`, and "what does an unmeasured window look like" is one answer or
+two. A second copy is how the metric table learns to draw a dot while the drill-down
+keeps drawing nothing — and *nothing* is what the walk reads as a missing chart. It
+gained a `label` prop in the same move: twelve rows all named "sparkline" is a screen
+a screen reader cannot be read from.
+
+**`/health/samples` stopped taking `hours`.** It was the last endpoint in the centre
+still clamping an hour count — the exact defect slice 2 removed from `/health/metrics`.
+A caller asking for 30 days got 7 with a `200` and no warning, drew the wrong chart,
+and had no way to tell. It now goes through the same `Range::parse`, so the refusal
+is a property of the *vocabulary* rather than of one handler, and `fetchHealthSamples`
+moved with it: `hours=24` and `range=24h` are one window with two spellings, and the
+second spelling travels into the CSV filename.
+
+## The other half of this tick: 14 errors, committed, invisible to every gate
+
+`cargo check -p omnion-api --tests` reported **fourteen compile errors** across the
+two health walk files. All fourteen were committed. Not one gate had ever caught
+them, and each gate was *correct about the thing it checked*:
+
+| gate | what it compiles |
+|---|---|
+| `cargo test -p omnion-health --lib` | the health **crate** — not `apps/api`, and not its test binaries |
+| `pnpm typecheck` (admin) | TypeScript — cannot see Rust |
+| `node --check walkthrough.cjs` | the walkthrough — does not parse `.rs` |
+| `tsc` on a screen | the admin's JSX — cannot see the route that serves it |
+
+**Not one of them puts an `apps/api` test binary in a dependency graph.** Tick 80
+wrote that rule into the ledger after finding the mirror-image failure in
+`health_panel.rs`; the rule was in the ledger, in my own words, when it happened
+again on the very next tick. That is the part worth writing down: reading a lesson
+is not the same as the lesson being in force, and the only thing that put
+`apps/api`'s tests in the graph this time was deliberately reaching for
+`--tests`.
+
+**Eleven of the fourteen were the same line, in the same shape.**
+
+```rust
+harness.dispose().await;          // dispose(self) — takes the harness BY VALUE
+std::mem::forget(harness);        // …and this moves it again
+```
+
+`dispose(self)` consumes the harness, so the call above *moves* it and there is
+nothing left to forget — E0382, eleven times. The comment above the method gave a
+confident reason for the `forget`: "stops the later `Drop` from running against a
+moved-from handle". **That reason is false.** There is no later `Drop` of that
+value, because the value was consumed by the call two lines up. The same comment
+had already been copied into `notification_delivery_reader.rs`, which received the
+justification without the code — a file that reads as though the hazard is real,
+which is how the next writer adds it back.
+
+Both comments now record why there is deliberately no `forget`, because a
+plausible-sounding story is what carried this through two reviews and four ticks.
+The rule that falls out of it: **a comment that explains a line's purpose is a
+claim to verify, and the ones that sound most confident are the ones nobody reads
+closely.**
+
+The other three: a stray `await` on a non-`await` expression; an import list naming
+the crate's own root (`use omnion_health::{MetricSummary, Range, omnion_health};` —
+there is no such item); and `&[good, good]`, which moves the same non-`Copy`
+`NewSample` into an array twice.
+
+**Proof**
+
+```
+cargo check -p omnion-api --tests   clean   (was 14 errors)
+cargo test -p omnion-health --lib    40 passed; 0 failed   (0.27s)
+admin tsc -p tsconfig.json --noEmit  exit 0
+node --check walkthrough.cjs        syntax ok
+```
+
+**What this costs the next tick, stated plainly.** The `health_history` and
+`health_probes` suites have still **not been run** — they now compile, which is a
+different and much lower claim. An `omnion-api` test binary needs a ~30-minute link
+at the current load average (85, four sibling cargo trees), and the browser pass
+(`bash scripts/qa/run.sh`) has still not run at all: the QA slot is held by a sibling
+writer and `/mnt/apopic` is at 87%. So slice 2's screen behaviour rests on the walk
+being **written and wired**, not on a rendered page, and the REQ says so.
+
+**Next:** run `health_history` and `health_probes` when a slot frees, then
+`bash scripts/qa/run.sh` — which closes slice 2's last box and the walkthrough box
+at the same time. Then slice 3 (incidents + thresholds), whose schema
+(`health_incidents`, `health_settings`) has shipped empty since slice 1 and whose
+empty-only screen the migration comment explicitly refuses to build.
 ## 2026-09-30 — REQ-014 slice 2 (history) · the export that has to match the screen
 
 feat(health) + feat(admin): named ranges, real aggregates, per-row sparklines, and a CSV the

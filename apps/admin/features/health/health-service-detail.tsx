@@ -17,6 +17,11 @@
  *    report.** The report is this run's readings; the table is everything the
  *    service has published. A probe that changed its metric set last week must
  *    still show its history rather than silently losing a column.
+ * 2b. **Every row carries its own 24 h trend, read in the same request.** The
+ *    request asks for "a 24 h trend chart" on this screen, and a table of current
+ *    values with the history somewhere else is not a trend chart. One window, one
+ *    instant, all rows — two series read at two different times are not
+ *    comparable, and two charts on one page have to be.
  * 3. **An empty metric table says "no samples yet" and keeps the checks.** The
  *    checks are live and the history is not; blanking the whole screen because a
  *    fresh database has no history would hide the one part that does work.
@@ -24,7 +29,7 @@
  *    bannered above it, for the same reason the overview does.
  *
  * Keyboard: `r` re-reads. Mobile: the checks table becomes a card list and the
- * metric table scrolls horizontally rather than squeezing four columns into a
+ * metric table scrolls horizontally rather than squeezing five columns into a
  * phone.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -41,6 +46,8 @@ import {
 
 import { fetchHealthService, type ApiError } from "@/lib/api";
 import type { HealthServiceDetail, HealthState } from "@/lib/types";
+
+import { Sparkline } from "./sparkline";
 
 const STATE_LABEL: Record<HealthState, string> = {
   healthy: "Healthy",
@@ -317,8 +324,18 @@ export function HealthServiceDetailScreen() {
         )}
       </section>
 
+      {/*
+        The trend column is the point of this screen, and the reason it is on the
+        *row* rather than behind a second request is in the request itself: the detail
+        page's job is "a 24 h trend chart", and a table of current values with the
+        history on another screen is a table, not a drill-down. Every row's series
+        comes from the server in the same response, over the same window — see
+        `SERVICE_TREND_RANGE` in `health_panel.rs`. Two lines on one page that were
+        read at two different instants would not be comparable, which is the single
+        thing two charts sharing a screen must be.
+      */}
       <section>
-        <h3 className="mb-2 text-[13.5px] font-medium">Published metrics</h3>
+        <h3 className="mb-2 text-[13.5px] font-medium">Published metrics · last 24 h</h3>
         {metrics.length === 0 ? (
           <p
             data-health-detail-no-metrics
@@ -336,6 +353,7 @@ export function HealthServiceDetailScreen() {
                   <th className="py-1.5 pr-3 font-medium">Value</th>
                   <th className="py-1.5 pr-3 font-medium">Unit</th>
                   <th className="py-1.5 pr-3 font-medium">Sampled at</th>
+                  <th className="py-1.5 font-medium">24 h trend</th>
                 </tr>
               </thead>
               <tbody>
@@ -349,6 +367,9 @@ export function HealthServiceDetailScreen() {
                     <td className="py-1.5 pr-3 tabular-nums">{metric.value}</td>
                     <td className="py-1.5 pr-3 text-muted">{metric.unit || "—"}</td>
                     <td className="py-1.5 pr-3 text-muted">{ago(metric.sampled_at)}</td>
+                    <td className="py-1.5">
+                      <Sparkline values={metric.series} label={metric.metric} widthClass="w-32" />
+                    </td>
                   </tr>
                 ))}
               </tbody>

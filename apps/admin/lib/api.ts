@@ -6947,13 +6947,25 @@ export function fetchReliabilityAttempts(limit = 50): Promise<ReliabilityAttempt
   );
 }
 
-/** One metric's series, oldest first. `hours` is clamped server-side to 1 h … 7 d. */
+/**
+ * One metric's series, oldest first.
+ *
+ * The window is a **named range** (`1h` / `24h` / `7d`), the same vocabulary
+ * `/health/metrics` uses, and the server refuses anything else with a message naming
+ * what is offered. It used to take `hours` and clamp it, which is the silent-clamp
+ * shape: a caller asking for a month got a week with a `200`, drew the wrong chart,
+ * and had no way to tell from the response. The parameter's *name* is the reason this
+ * was worth changing rather than leaving compatible — `hours=24` and `range=24h` are
+ * the same window with two spellings, and the second one travels into the CSV
+ * filename, so there must be exactly one.
+ */
+
 export function fetchHealthSamples(
   service: string,
   metric: string,
-  hours = 24,
+  range: HealthRangeKey = "24h",
 ): Promise<HealthSamplePoint[]> {
-  const query = new URLSearchParams({ service, metric, hours: String(hours) });
+  const query = new URLSearchParams({ service, metric, range });
   return request<HealthSamplePoint[]>(`/api/v1/health/samples?${query.toString()}`, {
     cache: "no-store",
   });
