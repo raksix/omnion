@@ -845,6 +845,37 @@ async function settleAfterClick(page, minimum = STEP_MS) {
   }
 }
 
+/**
+ * Wait for the builder canvas to stop repainting its cards.
+ *
+ * `settleAfterClick` waits for the URL to stop changing, which is the right question for a page
+ * that navigates and the wrong one for a canvas that re-renders in place: a graph loading from
+ * the API keeps the URL identical while its card list grows from one node to six, and every
+ * read taken during that window sees a *partial* canvas.
+ *
+ * That is not hypothetical. The run-from-here probe read the card list, then the same cards
+ * again a moment later, and the two disagreed — one card in the first reading, six in the second
+ * — so the probe scanned one node, found that it was the trigger, and concluded that no node on
+ * the graph could start a run. Every row below it (`startedFrom: null`, `pillsPainted: 0`,
+ * `step-trace.panelFound: false`) is downstream of that one early read: nothing ran, so there
+ * were no pills to paint and no step to open. Four "the product is missing this" readings, one
+ * race.
+ *
+ * A count is the right signal because the canvas only ever *adds* or *replaces* cards, and it
+ * does so in bursts while a graph or a run lands. Stable twice in a row is the stop condition.
+ */
+async function settleCanvasCards(page, minimum = 250, attempts = 20) {
+  await page.waitForTimeout(minimum);
+  let previous = -1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const count = await page.locator("[data-node-id]").count();
+    if (count === previous) return count;
+    previous = count;
+    await page.waitForTimeout(200);
+  }
+  return previous;
+}
+
 async function interact(page, pageName, report) {
   const inventory = () =>
     page.evaluate((max) => {
@@ -10440,8 +10471,12 @@ note({
     // a whole run and proves nothing about a prefix being skipped) wins. The scan is recorded
     // so "no node on this graph can start" is a finding with evidence behind it rather than
     // a null.
+    // The canvas has to finish painting before anything is read off it. Both readings below
+    // used to disagree — `cardCount` said 6 and `cardOrder` said 1 — and a scan that sees one
+    // card sees the *trigger*, which cannot start a run, so the probe concluded the graph had
+    // no startable node and every row under it reported nothing.
+    const cardCount = await settleCanvasCards(page);
     const cards = page.locator("[data-node-id]");
-    const cardCount = await cards.count();
     const cardOrder = await page
       .evaluate(() =>
         Array.from(document.querySelectorAll("[data-node-id]")).map((card) => ({
@@ -10558,6 +10593,13 @@ note({
       step: "run-from-here",
       controlFound: controlCount > 0,
       cardsOnCanvas: cardCount,
+      // The two readings of the same DOM, milliseconds apart. They disagreed (1 vs 6) for a
+      // whole tick, and every unmeasured row in this block was downstream of that race rather
+      // than of anything in the product — so the disagreement itself is now a reported number.
+      // A scan that finds no startable node while this says false is a *harness* failure and
+      // reads as one; the same scan with `canvasWasStable: false` is a stale read and reads as
+      // one too, which is the point of recording it separately.
+      canvasWasStable: cardOrder.length === cardCount,
       canStart,
       // Which node each card answered for, so a `canStart: "false"` can be told apart from
       // "the control never rendered for the node the criterion is about".
