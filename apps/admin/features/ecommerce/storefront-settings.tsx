@@ -88,7 +88,20 @@ interface FieldError {
   message: string;
 }
 
-const DRAFT_FIELDS: (keyof Draft)[] = [
+/**
+ * Every field the save body carries — the contract the `PUT` has to satisfy.
+ *
+ * It was `DRAFT_FIELDS`, private, read by nothing but a re-export that also had no
+ * reader, under a comment claiming the naming "keeps the two honest". It kept nothing
+ * honest: `keyof Draft` makes the list *type-check* against the shape, which catches a
+ * key that does not exist and nothing else, so a field added to `StorefrontSettings` and
+ * forgotten here compiled green, rendered no control, and was never edited. The half a
+ * developer actually adds is the one the type system cannot see.
+ *
+ * So the completeness half is asserted at the type level, below, and the assertion
+ * reads THIS constant — which is what gives the export the caller it never had.
+ */
+export const STOREFRONT_DRAFT_FIELDS = [
   "site_id",
   "guest_checkout",
   "tax_display",
@@ -101,7 +114,22 @@ const DRAFT_FIELDS: (keyof Draft)[] = [
   "abandonment_hours",
   "confirmation_template",
   "currency",
-];
+] as const satisfies readonly (keyof Draft)[];
+
+/** A key of `Draft` this list does not name: the type is a union of them, so any is an error. */
+type UncoveredDraftField = Exclude<keyof Draft, (typeof STOREFRONT_DRAFT_FIELDS)[number]>;
+
+/** A key this list names that is not a field of `Draft` — the opposite drift. */
+type UnknownDraftField = Exclude<
+  (typeof STOREFRONT_DRAFT_FIELDS)[number],
+  keyof Draft
+>;
+
+/** Compiles only when both are `never`; otherwise the error names every offending key. */
+type AssertNone<T extends never> = T;
+export type DraftFieldsAreComplete = AssertNone<UncoveredDraftField>;
+export type DraftFieldsAreKnown = AssertNone<UnknownDraftField>;
+
 
 /** `inclusive` → `Prices include tax`. The label a customer would read. */
 function taxLabel(value: string): string {
@@ -566,9 +594,6 @@ export function StorefrontSettingsScreen() {
     </div>
   );
 }
-
-/** DRAFT_FIELDS is the contract the PUT body must satisfy; naming it keeps the two honest. */
-export const STOREFRONT_DRAFT_FIELDS = DRAFT_FIELDS;
 
 function Section({
   title,
