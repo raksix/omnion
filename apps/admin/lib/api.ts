@@ -17,6 +17,9 @@ import type {
   HealthSamplePoint,
   HealthSummary,
   HealthPruneResult,
+  HealthMetricRow,
+  HealthMetricsReport,
+  HealthRangeKey,
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
@@ -5135,4 +5138,66 @@ export function fetchHealthHost(): Promise<Record<string, unknown>> {
 /** Drop raw samples past the retention window. Destructive, so it is a POST. */
 export function pruneHealthSamples(): Promise<HealthPruneResult> {
   return request<HealthPruneResult>("/api/v1/health/maintenance/prune", { method: "POST" });
+}
+
+/**
+ * `GET /api/v1/health/metrics` — the aggregated table for a named range.
+ *
+ * The range is a **name** (`1h`, `24h`, `7d`) rather than a number of hours, and the server
+ * refuses anything else. The client cannot quietly ask for a window the panel has no label
+ * for, which is what stops a table headed `7d` from holding a day.
+ */
+export function fetchHealthMetrics(
+  range: HealthRangeKey = "24h",
+): Promise<HealthMetricsReport> {
+  return request<HealthMetricsReport>(
+    `/api/v1/health/metrics?range=${encodeURIComponent(range)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * `GET /api/v1/health/metrics.csv` — exactly the rows the table is showing.
+ *
+ * The **server** renders the file from the same query the table used, and repeats the window in
+ * `X-Health-Range`. The client never builds CSV from the rows it holds: a client-built export is
+ * a client-chosen file, and "the export matches the range shown" is precisely the property that
+ * a client-built export cannot promise.
+ */
+export async function downloadHealthMetricsCsv(
+  range: HealthRangeKey = "24h",
+): Promise<{ rows: number; blob: Blob; filename: string; range: string }> {
+  const url = `/api/v1/health/metrics.csv?range=${encodeURIComponent(range)}`;
+  let response: Response;
+  try {
+    response = await fetch(url, { credentials: "same-origin", headers: { accept: "text/csv" } });
+  } catch {
+    throw new ApiError(0, "network_error", "The Omnion API could not be reached.");
+  }
+
+  if (!response.ok) {
+    const text = await response.text();
+    let code = "export_failed";
+    let message = `The export answered with status ${response.status}.`;
+    try {
+      const body = JSON.parse(text) as ErrorBody;
+      code = body.error?.code ?? code;
+      message = body.error?.message ?? message;
+    } catch {
+      // A non-JSON error body is still an error; the status stays in the message.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="?([^";]+)"?/.exec(disposition);
+  const served = response.headers.get("x-health-range") ?? range;
+  const blob = await response.blob();
+
+  // The row count is read from the file itself rather than trusted from a header, because the
+  // header the API sends is the same code path that made the mistake.
+  const text = await blob.text();
+  const rows = Math.max(0, text.split("\n").filter((line) => line.trim() !== "").length - 1);
+
+  return { rows, blob, filename: match?.[1] ?? `omnion-health-${served}.csv`, range: served };
 }
