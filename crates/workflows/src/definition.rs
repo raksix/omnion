@@ -546,6 +546,31 @@ pub struct WorkflowDefinition {
 
 impl WorkflowDefinition {
     /// Build a definition and check it.
+    ///
+    /// The opening `conditions` is `[]` and **must stay an array**, which is a conclusion this
+    /// constructor reached the expensive way and the doc comment is here to keep.
+    ///
+    /// Two columns have an opinion about this field, and they do not agree:
+    ///
+    /// * `workflows_conditions_is_group` (migration 0020) accepts an **array** *or* an object
+    ///   with exactly one of `all` / `any`.
+    /// * `workflows_conditions_need_event` (migration 0010) reads
+    ///   `jsonb_array_length(conditions) = 0` — and `jsonb_array_length` does not return
+    ///   `null` for a non-array, it **raises** `cannot get array length of a non-array`. The
+    ///   check therefore only survives a non-array when the trigger is an event, because the
+    ///   left-hand side `trigger_kind = 'event'` short-circuits the `or` before the length is
+    ///   ever taken.
+    ///
+    /// So `[]` is the only value a **manual or scheduled** rule can store, and a value like
+    /// `null` or `{"all": []}` answers `workflow_store_error` at the insert. That is a real
+    /// constraint, not a mistake in the migration: a non-event trigger has no payload to
+    /// evaluate conditions against, so there is no group to describe.
+    ///
+    /// The failure this doc exists for looked like a store fault. An approval of a generated
+    /// draft — a **manual** rule, the shape the model writes most often — came back
+    /// `400 workflow_store_error … violates check constraint "workflows_conditions_is_group"`,
+    /// naming the column's *other* constraint and blaming the database for a value the
+    /// constructor had chosen three lines earlier.
     pub fn new(trigger: Trigger, steps: Vec<StepDefinition>) -> Result<Self> {
         let definition = Self {
             trigger,
@@ -959,4 +984,62 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_rule_with_no_conditions_stores_an_array_because_the_column_asks_for_a_length() {
+        // **The regression test for a real failure**, and the reason it lives here rather
+        // than beside the migration. `conditions` reaches the column as whatever this
+        // constructor chose, and the two columns that inspect it disagree about what "empty"
+        // looks like:
+        //
+        //   * `workflows_conditions_is_group` (0020) accepts an array **or** a group object;
+        //   * `workflows_conditions_need_event` (0010) evaluates `jsonb_array_length(…) = 0`,
+        //     and `jsonb_array_length` **raises** on a non-array rather than returning
+        //     something falsy. The `or` short-circuits it away only when the trigger is an
+        //     event.
+        //
+        // So for a manual or scheduled rule the *only* storable "no conditions" is `[]`, and
+        // the natural-looking alternatives (`null` for "absent", `{"all": []}` for "one stored
+        // shape") both answer `workflow_store_error` at the insert. The error names
+        // `workflows_conditions_is_group`, which is the constraint that *passed* — the check
+        // that actually failed is a different one, and a reader is sent to audit the wrong
+        // column.
+        //
+        // Asserting `is_array()` rather than "the definition validates" is the point: the
+        // value that made every manual create fail **is** valid by this crate's own rules.
+        for trigger in [Trigger::manual(), Trigger::schedule("0 8 * * *")] {
+            let definition = WorkflowDefinition::new(
+                trigger,
+                vec![StepDefinition::task("greet", "noop", serde_json::json!({}))],
+            )
+            .expect("a definition with no conditions is valid");
+
+            let stored = definition.conditions_json().expect("conditions serialise");
+            assert!(
+                stored.is_array(),
+                "a non-event rule stored conditions as {stored}; \
+                 `jsonb_array_length` raises on a non-array, so only an array can be stored"
+            );
+            assert_eq!(stored, serde_json::json!([]), "and it must be the EMPTY array");
+        }
+    }
+
+    #[test]
+    fn an_event_trigger_still_normalises_the_v0_flat_array_to_one_stored_shape() {
+        // The counterpart: the automation layer normalises `[]` into `{"all": []}` before it
+        // reaches the constructor, and a definition that read one way on the way in and
+        // another way on the way out would make "the stored definition round-trips unchanged"
+        // false for reasons that have nothing to do with what the operator wrote.
+        let definition = WorkflowDefinition::new(
+            Trigger::event("page.published"),
+            vec![StepDefinition::task("greet", "noop", serde_json::json!({}))],
+        )
+        .expect("an event definition with no conditions is valid")
+        .with_conditions(serde_json::json!({ "all": [] }));
+
+        assert_eq!(
+            definition.conditions_json().expect("stores"),
+            serde_json::json!({ "all": [] })
+        );
+    }
+
 }

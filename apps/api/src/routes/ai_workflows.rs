@@ -50,7 +50,7 @@ use crate::state::AppState;
 use omnion_module_ai as ai;
 
 /// How many stage frames may queue in front of a client before the stream waits for it.
-const STREAM_BUFFER: usize = 8;
+pub(crate) const STREAM_BUFFER: usize = 8;
 
 /// Longest a prompt may be, in **characters**.
 ///
@@ -131,7 +131,7 @@ pub struct DraftSummary {
 }
 
 impl DraftSummary {
-    fn build(draft: &ai::AiWorkflowDraft) -> Self {
+    pub(crate) fn build(draft: &ai::AiWorkflowDraft) -> Self {
         let mut tokens = ai::DraftTokens::default();
         tokens.add(
             draft.tokens_input.map(i64::from),
@@ -226,7 +226,7 @@ pub struct StepSummary {
 }
 
 impl DraftBody {
-    fn build(draft: &ai::AiWorkflowDraft) -> Self {
+    pub(crate) fn build(draft: &ai::AiWorkflowDraft) -> Self {
         let steps = draft
             .definition()
             .and_then(|definition| definition.get("steps"))
@@ -931,7 +931,7 @@ fn clamp_tokens(count: i64) -> i32 {
 }
 
 /// Turn a store failure into a `500` with the module's own code.
-fn store_error(error: ai::AiWorkflowError) -> ApiError {
+pub(crate) fn store_error(error: ai::AiWorkflowError) -> ApiError {
     ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
         error.code(),

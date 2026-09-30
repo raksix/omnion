@@ -70,6 +70,7 @@
 //! keeps the rollups fresh is `crate::analytics_runner`.
 
 pub mod ai;
+pub mod ai_workflow_decisions;
 pub mod ai_workflows;
 pub mod analytics;
 pub mod auth;
@@ -836,7 +837,29 @@ pub fn router(state: AppState) -> Router {
         .merge(
             delete(ai_workflows::delete_draft)
                 .layer(guards::require(&state, "workflows.manage")),
+        )
+        .merge(
+            // Saving an edited definition is a `workflows.manage` write, and it is the one
+            // the spec pairs with revalidation: the bytes came from a human, so the same
+            // validator the model's answer went through has to see them too.
+            patch(ai_workflow_decisions::save_definition)
+                .layer(guards::require(&state, "workflows.manage")),
         );
+
+    // The decision half of the console (REQ-046 slice 4). Three different permissions, and
+    // the split is the point: deciding a draft **is** the materialisation of a workflow, so
+    // `approve` is `workflows.manage`; spending tokens is `ai.chat`, the same key generate
+    // sits behind, so a role that may manage rules but may not chat cannot arm one; and a
+    // test run reports what a rule *would* do, so it is `workflows.run` — the key the rule
+    // itself would need.
+    let ai_workflow_revise = post(ai_workflow_decisions::revise)
+        .layer(guards::require(&state, "ai.chat"));
+    let ai_workflow_approve = post(ai_workflow_decisions::approve)
+        .layer(guards::require(&state, "workflows.manage"));
+    let ai_workflow_reject = post(ai_workflow_decisions::reject)
+        .layer(guards::require(&state, "workflows.manage"));
+    let ai_workflow_test_run = post(ai_workflow_decisions::test_run)
+        .layer(guards::require(&state, "workflows.run"));
 
     // Events and webhooks (docs/01-VISION.md §13, P12): reading the endpoints and their queue
     // history is `webhooks.read`, connecting, changing, testing and removing them is
@@ -1612,6 +1635,10 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/workflows/examples", ai_workflow_examples)
         .route("/ai/workflows/drafts/authors", ai_workflow_authors)
         .route("/ai/workflows/drafts/{id}", ai_workflow_draft)
+        .route("/ai/workflows/drafts/{id}/revise", ai_workflow_revise)
+        .route("/ai/workflows/drafts/{id}/approve", ai_workflow_approve)
+        .route("/ai/workflows/drafts/{id}/reject", ai_workflow_reject)
+        .route("/ai/workflows/drafts/{id}/test-run", ai_workflow_test_run)
         .route("/webhooks", webhooks)
         .route("/webhooks/{id}", webhook)
         .route("/webhooks/{id}/deliveries", webhook_deliveries)

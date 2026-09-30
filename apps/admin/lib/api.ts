@@ -6317,6 +6317,89 @@ export function removeAiWorkflowDraft(draftId: string): Promise<null> {
   });
 }
 
+// ---- The decision half (REQ-046 slice 4) ---------------------------------------------------
+
+/** What a decision answers: the draft as it now reads, plus what the decision produced. */
+export type AiWorkflowDecision = {
+  draft: AiWorkflowDraftDetail;
+  workflow_id?: string;
+  enabled: boolean;
+};
+
+/** One planned step of a test run, as the review screen draws the plan. */
+export type AiWorkflowTestRunStep = {
+  position: number;
+  name: string;
+  kind: string;
+  action: string | null;
+  /** Whether the HOST runs this action — the line that says the step leaves the process. */
+  host: boolean;
+  /** The permission the action needs at run time, or `null` for the engine's own actions. */
+  permission: string | null;
+  params: unknown;
+};
+
+/**
+ * What a test run reports.
+ *
+ * A test run validates the definition and projects it step by step; it does **not** dispatch
+ * a run, so the `note` is the platform's own sentence about that and the screen shows it
+ * rather than letting the operator assume a rule was exercised.
+ */
+export type AiWorkflowTestRun = {
+  draft_id: string;
+  workflow_id: string | null;
+  definition: unknown;
+  steps: AiWorkflowTestRunStep[];
+  verdict: string;
+  note: string;
+};
+
+/**
+ * Approve a draft: it becomes a **disabled** workflow.
+ *
+ * `409` on a second call, naming the workflow the first call created — the message is the
+ * reason the operator can act on the conflict.
+ */
+export function approveAiWorkflowDraft(
+  draftId: string,
+): Promise<AiWorkflowDecision> {
+  return request<AiWorkflowDecision>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/approve`,
+    { method: "POST" },
+  );
+}
+
+/** Reject a draft. The reason is required by the API, not merely by this form. */
+export function rejectAiWorkflowDraft(
+  draftId: string,
+  reason: string,
+): Promise<AiWorkflowDecision> {
+  return request<AiWorkflowDecision>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/reject`,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+}
+
+/** Save an operator-edited definition. The API revalidates and changes nothing on failure. */
+export function saveAiWorkflowDefinition(
+  draftId: string,
+  definition: unknown,
+): Promise<AiWorkflowDraftDetail> {
+  return request<AiWorkflowDraftDetail>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}`,
+    { method: "PATCH", body: JSON.stringify({ definition }) },
+  );
+}
+
+/** Validate a draft's definition and get the plan back, without running anything. */
+export function testRunAiWorkflowDraft(draftId: string): Promise<AiWorkflowTestRun> {
+  return request<AiWorkflowTestRun>(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/test-run`,
+    { method: "POST" },
+  );
+}
+
 /** One stage of a generation, as the progress panel draws it. */
 export type AiWorkflowStage = "plan" | "validate" | "repair";
 
@@ -6344,13 +6427,66 @@ export type AiWorkflowDone = {
  */
 export async function streamGenerateWorkflowDraft(
   input: { prompt: string; model?: string; siteId?: string; organizationId?: string },
-  handlers: {
-    onStage?: (stage: AiWorkflowStage) => void;
-    onDone?: (done: AiWorkflowDone) => void;
-  } = {},
+  handlers: AiWorkflowStreamHandlers = {},
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch("/api/v1/ai/workflows/generate", {
+  await streamDraft(
+    "/api/v1/ai/workflows/generate",
+    {
+      prompt: input.prompt,
+      model: input.model && input.model.trim() ? input.model.trim() : null,
+      site_id: input.siteId || null,
+      organization_id: input.organizationId || null,
+    },
+    handlers,
+    signal,
+  );
+}
+
+/**
+ * Ask the model for a change to an existing draft, streaming.
+ *
+ * The same frames and the same reader as [`streamGenerateWorkflowDraft`], and that is the
+ * point: a revision that answered after one round-trip would leave the operator staring at
+ * a button they can press again, and the review screen's progress panel would have to be a
+ * second implementation of the panel the console already has.
+ */
+export async function streamReviseWorkflowDraft(
+  draftId: string,
+  note: string,
+  model: string | undefined,
+  handlers: AiWorkflowStreamHandlers = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  await streamDraft(
+    `/api/v1/ai/workflows/drafts/${encodeURIComponent(draftId)}/revise`,
+    { note, model: model && model.trim() ? model.trim() : null },
+    handlers,
+    signal,
+  );
+}
+
+/** The callbacks a generation stream reports through. */
+export type AiWorkflowStreamHandlers = {
+  onStage?: (stage: AiWorkflowStage) => void;
+  onDone?: (done: AiWorkflowDone) => void;
+};
+
+/**
+ * Read one generation or revision stream.
+ *
+ * One reader for both routes: the frames are the same contract (`stage` / `done` / `error`),
+ * and two readers would be two places where an `error` frame is handled slightly differently
+ * — which is exactly the kind of difference that shows up as "asking for changes does
+ * nothing" while generating works.
+ */
+async function streamDraft(
+  path: string,
+  body: Record<string, unknown>,
+  handlers: AiWorkflowStreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(path, {
     method: "POST",
     credentials: "same-origin",
     headers: {
@@ -6361,12 +6497,7 @@ export async function streamGenerateWorkflowDraft(
       // `403 csrf_failed` while every other write on the platform works.
       ...csrfHeader({ method: "POST" }),
     },
-    body: JSON.stringify({
-      prompt: input.prompt,
-      model: input.model && input.model.trim() ? input.model.trim() : null,
-      site_id: input.siteId || null,
-      organization_id: input.organizationId || null,
-    }),
+    body: JSON.stringify(body),
     signal,
   });
 

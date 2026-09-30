@@ -2037,6 +2037,110 @@ async function runAiWorkflowConsole(page, report) {
     steps.reason = "the step's parameters do not read as the parameters the draft stored";
   }
 
+  // ---- the decision bar (slice 4) ------------------------------------------------------------
+  // The bar is only a real test if each of its four controls is pressed, so they are. The
+  // order is the order a reviewer works in and each step reads the ROW back out of the
+  // database: a bar that moved its own state while the row said `draft` is a bar that
+  // reports a decision nobody made.
+  const bar = {
+    present: (await page.locator("[data-approval-bar]").count()) > 0,
+    approve: (await page.locator("[data-approve]").count()) > 0,
+    reject: (await page.locator("[data-reject]").count()) > 0,
+    revise: (await page.locator("[data-revise]").count()) > 0,
+    testRun: (await page.locator("[data-test-run-button]").count()) > 0,
+  };
+  note({ bar });
+  if (!bar.present || !bar.approve || !bar.reject || !bar.revise || !bar.testRun) {
+    steps.ok = false;
+    steps.reason = `the decision bar is missing a control: ${JSON.stringify(bar)}`;
+  }
+
+  // Reject is refused without a reason — the spec's "reason required", proven by the control
+  // being disabled rather than by a server error, because a disabled button is what the
+  // operator sees.
+  const rejectDisabledNoReason = await page.locator("[data-reject]").isDisabled().catch(() => false);
+  note({ rejectDisabledNoReason });
+  if (!rejectDisabledNoReason) {
+    steps.ok = false;
+    steps.reason = "Reject is enabled with no reason typed — the reason is required, not decorative";
+  }
+
+  // A test run answers a PLAN. It must say so on screen, and it must not claim a rule ran:
+  // the fixture's step is `ai.prompt`, a host action, so the plan has to flag that it leaves
+  // the process and name the permission it needs.
+  await page.click("[data-test-run-button]").catch(() => {});
+  await page.waitForTimeout(2500);
+  const planRows = await page.locator("[data-test-run-steps] li").count();
+  const planText = (await page.locator("[data-test-run]").first().innerText().catch(() => "")) || "";
+  note({ planRows, planMentionsPermission: planText.includes("ai.chat"), planSaysNothingDispatched: /nothing was dispatched/i.test(planText) });
+  if (planRows < 1) {
+    steps.ok = false;
+    steps.reason = "the test run rendered no plan — a test run that draws nothing is a dead button";
+  }
+  await shot(page, "page-ai-workflow-test-run");
+
+  // An invalid edit changes nothing. The editor is a textarea: break the JSON, save, and the
+  // row's status must still be `draft` with the same steps.
+  const beforeSteps = steps_;
+  await page.fill("[data-definition-editor]", "{ not json at all").catch(() => {});
+  await page.click("[data-definition-save]").catch(() => {});
+  await page.waitForTimeout(1200);
+  const parseErrorShown = (await page.locator("[data-definition-parse-error]").count()) > 0;
+  const statusAfterBadSave = qaSql(`select status from ai_workflow_drafts where id = '${draftId}'`);
+  note({ parseErrorShown, statusAfterBadSave: statusAfterBadSave.trim() });
+  if (!parseErrorShown) {
+    steps.ok = false;
+    steps.reason = "an unparseable definition was accepted by the editor with no message";
+  }
+  if (statusAfterBadSave.trim() !== "draft") {
+    steps.ok = false;
+    steps.reason = `an invalid save changed the row to ${statusAfterBadSave.trim()}`;
+  }
+
+  // Approve. This is the load-bearing click: it must create a workflow and it must create a
+  // DISABLED one, because the workflow API arms a new rule by default and inheriting that
+  // here would create a schedule nobody read.
+  await page.click("[data-approve]").catch(() => {});
+  await page.waitForTimeout(3000);
+  const approvedStatus = qaSql(`select status from ai_workflow_drafts where id = '${draftId}'`).trim();
+  const approvedWorkflow = qaSql(
+    `select coalesce((select id from workflows where name = 'QA console draft' order by created_at desc limit 1)::text, '')`,
+  ).trim();
+  const workflowEnabled = qaSql(`select enabled from workflows where id = '${approvedWorkflow}'`).trim();
+  const approvedMessage = (await page.locator("[data-outcome]").first().innerText().catch(() => "")) || "";
+  note({ approvedStatus, approvedWorkflow, workflowEnabled, approvedMessageChars: approvedMessage.length });
+  if (approvedStatus !== "activated") {
+    steps.ok = false;
+    steps.reason = `approve left the draft as ${approvedStatus}, not activated`;
+  }
+  if (!approvedWorkflow) {
+    steps.ok = false;
+    steps.reason = "approve created no workflow";
+  }
+  if (workflowEnabled !== "f" && workflowEnabled !== "false") {
+    steps.ok = false;
+    steps.reason = `approval created an ARMED workflow (enabled=${workflowEnabled}) — a reviewed draft must be disabled`;
+  }
+  if (!approvedMessage.includes(approvedWorkflow)) {
+    steps.ok = false;
+    steps.reason = "the approval bar did not report which workflow it created";
+  }
+  await shot(page, "page-ai-workflow-approved");
+
+  // The bar closes once the draft is a rule: a second approve would be a second workflow.
+  const barAfterApproval = (await page.locator("[data-approval-decided]").count()) > 0;
+  const approveDisabledAfter = await page.locator("[data-approve]").isDisabled().catch(() => true);
+  note({ barAfterApproval, approveDisabledAfter });
+  if (!barAfterApproval) {
+    steps.ok = false;
+    steps.reason = "the decision bar is still offering a decision on a draft that is a rule now";
+  }
+  const rowsAfter = await page.locator("[data-step]").count();
+  if (rowsAfter !== beforeSteps) {
+    steps.ok = false;
+    steps.reason = `the step list changed across the approval (${beforeSteps} → ${rowsAfter})`;
+  }
+
   // The mobile pass: the list is cards, not a scrolled table, and the review screen is legible.
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(900);

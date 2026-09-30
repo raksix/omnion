@@ -425,6 +425,17 @@ catalogue! {
     "ai.workflow_draft.failed", "workflows", Live,
     "A generation ran out of answers and the draft carries the reason.",
     [("draft_id", Uuid, req), ("reason", String, req)];
+    // The decision half of the console (slice 4). `approved` carries the workflow id because
+    // a receiver whose job is "tell the channel we now have a rule" cannot do it from a
+    // draft id alone; `rejected` carries the reason because "a draft was rejected" with
+    // nothing else is not actionable — it does not distinguish a duplicate idea from a
+    // dangerous one. Neither carries the prompt, the definition or a provider key.
+    "ai.workflow_draft.approved", "workflows", Live,
+    "A person approved a draft and it became a disabled workflow.",
+    [("draft_id", Uuid, req), ("workflow_id", Uuid, req)];
+    "ai.workflow_draft.rejected", "workflows", Live,
+    "A person rejected a draft and left a reason.",
+    [("draft_id", Uuid, req), ("reason", String, req)];
 
     // ---- Webhooks ------------------------------------------------------------------------------
     "webhook.endpoint.created", "webhooks", Live,
