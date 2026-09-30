@@ -6597,3 +6597,113 @@ export function fetchReliabilityRefusals(limit = 50): Promise<ReliabilityRefusal
     { cache: "no-store" },
   );
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// REQ-127 — the keyed-write ledger (slice 2)
+//
+// Every function here talks to `/api/v1/reliability/idempotency/*`. The read routes are the
+// caller's OWN keys: a key is `(scope, subject, key)`, so "the key abc" is one row per subject
+// and the screen shows the account that is signed in, never the platform's table.
+//
+// The detail route returns stored-response METADATA and never the body — that is the API's
+// contract, not a client choice, and the type below has no body field so that a future edit
+// cannot quietly add one.
+// ---------------------------------------------------------------------------------------------
+
+/** One key as the ledger lists it. `has_response` is not the same as being `completed`. */
+export interface IdempotencyKey {
+  key: string;
+  scope: string;
+  state: string;
+  replay_count: number;
+  expires_at: string;
+  completed_at: string | null;
+  has_response: boolean;
+}
+
+/** The list, with the two counts the header tiles read. */
+export interface IdempotencyKeys {
+  keys: IdempotencyKey[];
+  total: number;
+  in_progress: number;
+  state_filter: string | null;
+}
+
+/**
+ * One key's stored-response metadata.
+ *
+ * There is no `response_body` field, and that omission is the reason the request is phrased as
+ * "metadata": the store must never become a second request archive, so a read route that handed
+ * back a write's payload would be the archive.
+ */
+export interface IdempotencyKeyDetail {
+  key: string;
+  scope: string;
+  state: string;
+  method: string;
+  path: string;
+  response_status: number | null;
+  stored_body: boolean;
+  stored_body_bytes: number | null;
+  inline_cap_bytes: number;
+  response_body_ref: string | null;
+  replay_count: number;
+  original_request_id: string | null;
+  created_expires_at: string;
+  completed_at: string | null;
+  next_attempt: string;
+}
+
+/** The release answer: what happened, in the API's words, so the notice is not invented. */
+export interface IdempotencyReleased {
+  key: string;
+  scope: string;
+  state: string;
+  released: boolean;
+  message: string;
+}
+
+/**
+ * The caller's keys, newest first.
+ *
+ * `no-store`, and the state filter is a QUERY parameter rather than a client-side filter: the
+ * tile next to the list says how many are stuck, and that number has to come from the same
+ * filtered read the table is showing or the two disagree the moment the page is more than one
+ * window old.
+ */
+export function fetchIdempotencyKeys(options: {
+  state?: string | null;
+  limit?: number;
+} = {}): Promise<IdempotencyKeys> {
+  const params = new URLSearchParams();
+  if (options.state) params.set("state", options.state);
+  params.set("limit", String(options.limit ?? 100));
+  return request<IdempotencyKeys>(`/api/v1/reliability/idempotency?${params.toString()}`, {
+    cache: "no-store",
+  });
+}
+
+/** One key's metadata. Metadata only — the body is not on this surface. */
+export function fetchIdempotencyKey(key: string): Promise<IdempotencyKeyDetail> {
+  return request<IdempotencyKeyDetail>(
+    `/api/v1/reliability/idempotency/${encodeURIComponent(key)}`,
+    { cache: "no-store" },
+  );
+}
+
+/**
+ * Release a stuck `in_progress` key so the next attempt of that write runs again.
+ *
+ * The reason is not optional: the API refuses an empty one, and a release with nobody to explain
+ * it is a release nobody can audit. The screen asks for it in a dialog rather than defaulting it.
+ */
+export function releaseIdempotencyKey(
+  key: string,
+  reason: string,
+): Promise<IdempotencyReleased> {
+  return request<IdempotencyReleased>(
+    `/api/v1/reliability/idempotency/${encodeURIComponent(key)}`,
+    { method: "DELETE", body: JSON.stringify({ reason }) },
+  );
+}

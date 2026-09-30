@@ -111,6 +111,7 @@ pub mod notifications_admin;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod reliability_idempotency;
 pub mod reliability_limits;
 pub mod scim;
 pub mod search;
@@ -842,7 +843,30 @@ pub fn router(state: AppState) -> Router {
     let automations = get(automation::list_automations)
         .layer(guards::require(&state, "workflows.read"))
         .merge(
-            post(automation::create_automation).layer(guards::require(&state, "workflows.manage")),
+            post(automation::create_automation)
+                // The keyed layer goes FIRST, so it is the INNERMOST of the two: `.layer` wraps
+                // what is already built, so the LAST call is the OUTERMOST. This ordering is the
+                // acceptance criterion, not a style choice —
+                // "a keyed request that is refused by a permission check never consumes an
+                // idempotency key" is true here because the guard answers before the code that
+                // inserts a key row is ever reached. There is no rollback branch to be wrong, and
+                // a rollback would be a second bug: releasing the key on a refusal would let a
+                // refused request delete the WINNER's `in_progress` row, which is a different
+                // request running concurrently.
+                //
+                // The other half of the same ordering is what the keyed layer reads: it takes
+                // the subject from the `CurrentSession` the guard writes into the request's
+                // extensions. Outermost, that map is empty, the layer declines to claim, and the
+                // key silently does nothing — which is exactly what the first run of this walk
+                // showed, and is the reason the walk asserts the header rather than the 201.
+                .layer(crate::idempotency_middleware::require(&state))
+                // The guard is OUTSIDE the keyed layer, so it is the LAST `.layer` call and the
+                // first thing a request meets. `POST /automations` is also the FIRST endpoint to
+                // opt into the contract, chosen deliberately: it is a **job submission** — the
+                // request names the case itself — and the write a client is most likely to retry,
+                // because a dropped connection after a `201` and a `201` for a rule that already
+                // exists are the same end state and two different experiences.
+                .layer(guards::require(&state, "workflows.manage")),
         );
 
     let automation_catalogue =
@@ -1106,6 +1130,20 @@ pub fn router(state: AppState) -> Router {
                 .layer(guards::require(&state, "reliability.manage"))
                 .merge(
                     delete(reliability_limits::delete_policy)
+                        .layer(guards::require(&state, "reliability.manage")),
+                ),
+        )
+        .route(
+            "/reliability/idempotency",
+            get(reliability_idempotency::list_keys)
+                .layer(guards::require(&state, "reliability.read")),
+        )
+        .route(
+            "/reliability/idempotency/{key}",
+            get(reliability_idempotency::get_key)
+                .layer(guards::require(&state, "reliability.read"))
+                .merge(
+                    delete(reliability_idempotency::release_key)
                         .layer(guards::require(&state, "reliability.manage")),
                 ),
         )

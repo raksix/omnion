@@ -355,6 +355,40 @@ pub async fn release_stale(
     Ok(result.rows_affected() == 1)
 }
 
+/// Mark a key `failed` because its attempt finished without a storable answer.
+///
+/// **This is not an undo and it is not a success.** It is the honest record of a write whose
+/// response could not be stored — a body past [`INLINE_BODY_CAP`] with no object-store reference
+/// to find it by. The alternatives were both worse: storing a truncated body makes a replay a
+/// lie, and leaving the row `in_progress` makes the key permanently unusable because every
+/// retry is a `409` with nobody left to release it. `failed` is the only state that says "run it
+/// again", and the double execution that can follow is a client-visible retry rather than a
+/// silent `200` with half a body.
+///
+/// The predicate is `state = in_progress` for the same reason [`release_stale`] uses it: a key
+/// that already has a stored response must never be overwritten by a second, later attempt.
+pub async fn abandon(
+    pool: &PgPool,
+    scope: &str,
+    subject_id: &str,
+    key: &str,
+    now: OffsetDateTime,
+) -> Result<bool> {
+    let result = sqlx::query(
+        "update idempotency_keys set state = $4, completed_at = $5 \
+          where scope = $1 and subject_id = $2 and key = $3 and state = $6",
+    )
+    .bind(scope)
+    .bind(subject_id)
+    .bind(key)
+    .bind(IDEMPOTENCY_FAILED)
+    .bind(now)
+    .bind(IDEMPOTENCY_IN_PROGRESS)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 /// Delete every key past its lifetime.
 ///
 /// Returns how many rows it removed, so the retention job can log a real number rather than the
