@@ -68,6 +68,13 @@ reap
 
 deadline=$(( $(date +%s) + WAIT ))
 while :; do
+  # Reap on every turn, not once before the loop. The reaper is the only thing that notices a
+  # place whose holder died — and the one moment it cannot help is the one that matters: a pass
+  # that takes a place and is then killed leaves `QA_SLOTS` places owned by nobody, and a waiter
+  # that already ran `reap` before that death sits out the **whole** wait window on a semaphore
+  # nobody is using. Observed 2026-09-30: holder 3338826 dead, place 150 s old, one writer
+  # waiting with 60 minutes of wait left. `reap` is idempotent and costs one `stat` per place.
+  reap
   count="$(count_places)"
   if [ "$count" -lt "$MAX" ]; then
     : > "$mine"
