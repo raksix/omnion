@@ -320,6 +320,14 @@ pub fn days_past_due(due: Option<Date>, report_date: Date) -> Option<i64> {
 /// One invoice's row in the aging table.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgingRow {
+    /// The invoice's own id, so a screen can **link** the row to the invoice.
+    ///
+    /// The number is what a reader quotes and what the CSV prints, but it is not what the detail
+    /// route takes: `/accounting/invoices/{id}` addresses a uuid. A row that carried only the
+    /// number would force the screen to build a link to a 404, and a link that 404s is the one
+    /// thing this repository calls a dead button. The id is **not** in the CSV — the export's
+    /// column list is written out by hand, so adding a field here cannot change the file.
+    pub invoice_id: uuid::Uuid,
     /// The invoice number, as issued.
     pub number: String,
     /// The customer's name **as the invoice was issued under** — the invoice's own copy, not a
@@ -842,7 +850,7 @@ impl<'a> Reports<'a> {
         let (from, to) = self.bounds();
         let rows = sqlx::query(
             r#"
-            select number, coalesce(customer_name, '') as customer_name,
+            select id, number, coalesce(customer_name, '') as customer_name,
                    due_date,
                    grand_total::text as grand_total,
                    paid_total::text as paid_total,
@@ -869,6 +877,7 @@ impl<'a> Reports<'a> {
             .collect();
 
         for row in &rows {
+            let invoice_id: Uuid = row.get("id");
             let number: String = row.get("number");
             let customer_name: String = row.get("customer_name");
             let due: Option<Date> = row.get("due_date");
@@ -882,6 +891,7 @@ impl<'a> Reports<'a> {
                 slot.2 = slot.2.plus(outstanding);
             }
             out_rows.push(AgingRow {
+                invoice_id,
                 number,
                 customer_name,
                 due_date: due.map(|d| dates::to_wire(&d)),
@@ -1277,6 +1287,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, o)| AgingRow {
+                invoice_id: Uuid::nil(),
                 number: format!("INV-{i}"),
                 customer_name: "Acme".into(),
                 due_date: None,
