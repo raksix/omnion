@@ -1142,9 +1142,14 @@ pub async fn list_payments(
     // and are numbered by their own position, so a filter added here cannot shift a `$n` that is
     // already written further down.
     let mut query = sqlx::QueryBuilder::<Postgres>::new(
+        // `p.created_by as recorded_by` — the alias is load-bearing. `from_row` reads
+        // `recorded_by`, `row.get` is a *runtime* lookup, and the column is `created_by` because
+        // migration 0167 wrote it that way. Without the alias the list 500s with
+        // `ColumnNotFound("recorded_by")` on every call, which is why it is spelled here rather
+        // than read under two names: reading both is a panic, not a compatibility layer.
         "select p.id, p.number, p.customer_name, p.paid_on, p.method, p.amount::text as amount, \
-                p.currency, p.reference, p.journal_entry_id, p.reversed_at, p.created_by, \
-                p.created_by, p.created_at, \
+                p.currency, p.reference, p.journal_entry_id, p.reversed_at, \
+                p.created_by as recorded_by, p.created_at, \
                 coalesce((select sum(a.amount)::text from accounting_payment_allocations a \
                           where a.payment_id = p.id), '0') as allocated \
          from accounting_payments p where p.organization_id = ",
