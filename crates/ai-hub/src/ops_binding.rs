@@ -702,4 +702,89 @@ mod tests {
         assert!(preview.idempotent, "a preview changes nothing");
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // The ops-tool criterion: "ops tools call the platform's own service layer: a deployment tool
+    // cannot be invoked with a raw command, and `logs.read` is scoped to the caller's organization."
+    //
+    // Two claims, and they are claims about DIFFERENT layers, so they are proved in different
+    // layers. The first is about the *call shape* — a raw command has to be refused before any
+    // service sees it, which is the only place the refusal can be cheap. The second is about
+    // tenancy, and tenancy is a property of the row a query returns, not of the tool table: the
+    // table carries no organization at all. Asserting the scope from the registry would be
+    // asserting a string in the same file the tool is declared in.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A tool that reaches the installation must be addressed by the thing it operates ON, never
+    /// by a string the caller supplies.
+    ///
+    /// The mechanism is the schema's own `additionalProperties: false` — which every tool ships
+    /// — so this is not a new rule being invented here, it is a rule that already exists being
+    /// held to. The raw shape an attacker or a confused model reaches for is
+    /// `{"site_id": "...", "command": "rm -rf /"}`; what matters is that the refusal names the
+    /// field it refused, because a tool that said only "invalid arguments" would be a tool whose
+    /// schema a model cannot learn from.
+    #[test]
+    fn a_deployment_tool_cannot_be_invoked_with_a_raw_command() {
+        // Every one of the four install-touching tools, not just the deploy: a raw shell escape
+        // is equally available on a restart or a preview if any of them accepted one.
+        const INSTALL_TOOLS: &[&str] = &[
+            "deployment.deploy",
+            "deployment.restart",
+            "deployment.preview",
+            "deployment.read",
+        ];
+        for key in INSTALL_TOOLS {
+            let spec = crate::catalogue::find(key)
+                .unwrap_or_else(|| panic!("{key} is named by this test and must be a real tool"));
+            for field in ["command", "shell", "script", "exec", "cmd", "args"] {
+                let call = serde_json::json!({
+                    "site_id": "1a2b3c4d-0000-4000-8000-000000000000",
+                    field: "rm -rf /",
+                });
+                let errors = crate::schema::validate_all(&(spec.input_schema)(), &call);
+                assert!(
+                    !errors.is_empty(),
+                    "{key} accepted a `{field}` argument. An install tool addressed by a raw \
+                     command string is a shell escape wearing a tool's clothes — the arguments \
+                     must name a site, not a command."
+                );
+                assert!(
+                    errors.iter().any(|e| e.message.contains(field)),
+                    "{key} refused a `{field}` argument but never named it, so a caller cannot \
+                     tell which field was wrong: {errors:?}"
+                );
+            }
+        }
+    }
+
+    /// The same rule stated once for the WHOLE catalogue, so the next ops tool added inherits it.
+    ///
+    /// A per-tool list is a list that goes stale: the fourth tool added next year is not on it.
+    /// The predicate is the class instead, and the class is the thing the request groups by —
+    /// `ops` is defined in the request as the tools that touch the installation.
+    #[test]
+    fn no_ops_tool_accepts_a_command_shaped_argument() {
+        for spec in specs() {
+            if spec.class != "ops" {
+                continue;
+            }
+            // `input_schema` is a thunk (`fn() -> Value`) so the table is const-constructible;
+            // calling it is how the real shape is read, not re-deriving the wrapper's field name.
+            let schema_value = (spec.input_schema)();
+            let properties = schema_value
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{} has no properties object", spec.key));
+            for shell_field in ["command", "shell", "script", "exec", "cmd", "args"] {
+                assert!(
+                    !properties.contains_key(shell_field),
+                    "{} is an ops tool and declares a `{shell_field}` argument. Ops tools are \
+                     addressed by the object they act on; a field carrying a command string is a \
+                     way around the service layer.",
+                    spec.key
+                );
+            }
+        }
+    }
+
 }
