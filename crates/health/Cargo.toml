@@ -1,0 +1,33 @@
+[package]
+name = "omnion-health"
+description = "Omnion system health: the probe registry, samples and incidents the panel reports on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Host metrics are read from the kernel's own interfaces, so this crate needs
+# `statvfs` for the disk rows. `libc` is already in the lock file (every transitive
+# dependency of every crate in the workspace pulls it in); naming it here makes the
+# edge explicit instead of leaving the disk probe depending on somebody else's
+# dependency graph. The health crate is the only place that reads a filesystem's
+# block count, and it is deliberately the only crate allowed to do so.
+libc = "0.2"
+# The storage probe speaks the platform's own abstraction, never a vendor SDK: a
+# deployment pointed at a directory has to be probeable by the same code path as one
+# pointed at S3, or the storage row would only ever be honest for half the installs.
+omnion-core = { path = "../core" }
+omnion-storage = { path = "../storage" }
+# `redis` only for `INFO`'s reply type. The PING itself goes through `omnion-core`'s
+# own handle, because that is the handle the request path uses and a probe must not
+# open a second connection to the dependency it is measuring.
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

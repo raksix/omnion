@@ -4872,6 +4872,37 @@ async function runNotificationsDepth(page, report) {
   await page.waitForTimeout(1200);
   steps.keyboardOpenedDrawer = (await page.locator("[data-notification-drawer]").count()) > 0;
   await shot(page, "page-notifications-drawer");
+
+  // The drawer's delivery rows. This is the section that makes "it is in my panel but the
+  // e-mail never arrived" a thing a reader can see rather than infer, and it has two states that
+  // are both correct on a fresh database — so the assertion is deliberately about the SHAPE:
+  // either a list of channel rows, or the honest sentence that nothing has been tried. What it
+  // refuses to accept is a section heading with nothing under it, which is what a screen that
+  // renders the heading before the read returns looks like, and which reads as a broken panel.
+  if (steps.keyboardOpenedDrawer) {
+    const drawerDelivery = page.locator("[data-notification-drawer] [data-notification-deliveries]");
+    steps.drawerHasDeliverySection = (await drawerDelivery.count()) > 0;
+    const rows = await page.locator("[data-notification-drawer] [data-notification-delivery]").count();
+    const empty = await page
+      .locator("[data-notification-drawer] [data-notification-deliveries-empty]")
+      .count();
+    steps.drawerDeliveryRows = rows;
+    steps.drawerDeliveryEmptyState = empty > 0;
+    // A channel the platform has five of: the reader must never see a raw database value.
+    steps.drawerDeliveryNamesChannelsInProse =
+      rows === 0 ||
+      (await page
+        .locator("[data-notification-drawer] [data-notification-delivery]")
+        .allInnerTexts()
+        .catch(() => []))
+        .every((text) => !/\b(in_app|web_push)\b/.test(text));
+  } else {
+    steps.drawerHasDeliverySection = "the drawer never opened, so the section cannot be asserted";
+    steps.drawerDeliveryRows = "no drawer";
+    steps.drawerDeliveryEmptyState = "no drawer";
+    steps.drawerDeliveryNamesChannelsInProse = "no drawer";
+  }
+
   await page.keyboard.press("Escape");
   await page.waitForTimeout(600);
   steps.escapeClosedDrawer = (await page.locator("[data-notification-drawer]").count()) === 0;
@@ -6446,6 +6477,213 @@ async function runSecurityDepth(page, report) {
   return { ok: true, steps };
 }
 
+/**
+ * The system health centre, driven end to end (REQ-014, slice 1).
+ *
+ * The assertion that matters is the **row count**, and it is asserted as a count
+ * rather than as content. The request names seven services and the registry adds
+ * the host, so the panel must show eight rows whether or not any of them has ever
+ * been probed. A screen that listed only the services it received would render a
+ * fresh database as *empty* and a broken one as *short* — and both of those read
+ * to an operator as "there is nothing to report here", which is the single most
+ * expensive thing this screen can show.
+ *
+ * The second assertion is the state's own honesty: every row must carry a state
+ * out of the closed set, and a row that has never been probed must say `unknown`
+ * rather than `healthy`. A `healthy` badge on a row nothing checked is a claim
+ * the product made up, and it is asserted against here rather than trusted to the
+ * server.
+ */
+async function runHealthDepth(page, report) {
+  const steps = {};
+  const note = (key, value) => {
+    steps[key] = value;
+    record({ page: "health", action: "health-depth", step: key, ...value });
+  };
+
+  await page.goto(`${URL_ADMIN}/health`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("[data-health-screen]", { timeout: 20000 }).catch(() => {});
+  const ready = (await page.locator('[data-health-screen="ready"]').count()) > 0;
+  note({ step: "screen-ready", ready });
+  if (!ready) {
+    return { ok: false, reason: "/health did not finish loading", steps };
+  }
+
+  // ---- Every registered service is a row ------------------------------------------------------
+  const rows = await page.locator("[data-health-service]").count();
+  note({ step: "service-rows", rows });
+  if (rows < 8) {
+    note({
+      step: "registry-too-short",
+      rows,
+      reason: "fewer than eight service rows rendered — a missing row reads as 'nothing to report'",
+    });
+  }
+
+  // Every row's state is one of the four words, and it is on the element itself so
+  // the assertion does not depend on reading the badge's text.
+  const states = await page.$$eval("[data-health-service]", (nodes) =>
+    nodes.map((node) => node.getAttribute("data-health-state")),
+  );
+  const legal = new Set(["healthy", "degraded", "down", "unknown"]);
+  const illegal = states.filter((state) => !legal.has(state));
+  note({ step: "states", tally: states.reduce((acc, s) => ({ ...acc, [s]: (acc[s] || 0) + 1 }), {}) });
+  if (illegal.length > 0) {
+    note({ step: "state-outside-vocabulary", illegal });
+  }
+  if (states.length !== rows) {
+    note({ step: "state-missing", badges: states.length, rows });
+  }
+
+  // The banner is the server's own sentence and it must be non-empty. A client that
+  // recomputed the worst state would disagree with the runner before the first run.
+  const banner = await page
+    .locator("[data-health-banner]")
+    .first()
+    .getAttribute("data-health-banner")
+    .catch(() => null);
+  const headline = (await page.locator("[data-health-banner]").first().innerText().catch(() => "")).trim();
+  note({ step: "banner", banner, hasHeadline: headline.length > 0 });
+  if (!banner || headline.length === 0) {
+    note({ step: "banner-missing", reason: "the banner rendered no state or no sentence" });
+  }
+
+  // ---- A row's own checks, behind the disclosure ------------------------------------------------
+  // Clicked rather than merely counted: a disclosure that renders its rows but does
+  // not open is a dead control, and only a click proves it opens.
+  const toggle = page.locator("[data-health-checks-toggle]").first();
+  const hasToggle = (await toggle.count()) > 0;
+  note({ step: "checks-toggle-present", hasToggle });
+  if (hasToggle) {
+    await toggle.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    const checkRows = await page.locator("[data-health-checks] li").count();
+    note({ step: "checks-opened", checkRows });
+    if (checkRows === 0) {
+      note({ step: "checks-empty-after-open", reason: "the disclosure opened with no checks in it" });
+    }
+  }
+  await shot(page, "health-overview-checks");
+
+  // ---- "Run all checks" -------------------------------------------------------------------------
+  // The button must not blank the screen, and the rows must survive the run: a run
+  // that answers 200 and leaves eight rows is the whole criterion, and a run that
+  // left the screen empty would be the expensive failure.
+  const before = await page.locator("[data-health-service]").count();
+  await page.locator("[data-health-run]").click({ timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(3000);
+  const after = await page.locator("[data-health-service]").count();
+  const runError = await page.locator("[data-health-error]").count();
+  note({ step: "run-all-checks", before, after, errorShown: runError > 0 });
+  if (after !== before) {
+    note({
+      step: "run-changed-row-count",
+      before,
+      after,
+      reason: "a manual run must not change how many services there are",
+    });
+  }
+  await shot(page, "health-overview-after-run");
+
+  // ---- The auto-refresh control is real --------------------------------------------------------
+  const refreshValue = await page
+    .locator("[data-health-auto-refresh]")
+    .first()
+    .inputValue()
+    .catch(() => null);
+  note({ step: "auto-refresh", refreshValue });
+  if (refreshValue === null) {
+    note({ step: "auto-refresh-missing", reason: "the interval selector rendered nothing" });
+  }
+
+  // ---- The metric cards -------------------------------------------------------------------------
+  // `NaN` and `Infinity` as *text* are named in the request's visual check, and they
+  // are the failure a division by a zero total produces. Reading the rendered text is
+  // the only assertion that catches it: the DOM value would still be a number.
+  const cardText = (await page.locator("[data-health-metric]").allInnerTexts()).join(" ");
+  note({ step: "metric-cards", hasCards: cardText.trim().length > 0 });
+  if (/NaN|Infinity|undefined/i.test(cardText)) {
+    note({ step: "non-finite-text", reason: "a metric card rendered NaN, Infinity or undefined" });
+  }
+  const dashOnly = (await page.locator("[data-health-service]").allInnerTexts()).every((text) =>
+    !/NaN|Infinity|undefined/i.test(text),
+  );
+  if (!dashOnly) {
+    note({ step: "non-finite-text-in-rows", reason: "a service row rendered a non-finite number" });
+  }
+
+  // ---- The service detail link is real ----------------------------------------------------------
+  // The row's href is rendered by the server; clicking it proves the detail screen
+  // exists rather than 404-ing, which is the dead-affordance the request forbids.
+  const detailLink = page.locator("[data-health-service-link]").first();
+  const href = await detailLink.getAttribute("href").catch(() => null);
+  note({ step: "detail-href", href });
+  if (!href || !href.startsWith("/health/services/")) {
+    note({ step: "detail-href-missing", href });
+  } else {
+    await detailLink.click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    const landed = page.url().includes("/health/services/");
+    note({ step: "detail-opened", landed, url: page.url() });
+    if (!landed) {
+      note({ step: "detail-did-not-open", url: page.url() });
+    } else {
+      // Landing on the URL is half the assertion. The screen has to have *rendered*:
+      // a Next.js route that resolves but throws in the client still lands here, and
+      // the operator gets a blank page behind a working link. Waiting for the
+      // ready marker is what separates the two, and it is the only part that catches
+      // the common "the API is fine, the component throws" failure.
+      await page
+        .waitForSelector('[data-health-detail-screen="ready"]', { timeout: 15000 })
+        .catch(() => {});
+      const detailReady = (
+        await page.locator('[data-health-detail-screen="ready"]').count()
+      ) > 0;
+      note({ step: "detail-screen-rendered", detailReady });
+      if (!detailReady) {
+        const which = await page
+          .locator("[data-health-detail-screen]")
+          .first()
+          .getAttribute("data-health-detail-screen")
+          .catch(() => null);
+        note({
+          step: "detail-screen-missing",
+          which,
+          reason: "the detail route resolved but never rendered a state marker",
+        });
+      } else {
+        // The drill-down's own content: a checks table (or an honest "not probed
+        // yet" sentence) and the back link that proves the route has an exit.
+        const checkCells = await page.locator("[data-health-check]").count();
+        const noChecks = await page.locator("[data-health-detail-no-checks]").count();
+        const metrics = await page.locator("[data-health-detail-metric]").count();
+        const noMetrics = await page.locator("[data-health-detail-no-metrics]").count();
+        note({ step: "detail-content", checkCells, noChecks, metrics, noMetrics });
+        if (checkCells === 0 && noChecks === 0) {
+          note({
+            step: "detail-no-checks-and-no-explanation",
+            reason: "neither a check row nor the 'not probed yet' sentence rendered",
+          });
+        }
+        if (metrics === 0 && noMetrics === 0) {
+          note({
+            step: "detail-no-metrics-and-no-explanation",
+            reason: "neither a metric row nor the 'no samples yet' sentence rendered",
+          });
+        }
+        await shot(page, "health-service-detail");
+        // Back to the overview, so the next leg does not start from the detail page.
+        await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page
+          .waitForSelector("[data-health-service]", { timeout: 15000 })
+          .catch(() => {});
+      }
+    }
+  }
+
+  report.health = { steps };
+}
+
 async function runRetentionDepth(page, report) {
   const steps = {};
   const before = await page
@@ -7134,6 +7372,17 @@ async function main() {
     { path: "/security/headers", name: "security-headers" },
     { path: "/security/rate-limits", name: "security-rate-limits" },
     { path: "/security/sign-in-protection", name: "security-sign-in-protection" },
+    // The system health centre (REQ-014, slice 1). Walked here and driven by
+    // `runHealthDepth` below, which reads the eight service rows, opens a row's
+    // checks and presses "Run all checks". "No untested screen" means no
+    // untested screen: a status screen that has never been rendered by anything
+    // is the one screen whose whole job is to be believed.
+    { path: "/health", name: "health-overview" },
+    // The drill-down is a *different screen* and is walked as one, for the reason the
+    // definition of done spells out: every row on the overview links here, so a detail
+    // page that was never rendered is eight dead affordances. `runHealthDepth` clicks
+    // through to it and asserts the landing URL, which is what proves the link works.
+    { path: "/health/services/redis", name: "health-service-detail" },
   ];
   // `--only` narrows the route list; the default walks every entry above, unchanged.
   const walkedRoutes = ONLY_ALL ? routes : routes.filter((route) => wants(route.name));
@@ -7337,6 +7586,16 @@ async function main() {
     log(`security: ${JSON.stringify(report.security)}`);
   }
 
+  // The system health centre (REQ-014, slice 1). It runs after the security pass
+  // because both screens run live probes, and running them in the other order
+  // would have the health screen's own PostgreSQL probe read the connection pool
+  // the security scan is still holding.
+  if (wants("health-overview")) {
+    matchedOnly.add("health-overview");
+    report.health = await runDepthPass("health", () => runHealthDepth(page, report));
+    log(`health: ${JSON.stringify(report.health)}`);
+  }
+
   // The preferences pass (REQ-021, slice 2). It runs immediately after the list pass and
   // restores the row it touched, so a later pass in the same run sees the defaults rather
   // than whatever this one left behind.
@@ -7455,7 +7714,7 @@ async function main() {
   }
   // A `mobile:` spelling names the same screen's phone layout, so the roll-up must accept it
   // as a known name instead of reporting it as unmatched.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been

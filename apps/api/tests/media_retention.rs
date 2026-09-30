@@ -1429,3 +1429,123 @@ async fn the_past_restore_window_counts_files_that_are_actually_past_it() {
         "a file deleted seconds ago has not aged out"
     );
 }
+
+/// The most destructive thing this module does leaves a record (REQ-010, slice 4).
+///
+/// The sweep is the only purge that runs **unattended**, and it is the only purge that used to
+/// leave nothing behind: `media.retention_applied` was emitted onto the event bus and nowhere
+/// else, so an event an operator never subscribed to was standing in for a record. The hand-emptied
+/// trash next door wrote `media.trash_emptied` for the same deletion, which is the shape of the
+/// defect — the destructive path with a person at the keyboard was audited and the one without
+/// was not.
+///
+/// This walk drives the runner's own path (`run_once` with no actor) rather than the HTTP route,
+/// because the HTTP route always has a signed-in account and could never reach the system-actor
+/// branch. Nothing else covered that branch at all.
+#[tokio::test]
+async fn an_unattended_sweep_audits_itself_as_the_platform() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.sites[0];
+    let editor = fixture.editor_token().await;
+
+    // The window is tightened first, exactly as the other sweep walk does. This is the fixture
+    // lesson and it is expensive to learn twice: the seeded default keeps a file for **30** days
+    // and only purges it two days after that, so ageing a deletion 40 days reaches the *trash*
+    // window and leaves the purge window 30 days behind. The first run of this walk read `purged:
+    // 0` and the assertion blamed the audit entry that came after it.
+    let policy: Value = call(
+        &fixture.state,
+        request(Method::GET, &retention_uri(site), Some(&editor), None),
+    )
+    .await
+    .body;
+    let policy_id =
+        Uuid::parse_str(policy["policies"][0]["id"].as_str().expect("an id")).expect("a uuid");
+    let tightened = call(
+        &fixture.state,
+        request(
+            Method::PUT,
+            &policy_uri(site, policy_id),
+            Some(&editor),
+            Some(json!({ "keep_versions_days": 1, "trash_days": 1, "purge_after_days": 2 })),
+        ),
+    )
+    .await;
+    assert_eq!(tightened.status, StatusCode::OK, "{}", tightened.body);
+
+    // A file past its window, and nothing else to sweep — a run that removes something is the
+    // only kind whose audit row can be read back.
+    let doomed = upload(&fixture.state, &editor, site, "swept.txt", b"goodbye").await;
+    let deleted = call(
+        &fixture.state,
+        request(Method::DELETE, &file_uri(site, doomed), Some(&editor), None),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::OK, "{}", deleted.body);
+    fixture.age_trash(doomed, 10).await;
+
+    // Nobody is signed in. This is the nightly worker.
+    let outcome = routes::media_retention::run_once(&fixture.state, site, None)
+        .await
+        .expect("an unattended sweep must run");
+    assert_eq!(
+        outcome.run.purged, 1,
+        "the file past its window is the one the sweep takes"
+    );
+
+    // The record, read out of PostgreSQL. Not a response field: a response can report a write it
+    // did not make.
+    let rows: Vec<(String, Option<String>, Option<uuid::Uuid>, String, Value)> = sqlx::query_as(
+        "select action, target_type, actor_user_id, actor_type::text, metadata \
+         from audit_log where action = 'media.retention_applied' and organization_id = $1",
+    )
+    .bind(fixture.organizations[0])
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the audit log must read");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one entry for the one run that removed something: {rows:?}"
+    );
+
+    let (action, target_type, actor, actor_type, metadata) = &rows[0];
+    assert_eq!(action, "media.retention_applied");
+    assert_eq!(
+        target_type.as_deref(),
+        Some("media_retention_run"),
+        "the target is the run, so the entry can be found from the run log"
+    );
+    // The whole point of the system actor: nobody asked for this deletion, so nobody is named.
+    assert!(
+        actor.is_none(),
+        "an unattended purge must not put a person's name on it: {actor:?}"
+    );
+    assert_eq!(actor_type, "system");
+    assert_eq!(metadata["purged"], json!(1), "and it says what it removed");
+    assert_eq!(
+        metadata["run_id"].as_str(),
+        Some(outcome.run_id.to_string().as_str()),
+        "the entry and the run log talk about the same run"
+    );
+
+    // A run that finds nothing writes nothing. Without this, a nightly worker would append an
+    // audit row every few minutes forever and "the log" would stop meaning anything.
+    let quiet = routes::media_retention::run_once(&fixture.state, site, None)
+        .await
+        .expect("a second sweep must still run");
+    assert_eq!(quiet.run.purged, 0, "there is nothing left to take");
+    let after: i64 = sqlx::query_scalar(
+        "select count(*) from audit_log where action = 'media.retention_applied' and organization_id = $1",
+    )
+    .bind(fixture.organizations[0])
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit count must read");
+    assert_eq!(
+        after, 1,
+        "a run that removed nothing leaves no entry, or the log is just a heartbeat"
+    );
+}

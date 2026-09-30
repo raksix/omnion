@@ -1,6 +1,6 @@
 # REQ-014 — System Health
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** core + admin UI
+> **Status:** in-progress (slice 1: probes + overview, `/health` + `/health/services/{key}`) · **Captured:** 2026-09-25 · **Layer:** core + admin UI
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request
@@ -94,23 +94,27 @@ Webhook relevance: `health.service.degraded` and `health.service.recovered` are 
 
 ### Acceptance criteria
 
-- [ ] `crates/health` exists with a probe registry and one probe per dependency, unit-tested.
-- [ ] `database/migrations/0014_system_health.sql` applies on fresh and populated databases.
-- [ ] `/health` shows all seven services from the request sketch with real states, not constants.
+- [x] `crates/health` exists with a probe registry and one probe per dependency, unit-tested.
+- [x] `database/migrations/0014_system_health.sql` applies on fresh and populated databases.
+      → shipped as `0188_system_health.sql`: the number is a shared namespace and 0188 is the
+      union high-water across every worktree, not the next free slot on this branch.
+- [x] `/health` shows all seven services from the request sketch with real states, not constants.
 - [ ] Stopping Redis flips its row to `down` within one interval and restores on recovery.
-- [ ] Worker counts come from heartbeat rows; stopping a worker changes `4/4` to `3/4` and names it.
-- [ ] CPU, memory and disk values match the host within a small tolerance and update on refresh.
-- [ ] Auto-refresh (15 s) visibly updates timestamps and values without a manual reload.
-- [ ] "Run all checks" records a new sample set and reports per-probe failures instead of failing whole.
-- [ ] Service detail lists each probe with latency and message and charts the last 24 h.
+      → the `down` leg is proven by walk (an unreachable Redis is `down`, and the row survives);
+      the "restores on recovery" leg needs a container this tick did not stop. Slice 3.
+- [x] Worker counts come from heartbeat rows; stopping a worker changes `4/4` to `3/4` and names it.
+- [x] CPU, memory and disk values match the host within a small tolerance and update on refresh.
+- [x] Auto-refresh (15 s) visibly updates timestamps and values without a manual reload.
+- [x] "Run all checks" records a new sample set and reports per-probe failures instead of failing whole.
+- [x] Service detail lists each probe with latency and message and charts the last 24 h.
 - [ ] A state transition opens an incident; recovery resolves it with a duration.
 - [ ] Acknowledging an incident stores the actor, the note and the timestamp.
 - [ ] A maintenance window suppresses incident creation while the state still shows degraded.
 - [ ] Thresholds save and a breach beyond the critical limit emits `health.threshold.breached` once.
 - [ ] Out-of-range settings (interval 0, heartbeat 0, warn above critical) are refused with messages.
 - [ ] Metric ranges (1 h, 24 h, 7 d) return real aggregates and CSV export matches the range shown.
-- [ ] Sample retention prunes raw samples older than 30 days without touching incidents.
-- [ ] Reads require `health.read`; run-checks and settings require `health.manage` (`403` otherwise).
+- [x] Sample retention prunes raw samples older than 30 days without touching incidents.
+- [x] Reads require `health.read`; run-checks and settings require `health.manage` (`403` otherwise).
 - [ ] Walkthrough passes with zero high findings.
 
 ### QA plan
