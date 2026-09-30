@@ -586,13 +586,29 @@ async fn a_backup_of_all_five_parts_writes_five_artifacts_and_lands_on_succeeded
     )
     .await;
     assert_eq!(cards.status, StatusCode::OK);
-    // `OffsetDateTime` serialises as a tuple, not an RFC 3339 string, so the card is a JSON
-    // array — an assertion written for the string form fails on a working endpoint, which is
-    // worse than no assertion: it trains the reader to distrust the test rather than the code.
+    // **A string, and that is the assertion's whole point.** This line used to demand a
+    // nine-element array, with a comment explaining that `OffsetDateTime` serialises as a
+    // tuple — which is true of `time` only when its `serde-human-readable` feature is off, and
+    // the workspace did not enable it. So it documented the defect as if it were the contract,
+    // and `8322d753` fixed the endpoint. A test that pins the *bug* is worse than no test: it
+    // is a green that tells the next reader to distrust the code rather than the test, and it
+    // makes the fix look like a regression.
+    //
+    // The panel's `formatTimestamp` returns an em dash for anything it cannot parse, and an
+    // em dash is also what it renders for a value that has not happened yet — a loss and a
+    // designed answer, pixel-identical. Asserting the **JSON type** is the only way to tell
+    // them apart, so the type is what is asserted, and the value is checked for the shape
+    // rather than merely for existing.
+    let stamp = &cards.body["last_successful_at"];
     assert!(
-        cards.body["last_successful_at"].is_array(),
-        "the card carries a timestamp, whatever shape it serialises in: {}",
-        cards.body["last_successful_at"]
+        stamp.is_string(),
+        "the card must carry an RFC 3339 string, not {}: {stamp}",
+        stamp
+    );
+    let stamp = stamp.as_str().expect("checked above");
+    assert!(
+        stamp.len() >= 20 && stamp.ends_with('Z') && stamp.contains('T'),
+        "the card must carry a timestamp whatever shape it serialises in: {stamp}"
     );
     assert!(
         cards.body["last_successful_age_seconds"].is_number(),
@@ -3927,6 +3943,96 @@ async fn the_worker_restores_a_queued_job_and_skips_one_that_was_cancelled() {
         cancel_requested,
         "the platform did ask — the row must say so rather than claim a restore that stopped \
          itself"
+    );
+
+    // --- 3b. A job the worker DIED on is reclaimed, not left blocking the run ----------------
+    // The sweep originally covered only `queued`, and this is the state that made that a
+    // product bug rather than an omission: a worker killed mid-restore leaves a `running`
+    // row, and **nothing else can ever move it** — the queue read is the only thing that
+    // advances a job, a dead worker is by definition not going to, and the partial unique
+    // index refuses a new restore of that run while the row stands. One deploy in the middle
+    // of a restore and that run could not be restored again by anybody.
+    //
+    // It is `failed` and NOT `aborted`, and that distinction is the whole assertion: a
+    // claimed job has already taken its safety backup and may have written objects, so
+    // "nothing was written" would be a lie. `failed` is the state that means "it began and
+    // nobody finished it", and the schema allows it only for a job with a start.
+    let orphaned = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    let orphaned_id =
+        Uuid::parse_str(orphaned.body["id"].as_str().expect("a job id")).expect("a uuid");
+    // Claim it the way a worker does, then age it: this is a restore that was interrupted,
+    // not one that nobody picked up.
+    omnion_backup::restore_jobs::claim_restore_job(fixture.db.pool(), orphaned_id)
+        .await
+        .expect("the job must be claimable");
+    sqlx::query(
+        "update backup_restore_jobs set created_at = now() - interval '3 hours' where id = $1",
+    )
+    .bind(orphaned_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the job must be backdatable");
+
+    omnion_api::restore_job_runner::tick(&fixture.state)
+        .await
+        .expect("the restore tick must answer");
+    let (status, _, started) = job_status(fixture.db.pool(), orphaned_id).await;
+    assert_eq!(
+        status, "failed",
+        "a job whose worker died must be reclaimed, not left running for ever: {status}"
+    );
+    assert!(
+        started.is_some(),
+        "a failed restore is one that began, so the start must survive: {started:?}"
+    );
+    let reason: Option<String> =
+        sqlx::query_scalar("select error from backup_restore_jobs where id = $1")
+            .bind(orphaned_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the job must read");
+    let reason = reason.unwrap_or_default();
+    assert!(
+        reason.contains("NOT known"),
+        "the reason must say what is unknown rather than claim nothing was written: {reason}"
+    );
+
+    // And the run is restorable again, which is the point of clearing it. The job this
+    // creates is **cancelled at once**, because the walk still has a step after this one and
+    // the partial unique index refuses a second live job for the same run — a leftover of a
+    // walk's own making blocking the walk's next step is a self-inflicted failure that reads
+    // exactly like a product bug.
+    let again = queue_restore(
+        &fixture.state,
+        &restorer_token,
+        &restorer_csrf,
+        run_id,
+        &["media"],
+        &phrase,
+    )
+    .await;
+    assert_eq!(
+        again.status,
+        StatusCode::ACCEPTED,
+        "a run whose interrupted restore was reclaimed must be restorable again, or one crash \
+         costs the run its restore point for ever: {}",
+        again.body
+    );
+    let again_id = Uuid::parse_str(again.body["id"].as_str().expect("a job id")).expect("a uuid");
+    let released = cancel_restore(&fixture.state, &restorer_token, &restorer_csrf, again_id).await;
+    assert_eq!(
+        released.status,
+        StatusCode::OK,
+        "the walk's own leftover must be cancellable: {}",
+        released.body
     );
 
     // --- 4. A job queued with a phrase that is not this run's is refused, not run ------------
