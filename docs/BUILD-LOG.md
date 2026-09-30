@@ -7901,3 +7901,76 @@ its own timeout has verified nothing about the pages after the cut.
 "the slot is held" were the wait; the real blocker was my own 1500 s). (b) The `partial`-run
 UI — the status-card criterion is closed by this tick's fix, but it wants a walkthrough tick
 rather than a test alone. (c) Slice 4, encryption.
+
+## Tick 37 · REQ-133 slice 8 — global search, scoped to the caller's projects
+
+Acceptance 5 ("Global search returns only resources the caller may see, scoped to their projects,
+verified with two accounts") had **no code behind it anywhere on this branch**. `grep -rn project
+crates/search/src/` returned nothing; `search_documents` has carried `organization_id` and
+`site_id` since migration 0012 and never a project; the query narrowed by provider and
+organization only. Two people in one organization, in different projects, both passed every check
+the query made — and organization-only is *exactly the filter that was already there*, which is
+why no single-account test could ever have told the difference.
+
+**The finding that shaped the slice.** I wrote the project clause first and then went looking for
+rows it could narrow, and there were none: not one provider indexed a project-scoped entity — the
+`logs` provider deliberately narrows to audit entries that point at a **page, media file or
+site**, because "a row which cannot go somewhere is worse than a row that is not there". So the
+clause alone would have been the greenest possible lie: a filter matching nothing, every assertion
+passing, nothing scoped. The slice therefore needed a **provider**, not only a filter. `workflows`
+registers (`workflows.read`) and its upsert carries `project_id`; without it the gate's first
+assertion — "the indexed row must carry its project" — has nothing to read back.
+
+**Design decisions that decide which failure a bug produces:**
+
+* `project_ids: Option<Vec<Uuid>>` where `None` means *no filtering* (instance administrator) and
+  `Some(vec![])` means *member of no project*. Those are different answers and conflating them is
+  how a scoping rule gets un-applied by accident; `visible_project_filter` already draws the line
+  and I reused it rather than writing a second opinion of "admin".
+* The read clause keeps a null arm (`d.project_id is null or …`). Four of the eight providers
+  belong to no project, so dropping it empties the results screen of everything but automations —
+  which reads as an outage, not as a scoping fix. The gate asserts a **page** survives an *empty*
+  project scope for exactly this reason: the other eight tests only ever ask about workflows and
+  would all stay green through that outage.
+* Migration `0180` indexes partially (`where project_id is not null`), because the four non-project
+  providers write null on every row and an index over mostly-null columns is a write amplifier on
+  the engine's hottest table.
+* The `ON CONFLICT` tail refreshes `project_id`, so a workflow **moved** between projects stops
+  answering for the membership it lost. Asserted directly — the move surface and the index have to
+  agree or the move leaks.
+
+**Two statements, one rule.** The palette's suggestion query (`query::suggest`) is a *separate*
+SQL statement from the results screen. Scoping only `push_conditions` would have left the first
+paint of the ⌘K box answering with a foreign project's workflow — the leak surviving in the path
+people touch first, invisible to every other test in the suite because they all go through
+`search()`. Both call sites now ask one `visible_projects()`, which reuses the automation surface's
+own `is_instance_admin` (already `pub(crate)` for exactly this) so `projects.admin` cannot mean
+two things on one branch.
+
+**Proof.** `scripts/qa/run-search-project-scope.sh` **9/9 and PROVEN TO FAIL at 4/9** with the
+clause deleted. The survivors are precisely the ones that do not touch it — the two "not
+over-scoped" tests (default project, page) and the unfiltered administrator — and the suggestion
+test staying *green* in the proof run is the two-statement point rather than a hole in it.
+`omnion-search --lib` 44, `omnion-workflows --lib` 56, `omnion-api --lib` **254** unchanged,
+`omnion-api` builds, 0 clippy in the files touched.
+
+**Two fixture defects of mine, before any product defect** — the branch's recurring shape:
+
+1. `insert into pages (…, organization_id, …)` — `pages` has no organization column; it inherits
+   tenancy through `sites`. `42703` naming the column.
+2. `page_revisions (…, status)` — the column is `state`. Same `42703`.
+3. And one *assertion* of mine was wrong about the **product**: it asserted `hidden_count == 1`.
+   `hidden_count` answers "how many providers can this caller not read at all", which is a
+   different question from "how many rows lie outside their project scope". The assertion was
+   rewritten against `counts` — the facet rail's own per-provider totals — which is the more
+   interesting statement anyway, since a rail reading "Workflows 2" above a one-row result list is
+   the same disclosure told twice.
+
+**Not mine, found on the merge.** `origin/main` added `restore_job_runner`; the only conflict was
+`apps/api/src/main.rs`'s runner import list. Resolved as a union (`70639c6a`) — taking either
+side silently unregisters the other's workers, and an unregistered runner is a feature that never
+fires. Verified by grep that both sides' `::spawn` calls survive, not by the import list alone.
+
+**Next.** Acceptance 6 (member role changes bite on the very next request — the REQ's own risk note
+names the membership-revision cache key, and nothing on this branch invalidates anything) is the
+next unticked item that this branch can actually build.
