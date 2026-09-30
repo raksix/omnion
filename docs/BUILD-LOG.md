@@ -1,3 +1,74 @@
+## 2026-09-30 — wave8 tick 50 — REQ-117 slice 20: the ceiling was inert behind the platform's own proxy
+
+fix(api): one proxy rule for the caller's address. The dial shipped last tick counted
+`crm_leads.submitter_ip`; behind a reverse proxy that column held the *proxy's* address
+for every visitor, so the whole ceiling did nothing in the only topology the platform runs
+in. `client_ip::resolve_client_ip` is now the single answer, believed by the rate limiter
+and by analytics in place of their two private copies.
+
+**What the defect was.** Three files each decided independently who the caller was, and
+their answers contradicted each other:
+
+| Surface | Rule it applied | Cost in production |
+|---|---|---|
+| `ClientAddress` (every extract handler) | socket only | every visitor behind a proxy counts as the proxy |
+| `rate_limit_middleware::peer_from_headers` | socket **first**, header as fallback | its loopback guard was finished code |
+| `analytics::visitor_address` | header **first**, unconditionally | any caller mints a bucket per request |
+
+The middle copy is the one worth reading twice: its doc comment says the header is
+consulted *only when the peer is loopback*, and the call site is
+`peer.or_else(|| peer_from_headers(headers))` — socket first, header only as a fallback.
+In production the peer is never loopback (nginx is a separate host, so the peer is a LAN
+address), so the guard it documents is unreachable. Its unit test then "proved" the guard
+by calling the helper directly with a `peer` of `Some`, a pair the production call site
+cannot produce. **A comment describing a rule is a claim about the code, and this one
+described the opposite.**
+
+**Why slice 19's gate stayed green.** It drove `store::capture` with an address argument
+*it supplied itself*, so it tested the counter against an address and never against the
+address's **provenance** — the one thing a test cannot manufacture and a request does.
+This is the module-gate rule (`run-crm-capture-routing.sh`, `run-crm-assignment.sh`)
+reaching a case where "begin at the function" is not merely slow but blind: the function
+takes the very input whose origin is in question.
+
+**The rule, settled once.** `X-Forwarded-For` is believed only when the socket peer is
+loopback — a proxy on this host, the one peer whose address is guaranteed not to be a
+client's — or when there is no peer at all (an in-process call, where the header is all
+there is). From a public peer the socket wins: a caller that may write a header freely may
+otherwise pick its own limiter identity, a fresh analytics bucket, and its way out of the
+exclusion list. The guard is a property of the **type**, not of a call site, so a handler
+takes `ClientAddress` and there is no longer a way to read the raw socket for a decision.
+
+**Proof.**
+- `bash scripts/qa/run-crm-proxy-address.sh` — `crm_proxy_address` **6/6**, and slice 19's
+  `crm_address_ceiling` re-runs in the same gate unchanged at **10/10**.
+- **Proven to fail**, with the resolver reverted to socket-only: **4/6** — the four proxy
+  assertions go red, while the two negative controls (a forged header from a public peer;
+  an addressless in-process delivery) stay green, which is what shows the gate names the
+  defect and not its neighbourhood.
+- `cargo test -p omnion-api --lib` **277**, `cargo test -p omnion-module-crm-intake --lib`
+  **170**, `cargo build -p omnion-api` green, admin `tsc --noEmit` exit 0.
+
+**What the gate caught in me, which is the part worth keeping.** My first resolver was
+`forwarded.or(peer)`, and its own unit test failed it before any gate ran: a loopback proxy
+writing an unusable header produced `Some(127.0.0.1)` — *this same defect re-entering
+through the fallback branch*, one bucket for every visitor of that installation. The
+version that ships has three explicit arms, and a loopback peer with no usable header is
+`None`, which the ceiling already reads as "not throttled" rather than "one bucket with
+everybody else". I also wrote the middleware's replacement test with a `let _ = (&limiter,
+api)` to silence two unused bindings — an assertion with padding around it is an assertion
+nobody trusts, so it was rewritten to assert the `ClientId::key` string, which is the only
+form in which the two answers actually differ.
+
+**Not done, deliberately.** No browser pass and none claimed: the QA slot is held by a live
+w3 pass (`/tmp/omnion-qa-slot-holders`, cwd `/mnt/apopic/omnion-w3`). No screen changed in
+this slice. The REQ stays open on two counts that are not mine: the REQ-064 form-editor
+card is still slice 3's one missing screen, and REQ-064's forms module is on no branch.
+
+**Next.** REQ-117's remaining surface is thin, so the queue moves to REQ-061
+manufacturing (`pending`, no crate on this branch) or back to REQ-064's form-editor card,
+which cannot be built while its module exists nowhere.
+
 ## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
 
 feat(health): the service detail page draws a 24 h trend. fix(health): the health
