@@ -6790,3 +6790,63 @@ next-run cell carries a date and the zone, and this tick explains why that cell 
 with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
 belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
 this tick looked at.
+
+---
+
+## 2026-09-30 · omnion-wave2 tick 32 · REQ-062 slice 3, screens
+
+**What.** `/themes/<key>/builder` and `/themes/upload`, both wired into the gallery, plus
+`runThemeBuilderDepth` and the `--only=theme-builder` gate. Acceptance 10 and 13 had their API
+halves proven since last tick and no screens at all; both stay UNticked because the depth pass
+has not run.
+
+**The builder is the page editor, not a second one.** `BlockCanvas`, `BlockInspector`,
+`InsertPanel`, all of `block-tree.ts` and the undo stack are reused as they are. A header, a
+footer and a page body are all block trees drawn by one renderer, so a slot editor would be a
+second implementation of insert, reorder, duplicate, delete, nesting, the inspector and undo —
+and the first time one of the two changed, the same tree would draw differently in a page and
+in a header. What the screen adds is the slot picker (all eight, always), a reset drawn only for
+a slot the theme actually ships, and an export that is a real file download.
+
+| Gate | Result |
+| --- | --- |
+| `omnion-content --lib` | **252/0** |
+| `apps/admin` `tsc --noEmit` | clean, 753 files (both new files in `--listFilesOnly`) |
+| `walkthrough.cjs` parse | clean (`bun build`, only the expected unresolved `playwright-core`) |
+| `cms_theme_layouts` | **17/0** (re-verified, unchanged) |
+| QA browser pass | **deferred** — the slot's holder was dead on arrival (see below) and a w7 pass is queued behind it |
+
+**A dead control, found by reading the file I was about to extend.** The gallery card's delete
+button has rendered with no `onClick` since slice 3 shipped `DELETE /themes/{key}`. `canDelete`
+came from the server, the route underneath it is covered by two walks, and the criterion's
+removal clause stayed unticked for a whole slice — because `data-theme-delete` existing is not
+the same claim as the control working, and nothing in the suite pressed it. It now opens a
+confirmation that names the theme, calls `removeTheme` and re-reads the gallery. The pass
+asserts the button is *behaviourally* wired (the dialog names the theme and states the bundled
+refusal) rather than that an attribute is present, so the same shape of gap cannot pass again.
+
+**Why the pass is deferred, and the stale holder.** `/tmp/omnion-qa-slot` held one place whose
+holder pid was dead and whose owning script had exited five minutes earlier. The reaper's own
+comment records a 75-minute hostage from exactly this, and its grace is 120 s, so it should have
+fired — except nothing runs the reaper except a pass, and the queue had a w7 pass waiting on a
+place a dead pid was holding. Reaped by hand (age 303 s, holder dead) and the directory verified
+empty. Reclaiming is only safe because the liveness test reads the HOLDER file, not the place
+name: the place is named after a pid that exits within milliseconds of a healthy pass, so a
+reaper testing the name reclaims every live place.
+
+**Two of my own mistakes, both from not checking what the tool does.**
+(1) I used `write_file` to rewrite ONE line of `REQ-062-themes.md` — it replaces the whole file,
+so the REQ collapsed to a single line. `git checkout` restored it and the three acceptance
+annotations plus the status line were redone with `patch`. The rule: `write_file` is for new
+files; a single line inside a 162-line document is a `patch`, and the cost of being wrong about
+that is a `git checkout` plus four re-applied edits.
+(2) I nearly wrote the same lesson twice: the "two implementations of a rule drift" note is
+already in slice 3's record from an earlier tick. Status lines that keep every past finding
+become unreadable; the acceptance annotations are the right place for what a given screen now
+does, and the status line is the right place for what is proved right now.
+
+**Next.** (a) `QA_STACK=w2 … --only=theme-builder` when the slot is free and `/mnt/apopic` has
+room at the moment the slot is GRANTED — then tick acceptance 10, 13 and 14's removal clause on
+the database reads rather than on the screen's own report. (b) Acceptance 11's remaining half is
+a *rendering* claim ("renders identically" on a second site) and needs two sites in a browser,
+not a validator round trip. (c) Slice 4, the ten themes and `omnion create-theme`.
