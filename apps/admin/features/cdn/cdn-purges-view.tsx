@@ -27,7 +27,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Copy, Download, Filter, RefreshCw, RotateCcw, Search, X } from "lucide-react";
+import { Copy, Download, Filter, RefreshCw, RotateCcw, X } from "lucide-react";
 import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
@@ -115,7 +115,8 @@ export function CdnPurgesView() {
   const [fieldError, setFieldError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
-  const searchRef = useRef<HTMLInputElement>(null);
+  /** `/` focuses this. It is a `<select>`, not a text box: the status set is closed. */
+  const searchRef = useRef<HTMLSelectElement>(null);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
 
@@ -311,27 +312,44 @@ export function CdnPurgesView() {
       ) : null}
 
       <div className="flex flex-wrap items-center gap-2">
-        <div className="relative flex-1 min-w-[200px]">
-          <Search
-            className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-muted"
-            aria-hidden
-          />
-          <input
-            ref={searchRef}
-            type="search"
-            value={filters.status ?? ""}
-            onChange={(event) =>
-              setFilters((current) => ({
-                ...current,
-                status: (event.target.value || undefined) as CdnPurgeStatus | undefined,
-              }))
-            }
-            placeholder="Filter by status — press / to focus"
-            aria-label="Filter the purge history by status"
-            data-cdn-purge-filter
-            className="w-full rounded-lg border border-line bg-surface py-2 pr-3 pl-8 text-[12.5px]"
-          />
-        </div>
+        {/*
+         * The status filter is a closed set, so it is a `<select>` and not a search box, and
+         * this is a correction rather than a preference.
+         *
+         * The control was an `<input type="search">` whose value was passed straight to the
+         * API as `status`. The API parses that string with `PurgeStatus::parse` and treats an
+         * unrecognised value as *no filter* rather than an error — a decision that is right
+         * for the API and catastrophic for this control: typing `fail` filters nothing, typing
+         * `Failed` filters nothing because the stored spelling is lowercase, and nothing on
+         * screen distinguishes "the filter is wrong" from "nothing has failed". The `STATUSES`
+         * table above this file, with all five labels, was written for the control and never
+         * rendered by it. A field whose only correct input is a value the user cannot know is
+         * a filter that silently does nothing.
+         *
+         * The keyboard focus target moves to this select because `/` still has to land
+         * somewhere: the REQ's keyboard line promises "`/` focuses filter", and a shortcut
+         * that focuses nothing is a shortcut that looks implemented.
+         */}
+        <select
+          ref={searchRef}
+          value={filters.status ?? ""}
+          onChange={(event) =>
+            setFilters((current) => ({
+              ...current,
+              status: (event.target.value || undefined) as CdnPurgeStatus | undefined,
+            }))
+          }
+          aria-label="Filter the purge history by status"
+          data-cdn-purge-filter
+          className="rounded-lg border border-line bg-surface px-3 py-2 text-[12.5px]"
+        >
+          <option value="">Every status</option>
+          {STATUSES.map((status) => (
+            <option key={status.value} value={status.value}>
+              {status.label}
+            </option>
+          ))}
+        </select>
         <select
           value={filters.kind ?? ""}
           onChange={(event) =>

@@ -6092,7 +6092,20 @@ async function runCdnPurgeDepth(page, report) {
   // The filter, narrowed and then cleared: a filter that does not change the rows is
   // decoration, and this is the cheapest place to see that.
   const before = steps.rows;
-  await page.locator("[data-cdn-purge-filter]").selectOption("failed").catch(() => {});
+  // `selectOption`, and NOT a `.fill` or a `selectOption` on a text box: the status filter is
+  // a closed set, so the control is a `<select>` (see the note in `cdn-purges-view.tsx`).
+  //
+  // The catch that used to swallow this was the defect's first half. `selectOption` on an
+  // `<input>` throws, the `.catch(() => {})` ate it, and the pass went on to record
+  // `filterNarrows: false` — a sentence the summary reads as *the product's filter does not
+  // narrow its rows*. A harness that cannot drive a control and a control that does not work
+  // produce the same line, and the second reading is the one somebody acts on.
+  //
+  // So: no catch on the interaction, and the two readings are recorded separately.
+  const statusFilter = page.locator("[data-cdn-purge-filter]");
+  steps.statusFilterIsSelect =
+    (await statusFilter.evaluate((el) => el.tagName.toLowerCase()).catch(() => "")) === "select";
+  await statusFilter.selectOption("failed", { timeout: 5000 });
   await page.waitForTimeout(1300);
   steps.filteredRows = await page.locator("[data-cdn-purge-row]").count();
   steps.filterNarrows = steps.filteredRows < before;
