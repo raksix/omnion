@@ -9238,8 +9238,26 @@ async function main() {
     log(`focused pass coverage: ${matchedOnly.size} route/pass name(s) walked, ${unmatched.length} unmatched`);
   }
 
+  // A page whose diagnostics never came back is NOT a page that passed.
+  //
+  // `diagnostics()` resolves `undefined` when the tab navigates away or is closed while the
+  // evaluate is in flight — Playwright answers `undefined` rather than throwing in that window.
+  // The roll-up then reached `m.diagnostics.horizontalOverflow`, threw a TypeError, and the pass
+  // died *before* `summary.json` was written: no report, no findings, no screenshots index, and
+  // the slot still held until the holder was reaped. A harness that loses its own evidence when
+  // one page misbehaves is worse than a red one, because the next tick cannot tell a broken
+  // screen from a broken measurement.
+  //
+  // So an unmeasurable page is recorded as a finding of its own. It is deliberately NOT a pass:
+  // the screen was in the route list, so the rule that decides whether a page ships cannot treat
+  // "we failed to look at it" as "we looked and found nothing".
+  const unmeasured = [];
   for (const p of report.pages) {
     const d = p.diagnostics;
+    if (!d) {
+      unmeasured.push(p.name);
+      continue;
+    }
     if (d.horizontalOverflow) pushFindings("high", "overflow", `${p.name}: page scrolls horizontally (${d.scrollWidth}px > ${d.viewport.w}px)`);
     if (d.offscreen.length) pushFindings("high", "offscreen", `${p.name}: ${d.offscreen.length} element(s) outside the viewport, e.g. ${JSON.stringify(d.offscreen[0])}`);
     if (d.brokenImages.length) pushFindings("high", "broken-image", `${p.name}: ${d.brokenImages.join(", ")}`);
@@ -9250,6 +9268,13 @@ async function main() {
     if (d.h1Count === 0) pushFindings("low", "no-h1", `${p.name}: no h1 heading`);
   }
   for (const m of report.mobile) {
+    // Same contract as the desktop roll-up above: a phone screen we could not measure is a
+    // finding, not a pass. The 390×844 leg is the only evidence the mobile acceptance boxes can
+    // ever be ticked from, so letting it throw here would leave them untickable with no report.
+    if (!m.diagnostics) {
+      unmeasured.push(`mobile:${m.name}`);
+      continue;
+    }
     if (m.diagnostics.horizontalOverflow) pushFindings("high", "overflow-mobile", `mobile ${m.name}: horizontal overflow`);
     if (m.diagnostics.offscreen.length) pushFindings("medium", "offscreen-mobile", `mobile ${m.name}: ${m.diagnostics.offscreen.length} element(s) outside the viewport`);
   }
@@ -9270,6 +9295,18 @@ async function main() {
   for (const [name, value] of Object.entries(report.crmStates ?? {})) {
     if (value === false) pushFindings("high", "crm-state", `state step failed: ${name}`);
     if (value === undefined) pushFindings("medium", "crm-state", `state step never ran: ${name}`);
+  }
+  // A screen that was walked but never measured is reported the same way the two claim loops
+  // above report a step that returned `false`: the report is the only place it can surface, and a
+  // number in a log is not a verdict. `medium` rather than `high` because the page may well be
+  // fine and the tab may have navigated — but the acceptance box it was to prove stays UNticked,
+  // because nothing about that page was actually read.
+  if (unmeasured.length) {
+    pushFindings(
+      "medium",
+      "unmeasured-page",
+      `${unmeasured.length} screen(s) were visited but produced no diagnostics: ${unmeasured.join(", ")}`,
+    );
   }
   const refusedOnPurpose = [];
   for (const [index, f] of consoleLog.entries()) {
