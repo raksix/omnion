@@ -1,6 +1,6 @@
 # REQ-011 — CDN / Edge System
 
-> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; `origin/main` merged in `0caa8c6`; browser gate still **red** after tick 22 — the tick-21 "0 elements" reading is **not reproduced** (every route in the re-run reported 30–42), and the pass is now blocked on the box rather than the code: `71d55cb` closed the second half of the scope defect, where nine depth passes ran outside `QA_ONLY` and the pass spent its time in `search-depth` instead of reaching `/cdn/purges`) · **Captured:** 2026-09-25 · **Layer:** platform / infra
+> **Status:** in-progress (slices 1–3 built and green — `807e307`, `69ba2c7`, `3df6432`; `origin/main` merged in `0caa8c6`. Tick 77 replaced the "blocked on the box" reading with the one the code actually supported: the two unticked boxes were not waiting on a flaky pass, they were **unmeasurable** — `runCdnPurgeDepth` captured the header sentence and `runCdnRulesDepth` counted the rows, and neither compared either to the API, so the clause the box names had no instrument at all. `04bc7e73` builds it: two deterministic hooks, a three-way count match that refuses to run on a single page (where `Showing N of N` is true by construction), a different assertion for the unpaged rules table, and a drive of the filtered empty state no pass had reached) · **Captured:** 2026-09-25 · **Layer:** platform / infra
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
 ## Request

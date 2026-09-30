@@ -32,7 +32,18 @@ const { chromium } = require("playwright-core");
 
 function arg(name, fallback) {
   const i = process.argv.indexOf(`--${name}`);
-  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+  if (i !== -1 && process.argv[i + 1]) return process.argv[i + 1];
+  // The `--name=value` form. `run.sh` builds the scope as `--only="$QA_ONLY"`, so this is the
+  // form every scoped pass actually arrives with — and until this branch existed the flag was
+  // silently ignored, `arg` returned the fallback, and ONLY_ALL stayed true. The pass then
+  // walked the WHOLE product while every artifact it wrote (screenshots, clicks, the
+  // summary's `scope`) claimed the narrow scope, and the "matched no route" guard at the end
+  // could not fire because its whole premise is a scope that was never applied.
+  //
+  // It is a prefix test rather than an exact one, so a later `--name-extra` cannot be read as
+  // `--name`; the value is then sliced by the length of the literal prefix.
+  const inline = process.argv.find((entry) => entry.startsWith(`--${name}=`));
+  return inline ? inline.slice(name.length + 3) : fallback;
 }
 
 const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
