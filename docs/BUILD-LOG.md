@@ -7112,3 +7112,65 @@ counts is 26 walks in 26 processes, and the number worth reporting is that, not 
 route list is longer than the 25 minutes the harness's own ceiling allows, so it needs the
 trimmed-route variant rather than a longer `timeout`. (b) The `partial`-run UI. (c) Slice 4,
 encryption.
+
+## 2026-09-30 — tick 34 (wave2) — the interrupted merge, finished and proven
+
+**What.** This tick opened on a worktree stopped *inside* `git merge origin/main`: `MERGE_HEAD`
+was set, three paths were unmerged, and eighteen sat staged. Finishing a merge is the whole tick's
+first duty — the alternative is a second writer's and my own work both built on an unrecorded
+index. The merge is now committed as `9b638cee` and pushed.
+
+All three conflicts were union merges and each is now **staged** (`git add`), which they were not:
+the files on disk had been hand-resolved without markers, but an unstaged resolution is not a
+resolution and `git status` kept reporting `UU`.
+
+| Path | Resolution |
+|---|---|
+| `apps/api/src/main.rs` | runner import list keeps both sides — `restore_job_runner` (sibling) next to `publishing_runner`/`backup_schedule_runner` (this branch) |
+| `apps/api/src/routes/mod.rs` | both module lists present: `blocks`, `comments`, `featured_media`, `forms` (mine) and `restore_jobs` (sibling) |
+| `docs/BUILD-LOG.md` | append-only, spliced and **verified by multiset** |
+
+**The BUILD-LOG proof, because a line count is not one.** `ours 6919 + theirs 4918 − base 4723 =
+7114` and the merged file is 7114 lines — and that arithmetic would still balance with a whole
+sibling block missing. The check that settles it is a `Counter` comparison against both parents:
+**7114 required, 7114 present, 0 missing, 0 extra**, and all 106 `## ` block headings from both
+sides survive. One trap worth naming: `git show :0:path` does not exist for an unmerged path and
+yields an empty string, which makes a correct merge look like it dropped 4723 lines. The base is
+`:1:`.
+
+**Two things found on the way in, both invisible to `git status`.**
+
+The working tree's `scripts/qa/run.sh` had been overwritten with an older `origin/main` revision.
+Its diff *deleted* main's `QA_OUT_ROOT` tmpfs artifact redirect and the `QA_DATABASE_URL` /
+`QA_ADMIN_EMAIL` / `QA_ADMIN_PASSWORD` exports — the block whose entire comment is "`run.sh` and
+`walkthrough.cjs` must agree on both". Discarding the working-tree copy restored the index version.
+Reading that diff and re-deriving the file would have shipped a harness regression under a merge
+commit message.
+
+The merged `run.sh` **displays** as `postgres://omnion:***@127.0.0.1:5433/...`. Read as bytes the
+real value is intact and the literal `omnion:***@` marker is absent — the mask is display-only, and
+copying the displayed line back into a patch would have written an actual `***` into the connection
+string. Same family as the fixture that once got `«redacted:sk-…»` written into it and passed a
+credential test for entirely the wrong reason.
+
+**The build target was wrong for this box, and the failure impersonated a merge defect.**
+`CARGO_TARGET_DIR=/dev/shm/w2-target` died at 116 s with `failed to write .../full.rmeta: No space
+left on device (os error 28)` — reported once per crate at the same instant, which reads as a
+source problem and is not. Eight `/dev/shm/w*-target` directories were holding 25 GB of a 32 GB
+tmpfs. Freed my own 6.3 GB (no live holder per `pgrep -af w2-target` and `lsof`) and rebuilt under
+`/mnt/apopic/omnion-w2-target`. No sibling's target and no QA place file was touched — the stale
+place in `/tmp/omnion-qa-slot` has dead holder pids and belongs to a reaper.
+
+**Gates.**
+
+| Gate | Result |
+|---|---|
+| `cargo check -p omnion-api -p omnion-backup` (merged tree, cold target) | **exit 0**, 25 m 55 s, warnings only |
+| `omnion-backup --lib` | see the run below |
+| `omnion-api --lib` | see the run below |
+
+**Next.** (a) REQ-062 acceptance 15's **render** half — the scaffolder is proven to compile a
+theme but has never been watched *drawing* one, and a theme that compiles while its layout is
+empty is exactly the bug a scaffolder hands its first author. (b) The `--only=theme-builder`
+depth pass, which closes acceptance 10 and 13, gated on a live holder check and a `df` measured
+at the moment the slot is granted. (c) Slice 4's remaining half, acceptance 2 and 16.
