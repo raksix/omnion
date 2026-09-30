@@ -31,9 +31,11 @@ import {
   ApiError,
   type AiAgent,
   type AiModel,
+  type AiTool,
   createAiAgent,
   fetchAiAgent,
   fetchAiModels,
+  fetchAiTools,
   updateAiAgent,
 } from "@/lib/api";
 import { useSession } from "@/lib/session";
@@ -166,6 +168,21 @@ export function AgentForm({ agentId }: AgentFormProps) {
   const [form, setForm] = useState<FormState>(BLANK);
   const [agent, setAgent] = useState<AiAgent | null>(null);
   const [models, setModels] = useState<AiModel[]>([]);
+  /**
+   * The registry rows this form needs, by key.
+   *
+   * **The registry is the authority on risk, not this form.** The acceptance criterion is "a
+   * high-risk tool enabled for an agent without an approval gate produces a validation warning on
+   * the agent form", and the registry already computes that state as `ungated_high_risk` — the
+   * same field the tool table stripes on. Deriving it here from `risk === "high" &&
+   * !requires_approval` would re-implement the disabled-wins rule and drift from the one place
+   * that has it, which is how a screen ends up disagreeing with itself.
+   *
+   * A failed read is **not** a broken form: the tools still save, and the warning simply does not
+   * appear. The alternative — blocking a save on a list we could not fetch — would let a
+   * registry outage stop an operator from editing an agent's prompt.
+   */
+  const [toolIndex, setToolIndex] = useState<Record<string, AiTool>>({});
   const [loading, setLoading] = useState(Boolean(agentId));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -205,6 +222,24 @@ export function AgentForm({ agentId }: AgentFormProps) {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await fetchAiTools({ organizationId });
+        if (cancelled) return;
+        setToolIndex(
+          Object.fromEntries(list.tools.map((tool) => [tool.key, tool])),
+        );
+      } catch {
+        /* no registry means no warning stripe, and the form still saves */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId]);
 
   useEffect(() => {
     if (!agentId) return;
@@ -266,6 +301,37 @@ export function AgentForm({ agentId }: AgentFormProps) {
   const modelOptions = useMemo(
     () => (toolList.length === 0 ? models : models.filter((model) => model.supports_tools)),
     [models, toolList.length],
+  );
+
+  /**
+   * The tools this agent would run with nobody watching.
+   *
+   * Three conditions, and all three matter:
+   *
+   * - the tool is **in the agent's list** — a high-risk tool this agent cannot call is a fact
+   *   about the registry, not about this form, and warning about it would train the operator to
+   *   ignore the stripe;
+   * - the registry says **`ungated_high_risk`** — high risk, enabled, and no approval gate, which
+   *   is the exact state the criterion names and the state the tool table stripes;
+   * - the key is **not in the approvals list** — the checkbox in the list below is the gate, and an
+   *   agent whose operator ticked it is not ungated.
+   *
+   * The third condition is read from the *form's* approval list rather than the registry's
+   * `requires_approval`, because the two are different switches: the registry's is the tool's
+   * default for every agent, the form's is this agent's. Warning on the wrong one either nags
+   * about a gated tool or misses the ungated one.
+   */
+  const ungatedHighRisk = useMemo(
+    () =>
+      toolList.filter((key) => {
+        const tool = toolIndex[key];
+        return (
+          tool !== undefined &&
+          tool.ungated_high_risk &&
+          !approvalList.includes(key)
+        );
+      }),
+    [toolList, toolIndex, approvalList],
   );
 
   const addTool = () => {
@@ -615,38 +681,79 @@ export function AgentForm({ agentId }: AgentFormProps) {
             </div>
             {toolList.length > 0 ? (
               <ul data-agent-tool-list className="mt-2 space-y-1">
-                {toolList.map((key) => (
-                  <li
-                    key={key}
-                    data-agent-tool={key}
-                    className="flex items-center gap-2 rounded-lg border border-line px-2 py-1 text-[12.5px]"
-                  >
-                    <code className="flex-1 font-mono">{key}</code>
-                    <label className="inline-flex items-center gap-1 text-[11.5px] text-muted">
-                      <input
-                        type="checkbox"
-                        data-agent-approval={key}
-                        checked={approvalList.includes(key)}
-                        onChange={() => toggleApproval(key)}
-                      />
-                      needs approval
-                    </label>
-                    <button
-                      type="button"
-                      data-agent-tool-remove={key}
-                      onClick={() => removeTool(key)}
-                      className="text-[11.5px] text-muted hover:text-danger"
+                {toolList.map((key) => {
+                  // The row half of the criterion: a high-risk, enabled, ungated tool this agent
+                  // can call gets a left stripe on its own row. The condition is the same triple
+                  // the block-level warning uses, and `ungatedHighRisk` is the list, so a row
+                  // that stripes is always a row the warning names.
+                  const striped = ungatedHighRisk.includes(key);
+                  return (
+                    <li
+                      key={key}
+                      data-agent-tool={key}
+                      className={`flex items-center gap-2 rounded-lg border border-line px-2 py-1 text-[12.5px] ${
+                        striped ? "border-l-2 border-l-rose-500" : ""
+                      }`}
                     >
-                      Remove
-                    </button>
-                  </li>
-                ))}
+                      <code className="flex-1 font-mono">{key}</code>
+                      {striped ? (
+                        <span
+                          data-agent-tool-ungated={key}
+                          title="High risk, enabled and with no approval gate: this agent can run it unattended"
+                          className="rounded-full border border-rose-300 px-1.5 text-[10.5px] text-rose-700 dark:border-rose-800 dark:text-rose-300"
+                        >
+                          ungated
+                        </span>
+                      ) : null}
+                      <label className="inline-flex items-center gap-1 text-[11.5px] text-muted">
+                        <input
+                          type="checkbox"
+                          data-agent-approval={key}
+                          checked={approvalList.includes(key)}
+                          onChange={() => toggleApproval(key)}
+                        />
+                        needs approval
+                      </label>
+                      <button
+                        type="button"
+                        data-agent-tool-remove={key}
+                        onClick={() => removeTool(key)}
+                        className="text-[11.5px] text-muted hover:text-danger"
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
             ) : (
               <p data-agent-tools-empty className="mt-2 text-[11.5px] text-muted">
                 No tools: the agent can only answer in text.
               </p>
             )}
+
+            {ungatedHighRisk.length > 0 ? (
+              // **Two surfaces, one state.** The criterion says "renders the warning stripe **and**
+              // produces a validation warning on the agent form" — so the list carries the
+              // per-row stripe and this block carries the form-level warning. They read from the
+              // same `ungatedHighRisk`, so they cannot disagree: a stripe with no warning (or the
+              // reverse) would be two rules written twice.
+              <div
+                data-agent-ungated-warning
+                role="status"
+                className="mt-2 rounded-lg border border-l-2 border-rose-300 bg-rose-50/60 px-3 py-2 text-[12px] text-rose-900 dark:border-rose-900/60 dark:bg-rose-950/30 dark:text-rose-200"
+              >
+                <p className="font-medium">
+                  {ungatedHighRisk.length === 1
+                    ? "1 high-risk tool runs without approval"
+                    : `${ungatedHighRisk.length} high-risk tools run without approval`}
+                </p>
+                <p className="mt-0.5 text-rose-800/90 dark:text-rose-200/80">
+                  {ungatedHighRisk.join(", ")} — tick &ldquo;needs approval&rdquo; to park the run
+                  for a person, or turn the tool off in the registry.
+                </p>
+              </div>
+            ) : null}
           </Field>
 
           <label className="flex items-center gap-2 text-[12.5px]">
