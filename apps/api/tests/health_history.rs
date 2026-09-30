@@ -401,6 +401,118 @@ async fn retention_leaves_the_windows_the_table_reads_intact() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The service detail page's own 24 h trend (slice 2's last open item)
+// ---------------------------------------------------------------------------------------------
+//
+// The request asks the drill-down for "a 24 h trend chart", and the screen that
+// shipped with slice 2's sibling listed current values with the history on another
+// page. Two failures hide in that, and only one of them is visible:
+//
+//  1. **A row that carries a value and no series.** The screen renders perfectly:
+//     a table, a value, a timestamp. The *chart* is what is missing, and a table
+//     is not obviously a missing chart. The walk asserts every metric row accounts
+//     for a trend — a line, a point, or the sentence that says the window is empty.
+//  2. **Two rows drawn over two different windows.** If each row's series were read
+//     with its own `now()`, the first row's window would be a fraction of a second
+//     wider than the last, and two lines sharing one screen would not be
+//     comparable. So the series is read once per response and the walk asserts
+//     that two metrics sampled at the same ages get the same *count* — a
+//     per-row `now()` cannot produce that, and a fixture with different metrics
+//     cannot prove it either.
+
+#[tokio::test]
+async fn every_metric_row_of_a_service_carries_its_own_series() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    // Two metrics on ONE service, sampled at the same ages. A per-row `now()` gives
+    // them different windows; one read for the whole response gives them the same.
+    for metric in ["latency_ms", "queue_depth"] {
+        insert_sample(harness.pool(), "redis", metric, 10.0, 2.0).await;
+        insert_sample(harness.pool(), "redis", metric, 20.0, 1.0).await;
+        insert_sample(harness.pool(), "redis", metric, 30.0, 0.5).await;
+    }
+
+    let now = time::OffsetDateTime::now_utc();
+    // The window the detail page draws, named the same way the route names it.
+    for metric in ["latency_ms", "queue_depth"] {
+        let values = omnion_health::sparkline_values(
+            harness.pool(),
+            "redis",
+            metric,
+            omnion_health::Range::Day,
+            now,
+        )
+        .await
+        .expect("the series must read");
+        assert_eq!(
+            values,
+            vec![10.0, 20.0, 30.0],
+            "{metric} did not come back oldest first, so the line would draw time backwards"
+        );
+    }
+
+    // The mechanism leg, through the same function the route uses: a metric with one
+    // sample yields a one-element series, which the screen must draw as a dot. A
+    // reader that dropped single samples would render "no data" on a row that has one.
+    insert_sample(harness.pool(), "redis", "used_memory_bytes", 42.0, 0.25).await;
+    let one = omnion_health::sparkline_values(
+        harness.pool(),
+        "redis",
+        "used_memory_bytes",
+        omnion_health::Range::Day,
+        now,
+    )
+    .await
+    .expect("the single-sample series must read");
+    assert_eq!(one.len(), 1, "a lone sample is a dot, not an empty chart");
+
+    // And a metric nobody has ever sampled yields an EMPTY series, not a zero and
+    // not a fabricated point: the row itself is absent from the detail page, and
+    // this is the read that must not invent one.
+    let none = omnion_health::sparkline_values(
+        harness.pool(),
+        "redis",
+        "never_measured",
+        omnion_health::Range::Day,
+        now,
+    )
+    .await
+    .expect("an unmeasured metric is not an error");
+    assert!(
+        none.is_empty(),
+        "a metric with no samples invented {} point(s)",
+        none.len()
+    );
+
+    harness.dispose().await;
+}
+
+#[tokio::test]
+async fn the_detail_window_is_a_day_and_the_samples_query_no_longer_clamps() {
+    // The samples endpoint used to take `hours` and clamp it to 1 h … 7 d, which
+    // is the silent-clamp defect slice 2 removed from `/health/metrics`: a caller
+    // asking for 30 days got seven days with a `200` and no warning, and the
+    // chart it drew was confidently the wrong window. The route now resolves a
+    // *named* range through the same `Range::parse` the metric table uses, so the
+    // refusal is a property of the vocabulary rather than of one handler.
+    assert_eq!(omnion_health::DEFAULT_RANGE, Range::Day, "the detail draws a day");
+    for offered in omnion_health::RANGE_KEYS {
+        assert!(
+            Range::parse(offered).is_ok(),
+            "{offered} is on screen and must be accepted"
+        );
+    }
+    for rejected in ["168", "30", "hours=24", ""] {
+        assert!(
+            Range::parse(rejected).is_err(),
+            "{rejected} silently became a window in the samples endpoint too"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
