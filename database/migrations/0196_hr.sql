@@ -58,9 +58,15 @@ create table hr_departments (
     updated_at timestamptz not null default now(),
     -- A department may not be its own parent. The *descendant* case is refused in the service
     -- (a constraint cannot see the subtree), and this is only the fixed point.
-    check (parent_id is null or parent_id <> id),
-    unique (organization_id, lower(name))
+    check (parent_id is null or parent_id <> id)
 );
+
+-- Case-insensitive on the name, and an **index** rather than a table constraint: an expression
+-- may appear in an index but not in a `unique (...)` constraint, and Postgres parses the whole
+-- migration before running any of it, so this is a syntax error that takes the file down rather
+-- than a constraint it quietly skips. The third time this repository has met it.
+create unique index hr_departments_org_lower_name_key
+    on hr_departments (organization_id, lower(name));
 
 comment on table hr_departments is
     'Departments as a tree. A department with members or children is renamed or merged, never deleted.';
@@ -103,15 +109,23 @@ create table hr_employees (
     check (employment_type in ('full_time', 'part_time', 'contract', 'intern')),
     check (employee_status in ('active', 'on_leave', 'terminated')),
     -- An end date before the start is a data-entry slip the schema can catch for free.
-    check (end_date is null or end_date >= start_date),
-    -- A contract has to say when it ends, otherwise "this contract ended" is a question the
-    -- record cannot answer. Not a check constraint: the dependency is on employment_type, and
-    -- the service is what enforces it with a message the form can show.
-    unique (organization_id, employee_no),
-    -- Case-insensitive on the address, because a work e-mail is not case-sensitive in practice
-    -- and two spellings of one mailbox would be two employees.
-    unique (organization_id, lower(work_email))
+    check (end_date is null or end_date >= start_date)
+    -- The contract rule is deliberately **not** a check constraint: it depends on
+    -- `employment_type`, and the service is what enforces it with a message the form can show
+    -- ("a contract needs an end date" is a sentence a person acts on; a constraint violation
+    -- is not).
 );
+
+-- Both are **indexes**, not table constraints: an expression such as `lower(work_email)` may not
+-- appear in a `unique (...)` constraint. The employee number is case-sensitive on purpose -- it is
+-- a label an organization prints, not an address.
+create unique index hr_employees_org_employee_no_key
+    on hr_employees (organization_id, employee_no);
+
+-- Case-insensitive on the address, because a work e-mail is not case-sensitive in practice and
+-- two spellings of one mailbox would be two employees.
+create unique index hr_employees_org_lower_work_email_key
+    on hr_employees (organization_id, lower(work_email));
 
 comment on table hr_employees is
     'People. Termination is a status and an end date, never a delete; salary and bank details are not in this schema at all.';
@@ -202,9 +216,14 @@ create table hr_leave_types (
     allow_negative boolean not null default false,
     active boolean not null default true,
     created_at timestamptz not null default now(),
-    unique (organization_id, lower(code)),
     check (annual_days >= 0 and annual_days <= 366)
 );
+
+-- An index rather than a table constraint: `lower(code)` is an expression, and an expression may
+-- not appear in a `unique (...)` constraint. A leave type's code is what an API client sends, and
+-- "ANNUAL" and "annual" naming the same policy is a bug a person would have to unpick by hand.
+create unique index hr_leave_types_org_lower_code_key
+    on hr_leave_types (organization_id, lower(code));
 
 comment on table hr_leave_types is
     'The leave catalogue: entitlement, whether approval is needed, and whether a negative balance is allowed.';
@@ -220,9 +239,12 @@ create table hr_onboarding_templates (
     items jsonb not null default '[]'::jsonb,
     active boolean not null default true,
     created_at timestamptz not null default now(),
-    unique (organization_id, lower(name)),
     check (jsonb_typeof(items) = 'array')
 );
+
+-- An expression index, for the same reason as the two above.
+create unique index hr_onboarding_templates_org_lower_name_key
+    on hr_onboarding_templates (organization_id, lower(name));
 
 comment on table hr_onboarding_templates is
     'Reusable onboarding checklists. Applying one materialises its items onto an employee in slice 4.';
