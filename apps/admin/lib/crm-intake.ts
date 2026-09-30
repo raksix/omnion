@@ -343,3 +343,43 @@ export const DECISION_LABEL: Record<string, string> = {
   rejected: "Rejected",
   spam: "Filed as spam",
 };
+
+/** What a refresh does to the open source editor. */
+export type EditorAfterRefresh<T> =
+  /** The editor was closed, or stays open on the state the operator is holding. */
+  | { action: "keep"; editing: T | null }
+  /** The source the editor was editing is gone from the list, so the editor closes. */
+  | { action: "close" };
+
+/**
+ * What a list refresh must do to the open source editor.
+ *
+ * **Keep, do not rehydrate.** An editor that follows the server here throws away a half-typed
+ * mapping, a renamed source and a consent wording the operator is still writing, and it does
+ * it on the one gesture that feels harmless — `Refresh`, which is a *read*. The old code said
+ * in a comment that it must not do that and then did it: on an open editor it replaced the
+ * state with the freshly fetched row, and on a closed one it returned `null`, which is
+ * precisely the inverse of the stated intent.
+ *
+ * So the two arms are separated rather than merged into one expression: an editor that is
+ * closed has nothing to protect, and one that is open is only closed when the source it is
+ * editing is **no longer in the list** — deleted by somebody else, or deleted by this
+ * operator on another tab. That is the single case where keeping the draft would leave an
+ * editor writing to a row that is not there.
+ *
+ * `T` stays the caller's own state type and only `id` is required, so the decision is a pure
+ * function of two values and can be driven directly: the rule that decides whether an
+ * operator's in-flight work survives is not something to be reasoned about from a JSX
+ * callback every time it is read.
+ */
+export function editorAfterRefresh<T extends { id: string }>(
+  editing: T | null,
+  sources: readonly { id: string }[],
+): EditorAfterRefresh<T> {
+  if (editing === null) {
+    return { action: "keep", editing: null };
+  }
+  return sources.some((source) => source.id === editing.id)
+    ? { action: "keep", editing }
+    : { action: "close" };
+}

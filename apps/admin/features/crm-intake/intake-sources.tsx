@@ -44,6 +44,7 @@ import { ApiError } from "@/lib/api";
 import {
   DEDUPE_POLICIES,
   DEDUPE_POLICY_LABEL,
+  editorAfterRefresh,
   MAPPING_TARGETS,
   MAPPING_TARGET_LABEL,
   MAPPING_TRANSFORMS,
@@ -55,6 +56,7 @@ import {
   createIntakeSource,
   deleteIntakeSource,
   fetchAutoresponderTemplates,
+  fetchIntakeSource,
   fetchIntakeSources,
   intakeEndpointUrl,
   previewAutoresponder,
@@ -134,6 +136,8 @@ export function IntakeSources() {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<EditorState | null>(null);
+  /** The source being fetched for the editor, so one row shows a spinner and the rest do not. */
+  const [opening, setOpening] = useState<string | null>(null);
   const [revealedKey, setRevealedKey] = useState<{ name: string; key: string } | null>(null);
   const [rotating, setRotating] = useState(false);
 
@@ -143,14 +147,13 @@ export function IntakeSources() {
     try {
       const sources = await fetchIntakeSources();
       setRows(sources);
-      // A refresh must not silently throw away a half-edited mapping: the editor only follows
-      // the server when it is closed, and when the source it is editing is gone it closes too.
+      // A refresh must not throw away a half-edited mapping: the editor only closes when the
+      // source it is editing is gone from the list, and never re-reads the row into it. Both
+      // halves are in one pure function, and the reason each is true is not obvious from a
+      // `setState` callback — see `editorAfterRefresh` in `@/lib/crm-intake`.
       setEditing((current) => {
-        if (current === null) {
-          return null;
-        }
-        const fresh = sources.find((source) => source.id === current.id);
-        return fresh ? editorOf(fresh) : null;
+        const verdict = editorAfterRefresh(current, sources);
+        return verdict.action === "close" ? null : verdict.editing;
       });
     } catch (caught) {
       setRows(null);
@@ -159,6 +162,30 @@ export function IntakeSources() {
       setLoading(false);
     }
   }, []);
+
+  /**
+   * Open one source for editing, from the server rather than from the list row.
+   *
+   * The list row is a *summary* — it carries the name, the kind, the health and the mapping,
+   * because the table needs them to draw. It is not a promise that it carries everything the
+   * editor saves, and the day it stopped carrying one of them the save would quietly drop that
+   * field: the editor would put its own (unchanged) copy on the wire, the API would accept it,
+   * and the column would be overwritten with the value the list happened to carry. A read
+   * endpoint already exists for exactly one source; this is its first caller, and the reason
+   * it had none is that the row was always "good enough" for a screen nobody was looking at
+   * until now.
+   */
+  const openEditor = async (id: string) => {
+    setOpening(id);
+    setError(null);
+    try {
+      setEditing(editorOf(await fetchIntakeSource(id)));
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "The source could not be opened.");
+    } finally {
+      setOpening(null);
+    }
+  };
 
   useEffect(() => {
     void load();
@@ -470,9 +497,12 @@ export function IntakeSources() {
                         <button
                           type="button"
                           data-source-edit={source.id}
-                          onClick={() => setEditing(editorOf(source))}
-                          className="rounded-lg border border-line px-2 py-1 text-[11.5px] transition hover:text-ink"
+                          onClick={() => void openEditor(source.id)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] transition hover:text-ink"
                         >
+                          {opening === source.id ? (
+                            <Loader2 className="size-3 animate-spin" aria-hidden />
+                          ) : null}
                           Edit
                         </button>
                         <button
