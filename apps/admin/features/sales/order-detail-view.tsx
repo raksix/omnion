@@ -498,14 +498,28 @@ export function OrderDetailView() {
                     {formatMoney(invoice.grand_total, invoice.currency)}
                   </span>
                 </p>
+                {/*
+                  The link is only rendered when accounting has actually issued the document, so
+                  its presence IS the fact — there is no separate "not linked yet" wording to keep
+                  in step with it. The date beside it is the wait, which is the question a sales
+                  manager opens this screen with: raised on one day, invoiced on another, and the
+                  gap between them is what a late order actually is.
+                */}
                 {invoice.external_url ? (
-                  <a
-                    href={invoice.external_url}
-                    className="underline underline-offset-2"
-                    data-qa-sales-order-invoice-link
-                  >
-                    Open the invoice
-                  </a>
+                  <p className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <a
+                      href={invoice.external_url}
+                      className="underline underline-offset-2"
+                      data-qa-sales-order-invoice-link
+                    >
+                      Open the invoice
+                    </a>
+                    {invoice.settled_at ? (
+                      <span className="text-muted" data-qa-sales-order-invoice-settled>
+                        issued {formatTimestamp(invoice.settled_at)}
+                      </span>
+                    ) : null}
+                  </p>
                 ) : null}
               </div>
             ) : (

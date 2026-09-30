@@ -185,7 +185,10 @@ pub struct InvoiceHandoffView {
     pub external_id: Option<Uuid>,
     /// The link to it in the accounting module, once it exists.
     pub external_url: Option<String>,
-    /// When the draft was raised.
+    /// When the document was issued, so the screen can answer "how long was this order waiting?"
+    /// rather than showing a link with no date against it. `None` while the handoff is a draft.
+    pub settled_at: Option<OffsetDateTime>,
+    /// When.
     #[serde(with = "crate::dates::instant")]
     pub raised_at: OffsetDateTime,
 }
@@ -1612,10 +1615,11 @@ async fn load_invoice_handoff(
         String,
         Option<Uuid>,
         Option<String>,
+        Option<OffsetDateTime>,
         OffsetDateTime,
     )>(
         "select id, order_id, state, currency, subtotal::text, tax_total::text,
-                grand_total::text, external_id, external_url, raised_at
+                grand_total::text, external_id, external_url, settled_at, raised_at
            from sales_invoice_handoffs
           where organization_id = $1 and order_id = $2
           order by (state in ('draft', 'issued')) desc, raised_at desc
@@ -1637,6 +1641,7 @@ async fn load_invoice_handoff(
             grand_total,
             external_id,
             external_url,
+            settled_at,
             raised_at,
         )| InvoiceHandoffView {
             id,
@@ -1648,6 +1653,7 @@ async fn load_invoice_handoff(
             grand_total,
             external_id,
             external_url,
+            settled_at,
             raised_at,
         },
     ))

@@ -159,6 +159,8 @@ export type SalesInvoiceHandoff = {
   grand_total: string;
   external_id: string | null;
   external_url: string | null;
+  /** When accounting issued the document. `null` while the handoff is still a draft. */
+  settled_at: string | null;
   raised_at: string;
 };
 

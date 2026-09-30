@@ -1247,3 +1247,223 @@ async fn confirmed_order(db: &Db, organization_id: Uuid) -> Uuid {
 
     order_id
 }
+
+/// **The handoff settles.** This is the walk that had no walk.
+///
+/// The sales module raises a `sales_invoice_handoffs` row whose `external_id`/`external_url`
+/// columns exist for exactly one purpose: to let the order screen link the document that answered
+/// the request. The screen renders that link behind `invoice.external_url`, and **nothing in the
+/// workspace ever wrote either column** — so `state = 'issued'`, the state the schema's own check
+/// constraint describes (`state <> 'issued' or external_id is not null`), was a state that no code
+/// path could reach. The link was markup behind a permanently-false condition, which is a dead
+/// control by another name.
+///
+/// The walk drives the whole chain through the real HTTP surface — handoff, conversion, issue,
+/// void — and asserts the four facts a sales manager would state about it: the link points at the
+/// document, the number on it is the number accounting issued, the sales order and the handoff
+/// agree in the same transaction, and a void puts both back rather than leaving the order saying
+/// `none` under a handoff still claiming `issued`.
+#[tokio::test]
+async fn issuing_the_invoice_settles_the_sales_handoff_and_voiding_it_releases_the_link() {
+    let Some(fixture) = Fixture::new().await else { return };
+    let book = fixture.book().await;
+
+    let order_id = confirmed_order(&fixture.db, fixture.organization).await;
+
+    // 1. The sales side raises its handoff — the request to be invoiced, with the money frozen.
+    let handoff_id: Uuid = sqlx::query_scalar(
+        "insert into sales_invoice_handoffs \
+             (organization_id, order_id, currency, subtotal, tax_total, grand_total, state) \
+         values ($1, $2, 'USD', 250.00, 40.00, 290.00, 'draft') \
+         returning id",
+    )
+    .bind(fixture.organization)
+    .bind(order_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the handoff must be raisable");
+    assert!(
+        handoff_id != Uuid::nil(),
+        "a handoff is what the sales screen renders; the walk needs a real row"
+    );
+
+    // 2. Accounting converts the order and issues the document.
+    let converted = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/accounting/invoices",
+            Some(&book),
+            Some(json!({ "order_id": order_id })),
+        ),
+    )
+    .await;
+    assert_eq!(converted.status, StatusCode::CREATED, "{}", converted.body);
+    let invoice_id = converted.body.get("id").and_then(Value::as_str).expect("an invoice id");
+    let invoice_number = text(&converted.body, "number");
+    assert!(invoice_number.starts_with("INV-"), "the document has a number: {invoice_number}");
+
+    // 3. **A draft is not a document yet.** The handoff must still be un-settled, because nothing
+    //    has been issued — this is the assertion that makes the next one mean something.
+    let before: (String, Option<Uuid>, Option<String>) = sqlx::query_as(
+        "select state, external_id, external_url from sales_invoice_handoffs where id = $1",
+    )
+    .bind(handoff_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the handoff row must read");
+    assert_eq!(before.0, "draft", "issuing is what settles it, not creating a draft");
+    assert!(before.1.is_none(), "no document has answered the request yet");
+    assert!(before.2.is_none(), "so there is nothing to link to");
+
+    let sent = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/accounting/invoices/{invoice_id}/send"),
+            Some(&book),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+
+    // 4. The handoff now names the document, and the link is the path to *this* invoice.
+    let after: (String, Option<Uuid>, Option<String>, bool) = sqlx::query_as(
+        "select state, external_id, external_url, settled_at is not null \
+           from sales_invoice_handoffs where id = $1",
+    )
+        .bind(handoff_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the handoff row must read");
+    assert_eq!(after.0, "issued", "an issued invoice settles the handoff");
+    assert_eq!(
+        after.1,
+        Some(Uuid::parse_str(invoice_id).expect("the invoice id must parse")),
+        "the handoff names the document that answered it, not merely that one exists"
+    );
+    assert_eq!(
+        after.2.as_deref(),
+        Some(format!("/accounting/invoices/{invoice_id}").as_str()),
+        "the link is a path into the panel that owns the route, so it survives being mounted \
+         somewhere else"
+    );
+    assert!(after.3, "settled_at answers 'how long was this order waiting?'");
+
+    // 5. The order and the handoff agree, in the same transaction. A sales screen that reads
+    //    `issued` on the order and `draft` on the card under it is worse than either being wrong
+    //    alone, so the two are read together rather than one at a time.
+    let order_state: Option<String> =
+        sqlx::query_scalar("select invoice_state from sales_orders where id = $1")
+            .bind(order_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the order row must read");
+    assert_eq!(
+        order_state.as_deref(),
+        Some("issued"),
+        "the order's own column is what the list filters on, and it must not lag the handoff"
+    );
+
+    // 6. The money agrees to the cent — the other half of the REQ box, now with a real invoice
+    //    to compare against rather than only the sales module's own frozen copy.
+    let order_total: Option<String> =
+        sqlx::query_scalar("select grand_total::text from sales_orders where id = $1")
+            .bind(order_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the order total must read");
+    assert_eq!(
+        order_total.as_deref(),
+        Some(text(&converted.body, "grand_total").as_str()),
+        "the invoice number and the order totals agree, which is what the box asked for"
+    );
+
+    // 7. Voiding releases both. A voided document must not stay linked from the sales screen, and
+    //    the order must not keep claiming to be invoiced.
+    let voided = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/accounting/invoices/{invoice_id}/void"),
+            Some(&book),
+            Some(json!({ "reason": "duplicate invoice raised in error" })),
+        ),
+    )
+    .await;
+    assert_eq!(voided.status, StatusCode::OK, "{}", voided.body);
+
+    let released: (String, Option<Uuid>, Option<String>) = sqlx::query_as(
+        "select state, external_id, external_url from sales_invoice_handoffs where id = $1",
+    )
+    .bind(handoff_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the handoff row must still read after a void");
+    assert_eq!(
+        released.0, "draft",
+        "a voided document puts the handoff back where it started — not `void`, which means the \
+         delivery was abandoned"
+    );
+    assert!(released.1.is_none(), "nothing links to a withdrawn document");
+    assert!(released.2.is_none(), "the dead link must actually go away, not linger");
+
+    let order_state: Option<String> =
+        sqlx::query_scalar("select invoice_state from sales_orders where id = $1")
+            .bind(order_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("the order row must read");
+    assert_eq!(
+        order_state.as_deref(),
+        Some("none"),
+        "the order and its handoff must not disagree after a void either"
+    );
+
+    // 8. Re-issuing a replacement settles the same handoff again, so the chain is repeatable
+    //    rather than a one-shot that strands the order. This is the void-and-duplicate path the
+    //    send refusal names, walked rather than asserted.
+    let replacement = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/accounting/invoices",
+            Some(&book),
+            Some(json!({ "order_id": order_id })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        replacement.status, StatusCode::CREATED,
+        "a voided invoice does not block a new draft for the same order: {}",
+        replacement.body
+    );
+    let replacement_id = replacement.body.get("id").and_then(Value::as_str).expect("an id");
+    let resent = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/accounting/invoices/{replacement_id}/send"),
+            Some(&book),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(resent.status, StatusCode::OK, "{}", resent.body);
+
+    let reissued: (String, Option<Uuid>) = sqlx::query_as(
+        "select state, external_id from sales_invoice_handoffs where id = $1",
+    )
+    .bind(handoff_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the handoff row must read a third time");
+    assert_eq!(reissued.0, "issued", "the chain completes again from the released handoff");
+    assert_eq!(
+        reissued.1,
+        Some(Uuid::parse_str(replacement_id).expect("the replacement id must parse")),
+        "and it points at the NEW document, not the withdrawn one — a handoff that kept the old \
+         id would send the sales desk to a voided invoice forever"
+    );
+}

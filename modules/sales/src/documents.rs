@@ -680,6 +680,9 @@ mod tests {
                 state: "draft".into(),
                 external_id: None,
                 external_url: None,
+                // A draft handoff has not been answered by a document yet, so there is no issue
+                // date to print — the PDF must not invent one the way it does not invent a total.
+                settled_at: None,
                 subtotal: "349.75".into(),
                 tax_total: "67.96".into(),
                 grand_total: "407.76".into(),
