@@ -7932,3 +7932,65 @@ the real `run.sh` under the real failure rather than grepping it for the shape o
 
 **Next.** REQ-127's close box still needs a pass that reaches the walkthrough. The gate for
 that is unchanged: all three reliability screens measured against a tenant that exists.
+
+## 2026-09-30 — omnion-w6 tick 36 — REQ-128 opens, and three artifacts that assumed things the platform does not have
+
+Four ticks of this branch went into the QA harness. This one wrote product code, and the first
+three things it wrote were all wrong in the same direction: each assumed a capability the
+platform does not have, and each was caught by **running the tool** rather than by reading the
+file. That is now the fourth request in a row where the defect is documentation-shaped — the
+sentence is right, the code behind it is absent.
+
+**Neither `next.config` declared `output: "standalone"`.** The panel and renderer images are
+built against it and the 250 MB budget is unreachable without it, so the `test -f
+…/standalone/server.js` guard would have failed the build. The guard is why this is a build
+error and not a silently oversized image. Added to both configs; `pnpm typecheck` clean.
+
+**The API binary took no arguments, and a distroless runtime has no shell, no `curl` and no
+`wget`.** The `HEALTHCHECK` I wrote had nothing to call. A healthcheck that always fails is
+worse than none: an orchestrator reads it as an unhealthy container and restarts a healthy API
+forever. `--healthcheck` probes **`/readyz`, not `/healthz`** — liveness answers "the process
+exists", so a container whose database is gone probes healthy and a rollout completes on top of
+an instance that cannot serve. `image-probe.sh` 6/6 against the rebuilt binary, and the case
+that matters is the third one: **a 503 from `/readyz` FAILS the probe.**
+
+**The override example declared `api:` twice.** A duplicate mapping key is resolved by taking
+the last one, so the environment, replicas and limits above it were silently discarded — and an
+*example* is the worst place to teach that. Merged into one block, with the merge semantics
+(scalars replaced, maps merged key by key) written next to the values they explain.
+
+**The gate's own defects are the more useful half of this entry.** Each was a check that was
+not checking, and the run still reported success in every case:
+
+- `[ -f "$df" || continue` is missing a bracket. Bash parsed past it and **six checks per loop
+  never ran**, with the gate reporting `0 failed`. A gate that silently skips its own work and
+  reports green is the exact shape REQ-126 produced four times over.
+- The non-root `USER` pattern excluded `:`, so `USER nonroot:nonroot` — the safest image in the
+  set — was reported as running as root. **A false alarm is how a gate gets ignored**, and this
+  one would have trained anyone reading it to ignore the line.
+- The enterprise file's variables were not exported, so `config` refused and three checks
+  reported a parse failure in a file that parses. The first red this gate produced was its own.
+
+**Also: the record from tick 35 was wrong in a way its own gate could not see.** The void
+summary escaped a `$` inside a heredoc, so every artifact recorded the literal text
+`${QA_STACK:-main}` and never the stack it actually wrote to. The file was there, the sentence
+was there, only the value was wrong — and the gate asserted presence, so it was green
+throughout. The new check asserts the fields are *expanded*; 8/8 against `run.sh`, 7/8 with
+only the expansion reverted.
+
+**Gates.** `deployment-artifacts.sh` **30/30** (three mutations applied and reverted, each on
+its own: downgrading the dependency to `service_started`, dropping a `:?` from a credential,
+adding a datastore to the enterprise file) · `image-probe.sh` **6/6** against the rebuilt
+binary · `queued-pass-evidence` **8/8**, discriminating · `bash -n` clean · `pnpm typecheck`
+clean · `cargo build -p omnion-api` green.
+
+**Not claimed.** No image was built and no container was booted. The box sat at **load 65 with
+1.0 GB free of 33 GB** across ten writer worktrees, and a release Rust build plus five
+containers is not a thing to attempt there. Every image-level acceptance line stays unticked;
+the two that are ticked were ticked against compose's own parser and against the rebuilt
+binary, and the REQ says so in those words.
+
+**Next.** REQ-128 slice 2b: the Helm chart with `values.schema.json`, the migration hook and
+`NOTES.txt` — deferred rather than skipped, because `helm` is not installed here and a chart
+that has never been rendered is the unreachable shape this wave keeps producing. It lands with
+a `helm template` assertion in the same commit.

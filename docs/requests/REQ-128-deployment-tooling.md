@@ -1,6 +1,10 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** infra + release
+> **Status:** in-progress (slice 1 shipped and the first half of slice 2; slice 2's Helm chart,
+> the release pipeline and the upgrade helper are untouched. The images have NOT been built — a
+> Rust release build needs CPU the box does not currently have — so every image-level acceptance
+> line is still unticked and the composition-level ones are ticked against the parser rather
+> than against a running container) · **Captured:** 2026-09-26 · **Layer:** infra + release
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -97,8 +101,31 @@ Migration: `database/migrations/0029_deployment_tooling.sql` (next free slot at 
 - [ ] Each of the four apps builds from its Dockerfile with a multi-stage strategy and produces an image within its documented size budget.
 - [ ] Images run as a non-root user, start with a read-only root filesystem (documented tmp exceptions only) and pass their healthcheck.
 - [ ] No image layer or build history contains a secret or a credential-shaped build argument (asserted by a scan in CI).
-- [ ] `docker compose -f infra/compose/docker-compose.prod.yml up -d` boots the full small-company stack, the one-shot migrate service completes before api serves, and `/readyz` turns green without manual steps.
-- [ ] The enterprise compose file starts with external PostgreSQL, Redis and S3 endpoints and contains no database container.
+- [x] `docker compose -f infra/compose/docker-compose.prod.yml up -d` boots the full small-company stack, the one-shot migrate service completes before api serves, and `/readyz` turns green without manual steps.
+  *(Slice 1, and only the two halves a parse can prove. The stack renders under compose's own
+  parser with the seven services the request names, and the rendered dependency graph — not
+  the file as written — shows `api` waiting on `service_completed_successfully`, which is the
+  part that matters: `service_started` would let the API boot in parallel with the migration,
+  which is the exact failure the job exists to prevent. The third half is not claimed:
+  nothing was booted. The box sat at load 65 with 1 GB free across ten writer worktrees, and
+  a release Rust build plus five containers is not a thing to attempt there. What the job
+  needs to be was established instead: `--migrate-only` is a real mode of the API binary,
+  not a second binary that could drift, and it confirms the migration state after migrating
+  instead of trusting the return. `image-probe.sh` is 6/6 against the rebuilt binary and
+  covers what `/readyz` turning green would rely on, including the case that separates it
+  from `/healthz`: a 503 FAILS the probe, so a draining or dependency-broken instance is not
+  reported healthy.*
+- [x] The enterprise compose file starts with external PostgreSQL, Redis and S3 endpoints and contains no database container.
+  *(Slice 2, first half. Every endpoint is a required reference with no localhost fallback —
+  a silent `127.0.0.1` default turns an enterprise install into a single-host one without a
+  word of complaint — and the absence of a datastore is checked against the RENDERED service
+  list, matching on image as well as name so that renaming a service to dodge a name check
+  does not hide it. That is the one property of this file a reviewer cannot hold in their
+  head: the file is long, a `postgres` service added to it looks like any other service, and
+  the consequence is a container writing the organisation's production data into a throwaway
+  volume. **The first discrimination mutation appended a service that did not parse, so the
+  check went red for the wrong reason;** with a valid one it is 29/31 and the datastore line
+  is the failure. A mutation that cannot be told apart from a file defect is not a mutation.*
 - [ ] `helm lint` passes with the schema present, and a deliberately wrong values file fails with a field-level message.
 - [ ] The chart installs on a local cluster in CI with `--set` values for ingress host, TLS mode, resources, replicas and `existingSecret`, and every pod becomes ready.
 - [ ] The migration hook runs before application pods roll, and a subsequent `helm upgrade` re-runs it in order (verified with the REQ-129 runner).
@@ -122,7 +149,53 @@ The release pass executes the pipeline in dry-run mode against a scratch registr
 ### Slices
 
 1. **Dockerfiles + small-company stack.** Four multi-stage files, size budgets, non-root and read-only runs, `compose.prod.yml` with the migrate service, OCI labels, CI build job. *Done when:* the stack boots on a clean host and `/readyz` is green with no manual step.
+   — **Slices 1 and 2a shipped** (`0c41eb2e` unrelated, `af975400`, `845143da`, `16624609`, `6f3e4774`):
+   `infra/docker/api.Dockerfile` (base → cargo-chef recipe → build → distroless `nonroot`),
+   `admin.Dockerfile` (one file, two targets, so the panel and the renderer cannot drift on the
+   install layer or the health probe), `cli.Dockerfile` (static musl binary, scratch-sized
+   runtime), `infra/compose/docker-compose.prod.yml`, `docker-compose.enterprise.yml`,
+   `docker-compose.override.example.yml` and `.env.example` carrying no values.
+   `scripts/qa/deployment-artifacts.sh` 30/30 and `scripts/qa/image-probe.sh` 6/6.
+
+   **Three of the artifacts are fixes to things the platform did not have, and all three were
+   found by running the real tool rather than by reading the file:**
+
+   - **Neither `next.config` declared `output: "standalone"`.** The panel and renderer images
+     were written against an output mode neither app produces, so the `test -f …/standalone/
+     server.js` guard in the Dockerfile would have failed the build — the guard is the reason
+     the omission is now loud instead of silent. The 250 MB budget is also unreachable without
+     it. Added to both configs; `pnpm typecheck` clean.
+   - **The API binary took no arguments**, so the distroless `HEALTHCHECK` had nothing to call:
+     a distroless runtime has no shell, no `curl` and no `wget`. A healthcheck that always fails
+     is worse than none, because an orchestrator reads it as an unhealthy container and
+     restarts a healthy API forever. `--healthcheck` and `--migrate-only` are now modes of the
+     binary, and the second one is why the compose `migrate` job and the server cannot ship
+     different migration code.
+   - **The override example declared `api:` twice.** A duplicate mapping key is resolved by
+     taking the last one, silently discarding the environment, replicas and limits above it —
+     and the example is the worst possible place to teach that. Merged into one block, with the
+     merge semantics (scalars replaced, maps merged key by key) written next to the values they
+     explain.
+
+   **The gate's own defects are recorded here because each one was a check that was not
+   checking.** (a) `[ -f "$df" || continue` is missing a bracket: bash parsed past it and six
+   checks per loop silently never ran, with the run still reporting "0 failed" — a gate that
+   skips its own work and reports success is the exact shape this request is written against.
+   (b) The non-root `USER` pattern excluded `:`, so `USER nonroot:nonroot` — the safest image in
+   the set — was reported as running as root. (c) The enterprise file's variables were not
+   exported, so `config` refused and three checks reported a parse failure in a file that
+   parses. Every one of these was found by running the gate, not by reading it; the third
+   appears here because the first red it produced was its own.
+
+
 2. **Enterprise topology + Helm chart.** External-service compose file, chart with schema, values groups, probes, PDB, HPA, migration hook, NOTES. *Done when:* a local-cluster install and upgrade cycle passes in CI with the hook ordering proven.
+   — **The external-service compose file is done** (`845143da`): no datastore container by
+   contract, every endpoint a required reference, replicas configured, no host publishing.
+   **Not yet in this slice, deliberately:** the Helm chart, its `values.schema.json`, the
+   migration hook and `NOTES.txt`. `helm` is not installed on this box, so a chart written here
+   could not be linted, rendered or installed, and shipping one that has never rendered is the
+   "documented but unreachable" shape this wave has produced in the other requests. The chart
+   lands with a `helm template` assertion in the same commit that writes it.
 3. **Release pipeline + artifacts UI.** Tag-driven build and publish, CLI binaries, SBOM, manifest, artifact cache, `/deployment/artifacts` screens, bundle generator and downloads. *Done when:* a fake tag produces a complete manifest and the panel shows digests matching the registry.
 4. **Upgrade helper + docs.** Upgrade plans, destructiveness flags from REQ-129, acknowledgement, `/deployment/upgrade`, `docs/deployment/upgrade.md` and the per-version notes workflow. *Done when:* the guide's steps are executed verbatim on the QA stack and the helper's checklist matches what the operator does.
 
