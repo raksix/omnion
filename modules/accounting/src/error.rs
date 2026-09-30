@@ -73,6 +73,38 @@ pub enum AccountingError {
         /// `debit_total - credit_total`, signed, so the direction is readable from the message.
         difference: String,
     },
+    /// **An allocation asks for more than the invoice still owes.**
+    ///
+    /// Its own variant, and a `422` rather than the family's usual `400` or `409`, because it is
+    /// the one refusal in this module whose answer is a *number* rather than a rule. The person
+    /// fixing it is looking at an outstanding balance and needs to be told what it is, what they
+    /// asked for, and by how much the two disagree — "payment rejected" sends them to a report.
+    /// The route maps this one status to `422` while every other refusal in the family keeps
+    /// its own, which is what the REQ's "refused with a 422 unless the override permission is
+    /// held" asks for.
+    #[error(
+        "invoice {invoice_number} has {outstanding} outstanding, which is less than the \
+         {attempted} this payment allocates to it"
+    )]
+    OverAllocation {
+        /// The invoice's number.
+        invoice_number: String,
+        /// What the payment asked to apply.
+        attempted: String,
+        /// What the invoice actually has left.
+        outstanding: String,
+    },
+    /// A stored amount this build cannot read.
+    ///
+    /// Not [`AccountingError::InvalidNumber`], because that one is about a value a **caller**
+    /// sent and belongs to a field on the form. This is a row the database handed back, so the
+    /// person who caused it is the migration or the drift, and the entity/field of the form
+    /// would point them at the wrong screen.
+    #[error("a stored amount is unreadable: {message}")]
+    InvalidAmount {
+        /// What could not be parsed, named so the log names a column.
+        message: String,
+    },
     /// A write the module will not perform for a reason the caller can act on.
     #[error("{0}")]
     NotAllowed(String),
@@ -160,6 +192,13 @@ pub fn status_of(error: &AccountingError) -> u16 {
         | AccountingError::UnbalancedEntry { .. }
         | AccountingError::AccountInUse { .. }
         | AccountingError::NotAllowed(_) => 409,
+        // The one `422` in the family, and deliberately so: an over-allocation is a request that
+        // was well formed, referred to a real invoice, and asked for something the arithmetic
+        // refuses. `400` would say the request was malformed and `409` would say the row is in
+        // conflict — neither is true, and both send a client to the wrong branch of its error
+        // handling.
+        AccountingError::OverAllocation { .. } => 422,
+        AccountingError::InvalidAmount { .. } => 500,
         AccountingError::Database(_) => 500,
     }
 }

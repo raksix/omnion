@@ -682,6 +682,39 @@ impl From<AccountingError> for ApiError {
                 "accounting_foreign_key_not_found",
                 format!("{kind} {id} is not in this organization"),
             ),
+            // The second `422` in the family (REQ-054 slice 3), and it earns one for the same
+            // reason the unbalanced entry does: the request is well formed, the invoice is real,
+            // nothing is taken, and it will never succeed unchanged — the arithmetic refuses it.
+            // The three numbers travel in `details` for the same reason they do above: the screen
+            // shows the sentence, the allocation grid shows the figures.
+            AccountingError::OverAllocation {
+                invoice_number,
+                attempted,
+                outstanding,
+            } => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "accounting_over_allocation",
+                format!(
+                    "invoice {invoice_number} has {outstanding} outstanding, which is less than \
+                     the {attempted} this payment allocates to it"
+                ),
+            )
+            .with_details(json!({
+                "invoice_number": invoice_number,
+                "attempted": attempted,
+                "outstanding": outstanding,
+            })),
+            // A stored amount this build cannot read. A `500` and not a `400`: nothing the
+            // caller sent is wrong, so telling them to fix their request would send them to a
+            // form that is already correct.
+            AccountingError::InvalidAmount { message } => {
+                tracing::error!(error = %message, "a stored accounting amount is unreadable");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "accounting_storage_error",
+                    "a stored amount in this organization could not be read",
+                )
+            }
             AccountingError::Database(inner) => {
                 tracing::error!(error = %inner, "the accounting store refused a query");
                 // The underlying message is attached to `details` **in a non-production build
@@ -827,6 +860,22 @@ fn clone_refusal(error: &AccountingError) -> AccountingError {
             entity,
             field,
             source: source.clone(),
+        },
+        // The payment refusals (REQ-054 slice 3). Cloned in full, unlike `Database`, because
+        // these are the two the API layer turns into a `422` **with numbers in `details`** — a
+        // reconstruction that dropped them would answer with the right status and the wrong
+        // message, which is the failure the walk that asserts on them is written to catch.
+        AccountingError::OverAllocation {
+            invoice_number,
+            attempted,
+            outstanding,
+        } => AccountingError::OverAllocation {
+            invoice_number: invoice_number.clone(),
+            attempted: attempted.clone(),
+            outstanding: outstanding.clone(),
+        },
+        AccountingError::InvalidAmount { message } => AccountingError::InvalidAmount {
+            message: message.clone(),
         },
     }
 }

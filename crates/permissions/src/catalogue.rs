@@ -886,6 +886,45 @@ pub const CATALOGUE: &[PermissionDef] = &[
         description:
             "Issue, void and overdue-sweep an invoice (a permanent statement about money owed)",
     },
+    // Payments (docs/requests/REQ-054, slice 3). Three keys, and the third is the one worth
+    // arguing for:
+    //
+    // * `accounting.payments.read` / `.record` is the ordinary split — seeing what came in is
+    //   not the same act as writing it down.
+    // * `.record` is split from reversal rather than sharing it. Recording money that arrived is
+    //   the routine act of a bookkeeper; **undoing** a recorded payment rewrites an invoice's
+    //   status and posts a counter entry against the ledger, so it is the statement that the
+    //   books were wrong, and the same argument that separated `accounting.journal.manage` from
+    //   reading the journal applies a second time here.
+    // * **`accounting.payments.overpay` is a permission of its own and the narrowest in the
+    //   family.** Every other key in this module gates an action that is legitimate. This one
+    //   gates the action that is *arithmetically wrong*: allocating more to an invoice than it
+    //   has outstanding. It is refused with a 422 by default, and holding the key is how a
+    //   person says "I know, it is a goodwill write-off". Folding it into `.record` would hand
+    //   every bookkeeper the ability to overstate what was collected — which no permission
+    //   review anywhere in the platform would call intended.
+    PermissionDef {
+        key: "accounting.payments.read",
+        category: "accounting",
+        description: "Read payments, their allocations and what each one settled",
+    },
+    PermissionDef {
+        key: "accounting.payments.record",
+        category: "accounting",
+        description:
+            "Record a payment and apply it to invoices (each allocation within its outstanding)",
+    },
+    PermissionDef {
+        key: "accounting.payments.reverse",
+        category: "accounting",
+        description: "Reverse a payment: release its allocations and post the counter entry",
+    },
+    PermissionDef {
+        key: "accounting.payments.overpay",
+        category: "accounting",
+        description:
+            "Allocate more to an invoice than it has outstanding (refused with 422 without this)",
+    },
 ];
 
 /// Look a permission up by key.
@@ -1201,20 +1240,52 @@ mod tests {
                 "{key} belongs to the accounting category"
             );
         }
-        // The keys the REQ's API table names for later slices must STILL not be here. Payments,
-        // expenses, reports and the PDF are slices 3 and 4, and a key with no route is exactly
-        // the lie this assertion exists to prevent — so it is kept, aimed at the next slice.
-        for later in [
-            "accounting.payments.read",
-            "accounting.payments.record",
-            "accounting.expenses.read",
-            "accounting.reports.read",
-        ] {
+        // The keys the REQ's API table names for later slices must STILL not be here. **This
+        // guard moved forward in slice 3 and it is aimed at slice 4**, for the same reason slice
+        // 2 moved it: a key with no route is a promise the permission screen makes that the
+        // product does not keep. Slice 3 turned `accounting.payments.*` from "later" into "real",
+        // so those three left this list and entered the assertion above, and the list now names
+        // what slice 4 has to deliver.
+        for later in ["accounting.expenses.read", "accounting.reports.read"] {
             assert!(
                 get(later).is_none(),
-                "{later} belongs to slices 3-4 and must not appear before its route does"
+                "{later} belongs to slice 4 and must not appear before its route does"
             );
         }
+    }
+
+    #[test]
+    fn the_payment_family_is_catalogued_and_overpaying_is_its_own_key() {
+        // REQ-054, slice 3. Four keys, and the assertion that is worth the test is the last one:
+        // `overpay` must be a key **of its own**, not a synonym for `record`. Every other key in
+        // this catalogue gates an action that is legitimate; this one gates the action that is
+        // arithmetically wrong, and folding it into `record` would hand every bookkeeper the
+        // ability to allocate more to an invoice than it has outstanding.
+        for key in [
+            "accounting.payments.read",
+            "accounting.payments.record",
+            "accounting.payments.reverse",
+            "accounting.payments.overpay",
+        ] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("accounting"),
+                "{key} belongs to the accounting category"
+            );
+        }
+
+        // `reverse` is separate from `record`: recording money that arrived is a bookkeeper's
+        // routine act, and undoing one rewrites an invoice and posts a counter entry.
+        assert_ne!(
+            get("accounting.payments.reverse").map(|entry| entry.description),
+            get("accounting.payments.record").map(|entry| entry.description),
+            "reversing and recording are different acts and must not share a description"
+        );
+        assert_ne!(
+            get("accounting.payments.overpay").map(|entry| entry.description),
+            get("accounting.payments.record").map(|entry| entry.description),
+            "the overpay override must not be described as recording"
+        );
     }
 
     #[test]

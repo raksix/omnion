@@ -34,6 +34,7 @@ pub mod invoices;
 pub mod journal;
 pub mod model;
 pub mod money;
+pub mod payments;
 pub mod store;
 
 pub use accounts::{
@@ -47,5 +48,9 @@ pub use invoices::{
 pub use journal::{
     EntrySource, JournalEntrySummary, JournalEntryView, JournalLineInput, JournalLineView,
     NewJournalEntry,
+};
+pub use payments::{
+    AllocationInput, AllocationState, AllocationView, NewPayment, PaymentMethod, PaymentSummary,
+    PaymentView, SettledInvoice,
 };
 pub use store::Page;

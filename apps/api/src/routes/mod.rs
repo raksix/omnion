@@ -82,6 +82,7 @@
 
 pub mod accounting;
 pub mod accounting_invoices;
+pub mod accounting_payments;
 pub mod ai;
 pub mod analytics;
 pub mod auth;
@@ -1599,6 +1600,32 @@ pub fn router(state: AppState) -> Router {
         )
         .route_layer(guards::require(&state, "accounting.invoices.send"));
 
+    // Payments (docs/requests/REQ-054, slice 3). Three layers rather than two, and the split is
+    // the argument the catalogue spells out: recording what arrived is a bookkeeper's routine
+    // act, reversing it rewrites an invoice and posts against the ledger, and the overpay
+    // override gates the one action here that is arithmetically wrong rather than merely
+    // consequential. **`.overpay` is checked inside the route, not as a layer** — it is a field
+    // on a body that is otherwise legal, and a layer would forbid the whole payment rather than
+    // the flag that was not entitled to it.
+    let accounting_payments_read = Router::new()
+        .route("/accounting/payments", get(accounting_payments::list_payments))
+        .route(
+            "/accounting/payments/{id}",
+            get(accounting_payments::get_payment),
+        )
+        .route_layer(guards::require(&state, "accounting.payments.read"));
+
+    let accounting_payments_record = Router::new()
+        .route("/accounting/payments", post(accounting_payments::record_payment))
+        .route_layer(guards::require(&state, "accounting.payments.record"));
+
+    let accounting_payments_reverse = Router::new()
+        .route(
+            "/accounting/payments/{id}/reverse",
+            post(accounting_payments::reverse_payment),
+        )
+        .route_layer(guards::require(&state, "accounting.payments.reverse"));
+
     // The customer's copy: no session, no permission, the token is the credential. `post` is the
     // same method as a mutation because accepting a quote **is** a mutation — a GET that changed
     // a document would be prefetched by a crawler and accepted on the customer's behalf.
@@ -1632,7 +1659,10 @@ pub fn router(state: AppState) -> Router {
         .merge(accounting_journal_manage)
         .merge(accounting_invoices_read)
         .merge(accounting_invoices_create)
-        .merge(accounting_invoices_issue);
+        .merge(accounting_invoices_issue)
+        .merge(accounting_payments_read)
+        .merge(accounting_payments_record)
+        .merge(accounting_payments_reverse);
 
     // The inventory surface (docs/requests/REQ-053, slice 1): items, warehouses, locations, the
     // stock rollup and the append-only ledger.
