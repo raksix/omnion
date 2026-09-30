@@ -350,7 +350,15 @@ export const SHORTCUT_GROUPS: readonly {
     title: "Moving",
     rows: [
       { keys: "Arrows", label: "Nudge the selection one grid step (⇧ for five)", locked: false },
-      { keys: "Tab", label: "Walk to the next card", locked: false },
+      // Said precisely because it was not true until this tick. The row read "Walk to the
+      // next card" while `onCanvasKeyDown` bound no `Tab` case at all and every card is
+      // `tabIndex={-1}` — so the browser moved focus out to the toolbar and the selection
+      // never moved. The wording now names both halves of what a keyboard user does next:
+      // the wrap (there is no End key for the canvas) and the fact that it reaches the
+      // connections, which is what makes "Del on a selected edge" satisfiable from a
+      // keyboard rather than from a pointer.
+      { keys: "Tab", label: "Walk to the next card or connection, and wrap", locked: false },
+      { keys: "⇧Tab", label: "Walk the same route backwards", locked: false },
       { keys: "⌘A", label: "Select every node", locked: true },
     ],
   },

@@ -133,6 +133,11 @@ import {
   isReadingKey,
   lockPlan,
 } from "./viewport-lock";
+import {
+  isEdgeIn,
+  nextFocusable,
+  shouldWalkCanvas,
+} from "./canvas-walk";
 
 /** The snap grid the canvas draws and drops onto. */
 const GRID = 8;
@@ -1423,6 +1428,61 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
         return;
       }
 
+      // ---- Tab: walk the cards ----------------------------------------------------------------
+      //
+      // This case did not exist, and the shortcut list has been advertising it — "Walk to the
+      // next card", and the keyboard-only criterion's own script says `Tab` walks the
+      // selection onto a connection's target — for two ticks. `selection.ts` exported
+      // `focusOrder` and a unit test asserted its shape, so the walking *order* was written,
+      // tested and never called. Every card is `tabIndex={-1}` (the canvas manages focus
+      // itself, deliberately), so the browser's own Tab moved focus out to the next toolbar
+      // control and the selection never moved: a documented shortcut that did nothing, and a
+      // key the narrow-screen lock whitelists as a *reading* key, so the lock was protecting
+      // a gesture that did not exist.
+      //
+      // It sits above the single-key path because `readKey` has no `Tab` case and must not
+      // grow one: that block only runs with no modifier held, and `Tab` must answer
+      // `Shift+Tab` too, which is the same gesture in reverse rather than a second key.
+      //
+      // `shouldWalkCanvas` refuses a Tab inside a field, and that is the part that keeps the
+      // keyboard criterion satisfiable: `I` focuses the inspector's first input, so a Tab
+      // that jumped the selection instead of leaving the field would make "edits a
+      // parameter" impossible while looking like the shortcut was broken.
+      if (shouldWalkCanvas(event)) {
+        const direction = event.shiftKey ? "backward" : "forward";
+        const world = { nodes: nodes.map((node) => node.id), edges: edges.map((edge) => edge.id) };
+        const landed = nextFocusable(world, selection, direction);
+        if (landed === null) {
+          // Nothing to walk. The key is not consumed, so a Tab on an empty canvas still moves
+          // the author out to the next control rather than swallowing it for no reason.
+          return;
+        }
+        event.preventDefault();
+        // The browser's own focus ring has to follow the selection, or the two disagree and
+        // the author is editing the focused card with the previous one outlined. The card is
+        // `tabIndex={-1}`, which is exactly what makes a programmatic `.focus()` land.
+        //
+        // The two markers are the ones the *existing* code writes: `data-edge` on the SVG
+        // `<g>` and `data-node-id` on the card. The first version of this handler guessed
+        // `data-edge-id`, which nothing in the file emits — a selector for a marker that does
+        // not exist fails closed, so Tab would have selected the edge and moved no focus,
+        // which is the "focus and selection disagree" case the comment above forbids. A
+        // selector is an assertion about the DOM, and the DOM is the other file.
+        document
+          .querySelector<HTMLElement>(
+            isEdgeIn(world, landed)
+              ? `[data-edge="${landed}"]`
+              : `[data-node-id="${landed}"]`,
+          )
+          ?.focus();
+        // A landed edge is selected the way a click selects it, so `Del` on it removes the
+        // line the author is looking at rather than a node the outline does not draw.
+        setSelection(
+          isEdgeIn(world, landed) ? selectEdge(selection, landed) : selectNode(landed),
+        );
+        return;
+      }
+
       // ---- the single-key path (REQ-004: a keyboard-only pass) --------------------------
       //
       // Everything the criterion names is in this block, and the reason it is one block is
@@ -2211,7 +2271,19 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                 const path = edgePath(from.position, to.position);
                 const isSelected = selectedEdge === edge.id;
                 return (
-                  <g key={edge.id} data-edge={edge.id} data-edge-selected={isSelected ? "true" : undefined}>
+                  <g
+                    key={edge.id}
+                    data-edge={edge.id}
+                    data-edge-selected={isSelected ? "true" : undefined}
+                    // An edge is walkable, and that is the criterion's own reason for the
+                    // walk: "Del on a selected edge removes it" can only be satisfied from
+                    // the keyboard if a keyboard can *reach* an edge. `tabIndex={-1}` is the
+                    // same deliberate choice the node cards make — the canvas owns the roving
+                    // focus ring — and it is the only reason a programmatic `.focus()` lands
+                    // on a `<g>` that has no `href` or `tabindex` of its own.
+                    tabIndex={-1}
+                    aria-label={`Connection from ${from.label} to ${to.label}`}
+                  >
                     {/* A fat transparent stroke under the visible line: a 2px bezier is close
                         to unclickable, and an edge you cannot select is an edge you cannot
                         delete. The hit area is the line's real geometry, not a bounding box. */}
