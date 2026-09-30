@@ -57,6 +57,32 @@ pub const TRANSFORMS: [&str; 6] = [
     "split_full_name",
 ];
 
+/// The only target a `split_full_name` line may be written against.
+///
+/// **Asymmetric on purpose, and it is the only correct direction.** The transform reads one
+/// field holding a whole name and produces two columns; the line's target must therefore be the
+/// *given* name, and the surname is the partner. A line written against `last_name` would put
+/// "Ada" in the surname column and "Lovelace" in the given-name column — the two halves exactly
+/// the wrong way round, on every lead, with nothing failing — so it is refused at save time
+/// rather than accepted and swapped.
+///
+/// The alternative of supporting both directions was measured and rejected: it needs a
+/// direction flag or a target-dependent partner, and both make the same submitted name mean two
+/// different stored rows depending on which column the operator happened to click first.
+pub const SPLIT_FIRST_TARGET: &str = "first_name";
+
+/// The target `split_full_name` writes the remaining name into.
+pub const SPLIT_LAST_TARGET: &str = "last_name";
+
+/// The one transform in [`TRANSFORMS`] that writes a target other than the one its line names.
+///
+/// Every other transform is a string-to-string rewrite, so it can only ever fill the target it
+/// was written against. `split_full_name` produces *two* values and a mapping line carries
+/// exactly one target, which is why it is expressed as a partner target rather than a flag on
+/// the entry: the operator names both columns in the mapping editor and the rule is checkable at
+/// save time, which an entry flag would not be.
+pub const SPLIT_TARGET: &str = "split_full_name";
+
 /// `true` when `value` is a target the platform can fill.
 #[must_use]
 pub fn is_target(value: &str) -> bool {
@@ -203,10 +229,61 @@ pub fn apply(mapping: &[MappingEntry], payload: &Value) -> Result<MappedValues> 
             continue;
         }
 
+        // `split_full_name` is the one transform with a second output, so it writes two targets
+        // rather than one: the line's own target carries the given name and its partner carries
+        // the rest. It ran as an identity for the whole life of this module — the transform was
+        // offered by `TRANSFORMS`, validated by `is_transform`, drawn by the mapping editor and
+        // documented as "a form with one name field is the common case", while
+        // `apply_transforms` answered it with `value`. Every such lead was written with the
+        // whole name in the first-name column and an empty surname, and nothing failed: the
+        // surname column is not required by the lead's check constraints.
+        if entry.transform.iter().any(|t| t == SPLIT_TARGET) {
+            // A split on a target that is not `first_name` is refused here rather than
+            // half-applied, because `apply` is public and `validate_required_targets` only runs
+            // on the two save paths. Refusing rather than guessing the direction is what keeps
+            // the two halves from being stored the wrong way round.
+            if entry.target != SPLIT_FIRST_TARGET {
+                return Err(CrmIntakeError::invalid(format!(
+                    "the {SPLIT_TARGET} transform may only fill \"{SPLIT_FIRST_TARGET}\", not \"{}\"",
+                    entry.target
+                )));
+            }
+            let (first, last) = split_full_name(&cleaned);
+            let partner = split_partner(&entry.target);
+            if first.is_empty() {
+                if entry.required {
+                    mapped.missing_required.push(entry.target.clone());
+                }
+            } else {
+                mapped.values.insert(entry.target.clone(), first);
+            }
+            // An empty surname is not a refusal: "ada" is a whole name, and demanding a surname
+            // would turn a single-word form into a rejected submission. The partner is written
+            // only when the split produced one, so a later line for the same target is not
+            // silently overwritten with an empty string.
+            if !last.is_empty() {
+                mapped.values.insert(partner, last);
+            }
+            continue;
+        }
+
         mapped.values.insert(entry.target.clone(), cleaned);
     }
 
     Ok(mapped)
+}
+
+/// The target that receives the second half of a `split_full_name`.
+///
+/// **Constant, and the parameter exists only so the caller cannot pair the split with an
+/// arbitrary column by hand.** A `debug_assert` used to live here and was removed: the guard in
+/// `validate_required_targets` reads `split_partner` for lines it is *about* to refuse, so the
+/// assertion fired on exactly the input the refusal exists for. An assertion that a caller
+/// cannot satisfy is an assertion that trains you to delete it.
+#[must_use]
+pub fn split_partner(target: &str) -> String {
+    let _ = target;
+    SPLIT_LAST_TARGET.to_string()
 }
 
 /// The source keys a mapping reads, in order, without the constant lines.
@@ -223,10 +300,71 @@ pub fn source_keys(mapping: &[MappingEntry]) -> Vec<String> {
 /// Checked at *save* time rather than at submission time, so the operator is told which
 /// target is unsatisfied while they are still editing rather than when a real visitor is
 /// being turned away.
+///
+/// **`split_full_name` satisfies a required target through its partner.** A mapping that reads
+/// one name field and splits it has no line for `last_name` at all, so the plain "no line ⇒
+/// unsatisfied" rule below refused the exact mapping the split exists to express — and the
+/// refusal names `last_name`, which the operator cannot produce by any legal edit. The partner
+/// is the line's second output, so its presence is the satisfaction.
 pub fn validate_required_targets(
     mapping: &[MappingEntry],
     required_targets: &[String],
 ) -> Result<()> {
+    // A split line writes a second target, so a mapping can now contain two lines competing for
+    // one column: a `first_name` split line and a plain `last_name` line both write
+    // `last_name`, and `apply` inserts into the same map either way, so one silently overwrites
+    // the other. The operator sees one name half the time and the other half the other time.
+    // Only split lines are checked — two *plain* lines for one target were already possible
+    // before this change and refusing them now would reject mappings every installation
+    // already holds, which is a migration this slice has no business performing.
+    let mut split_written: Vec<String> = Vec::new();
+    for entry in mapping {
+        if !entry.transform.iter().any(|t| t == SPLIT_TARGET) {
+            continue;
+        }
+        // Only one direction is legal, and the reason is in `SPLIT_FIRST_TARGET`: the line's
+        // target carries the *given* name and the partner the surname. A split written against
+        // any other target would store "Lovelace" as the given name and "Ada" as the surname,
+        // and nothing downstream could tell — so it is refused by name here rather than swapped.
+        if entry.target != SPLIT_FIRST_TARGET {
+            return Err(CrmIntakeError::invalid(format!(
+                "the {SPLIT_TARGET} transform may only fill \"{SPLIT_FIRST_TARGET}\", not \"{}\"",
+                entry.target
+            )));
+        }
+        let partner = split_partner(&entry.target);
+        if !is_target(&partner) {
+            return Err(CrmIntakeError::invalid(format!(
+                "split target \"{partner}\" is not a CRM field"
+            )));
+        }
+        for target in [entry.target.as_str(), partner.as_str()] {
+            // A rival is any OTHER line that ends up writing this target — either one whose own
+            // target is it, or another split whose partner is it. Counting only lines whose
+            // *own* target matches missed exactly the interesting case: the surname has one
+            // plain line and one split partner, and `count() == 1` said there was no
+            // competition while `apply` would silently overwrite one with the other.
+            let rival = mapping.iter().any(|line| {
+                if std::ptr::eq(line, entry) {
+                    return false;
+                }
+                let writes_here = line.target == target;
+                let splits_here = line
+                    .transform
+                    .iter()
+                    .any(|t| t == SPLIT_TARGET)
+                    && split_partner(&line.target) == target;
+                writes_here || splits_here
+            });
+            if rival {
+                return Err(CrmIntakeError::invalid(format!(
+                    "two mapping lines both write \"{target}\"; one would overwrite the other"
+                )));
+            }
+            split_written.push(target.to_string());
+        }
+    }
+
     let mut unsatisfied = Vec::new();
     for target in required_targets {
         if !is_target(target) {
@@ -235,8 +373,13 @@ pub fn validate_required_targets(
             )));
         }
         let line = mapping.iter().find(|entry| &entry.target == target);
+        // A split line whose partner is this target produces it.
+        let from_split = mapping.iter().any(|entry| {
+            entry.transform.iter().any(|t| t == SPLIT_TARGET) && split_partner(&entry.target) == *target
+        });
         match line {
             // No line at all: nothing can ever produce this value.
+            None if from_split => {}
             None => unsatisfied.push(target.clone()),
             Some(entry)
                 if !entry.required && entry.fallback.is_none() && entry.source_key.is_none() =>
@@ -315,7 +458,12 @@ fn apply_transforms(raw: &str, transforms: &[String]) -> String {
             "title_case" => title_case(&value),
             "strip_html" => strip_html(&value),
             "e164_lite" => e164_lite(&value),
-            "split_full_name" => value,
+            // The split itself is NOT a rewrite, so this arm stays an identity: the second
+            // target can only be written by `apply`, which knows the line's own target. Folding
+            // the split in here would need the target threaded through a function whose whole
+            // contract is `&str -> String`, and a string function cannot write a second column.
+            // `apply` checks for this transform before it calls this.
+            SPLIT_TARGET => value,
             // Unreachable: `apply` validates every name before running. Kept as identity so a
             // future transform added to the list without a branch is a no-op rather than a
             // silent data loss — and the `is_transform` test keeps the two in step.
@@ -582,5 +730,136 @@ mod tests {
         let (first, last) = split_full_name("ada");
         assert_eq!(first, "Ada");
         assert_eq!(last, "");
+    }
+
+    /// The defect this slice exists for: the transform was in `TRANSFORMS`, validated by
+    /// `is_transform`, drawn by the mapping editor and documented as the common case, while
+    /// `apply_transforms` answered it with `value`. A lead was therefore written with the whole
+    /// name in the first-name column and no surname at all — and no gate noticed, because the
+    /// one unit test for it called the splitter directly and never went through `apply`.
+    #[test]
+    fn the_split_transform_writes_both_name_targets() {
+        let mapping = vec![
+            MappingEntry::new("first_name", "name").with_transforms(&["split_full_name"]),
+        ];
+        let mapped = apply(&mapping, &json!({"name": "ada lovelace"})).unwrap();
+        assert_eq!(mapped.get("first_name"), Some("Ada"));
+        assert_eq!(mapped.get("last_name"), Some("Lovelace"));
+    }
+
+    /// A single-word name is a whole name, not a missing one: an empty surname must not turn
+    /// into a `missing_required` entry and refuse the submission.
+    #[test]
+    fn a_single_word_name_leaves_the_surname_absent_rather_than_empty() {
+        let mapping = vec![
+            MappingEntry::new("first_name", "name")
+                .with_transforms(&["split_full_name"])
+                .required(),
+        ];
+        let mapped = apply(&mapping, &json!({"name": "ada"})).unwrap();
+        assert_eq!(mapped.get("first_name"), Some("Ada"));
+        assert_eq!(mapped.get("last_name"), None, "absent, not an empty string");
+        assert!(mapped.missing_required.is_empty());
+    }
+
+    /// The partner is a constant, and the direction is fixed: the line's target carries the *given*
+    /// name and the partner the surname. The alternative — deriving the partner from whatever
+    /// target the operator clicked — was measured and it stores "ada lovelace" as
+    /// `last_name: Ada, first_name: Lovelace` on every such lead, which is the whole defect with
+    /// the halves swapped.
+    #[test]
+    fn the_partner_of_a_split_line_is_the_surname_column() {
+        assert_eq!(split_partner(SPLIT_FIRST_TARGET), "last_name");
+    }
+
+    /// The direction is enforced at both entry points, because `apply` is public and
+    /// `validate_required_targets` only runs on the two save paths.
+    #[test]
+    fn a_split_written_against_the_surname_column_is_refused_by_name() {
+        let mapping = vec![
+            MappingEntry::new("last_name", "name").with_transforms(&["split_full_name"]),
+        ];
+        let error = validate_required_targets(&mapping, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("first_name"),
+            "the refusal names the only legal target: {error}"
+        );
+
+        let error = apply(&mapping, &json!({"name": "ada lovelace"})).unwrap_err();
+        assert!(
+            error.to_string().contains("first_name"),
+            "and `apply` refuses it too, for a caller that skips the save path: {error}"
+        );
+    }
+
+    /// Save time, not submission time: a mapping that splits one field into both name columns
+    /// has no line for `last_name` at all, and the plain "no line means unsatisfied" rule
+    /// refused the exact mapping the split exists to express — naming a target the operator
+    /// cannot produce by any legal edit.
+    #[test]
+    fn a_required_surname_is_satisfied_by_the_split_that_produces_it() {
+        let mapping = vec![
+            MappingEntry::new("first_name", "name").with_transforms(&["split_full_name"]),
+        ];
+        validate_required_targets(
+            &mapping,
+            &["first_name".to_string(), "last_name".to_string()],
+        )
+        .expect("the split produces both columns");
+    }
+
+    /// The negative control for the half above: with the split removed, the surname is once
+    /// again unsatisfiable and must be refused.
+    #[test]
+    fn a_required_surname_with_no_split_line_is_still_refused() {
+        let mapping = vec![MappingEntry::new("first_name", "name")];
+        let error = validate_required_targets(&mapping, &["last_name".to_string()]).unwrap_err();
+        assert!(
+            error.to_string().contains("last_name"),
+            "the refusal names the field: {error}"
+        );
+    }
+
+    /// Two lines writing one column is a competition, and `apply` resolves it by map order
+    /// rather than by asking.
+    #[test]
+    fn two_lines_that_write_the_same_name_column_are_refused_by_name() {
+        let mapping = vec![
+            MappingEntry::new("first_name", "name").with_transforms(&["split_full_name"]),
+            MappingEntry::new("last_name", "surname"),
+        ];
+        let error = validate_required_targets(&mapping, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("last_name"),
+            "the refusal names the contested column: {error}"
+        );
+    }
+
+    /// A split paired against a plain line for its own target is the same competition, and the
+    /// *other* target is named in the message, not the line's own.
+    #[test]
+    fn a_split_whose_partner_is_also_written_plainly_is_refused() {
+        let mapping = vec![
+            MappingEntry::new("first_name", "name").with_transforms(&["split_full_name"]),
+            MappingEntry::new("first_name", "given"),
+        ];
+        let error = validate_required_targets(&mapping, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("first_name"),
+            "the refusal names the contested column: {error}"
+        );
+    }
+
+    /// The negative control for both refusals above: a mapping with no split keeps exactly the
+    /// latitude it had before this change, including two plain lines for one target, which
+    /// installations already hold and this slice must not reject.
+    #[test]
+    fn a_mapping_with_no_split_keeps_its_pre_existing_latitude() {
+        let mapping = vec![
+            MappingEntry::new("first_name", "a"),
+            MappingEntry::new("first_name", "b"),
+        ];
+        validate_required_targets(&mapping, &["first_name".to_string()])
+            .expect("two plain lines for one target were legal before and still are");
     }
 }
