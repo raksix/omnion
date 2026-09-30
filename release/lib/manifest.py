@@ -658,6 +658,23 @@ def build_manifest(
     if mismatch:
         raise ManifestError(mismatch)
 
+    # EVERY missing digest is reported, not the first. The builder asked for one digest at
+    # a time and raised on the first absence, so a build with no facts at all produced one
+    # refusal naming one artifact — and a pipeline operator fixing that is re-run, told
+    # about the next, and re-run again. A partial build is the normal state of a dry run,
+    # so the common case was the one that took the most attempts. `digest_for` accumulates
+    # the names and the message lists them all, which is the difference between one run and
+    # fourteen. The placeholder it returns is never used: the raise below happens first, and
+    # a caller that catches the error gets no document.
+    absent: list[str] = []
+
+    def digest_for(key: str, name: str) -> str:
+        try:
+            return _require_digest(facts, key, name)
+        except ManifestError as exc:
+            absent.append(f"{name} ({key}): {exc}")
+            return "sha256:" + "0" * 64
+
     chart = chart_metadata(root)
     registry = registry.rstrip("/")
     artifacts: list[dict[str, Any]] = []
@@ -668,7 +685,7 @@ def build_manifest(
             {
                 **image,
                 "name": name,
-                "digest": _require_digest(facts, "images", name),
+                "digest": digest_for("images", name),
                 "size_bytes": _optional_int(facts, "images", name, "size_bytes"),
                 "download_url": f"oci://{name}",
             }
@@ -680,7 +697,7 @@ def build_manifest(
             {
                 "kind": "cli",
                 "name": name,
-                "digest": _require_digest(facts, "cli", name),
+                "digest": digest_for("cli", name),
                 "platforms": [platform],
                 "size_bytes": _optional_int(facts, "cli", name, "size_bytes"),
                 "download_url": f"https://github.com/raksix/omnion/releases/download/v{version}/{name}.tar.gz",
@@ -692,7 +709,7 @@ def build_manifest(
         {
             "kind": "chart",
             "name": chart_name,
-            "digest": _require_digest(facts, "charts", chart_name),
+            "digest": digest_for("charts", chart_name),
             "platforms": [],
             "size_bytes": _optional_int(facts, "charts", chart_name, "size_bytes"),
             "download_url": f"https://github.com/raksix/omnion/releases/download/v{version}/{chart_name}",
@@ -705,7 +722,7 @@ def build_manifest(
             {
                 "kind": "sbom",
                 "name": sbom_name,
-                "digest": _require_digest(facts, "sboms", sbom_name),
+                "digest": digest_for("sboms", sbom_name),
                 "platforms": list(image["platforms"]),
                 "size_bytes": _optional_int(facts, "sboms", sbom_name, "size_bytes"),
                 "download_url": f"https://github.com/raksix/omnion/releases/download/v{version}/{sbom_name}",
@@ -717,13 +734,17 @@ def build_manifest(
             {
                 "kind": "compose",
                 "name": compose_name,
-                "digest": _require_digest(facts, "compose", compose_name),
+                "digest": digest_for("compose", compose_name),
                 "platforms": [],
                 "size_bytes": _optional_int(facts, "compose", compose_name, "size_bytes"),
                 "download_url": f"https://github.com/raksix/omnion/releases/download/v{version}/{compose_name}",
             }
         )
 
+    if absent:
+        raise ManifestError(
+            f"{len(absent)} artifact(s) have no digest supplied: " + "; ".join(absent)
+        )
     migrations = discover_migrations(root)
     destructive = destructive_migrations(root)
 
