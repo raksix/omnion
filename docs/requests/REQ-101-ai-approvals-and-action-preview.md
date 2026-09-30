@@ -111,11 +111,23 @@ All dotted lower-case on the signed webhook bus; approval events carry the organ
 > box: `GET /ai/approvals` now serves `viewer_missing` from the caller's effective permissions and
 > both screens render the buttons disabled and named, but the API's 403 half was proven by the
 > walks while the *rendering* half is still for the pass to see.
+>
+> **Slice 2 — the shared preview/apply mapping (`8c21b8d3`).** The two boxes ticked above are
+> ticked against the *mapping*, not against a live apply, and the distinction is the point of
+> the module: `plan()` and `writes()` are pure functions over a `FieldSpec` list, so
+> "preview and apply share one implementation" is testable without a database. Both criterion
+> tests are in `crates/ai-hub/src/approvals/plan.rs` — `every_written_value_is_the_previewed_value`
+> compares each field per field *through the frozen jsonb* (read the plan back out of storage
+> first, so the agreement survives the round trip), and
+> `mutating_the_mapping_moves_both_halves_together` remaps `title` to a different column and
+> asserts the previewed column and the written column move together. What is **not** yet ticked:
+> the DB-backed walk that applies a plan through `content::pages` and reads the page back. That
+> is the next slice — the reader, the apply and the stale check at the API level.
 
 - [x] All six dangerous classes are gated by default on a fresh installation, and a gated tool call parks its run as `awaiting_approval` with no side effect (test asserts the target row is unchanged).
 - [x] An approval is required even when the caller holds the underlying domain permission — permissions gate *who may ask*, approval gates *what happens*.
-- [ ] Approving applies exactly the previewed operations: every written field value equals the value in the frozen preview, asserted per field in a test.
-- [ ] The preview and the apply share one implementation: a test mutates a field mapping and fails both together.
+- [x] Approving applies exactly the previewed operations: every written field value equals the value in the frozen preview, asserted per field in a test.
+- [x] The preview and the apply share one implementation: a test mutates a field mapping and fails both together.
 - [ ] A resource edited between preview and decision makes the approval `stale`, the apply refuses with the `stale` code and the current revision, and the screen offers Re-preview.
 - [x] A single-use approval cannot be decided twice (`already_decided`) and the second attempt changes nothing.
 - [x] An approval past its expiry cannot be decided (`expired`), the sweeper resumes the parked run, and the inbox shows it read-only.
