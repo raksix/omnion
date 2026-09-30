@@ -7688,3 +7688,59 @@ top of the file, because the number is the thing a reader looks at.
 **Close box for REQ-127 stays UNTICKED** — the focused re-run is in flight and the two unmeasured
 screens still have no valid measurement. **Next:** read that pass; if the wizard's owner POST is
 refused again with 400, the defect is in the *wizard's* step, not in this request.
+
+## Tick 33 — the harness skipped its own tenant (three ticks of this loop read the wrong report)
+
+**Three ticks have now explained that pass away — as a lost session, then as a lost session
+again, then as a missing row — and all three were inferences over a report the harness had
+produced without a tenant.** This tick found the actual cause, and it is in `walkthrough.cjs`,
+not in any screen.
+
+**Measured, not inferred.** `omnion_qa_w6` ended with **1 user and 0 organizations**, and the
+wizard's `POST /api/v1/onboarding/owner` is the first entry in `netFailures`, answering **400**.
+A 400 on that route means the body was empty — `create_owner` refuses a blank `display_name`,
+`email` or `password` before it touches the database. So the question was never "why is the
+platform refusing a valid owner" but "why did the walk submit an empty form", and the answer is
+visible in the artifacts rather than in any log: **`summary.json` contains no `reached /setup`
+step and no `01-setup-step-1` screenshot**, both of which `runWizard` writes on the line after it
+decides it is on the wizard. Its `steps` array holds three entries, all from `ensureSignedIn`, and
+the first reads `clicked: "Create account"` at `…/setup`.
+
+**The race, and why a fixed sleep lost it.** The redirect into the wizard is a CLIENT-side
+`router.replace("/setup")` fired from `/login`'s `fetchOnboarding()` effect. On a cold `next dev`
+Turbopack compiles `/` first, the client hydrates, and only then does the URL move — all after
+`runWizard`'s single `waitForTimeout(900)`. It read a server-rendered `/`, returned
+`{ ran: false }`, and **printed one log line that no artifact recorded**. `ensureSignedIn` ran
+seconds later, found `/setup` with warm modules, and its generic `primaryClick` pressed the one
+submit button on the screen: "Create account", every field empty. Then the pass walked on into an
+installation with **no tenant**, and 729 org-scoped requests answered 403 by the scope guard.
+
+**Three defects, one shape: a silent skip that reads as a verdict.**
+
+| Defect | Before | After | Why it was invisible |
+|---|---|---|---|
+| Redirect raced | 900 ms sleep, then one `page.url()` read | polls to a settled URL; `/login` → `/setup` is waited out | the skip returned a flag no artifact carried |
+| Empty step submitted | `fillWizardStep` → `clickAction`, nothing between | nothing-to-fill is recorded and **not** submitted | a correct 400 reads exactly like a defect |
+| Generic click drives the wizard | `ensureSignedIn` submits whatever it finds | `/setup` routes to the login form | the wizard button is the *only* submit on that screen |
+
+`95687b0c`; `scripts/qa/wizard-gate.test.cjs` holds all three — **5/5 fail against the previous
+`walkthrough.cjs`, 5/5 pass against this one.**
+
+**The detail of the gate worth carrying forward: it strips comments before matching.** A source
+gate for a fix whose whole purpose is to explain the bug in prose is satisfiable by the
+explanation — a comment containing `ran: false` matches a regex looking for a `ran: false`
+RETURN, and the fix could be documented without ever being written. Every check reads code.
+
+**Second time in two ticks that the honest reading only arrived when an assertion replaced an
+inference.** Last tick's precondition query is what made this visible at all: it failed the pass
+in thirty seconds instead of letting it spend an hour describing an installation with no tenant.
+It is still the cheapest gate in the harness.
+
+**Gates.** `node --check scripts/qa/walkthrough.cjs` clean · `wizard-gate.test.cjs` 5/5 ·
+`focused-pass-args.test.cjs` still green (the previous tick's filter fix is unaffected) ·
+stashed-baseline run proves all 5 fail on the old file.
+
+**Next.** Read the confirming pass (`QA_STACK=w6 … QA_ONLY=wizard`, queued behind a sibling
+writer's slot rather than contending — reproducing this race needs the cold start a loaded box
+destroys). Tick REQ-127's close box only if it measures all three reliability screens against a
+tenant that exists.

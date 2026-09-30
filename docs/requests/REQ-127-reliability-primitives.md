@@ -1,7 +1,7 @@
 # REQ-127 — Reliability Primitives
 
 
-> **Status:** in-progress (slice 4 — the intake guard — is CODE COMPLETE and the focused QA pass over it has now run. Two things changed this tick. **The migration was renumbered `0185` → `0187`**: main's merge brought a fresh `0185_notification_delivery_lease.sql` and w2 already held `0186`, and sqlx keys `_sqlx_migrations` by NUMBER, so two different files claiming `0185` is a collision git cannot see. All ten worktrees were scanned first. **Two silent harness defects were found and fixed**, both quietly degrading every writer's passes. `run.sh` emits `--only=a,b` while `walkthrough.cjs`'s `arg()` parsed only `--only a,b`, so **every focused pass any writer has ever run walked the entire route list** — and it failed silently, because a filter that matches everything produces a complete, green report. And `qa-slot.sh` reaped stale places once *before* its wait loop, so a holder that died while waiters were queued was never reclaimed: twenty-two waiters sat behind a dead place for a full hour. Both fixes carry tests that FAIL against the previous code (5 of 9 parser cases; the mid-wait-death case). With the filter working the pass measured 3/52 routes in minutes instead of 52 in an hour, and the intake screen came back clean — title, `h1Count` 1, no horizontal overflow at 1440, no broken images, no duplicate ids, a real empty state (`rows: 0, cards: 0, hasEmptyState: true`) rather than a spinner, **10 of 10 declare-dialog fields labelled**, 3 px of overflow at 390 px. Gates: `omnion-reliability --lib` 116/0, `omnion-api --lib` 291/0, the ten intake walks 10/0 against a **freshly recreated** `omnion_w6_dev` (which is what proves the renumbered migration), `pnpm typecheck` 2/2. Three boxes ticked, the close box still UNTICKED — specifically because `reliability-retries` and `reliability-breakers` were never measured: the pass lost its session after the sign-out step (`reLogin: false`), so both bounced to `/login` and the 1,477 high findings are that one lost session expressed as 403s, not a defect list. Re-ordering the sign-out step behind the depth passes is a `walkthrough.cjs` change on main · **Captured:** 2026-09-26 · **Layer:** infra
+> **Status:** in-progress (slice 4 — the intake guard — is CODE COMPLETE, and the blocker that held this request for three ticks is now NAMED and FIXED: the QA harness skipped its own first run. `runWizard` raced a client-side `router.replace("/setup")` with a fixed 900 ms sleep, read a server-rendered `/` on a cold `next dev`, returned `ran: false` and logged nothing — then `ensureSignedIn` reached `/setup` seconds later with warm modules and pressed "Create account" on an EMPTY form, which the API correctly refused with 400. The pass then walked an installation with no tenant and every org-scoped request answered 403: **the 1,477 high findings were one silent skip, not a defect list and not a lost session.** The evidence is in the artifacts, not in an inference — `summary.json` carries no `reached /setup` step and no `01-setup-step-1` shot, which is what rules out every other explanation. Three fixes in `95687b0c`: the redirect is polled until the URL settles, a step with nothing to fill is recorded and NOT submitted, and `ensureSignedIn` routes `/setup` to the login form instead of pressing a wizard button with a generic click. The skip now reports a reason, so "already set up" and "the first run never ran" are distinguishable. `scripts/qa/wizard-gate.test.cjs` holds all three — 5 checks that fail 5/5 against the previous `walkthrough.cjs` and pass 5/5 against this one, matching code with comments stripped first (this file explains the bug in prose, so a comment containing `ran: false` would satisfy a regex looking for a `ran: false` RETURN). Close gate STILL UNTICKED and for a new reason: the confirming pass had not finished when the tick ended — the QA slot was held by a sibling writer, so it queued rather than contend, which is the right call since reproducing the race needs the cold start a contended box destroys. Next tick: read that pass, and tick the box only if it measured all three reliability screens against a tenant that exists
 whose live holder is w3's own pass (verified by reading the holder's pid and its /proc cwd, not by
 the command's exit code). w6's API came up healthy on :18085; the admin dev server has not been
 given the slot yet. The stale `omnion-qa-admin-w6` pm2 logs from 05:10 show `ENOSPC` in Turbopack
@@ -515,3 +515,48 @@ internally consistent report — 76 clicks, 81 screenshots, a per-page diagnosti
 review — every field populated and every one of them answering about an installation with no tenant.
 The missing check would have failed the pass in its first thirty seconds, before the hour of walking
 was spent, and it costs one query.
+
+### Slices — progress, sixth pass: the harness skipped its own tenant, and the log said `ran: false`
+
+**The cause is now named, and it is not in this request's code at all.** The previous pass
+measured `1 user / 0 organizations` and this one set out to find which POST refused. It was the
+wizard's `POST /api/v1/onboarding/owner` answering **400** — a *correct* refusal of an empty
+form. `runWizard` slept a fixed 900 ms and then asked whether it was on `/setup`. The redirect
+into the wizard is a **client-side** `router.replace("/setup")` that runs from `/login`'s
+`fetchOnboarding()` effect, so on a cold `next dev` — Turbopack compiling `/` first, then the
+hydration — the URL had not settled when the guard asked. It read a server-rendered `/`,
+returned `ran: false`, and **logged nothing**: `summary.json` holds no `reached /setup` step and
+no `01-setup-step-1` screenshot, which is the evidence that separates this from every other
+explanation. `ensureSignedIn` then reached `/setup` seconds later, with warm modules, and its
+generic `primaryClick` pressed **"Create account" with every field empty** — the step log carries
+`clicked: "Create account"` at `…/setup`, and a filled form would have produced a user row.
+
+**So the 1,477 findings were never a lost session, never a product defect, and never even a
+failed wizard: they were one silent skip.** The pass reported `ran: false`, walked on into an
+installation with no tenant, and every org-scoped request below it answered 403. `run.sh`'s
+precondition query (added last tick) turned that hour into a thirty-second failure — which is
+what made the skip visible at all, and is the second time in this request that the honest
+reading only became possible once an assertion replaced an inference.
+
+**Three harness defects, one shape — a silent skip read as a verdict** (`95687b0c`):
+
+| Defect | Before | After |
+|---|---|---|
+| The redirect is raced | `waitForTimeout(900)` then one `page.url()` read | polls until the URL settles; a `/login` that resolves to `/setup` is waited out |
+| An empty step is submitted | `fillWizardStep` → `clickAction` with no decision between them | a step with nothing to fill is recorded as unfillable and **not** submitted |
+| A generic click drives the wizard | `ensureSignedIn` presses whatever submit it finds, including "Create account" | `/setup` routes to the login form; the wizard is `runWizard`'s job alone |
+
+The skip now carries a reason (`skippedBecause: "already-installed"`) and logs `wizard-skipped`,
+so **"already set up" and "the first run never ran" are distinguishable in `summary.json`** —
+the distinction whose absence is why two ticks read the same wrong report three times.
+
+**`scripts/qa/wizard-gate.test.cjs` holds all three, and it strips comments before matching.**
+That last detail is the one worth keeping: this file's job is to explain the bug *in prose*, so a
+comment containing `ran: false` satisfies a regex looking for a `ran: false` **return** — the fix
+could be described in a comment and never written. Every check reads code, not documentation.
+**All five checks fail against the previous `walkthrough.cjs` and pass against this one.**
+
+**Still not ticked, and the reason has moved again.** The close gate needs a pass that measures
+the three reliability screens *against a tenant that exists*. That pass has not finished yet this
+tick: the QA slot was held by a sibling writer, so it queued rather than contend — correct here,
+since reproducing the race needs the cold start a contended box would have destroyed.
