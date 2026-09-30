@@ -39,18 +39,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # put the machine at a load average of 20 with a half-full swap. Half the cores per
 # build keeps a pass readable and leaves the rest of the box alone.
 export CARGO_BUILD_JOBS="${QA_CARGO_JOBS:-3}"
-# Eight writers share six cores: a global semaphore keeps at most CARGO_SLOTS builds
-# compiling at once (see cargo-slot.sh). Without it every pass's `cargo build -p omnion-api`
-# takes all six cores and eight of them thrash at load 30+.
 export CARGO_SLOTS="${QA_CARGO_SLOTS:-2}"
-# A CSRF secret for this disposable stack only, so the panel can save anything.
-#
-# The API's CSRF layer refuses rather than skips when no secret is configured — correct in
-# production, where a silent skip would be invisible — but that refusal is unconditional, so
-# every panel mutation answers `403 csrf_unavailable` on a stack that simply forgot to set one.
-# A walkthrough that creates a rule and watches it fail on that is measuring the harness, not the
-# product. This is a throwaway credential for a throwaway database on localhost.
-export OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-stack-csrf-secret-not-a-credential}"
 
 step() { printf '\n[qa] %s\n' "$*"; }
 
@@ -86,6 +75,13 @@ fi
 # begins from a clean set and the box is not carrying yesterday's processes.
 stop_stack() {
   pm2 delete "$API_NAME" "$ADMIN_NAME" "$WEB_NAME" >/dev/null 2>&1 || true
+  # Turbopack leaves a build cache behind when the server is killed, and the cache is
+  # the largest thing any worktree holds: ten stacks held 13 GB of it and filled the
+  # disk twice. The next pass rebuilds what it needs, so this is pure waste — but only
+  # drop it when the pass actually ran, so a stack that failed to start keeps its cache.
+  if [ "${QA_KEEP_NEXT:-0}" != "1" ]; then
+    rm -rf "$ROOT/apps/admin/.next" "$ROOT/apps/web/.next" 2>/dev/null || true
+  fi
 }
 # One trap, both cleanups: a second trap would replace the first and leave the slot held.
 release() {
@@ -94,23 +90,12 @@ release() {
   return 0
 }
 trap release EXIT INT TERM
-stop_stack
+# Only the exit path drops the build cache: the pre-pass call below is here to clear
+# stale servers, and deleting .next there would throw away a warm cache every tick and
+# turn each QA pass into a cold Turbopack build.
+QA_KEEP_NEXT=1 stop_stack
 
 step "resetting the QA database"
-# Free this worktree's own build space BEFORE the build, not after a failure. `/dev/shm` is 32 G
-# shared between seven writers, and a full one does not report "no space": the linker bus-errors
-# with a note asking for a bug report, which reads as a defect in whatever crate was being built.
-# Two ticks of REQ-126 logged a passing suite as "aborts with exit 101, pre-existing, not claimed"
-# because of exactly that. Only this worktree's target/ is trimmed — never a sibling writer's.
-bash scripts/qa/shm-guard.sh || { echo "[qa] not enough shared build space to run a pass"; exit 1; }
-# Stop this stack's API *before* the reset, not after. A process that is already running (or
-# crash-looping, as it does when the binary and the migration set disagree) reconnects to the
-# moment the database comes back and applies whatever migration set *it* was compiled with. The
-# rebuilt binary then boots into a database carrying its predecessor's checksums and dies with
-# `migration 27 was previously applied but has been modified` — a failure that reads like a
-# corrupt database and is really a race between the reset and the restart. Only this stack's own
-# process is touched; the sibling stacks keep their servers.
-pm2 stop "$API_NAME" >/dev/null 2>&1 || true
 bash scripts/qa/reset-db.sh
 
 step "API on :$API_PORT (database omnion_qa)"
@@ -125,17 +110,25 @@ if [ ! -x target/debug/omnion-api ] \
   # compiling at once instead of every pass grabbing all six threads for itself.
   "$(dirname "$0")/cargo-slot.sh" cargo build -p omnion-api
 fi
+# `OMNION_CSRF_SECRET` decides whether a cookie-authenticated mutation is refused before its
+# handler runs. Without one the QA API refuses EVERY write with `csrf_unavailable`, so a
+# walkthrough that saves a header policy, uploads a file or takes a backup would record screens
+# that "work" while the API answered 403 the whole time -- and because that refusal is the
+# documented behaviour of a deployment *without* a secret, it reads as the product being correct
+# rather than the harness being under-configured. It is a throwaway value: the process points at
+# a database that was dropped two lines above and listens on loopback.
+#
+# The comment sits here rather than inside the command because a `#` line between two backslash
+# continuations is not a comment: bash keeps reading the command, `#` and the words after it
+# become its arguments, and `pm2 start` is handed a stray name it never recovers from.
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
-  # --update-env re-reads the stack's env from THIS shell, which is where the CSRF secret and
-  # the QA port come from. Without it a restarted API keeps whatever env it was first started
-  # with — a different stack's port, and no CSRF secret, so every panel write answers 403.
-  pm2 restart "$API_NAME" --update-env >/dev/null
+  pm2 restart "$API_NAME" >/dev/null
 else
   OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
-  OMNION_CSRF_SECRET="$OMNION_CSRF_SECRET" \
+  OMNION_CSRF_SECRET="${QA_CSRF_SECRET:-qa-pass-throwaway-secret-not-a-real-key}" \
     pm2 start "$ROOT/target/debug/omnion-api" --name "$API_NAME" --time >/dev/null
 fi
 wait_http "$API_URL/healthz" 90 || { echo "[qa] API did not answer on :$API_PORT"; pm2 logs "$API_NAME" --lines 20 --nostream || true; exit 1; }
@@ -161,8 +154,16 @@ else
 fi
 wait_http "http://127.0.0.1:$WEB_PORT/" 150 || { echo "[qa] public renderer did not answer"; pm2 logs "$WEB_NAME" --lines 20 --nostream || true; exit 1; }
 
-step "browser walkthrough"
-node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT"
+# `QA_ONLY` narrows the pass to named routes and depth passes. The default runs every one of
+# them, which is the right thing for a full acceptance run and the wrong thing for a loop that
+# has just built two screens and needs them proven before the tick ends. It is a filter on the
+# walk, never on the harness around it: the stack, the reset, the vision review and the report
+# all run exactly as they do for a full pass.
+QA_ONLY_ARGS=()
+[ -n "${QA_ONLY:-}" ] && QA_ONLY_ARGS=(--only="$QA_ONLY")
+
+step "browser walkthrough${QA_ONLY:+ (focused: $QA_ONLY)}"
+node scripts/qa/walkthrough.cjs --url "http://127.0.0.1:$ADMIN_PORT" --web "http://127.0.0.1:$WEB_PORT" --out "$OUT" "${QA_ONLY_ARGS[@]}"
 
 step "vision review"
 node scripts/qa/vision-review.cjs --dir "$OUT" || echo "[qa] vision review skipped"

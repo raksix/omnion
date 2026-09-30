@@ -1886,79 +1886,17 @@ pub async fn restore_preview(
     let org = current.user.organization_id;
     let pool = state.db().pool();
     let row = omnion_backup::find_backup(pool, id, org).await?;
-    let manifest = omnion_backup::manifest_of(&row);
     let settings = omnion_backup::load_settings(pool).await?;
 
-    // Re-read the artifacts. `observe` already walks the manifest for `verify`, and the
-    // preview needs the same walk — but it needs the *failures* too, and `verify` drops
-    // them (`unreadable` is a name, not a sentence). So the reads happen here rather than by
-    // reusing a function whose return type cannot carry the reason.
-    // ONE reader, shared with the restore route. The first version inlined this loop and
-    // the restore wrote its own; two implementations of "what does the destination actually
-    // hold" is two answers to one question, and the restore is the half that destroys data —
-    // a restore that read the artifacts with slightly different rules would offer parts the
-    // preview refused, or the reverse, and the operator would see one price and pay another.
-    let mut evidence: Vec<omnion_backup::PartEvidence> = read_artifacts(&manifest, &settings).await;
-    let mut archive_keys: Vec<String> = Vec::new();
-
-    // The media index is a separate file from the media artifact, and it is the only place
-    // the archive's own list of storage keys exists. Without it the preview can count what
-    // the live library holds but has nothing to compare it against, and would report every
-    // live object as "dropped" — which is the most alarming possible false positive on a
-    // screen whose whole job is being believed.
-    let media_readable = evidence
-        .iter()
-        .any(|item| item.part.part == "media" && item.artifact.is_ok());
-    if media_readable {
-        let index_key = omnion_backup::index_key(&row.storage_prefix);
-        let index_path = omnion_backup::local_path_for(&settings.local_root, &index_key);
-        if let Ok(text) = tokio::fs::read(&index_path).await {
-            if let Ok(index) = serde_json::from_slice::<omnion_backup::MediaIndex>(&text) {
-                archive_keys = index
-                    .objects
-                    .iter()
-                    .map(|object| object.storage_key.clone())
-                    .collect();
-            }
-        }
-    }
-
-    for item in &mut evidence {
-        item.live = if item.part.part == "media" && !archive_keys.is_empty() {
-            match omnion_backup::compare_media(pool, org, &archive_keys).await {
-                Ok(comparison) => comparison.counts(),
-                Err(error) => {
-                    // A preview that cannot count the live side must not quietly render
-                    // zeros: the caller is told the comparison is unpriced, and the wizard
-                    // says so rather than drawing a reassuring all-clear.
-                    tracing::warn!(%error, "the restore preview could not compare live media");
-                    omnion_backup::LiveCounts::default()
-                }
-            }
-        } else if item.part.part == "database" {
-            match omnion_backup::compare_database(pool, item.part.item_count, org).await {
-                Ok(comparison) => comparison.counts(),
-                Err(error) => {
-                    tracing::warn!(%error, "the restore preview could not count live rows");
-                    omnion_backup::LiveCounts::default()
-                }
-            }
-        } else {
-            omnion_backup::LiveCounts::default()
-        };
-    }
-
-    let preview = omnion_backup::build_preview(
-        &row.id.to_string(),
-        &row.label,
-        &manifest,
-        &evidence,
-        row.finished_at.map(|at| {
-            at.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default()
-        }),
-        OffsetDateTime::now_utc().unix_timestamp(),
-    );
+    // The shared rebuild, not an inline copy. Slice 2c added a third caller (the queued
+    // restore's worker) and the two existing copies had already been allowed to diverge at
+    // exactly one point: when the live media library could not be counted, the preview
+    // substituted zeros and drew a reassuring "you lose nothing" while the restore refused.
+    // Both were defensible alone and together they are the defect — one price on the screen
+    // and another in the effect. One function, one answer; each caller decides what to *do*
+    // with the fact that the comparison failed.
+    let priced = super::restore_jobs::rebuild_preview(&state, &row, &settings).await;
+    let preview = &priced.preview;
 
     record(
         pool,
@@ -1973,11 +1911,20 @@ pub async fn restore_preview(
             "live_dropped": preview.total_live_dropped,
             "live_matches": preview.total_live_matches,
             "age_days": preview.age_days,
+            // The one thing the preview records that the restore refuses on. The screen
+            // renders "this restore could not be priced" beside the numbers rather than
+            // quietly showing a loss of zero, because a *read* costs nothing and turning a
+            // count failure into a `403` would hide the warnings the operator needs.
+            "unpriced": priced.live_comparison_failed,
         }),
     )
     .await;
 
-    Ok(Json(serde_json::to_value(&preview).unwrap_or_default()))
+    let mut body = serde_json::to_value(preview).unwrap_or_default();
+    if priced.live_comparison_failed {
+        body["unpriced"] = json!(true);
+    }
+    Ok(Json(body))
 }
 
 /// `POST /api/v1/backups/{id}/restore` — what an operator sends.
@@ -2027,7 +1974,7 @@ pub struct RestoreOutcome {
 ///
 /// A part with no recorded path is `Err`, not a silent skip: "the run never wrote this" and
 /// "the bytes are gone" are different sentences, and `build_preview` reads the difference.
-async fn read_artifacts(
+pub(crate) async fn read_artifacts(
     manifest: &omnion_backup::Manifest,
     settings: &omnion_backup::BackupSettings,
 ) -> Vec<omnion_backup::PartEvidence> {
@@ -2061,7 +2008,7 @@ async fn read_artifacts(
 /// than treats as an empty archive. A restore that answered "0 objects restored" for a
 /// library of four thousand because the index could not be parsed is a success that restored
 /// nothing, and that sentence must never be produced.
-async fn media_index_keys(
+pub(crate) async fn media_index_keys(
     row: &omnion_backup::Backup,
     settings: &omnion_backup::BackupSettings,
 ) -> Option<Vec<omnion_backup::CopiedObject>> {
@@ -2078,13 +2025,13 @@ async fn media_index_keys(
 }
 
 /// What the safety backup produced, and whether it is fit to rely on.
-struct SafetyBackup {
+pub(crate) struct SafetyBackup {
     /// Its run id, carried into the audit entry so the operator can go back to it.
-    backup_id: Uuid,
+    pub backup_id: Uuid,
     /// Whether every part it tried to take landed.
-    complete: bool,
+    pub complete: bool,
     /// One sentence for the refusal.
-    summary: String,
+    pub summary: String,
 }
 
 /// Take the backup an operator can go back to, before anything is overwritten.
@@ -2100,7 +2047,7 @@ struct SafetyBackup {
 /// no explanation is a restore point an operator has to guess about, and the run is marked
 /// `protected` so the retention sweep will not quietly remove the one thing a failed restore
 /// needs.
-async fn take_safety_backup(
+pub(crate) async fn take_safety_backup(
     state: &AppState,
     source: &omnion_backup::Backup,
     actor: Uuid,
@@ -2160,7 +2107,7 @@ async fn take_safety_backup(
 }
 
 /// Write the media part back into the live library.
-async fn restore_media_part(
+pub(crate) async fn restore_media_part(
     state: &AppState,
     row: &omnion_backup::Backup,
     settings: &omnion_backup::BackupSettings,
@@ -2256,75 +2203,44 @@ pub async fn restore(
     let org = current.user.organization_id;
     let pool = state.db().pool();
     let row = omnion_backup::find_backup(pool, id, org).await?;
-    let manifest = omnion_backup::manifest_of(&row);
     let settings = omnion_backup::load_settings(pool).await?;
 
     // --- 2. The preview, rebuilt here, because the operator may be late --------------------
-    let mut evidence = read_artifacts(&manifest, &settings).await;
-    let archived = media_index_keys(&row, &settings).await;
-    let archive_keys: Vec<String> = archived
-        .as_ref()
-        .map(|objects| objects.iter().map(|o| o.storage_key.clone()).collect())
-        .unwrap_or_default();
-    let media_bytes: i64 = archived.as_ref().map_or(0, |objects| {
+    // The **same** function the preview screen and the queued worker's worker call. The
+    // operator may have been sitting on the confirmation for a minute, so a plan built from
+    // what the screen showed would restore a part that was truncated in the meantime; and
+    // because this route's refusal on an unpriceable comparison is now the *only* copy of
+    // that rule, there is no second place to forget it.
+    let priced = super::restore_jobs::rebuild_preview(&state, &row, &settings).await;
+    if priced.live_comparison_failed {
+        // A restore that cannot count the live side must not quietly proceed on zeros: the
+        // operator agreed to a price, and a price of zero they never saw is worse than an
+        // error.
+        return Err(ApiError::bad_request(
+            "live_comparison_unavailable",
+            super::restore_jobs::UNPRICED,
+        ));
+    }
+    let preview = &priced.preview;
+    let archived = priced.media_objects.as_ref();
+    // The live totals the plan is priced against, recomputed from the same evidence rather
+    // than read off the preview's own sums: `build_preview` sums the *available* parts, and
+    // the plan must be priced against everything the archive holds.
+    let live_dropped: i64 = preview.parts.iter().map(|part| part.live_dropped).sum();
+    let live_matches: i64 = preview.parts.iter().map(|part| part.live_matches).sum();
+    let media_bytes: i64 = archived.map_or(0, |objects| {
         objects.iter().map(|object| object.size_bytes.max(0)).sum()
     });
 
-    let mut live_dropped = 0;
-    let mut live_matches = 0;
-    for item in &mut evidence {
-        item.live = if item.part.part == "media" && !archive_keys.is_empty() {
-            match omnion_backup::compare_media(pool, org, &archive_keys).await {
-                Ok(comparison) => comparison.counts(),
-                Err(error) => {
-                    // A restore that cannot count the live side must not quietly render
-                    // zeros: the operator agreed to a price, and a price of zero they never
-                    // saw is worse than an error.
-                    tracing::warn!(%error, "the restore could not compare live media");
-                    return Err(ApiError::bad_request(
-                        "live_comparison_unavailable",
-                        "the live media library could not be compared with this archive, so \
-                         the restore refuses to price itself. Nothing was changed.",
-                    ));
-                }
-            }
-        } else if item.part.part == "database" {
-            match omnion_backup::compare_database(pool, item.part.item_count, org).await {
-                Ok(comparison) => comparison.counts(),
-                Err(error) => {
-                    tracing::warn!(%error, "the restore could not count live rows");
-                    omnion_backup::LiveCounts::default()
-                }
-            }
-        } else {
-            omnion_backup::LiveCounts::default()
-        };
-        live_dropped += item.live.dropped();
-        live_matches += item.live.matching.max(0);
-    }
-
-    let preview = omnion_backup::build_preview(
-        &row.id.to_string(),
-        &row.label,
-        &manifest,
-        &evidence,
-        row.finished_at.map(|at| {
-            at.format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default()
-        }),
-        OffsetDateTime::now_utc().unix_timestamp(),
-    );
-
     // --- 3. The plan, refused before anything happens ---------------------------------------
-    let (sites, sites_truncated) = archived
-        .as_ref()
-        .map_or_else(|| (Vec::new(), false), |objects| {
-            omnion_backup::archived_sites(objects, omnion_backup::MAX_REPORTED_SITES)
-        });
+    let (sites, sites_truncated) = archived.map_or_else(
+        || (Vec::new(), false),
+        |objects| omnion_backup::archived_sites(objects, omnion_backup::MAX_REPORTED_SITES),
+    );
     let facts = omnion_backup::ArchiveFacts {
         preview_parts: &preview.parts,
         media_objects: if preview.parts.iter().any(|part| part.part == "media" && part.available) {
-            archived.as_ref().map(|objects| objects.len() as i64)
+            archived.map(|objects| objects.len() as i64)
         } else {
             None
         },
@@ -2445,7 +2361,7 @@ pub async fn restore(
 /// But a run that produced five verified artifacts has *happened*, and refusing to tell the
 /// operator so because the audit insert failed is its own kind of lie. The failure is
 /// logged, which is where a person debugging it will look.
-async fn record(
+pub(crate) async fn record(
     pool: &sqlx::PgPool,
     organization_id: Option<Uuid>,
     actor: Uuid,
