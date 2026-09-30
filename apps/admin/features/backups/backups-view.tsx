@@ -47,9 +47,12 @@ import {
   ShieldAlert,
   Trash2,
   TriangleAlert,
+  Unplug,
+  X,
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { RestorePreviewPanel } from "@/features/backups/restore-preview-panel";
 import { LoadingTable } from "@/components/loading-table";
 import {
   ApiError,
@@ -58,6 +61,7 @@ import {
   fetchBackup,
   fetchBackups,
   fetchBackupStatus,
+  sweepBackups,
   verifyBackup,
 } from "@/lib/api";
 import { formatBytes } from "@/lib/format";
@@ -67,6 +71,7 @@ import type {
   BackupRun,
   BackupStatus,
   BackupStatusCounts,
+  BackupSweepReport,
 } from "@/lib/types";
 
 /** The five parts, with the icon each row carries. */
@@ -176,6 +181,11 @@ export function BackupsOverviewScreen() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<string | null>(null);
+  // The retention sweep is destructive and unattended, so the panel keeps its own state for
+  // it rather than folding it into `busy`: the two buttons must not disable each other, and a
+  // sweep that reports stranded artifacts needs a panel of its own to put them in.
+  const [sweeping, setSweeping] = useState(false);
+  const [sweep, setSweep] = useState<BackupSweepReport | null>(null);
 
   const reload = useCallback(() => {
     setLoading(true);
@@ -293,6 +303,47 @@ export function BackupsOverviewScreen() {
     }
   }
 
+  /**
+   * Run the retention sweep now, and report what it actually did.
+   *
+   * The report is kept rather than flattened into `notice`, because the three counts are
+   * three different facts: "pruned 4" and "1 of those 4 left a file behind" and "the sweep
+   * itself failed" reconcile three different ways, and a single green line can only carry
+   * one of them. A sweep that found nothing is its own sentence too — it is not a failure
+   * and not "pruned 0", and an operator who pressed the button deserves to know which.
+   */
+  async function runSweep() {
+    setSweeping(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const report = await sweepBackups();
+      setSweep(report);
+      if (report.failed > 0) {
+        setError(
+          `The retention sweep failed for ${report.failed} tenant${report.failed === 1 ? "" : "s"}. ` +
+            `Its rows are untouched; nothing was deleted.`,
+        );
+      } else if (report.candidates === 0) {
+        setNotice("Nothing to prune — no backup is past its retention window.");
+      } else {
+        setNotice(
+          `Pruned ${report.removed + report.partial} of ${report.candidates} expired ` +
+            `backup${report.candidates === 1 ? "" : "s"}: ${report.removed} fully, ` +
+            `${report.partial} with files still on the destination.`,
+        );
+      }
+      reload();
+    } catch (cause) {
+      setSweep(null);
+      setError(
+        cause instanceof ApiError ? cause.message : "The retention sweep could not be run.",
+      );
+    } finally {
+      setSweeping(false);
+    }
+  }
+
   const chips: { key: string; label: string; value: number }[] = [
     { key: "", label: "All", value: total },
     ...STATUSES.map((key) => ({
@@ -371,6 +422,74 @@ export function BackupsOverviewScreen() {
           hint={status?.destination.message ?? "Reading the destination…"}
         />
       </div>
+
+      {/*
+        The retention strip, below the cards rather than as a fifth one.
+
+        A fifth card would push the grid to five columns and shrink every number on the page
+        to make room for a button, and the button is the only part of this that is not a
+        fact about the destination. It sits under the numbers it acts on instead.
+      */}
+      <div
+        className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-panel px-4 py-3"
+        data-testid="backup-retention"
+      >
+        <div className="min-w-0">
+          <p className="text-[13px] font-medium">Retention</p>
+          <p className="mt-0.5 text-[12.5px] text-muted">
+            Expired backups are swept off the destination every six hours, and the newest
+            successful run plus anything protected are never swept. You can run it now.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={runSweep}
+          disabled={sweeping}
+          data-testid="backup-sweep"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-muted disabled:opacity-60"
+        >
+          {sweeping ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            <Unplug className="h-3.5 w-3.5" />
+          )}
+          {sweeping ? "Sweeping…" : "Run retention now"}
+        </button>
+      </div>
+
+      {sweep ? (
+        <div
+          className="rounded-xl border border-line bg-panel px-4 py-3"
+          data-testid="backup-sweep-report"
+          role="status"
+        >
+          <p className="text-[12.5px] font-medium">
+            The sweep looked at {sweep.candidates} expired backup
+            {sweep.candidates === 1 ? "" : "s"} and removed {sweep.removed} from{" "}
+            {status?.destination.local_root ?? "the destination"}.
+          </p>
+          {sweep.partial > 0 ? (
+            <p className="mt-1 text-[12.5px] text-caution">
+              {sweep.partial} row{sweep.partial === 1 ? " is" : "s are"} gone but
+              {sweep.partial === 1 ? " its" : " their"} artifacts could not all be removed.
+              They are still on the destination and have to be cleared by hand.
+            </p>
+          ) : null}
+          {sweep.stranded.length > 0 ? (
+            <ul className="mt-2 space-y-1" data-testid="backup-sweep-stranded">
+              {sweep.stranded.map((stranded) => (
+                <li key={`${stranded.backup_id}-${stranded.path}`} className="text-[12px]">
+                  <span className="font-mono text-muted">{stranded.path}</span>
+                  <span className="text-muted"> — {stranded.reason}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          <p className="mt-2 text-[12px] text-muted">
+            Run at {sweep.at}. Nothing protected and no newer successful backup was touched.
+          </p>
+        </div>
+      ) : null}
 
       {status && status.destination.encryption === "none" ? (
         <p
@@ -587,6 +706,10 @@ function BackupDetailPanel({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  // The preview is collapsed until it is asked for. A restore panel that renders itself
+  // unprompted puts five tables of numbers in front of an operator who opened a run to see
+  // its status, and the warning they needed is now one of thirty rows.
+  const [previewing, setPreviewing] = useState(false);
   return (
     <div className="rounded-xl border border-line bg-panel px-4 py-3" data-testid="backup-detail">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -628,6 +751,21 @@ function BackupDetailPanel({
             {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldAlert className="h-3 w-3" />}
             Verify
           </button>
+          {/*
+            The restore preview is offered on every run, including a `failed` one. That is
+            the point: "can I restore from this?" is the question an operator has when a run
+            went red, and hiding the button until the run is healthy answers it the wrong way
+            round. The panel reports an unrestorable run honestly instead of disappearing.
+          */}
+          <button
+            type="button"
+            onClick={() => setPreviewing((value) => !value)}
+            data-testid="backup-restore-preview"
+            className="inline-flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11.5px] text-muted"
+          >
+            {previewing ? <X className="h-3 w-3" /> : <ShieldAlert className="h-3 w-3" />}
+            {previewing ? "Hide restore preview" : "Restore preview"}
+          </button>
           <button
             type="button"
             onClick={onClose}
@@ -667,6 +805,15 @@ function BackupDetailPanel({
           ))}
         </tbody>
       </table>
+
+      {previewing ? (
+        <div className="mt-3">
+          <RestorePreviewPanel
+            backupId={detail.backup.id}
+            onClose={() => setPreviewing(false)}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }

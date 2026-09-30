@@ -11,8 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    analytics_runner, automation_runner, event_retention_runner, event_runner, publishing_runner,
-    search_runner, workflow_runner,
+    analytics_runner, automation_runner, backup_sweep_runner, event_retention_runner, event_runner,
+    publishing_runner, search_runner, workflow_runner,
 };
 use omnion_core::config::Config;
 use omnion_core::{BuildInfo, Db, RedisClient, telemetry};
@@ -148,6 +148,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // acceptance criterion names, and it claims its rows before touching a page, so a second
     // worker cannot publish the same revision twice.
     let _publishing = publishing_runner::spawn(state.clone());
+
+    // The backup retention sweep removes expired runs from the destination, artifacts first
+    // (REQ-013, slice 3). It is gated by its own flag rather than by `OMNION_RETENTION_RUNNER`
+    // because the two sweep different things: an installation that keeps every backup for
+    // ever must be able to keep its media sweeper. `prune_candidates` shipped in slice 1 and
+    // had no caller at all, so this is the tick that gives it one.
+    if state.config().retention.backup_sweep_enabled {
+        let _backup_sweep = backup_sweep_runner::spawn(state.clone());
+    } else {
+        tracing::info!(
+            "the backup retention sweep is disabled (OMNION_BACKUP_SWEEP=false) — expired runs \
+             and their artifacts stay on the destination"
+        );
+    }
 
     if state.config().analytics.runner_enabled {
         let _rollups = analytics_runner::spawn(state.clone());

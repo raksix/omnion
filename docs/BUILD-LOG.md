@@ -6201,3 +6201,209 @@ gate for REQ-064 acceptance 18 and REQ-063's 17th criterion, and it still has to
 **Next.** (a) The `/themes/<key>/customize` and `/themes/<key>/history` SCREENS — the layer they read
 is what this tick built, and the REQ's numbers 6-9 are about the screen, not the API. (b) When a slot
 holds, run `--only=featured-media` and `--only=members` to close the two open criteria.
+
+## Tick 68 — REQ-013 slice 3 (retention): the sweep had no caller
+
+**What.** `prune_candidates` shipped in slice 1 with a doc comment describing four
+exemptions, and **nothing called it**. The retention screen could list what the sweep would do
+and the walkthrough could assert the exemptions hold, and the bytes on the destination would
+accumulate for ever. Five commits: `e704c0f` the sweep, `faea0bd` the two config knobs,
+`514665c` the worker, `813f33b` the manual route, `9c8170b` the panel, `e77fd9a` the walk.
+
+**The shape of the defect is now unmistakable.** Tick 66 found a half that *counted*. Tick 67
+found a half that *scoped wrongly*. This tick found a half that **was never invoked**. Three
+ticks, three different ways for one feature to satisfy every assertion in its own tests and
+disagree with reality, and all three are the same question: *who calls this?* The delete
+knew how to take a run's artifacts off the disk; the sweep — which deletes **more** than the
+delete does, unattended, with nobody watching — had never heard of the function. That is the
+lesson worth more than the code: **a pure function with a thorough doc comment and no caller
+is the most convincing piece of dead code there is.** It reads as a feature. Its tests pass.
+Its exemption rules are correct. It does nothing at all.
+
+So `crates/backup/src/sweep.rs` is a **caller** and deliberately the only one, and it writes
+no path arithmetic of its own. Two implementations of "remove a run's directory" is how a
+destination ends up with a directory the sweep believes it deleted — the same "two halves that
+make the same mistake are not a cross-check" rule the media part taught, restated at the
+removal.
+
+Three decisions that are not obvious. **Bytes first, row second**, so an interrupted sweep
+leaves a row over an archive that is still there and the next tick takes it again. **A
+partial removal still deletes the row** — the same call the delete handler makes, because
+retention is a window and not a bulk delete, and one stuck file must not retain a run for
+ever. And the sweep walks **tenants**, not rows, through `organizations_with_backups`: a
+separate function rather than an inline `select distinct`, because a second answer to "who
+gets swept" is a rule that drifts the first time one of them is edited. `null` is a real
+member of that list — a sweep that filtered the platform's own backups away would never prune
+the restore points that matter most on a single-tenant installation.
+
+**Two flags, not one.** `OMNION_BACKUP_SWEEP` is independent of `OMNION_RETENTION_RUNNER`,
+because "never delete my backups" must not have to mean "never purge my trash"; the only way
+out otherwise is to turn the whole worker off. The six hour default is chosen from the
+feature: the shortest window the panel allows is a day and the newest successful run is exempt
+whatever it is, so hourly finds the same set six times for the same answer and nightly leaves
+a run whose day ended at 04:00 sitting there for twenty hours.
+
+**The manual route is scoped, and that is the part worth proving.** `POST
+/api/v1/backups/sweep` calls `sweep_organization` for the **caller's** tenant, never
+`sweep_all` — an operator pressing "run retention" on their own site must not delete another
+tenant's restore points. The walk creates a stranger tenant's expired run pointed at the same
+destination and requires it to keep **both** its row and its directory. The stranger is not
+decoration: without it "everything" and "this organization" are the same set, which is the
+exact blind spot the media part's tenancy fix was found through last tick. The same lesson,
+one layer up, and it is now the second time this feature needed a stranger in the fixture.
+
+The route is registered **before** `/backups/{id}`. A `POST` against `/backups/sweep` would
+otherwise match `{id}` and fail to parse `sweep` as a UUID — a 500 that reads like a router
+bug on the one route whose whole point is to be callable by hand.
+
+**Proof.** `omnion-backup --lib` **85/0** (80 before, +5 in `sweep`) · `omnion-core --lib`
+**39/0** (+2, both pinning the flag independence in both directions) · `apps/admin`
+`tsc --noEmit` clean · `the_retention_sweep_takes_the_bytes_and_spares_what_it_promised`
+**1/0 in 5.5s** over the real router and the real filesystem. That walk goes and *looks at
+the directory*, because the sweep's whole claim is about bytes and a row delete reports the
+same counts the panel shows.
+
+**Blocker, fourth tick running, unchanged and not worked around.** The browser pass did not
+run. `qa-slot.sh` is held by a live sibling (pid 142641) and the box peaked at load 23 with
+**1 GB of 32 free** and 24 GB of swap in use; `scripts/qa/run.sh` would have added a fifth
+Chromium to that. `runBackupDepth` stays written-but-unrun, so REQ-013 does not close on
+tests alone. Two toolchain facts, both recorded because each read like a product defect and neither was
+one. A **stale orphan test binary** from an earlier tick (`backups-b245d57c4aaeca51`, no
+parent shell) was holding QA database connections across ticks; killed it. And a **sibling
+deleted my `target/debug/incremental` mid-build**, which surfaces as
+`failed to move dependency graph … os error 2` — a compile failure in files that were already
+merged and building fine. The full-suite run then hung in the pre-existing
+`a_protected_backup_is_never_a_prune_candidate_and_the_newest_successful_survives` with no
+active query and no blocked lock, so I killed it, killed the orphan, rebuilt with
+`CARGO_INCREMENTAL=0` and re-ran that exact test in isolation: **1/0 in 3.19s**. It was never
+red and never broken — it was starved. Two rules, both already half-known and now confirmed:
+**build with `CARGO_INCREMENTAL=0` when siblings are live**, and **an unexplained hang with no
+database activity is contention before it is a defect**.
+
+**Next.** (a) The restore path (slice 2) now has the index a preview needs: the media index
+is written, `pending_objects_for_organization` says whose files a run may restore, and the
+sweep tells the operator what is actually on the destination. (b) The `partial` box is still
+unticked — a run where one part fails ends as `partial` with the message visible in the UI
+needs a fault injected into the drawer, not a test.
+
+
+## Tick 69 — the restore preview, and the two rules three ticks of unit tests had passed
+
+**REQ-013 slice 2a.** `GET /api/v1/backups/{id}/restore-preview` plus the panel that reads it.
+The decisions live in a pure module (`crates/backup/src/restore.rs`) so the rules are
+unit-tested with no stack, and the live-data comparison is a separate one
+(`crates/backup/src/preview.rs`) so a change in how it is counted cannot silently alter which
+warnings fire. The route re-reads every artifact, compares each part's size against the
+manifest, and prices the restore against the live library.
+
+**It found two defects in shipped code.** Both are the fourth instance of one shape — **a rule
+that is tested and that nothing obeys** — and neither was findable by a unit test, because in
+both cases the unit test was the reason it survived.
+
+**1. A media part's recorded size could never match its own artifact.** `finish_media_part`
+recorded `bytes_copied + index bytes` as `size_bytes`, with a doc comment saying that
+`size_bytes` is "what `verify_manifest` compares against the artifact on disk". That reasoning
+is backwards: `storage_path` for the media part names the **index alone**, so a size including
+the copied objects' bytes can never equal the length of that one file. The two agree only when
+`bytes_copied` is zero — which is exactly what the `verify` walk's fixture was, because that
+suite's library has no objects. So `verify` reported every real media backup as mismatched,
+for ever, and the new preview refused to offer it as a restore point. **Both verdicts were
+correct; the number was wrong.** The preview is the first reader that compares a media
+artifact's length on a run with a non-empty library.
+
+**2. `produce_all` never read `run.scopes`.** It walked all five `PARTS` unconditionally, so a
+backup requested for `["database"]` produced five artifacts: the scopes were validated by
+`normalise_scopes`, stored, normalised, and rendered in the drawer's five checkboxes, and then
+ignored at the only point that mattered. **Four existing walks request `["database"]` and none
+of them noticed**, because each asserted on the part it *wanted* rather than on the number of
+parts, and the two extra artifacts are perfectly valid files. The scope selector was a dead
+control with a green tick beside it. A consequence worth recording: a media-only run whose one
+part failed used to be `partial` — the correct verdict about four parts the operator never
+asked for — and is now honestly `failed`. `summarise` is untouched and still right; what
+changed is the set of parts it is handed.
+
+**A third finding, in the new code, from a test with a realistic id.** The typed confirmation
+sliced the first eight hex characters off the run's id. For a v4 uuid that is fine and looks
+random. For a **v7** uuid — whose leading bytes are a millisecond timestamp — "the first eight
+hex characters" is a *clock*: two backups taken three hours apart produced the identical phrase
+`RESTORE 000001a0`, and every run inside a ~50-day window shares one. A guard that restores the
+wrong run is worse than no guard, because it looks like one. The phrase is now a **hash of the
+id**, which mixes the timestamp with the random tail whatever the id's layout, and the id is
+validated first so an unnameable run still yields no phrase at all. The regression test uses two
+v7-shaped ids sharing a timestamp prefix.
+
+**Two smaller ones in my own code, both the silence class.** `LiveCounts::dropped` documented a
+zero floor that `saturating_sub` does not provide — saturating means stop at `i64::MIN`, not
+stop at zero, so an inconsistent live pair rendered as a negative loss. And the
+healthy-archive fixture stamped `now` at a round epoch (Jan 2027) that made every archive look
+107 days old, which is why the first "healthy archive" test failed on a `stale_archive`
+warning it had just proved absent.
+
+**Why the preview is behind `backup.read` and not `backup.restore`.** Reading a warning is free
+and changes nothing; gating it behind the destructive key means the first time an operator
+meets this screen is a 403 that never showed them what they were agreeing to. The expensive
+permission is for the button *after* it.
+
+**Why there is no restore button.** The safety backup, the typed confirmation's enforcement and
+the abort path are the next slice. A "Restore" button that could not be pressed is a dead
+button, which this product does not ship; the panel that explains the restore and asks for
+nothing is a working one. The phrase is **shown** rather than demanded for the same reason.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `omnion-backup --lib` | **103/0** (85 before: +18 preview model) |
+| `omnion-api --test backups` | **15/15** (12 before: +3 preview walks) |
+| `apps/admin` `tsc --noEmit` | clean |
+
+The three new walks are over the **real router and the real filesystem**. The load-bearing one
+prices a one-file archive over a two-file library at exactly **one** lost item, and then proves
+it wrote **nothing**: part rows, run status, `storage_prefix`, `finished_at`, the media rows and
+the archive's directory on the destination are all byte-identical before and after, read back
+out of **PostgreSQL** rather than from the response — a response body cannot prove the database
+was not written to, and this is the one property the whole slice exists for. The second refuses
+a truncated artifact and issues **no phrase**. The third requires a stranger's run to be a 404
+whose message does not name the tenancy rule, because `403 cross_organization` confirms the id
+exists and turns a preview into a restore-point oracle.
+
+**Toolchain, four facts, all of which read like product defects and none was one.**
+`VersionMissing(19)` on the default test database is a **stale QA database from a sibling's
+tree** — the shared migration namespace again, and the default `omnion` database carries a
+version-19 row from `omnion-w2`/`w5`/`w6`, none of which have a 0019 in this tree. The walks ran
+against a disposable `omnion_build_69` instead, which is the rule for a suite database the whole
+box shares. `cargo fmt -p omnion-backup` **rewrote five files I had not touched**; the diff was
+pure whitespace and was reverted with `git checkout --` on exactly the foreign five, which is why
+the `git diff --name-only` comparison is done by hand every tick. The doc-comment linter reports
+`async fn is not permitted in Rust 2015` on every `async` in the crate — the toolchain linter
+does not pass the edition, and `cargo build` is the authority. And a doc comment containing
+`**/` inside a Python triple-quoted string closes the string: two patches this tick failed to
+parse for that reason, and the fix is the `patch` tool, not `execute_code`.
+
+**Browser pass: still not run, fifth tick running, and the reason has changed.** It is no
+longer the `qa-slot.sh` hold recorded in tick 68. That hold is **genuinely live** — I verified
+the holder pid's parent is a running `run.sh` with a walkthrough against `:3102`, so reclaiming
+it would have been stealing another writer's slot, not fixing a stale lock. The pass queued,
+took its place, and then sat in the stack build: at 22:54 the default stack's `18080/3100/3200`
+were still not listening, `qa-artifacts/20260929-224017/` was empty, and the box was at **load
+19** with four sibling stacks (w3, w5, w6, w7) each holding three pm2 processes and Chromium
+sessions. I stopped the pass rather than add a fifth Chromium to a box already at 19, and left
+no orphans: the one remaining slot place is the sibling's, and no `omnion-qa-*` process of mine
+survived. The rule that came out of it is the one already in the ledger — **load 15+ with under
+4 GB free is a deferred pass, not a failed one** — and the discipline that matters more is that
+a deferred pass is reported as deferred. `runBackupDepth` remains written-but-unrun, so REQ-013
+does not close on tests alone, and the walkthrough extension committed in `54f305e` means there
+is a real pass waiting the moment the box has room.
+
+**Two halves making the same mistake are not a cross-check** is a general rule, not a backup
+one, and it is worth carrying out of this feature: the walkthrough's `artifact()` helper and
+`local_path_for` both resolve a prefix to a path, and had the walkthrough repeated the
+double-prefix bug this crate already fixed once, the preview would have "passed" against a
+directory no operator would ever look in.
+
+**Next.** (a) The destructive half of the restore: part selection, the mandatory safety backup
+before the first write, the enforced phrase behind `backup.restore`, abort until the import
+begins, and the `backup.restored` audit entry. (b) The `partial` box is still unticked — a run
+where one part fails needs a fault injected into the drawer, not a test. (c) The browser pass
+is queued behind a live sibling's `qa-slot.sh`; the walkthrough is extended to open the panel,
+read the price, the warnings and the phrase, so when the slot frees there is something to run.

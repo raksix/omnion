@@ -688,6 +688,16 @@ pub fn router(state: AppState) -> Router {
         post(backups::verify).layer(guards::require(&state, "backup.create"));
     let backups_delete: MethodRouter<AppState, Infallible> =
         delete(backups::delete).layer(guards::require(&state, "backup.manage"));
+    // The manual retention sweep. `backup.manage`, not `backup.create`: this removes data,
+    // and the key that lets an operator take a backup is not the key that lets one remove it.
+    // The preview is a GET that writes nothing, so it sits under `backup.read`: reading a
+    // warning is free and non-destructive, and gating it behind `backup.restore` would mean
+    // the first time an operator meets this screen is a 403 that never showed them what
+    // they were agreeing to.
+    let backups_restore_preview: MethodRouter<AppState, Infallible> =
+        get(backups::restore_preview).layer(guards::require(&state, "backup.read"));
+    let backups_sweep: MethodRouter<AppState, Infallible> =
+        post(backups::sweep).layer(guards::require(&state, "backup.manage"));
     let backup_schedules_read: MethodRouter<AppState, Infallible> =
         get(backups::list_schedules).layer(guards::require(&state, "backup.read"));
     let backup_settings_read: MethodRouter<AppState, Infallible> =
@@ -1836,9 +1846,15 @@ pub fn router(state: AppState) -> Router {
         .route("/backups", backups_read)
         .route("/backups", backups_create)
         .route("/backups/status", backups_status)
+        // Registered BEFORE `/backups/{id}` and not after it. A `POST` against
+        // `/backups/sweep` would otherwise match `{id}` and fail to parse `sweep` as a UUID
+        // — a 500 that reads like a router bug on the one route whose whole point is to be
+        // callable by hand.
+        .route("/backups/sweep", backups_sweep)
         .route("/backups/{id}", backups_detail)
         .route("/backups/{id}", backups_delete)
         .route("/backups/{id}/manifest", backups_manifest)
+        .route("/backups/{id}/restore-preview", backups_restore_preview)
         .route("/backups/{id}/verify", backups_verify)
         .route("/backup-schedules", backup_schedules_read)
         .route("/backup-settings", backup_settings_read)

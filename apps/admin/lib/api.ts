@@ -123,6 +123,8 @@ import type {
   BackupStatus,
   BackupPurge,
   BackupPurgeFailure,
+  BackupSweepReport,
+  RestorePreview,
   BackupVerification,
   MediaRetentionRunList,
   MediaRetentionRunResult,
@@ -6224,6 +6226,18 @@ export function verifyBackup(id: string): Promise<BackupVerification> {
 }
 
 /**
+ * What a restore of this run would do — without doing it.
+ *
+ * A `GET` on purpose: the preview re-reads every artifact off the destination and counts the
+ * live side, and neither of those writes anything. Putting it behind the destructive
+ * permission would mean the first time an operator meets this screen is a 403 that never
+ * showed them what they were agreeing to.
+ */
+export function previewRestore(id: string): Promise<RestorePreview> {
+  return request<RestorePreview>(`/api/v1/backups/${id}/restore-preview`, { method: "GET" });
+}
+
+/**
  * Remove a run **and the artifacts it left on the destination**.
  *
  * The returned report is the point of this call: "the row is gone" and "the bytes are gone"
@@ -6234,6 +6248,18 @@ export function verifyBackup(id: string): Promise<BackupVerification> {
  */
 export function deleteBackup(id: string): Promise<BackupPurge> {
   return request<BackupPurge>(`/api/v1/backups/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Run the retention sweep now, for this tenant.
+ *
+ * The background sweep runs every six hours, and a six hour wait is not an answer an
+ * operator can act on when the disk is filling. The full report comes back rather than a
+ * count, because "pruned 4" and "1 of those 4 left a stuck file" are two different facts and
+ * the screen renders both.
+ */
+export function sweepBackups(): Promise<BackupSweepReport> {
+  return request<BackupSweepReport>("/api/v1/backups/sweep", { method: "POST" });
 }
 
 /** The schedules table. Slice 3 adds the writes. */
