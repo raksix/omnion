@@ -1270,6 +1270,60 @@ async function runAccountingDepth(page, report) {
   note({ step: "tax-rates", ratesRendered, seededRate, defaultBadges, defaultCount });
   await shot(page, "page-accounting-tax-rates");
 
+  // ---- the invoices (slice 2) --------------------------------------------------------------
+  // The list first, with the empty state as the thing being proved: a finance screen whose first
+  // visit is a blank table is a screen nobody believes works.
+  await page.goto(`${URL_ADMIN}/accounting/invoices`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1700);
+  const invoiceNavLink = (await page.locator("[data-qa-accounting-module-link='invoices']").count()) === 1;
+  const invoiceListRendered = (await page.locator("[data-qa-accounting-invoices]").count()) === 1;
+  const newButton = (await page.locator("[data-qa-accounting-invoice-new]").count()) === 1;
+  const sweepButton = (await page.locator("[data-qa-accounting-sweep]").count()) === 1;
+  const statusTabs = await page.locator("[data-qa-accounting-invoice-tab]").count();
+  note({
+    step: "invoice-list",
+    invoiceNavLink,
+    invoiceListRendered,
+    newButton,
+    sweepButton,
+    statusTabs,
+  });
+  await shot(page, "page-accounting-invoices");
+
+  // The form: a line's live total has to be *watched* changing, and the save button has to be
+  // disabled while no line is usable — otherwise a blank grid is one click away from a document.
+  await page.goto(`${URL_ADMIN}/accounting/invoices/new`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1500);
+  const formRendered = (await page.locator("[data-qa-accounting-invoice-form]").count()) === 1;
+  const saveDisabledEmpty = (await page
+    .locator("[data-qa-accounting-invoice-save]")
+    .first()
+    .isDisabled()
+    .catch(() => false)) === true;
+  await page
+    .locator("[data-qa-accounting-invoice-line-description='0']")
+    .first()
+    .fill("Consultancy, day rate", { timeout: 5000 })
+    .catch(() => {});
+  await page.locator("[data-qa-accounting-invoice-line-qty='0']").first().fill("2", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-qa-accounting-invoice-line-unit='0']").first().fill("100", { timeout: 4000 }).catch(() => {});
+  await page.locator("[data-qa-accounting-invoice-line-tax='0']").first().fill("20", { timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  // 2 x 100 at 20% is 240.00 — and the whole point of the preview is that it is the server's
+  // figure, so a mismatch here is a defect in the shared arithmetic order, not in the form.
+  const previewTotal = (await page
+    .locator("[data-qa-accounting-invoice-preview-total]")
+    .first()
+    .innerText()
+    .catch(() => "")).trim();
+  const saveEnabledWithLine = (await page
+    .locator("[data-qa-accounting-invoice-save]")
+    .first()
+    .isDisabled()
+    .catch(() => true)) === false;
+  note({ step: "invoice-form", formRendered, saveDisabledEmpty, previewTotal, saveEnabledWithLine });
+  await shot(page, "page-accounting-invoice-form");
+
   // ---- mobile ------------------------------------------------------------------------------
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`${URL_ADMIN}/accounting/journal`, { waitUntil: "domcontentloaded" }).catch(() => {});
@@ -1278,8 +1332,20 @@ async function runAccountingDepth(page, report) {
     .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
     .catch(() => -1);
   const mobileNavReachable = (await page.locator("[data-qa-accounting-module-nav]").count()) === 1;
-  note({ step: "mobile", overflow: mobileOverflow, navReachable: mobileNavReachable });
-  await shot(page, "mobile-accounting-journal");
+  // The invoice list at 390 is the spec's own mobile box, and it is the one that can actually
+  // overflow: eight columns of currency in a table the screen has to scroll sideways.
+  await page.goto(`${URL_ADMIN}/accounting/invoices`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1400);
+  const mobileInvoiceOverflow = await page
+    .evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+    .catch(() => -1);
+  note({
+    step: "mobile",
+    overflow: mobileOverflow,
+    navReachable: mobileNavReachable,
+    mobileInvoiceOverflow,
+  });
+  await shot(page, "mobile-accounting-invoices");
   await page.setViewportSize({ width: 1440, height: 900 });
 
   return {

@@ -19,12 +19,13 @@
  */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BookOpen, Percent, ScrollText } from "lucide-react";
+import { BookOpen, Percent, ReceiptText, ScrollText } from "lucide-react";
 
 const LINKS: { href: string; label: string; icon: typeof BookOpen }[] = [
   { href: "/accounting/journal", label: "Journal", icon: ScrollText },
   { href: "/accounting/accounts", label: "Chart of accounts", icon: BookOpen },
   { href: "/accounting/tax-rates", label: "Tax rates", icon: Percent },
+  { href: "/accounting/invoices", label: "Invoices", icon: ReceiptText },
 ];
 
 export function AccountingModuleNav() {
