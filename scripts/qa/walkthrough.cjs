@@ -9904,8 +9904,25 @@ async function main() {
       "editorNarrowAt390", "editorReadOnlyAt390", "noPublishControlAt390",
       "canvasDrawnAt390", "canvasCountMatchesStatus", "editorNoHorizontalScrollAt390",
       "narrowNoticeSaysWhy", "narrowNoticeOffersPreview", "publicRendered",
+      // Slice 4's media panel. `mediaSimulateControls` is demanded even when it is 0: a page
+      // whose draft has no uploaded image legitimately has no row to simulate, and the absence
+      // is an answer. What is NOT allowed is a summary that stays silent about whether the
+      // panel was ever opened, because a silently-unmeasured screen is the one failure this
+      // demanded-keys mechanism exists to prevent.
+      "mediaPanelOpened", "mediaFileCount", "mediaBrokenCount", "mediaRows",
+      "mediaEmptyStateExplained", "mediaSimulateControls",
     ];
     const missing = flags.filter((f) => be[f] === undefined);
+    // The simulation readings are conditional on there being something to simulate, exactly as
+    // `warningReachable` is conditional on a warning existing: an absent check whose
+    // precondition was not met is a fact, not a gap. Read AFTER `missing` is declared — a
+    // push into it above that line is a use-before-declaration, which `node --check` passes and
+    // `check-tdz.cjs` exists to catch.
+    if (be.mediaSimulateControls > 0 && be.mediaSimulationChangedTheRender === undefined) {
+      missing.push("mediaSimulationChangedTheRender");
+      missing.push("mediaSimulated");
+      missing.push("mediaSimulatedPressed");
+    }
     if (be.warningJumpOffered === true && be.warningReachable === undefined) {
       missing.push("warningReachable");
     }
@@ -12817,6 +12834,74 @@ async function runBlockEditorDepth(page, report) {
     await page.locator("[data-block-preview-viewport=desktop]").first().click({ timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(1800);
     note("switched the frame between screens");
+
+    // ---- The media panel and its deletion simulation (REQ-063 slice 4) ----------------------
+    //
+    // The panel is the only place the degradation is *explained*; the frame is where it is
+    // drawn. So the pass opens it, reads the server's own counts, and then actually runs the
+    // simulation — because the button existing is not the same claim as the button working, and
+    // the one failure that matters here is silent: a simulation that quietly does nothing draws
+    // exactly the same page as before.
+    await page.locator("[data-block-media-toggle]").first().click({ timeout: 8000 }).catch(() => {});
+    await page.waitForSelector("[data-block-media-panel]", { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    steps.mediaPanelOpened = (await page.locator("[data-block-media-panel]").count()) > 0;
+    steps.mediaFileCount = await statusAttr("data-block-media-file-count");
+    steps.mediaBrokenCount = await statusAttr("data-block-media-broken-count");
+    steps.mediaRows = await page.locator("[data-block-media-row]").count().catch(() => 0);
+    // The counts are the server's and they are about FILES; the rows are references. A gallery
+    // that names one dead file twice is one broken file and two rows, so a walk that demanded
+    // rows === broken would be demanding a bug. What it does demand is that a page with no
+    // images says so rather than drawing an empty list.
+    steps.mediaEmptyStateExplained =
+      steps.mediaRows === 0
+        ? (await page.locator("[data-block-media-empty]").count()) > 0
+        : true;
+    await shot(page, "page-block-media-panel");
+
+    // The simulation: name a live file as deleted, and the frame must draw the degraded page
+    // and SAY it is simulating. Both halves are read, because a panel that showed the degraded
+    // page without the note would be reporting a fact about the library that is not true.
+    const simulate = page.locator("[data-block-media-simulate]").first();
+    steps.mediaSimulateControls = await page
+      .locator("[data-block-media-simulate]")
+      .count()
+      .catch(() => 0);
+    if ((await simulate.count()) > 0) {
+      const targetId = await simulate.getAttribute("data-block-media-simulate", { timeout: 5000 });
+      const beforeText = (await page
+        .locator("[data-block-preview-frame]")
+        .first()
+        .innerText({ timeout: 8000 })
+        .catch(() => "")) || "";
+      await simulate.click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(2200);
+      steps.mediaSimulated = await page
+        .locator("[data-block-media-simulating]")
+        .count()
+        .catch(() => 0);
+      steps.mediaSimulatedPressed = (await page
+        .locator("[data-block-media-simulate]").first()
+        .getAttribute("aria-pressed", { timeout: 5000 })
+        .catch(() => null)) === "true";
+      const afterText = (await page
+        .locator("[data-block-preview-frame]")
+        .first()
+        .innerText({ timeout: 8000 })
+        .catch(() => "")) || "";
+      // A simulation that changed nothing at all would leave the frame's text identical, and
+      // there is no flag on screen that distinguishes that from a page with no images at all.
+      steps.mediaSimulationChangedTheRender = beforeText !== afterText;
+      steps.mediaSimulatedId = targetId;
+      await shot(page, "page-block-media-simulated");
+      // Put it back, or the rest of the pass measures a page the author never saved.
+      await page
+        .locator("[data-block-media-simulate]")
+        .first()
+        .click({ timeout: 8000 })
+        .catch(() => {});
+      await page.waitForTimeout(1800);
+    }
 
     // Inline editing: the toggle makes the page's own text editable, a keystroke marks the page
     // dirty, and the save names the revision the server actually wrote.
