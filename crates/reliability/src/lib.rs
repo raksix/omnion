@@ -38,6 +38,7 @@ pub mod error;
 pub mod idempotency;
 pub mod idem_store;
 pub mod intake;
+pub mod intake_store;
 pub mod limiter_redis;
 pub mod limits;
 pub mod retry;

@@ -55,6 +55,22 @@ pub enum ReliabilityError {
 }
 
 impl ReliabilityError {
+    /// The underlying `sqlx::Error`, when this is a database failure.
+    ///
+    /// Exists so a caller can inspect the SQLSTATE without this error type re-declaring the
+    /// reasons a query can fail. The intake store's `insert` wraps a `23505` here, and the
+    /// route that has to turn it into "that path is already declared" cannot see the code from
+    /// the outside — which is the exact shape of a bug where a name collision answers `500`.
+    #[must_use]
+    pub fn database_error(&self) -> Option<&sqlx::Error> {
+        match self {
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl ReliabilityError {
     /// Stable, machine-readable code for this failure.
     ///
     /// Every string here is one of [`crate::vocabulary::ERROR_CODES`] or a general API error,
