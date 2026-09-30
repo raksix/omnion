@@ -138,6 +138,13 @@ import {
   nextFocusable,
   shouldWalkCanvas,
 } from "./canvas-walk";
+import {
+  cardAnnouncement,
+  linkAnnouncement,
+  lockAnnouncement,
+  saveAnnouncement,
+  selectionAnnouncement,
+} from "./builder-a11y";
 
 /** The snap grid the canvas draws and drops onto. */
 const GRID = 8;
@@ -1876,10 +1883,21 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
           toolbar down is a banner that moves the buttons the author is looking for, and the
           criterion's "no control is unreachable" is easier to honour when the layout below
           never moves. */}
+      {/* The narrow-screen lock, announced whether or not the banner is on screen.
+          The banner itself is mounted only while `locked` is true, and a `role="status"` that
+          appears *with* its text is not announced — so the one moment that matters (a narrow
+          screen, which is usually narrow *before* the page loads) was the one moment a reader
+          heard nothing. The region below is permanent and its text changes, and the sentence
+          names the way out, because a lock with no announced exit is the same dead end the
+          criterion forbids with a mouse. */}
+      <LiveRegion
+        announcement={lockAnnouncement(locked, LOCK_BANNER.tableModeLabel)}
+        className="absolute left-0 top-0"
+        dataName="lock-region"
+      />
       {locked ? (
         <div
           className="flex flex-wrap items-center gap-2 border-b border-line bg-quiet-soft px-3 py-2 text-[12.5px]"
-          role="status"
           data-builder-lock-banner
         >
           <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
@@ -2385,6 +2403,20 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
                   data-node-selected={isSelected ? "true" : "false"}
                   role="button"
                   tabIndex={-1}
+                  // The card's name, for a reader. A `role="button"` whose only text is a
+                  // truncated label announces "Send mail, button" — no node type, no
+                  // parameters, and nothing when a Tab moves the selection, because an
+                  // outline is a CSS class and not a text change. The announcement is built by
+                  // `cardAnnouncement` rather than written here, so the canvas, the palette
+                  // and the problems panel cannot drift into three vocabularies for one node.
+                  aria-label={cardAnnouncement({
+                    label: node.label,
+                    nodeType: node.type,
+                    kindLabel: nodeType?.category ?? null,
+                    params: node.params,
+                    selected: selection.focus === node.id,
+                    partOfGroup: selection.nodes.includes(node.id),
+                  })}
                 >
                   <div className="flex items-center gap-1.5 px-2.5 pt-2">
                     <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted" aria-hidden="true" />
@@ -2460,9 +2492,14 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               {linkDraft.port} — click a target node, or press Escape.
             </p>
           ) : null}
+          {/* The connection outcome, in two layers. The visible paragraph is what the mouse
+              author reads, and it is still mounted conditionally — which is fine, because the
+              *visible* half does not have to announce anything. The region below it is what
+              the reader hears, and it is permanent: a live region that appears together with
+              its text is not announced at all, so a refusal rendered exactly when it happens
+              is the one message in this file a screen reader would never hear. */}
           {linkNotice ? (
             <p
-              role="status"
               className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-md border px-2.5 py-1 text-[12px] shadow-sm"
               style={{
                 borderColor: linkNotice.tone === "error" ? "var(--color-accent)" : "var(--color-line)",
@@ -2474,6 +2511,20 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               {linkNotice.text}
             </p>
           ) : null}
+          <LiveRegion
+            announcement={linkAnnouncement(linkNotice)}
+            className="absolute bottom-3 left-1/2"
+            dataName="link-region"
+          />
+          {/* The selection, spoken. A selected card's outline is a CSS class, so a selection
+              that moved is not a text change anywhere on the page — without this the only
+              signal a reader gets for the whole Tab walk is the card's own name changing,
+              which is not a live announcement and on a 200-node graph should not be one. */}
+          <LiveRegion
+            announcement={selectionAnnouncement(selection)}
+            className="absolute bottom-3 left-1/2"
+            dataName="selection-region"
+          />
         </div>
 
         {/* ---- inspector ---- */}
@@ -2627,7 +2678,20 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
 // Pieces
 // ---------------------------------------------------------------------------------------------
 
-/** The toolbar's save state, which is the toolbar's honesty. */
+/**
+ * The toolbar's save state, which is the toolbar's honesty.
+ *
+ * **The region is permanent and only its text changes.** It used to return a *different
+ * element* per state — one `<span>` for `dirty`/`saving`/`saved`, another for `conflict` that
+ * was the only one carrying `role="alert"`, a third for `error`. A live region is announced
+ * when its content changes *while it is already in the accessibility tree*, so
+ * `dirty → saving → saved` swapped the node three times and said nothing at all, and the one
+ * branch that could interrupt was `conflict` — the branch that only appears after a second
+ * tab has already overwritten the author. The only state-specific part now is `aria-live` on
+ * the container, which a live-region role is allowed to carry and which does not remove the
+ * region: `polite` for the three everyday transitions, `assertive` for the two that mean
+ * work was or is being lost.
+ */
 function SaveIndicator({
   state,
   onReload,
@@ -2637,50 +2701,59 @@ function SaveIndicator({
   onReload: () => void;
   onKeepMine: () => void;
 }) {
+  const announced = saveAnnouncement({
+    kind: state.kind,
+    version: state.kind === "conflict" ? state.version : null,
+    message: state.kind === "conflict" || state.kind === "error" ? state.message : undefined,
+  });
   if (state.kind === "conflict") {
-    // Two exits, and both of them work. The server's message offers the author a choice —
-    // "reload to see their change, or keep editing to overwrite it" — and until this tick
-    // only the first half was real: the tab kept quoting the version it had loaded, so every
-    // later save was refused again and "keep editing" was a sentence describing a dead end.
-    // Overwriting is the destructive half, so it is behind a confirm that names what it
-    // destroys; a one-click "overwrite" would be the same silent loss the criterion exists
-    // to prevent, one click earlier.
+    // The server's sentence offers the author a choice — "reload to see their change, or
+    // keep editing to overwrite it" — and until this tick only the first half was real: the
+    // tab kept quoting the version it had loaded, so every later save was refused again and
+    // "keep editing" was a sentence describing a dead end. Overwriting is the destructive
+    // half, so it is behind a confirm that names what it destroys; a one-click "overwrite"
+    // would be the same silent loss the criterion exists to prevent, one click earlier.
     const resolution = resolveConflict({ message: state.message, version: state.version });
     return (
-      <span
-        className="flex items-center gap-2 rounded-md bg-accent-soft px-2.5 py-1 text-[12px] text-ink"
-        data-save-state="conflict"
-        role="alert"
-      >
-        <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
-        {state.message}
-        <button
-          type="button"
-          onClick={onReload}
-          className="rounded border border-ink px-1.5 py-0.5 text-[11.5px]"
-          data-save-reload
+      <>
+        <LiveRegion announcement={announced} className="absolute left-0 top-0" dataName="save-region" />
+        <span
+          className="flex items-center gap-2 rounded-md bg-accent-soft px-2.5 py-1 text-[12px] text-ink"
+          data-save-state="conflict"
         >
-          Reload
-        </button>
-        {resolution.requiresConfirmation ? (
+          <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+          {state.message}
           <button
             type="button"
-            onClick={onKeepMine}
+            onClick={onReload}
             className="rounded border border-ink px-1.5 py-0.5 text-[11.5px]"
-            data-save-keep-mine
-            title={resolution.confirmLabel}
+            data-save-reload
           >
-            {resolution.confirmLabel}
+            Reload
           </button>
-        ) : null}
-      </span>
+          {resolution.requiresConfirmation ? (
+            <button
+              type="button"
+              onClick={onKeepMine}
+              className="rounded border border-ink px-1.5 py-0.5 text-[11.5px]"
+              data-save-keep-mine
+              title={resolution.confirmLabel}
+            >
+              {resolution.confirmLabel}
+            </button>
+          ) : null}
+        </span>
+      </>
     );
   }
   if (state.kind === "error") {
     return (
-      <span className="rounded-md bg-accent-soft px-2.5 py-1 text-[12px] text-ink" data-save-state="error">
-        {state.message}
-      </span>
+      <>
+        <LiveRegion announcement={announced} className="absolute left-0 top-0" dataName="save-region" />
+        <span className="rounded-md bg-accent-soft px-2.5 py-1 text-[12px] text-ink" data-save-state="error">
+          {state.message}
+        </span>
+      </>
     );
   }
   const text =
@@ -2692,13 +2765,72 @@ function SaveIndicator({
           ? "Saved"
           : "Saved";
   return (
+    <>
+      <LiveRegion announcement={announced} className="absolute left-0 top-0" dataName="save-region" />
+      <span
+        className={`rounded-md px-2.5 py-1 text-[12px] ${
+          state.kind === "dirty" ? "bg-caution-soft text-caution" : "text-muted"
+        }`}
+        data-save-state={state.kind}
+      >
+        {text}
+      </span>
+    </>
+  );
+}
+
+/**
+ * A live region that is always in the tree, and says only when it is told something to say.
+ *
+ * **This is the *only* live region in the builder.** There was a `SaveRegion` next to this
+ * one for one commit, which is the drift this file exists to stop arriving by a different
+ * route: two components with the same role and different rules, one of which would have kept
+ * a stale `politeness` while the other was updated. A guard counting `role="status"` in the
+ * source is what turned "two" into a red test rather than a code review nobody does.
+ *
+ * **The `nonce` is the part that is easy to leave out and impossible to notice.** A live
+ * region re-announces on a *change* of its content, so the same refusal twice in a row is
+ * byte-identical DOM and therefore silent — and the same refusal twice is a real thing an
+ * author does, because the first press did not look like it took. The nonce rides on a
+ * `data-` attribute rather than in the text, so the accessible text is untouched and the
+ * author can still see from the DOM that the region changed. Putting it *in* the text would
+ * mean a reader saying a marker character, which is worse than the silence it fixes.
+ *
+ * Visually hidden rather than `display: none` or `hidden`: both remove the element from the
+ * accessibility tree, which is the same defect as not rendering it.
+ */
+function LiveRegion({
+  announcement,
+  className,
+  dataName,
+}: {
+  announcement: {
+    text: string;
+    politeness: "assertive" | "polite";
+    nonce?: number;
+    empty?: boolean;
+  };
+  className: string;
+  dataName: string;
+}) {
+  const empty = announcement.empty ?? announcement.text === "";
+  return (
     <span
-      className={`rounded-md px-2.5 py-1 text-[12px] ${
-        state.kind === "dirty" ? "bg-caution-soft text-caution" : "text-muted"
-      }`}
-      data-save-state={state.kind}
+      role="status"
+      aria-live={announcement.politeness}
+      aria-atomic="true"
+      data-live-region={dataName}
+      data-live-nonce={announcement.nonce ?? 0}
+      className={`h-px w-px overflow-hidden whitespace-nowrap ${className}`}
+      style={{
+        clip: "rect(0 0 0 0)",
+        clipPath: "inset(50%)",
+        margin: "-1px",
+        padding: 0,
+        border: 0,
+      }}
     >
-      {text}
+      {empty ? "" : announcement.text}
     </span>
   );
 }
