@@ -26,6 +26,7 @@
  > clone areas have never executed, and for the fourth tick running the box has had no room
  > (QA slot held by a live sibling; `/mnt/apopic` at 100%, load 13–16)
 > · **Captured:** 2026-09-25 ·
+ **Browser gate unblocked at tick 76**: three consecutive ticks closed with "the slot is held", and the cause was never the box — it was the harness, which had two authors. Merging `origin/main` (13 commits) produced four conflicts, three in the QA harness, and resolving the qa-slot holder-format conflict naively would have introduced a defect neither branch had a test for: main's `awk '{print $NF}'` reader returns the OWNER on this branch's two-field line, so the reaper would `kill` a live pass while inspecting it. Fields are now read by position, and `scripts/qa/qa-slot-parse-test.sh` (8/8, six consecutive runs; both reader mutants caught) is the test that had never existed. The pass itself has still not run this tick — the slot is free and the gate is next.
 > **Layer:** platform
 > **Source:** owner brief — platform feature pool (2026-09-25)
 
