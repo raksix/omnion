@@ -126,6 +126,24 @@ pub enum AiHubError {
     /// that is invalid is a key they typed. Every message names the field and its rule.
     #[error("invalid identity: {0}")]
     InvalidIdentity(String),
+    /// An approval request, a decision or a class policy breaks one of the gate's own rules
+    /// (REQ-101).
+    ///
+    /// Its own code, for the same reason `InvalidIdentity` has one: the refusal belongs on a
+    /// *field* of the approval form — a class nobody has heard of, an expiry of zero, a
+    /// rejection with no reason — and a client that maps it onto `invalid_tool` or
+    /// `invalid_run` would print the wrong sentence above the wrong input. Every message names
+    /// the field and the rule it broke.
+    #[error("invalid approval: {0}")]
+    InvalidApproval(String),
+    /// No approval carries that id in this organization.
+    ///
+    /// `NotFound`, never a 403, and that is a tenancy property rather than a preference: an
+    /// approval id that exists in another tenant must not be confirmable by its status code, or
+    /// the inbox becomes an existence oracle for every approval in the installation — including
+    /// the ones that name a page somebody is about to delete.
+    #[error("no approval `{0}` in this organization")]
+    ApprovalNotFound(Uuid),
     /// No identity carries that id in this organization.
     ///
     /// `NotFound` rather than a 403, and that is a tenancy property rather than a preference:
@@ -216,6 +234,8 @@ impl AiHubError {
             // that mapped it onto the tool's code would print "the tool is invalid" above a
             // permission cell.
             Self::InvalidIdentity(_) => "invalid_identity",
+            Self::InvalidApproval(_) => "invalid_approval",
+            Self::ApprovalNotFound(_) => "approval_not_found",
             Self::IdentityNotFound(_) => "identity_not_found",
             Self::IdentityConflict(_) => "identity_conflict",
             Self::CapabilityUnsupported { .. } => "capability_unsupported",

@@ -16,6 +16,7 @@
 
 pub mod agent;
 pub mod agent_sdk;
+pub mod approvals;
 pub mod catalog;
 pub mod catalogue;
 pub mod ops_binding;
