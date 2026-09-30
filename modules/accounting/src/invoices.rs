@@ -961,8 +961,80 @@ pub async fn send_invoice(
     .execute(&mut *tx)
     .await?;
 
+    // Issuing is the moment the sales desk's "Create invoice draft" becomes a document with a
+    // number, and this is the only place that can be true. Without it the handoff stays `draft`
+    // forever, `sales_invoice_handoffs.external_id` is never written by anybody, and the order
+    // screen's "Open the invoice" link — which the sales module renders as soon as the column is
+    // set — is unreachable markup. The schema already says so: `state <> 'issued' or external_id
+    // is not null` means `issued` is a state nothing may write, which is a constraint describing
+    // a missing half rather than a rule.
+    if let Some(order_id) = invoice.order_id {
+        settle_sales_handoff(&mut tx, organization_id, order_id, invoice_id, &invoice.number).await?;
+    }
+
     tx.commit().await?;
     get_invoice(pool, organization_id, invoice_id).await
+}
+
+/// Point the sales module's handoff row at the document that answered it.
+///
+/// **The handoff is the join between two modules, and this is the only statement that closes it.**
+/// It is written from accounting rather than from sales because accounting is where the document
+/// becomes real: sales raised a *request* to be invoiced, and only the module that issues a
+/// number knows which number it was. Written the other way, sales would have to poll for a
+/// document nobody had told it about.
+///
+/// The URL is built here, in the module that owns the route, rather than stored by the caller —
+/// `external_url` is a path into `/accounting/invoices/{id}`, and a stored absolute URL rots the
+/// moment the panel is mounted somewhere else. `settled_at` is the time of the issue rather than
+/// `now()` at read time, so "how long was this order waiting for an invoice" is answerable.
+///
+/// A voided handoff is deliberately **not** re-settled: `where state <> 'void'` is implied by the
+/// partial unique index the handoff already carries, and re-pointing a voided row at a new
+/// document would rewrite the history of why the first one was abandoned.
+async fn settle_sales_handoff(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    organization_id: Uuid,
+    order_id: Uuid,
+    invoice_id: Uuid,
+    invoice_number: &str,
+) -> Result<()> {
+    let settled: Option<(String,)> = sqlx::query_as(
+        "update sales_invoice_handoffs \
+            set state = 'issued', external_id = $3, external_url = $4, settled_at = now() \
+          where organization_id = $1 and order_id = $2 and state = 'draft' \
+        returning state",
+    )
+    .bind(organization_id)
+    .bind(order_id)
+    .bind(invoice_id)
+    .bind(format!("/accounting/invoices/{invoice_id}"))
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if let Some((state,)) = settled {
+        // The order's own column is what the list filters on, and it must agree with the handoff
+        // in the same transaction: a sales screen reading `issued` while the handoff still says
+        // `draft` is the disagreement this row exists to prevent.
+        sqlx::query(
+            "update sales_orders set invoice_state = 'issued', updated_at = now() \
+              where id = $1 and organization_id = $2 and status <> 'cancelled'",
+        )
+        .bind(order_id)
+        .bind(organization_id)
+        .execute(&mut **tx)
+        .await?;
+
+        tracing::info!(
+            organization_id = %organization_id,
+            order_id = %order_id,
+            invoice_id = %invoice_id,
+            invoice_number = %invoice_number,
+            handoff_state = %state,
+            "sales invoice handoff settled by an issued invoice"
+        );
+    }
+    Ok(())
 }
 
 /// Void an invoice, keeping its number.
@@ -1037,6 +1109,34 @@ pub async fn void_invoice(
         .bind(organization_id)
         .execute(&mut *tx)
         .await?;
+
+        // The handoff has to be released in the same transaction as the order, or the sales
+        // screen reads `none` on the order and `issued` on the handoff it renders underneath —
+        // two widgets on one screen disagreeing, which is worse than either being wrong alone.
+        //
+        // The handoff goes back to `draft`, not to `void`. `void` means "this delivery was
+        // abandoned and will never be invoiced" and is what a *cancelled order* sets; here the
+        // document existed and was withdrawn, so the honest state is the one it started in, with
+        // the id and the URL cleared so nothing links to a voided document. The withdrawer's
+        // reason lives on the invoice itself, which is the document it describes — copying it
+        // here would put a second copy of a money sentence in a module that did not write it.
+        sqlx::query(
+            "update sales_invoice_handoffs \
+                set state = 'draft', external_id = null, external_url = null, settled_at = null \
+              where organization_id = $1 and order_id = $2 and state = 'issued' and external_id = $3",
+        )
+        .bind(organization_id)
+        .bind(order_id)
+        .bind(invoice_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tracing::info!(
+            organization_id = %organization_id,
+            order_id = %order_id,
+            invoice_id = %invoice_id,
+            "sales invoice handoff released by a voided invoice"
+        );
     }
 
     tx.commit().await?;
