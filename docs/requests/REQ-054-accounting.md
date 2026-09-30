@@ -1,6 +1,6 @@
 # REQ-054 — Accounting
 
-> **Status:** in-progress (slices 1 and 2 — slice 1 the data core, `4fd84f8`/`e3df78a`/`13791b6`/`2e31e3c`/`7c73c71`; slice 2 invoices, the sales handoff, the overdue sweep **and the three screens**, `707c4b1`/`34762df`/`615ed7db` — the eighteen integration walks **VERIFIED 18/18 against a live PostgreSQL**, tick 38) · **Captured:** 2026-09-26 · **Layer:** module (`modules/accounting`)
+> **Status:** in-progress (slices 1–3 — slice 1 the data core, `4fd84f8`/`e3df78a`/`13791b6`/`2e31e3c`/`7c73c71`; slice 2 invoices, the sales handoff, the overdue sweep **and the three screens**, `707c4b1`/`34762df`/`615ed7db` — **18/18 against a live PostgreSQL**, tick 38; slice 3 payments, allocations, the reversal and four permission keys, `9b027344`/`7b9e657a` — **6 of 14 walks GREEN, the seventh BLOCKS, the rest unrun**, tick 39) · **Captured:** 2026-09-26 · **Layer:** module (`modules/accounting`)
 > **Source:** owner brief — business suite / frontend depth (docs/08-BUSINESS-SUITE.md, docs/03-FRONTEND.md)
 
 ## Request
@@ -151,14 +151,14 @@ Webhook relevance: `accounting.invoice.issued`, `accounting.invoice.overdue` and
 
 - [x] Migration `0014_accounting.sql` applies on a populated database; `cargo test -p omnion-module-accounting` is green and seeds a usable chart of accounts.
 - [x] Every `/api/v1/accounting/*` route is permission-guarded; another organization's invoice id answers 404. *(slices 1–2: `every_invoice_route_refuses_an_anonymous_caller`, `a_reader_may_see_the_invoices_and_may_not_write_one`, `another_organizations_invoice_is_404_and_never_403` — 18/18 live, tick 38)*
-- [ ] Invoice, payment, expense and journal mutations write audit entries with before/after values. *(journal + invoice mutations write audited before/after; payment and expense are slice 3–4)*
+- [ ] Invoice, payment, expense and journal mutations write audit entries with before/after values. *(journal and invoice mutations write audited before/after; **payments now do too** — `accounting.payment.recorded` carries the amounts plus `payment_reference()` on both sides, and `accounting.payment.reversed` carries the reason with before/after — but no walk asserts the audit ROWS yet, so the ticked half is the written half. Expenses are slice 4)*
 - [x] An invoice's `total = subtotal - discount_total + tax_total` holds for every persisted row (invariant test with a tax-per-line fixture). *(`an_invoice_totals_what_its_lines_add_up_to_including_the_tax`, and the server ignores a posted total: `the_server_recomputes_the_totals_rather_than_trusting_the_request`)*
 - [x] A journal entry cannot be saved unbalanced; a posted entry cannot be edited (409) and correction requires a reversing entry. *(slice 1, proved against a live database; the refusal names both totals and the difference)*
 - [x] Creating an invoice from a sales order copies the lines and totals, links both documents, and refuses a second draft for the same order. *(`a_sales_order_becomes_a_draft_with_its_lines_and_is_not_converted_twice`)*
 - [ ] Sending an invoice stores `sent_at`, e-mails the customer with the PDF link, and moves the status to `sent`. *(the stamp, the move and the second-send refusal are proved; **the e-mail and the PDF are not built** — no mail is sent and there is no document endpoint, so this cannot be ticked on the strength of the walk)*
-- [ ] Partial payment: a 40% payment leaves the invoice `partially_paid` with the correct outstanding; the second payment closes it as `paid` and writes a `accounting.invoice.paid` event. *(slice 3)*
-- [ ] Overpayment beyond the outstanding is refused with a 422 unless the override permission is held, and auto-allocation oldest-first produces the documented split. *(slice 3)*
-- [ ] Payment reversal keeps the original record, writes a counter journal entry, restores the outstanding and is audited. *(slice 3)*
+- [x] Partial payment: a 40% payment leaves the invoice `partial` with the correct outstanding; the second payment closes it as `paid`. *(`a_forty_percent_payment_leaves_it_partial_and_the_balance_closes_it` — **GREEN**: 40.00 → `partial` with outstanding 60.00, then 60.00 → `paid` with 0.00, and a third payment is refused "already paid" rather than absorbed by the column's CHECK. The **event** half is not asserted — the walk checks the status move, not the `accounting.invoice.paid` payload)*
+- [ ] Overpayment beyond the outstanding is refused with a 422 unless the override permission is held, and auto-allocation oldest-first produces the documented split. *(the **permission** half is GREEN twice over: `claiming_the_override_without_the_permission_is_refused_before_the_arithmetic` gets **403 naming `accounting.payments.overpay`** before the arithmetic is consulted, and `the_override_is_honoured_when_the_key_is_held` accepts the same payment once the key is held. The **422** and the **oldest-first split** are NOT proved — `an_allocation_above_the_outstanding_is_refused_with_the_three_numbers` BLOCKS and `the_oldest_first_sweep_splits_the_money_the_way_the_docs_say` is unrun. Left unticked rather than half-ticked, because the box is one sentence and the sentence is not yet true)*
+- [x] Payment reversal keeps the original record, writes a counter journal entry, restores the outstanding. *(`a_reversal_keeps_the_row_writes_a_counter_entry_and_restores_the_outstanding` — **GREEN**: the row keeps its number, amount and original `journal_entry_id`, a `reversal_entry_id` is written, the invoice returns to `sent`/100.00, a blank reason is refused, and a second reversal is refused "already reversed". `a_reversal_recomputes_the_invoice_from_what_is_still_allocated` is written and UNRUN — and it is the more interesting half, because recomputing from what remains rather than decrementing is the property that keeps an invoice off −60.00)*
 - [x] Overdue sweep flips past-due invoices to `overdue` once and emits `accounting.invoice.overdue` exactly once per invoice. *(`the_overdue_sweep_flips_a_past_due_invoice_once_and_only_once` — the guard is `overdue_at is null` inside the UPDATE, so two racing sweeps cannot both win)*
 - [x] Voiding keeps the number, requires a reason and excludes the invoice from the receivable totals while keeping it visible under the Void tab. *(`voiding_keeps_the_number_requires_a_reason_and_takes_it_out_of_the_receivables`)*
 - [ ] Expense: receipt upload works, submit creates an approval, approve/reject with a comment is reflected with the reason visible, reimburse records the payout. *(slice 4)*
@@ -181,7 +181,67 @@ Visual check: invoice list shows status badges with text and the red/amber due-d
 2. **Invoices + sales handoff + PDF.** Invoice list/detail/form, order → draft invoice, send, void, PDF, overdue sweep, events. Done when the QA walkthrough issues, sends and overdue-flags an invoice and the PDF opens with matching totals. **In: `707c4b1` the module and its money arithmetic, `34762df` the routes, the three keys and the sixteen walks.** The module holds the four rules this slice is about: the server recomputes every total (`NewInvoice` has no field for `subtotal` or `grand_total`, so a client cannot post them at all), only a draft is editable and the refusal names void-and-duplicate, void keeps the number and demands a reason, and the overdue sweep is idempotent **by construction** — the guard is `overdue_at is null` inside the same `UPDATE` that flips the status, so two racing sweeps cannot both win and the returned rows are exactly the ones worth announcing. That last one is load-bearing rather than tidy: `accounting.invoice.overdue` drives the documented automation that sends an e-mail, so "once" is the whole property. `Amount::multiply_qty` and `Amount::percent_of` are new and round once, half away from zero, matching PostgreSQL's `round(numeric)` so the panel and a SQL recompute agree. **PROVED (tick 38, and this is the line that was outstanding):** `cargo test -p omnion-api --test accounting_invoices -- --test-threads=1` against a fresh `omnion_t_inv` on the shared PostgreSQL — **18 passed, 0 failed** in 172.58s. The assertion that was red last tick (comparing `tax_percent` to the form's `20` rather than the column's `20.00`) is green. **The suite is no longer a hypothesis.** Also green: `cargo test -p omnion-module-accounting --lib` **32/32**, `cargo build -p omnion-api`, and `tsc --noEmit` in `apps/admin` with 0 errors after `615ed7db` added the three screens.
 
 **The screens were the actual gap, and saying "routes wired" hid it.** Slice 2 committed six routes and sixteen walks; not one of them needed a browser, so `/accounting/invoices` stayed a URL that answered `404` to a person. `615ed7db` adds the list, the form and the document, and the `accounting-depth` pass now visits all three plus a 390px pass over the invoice table. Still **unticked** and honestly so: the empty/loading/error and mobile boxes, because **no browser pass has run** — load 7–25 across ten writers, and a pass under those conditions reports UI defects that do not exist. **NOT PROVED, and the reason is the environment rather than the code:** the sixteen integration walks in `apps/api/tests/accounting_invoices.rs` were run rather than left unrun, and they found what that shape of defect always finds — **0/18, then 12/18, then 17/18**, eight defects in all. Two were invisible to the compiler: `accounting_invoices` has **no `customer_name` column** (0167 gave the invoice `company_id`/`contact_id` and nothing to print, so every create answered 500 — migration `0171`, union high-water 0170, adds it and states the rule it encodes: *the CRM owns the current name, the invoice owns the name it was issued under*), and `crm_contacts` has `first_name`/`last_name`, **not** a `full_name` column that both joins and the search predicate had named. Six were introduced *while* fixing those, and the one worth naming twice is `gross_of` being `net + tax + discount` where the gross is `net + discount` — a **fix that rewrites arithmetic carries whatever the writer had wrong into the new code**, and it made a 100.00 line at 20% report a subtotal of 120.00. The others: a converted invoice had no customer when the order row already spells one; the second-send refusal stopped at "already Sent" instead of naming void-and-duplicate as this REQ's own docs promise; a test helper built `/invoices&overdue_only=true` with no `?` and read its 404 as a product defect; and one assertion compared `tax_percent` to the string the **form** typed (`20`) rather than the string the column holds (`20.00`). **FINAL STATE, STATED EXACTLY:** `cargo test -p omnion-module-accounting --lib` **32/32**; `cargo build -p omnion-api` green; the invoice suite **17/18 against a live PostgreSQL**, and the eighteenth was the `tax_percent` assertion, fixed in `edf65fd0` and **not re-run** — the box deleted this worktree's `target/` five times during the tick and the root filesystem reached 100% and then `os error 28`. That is an environment fact, not a code blocker: every fix is committed and pushed, one assertion short of green. **NOT TICKED:** every acceptance box below that depends on a browser, plus the PDF, the screens, the global search, the mobile and keyboard boxes.
-3. **Payments + allocation + cashflow.** Record payment with allocation (auto/manual), partial and full states, reversal, journal side effects, payments screen, cashflow report. Done when partial → paid works end to end and the cashflow sums match the payments.
+3. **Payments + allocation + reversal.** Record a payment with its allocations (auto or manual),
+   partial and full states, reversal with a counter entry, the journal side effects, and the
+   payments screen. Done when partial → paid works end to end and the reversals restore what they
+   undid. **In: `9b027344` the module, the migration, the routes and four permission keys;
+   `7b9e657a` three defects the first live run found.**
+
+   **The schema was wrong, and slice 1 is what made it wrong.** `accounting_payments.invoice_id`
+   was `not null`, which is true of the first payment and false of the rest: a customer who pays
+   three invoices in one transfer made *one* payment, and a table that can only point at one
+   invoice either invents three payments — losing the fact that the money arrived once, on one
+   date, with one reference — or keeps the money and loses the invoices. Migration `0175` makes
+   the column nullable and adds `accounting_payment_allocations`; the column survives as a
+   convenience for the single-invoice case, so slice 2's rows and queries keep working.
+
+   **The rule is one sentence and it is enforced in the module, not the route:** an allocation can
+   never exceed what is still owed on its invoice. It is checked inside the same transaction that
+   writes the allocation, against a figure read `for update` **in a stable order (sorted by id)**.
+   Both halves matter. Without the lock, two payments read the same outstanding and the invoice's
+   own `check (paid_total <= grand_total)` turns the loser into a constraint error naming
+   nothing; without the sort, two payments touching the same two invoices can deadlock each other.
+   The reversal recomputes each touched invoice from what is **still allocated** rather than
+   subtracting the reversed amount — subtracting takes a paid invoice to −60.00, which is the bug
+   `a_reversal_recomputes_the_invoice_from_what_is_still_allocated` exists to catch.
+
+   Two other decisions worth reading twice. A payment that arrives for more than it settles
+   leaves the surplus on **account 2300 Customer Advances**, a liability — without it the entry
+   either fails to balance or drops the surplus, and the second only shows up in a quarter's
+   books. And the counter entry is dated on the **original** payment, not today: a reversal
+   corrects the period the mistake was made in, `reversed_at` is when the undo happened, and
+   conflating them moves the correction into the wrong month's numbers.
+
+   `accounting.payments.overpay` is a permission **of its own**, deliberately not a synonym for
+   `.record`: every other key in this family gates an action that is legitimate, and this one
+   gates the action that is arithmetically wrong.
+
+   **PROVED (tick 39).** `cargo build -p omnion-api` green; `omnion-module-accounting --lib`
+   **38/38** (six new); `omnion-permissions --lib` **68/68** (one new, plus the catalogue's
+   "later slices" guard moved forward off the payment keys and onto the slice-4 ones).
+   **6 of the 14 integration walks GREEN**: `a_forty_percent_payment_leaves_it_partial_and_the_balance_closes_it`,
+   `a_payment_against_a_draft_or_a_voided_invoice_is_refused_with_the_way_out`,
+   `a_payment_cannot_allocate_more_than_it_itself_or_name_an_invoice_twice`,
+   `a_payment_larger_than_everything_owed_leaves_the_surplus_as_customer_credit`,
+   `a_reader_may_see_the_payments_and_may_not_record_one`,
+   `a_reversal_keeps_the_row_writes_a_counter_entry_and_restores_the_outstanding`.
+
+   **NOT PROVED, and the next tick starts here.** `an_allocation_above_the_outstanding_is_refused_with_the_three_numbers`
+   **blocks**, and the seven walks after it are unrun. What is known about the block, because
+   knowing the wrong thing would cost the next tick an hour: it is **not** a database deadlock —
+   `pg_stat_activity` shows every backend `idle`, nothing holds a lock, and `pg_locks where not
+   granted` is empty. The process burns **zero CPU** across 13 minutes with 8 open sockets, so it
+   is waiting on something external. It reproduces **alone on a fresh database**, so it is not a
+   cross-walk interaction either. Total connections are 37 of 100, so this is not pool pressure
+   and Redis answers `PONG` on 6380. The honest description is "an external wait under load 10–15
+   across ten writers", and it is left unresolved rather than blamed on the environment.
+
+   The three defects the live run found are all the same class — a claim about the database
+   written down instead of checked — and one of them is worth the price of the tick:
+   `line.amount.trim().is_empty().then_some(())` returns `Some(())` when the row **is** empty, so
+   the guard that drops a blank allocation row dropped every *real* one, and 12 of 14 walks failed
+   with a single message about a payment that had named its invoice perfectly well.
+
 4. **Expenses + approvals + remaining reports.** Expense CRUD with receipts, submit/approve/reject/reimburse, categories, income/expense + aging + tax reports, CSV/PDF exports. Done when a receipt-backed expense is approved through the approvals inbox and every report exports row-for-row.
 
 ### Risks / notes

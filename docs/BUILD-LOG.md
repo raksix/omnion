@@ -7899,3 +7899,48 @@ next-run cell carries a date and the zone, and this tick explains why that cell 
 with a correct `next_run_at`. (b) Slice 2c, the queued/abortable worker, where a real abort
 belongs. (c) The same array-vs-string scan belongs in `apps/web` and the CLI, neither of which
 this tick looked at.
+
+## Tick 39 — REQ-054 slice 3: payments, allocations and the reversal
+
+**What.** The payment half of accounting. Migration `0175` makes
+`accounting_payments.invoice_id` nullable and adds `accounting_payment_allocations`, seeds
+account **2300 Customer Advances**, and adds `number`/`currency`/`customer_name`/`note`/
+`reversed_at`/`reversal_entry_id`. The module (`modules/accounting/src/payments.rs`, 1.6k lines)
+holds the rule the REQ's headline criterion is about — **an allocation can never exceed what is
+still owed on its invoice** — checked inside the writing transaction against a `for update` read
+in sorted-id order, plus the oldest-first sweep, the reversal and the journal entry each payment
+writes. The routes are `GET/POST /accounting/payments`,
+`GET /accounting/payments/{id}`, `POST /accounting/payments/{id}/reverse`, guarded by four new keys
+with `accounting.payments.overpay` separate from `.record` on purpose.
+
+**Proof.**
+- `cargo build -p omnion-api` — **green, 0 errors**.
+- `cargo test -p omnion-module-accounting --lib` — **38 passed, 0 failed** (six new).
+- `cargo test -p omnion-permissions --lib` — **68 passed, 0 failed** (one new).
+- `cargo test -p omnion-api --test accounting_payments` against a live PostgreSQL — **6 of 14 GREEN**.
+  The suite's own shape is the proof it was written for: a committed-but-unrun walk is a
+  hypothesis, and this one found **three defects on its first real run** (2/14, then 4/14, now 6/14).
+
+**The three defects, all one class: a claim about the database written down instead of checked.**
+1. The guard that drops a blank allocation row was **inverted** —
+   `x.trim().is_empty().then_some(())` is `Some(())` when the row IS empty, so every real row was
+   skipped. 12 of 14 walks died on one message naming a field the payment had filled in correctly.
+2. The query selected `p.recorded_by`. The REQ's data model names it `recorded_by`, migration
+   `0167` wrote `created_by`, and I hedged by reading **both** — which is a panic, not a
+   compatibility layer: `row.get` on an alias the SELECT does not list is `ColumnNotFound` at
+   runtime, not `None`.
+3. The arithmetic walk signed in as the bookkeeper while sending `allow_overpayment: true`, so the
+   route refused on the flag before the module was consulted and the walk would have **passed
+   without ever testing the rule it exists to prove**. It now runs as a holder of the override key.
+
+**Not proved, and the next tick starts here.**
+`an_allocation_above_the_outstanding_is_refused_with_the_three_numbers` **blocks**; seven walks
+after it are unrun. What is ruled out, so the next tick does not re-derive it: **not** a deadlock
+(`pg_stat_activity` all `idle`, no ungranted locks), **not** cross-walk state (it reproduces alone
+on a fresh database), **not** pool pressure (37 of 100 connections), **not** Redis (6380 answers
+`PONG`). The process burns **zero CPU over 13 minutes** with 8 open sockets — an external wait,
+under load 10–15 with ten writers on the box. Left named rather than blamed.
+
+**Next.** The blocked walk, then the seven behind it. The payments **screen** is not written — slice
+3's UI is the next pair of commits after the walks are green, and the acceptance boxes that depend
+on a browser (empty/loading/error, 390px, keyboard) stay unticked until one runs.
