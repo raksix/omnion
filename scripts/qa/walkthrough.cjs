@@ -41,6 +41,9 @@ function arg(name, fallback) {
 
 const URL_ADMIN = arg("url", "http://127.0.0.1:3100");
 const URL_WEB = arg("web", "http://127.0.0.1:3200");
+// The repository root, for the passes that read the source tree itself (the theme
+// registry, a migration list). `__dirname/../..` says it once here so no pass spells it.
+const REPO_ROOT = path.join(__dirname, "..", "..");
 // The two names the CMS depth passes use, and the reason they are DEFINED here rather than
 // copied at each call site.
 //
@@ -6555,6 +6558,192 @@ async function runSeoDepth(page, report) {
 }
 
 /**
+ * The ten bundled themes, drawn (REQ-062, slice 4).
+ *
+ * Acceptance 1 asks for the ten to "resolve in the renderer registry, and a site activated on
+ * each renders its pages with that theme's layout, not a colour-swapped copy", and acceptance
+ * 16 asks for the walkthrough at 390 px and 1440 px with the vision review confirming "real
+ * typography and layout differences between at least three themes".
+ *
+ * Both are claims about a BROWSER, and neither is provable by a unit test. A registry can hold
+ * ten keys and a stylesheet can be imported ten times while every page still renders identically
+ * — which is the state this REQ was in for several ticks, and which passes every Rust test
+ * because the Rust side never draws anything.
+ *
+ * So the pass measures the three things that actually differ between themes, from the outside:
+ *
+ *  1. `data-theme` on `<html>` — the registry and the stylesheet both key off it, so a wrong
+ *     value here means the page was drawn by one theme and styled by another.
+ *  2. The computed `font-family` and `font-size` of the title — a different type system is a
+ *     measured difference, and two themes with the same family fail here even when their
+ *     palettes differ.
+ *  3. The computed `background-color` of the body — a different palette is a measured
+ *     difference.
+ *
+ * And then it asserts the *pairs*, which is the shape of the claim: ten themes that are all
+ * different from each other is a stronger statement than "three differ", and it is the one
+ * that catches the failure a per-theme check misses — a bundle where nine sheets are inert
+ * because only one `data-theme` selector matches, so every page draws in the same theme while
+ * each individual theme still "resolved".
+ *
+ * The site is switched by writing `sites.theme` directly, one theme at a time, and each render
+ * is read back from the DOM. Writing the column is not a shortcut around the activation route —
+ * `runThemesDepth` above already drives that route in a browser — this pass needs ten
+ * activations in a row and what it is testing is the RENDER, not the button.
+ */
+async function runThemeRenderPass(page, report) {
+  const steps = {};
+  const siteId = qaSql(`select id from sites where key = '${CREDS.siteKey}' limit 1`);
+  if (!siteId) {
+    steps.reason = "the QA site does not exist, so the renderer has no site to draw";
+    return steps;
+  }
+
+  const pageSlug =
+    qaSql(`select slug from pages where site_id = '${siteId}' and status = 'published' limit 1`) ||
+    SAMPLE_SLUG;
+  const before = qaSql(`select theme from sites where id = '${siteId}'`);
+
+  // The ten keys, read from the themes' own manifests rather than typed here or parsed out of
+  // the registry's source: a list written in the harness is a list that goes stale, and a stale
+  // list is a theme that quietly stops being tested while nothing fails. A manifest's `key` is
+  // the thing a site activates, so it is the one that has to be in this list.
+  //
+  // The earlier version of this read `[agencyTheme.key]:` lines out of `theme.ts` with a regex.
+  // That produced `agencytheme.` — the symbol, a trailing dot from the member access, and a
+  // name the renderer has never heard of — so every `update sites set theme = …` wrote a key
+  // that falls back to `minimal` and every measurement came back identical. The pass would
+  // have failed its own assertions, which is the good outcome, but for the wrong reason, and
+  // the reason is worth recording: a parsed name is not a key until something checks it.
+  const themeDirs = fs
+    .readdirSync(path.join(REPO_ROOT, "themes"), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  const keys = themeDirs
+    .map((dir) => {
+      const manifest = path.join(REPO_ROOT, "themes", dir, "omnion.theme.json");
+      if (!fs.existsSync(manifest)) return null;
+      return JSON.parse(fs.readFileSync(manifest, "utf8")).key;
+    })
+    .filter(Boolean)
+    .sort();
+  // Every key here must be one the renderer can actually resolve, or the pass measures the
+  // fallback ten times and calls it ten themes.
+  //
+  // The check is NOT `registrySource.includes(`"${key}"`)`. That was the second version and it
+  // reported nine themes, not ten, because the registry writes its keys as computed properties
+  // (`[agencyTheme.key]: agencyTheme`) rather than as string literals — so `minimal`, which the
+  // probe found "missing", is the DEFAULT theme and the one every unknown key falls back to. A
+  // grep-based membership test silently drops exactly the theme that matters most, and the
+  // resulting pass would have measured minimal nine times under nine different names.
+  //
+  // So the registry is read structurally: each `[<symbol>.key]:` line names a symbol, the
+  // symbol names a theme directory, and the directory's manifest carries the key. The default
+  // theme is the one line that is not a map entry, so it is added from `DEFAULT_THEME_KEY`.
+  const registrySource = fs.readFileSync(
+    path.join(REPO_ROOT, "apps", "web", "lib", "theme.ts"),
+    "utf8",
+  );
+  const registryKeys = new Set(
+    [...registrySource.matchAll(/^\s*\[(\w+)\.key\]:/gm)].map((match) => {
+      // `agencyTheme` → the directory whose manifest declares this theme.
+      const base = match[1].replace(/Theme$/, "").toLowerCase();
+      const manifest = path.join(REPO_ROOT, "themes", base, "omnion.theme.json");
+      return fs.existsSync(manifest) ? JSON.parse(fs.readFileSync(manifest, "utf8")).key : base;
+    }),
+  );
+  // `export const DEFAULT_THEME_KEY = minimalTheme.key;` — the key `resolveTheme` falls back to.
+  const defaultMatch = registrySource.match(/DEFAULT_THEME_KEY\s*=\s*(\w+)\.key/);
+  if (defaultMatch) {
+    const base = defaultMatch[1].replace(/Theme$/, "").toLowerCase();
+    const manifest = path.join(REPO_ROOT, "themes", base, "omnion.theme.json");
+    if (fs.existsSync(manifest)) {
+      registryKeys.add(JSON.parse(fs.readFileSync(manifest, "utf8")).key);
+    }
+  }
+  const resolvable = keys.filter((key) => registryKeys.has(key));
+
+  steps.registryKeysFound = keys.length;
+  steps.registryHasTenThemes = keys.length === 10;
+  steps.everyKeyIsInTheRegistry = resolvable.length === keys.length;
+  steps.unresolvableKeys = keys.filter((key) => !resolvable.includes(key));
+
+  const rendered = {};
+  for (const key of resolvable) {
+    qaSql(`update sites set theme = '${key}' where id = '${siteId}'`);
+    await page
+      .goto(`${URL_WEB}/${pageSlug}?site=${CREDS.siteKey}`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(900);
+    rendered[key] = await page
+      .evaluate(() => {
+        const html = document.documentElement;
+        const title = document.querySelector("h1");
+        const body = getComputedStyle(document.body);
+        const titleStyle = title ? getComputedStyle(title) : null;
+        return {
+          dataTheme: html.getAttribute("data-theme") || "",
+          background: body.backgroundColor,
+          color: body.color,
+          fontFamily: body.fontFamily,
+          titleFont: titleStyle ? titleStyle.fontFamily : "",
+          titleSize: titleStyle ? titleStyle.fontSize : "",
+          titleWeight: titleStyle ? titleStyle.fontWeight : "",
+          // The layout difference a palette cannot fake: how many top-level regions the
+          // theme's own markup adds around the article.
+          regions: document.querySelectorAll("header, nav, footer, main, article").length,
+        };
+      })
+      .catch(() => ({}));
+    await shot(page, `web-theme-${key}`);
+  }
+
+  steps.themesRendered = resolvable.filter((key) => rendered[key] && rendered[key].dataTheme === key);
+  steps.everyThemeAnnouncesItself = steps.themesRendered.length === resolvable.length;
+
+  // The pair claims. A theme that resolves but draws in another's palette fails the background
+  // comparison; two themes that share a type system fail the family comparison.
+  const signature = (key) => `${rendered[key]?.background}|${rendered[key]?.titleFont}`;
+  const signatures = Object.fromEntries(resolvable.map((key) => [key, signature(key)]));
+  steps.signatures = signatures;
+  steps.distinctPalettes = new Set(Object.values(signatures)).size;
+
+  const families = resolvable.map((key) => rendered[key]?.titleFont || "");
+  steps.titleFamilies = [...new Set(families)];
+  steps.distinctTypeSystems = new Set(families).size;
+
+  // The criterion's own words: "at least three themes" with real differences between them.
+  steps.atLeastThreeDiffer = steps.distinctPalettes >= 3 && steps.distinctTypeSystems >= 2;
+  // The stronger claim, and the one that catches an inert bundle: no two themes identical.
+  steps.noTwoThemesAreIdentical =
+    new Set(Object.values(signatures)).size === resolvable.length &&
+    new Set(families).size >= 2;
+
+  // Mobile: the layout must hold at 390 px for every theme, not just the one the pass
+  // happened to leave active.
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const overflow = {};
+  for (const key of resolvable) {
+    qaSql(`update sites set theme = '${key}' where id = '${siteId}'`);
+    await page
+      .goto(`${URL_WEB}/${pageSlug}?site=${CREDS.siteKey}`, { waitUntil: "domcontentloaded" })
+      .catch(() => {});
+    await page.waitForTimeout(700);
+    overflow[key] = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+  }
+  steps.mobileOverflow = overflow;
+  steps.noThemeOverflowsAt390 = resolvable.every((key) => (overflow[key] ?? 9999) <= 0);
+  if (viewport) await page.setViewportSize(viewport);
+
+  qaSql(`update sites set theme = '${before}' where id = '${siteId}'`);
+  steps.siteRestored = qaSql(`select theme from sites where id = '${siteId}'`) === before;
+  return steps;
+}
+
+/**
  * `/themes` — the theme gallery (REQ-062, slice 1).
  *
  * The pass drives the two things a gallery can get wrong that a screenshot cannot: the badge
@@ -9473,6 +9662,43 @@ async function main() {
     // report. `run.sh` runs under `set -e`, so returning here made "the QA site does not
     // exist" exit 0 — a green result for a pass that checked nothing, which is how 59 skipped
     // steps came to be read as a pass on 2026-09-30. A missing step now ends the process.
+    if (missing.length > 0) process.exit(4);
+    return;
+  }
+  // `--only=theme-render` draws all ten bundled themes in the public site. Split out from the
+  // builder pass for the same reason every other scoped pass exists (a full pass is cut down
+  // halfway) and for one more: this pass is the only place in the harness that needs twenty
+  // public renders, and folding them into an hour-long pass buries the one claim it makes.
+  if (process.argv.includes("--only=theme-render")) {
+    report.themeRender = await runThemeRenderPass(page, report);
+    log(`themeRender: ${JSON.stringify(report.themeRender)}`);
+    const required = [
+      "registryHasTenThemes", "everyKeyIsInTheRegistry", "everyThemeAnnouncesItself",
+      "atLeastThreeDiffer", "noTwoThemesAreIdentical",
+      "noThemeOverflowsAt390", "siteRestored",
+    ];
+    const renderSteps = report.themeRender || {};
+    const missing = required.filter((key) => renderSteps[key] === undefined);
+    fs.writeFileSync(
+      path.join(OUT, "summary.json"),
+      JSON.stringify(
+        {
+          mode: "--only=theme-render",
+          total: required.length,
+          passed: required.length - missing.length,
+          missing,
+          steps: renderSteps,
+        },
+        null,
+        2,
+      ),
+    );
+    if (missing.length > 0) {
+      log(`theme render pass MISSING ${missing.length}: ${missing.join(", ")}`);
+    } else {
+      log(`theme render pass ${required.length}/${required.length}`);
+    }
+    await page.context().browser()?.close().catch(() => {});
     if (missing.length > 0) process.exit(4);
     return;
   }
