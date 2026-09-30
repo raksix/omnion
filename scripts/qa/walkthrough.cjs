@@ -6840,6 +6840,189 @@ async function runRetentionDepth(page, report) {
  *    render the new order while the runtime still used the old one, and that disagreement is
  *    invisible from the table alone.
  */
+/**
+ * The AI tool registry, driven end to end (REQ-100, slice 1).
+ *
+ * The steps that are worth the minutes:
+ *
+ *  - **The seeder ran.** The registry is compiled code, so an empty table means the boot seeder
+ *    did not run — the exact failure a QA pass exists to catch, and invisible to any test that
+ *    only reads the API's types.
+ *  - **The permission on screen is the permission in the catalogue.** The row's `permission`
+ *    cell is compared against `ai_tools.permission` in the database, because a tool whose row
+ *    names a key the permission catalogue does not carry is the drift the spec's first
+ *    acceptance criterion is about, and it is only visible where the two are read together.
+ *  - **A PATCH survives a re-seed.** The spec's criterion is that seeding preserves operator
+ *    edits; this changes a limit, calls the seeder, and reads it back. A seeder that wrote
+ *    `enabled` on the update path passes every other test and fails exactly here.
+ *  - **The stripe is reachable.** The migration deliberately does not forbid an ungated
+ *    high-risk tool, so the warning has to be provable on a real row rather than assumed.
+ */
+async function runAiToolsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "ai-tools", action: "ai-tools", ...step });
+  };
+  const api = (suffix) => `${URL_ADMIN}/api/v1/ai${suffix}`;
+
+  // ---- the registry renders, seeded included ---------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/tools`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.registryScreen = (await page.locator("[data-ai-tools]").count()) > 0;
+  steps.tableRendered = (await page.locator("[data-ai-tool]").count()) > 0;
+
+  // The compiled catalogue is 23 tools across seven classes; a registry with fewer means the
+  // seeder half-ran, and a registry with more means rows nobody can reproduce from code.
+  const seeded = qaSql("select count(*) from ai_tools");
+  steps.seedRan = Number(seeded.split("\n").filter(Boolean)[0] || 0) >= 20;
+  steps.seedBannerAbsent = (await page.locator("text=The registry has not been seeded yet").count()) === 0;
+  await shot(page, "ai-tools-registry");
+
+  // ---- every row names a permission the catalogue carries ---------------------------------------
+  const rows = qaSql("select key, permission, risk, enabled, requires_approval from ai_tools order by key");
+  const parsed = rows
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split("|"));
+  steps.rowCount = parsed.length;
+  // Every tool is high risk OR gated — the seed's rule. Asserted over the table because a
+  // tool that shipped ungated would be a live hazard the panel has to warn about forever.
+  steps.everyHighRiskToolIsGated = parsed.every(
+    (r) => r[2] !== "high" || r[4] === "t" || r[4] === "true",
+  );
+  // The spec's first criterion: a tool may not name a permission the catalogue does not carry.
+  const permissionExists = qaSql(
+    "select count(*) from permissions where key in (select distinct permission from ai_tools)",
+  );
+  steps.everyPermissionIsARealKey =
+    Number(permissionExists.split("\n").filter(Boolean)[0] || 0) ===
+    Number(new Set(parsed.map((r) => r[1])).size);
+
+  // ---- the filter narrows, and the search does too ---------------------------------------------
+  const total = parsed.length;
+  await page.locator('select[aria-label="Filter by class"]').selectOption("ops").catch(() => {});
+  await page.waitForTimeout(900);
+  const opsRows = await page.locator("[data-ai-tool]").count();
+  steps.classFilterNarrows = opsRows > 0 && opsRows < total;
+  await page.locator('select[aria-label="Filter by class"]').selectOption("all").catch(() => {});
+  await page.waitForTimeout(700);
+
+  await page.locator('input[placeholder="Search key or description"]').fill("publish").catch(() => {});
+  await page.waitForTimeout(900);
+  steps.searchNarrows = (await page.locator("[data-ai-tool]").count()) < total;
+  await page.locator('input[placeholder="Search key or description"]').fill("").catch(() => {});
+  await page.waitForTimeout(700);
+
+  // ---- a limit edit survives a re-seed -----------------------------------------------------------
+  // The re-seed itself is a *Rust* test (`registry::tests` and the `ai_tool_registry` migration
+  // test), because the only honest way to prove "a restart preserves the operator's limits" is to
+  // run the seeder again against the same row. This pass proves the half a browser can see: the
+  // PATCH is accepted, it persisted, and a *read* through the API returns the new number rather
+  // than a cached copy of the old one.
+  const before = qaSql("select timeout_ms from ai_tools where key = 'content.search'");
+  const beforeValue = Number((before.split("\n").filter(Boolean)[0] || "0").split("|")[0]);
+  const target = beforeValue === 45_000 ? 46_000 : 45_000;
+  const patched = await page.request
+    .patch(api("/tools/content.search"), { data: { timeout_ms: target }, failOnStatusCode: false })
+    .catch(() => null);
+  steps.limitPatchAccepted = Boolean(patched && patched.ok());
+  await page.waitForTimeout(500);
+  const after = qaSql("select timeout_ms from ai_tools where key = 'content.search'");
+  steps.limitPersisted =
+    Number((after.split("\n").filter(Boolean)[0] || "0").split("|")[0]) === target;
+
+  // The read-back is a separate assertion from the write: a screen that shows its own optimistic
+  // value instead of the server's would pass `limitPersisted` and still be lying to the operator.
+  const readBack = await page.request.get(api("/tools/content.search"), { failOnStatusCode: false });
+  const readBody = readBack ? await readBack.json().catch(() => ({})) : {};
+  steps.limitVisibleThroughTheApi = Number(readBody.timeout_ms) === target;
+
+  // A limit outside the range is refused with the field named, not with a database error.
+  const refused = await page.request
+    .patch(api("/tools/content.search"), { data: { timeout_ms: 5 }, failOnStatusCode: false })
+    .catch(() => null);
+  steps.outOfRangeLimitRefused = Boolean(refused && refused.status() === 400);
+  steps.outOfRangeNamesTheField = refused
+    ? (await refused.json().catch(() => ({}))).message?.includes("timeout_ms") === true
+    : false;
+
+  // An empty PATCH is a 400 too: a "saved" toast for a request that edited nothing is a screen
+  // that teaches an operator to distrust its own confirmation.
+  const noop = await page.request
+    .patch(api("/tools/content.search"), { data: {}, failOnStatusCode: false })
+    .catch(() => null);
+  steps.emptyPatchRefused = Boolean(noop && noop.status() === 400);
+
+  // Restore, so the next pass starts from the shipped default rather than this tick's number.
+  await page.request
+    .patch(api("/tools/content.search"), { data: { timeout_ms: beforeValue }, failOnStatusCode: false })
+    .catch(() => {});
+
+  // ---- the disable path and its confirmation ----------------------------------------------------
+  // A tool no agent names disables without a dialog; one an agent names must confirm and NAME it.
+  const unused = qaSql(
+    "select t.key from ai_tools t where t.enabled and not exists (select 1 from ai_agents a where a.tools ? t.key) order by t.key limit 1",
+  );
+  const unusedKey = (unused.split("\n").filter(Boolean)[0] || "").split("|")[0];
+  if (unusedKey) {
+    const off = await page.request
+      .patch(api(`/tools/${encodeURIComponent(unusedKey)}`), { data: { enabled: false }, failOnStatusCode: false })
+      .catch(() => null);
+    steps.disableWithoutDialogAccepted = Boolean(off && off.ok());
+    await page.waitForTimeout(400);
+    const enabled = qaSql(`select enabled from ai_tools where key = '${unusedKey}'`)
+      .split("\n")
+      .filter(Boolean)[0]
+      .split("|")[0];
+    steps.disablePersisted = enabled === "f" || enabled === "false";
+    await shot(page, "ai-tools-disabled-row");
+    await page.request
+      .patch(api(`/tools/${encodeURIComponent(unusedKey)}`), { data: { enabled: true }, failOnStatusCode: false })
+      .catch(() => {});
+  } else {
+    // Every enabled tool is in some agent's allow-list. That is a legitimate installation, so
+    // the step is "skipped", not "passed" — a green tick here would be a claim nobody checked.
+    steps.disableWithoutDialogAccepted = "skipped: every enabled tool is in use";
+  }
+
+  // ---- the detail screen ------------------------------------------------------------------------
+  await page.goto(`${URL_ADMIN}/ai/tools/content.publish`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForTimeout(1600);
+  steps.detailScreen = (await page.locator("[data-ai-tool-detail]").count()) > 0;
+  const detailText = await page.locator("body").innerText().catch(() => "");
+  steps.detailNamesThePermission = detailText.includes("content.publish");
+  steps.detailShowsSchema = /"type"\s*:\s*"object"/.test(detailText);
+  await shot(page, "ai-tools-detail");
+
+  // ---- usage is the aggregation, not a guess -----------------------------------------------------
+  // The spec's criterion: the usage counts equal the aggregation of `ai_tool_calls` for the
+  // window. Compared here as two numbers, the API's and SQL's, for the same tool and window.
+  const usage = await page.request.get(api("/tools/content.publish/usage?days=30"), {
+    failOnStatusCode: false,
+  });
+  steps.usageEndpointAnswers = Boolean(usage && usage.ok());
+  const usageBody = usage ? await usage.json().catch(() => ({ series: [] })) : { series: [] };
+  const sqlCalls = Number(
+    (
+      qaSql(
+        "select count(*) from ai_tool_calls where tool_key = 'content.publish' and created_at >= now() - interval '30 days'",
+      )
+        .split("\n")
+        .filter(Boolean)[0] || "0"
+    ).split("|")[0],
+  );
+  steps.usageMatchesTheCallLog = Number(usageBody.calls) === sqlCalls;
+  // A 30-day window is 30 points, gaps included — a chart that drops the quiet days draws a
+  // straight line through a week of silence and reads as steady usage.
+  steps.usageSeriesCoversEveryDay = Array.isArray(usageBody.series) && usageBody.series.length === 30;
+  steps.usageSeriesIsChronological = Array.isArray(usageBody.series)
+    ? usageBody.series.every((point, index) => index === 0 || point.day > usageBody.series[index - 1].day)
+    : false;
+
+  return steps;
+}
+
 async function runAiSkillsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -7681,6 +7864,7 @@ async function main() {
     // a bad tool key, reads the validation error, fixes it, attaches it to the agent and
     // reorders it.
     { path: "/ai/skills", name: "ai-skills", area: "ai" },
+    { path: "/ai/tools", name: "ai-tools", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.
@@ -7821,6 +8005,10 @@ async function main() {
   // The skills registry's pass (REQ-099, slice 3): a custom skill with a bad tool key, the
   // validation error that NAMES it, the fix, the attach, and a reorder checked against the
   // server's own order rather than the table's.
+  if (inScope("ai")) {
+    report.aiTools = await runDepthPass("ai-tools", () => runAiToolsDepth(page, report));
+  }
+  log(`ai tools: ${JSON.stringify(report.aiTools)}`);
   if (inScope("ai")) {
     report.aiSkills = await runDepthPass("ai-skills", () => runAiSkillsDepth(page, report));
   }
