@@ -533,6 +533,13 @@ jobs:
         run: python3 release/tests/test_release_pipeline.py
       - name: Environment bundle unit tests
         run: python3 release/tests/test_release_bundle.py
+      # The upgrade helper. Same reasoning as the bundle above, and the property it guards is
+      # the one this slice exists for: a plan must not claim a database rollback nobody has
+      # verified, and its checklist must not render complete with a destructive migration
+      # unacknowledged. Both refusals are properties of committed files (the migration
+      # markers, the absence of REQ-129's policy), so they are checkable on a commit.
+      - name: Upgrade plan unit tests
+        run: python3 release/tests/test_release_upgrade.py
       # The gate mutates the manifest nineteen ways and requires every one to be caught. A
       # green run therefore means two things at once: the builder works, and the checks are
       # capable of failing.
@@ -551,5 +558,11 @@ jobs:
       # secret-shaped string.
       - name: Environment bundle gate (with mutations)
         run: bash scripts/qa/release-bundle.sh
+      # The upgrade gate. Six mutations, all differential: each one loads the real module
+      # and the mutated copy in separate interpreters and requires the behaviour to DIFFER,
+      # because a mutation with a live sibling check can leave the fixture caught and prove
+      # nothing about the check it removed.
+      - name: Upgrade plan gate (with mutations)
+        run: bash scripts/qa/release-upgrade.sh
       - name: Chart renders and lints
         run: bash scripts/qa/helm-chart.sh
