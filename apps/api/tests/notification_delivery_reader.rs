@@ -80,14 +80,22 @@ impl Harness {
         self.db.pool()
     }
 
-    /// Dropped explicitly, and `mem::forget`ed after.
+    /// Dropped explicitly, and it is the *only* cleanup there is.
     ///
     /// **A panicking walk that skips `dispose` leaves its database behind, and the box has a
     /// shared connection pool with nine sibling writers.** The scratch database is a directory
     /// of files, not a row: each leaked one holds tens of megabytes that nothing reclaims, and
     /// the walks stop being runnable once the disk fills. `close().await` is what releases the
-    /// pool — without it `drop database ... with (force)` has to terminate the backends — and
-    /// the `forget` stops the later `Drop` from running against a moved-from handle.
+    /// pool — without it `drop database ... with (force)` has to terminate the backends.
+    ///
+    /// **No `mem::forget` belongs after the call**, for the reason the health walks learned the
+    /// hard way this tick: the signature takes `self`, so the call *moves* the harness, and the
+    /// `std::mem::forget(harness)` these walks were written with was a use-after-move — eleven
+    /// compile errors in `health_probes.rs`, committed unnoticed because no gate that had run
+    /// compiled that binary. The comment claiming the `forget` "stops the later `Drop` from
+    /// running against a moved-from handle" is what kept it there: there is no later `Drop` of
+    /// that value, because the value was consumed by the call above. This file carries the
+    /// comment without the code, which is the cheaper half of the mistake to leave in place.
     async fn dispose(self) {
         self.db.pool().close().await;
         let database = self.database;

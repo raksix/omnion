@@ -42,92 +42,14 @@ import {
 } from "@/lib/api";
 import type { HealthMetricsReport, HealthRangeKey } from "@/lib/types";
 
+import { Num, Sparkline } from "./sparkline";
+
 /** The ranges, in display order. The keys are the server's vocabulary, not this screen's. */
 const RANGES: { key: HealthRangeKey; label: string }[] = [
   { key: "1h", label: "1 hour" },
   { key: "24h", label: "24 hours" },
   { key: "7d", label: "7 days" },
 ];
-
-/** One number, or a dash. Never `0` for a value the platform does not have. */
-function Num({ value }: { value: number | null }) {
-  if (value === null) return <span className="text-muted">—</span>;
-  return <span className="tabular-nums">{value}</span>;
-}
-
-/**
- * A row's sparkline.
- *
- * Scaled between its own minimum and maximum rather than from zero, because a sparkline's job is
- * to show *shape*: a queue depth that sits at 40 and spikes to 60 is 50% busier, and a zero-based
- * chart draws that as a hairline. The scale's bounds are exposed as `data-*` so the walkthrough
- * can assert a real series was drawn rather than a flat line pretending to be one.
- *
- * **A single point draws a dot.** A polyline through one point has no length and renders as
- * nothing, which the table would otherwise read as "no samples" on a row that has one.
- */
-function Sparkline({ values }: { values: number[] }) {
-  if (values.length === 0) {
-    return (
-      <span data-health-spark="empty" className="text-[11.5px] text-muted">
-        no samples
-      </span>
-    );
-  }
-  const finite = values.filter((value) => Number.isFinite(value));
-  if (finite.length === 0) {
-    return (
-      <span data-health-spark="empty" className="text-[11.5px] text-muted">
-        not a number
-      </span>
-    );
-  }
-
-  if (finite.length === 1) {
-    return (
-      <svg
-        data-health-spark="point"
-        data-health-spark-points={1}
-        viewBox="0 0 100 30"
-        preserveAspectRatio="none"
-        aria-hidden
-        className="h-8 w-24 text-muted"
-      >
-        <circle cx="50" cy="15" r="2" fill="currentColor" />
-      </svg>
-    );
-  }
-
-  const low = Math.min(...finite);
-  const high = Math.max(...finite);
-  const span = high - low;
-  const step = 100 / (finite.length - 1);
-  const points = finite
-    .map((value, index) => {
-      const y = span === 0 ? 15 : 28 - ((value - low) / span) * 26;
-      return `${(index * step).toFixed(2)},${y.toFixed(2)}`;
-    })
-    .join(" ");
-
-  return (
-    <svg
-      data-health-spark="line"
-      data-health-spark-points={finite.length}
-      viewBox="0 0 100 30"
-      preserveAspectRatio="none"
-      aria-hidden
-      className="h-8 w-24 text-ink"
-    >
-      <polyline
-        points={points}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        vectorEffect="non-scaling-stroke"
-      />
-    </svg>
-  );
-}
 
 export function HealthMetricsScreen() {
   const [range, setRange] = useState<HealthRangeKey>("24h");
@@ -375,7 +297,7 @@ export function HealthMetricsScreen() {
                     </span>
                   </td>
                   <td className="py-2">
-                    <Sparkline values={row.series} />
+                    <Sparkline values={row.series} label={row.metric} />
                   </td>
                 </tr>
               ))}
@@ -414,7 +336,7 @@ export function HealthMetricsScreen() {
                   </span>
                 </div>
                 <div className="mt-1">
-                  <Sparkline values={row.series} />
+                  <Sparkline values={row.series} label={row.metric} />
                 </div>
               </li>
             ))}

@@ -6886,3 +6886,262 @@ deleted the directory mid-build: a 50-minute compile ended in `failed to create 
 Not a directory (os error 20)` with no artifact. `/dev/shm/wN-target` is not private.
 
 **Next.** Slice 1's UI: the inbox, the review screen and the policy screen, then the w7 QA pass.
+## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
+
+feat(health): the service detail page draws a 24 h trend. fix(health): the health
+walks did not compile, and had been committed that way.
+
+**Slice 2 was one screen short, and it was short in the way that looks the least
+broken.** The request names the drill-down's contents: "current state, checks table,
+**a 24 h trend chart**, recent failures". The screen listed current values in four
+columns and drew no line. Nothing about it errored — the route resolved, the values
+were right, the heading was right — and "a table with no chart in it" is not a
+defect any compiler, type checker or linter in this workspace has an opinion about.
+
+Three things made it a chart rather than a decoration:
+
+| | |
+|---|---|
+| one window per response | `SERVICE_TREND_RANGE` is read once, before the loop, so every row covers the same 24 h. A per-row `now()` gives row one a fraction of a second more than row nine, and two lines on one screen that end at different instants cannot be compared. |
+| an empty window speaks | a row with no samples draws "no samples in the last 24 h", because an empty box on a numbers screen reads as a chart that failed to load. |
+| one point draws a dot | a polyline through one point has zero length and renders as nothing at all — which the table reads as "no data" on a row that has one. |
+
+**The sparkline was extracted, not copied.** Both screens now assert
+`data-health-spark`, and "what does an unmeasured window look like" is one answer or
+two. A second copy is how the metric table learns to draw a dot while the drill-down
+keeps drawing nothing — and *nothing* is what the walk reads as a missing chart. It
+gained a `label` prop in the same move: twelve rows all named "sparkline" is a screen
+a screen reader cannot be read from.
+
+**`/health/samples` stopped taking `hours`.** It was the last endpoint in the centre
+still clamping an hour count — the exact defect slice 2 removed from `/health/metrics`.
+A caller asking for 30 days got 7 with a `200` and no warning, drew the wrong chart,
+and had no way to tell. It now goes through the same `Range::parse`, so the refusal
+is a property of the *vocabulary* rather than of one handler, and `fetchHealthSamples`
+moved with it: `hours=24` and `range=24h` are one window with two spellings, and the
+second spelling travels into the CSV filename.
+
+## The other half of this tick: 14 errors, committed, invisible to every gate
+
+`cargo check -p omnion-api --tests` reported **fourteen compile errors** across the
+two health walk files. All fourteen were committed. Not one gate had ever caught
+them, and each gate was *correct about the thing it checked*:
+
+| gate | what it compiles |
+|---|---|
+| `cargo test -p omnion-health --lib` | the health **crate** — not `apps/api`, and not its test binaries |
+| `pnpm typecheck` (admin) | TypeScript — cannot see Rust |
+| `node --check walkthrough.cjs` | the walkthrough — does not parse `.rs` |
+| `tsc` on a screen | the admin's JSX — cannot see the route that serves it |
+
+**Not one of them puts an `apps/api` test binary in a dependency graph.** Tick 80
+wrote that rule into the ledger after finding the mirror-image failure in
+`health_panel.rs`; the rule was in the ledger, in my own words, when it happened
+again on the very next tick. That is the part worth writing down: reading a lesson
+is not the same as the lesson being in force, and the only thing that put
+`apps/api`'s tests in the graph this time was deliberately reaching for
+`--tests`.
+
+**Eleven of the fourteen were the same line, in the same shape.**
+
+```rust
+harness.dispose().await;          // dispose(self) — takes the harness BY VALUE
+std::mem::forget(harness);        // …and this moves it again
+```
+
+`dispose(self)` consumes the harness, so the call above *moves* it and there is
+nothing left to forget — E0382, eleven times. The comment above the method gave a
+confident reason for the `forget`: "stops the later `Drop` from running against a
+moved-from handle". **That reason is false.** There is no later `Drop` of that
+value, because the value was consumed by the call two lines up. The same comment
+had already been copied into `notification_delivery_reader.rs`, which received the
+justification without the code — a file that reads as though the hazard is real,
+which is how the next writer adds it back.
+
+Both comments now record why there is deliberately no `forget`, because a
+plausible-sounding story is what carried this through two reviews and four ticks.
+The rule that falls out of it: **a comment that explains a line's purpose is a
+claim to verify, and the ones that sound most confident are the ones nobody reads
+closely.**
+
+The other three: a stray `await` on a non-`await` expression; an import list naming
+the crate's own root (`use omnion_health::{MetricSummary, Range, omnion_health};` —
+there is no such item); and `&[good, good]`, which moves the same non-`Copy`
+`NewSample` into an array twice.
+
+**Proof**
+
+```
+cargo check -p omnion-api --tests   clean   (was 14 errors)
+cargo test -p omnion-health --lib    40 passed; 0 failed   (0.27s)
+admin tsc -p tsconfig.json --noEmit  exit 0
+node --check walkthrough.cjs        syntax ok
+```
+
+**What this costs the next tick, stated plainly.** The `health_history` and
+`health_probes` suites have still **not been run** — they now compile, which is a
+different and much lower claim. An `omnion-api` test binary needs a ~30-minute link
+at the current load average (85, four sibling cargo trees), and the browser pass
+(`bash scripts/qa/run.sh`) has still not run at all: the QA slot is held by a sibling
+writer and `/mnt/apopic` is at 87%. So slice 2's screen behaviour rests on the walk
+being **written and wired**, not on a rendered page, and the REQ says so.
+
+**Next:** run `health_history` and `health_probes` when a slot frees, then
+`bash scripts/qa/run.sh` — which closes slice 2's last box and the walkthrough box
+at the same time. Then slice 3 (incidents + thresholds), whose schema
+(`health_incidents`, `health_settings`) has shipped empty since slice 1 and whose
+empty-only screen the migration comment explicitly refuses to build.
+
+
+## Tick 82 — the constraint that made the incidents table unusable, and the one below it
+
+The tree arrived **dirty**: 2 080 uncommitted lines of slice 3 (`incidents.rs`, `health_incidents.rs`,
+`0190`) with two wiring lines and no test. Half-written work is the state this loop is worst at,
+because a tick that starts by writing something new leaves two half-written things. So the tick
+spent its first act finishing that.
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `f572dbde` | `crates/health::incidents`, the routes, `/health/incidents` + `/health/settings`, the walks |
+| this tick | `0191` — two database constraints that were wrong, found by the walk |
+
+**The two bugs, and they are the same bug twice.**
+
+`0188` shipped `health_incidents` with
+
+```sql
+check ((resolved_at is null) = (to_state = 'healthy'))
+```
+
+under the comment *"A run that is still open has no end; a resolved one always does."* The comment
+is true and the expression is its **inverse**: read literally, an open row must have
+`to_state = 'healthy'` and a resolved row must have anything *but* `healthy`. Between them the
+constraint makes the table unable to store the one thing it exists to store — the first
+`insert` of an open incident fails `23514`.
+
+The second is `0190`'s `check (warn < crit)`, unconditional, while `Threshold::classify` reads a
+`below` pair as `value <= crit` / `value <= warn` — i.e. it *expects* `warn > crit`. Every valid
+`below` threshold in the product ("at least 2 healthy workers") is refused, and the inverted ones
+are accepted. `Threshold::new` had the same defect in Rust, with a message that said "must be
+below" regardless of direction.
+
+**Why four green gates could not see either one.** A `check` constraint is not a type error, so
+`cargo check` is blind to it by construction. And both tables had **no writer**: slices 1 and 2
+are probes and samples, and nothing had ever inserted a row here. A constraint on a table with no
+writer is a comment with `check` in front of it. The tick that writes the first row is the tick
+that finds out what the table allows — an argument for writing the row *earlier*, not for
+trusting the comment next to it.
+
+**A third bug the walk found, in the code rather than the schema.** `record_breach` took
+`crit_limit` from `(select crit from health_thresholds where metric = $1)`, which is `NULL` for an
+unconfigured metric, and the column is `not null` — so the call died on `23502` and the helpful
+"has no threshold pair" message in its own `.ok_or_else` **could never fire**, because the row was
+never coming back. The threshold is now read *before* the insert.
+
+**The fixtures were wrong too, and that is worth writing down.** `acknowledged_by` and
+`created_by` are foreign keys to `users`, and the walk passed `Uuid::new_v4()`. The failure is a
+`23503` naming a constraint nothing in the test is about, so the obvious reading — "the window
+insert is broken" — points away from the cause. A walk that invents an actor is also asserting
+something the product deliberately forbids: acknowledgement whose actor points at no row is the
+un-evidenced acknowledgement the request rules out.
+
+**Proof**
+
+```
+cargo check -p omnion-api --tests         clean
+tsc -p tsconfig.json --noEmit             exit 0
+node --check scripts/qa/walkthrough.cjs   syntax ok
+health_incidents                          8 walks, live PostgreSQL
+```
+
+**Next:** the browser pass (`bash scripts/qa/run.sh`) still has not run on this box, and it is now
+the only thing standing between REQ-014 and slice 4. Both new screens have depth passes written
+and registered; they have not been executed.
+
+
+---
+
+## Tick 83 — REQ-014 slice 4: the two writers (2026-09-30)
+
+**What shipped**
+
+| Commit | What |
+|---|---|
+| `a87ee01a` | `crates/health::workers` — the heartbeat writer, plus the `n/m` summary the card renders |
+| `cddecee1` | `probe_context` reads the staleness limit it claimed to read; the defaults are named |
+| `c3c22e3f` | `apps/api::health_runner` — this process's heartbeat and the scheduled probe run |
+| `83209cab` | `health_workers` — six walks on live PostgreSQL |
+
+**The finding: two tables with readers and no writers, both of them ticked.**
+
+`worker_heartbeats` shipped in slice 1. `probe_workers` counts rows, groups them by kind and
+names the stale ones, and the acceptance criterion *"worker counts come from heartbeat rows;
+stopping a worker changes `4/4` to `3/4` and names it"* was ticked — by a walk that **inserted the
+rows it then read**. `grep -rn "insert into worker_heartbeats"` over `crates` and `apps` returns
+one hit, and it is a test file. In production the card would have rendered exactly one honest
+sentence for ever: "no worker has registered a heartbeat".
+
+The same shape, one table over, and this time the reader was the *probe* rather than a query:
+`run_and_record` was reached from four route handlers in `health_panel.rs` and nowhere else. Every
+sample in `health_samples` was written because somebody was looking at the panel. The
+`check_interval_seconds` setting (5–600, default 60) was stored, rendered, validated by a form and
+read by **nothing** — the default 24 h trend would have been an empty chart eight hours after the
+last visit.
+
+This is the third instance on this codebase of the same defect, after REQ-010's uncalled
+`prune_candidates` and REQ-013's unwritten `next_run_at`. It has a name now: *a table, a reader, a
+column nobody fills*. The green gates cannot see it — `cargo check` has nothing to complain about,
+the probe compiles, the reader is unit-tested — so the only instrument that finds it is reading
+the request's own claims against `grep`.
+
+**A comment describing a read that does not happen.**
+
+`context()` in `health_panel.rs` hard-coded `worker_stale_seconds: 120` under a doc comment that
+said the value "is read from the settings row, with the migration's default when the row is
+unreadable". It was not read. 120 *is* the migration's default, which is exactly why nothing
+looked wrong: an operator who saved 600 got a panel that silently decided to call their worker dead
+after two minutes, and the panel and the constant agreed whenever nobody had saved anything.
+
+**Two of my own assertions were wrong before the platform was.**
+
+The walks went red twice and both times the walk was at fault. One aged a worker to 400 seconds and
+asserted it had gone stale — against a limit the same test had just saved at **600**, so 400 is
+inside the window and the platform was correct. The other asserted `started_at` moves forward when a
+pid is reused, and the writer deliberately does not move it: a heartbeat loop that refreshed the
+column every 30 seconds would make a process that has run for three months look three seconds old,
+and a reused pid is indistinguishable from a worker still running. The tie breaks towards the
+claim that is safer to be wrong about — under-report the restart rather than invent one per tick.
+The walk now pins that decision instead of the tidier story, because an assertion that fails the
+moment somebody "fixes" the upsert is an assertion about the wrong thing.
+
+**Proof**
+
+```
+cargo test -p omnion-health --lib          68 passed
+cargo check -p omnion-api --tests          clean
+cargo test -p omnion-api --test health_workers -- --test-threads=1
+                                            6 passed, live PostgreSQL
+tsc -p apps/admin/tsconfig.json --noEmit   exit 0
+```
+
+**Also fixed, incidentally:** `the_breach_window_is_computed_not_derived_at_insert_time` had been
+failing for a week. Its comment said "14:30" and the input was 870 seconds — correct arithmetic,
+wrong expectation about which 15-minute window that falls in, since `div_euclid` floors 870 to 0
+and not to 900.
+
+**Blocker: the disk.** `/mnt/apopic` sat at **99% with 919 MB free** when this tick started, which
+is a build-hostile number and the reason `cargo` took 8 minutes to answer. `omnion-target-main`
+(1.9 GB) was an orphaned `CARGO_TARGET_DIR` from a process that no longer existed — proven by
+reading `/proc/*/cwd` and `/proc/*/environ` for every pid, not by its mtime — and 1.03 GB more came
+from duplicate `rlib`/`rmeta` pairs in my own `target/debug/deps`. 3.8 GB free now. **The repo's own
+`scripts/qa/disk-guard.sh` freed nothing** and did not say why; it reads `/proc/*/environ` and gets
+`Permission denied` for pids it does not own, and the resulting empty grep makes a held target look
+free.
+
+**Next:** slice 4's remaining half — the five `health.*` events. The events catalogue has no
+`health` area at all, so "an operations endpoint subscribes to degraded and recovered" is currently
+a sentence in a document. That is a catalogue addition plus five emitters. The browser pass is still
+outstanding: the QA slot was **legitimately held** by a live w3 pass when this tick checked (holder
+pid alive, log one minute old), so it was left alone rather than reclaimed.

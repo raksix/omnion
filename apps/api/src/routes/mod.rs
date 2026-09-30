@@ -86,6 +86,7 @@ pub mod restore_jobs;
 pub mod commands;
 pub mod content;
 pub mod health;
+pub mod health_incidents;
 pub mod health_panel;
 pub mod iam;
 pub mod iam_approvals;
@@ -1376,6 +1377,59 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/health/maintenance/prune",
             post(health_panel::prune).layer(guards::require(&state, "health.manage")),
+        )
+        // -------------------------------------------------------------------------------------
+        // Incidents and threshold policy (REQ-014 slice 3).
+        //
+        // Every write here is `health.manage` and every read is `health.read`, which is why
+        // the two live on separately-built method routers that get `.merge()`d: axum applies
+        // `.layer()` to the routers it is chained onto, so a single `route_layer` over a path
+        // that serves both a GET and a PATCH would demand the *managing* key from the reader
+        // who only opens an incident to read it. `guards::require` resolves its name from the
+        // permission catalogue, so both keys must exist there (`crates/permissions`).
+        // -------------------------------------------------------------------------------------
+        .route(
+            "/health/incidents",
+            get(health_incidents::incidents).layer(guards::require(&state, "health.read")),
+        )
+        .route(
+            "/health/incidents/{id}",
+            get(health_incidents::incident)
+                .layer(guards::require(&state, "health.read"))
+                .merge(
+                    patch(health_incidents::patch_incident)
+                        .layer(guards::require(&state, "health.manage")),
+                ),
+        )
+        // Settings split the same way: `GET` shows the policy, `PUT` changes it. A single
+        // route cannot, because the reader is exactly the person who should see *which*
+        // thresholds are configured without being able to rewrite them.
+        .route(
+            "/health/settings",
+            get(health_incidents::get_settings)
+                .layer(guards::require(&state, "health.read"))
+                .merge(
+                    put(health_incidents::put_settings)
+                        .layer(guards::require(&state, "health.manage")),
+                ),
+        )
+        .route(
+            "/health/maintenance-windows",
+            get(health_incidents::list_windows)
+                .layer(guards::require(&state, "health.read"))
+                // Creating a window is a write even though it only *suppresses* alerts: an
+                // operator who can silence a whole service has to be the operator who can
+                // change its thresholds, or the screen is a mute button for anyone with a
+                // login.
+                .merge(
+                    post(health_incidents::create_window)
+                        .layer(guards::require(&state, "health.manage")),
+                ),
+        )
+        .route(
+            "/health/maintenance-windows/{id}",
+            delete(health_incidents::delete_window)
+                .layer(guards::require(&state, "health.manage")),
         )
         .route(
             "/security/overview",

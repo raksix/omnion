@@ -150,6 +150,16 @@ pub struct ServiceMetricBody {
     pub unit: String,
     /// When that value was measured.
     pub sampled_at: String,
+    /// The metric's values over [`SERVICE_TREND_RANGE`], oldest first, for this
+    /// row's trend line.
+    ///
+    /// Carried on the row rather than fetched per metric from the client, for the
+    /// reason the metric table's rows carry theirs: the trend line is the reason
+    /// the row exists, and a client that had to ask for one series per metric
+    /// would make this screen issue a request per row on every paint — and would
+    /// show a table of numbers with a chart that arrives late, which is how a
+    /// drill-down stops looking like one.
+    pub series: Vec<f64>,
 }
 
 /// The one-line summary other centres consume.
@@ -239,14 +249,36 @@ fn overview_body(overview: &HealthOverview, sample_count: i64) -> OverviewBody {
 /// The probe context the registry is handed.
 ///
 /// Built per request from the handles the request path already holds, so a status
-/// screen can never be the thing that opens a new pool or a new connection. The
-/// `worker_stale_seconds` is read from the settings row, with the migration's
-/// default when the row is unreadable — and the fallback is *silent on purpose*,
-/// because a settings read that fails must not stop the probes from running: the
-/// screen's job is to report the platform, and a missing setting is a panel
-/// problem, not a platform one.
-fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
+/// screen can never be the thing that opens a new pool or a new connection.
+///
+/// **Asynchronous, and the `await` is the point.** This used to be a plain function
+/// that hard-coded `worker_stale_seconds: 120` under a comment claiming the value
+/// "is read from the settings row". It was not. The field is the only thing that
+/// decides whether a quiet worker is called stale, the settings form writes it (30–3600),
+/// and the migration's default happens to be 120 — so an operator who typed 600 was
+/// looking at a panel that had decided, silently, to start calling their worker dead
+/// after two minutes. A comment describing a read that does not happen is worse than no
+/// comment: it is what stops the next person from looking.
+///
+/// The read failing falls back to the migration's default rather than refusing, because
+/// a settings read that fails must not stop the probes from running: the screen's job is
+/// to report the platform, and a missing setting is a panel problem, not a platform one.
+/// The fallback is logged, because it is now a *deviation* from what the operator saved
+/// and silence would make it indistinguishable from being obeyed.
+pub(crate) async fn probe_context(
+    state: &AppState,
+) -> omnion_health::ProbeContext<'_> {
     let config = state.config();
+    let worker_stale_seconds = match omnion_health::load_settings(state.db().pool()).await {
+        Ok(settings) => i64::from(settings.worker_stale_seconds),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the worker staleness limit could not be read; using the migration default"
+            );
+            i64::from(omnion_health::incidents::DEFAULT_WORKER_STALE_SECONDS)
+        }
+    };
     omnion_health::ProbeContext {
         pool: state.db().pool(),
         redis: state.redis(),
@@ -268,7 +300,7 @@ fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
             }),
         build: state.build(),
         environment: config.env.as_str().to_string(),
-        worker_stale_seconds: 120,
+        worker_stale_seconds,
     }
 }
 
@@ -288,7 +320,7 @@ fn context(state: &AppState) -> omnion_health::ProbeContext<'_> {
 pub async fn overview(
     State(state): State<AppState>,
 ) -> Result<Json<OverviewBody>, ApiError> {
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let sample_count = omnion_health::sample_count(state.db().pool())
         .await
@@ -332,7 +364,7 @@ pub async fn service(
             format!("{key} is not a service this platform probes"),
         ));
     }
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let report = overview
         .services
@@ -354,17 +386,35 @@ pub async fn service(
         .await
         .map_err(map_store)?;
     let mut metrics = Vec::new();
+    // The trend window is read ONCE, before the loop, so every row on the screen
+    // draws the same 24 hours. A per-row `now()` would give the first row a
+    // slightly wider window than the last, and the two lines on one screen would
+    // not be comparable — which is the one thing two charts on one page must be.
+    let now = time::OffsetDateTime::now_utc();
     for (service_key, metric) in recorded.into_iter().filter(|(svc, _)| *svc == key) {
         if let Some(sample) =
             omnion_health::latest_sample(state.db().pool(), &service_key, &metric)
                 .await
                 .map_err(map_store)?
         {
+            // A failed series read leaves the row with its value and an empty
+            // trend, because a metric with a number and no line is a better
+            // answer than a missing row: the drop is per metric, not per service.
+            let series = omnion_health::sparkline_values(
+                state.db().pool(),
+                &service_key,
+                &metric,
+                SERVICE_TREND_RANGE,
+                now,
+            )
+            .await
+            .unwrap_or_default();
             metrics.push(ServiceMetricBody {
                 metric: sample.metric,
                 value: sample.value,
                 unit: sample.unit,
                 sampled_at: sample.sampled_at.to_string(),
+                series,
             });
         }
     }
@@ -385,7 +435,7 @@ pub async fn service(
 /// `unknown`, because a platform nobody has looked at is not a healthy platform
 /// and a badge that says otherwise is the exact claim this screen must not make.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<SummaryBody>, ApiError> {
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     Ok(Json(summary_of(&overview)))
 }
@@ -413,7 +463,7 @@ fn summary_of(overview: &HealthOverview) -> SummaryBody {
 pub async fn host_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    let ctx = context(&state);
+    let ctx = probe_context(&state).await;
     let overview = omnion_health::run_and_record(state.db().pool(), &ctx).await.map_err(map_store)?;
     let host = overview
         .services
@@ -424,6 +474,15 @@ pub async fn host_metrics(
     Ok(Json(host))
 }
 
+/// The window a service detail page's trend lines cover.
+///
+/// A **day**, and it is named here rather than spelled `24` at three call sites
+/// because the alternative is a drill-down whose chart silently means something
+/// different from the metric table's chart. The screen does not offer a range
+/// selector (that is `/health/metrics`' job, and it owns the selector), so this
+/// is the one window the drill-down draws — stated once, in one place.
+const SERVICE_TREND_RANGE: omnion_health::Range = omnion_health::Range::Day;
+
 /// The query the samples endpoint accepts.
 #[derive(Debug, Deserialize)]
 pub struct SamplesQuery {
@@ -431,9 +490,17 @@ pub struct SamplesQuery {
     pub service: String,
     /// Which metric.
     pub metric: String,
-    /// How far back, in hours. Clamped to the ranges the panel offers.
+    /// Which window. Omitted means [`omnion_health::DEFAULT_RANGE`].
+    ///
+    /// This used to be `hours: Option<i64>`, clamped to 1 h … 7 d, and the
+    /// clamp is the defect slice 2 removed everywhere else: a caller asking for
+    /// 30 days got seven days with a `200` and no warning, so the chart it drew
+    /// was *confidently* the wrong window. A named range with a refusal is the
+    /// same shape as `/health/metrics`, and the reason is the same — the export
+    /// matches the table perfectly while both are wrong is only avoidable if the
+    /// server refuses a window it does not have a label for.
     #[serde(default)]
-    pub hours: Option<i64>,
+    pub range: Option<String>,
 }
 
 /// `GET /health/samples` — one metric's series, oldest first.
@@ -452,13 +519,12 @@ pub async fn samples(
             format!("{} is not a service this platform probes", query.service),
         ));
     }
-    let hours = query.hours.unwrap_or(24).clamp(1, 24 * 7);
-    let since = time::OffsetDateTime::now_utc() - time::Duration::hours(hours);
+    let range = resolve_range(query.range.as_deref())?;
     let rows = omnion_health::samples_in_window(
         state.db().pool(),
         &query.service,
         &query.metric,
-        since,
+        range.since(time::OffsetDateTime::now_utc()),
     )
     .await
     .map_err(map_store)?;
