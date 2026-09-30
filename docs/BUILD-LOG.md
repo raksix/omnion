@@ -7344,3 +7344,42 @@ mine were dropped — w2 had a live cargo, so every sibling's database was left 
 **Still open:** the browser pass (`scripts/qa/run.sh`) has still not run on this box — the QA slot
 was held by a live w3 pass for the whole tick, so the only remaining box in this REQ's checklist is
 the one this loop cannot claim until a slot frees.
+
+## 2026-09-30 · tick 39 (omnion-w7) — REQ-101 slice 2b: the reader, the applier, and a stale check the server owns
+
+**What.** The resource reader (`approvals::target`), the writer that turns a frozen plan into
+`content::pages::update_page`'s change type, `POST /ai/approvals/{id}/apply`, and — the reason
+the slice exists — a stale check that reads the target instead of believing the caller. Slice 1
+compared `base_revision` against a `current_revision` the request posted; that made the whole
+"nothing dangerous happens without a human" guarantee a self-report, because a client echoing
+the row's own stored base revision passed every time. `decide()` now takes a `RevisionReader`,
+the route passes `DbRevisionReader`, and there is no parameter left to put a forged answer in.
+
+Also: `ai.approval.applied` added to the event catalogue (the drift detector refuses an emitter
+whose name the table does not carry), and `origin/main` folded in (14 commits; the conflict in
+`crates/events/src/catalogue.rs` was two disjoint test bodies, both kept).
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --lib` → **487 passed, 0 failed** (470 before; 17 new).
+- `OMNION_DATABASE_URL=…omnion_qa_w7 cargo test -p omnion-api --test ai_approvals` →
+  **24 passed, 0 failed** (17 before; 7 new), 46.85s, real PostgreSQL, each walk on its own
+  scratch database.
+- `pnpm typecheck` → 2 successful, 2 total.
+- `cargo build -p omnion-api` → no errors.
+
+The seven new walks: the forgery cannot be expressed; an uncheckable row is refused; the applied
+value is read back out of `page_revisions` and equals the previewed one; an edited page goes
+stale with no client argument; an apply is single-use and audited once; a delete preview counts
+real revisions; a missing page is refused rather than rendered as a create.
+
+**Not run.** `bash scripts/qa/run.sh` is still queued from tick 38 — w3 holds the slot
+legitimately (holder 973982, `/proc/973982/cwd` = omnion-w3) and my pass is waiting at pid
+984523. No w7 listener on 18086/3106/3206, so nothing is half-running.
+
+**Next.** Slice 2c: the re-preview endpoint (`POST /ai/approvals/{id}/preview`) on top of
+`target::preview`, and the review screen's Re-preview control. The stale criterion stays unticked
+until the screen renders the banner, which is a browser fact.
+
+**Merge note.** `cargo build` does not compile `#[cfg(test)]`, so the two call sites broken by
+main's `required_fields()` signature change were invisible until `cargo test` — the gate ran
+before the slice started rather than after it, which is the only reason that cost one commit.
