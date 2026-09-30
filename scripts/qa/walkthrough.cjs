@@ -6442,12 +6442,29 @@ async function runCdnRulesDepth(page, report) {
   //
   // Disabled buttons count. A rank-1 row's "Up" is correctly disabled, and excluding disabled
   // controls would measure a screen that is easier to use than it is.
+  //
+  // The measurement names the offending control, not just how many are short. `smallest` alone
+  // is the number tick 82's note claimed to have replaced: it says a row is short without saying
+  // which, so the next pass still starts by reading the source to guess — and on a row with six
+  // buttons the guess is the expensive way to find out that only "Delete" is at the floor. Each
+  // entry carries its `data-cdn-rule-*` hook, its label and its height, so a report line points
+  // at one line of `cdn-rules-view.tsx` instead of at a component.
   const touch = await page.evaluate(() => {
     const buttons = Array.from(document.querySelectorAll("[data-cdn-rule-row] button"));
-    const short = buttons
-      .map((button) => button.getBoundingClientRect().height)
-      .filter((height) => height > 0 && height < 32);
-    return { total: buttons.length, short: short.length, smallest: Math.min(...buttons.map((b) => b.getBoundingClientRect().height)) };
+    const measured = buttons
+      .map((button) => ({
+        label: (button.textContent || "").trim().slice(0, 24),
+        hook: Object.keys(button.dataset).find((key) => key.startsWith("cdnRule")) || "(no hook)",
+        height: Math.round(button.getBoundingClientRect().height * 10) / 10,
+      }))
+      .filter((button) => button.height > 0);
+    const short = measured.filter((button) => button.height < 32);
+    return {
+      total: measured.length,
+      short: short.length,
+      smallest: measured.length ? Math.min(...measured.map((button) => button.height)) : 0,
+      shortControls: short,
+    };
   });
   steps.mobileTouchTargets = touch.total > 0 && touch.short === 0;
   steps.mobileTouchTargetDetail = touch;
