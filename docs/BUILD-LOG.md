@@ -5376,3 +5376,55 @@ granted path. I falsified it first: with the write removed, the control went red
 `loop_engine` call `tools::decide` itself, which is the second door the request forbids. Then the
 `audit_log` row (`actor_type = 'agent'`, written by the runner so `ai-hub` gains no dependency on
 `omnion-audit`) and the `ai.tool.*` events, then `PUT /ai/tools/{key}/grants` and the prune tick.
+
+## 2026-09-30 · w7 tick 32 · REQ-100 slice 3, the second half
+
+**What.** The wiring slice 3 existed to make possible, then the three items the first half left.
+`Runtime` now holds an `Arc<dyn ToolExecutor>` and calls `execute()`; it no longer calls
+`tools::decide` itself. The registry-only executor is `#[cfg(test)]`, so a release build cannot
+compile a decider that skips the identity. `ai_agent_runner` resolves the identity once before the
+first step, builds a `Pipeline`, and hands the loop a `RunExecutor` that also writes the two
+records `ai-hub` must not depend on: the `audit_log` row (`actor_type = Agent`, action
+`ai.tool.call`) and the `ai.tool.*` alert event. Then `GET`/`PUT /ai/tools/{key}/grants` (the last
+of the spec's eleven endpoints with no handler), the agent-form half of the warning stripe, and the
+tool-call pruner wired into the daily log tick.
+
+**Proof.**
+- `cargo test -p omnion-ai-hub --quiet` → **421 passed**; `--doc` → 2 passed.
+- `cargo build -p omnion-api` → clean.
+- `cargo test -p omnion-api --test ai_tool_execution -- --test-threads=1` → **17 passed** against
+  `omnion_qa_w7`, rows read out of SQL.
+- `cargo test -p omnion-api --lib ai_log_runner` → 3 passed.
+- `pnpm typecheck` → clean.
+
+**A walk that failed on the code it was written for.** `the_daily_log_tick_reaches_the_tool_call_pruner`
+asserts the tick calls both pruners and that a failure in the first does not skip the second. It
+went red on the first run: the decision-pruner's error arm still `return`ed, which was correct when
+it was the only pruner and silently became "a decision-log hiccup stops the tool-call log from ever
+being pruned" the moment a second one was added below it. The fix is the arm, and the walk is the
+reason it is not the same bug again.
+
+**Three compile errors worth recording, because each had a shape that looks fine.**
+1. `Arc<PermissionsForCaller>` versus `Arc<dyn PermissionGate>`: inference picked the concrete type,
+   and the only place the trait object is written down is a `clone` three lines later. The
+   annotation belongs on the binding, where both uses can see it.
+2. `ToolGrant::from_identity` takes `&AiIdentity`, not the value: `is_platform_level` reads `self`,
+   so moving `name` out of the struct and then borrowing it is `E0382`, once per route. One shared
+   constructor also means `GET` and `PUT` cannot answer different shapes for the same state.
+3. `Arc::new(registry)` inside a two-round loop moves the registry on round 1 — the pipeline is
+   built per call there because each round is a resume. The `Arc`s belong outside the loop.
+
+**The doctest, and why it was broken.** Rewriting the SDK example for the executor left an orphaned
+`# }`: the `# async fn example()` wrapper had been dropped but its closing brace had not, and the
+file compiled fine while its doctest did not. Wrapping in `fn main()` instead made it worse — a
+`fn` item cannot capture the environment, so the closure in `sdk.run(…, |event| …)` stopped
+compiling. The shape that works is `# async fn example()` plus a hidden `block_on` helper and a
+`main` that calls it, which is what the two other doc examples in this crate already do.
+
+**Next.** Two criteria remain before REQ-100 can close: the permission-mapping test ("the declared
+permission equals the permission of the HTTP route it wraps") and the ops-tool service-layer one
+("a deployment tool cannot be invoked with a raw command, and `logs.read` is scoped to the caller's
+organization"). Then the closing gate: `cargo test --workspace`, `pnpm build` and a w7 QA pass at
+zero high findings. Note for that pass: `/` was at 100 % (133 M) when this tick started and my own
+`w7target/debug/incremental` was 1.6 G of it; reclaiming only my incremental cache brought it to
+98 %.
