@@ -5993,6 +5993,33 @@ async function runCdnPurgeDepth(page, report) {
     .replace(/\s+/g, " ")
     .trim();
 
+  // The count match. "Showing 4 of 7" is a claim about two numbers, and REQ-011's acceptance
+  // line is that the rows on screen agree with the API — so the pass compares three readings
+  // of the same fact: the rows the DOM has, the `total` the API answers, and the sentence the
+  // header renders. A screen that renders the sentence from a stale `total`, or counts only
+  // the page it holds, agrees with itself and fails here.
+  //
+  // The comparison is only worth anything with MORE THAN ONE PAGE of rows, because a single
+  // page makes `purges.length === total` true by construction — a pager that never pages is
+  // indistinguishable from a table with nothing to page through. So the pass asks the API for
+  // its total first and skips rather than records a vacuous pass.
+  const purgeCounts = await page.evaluate(async (siteId) => {
+    const response = await fetch(`/api/v1/cdn/purges?site_id=${siteId}&limit=1`, {
+      credentials: "same-origin",
+    });
+    if (!response.ok) return null;
+    const body = await response.json();
+    return { total: body.total ?? null, firstPage: (body.purges ?? []).length };
+  }, site);
+  steps.apiTotal = purgeCounts?.total ?? null;
+  steps.countMatches =
+    typeof steps.apiTotal === "number" &&
+    steps.rows > 1 &&
+    steps.pageTotal.includes(`Showing ${steps.rows} of ${steps.apiTotal}`);
+  // Above the fold is not the table: the same locator is counted at 1280px, and a page that
+  // only renders the first page while the API holds more is the defect this catches.
+  steps.pageOneOfMany = typeof steps.apiTotal === "number" && steps.rows < steps.apiTotal;
+
   // The drawer: open the failed fixture by its row, and read the provider's own words.
   const failedRow = page.locator('[data-cdn-purge-status="failed"]').first();
   if ((await failedRow.count()) > 0) {
@@ -6027,8 +6054,30 @@ async function runCdnPurgeDepth(page, report) {
   await page.waitForTimeout(1300);
   steps.filteredRows = await page.locator("[data-cdn-purge-row]").count();
   steps.filterNarrows = steps.filteredRows < before;
+  // The empty state, reached the only way an operator reaches it: a filter that matches
+  // nothing. "No purge has ever been requested" and "nothing matches that filter" are two
+  // different sentences with two different meanings, and a screenshot of the first proves
+  // nothing about the second — which is why this drives the *combination* rather than a
+  // status on its own: the pass's own failed fixture is a `url` purge, so filtering to
+  // `failed` AND a kind it does not have leaves the table genuinely empty while the
+  // unfiltered table above it has rows. A screen that renders its no-purges-yet message here
+  // tells an operator their site has no history when it is a filter that is wrong.
+  await page
+    .locator("[data-cdn-purge-kind-filter]")
+    .selectOption("tag")
+    .catch(() => {});
+  await page.waitForTimeout(1300);
+  steps.emptyRows = await page.locator("[data-cdn-purge-row]").count();
+  steps.emptyStateShown =
+    (await page.locator("text=Nothing matches that filter").count()) > 0;
+  // And the two must not be the same sentence: the honest empty state is a *different*
+  // answer from the unfiltered one, so a screen that reuses "no purges yet" under a filter
+  // fails here.
+  steps.emptyStateIsNotTheUnfilteredOne = steps.emptyStateShown && steps.emptyRows === 0;
   await page.locator("[data-cdn-purge-filter-clear]").click({ timeout: 4000 }).catch(() => {});
   await page.waitForTimeout(1100);
+  steps.clearedBackToRows =
+    (await page.locator("[data-cdn-purge-row]").count()) === before;
   await shot(page, "page-cdn-purges");
 
   // Mobile: the cards, not a horizontally scrolling table. The hooks are the same ones the
@@ -6078,6 +6127,32 @@ async function runCdnRulesDepth(page, report) {
   await page.goto(`${URL_ADMIN}/cdn/rules`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(1600);
   steps.rows = await page.locator("[data-cdn-rule-row]").count();
+  steps.pageTotal = (
+    await page.locator("[data-cdn-rule-count]").innerText().catch(() => "")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+  // The same count match the purge pass measures, on the second of the two screens whose
+  // acceptance line names it. The rules screen renders "N in precedence order" rather than a
+  // paged "showing N of M", so what it can lie about is different: the header counts the
+  // rules it was given, and a table that silently drops a rule the API returned is invisible
+  // in a screenshot. The comparison is rows-in-the-DOM against rules-in-the-API-body, and the
+  // API is asked for the same site so the two are counting the same set.
+  steps.apiRuleCount = await page.evaluate(async (siteId) => {
+    const response = await fetch(`/api/v1/cdn/rules?site_id=${siteId}`, {
+      credentials: "same-origin",
+    });
+    if (!response.ok) return null;
+    const body = await response.json();
+    return (body.rules ?? []).length;
+  }, site);
+  steps.countMatches =
+    typeof steps.apiRuleCount === "number" &&
+    steps.rows === steps.apiRuleCount &&
+    steps.pageTotal.includes(`${steps.rows} in precedence order`);
+  // The header is not the table: the numbers agree on screen only if the rows that carry the
+  // per-row hooks are the rows the header counted.
+  steps.headerCountedTheRows = steps.pageTotal.startsWith(`${steps.rows} `);
 
   // 1. The live tester, both ways, before anything is saved. A rule that matches nothing is
   //    a valid rule the server will happily store, which is exactly why this box exists.

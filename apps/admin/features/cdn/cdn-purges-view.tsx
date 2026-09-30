@@ -259,7 +259,7 @@ export function CdnPurgesView() {
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-col gap-1">
           <h1 className="text-[15px] font-medium">Purge history</h1>
-          <p className="text-[12px] text-muted">
+          <p className="text-[12px] text-muted" data-cdn-purge-count>
             {total === 0
               ? "No purge has been requested for this site"
               : `Showing ${purges.length} of ${total}`}

@@ -716,7 +716,7 @@ export function CdnRulesView() {
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-[13.5px] font-medium">Cache rules</h2>
-            <span className="text-[12px] text-muted">
+            <span className="text-[12px] text-muted" data-cdn-rule-count>
               {rules === null ? "Loading…" : `${rules.length} in precedence order`}
             </span>
           </div>
