@@ -17,18 +17,41 @@
  * - **The phrase is shown before it is required.** An operator who has to be told the phrase
  *   at the moment of submitting has already committed; the whole point is that the cost of
  *   this restore is legible while they are still deciding.
- * - **Nothing here restores anything.** There is no button in this slice, and that is the
- *   honest state of the feature: the destructive call ships when the parts, the safety
- *   backup and the abort path do. A "Restore" button that could not be pressed is a dead
- *   button; a panel that explains the restore and asks for nothing is a working one.
+ * - **The parts are ticked, not implied.** Every available part carries a checkbox that
+ *   starts ticked, because "restore the whole archive" is the common case and a panel that
+ *   made the operator tick five boxes to undo one mistake is a panel they will not use. But
+ *   the array that is POSTed is the ticked set, never "everything available" — the API
+ *   refuses an empty one by name, and a control that silently widened the selection is the
+ *   dead control this product does not ship.
+ * - **The button is disabled until the phrase matches, and the reason is on the line under
+ *   it.** A destructive control that is merely *red* invites the click; a disabled control
+ *   with a sentence saying what is missing is a control that teaches.
+ * - **A refusal is rendered as the API's own sentence.** `ApiError.message` already names
+ *   the rule that refused and, where it can, the part that was asked for. Rewording it in
+ *   the panel is how "the confirmation phrase does not match, the phrase for this run is
+ *   RESTORE ae11f7e8" becomes "Invalid confirmation", which is the version that gets a
+ *   support ticket.
  */
 import { useState } from "react";
 
-import { AlertTriangle, CircleAlert, Info, Loader2, ShieldAlert, TriangleAlert } from "lucide-react";
+import {
+  AlertTriangle,
+  CircleAlert,
+  CircleCheck,
+  Info,
+  Loader2,
+  ShieldAlert,
+  TriangleAlert,
+} from "lucide-react";
 
-import { ApiError, previewRestore } from "@/lib/api";
+import { ApiError, previewRestore, restoreBackup } from "@/lib/api";
 import { formatBytes } from "@/lib/format";
-import type { RestorablePart, RestorePreview, RestoreWarning } from "@/lib/types";
+import type {
+  RestorablePart,
+  RestoreOutcome,
+  RestorePreview,
+  RestoreWarning,
+} from "@/lib/types";
 
 /** Each severity's own visual, so a data-loss warning cannot be mistaken for a note. */
 const WARNING_TONE = {
@@ -76,14 +99,28 @@ export function RestorePreviewPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typed, setTyped] = useState("");
+  // Which parts are ticked. Seeded from the preview the moment it arrives, so the default is
+  // "everything available" without the panel having to guess what available means.
+  const [selected, setSelected] = useState<string[]>([]);
+  const [restoring, setRestoring] = useState(false);
+  const [outcome, setOutcome] = useState<RestoreOutcome | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
     setError(null);
     try {
-      setPreview(await previewRestore(backupId));
+      const next = await previewRestore(backupId);
+      setPreview(next);
+      // Re-seed the selection on every load, and clear the outcome: a preview that changed
+      // under the operator invalidates both the ticks and the result they were looking at.
+      setSelected(next.parts.filter((part) => part.available).map((part) => part.part));
+      setOutcome(null);
+      setRestoreError(null);
+      setTyped("");
     } catch (cause) {
       setPreview(null);
+      setSelected([]);
       setError(
         cause instanceof ApiError
           ? cause.message
@@ -94,10 +131,46 @@ export function RestorePreviewPanel({
     }
   }
 
+  function toggle(part: string) {
+    setSelected((current) =>
+      current.includes(part) ? current.filter((name) => name !== part) : [...current, part],
+    );
+  }
+
+  async function performRestore() {
+    if (!preview) return;
+    setRestoring(true);
+    setRestoreError(null);
+    setOutcome(null);
+    try {
+      setOutcome(await restoreBackup(backupId, selected, typed));
+    } catch (cause) {
+      setRestoreError(
+        cause instanceof ApiError
+          ? cause.message
+          : "The restore could not be started. Nothing was changed.",
+      );
+    } finally {
+      setRestoring(false);
+    }
+  }
+
   // The phrase is never pre-filled, and the input is never enabled before the preview has
   // arrived: a confirmation field that accepts a guess typed from a previous restore is
   // exactly the mis-click the guard exists to catch.
   const phraseMatches = preview ? typed === preview.confirm_phrase : false;
+  // Three independent conditions, and the button says which one is missing rather than
+  // simply being grey. A destructive control that is disabled for an unexplained reason is
+  // a control people click anyway.
+  const nothingSelected = selected.length === 0;
+  const blocked =
+    restoring ||
+    !preview ||
+    !preview.restorable ||
+    nothingSelected ||
+    !phraseMatches ||
+    outcome !== null ||
+    restoreError !== null;
 
   return (
     <div
@@ -236,7 +309,23 @@ export function RestorePreviewPanel({
             <tbody>
               {preview.parts.map((part: RestorablePart) => (
                 <tr key={part.part} data-testid="restore-part-row" className="border-t border-line">
-                  <td className="py-1 font-medium">{part.part}</td>
+                  <td className="py-1 font-medium">
+                    <label className="flex items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        checked={selected.includes(part.part)}
+                        // A part that is not available cannot be ticked: the control would
+                        // be a checkbox that lies, and a lie here becomes a `400` at the
+                        // worst possible moment.
+                        disabled={!part.available}
+                        onChange={() => toggle(part.part)}
+                        data-testid={`restore-part-check-${part.part}`}
+                        aria-label={`Restore the ${part.part} part`}
+                        className="h-3.5 w-3.5 accent-danger"
+                      />
+                      {part.part}
+                    </label>
+                  </td>
                   <td className="py-1">
                     <span
                       className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
@@ -267,11 +356,9 @@ export function RestorePreviewPanel({
           </table>
 
           {/*
-            The typed confirmation. It is shown, not demanded: the destructive call is the
-            next slice, and a field that asks for a phrase and then does nothing with it
-            would be the dead control this product is not allowed to ship. What it does prove
-            is that the phrase the API will ask for is legible now, while the operator is
-            still deciding.
+            The typed confirmation, and the button. The phrase is SHOWN before it is
+            demanded, so the operator can see what the API will ask for while they are still
+            deciding rather than after they have committed.
           */}
           {preview.restorable ? (
             <div className="rounded-lg border border-line px-3 py-2">
@@ -292,11 +379,48 @@ export function RestorePreviewPanel({
                 aria-describedby="restore-confirm-state"
                 className="mt-1 w-full max-w-[280px] rounded-lg border border-line bg-canvas px-2 py-1 font-mono text-[12px]"
               />
-              <p id="restore-confirm-state" className="mt-1 text-[11.5px] text-muted" data-testid="restore-confirm-state">
+              <p
+                id="restore-confirm-state"
+                className="mt-1 text-[11.5px] text-muted"
+                data-testid="restore-confirm-state"
+              >
+                {/* The one sentence that says what is missing, rather than three grey
+                    reasons. A control disabled for an unexplained reason is a control
+                    people click anyway. */}
                 {phraseMatches
-                  ? "Matches. Restoring from this panel is not enabled yet — the safety backup and abort path ship first."
-                  : "Restoring is not enabled from this screen yet. The phrase is shown so you can see what the API will ask for."}
+                  ? `Matches. Restoring takes a safety backup first, so nothing here is lost.`
+                  : nothingSelected
+                    ? "Tick at least one part above."
+                    : "The phrase does not match yet."}
               </p>
+
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void performRestore()}
+                  disabled={blocked}
+                  data-testid="restore-run"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-danger bg-danger-soft px-3 py-1.5 text-[12.5px] font-medium text-danger disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {restoring ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <ShieldAlert className="h-3.5 w-3.5" />
+                  )}
+                  {restoring
+                    ? "Restoring…"
+                    : `Restore ${selected.length} part${selected.length === 1 ? "" : "s"}`}
+                </button>
+                <span className="text-[11.5px] text-muted">
+                  {selected.length > 0 ? (
+                    <>
+                      Selected: <span className="font-mono">{selected.join(", ")}</span>
+                    </>
+                  ) : (
+                    "Nothing selected."
+                  )}
+                </span>
+              </div>
             </div>
           ) : (
             <p
@@ -307,6 +431,86 @@ export function RestorePreviewPanel({
               again — there is no phrase to confirm, because there is nothing to confirm.
             </p>
           )}
+
+          {/* The refusal. The API's own sentence, not a rewording: it names the rule that
+              refused and, where it can, the part that was asked for, and paraphrasing that
+              in the panel is how "the phrase for this run is RESTORE ae11f7e8" turns into
+              "Invalid confirmation" and a support ticket. */}
+          {restoreError ? (
+            <p
+              className="flex items-start gap-1.5 rounded-lg border border-danger bg-danger-soft px-3 py-2 text-[12px] text-danger"
+              role="alert"
+              data-testid="restore-error"
+            >
+              <CircleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                {restoreError}
+                <span className="mt-0.5 block text-[11.5px]">
+                  Nothing was changed — a refused restore takes no safety backup.
+                </span>
+              </span>
+            </p>
+          ) : null}
+
+          {/* What happened. The price the operator agreed to is repeated here next to what
+              actually landed, because a restore that wrote three of four objects and said
+              "done" is the failure this screen exists to make visible. */}
+          {outcome ? (
+            <div
+              className="rounded-lg border border-line bg-panel px-3 py-2"
+              data-testid="restore-outcome"
+            >
+              <p className="flex items-center gap-1.5 text-[12.5px] font-medium">
+                <CircleCheck className="h-3.5 w-3.5 text-ok" />
+                {outcome.summary}
+              </p>
+              <dl className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11.5px] sm:grid-cols-4">
+                <div>
+                  <dt className="text-muted">Objects restored</dt>
+                  <dd className="tabular-nums" data-testid="restore-objects-restored">
+                    {outcome.media.objects_restored}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted">Objects failed</dt>
+                  <dd
+                    className={`tabular-nums ${outcome.media.objects_failed > 0 ? "text-danger" : ""}`}
+                    data-testid="restore-objects-failed"
+                  >
+                    {outcome.media.objects_failed}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-muted">Bytes</dt>
+                  <dd className="tabular-nums">{formatBytes(outcome.media.bytes_restored)}</dd>
+                </div>
+                <div>
+                  <dt className="text-muted">Live items dropped</dt>
+                  <dd className="tabular-nums">{outcome.live_dropped}</dd>
+                </div>
+              </dl>
+              {outcome.media.objects_failed > 0 ? (
+                <ul
+                  className="mt-1.5 max-h-40 space-y-0.5 overflow-y-auto text-[11.5px] text-danger"
+                  data-testid="restore-failures"
+                >
+                  {outcome.media.failures.map((failure) => (
+                    <li key={`${failure.archive_key}-${failure.reason}`}>
+                      <span className="font-mono">{failure.storage_key}</span> — {failure.reason}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <p className="mt-1.5 text-[11.5px] text-muted">
+                A protected safety backup was taken first:{" "}
+                <span className="font-mono" data-testid="restore-safety-id">
+                  {outcome.safety_backup_id}
+                </span>
+                . Nothing was deleted from the library — a restore adds back what the archive
+                holds.
+              </p>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

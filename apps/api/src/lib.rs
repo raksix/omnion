@@ -11,6 +11,7 @@ pub mod ai_log_runner;
 pub mod analytics_runner;
 pub mod auth;
 pub mod automation_runner;
+pub mod backup_schedule_runner;
 pub mod backup_sweep_runner;
 pub mod client_ip;
 pub mod cookies;

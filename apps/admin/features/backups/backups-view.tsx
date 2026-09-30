@@ -52,6 +52,7 @@ import {
 } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { BackupSchedulesPanel } from "@/features/backups/schedules-panel";
 import { RestorePreviewPanel } from "@/features/backups/restore-preview-panel";
 import { LoadingTable } from "@/components/loading-table";
 import {
@@ -689,6 +690,16 @@ export function BackupsOverviewScreen() {
           </p>
         </div>
       )}
+
+      {/*
+        The schedules table, below the runs list rather than behind a tab.
+
+        A tab would hide the only place an operator can see whether a schedule will actually
+        fire, and the question "is this thing on?" is asked about backups more than any other.
+        The panel owns its own loading, so it is mounted unconditionally and shows a skeleton
+        while it reads.
+      */}
+      <BackupSchedulesPanel onRan={reload} />
     </div>
   );
 }
