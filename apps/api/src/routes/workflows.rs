@@ -695,6 +695,22 @@ async fn list_scoped_workflows(
         .await
         .map_err(ApiError::from)?;
 
+    // The REQ's "scoped defaults" half: with no `project_id` in the query, the caller's own stored
+    // selection narrows the list. An explicit `project_id` always wins — a typed filter is a
+    // question, and a remembered answer must not overrule it.
+    //
+    // `default_scope` intersects with `visible`, so a selection naming a project the caller has
+    // since been removed from is ignored rather than honoured: without that, removing a member
+    // would leave them on a default that returns rows they cannot see.
+    let wanted = match wanted {
+        Some(id) => Some(id),
+        None => {
+            projects::default_scope(state.db().pool(), current.user.id, &visible)
+                .await
+                .map_err(ApiError::from)?
+        }
+    };
+
     let allowed: Vec<Uuid> = match wanted {
         Some(id) if visible.contains(&id) => vec![id],
         Some(_) => Vec::new(),

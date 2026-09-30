@@ -295,7 +295,22 @@ pub async fn list_automations(
                 omnion_workflows::projects::visible_project_ids(state.db().pool(), organization_id, caller)
                     .await
                     .map_err(ApiError::from)?;
-            let scoped: Vec<Uuid> = match query.project_id {
+            // The stored selection narrows the list when no `project_id` was asked for (REQ-133's
+            // "scoped defaults"), and is ignored when it names a project this caller can no longer
+            // see — the intersection is `default_scope`'s job, not the route's.
+            let wanted = match query.project_id {
+                Some(id) => Some(id),
+                None => {
+                    omnion_workflows::projects::default_scope(
+                        state.db().pool(),
+                        current.user.id,
+                        &visible,
+                    )
+                    .await
+                    .map_err(ApiError::from)?
+                }
+            };
+            let scoped: Vec<Uuid> = match wanted {
                 Some(id) if visible.contains(&id) => vec![id],
                 Some(_) => Vec::new(),
                 None => visible,

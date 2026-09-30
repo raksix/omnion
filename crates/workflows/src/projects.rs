@@ -1305,6 +1305,42 @@ pub async fn stored_selection(pool: &PgPool, user_id: Uuid) -> Result<Option<Uui
     Ok(row)
 }
 
+/// The project a **list** should default to: the caller's stored selection, if it is one they may
+/// still see, and `None` otherwise.
+///
+/// REQ-133's API table promises lists gain "a `project_id` filter **and scoped defaults**", and
+/// only the filter half existed. The switcher stored a selection, the switcher read it back to
+/// label its own button, and nothing that *lists workflows* ever consulted it — so selecting
+/// OPS and then opening the workflow list showed every project the caller could see, which is the
+/// one thing the control promises it will not do. The stored row was written by three functions
+/// and read by none of them: this is the thirteenth instance of this module's signature defect,
+/// and the first where the dead thing was a *default* rather than a value.
+///
+/// Three rules, and each is a refusal rather than a convenience:
+///
+/// * **The selection is intersected with visibility, not trusted.** A membership row can be
+///   deleted after the selection was made — a project owner who removes a member leaves that
+///   member's stored selection naming a project they can no longer see. Reading the selection on
+///   its own would then *widen* a list for the person who just lost access, which is the opposite
+///   of what a default is for. This is why the function takes the visible set as an argument
+///   rather than reading it itself: the caller already has it, and a second read is a second
+///   moment for it to change.
+/// * **A selection naming a project outside the organization is ignored,** not applied. The
+///   `organization_id` join in [`selected_project`] exists for that, and a default is the one
+///   place where silently honouring a stale row would put a reader on a foreign tenant's screen.
+/// * **`None` means "no selection to apply" and is not an error,** which is what keeps the
+///   caller's own question — filter, or filter plus a narrower default? — a one-line `match`.
+pub async fn default_scope(
+    pool: &PgPool,
+    user_id: Uuid,
+    visible: &[Uuid],
+) -> Result<Option<Uuid>> {
+    let Some(selected) = stored_selection(pool, user_id).await? else {
+        return Ok(None);
+    };
+    Ok(visible.contains(&selected).then_some(selected))
+}
+
 /// What a shared link's `?project=` actually resolves to, and why.
 ///
 /// Acceptance 3 says the selection "is encoded in URLs so a shared link reproduces the view". The
