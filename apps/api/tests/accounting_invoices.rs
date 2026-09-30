@@ -422,7 +422,10 @@ async fn an_invoice_totals_what_its_lines_add_up_to_including_the_tax() {
     // The lines carry their own tax, so changing a rate later cannot rewrite this document.
     let lines = invoice.get("lines").and_then(Value::as_array).expect("lines");
     assert_eq!(lines.len(), 2, "{invoice}");
-    assert_eq!(text(&lines[0], "tax_percent"), "20", "{lines:?}");
+    // Two decimals, because `numeric(5,2)` is the column: a percent the form typed as `20` is
+    // stored and returned as `20.00`, and a test asserting the typed form is asserting the
+    // browser's copy rather than the document's.
+    assert_eq!(text(&lines[0], "tax_percent"), "20.00", "{lines:?}");
     assert_eq!(text(&lines[0], "line_total"), "120.00", "{lines:?}");
     assert_eq!(text(&lines[1], "line_total"), "60.00", "{lines:?}");
 }
@@ -1193,7 +1196,9 @@ async fn another_organizations_invoice_is_404_and_never_403() {
 
 /// A page of invoices with the given extra query string.
 async fn list(state: &AppState, book: &Session, extra: &str) -> Vec<Value> {
-    let uri = format!("/api/v1/accounting/invoices{extra}");
+    // A caller writes the fragment either way round; the URL needs exactly one `?`.
+    let separator = if extra.starts_with('?') { "" } else { "?" };
+    let uri = format!("/api/v1/accounting/invoices{separator}{extra}");
     let response = call(state, request(Method::GET, &uri, Some(book), None)).await;
     assert_eq!(response.status, StatusCode::OK, "{uri}: {}", response.body);
     response.body.as_array().cloned().unwrap_or_default()

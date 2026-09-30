@@ -655,7 +655,7 @@ pub async fn create_invoice(
     }
     let grand_total = subtotal.minus(discount_total).plus(tax_total);
 
-    let customer_name = resolve_customer_name(pool, new).await?;
+    let customer_name = resolve_customer_name(pool, new, from_order.as_ref()).await?;
     let currency = normalize_currency(new.currency.as_deref())?;
 
     // The three free-text fields are normalised **before** the statement is built, not inside the
@@ -940,8 +940,12 @@ pub async fn send_invoice(
             )));
         }
         other => {
+            // The way out is named, because a refusal that only says "already sent" sends the
+            // person to the invoice form to try again — and the form refuses too, for the same
+            // reason. Void and duplicate is the documented path and it belongs in the sentence.
             return Err(AccountingError::not_allowed(format!(
-                "invoice {} is already {} — send applies to a draft",
+                "invoice {} is already {} — send applies to a draft; to change it, void the \
+                 invoice with a reason and duplicate it as a new draft",
                 invoice.number,
                 other.label()
             )));
@@ -1082,6 +1086,10 @@ struct OrderForInvoice {
     invoice_id: Option<Uuid>,
     /// The customer, when the order names a company.
     customer_id: Option<Uuid>,
+    /// The name the order itself prints, copied onto the invoice. A converted document that
+    /// asked the caller to re-type the customer is a document with a second source of truth for
+    /// a field the order already holds.
+    customer_name: String,
     /// The lines to copy.
     lines: Vec<NewInvoiceLine>,
     /// Whether the order's status is one an invoice may be made from.
@@ -1095,7 +1103,7 @@ async fn read_order_for_invoice(
     order_id: Uuid,
 ) -> Result<OrderForInvoice> {
     let row = sqlx::query(
-        "select id, number, status, customer_id, customer_type \
+        "select id, number, status, customer_id, customer_type, customer_name \
          from sales_orders where organization_id = $1 and id = $2",
     )
     .bind(organization_id)
@@ -1121,6 +1129,7 @@ async fn read_order_for_invoice(
 
     Ok(OrderForInvoice {
         number: row.get("number"),
+        customer_name: row.get("customer_name"),
         // A cancelled order is not a sale, and a delivered one has already been invoiced by
         // whatever workflow did it — either way this is not a draft to create.
         convertible: matches!(status.as_str(), "confirmed" | "delivered" | "invoiced"),
@@ -1246,7 +1255,11 @@ fn resolve_due_date(raw: Option<&str>, issue_date: Date) -> Result<Option<Date>>
 ///
 /// `async` because it reads the CRM's name when the caller named a company or a contact rather
 /// than spelling the customer out.
-async fn resolve_customer_name(pool: &PgPool, new: &NewInvoice) -> Result<String> {
+async fn resolve_customer_name(
+    pool: &PgPool,
+    new: &NewInvoice,
+    order: Option<&OrderForInvoice>,
+) -> Result<String> {
     if let Some(name) = new
         .customer_name
         .as_deref()
@@ -1287,6 +1300,11 @@ async fn resolve_customer_name(pool: &PgPool, new: &NewInvoice) -> Result<String
                 return Ok(truncate(&name, MAX_DESCRIPTION_LENGTH));
             }
         }
+    }
+    // A converted invoice's customer is the order's: the order row already spells it, and asking
+    // the caller to re-type it would be a second place to fix a typo in the same fact.
+    if let Some(name) = order.map(|order| order.customer_name.trim()).filter(|name| !name.is_empty()) {
+        return Ok(truncate(name, MAX_DESCRIPTION_LENGTH));
     }
     Err(AccountingError::invalid(
         "invoice",
@@ -1343,8 +1361,12 @@ fn days_past_due(status: InvoiceStatus, due_date: Option<Date>) -> i32 {
 /// `line_total - tax`: the first is a sum of stored values and the second is a subtraction that
 /// has to be right, and the two differ whenever a discount makes the tax not a round figure.
 fn gross_of(line: &PricedLine) -> Amount {
+    // **net + discount**, and the tax is NOT in it. The gross is the pre-tax, pre-discount
+    // amount, and the first version added the tax as well — which made a 100.00 line at 20% with
+    // no discount report a `subtotal` of 120.00, a figure no line on the invoice has. The
+    // relationship is `gross - discount = net` and `net + tax = line_total`, and both halves of
+    // that are checked by the schema, so the reader can trust the pair rather than re-derive it.
     Amount::parse(&line.net_amount).unwrap_or(Amount::ZERO)
-        .plus(Amount::parse(&line.tax_amount).unwrap_or(Amount::ZERO))
         .plus(Amount::parse(&line.discount_amount).unwrap_or(Amount::ZERO))
 }
 
