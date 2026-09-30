@@ -598,7 +598,10 @@ async function clickAction(page) {
 
 async function runWizard(page, report) {
   log("wizard: detecting first-run state");
-  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" });
+  // Same reason as `ensureSignedIn`'s hop below: `/` decides between the setup wizard and the app
+  // shell by redirecting, so this navigation can be interrupted by the app itself. The line
+  // after it reads where we actually landed, which is the only thing this navigation is for.
+  await page.goto(`${URL_ADMIN}/`, { waitUntil: "domcontentloaded" }).catch(() => {});
   await page.waitForTimeout(900);
   let url = page.url();
   // A fresh database is NOT the same as "an installation already exists", and telling those two
@@ -737,7 +740,14 @@ async function ensureSignedIn(page, report) {
     return true; // already signed in — the wizard created the session
   }
   if (!/\/login/.test(page.url())) {
-    await page.goto(`${URL_ADMIN}/login`, { waitUntil: "domcontentloaded" });
+    // `.catch(() => {})` is not decoration here. The panel redirects an anonymous visitor away
+    // from `/login` the moment it has a session, so `goto("/login")` can be interrupted by the
+    // app's own navigation to `/` — and Playwright raises that as a *fatal* "Navigation is
+    // interrupted by another navigation", which took the whole pass down at the first step. The
+    // three other `goto` calls in this file already carry the catch for exactly this reason;
+    // this one was the odd one out. A redirect is not an error: the only thing this line needs
+    // is to end up somewhere, and the next line reads where that actually is.
+    await page.goto(`${URL_ADMIN}/login`, { waitUntil: "domcontentloaded" }).catch(() => {});
     await page.waitForTimeout(700);
   }
   const email = page.locator('input[type="email"], input[name="email"], #email').first();
