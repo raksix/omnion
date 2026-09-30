@@ -45,6 +45,7 @@ omnion-policy-engine = { path = "../../crates/policy-engine" }
 omnion-search = { path = "../../crates/search" }
 omnion-storage = { path = "../../crates/storage" }
 omnion-workflows = { path = "../../crates/workflows" }
+omnion-module-ai = { path = "../../modules/ai" }
 
 # Enterprise sign-in (REQ-006, slice 4b-2): the authorization URL is assembled with a real
 # URL parser (so a provider endpoint cannot smuggle a fragment or a second origin into it), and
