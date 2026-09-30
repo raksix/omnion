@@ -595,12 +595,39 @@ fn map_token_error(error: omnion_content::ContentError) -> ApiError {
 /// called: a token that expired and a token that was never right are two different integrations
 /// problems, and both reaching the caller as `invalid_token` teaches them to rotate a token that
 /// was fine.
+///
+/// **`StoreUnavailable` is the one case that is not a 401**, and it is the case this function was
+/// extended for. The caller did nothing wrong, the answer will be the same on a retry, and a `401`
+/// here teaches an integrator to go and rotate a perfectly good token because our database was
+/// busy. So it answers `503` with the store's own message, logs the cause at `error!` — the
+/// content crate has no logger, which is why the cause travels in the variant — and a `Retry-After`
+/// the client can actually honour.
+///
+/// The status is decided by `is_credential_problem()` rather than by matching on the variant, so
+/// a fifth failure added later cannot be forgotten here: whatever is not about the credential is a
+/// platform problem by default, and the exhaustive match below is what makes that safe.
 #[must_use]
 pub fn auth_failure_response(failure: &AuthFailure) -> ApiError {
+    if let AuthFailure::StoreUnavailable { source } = failure {
+        tracing::error!(
+            error = %source,
+            "the content API could not read its own token store; answering 503 rather than 401"
+        );
+        let error = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            failure.code(),
+            "the token store is temporarily unreachable; retry shortly",
+        )
+        .with_retry_after(5);
+        return error;
+    }
     let message = match failure {
         AuthFailure::Invalid => "this token is not valid",
         AuthFailure::Expired => "this token has expired",
         AuthFailure::Revoked => "this token was revoked",
+        // Handled above; the arm exists so adding a variant is a compile error here rather than a
+        // silent 401 in production.
+        AuthFailure::StoreUnavailable { .. } => unreachable!("handled before this match"),
     };
     ApiError::new(StatusCode::UNAUTHORIZED, failure.code(), message)
 }

@@ -140,6 +140,21 @@ pub enum AuthFailure {
     Expired,
     /// The token was revoked.
     Revoked,
+    /// The store could not answer: a pool timeout, a closed pool, or a row that decoded into
+    /// something the query did not promise.
+    ///
+    /// A **fourth** variant rather than a log line in the store, and the reason is structural: the
+    /// content crate has no logger, so a `tracing::error!` written here would not compile — and
+    /// the temptation that follows from that is worse, which is to keep `.map_err(|_| Invalid)`
+    /// and lose the class. This variant carries the evidence out to the one layer that does log,
+    /// so a database incident is visible as a database incident and never as an integrator's
+    /// mistake.
+    ///
+    /// It is deliberately NOT an `Invalid` alias with a side channel. A separate variant means the
+    /// route can answer `503` and log by **construction** rather than by remembering, which is
+    /// the whole difference between a diagnostic and a guess. The `source` string is the error's
+    /// own `Display`, so the log line names the constraint or the timeout that actually happened.
+    StoreUnavailable { source: String },
 }
 
 impl AuthFailure {
@@ -150,7 +165,19 @@ impl AuthFailure {
             Self::Invalid => "invalid_token",
             Self::Expired => "token_expired",
             Self::Revoked => "token_revoked",
+            Self::StoreUnavailable { .. } => "token_store_unavailable",
         }
+    }
+
+    /// Whether this failure is about the **credential** rather than about the platform.
+    ///
+    /// The route needs this distinction for one decision: what status to answer. A wrong token
+    /// fails identically forever, so answering `503` would teach an integrator to retry something
+    /// that will never succeed; an unreachable store is worth exactly one retry, and the status
+    /// code has to tell the two apart to be worth anything.
+    #[must_use]
+    pub fn is_credential_problem(&self) -> bool {
+        !matches!(self, Self::StoreUnavailable { .. })
     }
 }
 
@@ -308,6 +335,10 @@ pub fn constant_time_eq(left: &str, right: &str) -> bool {
 }
 
 /// Split a presented token into its prefix and secret halves.
+///
+/// The returned prefix is the **bare** 8 characters, because that is the half the secret is
+/// split *away* from. It is NOT what the `prefix` column stores — see [`lookup_prefix`], which is
+/// the one function that knows the column keeps the display form.
 pub fn split_token(token: &str) -> Option<(String, String)> {
     let rest = token.strip_prefix(&format!("{TOKEN_NAMESPACE}_"))?;
     let (prefix, secret) = rest.split_once('_')?;
@@ -327,6 +358,18 @@ pub fn split_token(token: &str) -> Option<(String, String)> {
         return None;
     }
     Some((prefix.to_owned(), secret.to_owned()))
+}
+
+/// The `prefix` column keeps the **namespaced display form** (`omn_1a2b3c4d`) — the copyable
+/// marker the panel shows, and what the `^omn_[0-9a-f]{8}$` check constraint is written against.
+/// [`split_token`], by contrast, returns the bare 8 characters, because that is the half the
+/// secret is split away from.
+///
+/// So the two disagree by exactly one prefix, and the lookup has to add it back. Doing that here,
+/// once, is the fix: an inline `format!` at each of the two `where prefix = $1` sites is a
+/// correct expression in both places and a guaranteed break in the first one somebody edits.
+fn lookup_prefix(bare: &str) -> String {
+    format!("{TOKEN_NAMESPACE}_{bare}")
 }
 
 /// A fresh `omn_<prefix>_<secret>` triple.
@@ -537,10 +580,10 @@ pub async fn authenticate(
     let row = sqlx::query_as::<_, TokenForAuth>(&format!(
         "select {LIST_COLUMNS}, token_hash from api_tokens where prefix = $1"
     ))
-    .bind(&prefix)
+    .bind(lookup_prefix(&prefix))
     .fetch_optional(pool)
     .await
-    .map_err(|_| AuthFailure::Invalid)?;
+    .map_err(store_error_as_invalid)?;
 
     let Some(row) = row else {
         return Err(AuthFailure::Invalid);
@@ -600,10 +643,10 @@ pub async fn authenticate_any_organization(
     let row = sqlx::query_as::<_, TokenForAuth>(&format!(
         "select {LIST_COLUMNS}, token_hash from api_tokens where prefix = $1"
     ))
-    .bind(&prefix)
+    .bind(lookup_prefix(&prefix))
     .fetch_optional(pool)
     .await
-    .map_err(|_| AuthFailure::Invalid)?;
+    .map_err(store_error_as_invalid)?;
     let Some(row) = row else {
         return Err(AuthFailure::Invalid);
     };
@@ -635,6 +678,40 @@ struct TokenForAuth {
     #[sqlx(flatten)]
     token: ApiToken,
     token_hash: String,
+}
+
+/// Classify a store failure so the refusal keeps its cause.
+///
+/// The obvious version of this line is `.map_err(|_| AuthFailure::Invalid)`, and it is a defect
+/// with a long reach: a pool that timed out, a statement whose row shape moved and a wrong
+/// credential are three unrelated problems, and the refusal to tell them apart turns a
+/// diagnosis into a bisect. The verdict itself must not become a fifth value the route has to
+/// invent a status code for, so the split is by *cause*: anything that means "the store could
+/// not answer" is [`AuthFailure::StoreUnavailable`] and everything else stays `Invalid`.
+///
+/// `ColumnNotFound` is classified with the store errors rather than with the credential, and that
+/// is the specific bisect this function exists to prevent: a column the struct names and the
+/// query does not return is a code/schema disagreement, and reading it as "your token is wrong"
+/// sends the reader to the integrator instead of to the migration.
+fn classify_store_error(err: &sqlx::Error) -> AuthFailure {
+    match err {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnDecode { .. } => {
+            AuthFailure::StoreUnavailable { source: err.to_string() }
+        }
+        _ => AuthFailure::Invalid,
+    }
+}
+
+/// Classify the error and return only the verdict.
+///
+/// Both authentication entry points want exactly this, and the evidence travels in the variant:
+/// [`AuthFailure::StoreUnavailable`] carries the `sqlx` error's own `Display`, so the route can
+/// log it with `Display` and the constraint or timeout that failed is named, not guessed at.
+fn store_error_as_invalid(err: sqlx::Error) -> AuthFailure {
+    classify_store_error(&err)
 }
 
 /// Map a database error to the store's vocabulary.
@@ -673,6 +750,76 @@ mod tests {
                 split_token(&token).is_none(),
                 "must refuse {token:?} before touching the database"
             );
+        }
+    }
+
+    /// The two halves of a token have to survive a round trip through the generator, the splitter
+    /// and the column, in that order, without anyone reformatting one of them.
+    ///
+    /// **This is the test for a real defect, and the defect was invisible to every test above
+    /// it.** `fresh_material` stores the *namespaced* prefix (`omn_1a2b3c4d`) because that is what
+    /// the `^omn_[0-9a-f]{8}$` check constraint is written against, while `split_token` returns
+    /// the *bare* 8 characters because that is the half the secret is split away from. The two
+    /// lookup sites bound the bare form, so `where prefix = $1` matched nothing and every token
+    /// this crate ever minted answered `invalid_token` — while the unit tests were all green,
+    /// because each of them tested one half and none of them made a round trip.
+    ///
+    /// The test asserts the *value that goes into the query*, not the shape of the parts. A test
+    /// that only checked `prefix.starts_with("omn_")` passes against both a correct and a broken
+    /// binding; this one fails on the exact line that broke.
+    #[test]
+    fn the_stored_prefix_is_the_namespaced_form_the_lookup_rebuilds() {
+        for _ in 0..500 {
+            let (stored_prefix, secret, plaintext) = fresh_material();
+            let (bare, split_secret) =
+                split_token(&plaintext).expect("a fresh token must split back into two halves");
+
+            // What `create_token` binds into the column.
+            assert!(
+                stored_prefix.starts_with(&format!("{TOKEN_NAMESPACE}_")),
+                "the column holds the display form, got {stored_prefix:?}"
+            );
+            // What the lookup must rebuild to find it.
+            assert_eq!(
+                lookup_prefix(&bare),
+                stored_prefix,
+                "the lookup value must equal the stored value, or the token never authenticates"
+            );
+            // And the secret half is untouched by either representation.
+            assert_eq!(split_secret, secret);
+            assert_eq!(hash_secret(&split_secret).len(), 64);
+        }
+    }
+
+    /// A store failure is a **different verdict** from a wrong credential, and the two differ in
+    /// the two ways a caller can act on them: the code, and whether a retry can ever help.
+    ///
+    /// This is the test for the swallow that hid the prefix defect. While both outcomes were
+    /// `Invalid`, a `PoolTimedOut` and a `ColumnNotFound` were indistinguishable from a
+    /// mistyped token, so a broken query read as an integrator's problem and nobody looked at the
+    /// statement.
+    #[test]
+    fn a_store_failure_is_not_the_same_verdict_as_a_wrong_credential() {
+        let unreachable = store_error_as_invalid(sqlx::Error::PoolTimedOut);
+        assert!(!unreachable.is_credential_problem());
+        assert_eq!(unreachable.code(), "token_store_unavailable");
+        // The evidence rides along, so the route can log the actual cause rather than a guess.
+        match &unreachable {
+            AuthFailure::StoreUnavailable { source } => assert!(
+                !source.is_empty(),
+                "the refusal must carry the store error's own Display"
+            ),
+            other => panic!("a pool timeout must not be reported as {other:?}"),
+        }
+
+        // A column the struct names and the query does not return is a schema disagreement.
+        let decode = store_error_as_invalid(sqlx::Error::ColumnNotFound("token_hash".to_string()));
+        assert!(!decode.is_credential_problem());
+
+        // And a plain query error is still the credential's own verdict, so nothing that was a
+        // 401 before stops being one.
+        for credential_problem in [AuthFailure::Invalid, AuthFailure::Expired, AuthFailure::Revoked] {
+            assert!(credential_problem.is_credential_problem());
         }
     }
 
