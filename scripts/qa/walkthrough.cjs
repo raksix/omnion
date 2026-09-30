@@ -9834,6 +9834,24 @@ async function main() {
   // from a pass that proved nothing because it was pointed at nothing. The count is also
   // printed in the log line above, so a reader can tell how much of the panel was covered.
   if (!ONLY_ALL) {
+    // A SECTION name (`crm`, `sales`, `inventory`) is a legitimate filter that is deliberately
+    // not a route name, so it is absent from `matchedOnly` by construction — `onlyGroup()` asks
+    // "is this name in the list", never "is this string a route". The guard below is about a name
+    // that matched *nothing at all*, and it read the group as one. So a focused CRM pass, which
+    // walked its six routes and its six depth passes and produced 119 screenshots, also reported
+    // `high unknown-pass-name: --only=crm matches no route and no depth pass` — a false finding
+    // sitting in the same report as the real ones, which is the one thing that makes a reader stop
+    // believing the report.
+    //
+    // A group is considered matched when it **drove** the pass, and the proof that it did is a
+    // route under its own prefix having been walked. Checking the walked routes rather than
+    // re-running the filter is what makes this an observation instead of a second opinion: if
+    // `crm` matched nothing, no `/crm` route can be in the walked set either.
+    for (const [group, prefix] of Object.entries(SCOPED_SECTIONS)) {
+      if (ONLY.includes(group) && walkedRoutes.some((route) => route.path?.startsWith(prefix))) {
+        matchedOnly.add(group);
+      }
+    }
     const unmatched = ONLY.filter((name) => !matchedOnly.has(name) && !MOBILE_NAMES.has(name));
     if (matchedOnly.size === 0) {
       pushFindings(
@@ -11260,6 +11278,14 @@ async function runCrmLeadsDepth(page, report) {
 
   // ---- the drain produces a verdict ---------------------------------------------------------
   // No dead button: whatever the bus holds, the click has to end in a sentence.
+  //
+  // The allowance is for a 403, and it is a real one rather than a tolerance: the endpoint refuses
+  // the platform Owner on purpose (`crm_leads::drain_now` — the drain is global by construction, so
+  // an account with no primary organization may not trigger it). A pass that signed in as the
+  // instance admin therefore gets the designed refusal, and the roll-up filed it next to the
+  // genuinely broken screens. The verdict is still asserted below, so a screen that only ever
+  // refuses still fails this pass — the allowance excuses the refusal, not the button.
+  expectRefusal("/api/v1/crm/leads/drain", "the lead drain is refused to an account with no primary organization, by design");
   await page.locator("#crm-leads-drain").click({ timeout: 8000 }).catch(() => {});
   await page.waitForSelector("[role='alert'], header ~ p", { timeout: 30000 }).catch(() => {});
   await page.waitForTimeout(1500);
@@ -11445,6 +11471,15 @@ async function runCrmStateSweep(page, report) {
   for (const screen of screens) {
     failNext = true;
     failPath = screen.read ?? LIST_READ[screen.label];
+    // **The refusal this pass is about to cause is not a finding.** The stub answers one read with
+    // a real 503, so the browser logs a console error and a failed request for every screen — six
+    // of each, plus a second pair when the retry re-arms the stub. The roll-up counted all of them
+    // as defects, which is how a pass whose *entire purpose* is to break the network reported the
+    // highest defect count in the module while proving three screens handle it correctly. The
+    // allowance is registered immediately before each screen so it can only excuse the entries
+    // that arrive after it, and the sweep's own state steps (below) still have to pass on their
+    // own merits — registering the refusal does not tick a box.
+    expectRefusal(failPath, `crm state sweep: the ${screen.label} screen under a refusal it must survive`);
     await page.goto(`${URL_ADMIN}${screen.path}`, { waitUntil: "domcontentloaded" }).catch(() => {});
     // The strip and the block are two shapes of the same state: a screen that keeps its own body
     // shows a strip, a screen that replaced its list shows a block. Both count.
@@ -11533,6 +11568,11 @@ async function runCrmStateSweep(page, report) {
   // must not fall over — but a picker that silently holds one option ("No company") is a control
   // that refuses every real choice and never says why. The state is the sentence where the choice
   // was, the id to quote, and a way to ask again. This is the same refusal, aimed at one read.
+  // The company picker's own refusal, registered like the state sweep's: this stub is the pass's
+  // instrument, so the 503 it produces is evidence rather than a defect. Without the allowance the
+  // same screen is simultaneously reported as "the list survived a lost dependency" (a pass) and
+  // as a failed request (a finding), which is the pass grading its own ruler.
+  expectRefusal("/api/v1/crm/companies", "crm state sweep: the company picker under a lost dependency");
   await page.route("**/api/v1/crm/**", (route) => {
     const path = new URL(route.request().url()).pathname;
     return path === "/api/v1/crm/companies" && route.request().method() === "GET"
