@@ -7944,3 +7944,44 @@ under load 10–15 with ten writers on the box. Left named rather than blamed.
 **Next.** The blocked walk, then the seven behind it. The payments **screen** is not written — slice
 3's UI is the next pair of commits after the walks are green, and the acceptance boxes that depend
 on a browser (empty/loading/error, 390px, keyboard) stay unticked until one runs.
+
+## 2026-09-30 · REQ-054 slice 3 — 14/14 walks, and the blocker was a word
+
+**What.** The walk named as blocking last tick passes alone in ten seconds. It was never blocked;
+the suite serialises on a static mutex, so a *different* walk failing first makes everything behind
+it look blocked. Four real defects, two of them the same class slice 2 already paid for:
+
+- `c359f8e2` — allocations were read back `order by a.created_at, a.id`, and `now()` is
+  transaction-stable, so every row of one payment shared a timestamp and the tiebreak fell to a
+  random `gen_random_uuid()`. The "oldest first" sweep was true of the write and false of the read,
+  failing roughly half the time. Migration `0178` adds the ordinal the module writes.
+- `cfbc2cf7` — the payments list selected `p.created_by, p.created_by` with no alias while
+  `from_row` reads `recorded_by`, so the list 500'd on every call. Second instance of this exact
+  defect in this module.
+- `ce813f2d` — **a tenant leak.** The reverse route's permission was a route *layer*, which answers
+  403 before the handler can check whether the id is the caller's, so naming another organization's
+  payment confirmed it exists. The layer is gone; the handler reads the row (404) and *then* asks
+  for the key.
+- `197dc399` — two walks asserted the wrong thing, module right both times: an outstanding of 40.00
+  where 40.00 is the *paid* figure (100.00 − 40.00 = 60.00 owed), and an allocation's own `id`
+  compared against an invoice id.
+- `1d57801e`/`d3c95d2f`/`5ca87c4e` — the payments **screen**: list, recorder drawer, receipt, and a
+  walkthrough pass that visits all three and leaves the drawer by keyboard.
+
+**Proof.**
+- the fourteen walks, one per process against a fresh `omnion_t_w4_54c`: **14 passed, 0 failed**
+  (3.9s–8.1s each);
+- `cargo test -p omnion-module-accounting --lib` **38/38**;
+- `cargo test -p omnion-permissions --lib` **68/68**;
+- `cargo build -p omnion-api` green;
+- `tsc --noEmit` in `apps/admin` **0 errors**.
+
+**Not proved, and it is the browser.** A *full-suite* run hung on
+`a_payment_cannot_allocate_more_than_it_itself_or_name_an_invoice_twice` with 0% CPU, every
+PostgreSQL backend `idle` and zero ungranted locks — the same external wait as last tick, now
+measured rather than guessed, which is why the fourteen were run one per process. No
+`scripts/qa/run.sh` pass this tick; the empty/loading/error, 390px and keyboard boxes stay unticked.
+
+**Next.** A QA pass over the new screens on the private stack
+(`QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203`), then slice 4 — expenses,
+receipts and the approval handoff, which is the last thing between this REQ and the reports.
