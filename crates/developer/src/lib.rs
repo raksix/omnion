@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod archive;
 pub mod authn;
 pub mod cli;
 pub mod error;
