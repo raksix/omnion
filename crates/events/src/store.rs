@@ -698,10 +698,7 @@ pub async fn list_events(pool: &PgPool, filter: &EventFilter) -> Result<EventPag
 /// `coalesce($2, $1)` rather than a plain read: the column is `not null default 30`, so a
 /// `None` here can only mean the organization row does not exist yet, and answering with the
 /// documented default is what lets the screen render before the first organization does.
-pub async fn retention_window(
-    pool: &PgPool,
-    organization_id: Option<Uuid>,
-) -> Result<i32> {
+pub async fn retention_window(pool: &PgPool, organization_id: Option<Uuid>) -> Result<i32> {
     let days: i32 = sqlx::query_scalar(
         "select coalesce((select event_retention_days from organizations where id = $1), $2)",
     )
@@ -719,11 +716,7 @@ pub async fn retention_window(
 /// reached by a future import and by an operator's own SQL: a check constraint that holds the
 /// range makes the rule true everywhere instead of true in one handler. The check constraint on
 /// the column is the backstop; this read-back is what the caller returns to the screen.
-pub async fn set_retention_window(
-    pool: &PgPool,
-    organization_id: Uuid,
-    days: i32,
-) -> Result<i32> {
+pub async fn set_retention_window(pool: &PgPool, organization_id: Uuid, days: i32) -> Result<i32> {
     let stored: i32 = sqlx::query_scalar(
         "update organizations set event_retention_days = $2, updated_at = now() \
          where id = $1 returning event_retention_days",
@@ -747,10 +740,7 @@ pub async fn set_retention_window(
 /// `due` counts only events that **could** be swept, so it is the same predicate the sweep
 /// itself uses: an event pinned by a pending delivery is counted in `events` and never in
 /// `due`, and a screen that said "12 due" while the sweeper removes 0 would be lying.
-pub async fn retention_counts(
-    pool: &PgPool,
-    organization_id: Option<Uuid>,
-) -> Result<(i64, i64)> {
+pub async fn retention_counts(pool: &PgPool, organization_id: Option<Uuid>) -> Result<(i64, i64)> {
     let row: (i64, i64) = sqlx::query_as(
         "select count(*) as total, \
                 count(*) filter (where e.created_at < now() - make_interval(days => o.window) \
@@ -771,7 +761,10 @@ pub async fn retention_counts(
 }
 
 /// How much history this organization keeps, and the last sweep that ran against it.
-pub async fn retention_status(pool: &PgPool, organization_id: Option<Uuid>) -> Result<RetentionStatus> {
+pub async fn retention_status(
+    pool: &PgPool,
+    organization_id: Option<Uuid>,
+) -> Result<RetentionStatus> {
     let window_days = retention_window(pool, organization_id).await?;
     let (events, due) = retention_counts(pool, organization_id).await?;
 
@@ -824,7 +817,10 @@ pub async fn list_retention_runs(
 /// not a correctness problem — the delete is idempotent and the counts are each truthful about
 /// their own work — but it is wasted work, and a batch bound turns "wasted" into "the tail never
 /// gets reached".
-pub async fn organizations_with_events(pool: &PgPool, batch: i64) -> Result<Vec<(Option<Uuid>, i32)>> {
+pub async fn organizations_with_events(
+    pool: &PgPool,
+    batch: i64,
+) -> Result<Vec<(Option<Uuid>, i32)>> {
     let rows = sqlx::query_as::<_, (Option<Uuid>, i32)>(
         "select e.organization_id, \
                 coalesce((select event_retention_days from organizations o where o.id = e.organization_id), $2) \
