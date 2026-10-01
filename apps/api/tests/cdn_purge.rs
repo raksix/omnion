@@ -1094,6 +1094,187 @@ async fn a_successful_drain_leaves_the_purge_succeeded_with_every_item_done() {
     fixture.cleanup().await;
 }
 
+/// Slice 4's second "Done" leg, and the one the overview card is actually about: **a real
+/// purge moves the counters**. The walk above counts two *queued* purges and asserts
+/// `failure_rate == 0.0` — a value that is structurally zero there, because nothing had been
+/// attempted, so the assertion could not have failed on a card that never updates. A card
+/// wired to a constant passes that walk. This one drives two real drains through the worker
+/// and reads the counters back off the API, so a card rendering a number nothing writes is
+/// caught here rather than by an operator noticing the tile is stuck at "2".
+///
+/// The two answers come from two adapters, and the ORDER is the whole trick. `cdn_settings`
+/// is scoped to the **site**, not to a purge, so a row written before the first drain sends
+/// the "success" case at the dead endpoint as well and the walk measures two failures. The
+/// first drain therefore runs against the default `origin` — which accepts every target, a
+/// real no-op rather than a fake success — and only then does the dead `generic_http` row
+/// exist for the second.
+#[tokio::test]
+async fn the_overview_counters_follow_a_real_drain_rather_than_the_queue() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let site = fixture.site_a;
+    let token = fixture.token_a.clone();
+
+    // No settings row yet, so the adapter is `origin`.
+    let ok = fixture
+        .purge(&token, site, json!({ "kind": "url", "targets": ["/served/one"] }))
+        .await;
+    assert_eq!(ok.status, StatusCode::CREATED);
+    let ok_id: Uuid = ok.body["id"]
+        .as_str()
+        .expect("an id")
+        .parse()
+        .expect("a uuid");
+
+    // Before anything is attempted the terminal counters must read zero. Without this the
+    // "after" numbers prove nothing: a `succeeded_24h` of 2 would also be consistent with a
+    // counter that ignores the drain entirely and is counting the queue twice.
+    let before = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/cdn/status?site_id={site}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(before.status, StatusCode::OK, "{}", before.body);
+    assert_eq!(
+        before.body["succeeded_24h"], 0,
+        "nothing has been attempted, so nothing has succeeded: {}",
+        before.body
+    );
+    assert_eq!(
+        before.body["failed_24h"], 0,
+        "and nothing has failed yet: {}",
+        before.body
+    );
+    assert_eq!(before.body["queue_depth"], 1, "one item is waiting");
+    assert_eq!(before.body["open_purges"], 1, "one purge is open");
+
+    // Drain one: `origin` accepts it, so the window gains a real success.
+    let (failed, attempted) = drain_once(&fixture.state, Some(site)).await;
+    assert_eq!(attempted, 1, "the target was sent");
+    assert_eq!(failed, 0, "`origin` accepts every target, so nothing failed");
+    assert_eq!(
+        fixture.detail(&token, &ok_id.to_string()).await.body["purge"]["status"],
+        "succeeded",
+        "a real success, not an assumption about the fixture"
+    );
+
+    // Now the site gets an adapter that cannot work, and `max_attempts = 1` so the refusal is
+    // a FAILURE on the first drain rather than a retry — a two-attempt budget would leave the
+    // item `pending` and the counters would read 1 succeeded / 0 failed, which looks like a
+    // working card and is not one.
+    // Clear any row the fixture might already carry, then insert outright. `on conflict` is not
+    // usable here and the reason is worth keeping: this table's uniqueness comes from a
+    // PARTIAL unique INDEX (`where site_id is not null`), not a constraint, so
+    // `on conflict (site_id)` cannot infer it and PostgreSQL answers 42P10. Deleting first is
+    // also what makes the walk's premise explicit — the adapter changes at a known point
+    // rather than depending on what the fixture happened to leave behind.
+    sqlx::query("delete from cdn_settings where site_id = $1")
+        .bind(site)
+        .execute(fixture.db.pool())
+        .await
+        .expect("the stale settings row must clear");
+    sqlx::query(
+        "insert into cdn_settings (site_id, provider, endpoint_url, max_attempts) \
+         values ($1, 'generic_http', 'http://127.0.0.1:1/never', 1)",
+    )
+    .bind(site)
+    .execute(fixture.db.pool())
+    .await
+    .expect("the settings row must insert");
+    // The row really landed and really names the adapter, or the second drain would measure
+    // `origin` succeeding again and the whole walk would read as "the counters work".
+    let configured: String = sqlx::query_scalar(
+        "select provider || ':' || max_attempts::text from cdn_settings where site_id = $1",
+    )
+    .bind(site)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the settings row must be readable");
+    assert_eq!(
+        configured, "generic_http:1",
+        "the failure is forced by the adapter, not by the assertion"
+    );
+
+    let bad = fixture
+        .purge(&token, site, json!({ "kind": "url", "targets": ["/never/answers"] }))
+        .await;
+    assert_eq!(bad.status, StatusCode::CREATED);
+    let bad_id: Uuid = bad.body["id"]
+        .as_str()
+        .expect("an id")
+        .parse()
+        .expect("a uuid");
+
+    let (failed, attempted) = drain_once(&fixture.state, Some(site)).await;
+    assert_eq!(attempted, 1, "the target was sent");
+    assert_eq!(
+        failed, 1,
+        "one attempt against a dead endpoint is a failure, not a retry"
+    );
+    assert_eq!(
+        fixture.detail(&token, &bad_id.to_string()).await.body["purge"]["status"],
+        "failed",
+        "and the refused one is a real failure, not a pending retry"
+    );
+
+    // The window now holds one success and one failure. This is the claim the card makes.
+    let after = call(
+        &fixture.state,
+        request(
+            Method::GET,
+            &format!("/api/v1/cdn/status?site_id={site}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK, "{}", after.body);
+    assert_eq!(
+        after.body["purges_24h"], 2,
+        "both purges are in the window: {}",
+        after.body
+    );
+    assert_eq!(
+        after.body["succeeded_24h"], 1,
+        "the success the worker settled is the success the card counts: {}",
+        after.body
+    );
+    assert_eq!(
+        after.body["failed_24h"], 1,
+        "and the failure is counted rather than quietly dropped: {}",
+        after.body
+    );
+    assert_eq!(
+        after.body["queue_depth"], 0,
+        "a drained item is not still waiting: {}",
+        after.body
+    );
+    assert_eq!(
+        after.body["open_purges"], 0,
+        "both are terminal: {}",
+        after.body
+    );
+
+    // The rate is what the card shows a human, so it is asserted as the arithmetic rather
+    // than as "some number": one of the two did not fully succeed.
+    let rate = after.body["failure_rate"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("a rate, not a null: {}", after.body));
+    assert!(
+        (rate - 50.0).abs() < 0.01,
+        "one of two did not fully succeed, so the card must say 50%, not {rate}: {}",
+        after.body
+    );
+
+    fixture.cleanup().await;
+}
+
 #[tokio::test]
 async fn a_partial_drain_says_partial_and_counts_only_what_failed() {
     let Some(fixture) = Fixture::new().await else {
