@@ -10496,6 +10496,12 @@ async function main() {
     // about the filtered branch.
     { path: "/ai/local", name: "ai-local", area: "ai" },
     { path: "/ai/local/models", name: "ai-local-models", area: "ai" },
+    // The air-gap switch (REQ-106 slice 2). Registered on bare path deliberately: the switch starts
+    // OFF in a fresh QA database, and a depth pass that turned it on would leave every later pass
+    // reading a banner and a refused chat. The route proves the screen renders in its resting state;
+    // the confirmation sheet and the flip are driven by the depth pass below, which restores the
+    // switch to OFF in a finally so the harness leaves the database as it found it.
+    { path: "/ai/settings/airgap", name: "ai-airgap", area: "ai" },
     // The results screen is a route like any other: it is walked, clicked and measured.
     { path: "/search?q=qa", name: "search" },
     // The index's own screen (REQ-002, slice 3) — no untested screen.

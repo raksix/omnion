@@ -81,6 +81,11 @@ const NAV = [
   // specific endpoint is about that endpoint — listing it beside configuration invites an
   // operator to pull a model with no endpoint chosen.
   { href: "/ai/local", label: "Local AI", icon: Cpu },
+  // The air-gap switch (REQ-106). Under "Local AI" rather than in the settings block, because it is
+  // the second half of the same question — the endpoint list says where a call can still go, this
+  // says what happens to the ones that cannot. It is the screen an operator opens mid-incident, so
+  // burying it in /settings would put the control furthest from the incident.
+  { href: "/ai/settings/airgap", label: "Air gap", icon: LockKeyhole },
   { href: "/settings/iam", label: "Identity & access", icon: ShieldCheck },
   { href: "/settings/iam/users", label: "Users", icon: UserCog },
   { href: "/settings/iam/groups", label: "Groups", icon: UsersRound },
