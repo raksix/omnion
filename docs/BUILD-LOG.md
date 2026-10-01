@@ -7601,3 +7601,95 @@ have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next
   QA slot), the chat reply entry point that files a set, and the park-one-operation-as-an-
   approval bridge. `updated_by` and the diff re-render / preview hash box stay open: the editor
   re-plans on the client today and the request wants a hash the reviewer can compare.
+
+### Tick 87 — REQ-021 slice 6b · the transport, the key route, the devices block
+
+**What.** `web_push` left the runner's `UNTRANSPORTED` list. It was not a channel that
+quietly failed — it was a channel the runner *claimed*, re-queued with "no transport is
+installed for this channel" until the cap, and then wrote to `failed`, for a key pair that
+had shipped the previous tick.
+
+Three things had to exist before a send could happen, and none of them did:
+
+```console
+$ grep -rn 'prune_endpoints' --include=*.rs .     # the "a revoked endpoint is pruned" box
+crates/notifications/src/push.rs:240:   pub async fn prune_endpoints(…)   # a definition
+                                                            # zero call sites, anywhere
+```
+
+- **the destination** — `DeliveryJob.push_targets`, filled by a second query. This forced
+  `DeliveryJob` to **stop deriving `FromRow`**: `sqlx` requires every field of a `FromRow`
+  to be a `Type<Postgres>`, and a `Vec<PushTarget>` is not one, so `#[sqlx(default)]` does
+  not work either. `ClaimedRow` is now what the `SELECT` decodes, and the conversion is one
+  function — so a column list that drifts fails to compile.
+- **the transport** — one ciphertext per device, because a body sealed to a phone's key pair
+  cannot be read by a laptop. One delivery settles once: `sent` when any device accepted,
+  `failed` only when every device refused.
+- **the prune** — a `404`/`410` is collected *during* the send and deleted *after* the row is
+  settled. Deleting inside the loop iterating over its own collection is a second bug
+  layered on the first: the collection shrinks under the loop and a fifth device can be
+  skipped without ever being sent to.
+
+**Proof.**
+
+```
+cargo test -p omnion-core --lib          73 passed
+cargo test -p omnion-notifications --lib 101 passed   (95 → 101, 6 new)
+cargo test -p omnion-api --lib          258 passed   (247 → 258, 11 new)
+cargo test -p omnion-permissions --lib   63 passed
+tsc -p apps/admin/tsconfig.json --noEmit exit 0
+bun build scripts/qa/walkthrough.cjs      parsed (playwright-core external)
+```
+
+**Three defects found by writing it, all three in my own code.**
+
+1. **A doc comment that described a language feature that does not exist.** I wrote that
+   `TransportOutcome::Accepted { status }` keeps compiling because `pruned` is "defaulted",
+   and then claimed `#[serde(default)]` on a struct variant of a type that is not `serde` at
+   all. Rust has no per-field default on a struct variant — the compiler said so. `accepted()`
+   and `failed()` constructors are the fix, and they have a second benefit: a future match arm
+   cannot silently forget a prune by writing `status: None` and stopping.
+2. **`WebPushTransport::new` built the transport without a contact address.** My own doc
+   comment said the constructor required "a usable key **and** a contact", and the code
+   required only the key. Every send would have been refused `401` by the push service for a
+   `sub` claim that is not a URL, days after an operator believed push worked — with no
+   outbox column able to distinguish it from a bad signature. Caught by the test that
+   asserted the constructor's own documented behaviour.
+3. **`request_user_agent` was `fn(&AppState, &CurrentSession) -> Option<String> { None }`** —
+   the **sixth** instance of this REQ's defect class. The right name, called from the right
+   place, returning nothing, with a doc comment two paragraphs above it arguing that the
+   value must come from the request headers "rather than taken from the body". The parameters
+   were there to make the signature look plausible: it took an `AppState` and a
+   `CurrentSession` and needed neither, because neither carries a header map. The
+   `user_agent` column has been `NULL` on every device row since slice 3, so the device list
+   could never answer the only question it exists for — *is this still my phone?*
+
+And one that was a gap rather than a defect: `PushConfig`'s fields are private, which is
+right (a private key is a credential), but "generated at deploy time" means something has to
+hand the platform a key it did not read from the environment. `with_private_key` /
+`with_contact` are that door, and they validate on *read* so "what is configured" and "what
+would a push service accept" stay two separate questions — which is what lets the settings
+screen say "you pasted something that is not base64url" instead of "push is broken".
+
+Commits: `f0d76c5f` (the transport), `473d98ec` (the push-key route + the browser string),
+`40cc566c` (the device block + the walkthrough legs).
+
+**Still open.** The acceptance box wants *subscribe, receive one real notification,
+unsubscribe* — and that needs a real browser. A headless Chromium has no user gesture and no
+service worker, so `pushManager.subscribe` cannot succeed there, and no amount of harness
+work substitutes. The walkthrough gained legs for the three states a headless pass *can*
+reach (no key on the installation, no device registered, and the `serviceWorker.ready`
+rejection), because that is what distinguishes a block that renders nothing from a block that
+was never wired up — which is how this slice found that three API functions had no callers.
+
+**The QA pass did not run: the slot was held for the whole tick.** Not a stale holder — a
+*live* one. `scripts/qa/run.sh` logged `waiting for a QA slot (max 1 concurrent pass)` for
+eleven minutes and the holder changed pids twice underneath it, which is a sibling loop
+(`/mnt/apopic/omnion-w5`, `QA_STACK=w5`) running back-to-back passes. `QA_SLOT_WAIT=3600` in
+`/etc/profile.d/omnion-qa-limits.sh` queued mine rather than letting it collide, which is the
+behaviour that limit exists for, so the pass is *running and waiting*, not failed. The legs
+for the device block are written and unrun; they are recorded here as **written, not
+measured**, because a screenshot is not a leg and an unrun assertion is not a proof.
+
+Next tick runs the pass first — it is the cheapest outstanding work and everything else in
+slice 6 is already committed, tested and pushed.
