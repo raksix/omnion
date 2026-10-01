@@ -9094,3 +9094,64 @@ under test is the tab's agreement with the platform, not the Explorer's UI.
 **Next.** The Explorer (`/content-api/explorer`): endpoint picker, generated parameter form, a real request
 pane with `x-ratelimit-remaining` and timing, the cURL/fetch/Python snippets, and deep links — the rest of
 slice 3 and the last thing between this REQ and `done`.
+
+### Tick 46b — the QA pass found two defects the 293 green unit tests could not
+
+**What.** `--only=content-api` finally ran, and it earned its keep twice over. The pass was queued for
+55 minutes behind a live w4 sibling, started at 02:24, and the volume hit **100%** partway through the
+walkthrough — so this entry is written from the artifacts that did land (39 screenshots of the Usage
+screen, a walkthrough log) and the API log, not from a verdict. The disk filled up, so the pass was
+killed rather than left to time out into a full volume: `kill -TERM -<pgid>`, no orphan `run.sh`, no
+half-started w2 stack, and this worktree's place released.
+
+**The screen rendered a 500 that was never a 500.**
+
+```
+content-api-usage.png → "The API answered with status 500."   (no chart, no KPI row, no table)
+curl /api/v1/content-api/usage  →  000                         (no response at all)
+omnion-qa-api-w2 log           →  panicked at content_api.rs:494
+                                  "an organization account is required by the content API surface"
+```
+
+`organization_of` `expect()`ed an `organization_id`. A `CurrentSession` without one is not an edge
+case — it is what the QA owner account *is*, because the seed makes it a primary account before
+onboarding runs. The panic unwound the worker thread, axum dropped the connection, and the panel's
+error wrapper filled in a status for a request that was never answered. **Two layers of translation
+between the defect and the lie on screen is precisely why 293 green unit tests did not catch it: every
+one of them asserts a status, and a status is exactly what a dropped connection has not got.** The
+function's own doc comment already described the right behaviour — a `403` that explains itself — so
+the code was contradicting the sentence written to describe it.
+
+`Result` and a `403 no_organization` naming the missing thing; ten call sites take the `?`. Two tests:
+one pins the status, the code and the message, and one pins that a *tenant* account still resolves,
+because "always 403" passes the first test.
+
+**And the flush had been failing once a minute since 01:59, before this tick touched anything.**
+
+```
+ERROR content_meter: the content usage flush failed; the window is kept
+  … violates foreign key constraint "api_token_usage_daily_token_id_fkey"
+```
+
+`on delete cascade` removes a token's durable rows when the token is deleted; Redis cannot cascade, so
+the counters outlive the row. The error arm's policy — "no clear, retry next tick" — is right for a
+transient blip and **permanent** for a foreign-key violation: the flush failed every minute with no
+recovery path. Worse, `record_window` writes in sequence and returns on the first error, so a token
+that was still *alive* never got its rows written either. One deleted token stopped metering for every
+token on the installation, silently, in a log line that looks like routine noise.
+
+The error arm now asks which tokens no longer exist, clears exactly their keys, and retries the
+survivors. `dead_tokens` answers "alive" when its own query fails, because a function whose output is
+a `DEL` must not be able to delete live counters over a transient outage.
+
+**Gates.**
+
+```
+cargo test -p omnion-api --lib   293 passed; 0 failed   (was 291 — 2 new)
+pnpm typecheck                   2/2
+--only=content-api               RAN, KILLED at 100% disk; no verdict, artifacts partial
+```
+
+**Not ticked by this tick:** the usage criterion stays *provisionally* ticked with the measurement named
+as pending, because a pass that produced no report is not evidence. REQ-019's remaining box is the
+Explorer, and the next tick runs `--only=content-api` again against a build that contains both fixes.
