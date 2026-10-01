@@ -15,7 +15,8 @@
 //!   is the panel's session-authenticated media CRUD surface. Reusing it with a second auth model
 //!   would be a security trap, so the document says so where a reader will see it.
 
-use serde_json::{json, Value};
+use omnion_content::content_read::{SORTS, SortKey, SortSource};
+use serde_json::{Value, json};
 
 /// The version string reported as the document's version.
 pub const OPENAPI_VERSION: &str = "3.1.0";
@@ -147,7 +148,17 @@ pub const ENDPOINTS: &[Endpoint] = &[
                 "Opaque cursor from a previous page's `next_cursor`.",
             ),
             ("fields", "Comma-separated projection."),
-            ("sort", "`updated_at` (default), `created_at` or `title`."),
+            // **Media offers two sorts, not three.** A file has no title, so `sort=title` is a
+            // `400 invalid_parameter` naming `sort` and listing these two. It used to be a
+            // hand-written string listing three, and the handler built `m.title` — a column media
+            // has never had — so a documented parameter answered `internal_error` on every call.
+            // `the_documented_sorts_are_the_sorts_each_endpoint_accepts` is what keeps this string
+            // honest against the parser, because a static table cannot ask the parser what it
+            // accepts and a document that lies about a parameter is worse than one that omits it.
+            (
+                "sort",
+                "`updated_at` (default), `created_at`. A file has no title, so `title` is refused.",
+            ),
             ("updated_since", "RFC 3339 instant."),
         ],
         experimental: false,
@@ -623,6 +634,60 @@ mod tests {
             text.contains("updated_since"),
             "the rebuild primitive must be documented"
         );
+    }
+
+    /// A parameter the document lists must be one the endpoint answers.
+    ///
+    /// The media list documented `sort=title` and the handler built `m.title` — a column media has
+    /// never had — so the document and the endpoint agreed with each other and were both wrong.
+    /// Since the description is now *generated* from the accepted set, this test's real job is to
+    /// prove the generation reads the parser rather than a second hand-kept list: it checks each
+    /// documented sort against `SortKey::parse_for` directly, which is the handler's own gate.
+    #[test]
+    fn the_documented_sorts_are_the_sorts_each_endpoint_accepts() {
+        let value = document("https://api.example.org");
+        for (id, source) in [
+            ("pages.list", SortSource::Pages),
+            ("posts.list", SortSource::Pages),
+            ("media.list", SortSource::Media),
+        ] {
+            let parameters = &value["paths"][path_of(id)]["get"]["parameters"];
+            let description = parameters
+                .as_array()
+                .expect("parameters are an array")
+                .iter()
+                .find(|parameter| parameter["name"] == "sort")
+                .unwrap_or_else(|| panic!("{id} documents `sort`"))["description"]
+                .as_str()
+                .expect("a description")
+                .to_owned();
+            for sort in SORTS {
+                let accepted = SortKey::parse_for(sort, source).is_ok();
+                if accepted {
+                    // The half that rots: a sort the handler honours but the document omits is a
+                    // feature nobody can find.
+                    assert!(
+                        description.contains(&format!("`{sort}`")),
+                        "{id} accepts `{sort}` but does not document it: {description}"
+                    );
+                } else {
+                    // The half that breaks promises: a refused sort may be *named*, but only in
+                    // the sentence saying it is refused — never inside the list of choices, which
+                    // is everything before the first `.`.
+                    let choices = description.split('.').next().unwrap_or(&description);
+                    assert!(
+                        !choices.contains(&format!("`{sort}`")),
+                        "{id} offers `{sort}` as a choice but the handler refuses it: {description}"
+                    );
+                    if description.contains(&format!("`{sort}`")) {
+                        assert!(
+                            description.contains("refused"),
+                            "{id} names `{sort}` without explaining the refusal: {description}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ---- YAML --------------------------------------------------------------------------------
