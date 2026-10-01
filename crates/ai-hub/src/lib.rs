@@ -29,6 +29,7 @@ pub mod error;
 pub mod failover;
 pub mod guard_checkpoint;
 pub mod guard_data;
+pub mod guard_remap;
 pub mod guard_store;
 pub mod guardrails;
 pub mod health;

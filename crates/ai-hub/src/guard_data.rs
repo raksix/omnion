@@ -730,30 +730,17 @@ impl Detector {
 /// Spans are applied right to left so earlier offsets stay valid — replacing left to right
 /// shifts every later index by the length difference, and the third replacement lands in the
 /// middle of the second.
+///
+/// The tokens come from `crate::guard_checkpoint::mask_tokens`, the single derivation the
+/// re-mapper also reads. It used to be built here inline, which is how the deterministic style
+/// ended up rendered two different ways in two files (`short_hash` here, `value_hash[..8]`
+/// there) — a drift no test caught because each file's own test only ever checked its own output.
 #[must_use]
 pub fn mask_text(text: &str, matches: &[Match_], style: MaskStyle) -> String {
     if matches.is_empty() {
         return text.to_string();
     }
-    let mut placeholders: BTreeMap<String, String> = BTreeMap::new();
-    let mut counters: BTreeMap<String, usize> = BTreeMap::new();
-    for m in matches {
-        if !placeholders.contains_key(&m.value_hash) {
-            let n = counters.entry(m.label.clone()).or_insert(0);
-            *n += 1;
-            let token = match style {
-                MaskStyle::Numbered => format!("[{}_{}]", m.label.to_ascii_uppercase(), n),
-                MaskStyle::Deterministic => {
-                    format!(
-                        "[{}:{}]",
-                        m.label.to_ascii_uppercase(),
-                        short_hash(&m.value_hash)
-                    )
-                }
-            };
-            placeholders.insert(m.value_hash.clone(), token);
-        }
-    }
+    let placeholders = crate::guard_checkpoint::mask_tokens(matches, style);
 
     let mut out = text.to_string();
     for m in matches.iter().rev() {

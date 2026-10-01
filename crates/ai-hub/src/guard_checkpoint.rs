@@ -96,6 +96,88 @@ pub struct CheckpointReport {
     pub value_hashes: Vec<String>,
     /// Set when the audit row could not be written. The verdict above still stands.
     pub audit_error: Option<String>,
+    /// Placeholder → original for the spans this inspection replaced (REQ-105 slice 2).
+    ///
+    /// **`None` for a payload that was not masked**, which is not the same as an empty map: an
+    /// empty map on a masked payload would mean the mask ran and its values could not be
+    /// recovered, and a caller that treated the two alike would show a requester a placeholder
+    /// forever with nothing behind it. `None` says "there is nothing to put back", which is the
+    /// only true thing about a clear payload.
+    pub remap: Option<crate::guard_remap::RemapMap>,
+}
+
+impl CheckpointReport {
+    /// Whether this inspection replaced anything with a placeholder.
+    ///
+    /// A `match` on the verdict rather than a read of the map, because the verdict is the
+    /// authority on what the policy did and the two can only be reconciled in one direction: a
+    /// report whose verdict says `Masked` but whose map is empty means the mask ran and the
+    /// values were lost, which is a fault to surface rather than paper over.
+    #[must_use]
+    pub fn is_masked(&self) -> bool {
+        matches!(self.verdict, GuardVerdict::Masked { .. })
+    }
+
+    /// The requester's own view of an answer: placeholders replaced by the values behind them.
+    ///
+    /// Falls through unchanged when there is no map, so a caller does not branch on `Option` at
+    /// every call site — and a payload that was never masked has nothing to substitute.
+    #[must_use]
+    pub fn substitute(&self, text: &str) -> String {
+        self.remap
+            .as_ref()
+            .map_or_else(|| text.to_owned(), |map| map.substitute(text))
+    }
+
+    /// The view anyone else gets: originals turned back into placeholders.
+    ///
+    /// The mirror of [`Self::substitute`], and not redundant. An answer that quotes the value the
+    /// user typed is *already* substituted in the text a caller holds, so a second reader of that
+    /// same text needs the reverse substitution — otherwise the value leaks into an audit row, a
+    /// shared transcript or an export while the guard screen still claims the payload was masked.
+    #[must_use]
+    pub fn redact(&self, text: &str) -> String {
+        self.remap
+            .as_ref()
+            .map_or_else(|| text.to_owned(), |map| map.redact(text))
+    }
+
+    /// Whether any payload in this batch was masked.
+    #[must_use]
+    pub fn batch_is_masked(reports: &[Self]) -> bool {
+        reports.iter().any(Self::is_masked)
+    }
+
+    /// The requester's view of a whole batch, substituted positionally.
+    ///
+    /// The batch case needs its own function because the reports and the texts are two parallel
+    /// vectors, and pairing them is exactly where an off-by-one would substitute one turn's
+    /// address into another turn's answer. A length mismatch substitutes nothing rather than
+    /// guessing the pairing — the un-substituted text is visible, a wrong substitution is not.
+    #[must_use]
+    pub fn substitute_batch(reports: &[Self], texts: &[String]) -> Vec<String> {
+        if reports.len() != texts.len() {
+            return texts.to_vec();
+        }
+        reports
+            .iter()
+            .zip(texts.iter())
+            .map(|(report, text)| report.substitute(text))
+            .collect()
+    }
+
+    /// The redaction of a whole batch of texts.
+    #[must_use]
+    pub fn redact_batch(reports: &[Self], texts: &[String]) -> Vec<String> {
+        if reports.len() != texts.len() {
+            return texts.to_vec();
+        }
+        reports
+            .iter()
+            .zip(texts.iter())
+            .map(|(report, text)| report.redact(text))
+            .collect()
+    }
 }
 
 impl CheckpointReport {
@@ -160,6 +242,7 @@ pub async fn checkpoint(
             rule_keys: Vec::new(),
             value_hashes: Vec::new(),
             audit_error: None,
+            remap: None,
         });
     }
 
@@ -168,6 +251,28 @@ pub async fn checkpoint(
     let action = finding.action.as_wire().to_owned();
     let match_count = i32::try_from(finding.matches.len()).unwrap_or(i32::MAX);
     let blocked = finding.verdict.is_blocked();
+
+    // REQ-105 slice 2: the re-map is built HERE, and nowhere else, because this is the only frame
+    // where the original text and the spans that index it are both in hand. Building it later —
+    // in a route, from the masked outbound text — would mean recovering values by searching a
+    // provider's own output for something shaped like a token, and a near-miss there writes the
+    // wrong value into a real answer.
+    //
+    // `mask_tokens` re-derives the placeholders with the same ordinals `mask_text` used, so the
+    // map and the mask come from one source and cannot disagree about which token is which value.
+    // The map is built for a `Masked` verdict only: an `Allowed` payload passed through untouched
+    // (an exemption), so there is nothing to put back and substituting would corrupt it.
+    let remap = if matches!(finding.verdict, GuardVerdict::Masked { .. }) {
+        let tokens = mask_tokens(&finding.matches, guard.policy.mask_style);
+        Some(crate::guard_remap::RemapMap::from_matches(
+            text,
+            &finding.text,
+            &finding.matches,
+            &tokens,
+        ))
+    } else {
+        None
+    };
 
     // Audited before the verdict is returned, including for a blocked call: the refusal is
     // precisely the event nobody must be able to argue did not happen.
@@ -209,6 +314,7 @@ pub async fn checkpoint(
         rule_keys,
         value_hashes,
         audit_error,
+        remap,
     })
 }
 
@@ -318,6 +424,39 @@ pub fn placeholder(style: MaskStyle, label: &str, ordinal: usize, value_hash: &s
             &value_hash[..value_hash.len().min(8)]
         ),
     }
+}
+
+/// The placeholder each distinct matched value was written as, keyed by value hash.
+///
+/// This exists because `mask_text` builds its tokens **inline** and does not return them, so
+/// nothing else in the platform can know which token stands for which value. Slice 2 needs
+/// exactly that, and the alternative — re-deriving the token in a second place — had already
+/// drifted once: `mask_text` renders the deterministic style with
+/// `guard_data::short_hash(value_hash)` while `placeholder()` (this file) rendered it with
+/// `value_hash[..8]`, so a deterministic placeholder produced by one was not the one the other
+/// looked for. Every answer would have come back with its placeholders still visible.
+///
+/// So the derivation lives in **one** place and `mask_text` is not asked to reproduce it: this
+/// function is the single source, and the drift is impossible by construction rather than by
+/// vigilance.
+pub fn mask_tokens(
+    matches: &[crate::guard_data::Match_],
+    style: MaskStyle,
+) -> BTreeMap<String, String> {
+    let mut tokens: BTreeMap<String, String> = BTreeMap::new();
+    let mut ordinals: BTreeMap<String, usize> = BTreeMap::new();
+    for m in matches {
+        if tokens.contains_key(&m.value_hash) {
+            continue;
+        }
+        let n = ordinals.entry(m.label.clone()).or_insert(0);
+        *n += 1;
+        tokens.insert(
+            m.value_hash.clone(),
+            placeholder(style, &m.label, *n, &m.value_hash),
+        );
+    }
+    tokens
 }
 
 fn collect_rule_keys(matches: &[crate::guard_data::Match_]) -> Vec<String> {
@@ -497,6 +636,7 @@ mod tests {
             rule_keys: vec!["email_block".to_owned()],
             value_hashes: Vec::new(),
             audit_error: None,
+            remap: None,
         };
         let error = report.blocked_error().expect("a refusal raises an error");
         assert_eq!(error.code(), "ai_guard_blocked");
@@ -521,6 +661,7 @@ mod tests {
             rule_keys: Vec::new(),
             value_hashes: Vec::new(),
             audit_error: None,
+            remap: None,
         };
         assert!(report.may_send());
         assert!(report.blocked_error().is_none());
@@ -547,6 +688,7 @@ mod tests {
             rule_keys: Vec::new(),
             value_hashes: Vec::new(),
             audit_error: Some("connection refused".to_owned()),
+            remap: None,
         };
         assert!(report.may_send(), "a missing audit row must not refuse a call");
         assert_eq!(audit_failures(&[report]), vec!["connection refused".to_owned()]);

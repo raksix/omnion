@@ -8827,3 +8827,51 @@ spent its budget and proceeded without a place because the shared slot belongs t
 (`/tmp/omnion-qa-slot` holder alive, cwd `/mnt/apopic/omnion-w5`). So this tick ends with the
 three fixes committed and every gate green, and the browser leg **still owed** — which is the
 honest state, not the "I ran a pass" reading of the same log.
+
+## w7 tick 55 — REQ-105 slice 2, the re-map half of the guard (2026-10-01)
+
+**What.** The guard masked values outbound (slice 1) and then had no way to put them back: a
+requester's own answer came home full of `[EMAIL_1]`. This tick adds `crates/ai-hub/src/guard_remap.rs`
+and wires it into `checkpoint()`, which is the **only** frame where the original text and the spans
+that index it are both in hand — building the map anywhere else means recovering values by searching
+a provider's own output for something shaped like a token, and a near-miss there writes the wrong
+value into a real answer.
+
+Two decisions worth naming, because both were the alternative:
+
+1. **The map holds originals and is therefore never persisted.** It lives for one request, in memory.
+   A stored map would be a second copy of exactly the data the guard exists to contain.
+2. **Substitution is two named functions, not one with a flag.** `CheckpointReport::substitute` is the
+   requester's view; `::redact` turns originals back into placeholders for a second reader, an audit
+   row, an export. The reverse direction is not redundant: an answer that quotes what the user typed is
+   *already* substituted in the caller's hand, so without it the value leaks to everyone downstream
+   while the events screen still claims the payload was masked.
+
+**A latent defect this tick found.** `mask_text` built its placeholders inline and `placeholder()`
+re-derived them separately — and the two had already drifted for the deterministic style
+(`short_hash(value_hash)` vs `value_hash[..8]`), so a deterministic token from one was not the one the
+other looked for. No test caught it, because each file's own test only ever checked its own output.
+`mask_tokens` is now the single derivation and `mask_text` reads it, so the drift is impossible by
+construction rather than by vigilance.
+
+**Proof.**
+
+- `cargo test -p omnion-ai-hub --quiet` → 583 passed, 0 failed (was 575; +8 re-map tests, 3 existing
+  report constructors updated for the new field).
+- `apps/admin` `tsc --noEmit` → real exit 0, empty log. (Measured without a pipe: `… | tail` returns
+  `tail`'s status, and a `TSC_EXIT=0` read off that pipe would have been a green that meant nothing.)
+- **NOT run this tick: the browser pass.** The box has 0 free RAM and 24 G of swap in use, and the
+  global QA slot is held by a *live* w4 walkthrough (`kill -0` + `/proc/<pid>/cwd` both confirm).
+  A second Chromium here is what took the box down on Sep 28, so the pass is deferred, not skipped.
+
+**Blockers (shared, not mine).** `omnion-postgres` on 5433 has been in crash recovery for 9 h; its
+startup process is in uninterruptible `D` state, so SIGKILL cannot restart it and ten writers share
+it. Because that outage is mine only to route around, **w7 now runs a private Postgres**
+(`omnion-postgres-w7`, `127.0.0.1:5447`) so this stack's DB walks and next tick's pass are not
+dependent on an outage with no owner. `scripts/qa/run.sh` already honours `OMNION_DATABASE_URL`, so
+pointing it at 5447 is all the wiring it takes.
+
+**Next.** (1) Wire `substitute`/`redact` into the chat route: deltas keep the placeholder, the `done`
+frame carries the substituted text, the audit metadata carries the redacted one. (2) Extend
+`ai_guard_outbound.rs` with the stub-provider walk that reads a substituted answer off `POST /ai/chat`
+and ticks criteria 2–4. (3) Run the w7 pass against 5447 the moment the box has RAM and the slot.
