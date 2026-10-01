@@ -1,3 +1,77 @@
+## 2026-10-01 — REQ-106 slice 1 completed · the screens, and the chat that proves an endpoint is real
+
+feat(admin) x2 + test(api) + test(qa): the local endpoints and models screens, the client they
+read, the walkthrough routes, and the walk that turns "local" from a stored word into a call that
+comes back.
+
+Slice 1's backend shipped last tick and its own file said so plainly: *backend-complete, not done*,
+because the "done when" has two halves and one of them — **a local endpoint serves a chat** — had
+never been executed. This tick closes it and then writes the half of the slice that was screens
+without a single route behind it.
+
+**The screen lists remote endpoints on purpose.** `/ai/local` answers "is anything still leaving
+this machine?", and a list containing only local endpoints cannot answer it. The air-gap switch
+(slice 2) reads exactly that answer, so the screen is a superset of the local rows on purpose and
+the docs say why. A panel that hid the remote providers would look tidier and answer nothing.
+
+**A never-probed endpoint is not a healthy one.** `last_seen_at === null` renders "not checked yet"
+in a neutral tone. A green badge on a row nobody has ever measured is the single thing this screen
+must never draw — it is the same trap as the `host_kind = NULL` row, one layer up: a badge whose
+meaning is "we did not check" wearing the colour of "we checked and it is fine".
+
+**Registering does not check reachability, and the form says so.** An endpoint gets its answer from
+a scan, which is a deliberate action with a visible outcome on the row. Probing as a side effect of
+typing a URL would report "reachable" for a server that had not finished booting.
+
+**The progress bar polls because the server holds the connection.** Ollama's `POST /api/pull`
+streams until the download finishes while the API has *already* claimed the row in the database, so
+the client cannot see progress until the request returns. The table re-reads the list on a timer
+while a pull is in flight and renders `pull_progress` with the server's own `pull_message`. A
+client-side percentage bar would have been a fake number agreeing with nothing — and the whole
+point of this REQ is that claims about locality are checked rather than asserted.
+
+**"Already there" is not an error.** The pull endpoint answers `200` with
+`already_available` / `already_pulling` precisely because nothing is in conflict. The client types
+the outcome as a union and the screen renders those two in a neutral tone. Painting them red would
+train operators to ignore the banner that matters.
+
+**The chat walk builds its target from the stored row, not from the URL in hand.** That is the
+claim: what the screen registered is what a later call will address, so a save path that mangled
+the base URL could not pass this test by re-typing the right one. The failure half asserts the
+server's *own* words survive (`invalid api key`, 401) — a platform-shaped "request failed" would
+send an operator to check the wrong end of the socket. Usage is asserted too, because a parser that
+dropped the token counts would still "answer".
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-api --test ai_local` | **9 passed**, 0 failed (was 8; +1) in 10.34 s against real PostgreSQL |
+| `cargo test -p omnion-ai-hub --quiet` | **596 passed**, 0 failed |
+| `apps/admin` `tsc --noEmit` | exit 0, empty log |
+| `node --check scripts/qa/walkthrough.cjs` | exit 0 |
+| tree after four commits | clean |
+
+**The disk was full when this tick started**, which is worth recording because it produced a
+mistake worth naming: a `write_file` of a 19 KB component returned **success with a 0-byte file on
+disk**. Only `wc -l`/`ls -l` caught it — the tool's own `verified: true` was honest about the
+*write*, and dishonest about the *content*. The repo's own `scripts/qa/disk-guard.sh` reclaimed
+~1.6 GB (93% of 60 GB full), which is the sanctioned tool and the reason this branch still has one:
+it refuses to delete a target a live build is writing into, and it reads `CARGO_TARGET_DIR` out of
+`/proc/<pid>/environ` rather than guessing from a directory name. A writer improvising a cleanup
+under pressure is how a sibling's build disappears.
+
+**Not run, recorded rather than skipped silently.** The **browser pass has NOT run**: this is not a
+REQ-close tick, and the QA slot is held again — pid `3591518`, `cwd=/mnt/apopic/omnion-w8` read
+through `/proc`, not through the place file. **No screen of this REQ is claimed verified.** The
+walkthrough routes are *registered*; a registered route is a promise, not a measurement, and
+"progress visible in the UI" stays `[~]` for that reason.
+
+**Next.** Run the pass over `/ai/local` and `/ai/local/models` — this is the slice's one remaining
+outstanding item, and it joins the single pass already owed to REQ-105 slice 5 and the closes of
+REQ-099/100/101. That queue, not new code, is the critical path. Then slice 2 (air-gap
+enforcement: `ai_airgap_state`, the pre-call check, the honest refusal, the switch screen).
+
 ## 2026-09-30 — REQ-014 slice 2 (history) · the export that has to match the screen
 
 feat(health) + feat(admin): named ranges, real aggregates, per-row sparklines, and a CSV the

@@ -1,6 +1,6 @@
 # REQ-106 — Local & Air-gapped AI Mode
 
-> **Status:** in-progress (slice 1 backend) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
+> **Status:** in-progress (slice 1 complete, awaiting its browser pass) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub` + infra
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -151,12 +151,22 @@ three cannot drift apart; the allow-list widens it, never replaces it.
 - [ ] `cargo test --workspace`, `pnpm typecheck && pnpm build` and the QA walkthrough are green with zero high findings.
 
 <!--
-Slice 1 (`f46b2388`, `0b68df62`, `c2285c30`, `e1c4ae94`, `4c6a6c31`, `7affb5a2`, `fe16365c`) proved:
+Slice 1 (`f46b2388`, `0b68df62`, `c2285c30`, `e1c4ae94`, `4c6a6c31`, `7affb5a2`, `fe16365c`,
+`a6730952`, `b0827c54`, `7feea2e5`, `8eb3c60f`) proved:
   * the redirect refusal, against a stub that answers 302 — ticked above.
   * `/api/v1/ai/local/models` lists, and a pull is CLAIMED (missing -> pulling -> available) with a
-    second concurrent pull refused WITH A REASON, read off `rows_affected` — that half is proved;
-    "progress visible in the UI" is NOT, because no `/ai/local` screen exists yet. Left as [~]
-    with the missing half named rather than quietly ticked.
+    second concurrent pull refused WITH A REASON, read off `rows_affected`.
+  * **the slice's "done when", now in full**: a registered endpoint answers a real chat through the
+    platform's own client, and a local server refusing a key surfaces ITS words (`invalid api key`,
+    401) rather than a platform-shaped "request failed". The target is built from the *stored* row,
+    so a save path that mangled the base URL could not pass by re-typing the right one.
+  * `/ai/local` and `/ai/local/models` exist, with empty/loading/error states, the register form,
+    the scan action, pull / cancel / retry / remove, and the two empty states kept distinct
+    (`is_empty` is computed server-side over the unfiltered list, so "nothing registered" and
+    "nothing matches this search" say different things).
+"progress visible in the UI" stays [~]: the progress bar polls the list while a pull is in flight and
+renders the server's own `pull_message`, but it has NOT been through a browser pass, and the
+walkthrough routes are registered only — so no screen of this REQ is yet claimed verified.
 The four air-gap rows (1, 2, 4, 8) are slice 2. The remaining rows are slices 3 and 4.
 -->
 
