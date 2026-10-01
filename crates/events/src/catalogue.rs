@@ -298,6 +298,24 @@ catalogue! {
     "Access to a media item was taken away.",
     [("media_id", Uuid, req), ("subject", String, req)];
 
+    // The retention route emits this pair from one `NewEvent::new(if hold { … } else { … })`, so
+    // the two names never appear as a plain string literal beside the constructor — which is why
+    // the drift gate only found them once it learned to read a name that follows the marker on
+    // the same line rather than inside it. The rows are `Live` because the route has been
+    // recording them since legal hold shipped.
+    //
+    // `reason` is **required** on both: a hold with no stated reason is a retention decision
+    // nobody can defend later, and the pair is how an outside system learns that a file it asked
+    // to delete is not going to be deleted.
+    "media.hold_placed", "media", Live,
+    "A legal hold was placed on a file: retention will not touch it until the hold is released.",
+    [("media_id", Uuid, req), ("site_id", Uuid, req), ("filename", String, opt),
+     ("reason", String, req)];
+    "media.hold_released", "media", Live,
+    "A legal hold was released; retention may now apply to the file again.",
+    [("media_id", Uuid, req), ("site_id", Uuid, req), ("filename", String, opt),
+     ("reason", String, req)];
+
     // ---- Identity ------------------------------------------------------------------------------
     "user.created", "identity", Live,
     "An account was created.",
@@ -559,6 +577,28 @@ catalogue! {
     "A probe run finished; the worst state it concluded is on the payload.",
     [("state", String, req), ("services", Integer, req), ("worst_service", String, opt),
      ("samples", Integer, opt)];
+
+    // ---- Backups and restoration -----------------------------------------------------------------
+    // The two rows the backup centre's own routes emit, added when the drift gate started
+    // naming them. Both are **Live and emitted**; what was missing was the row, which is the same
+    // failure as any other unlisted name — an operator cannot subscribe to an event the picker
+    // has never heard of, and the route has been recording it for every restore all along.
+    "backup.restored", "backups", Live,
+    "A restore finished. Carries what came back and what did not, so a receiver can tell a clean \
+     restore from a partial one.",
+    [("backup_id", Uuid, req), ("parts", Integer, opt), ("objects_restored", Integer, opt),
+     ("objects_failed", Integer, opt), ("safety_backup_id", Uuid, opt)];
+
+    // `notification.delivery.succeeded` is deliberately *not* here as a second row: the delivery
+    // lifecycle already publishes `notification.created` and the per-channel state lives in
+    // `notification_deliveries`. A "test delivery succeeded" audit fact is what this name is —
+    // one key says whether it was a test — and `test` is required rather than optional precisely
+    // so a receiver cannot read "succeeded" as a production delivery and page somebody for a
+    // message a person deliberately asked the platform to send.
+    "notification.delivery.succeeded", "notifications", Live,
+    "A channel accepted a notification the reader asked to be sent, one attempt at a time.",
+    [("notification_id", Uuid, req), ("channel", String, req), ("test", Boolean, req),
+     ("delivered", Boolean, opt)];
 
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
