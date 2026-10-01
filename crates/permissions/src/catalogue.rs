@@ -6,7 +6,7 @@
 //! outside the catalogue is a bug, and the store rejects it.
 //!
 //! Categories group the keys for the admin UI (`content`, `media`, `users`, `plugins`,
-//! `deployment`, `iam`, `audit`, `tenancy`, `webhooks`, `events`).
+//! `deployment`, `developer`, `iam`, `audit`, `tenancy`, `webhooks`, `events`).
 
 /// A single permission the platform understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +444,24 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "cdn",
         description: "Invalidate cached URLs, tags or a whole zone",
     },
+    // The developer platform (docs/requests/REQ-033, slice 1). Two keys, and the split is the
+    // one the request itself names: **reading** a key's metadata and **minting** one are
+    // different amounts of trust. An account that can see which integrations exist and how much
+    // they call is an auditor's need; an account that can mint a key that authenticates as
+    // this organization is a much larger power, and a read-only developer role must not be able
+    // to grant itself the write by virtue of holding the read. The request log rides the read
+    // key because it is the same question ("what has this organization called, and did it
+    // work") answered one row at a time rather than one day at a time.
+    PermissionDef {
+        key: "developer.keys.read",
+        category: "developer",
+        description: "Read API key metadata, usage and the request log",
+    },
+    PermissionDef {
+        key: "developer.keys.manage",
+        category: "developer",
+        description: "Create, rotate and revoke API keys",
+    },
     // Notifications (docs/requests/REQ-021). Four powers, split by *who is affected* rather
     // than by what the button does:
     //
@@ -774,6 +792,22 @@ mod tests {
             "deployment.maintenance",
         ] {
             assert!(is_known(family), "{family} must be in the catalogue");
+        }
+    }
+
+    #[test]
+    fn the_developer_family_is_catalogued() {
+        // REQ-033 slice 1. The two keys are guarded separately and a route guarded by a name
+        // the catalogue does not know answers 403 for *everybody* — including the owner — so a
+        // typo here would read as "permissions are broken" rather than as "a key is missing".
+        // The assertion is on the category as well as the key because the panel's role editor
+        // groups by it and a key in the wrong category is invisible where the editor looks.
+        for key in ["developer.keys.read", "developer.keys.manage"] {
+            assert_eq!(
+                get(key).map(|entry| entry.category),
+                Some("developer"),
+                "{key} belongs to the developer category"
+            );
         }
     }
 

@@ -106,6 +106,12 @@ const BASE_ROLES: &[BaseRole] = &[
             "webhooks.read",
             "events.read",
             "cdn.read",
+            // Reading which integrations exist and what they called is an auditor's question
+            // and it fits a manager; *minting* a key is a much larger power and stays with
+            // owner/administrator (who hold `BasePermissions::All`). If the two had been given
+            // together, the read would have arrived with the write and the split above would
+            // have been a distinction in name only.
+            "developer.keys.read",
             "search.read",
             "search.manage",
             "analytics.read",

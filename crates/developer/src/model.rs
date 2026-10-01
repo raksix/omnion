@@ -221,6 +221,19 @@ pub struct NewKey {
     pub created_by: Uuid,
 }
 
+impl ApiKey {
+    /// The status of this key at a given instant.
+    ///
+    /// A method on the row rather than a free function on the columns, because `decide` in
+    /// [`crate::authn`] needs it from a borrowed `ApiKey` it never owns — and because a second
+    /// copy of "which of the three timestamps wins" is a second place for the panel and the
+    /// authentication path to disagree about whether a key is live.
+    #[must_use]
+    pub fn status_at(&self, now: OffsetDateTime) -> KeyStatus {
+        KeyStatus::of(self.revoked_at, self.expires_at, now)
+    }
+}
+
 /// One request, as the log keeps it.
 ///
 /// Metadata only. There is no body field, no header bag and no query string, so the request
