@@ -13893,3 +13893,14 @@ platform-wide: `backups.rs`, `health_incidents.rs`, `health_panel.rs`, `media_gr
 **Next.** Read `summary.json` when the in-flight pass writes it and check the three new
 assertions by name. Then the module lib count and `cargo build -p omnion-api`, which the
 box's disk state forced into a tmpfs target.
+docs(crm-intake): the API builds, and the box had to build it in tmpfs
+
+cargo test -p omnion-module-crm-intake --lib: 185 passed / 0 failed (was
+181; four new timestamp tests, including the one that asks node whether the
+string it produced is a date). cargo build -p omnion-api: Finished in 7m22s,
+clean. apps/admin tsc --noEmit: exit 0. run-crm-timestamps.mjs: 14/14.
+
+The build had to run with CARGO_TARGET_DIR=/dev/shm/w8build. The first attempt
+against /mnt/apopic/w8build died with "No space left on device" on an .rmeta
+write and carried no error[] line, so it reads as an unrelated crate's failure
+rather than as a full filesystem.
