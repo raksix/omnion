@@ -7693,3 +7693,61 @@ measured**, because a screenshot is not a leg and an unrun assertion is not a pr
 
 Next tick runs the pass first — it is the cheapest outstanding work and everything else in
 slice 6 is already committed, tested and pushed.
+
+## 2026-10-01 · wave7 · REQ-101 slice 3c — the gate that was never closed
+
+**What.** The bridge slice 3a left open, and the hole under it.
+
+`has_gated_operations()` asked the gate whether an operation was dangerous by synthesising a
+**tool key** — `format!("{}.{}", kind.label(), resource_type)`, which produces `"delete.page"`
+and `"update.page"`. `class_of_tool()` is a closed `match` over seven **real** tool keys
+(`"content.publish"`, `"deployment.deploy"`, …) and never contained a synthesised one. So the
+lookup returned `None` for every operation ever built, `has_gated_operations()` was `false` for
+every set, and `needs_approval` was `false` on both `POST /ai/change-sets` and `confirm`.
+
+`POST /ai/change-sets/{id}/apply` accepted any row with `status = 'confirmed'`, so the flag was
+advisory: **a change set full of deletes could be confirmed and applied with no human ever
+seeing it.** REQ-101's first line is "Nothing dangerous happens without a human", and a
+synthesised string that no branch matched was how that failed.
+
+Two commits, because the defect and the feature are separable claims:
+
+- `0dab06a1` — classification is a `match` on `(kind, resource_type)`, with the publish test
+  reading the **mapping's** `FieldSpec` (`spec.field == "status"` → `spec.arg`) rather than a
+  hard-coded argument name, so a mapping rename moves both together.
+- `73529800` — `confirm` has two arms. Gated: `draft → pending` plus one approval per gated
+  operation, previewed by the same `target::preview` the single-call path uses. Ungated:
+  confirmed and applied through the same all-or-nothing store transaction. `NewApproval` gains
+  `change_set_id` (the column has existed since `0189`; nothing wrote it) and `policy_for()` is
+  extracted from `gate()` so a non-tool-call caller reads the policy through one precedence.
+
+**Proof.**
+
+```
+cargo build -p omnion-ai-hub -p omnion-api                  clean (17 pre-existing warnings)
+cargo test -p omnion-ai-hub --lib                           507 passed; 0 failed
+cargo test -p omnion-api --test ai_change_sets               7 passed; 0 failed
+cargo test -p omnion-api --test ai_approvals                 29 passed; 0 failed
+pnpm typecheck                                               2/2 successful
+```
+
+against `omnion_qa_w7` (127.0.0.1:5433), `QA_STACK=w7`'s own database.
+
+**The three new walks were proven to fail first.** The classification is reverted in place, the
+same three run, and the result is `3 failed; 0 passed` — then restored to `3 passed`. This
+matters because a walk that asserted only "a rename is not gated" would have passed the broken
+code: that half was true of *everything*, and the one assertion that fails first is the delete.
+The third walk covers the other direction — a mixed set parks the delete and leaves two renames
+alone, so the fix cannot be "gate everything".
+
+**One bug of my own, caught by the walks rather than by the compiler.** The `ai_approvals`
+insert grew a column, and I numbered the new placeholder `$23` and shifted the rest. sqlx binds
+the *n*th `.bind()` to `$n`, so every parameter after it moved one type left: 29 walks failed
+with `column "operation_count" is of type integer but expression is of type text`. The code
+compiled, and `cargo build` said nothing at all. Only a real `insert` against a real table can
+see a misnumbered positional parameter.
+
+**Next.** The chat reply that *files* a change set — the entry point, not the pipeline. Then the
+panel: `ai-change-sets.tsx` must read `approvals[]` off the confirm answer and route to the
+inbox, and the inbox must render the `change_set_id` link. The QA pass is still outstanding
+from slice 2c, and the w7 slot was held by w3 last tick.
