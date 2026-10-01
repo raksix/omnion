@@ -11304,3 +11304,49 @@ random. Measured on the file: `pipefail ON: 1000100010`, `pipefail OFF: 11111111
 **20/20 green** on the fix, **10/10 red (7 checks)** against the pre-fix `50978da8`, control check
 passing on both. A gate that changes its mind between runs is not a conservative gate; it is a
 coin flip with a green light on it.
+
+---
+
+## Tick 63 — a focused pass ran the sections it was NOT pointed at (`302a6d16`)
+
+**What.** The `--only=<section>` depth-pass guards were inverted. Every section was wrapped in
+`if (!onlyGroup(group))`, which is true for every group the pass did **not** name, so the polarity
+was exactly backwards. Measured on the pass that was running in this worktree as the tick started:
+`--only=hr` walked `14/14` HR routes and then ran **zero** HR depth passes, while running CRM, sales
+and accounting instead. A full `--only=all` pass skipped HR and inventory outright. Scoping a pass
+to a module therefore proved that the module's screens *render* and nothing else — and the report
+said nothing was missing, because the route counter and the depth-pass counter cannot see each
+other's failure.
+
+**Proof.**
+
+- `scripts/qa/section-scope-probe.sh` — 23 checks, **23/23** against the fix and **18 red / 5
+  passed** against the pre-fix `HEAD`, five identical runs each way. The determinism matters more
+  than the count: tick 62's gate changed its mind between runs on unchanged source, so a probe that
+  is only ever run green is not evidence.
+- `node --check scripts/qa/walkthrough.cjs` — parses. (The one check that catches a merge-mangled
+  array, which is how the fourth defect below got in.)
+- `cargo test -p omnion-module-hr --lib --quiet` — **132 passed; 0 failed**.
+- `pnpm typecheck` — **2 successful, 2 total**.
+
+**Three more defects in the same family, all found by reading the guards rather than the product.**
+
+1. A merge into this branch (`9a411999`) replaced all 33 `mobileRoutes` entries with **34**
+   `{ path: "path", name: "name" }` placeholders, so the phone pass has been screenshotting the
+   address `/path` on every run since. Both merge parents were clean, which is what identifies it as
+   a merge resolution rather than an edit; restored from the pre-merge file.
+2. `accounting` was a scoped group whose depth passes document `--only=accounting`, but it was
+   missing from `SCOPED_SECTIONS` — so naming it walked **zero** routes and reported its own
+   empty-pass finding, which is the same "a scoped pass must be distinguishable from a pass pointed
+   at nothing" rule firing on the section that already existed.
+3. Twelve shipped screens were absent from the route inventory (three inventory, seven accounting).
+   `--only=accounting` matched no route while `runAccountingDepth` drove those screens anyway: the
+   inventory and the depth pass disagreed about what accounting *is*.
+
+**Next.** Re-run the HR-focused pass now that `--only=hr` drives the six HR depth passes, and tick
+REQ-055's four browser-only criteria (org chart + keyboard + counts, event feed reaching a
+subscribed webhook, empty/loading/error states, 390×844) against that pass. The six HR DB walks in
+`apps/api/tests` are still **unmeasured** — `hr_attendance` blocked ~25 min last tick and was
+killed, which is not a green. Run them with `OMNION_DATABASE_URL` pointed at this stack
+(`postgres://omnion:***@127.0.0.1:5444/omnion_qa_w4`) or the gate silently hits the main writer's
+database and answers `VersionMissing` instead of the result.
