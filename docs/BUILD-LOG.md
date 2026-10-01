@@ -10670,3 +10670,54 @@ to hit `QA_SLOT_WAIT` and proceed into a full disk. This worktree's own `target/
 
 **Next:** REQ-063 acceptance 17 and REQ-064 acceptance 18, both browser measurements, both owed a
 pass against a build newer than the last one that ran.
+
+## 2026-10-01 · tick 56 — a validator that could only see that a field was there
+
+**What.** REQ-062 slice 4, acceptance 2: every bundled manifest now has to be *usable*, not merely
+*present*. `manifest_shape` (slice 1) counted `slots` and `tokens` and recorded which v2 fields the
+file carried — so it could pass a manifest that declared the wrong slot name, a token shape no
+stylesheet can read, or a `settingsSchema` default outside the range it declares.
+`validate_v2_fields` (`3a915842`) checks what a theme declares can actually be rendered.
+
+**The defect it found was in all ten shipped themes.** Every `themes/*/omnion.theme.json` declared
+the layout slot `single`; the slot the builder's picker holds and the renderer asks for is
+`single-page`. A theme claiming a layout its own builder cannot open, in ten files, behind a check
+that could only see that the field was there. Corrected in `a58cf648`.
+
+**The second find is the same class one layer over.** `previewImage` was on the manifest, in the
+gallery payload and in the client's `ThemeCard` type — and the card had no `<img>` anywhere, so
+acceptance 3's "cards show preview image" was satisfied by nothing. `GET /api/v1/themes/{key}/assets/{file}`
+(`9c4e3dee`) is now the reader; the card draws the image or a deterministic per-key swatch
+(`f5cd6de9`).
+
+**Proof.**
+- `cargo test -p omnion-content --lib` → **328 passed, 0 failed** (was 317).
+- The 7 new validator tests were **verified to fail against the old presence-only behaviour** by
+  replacing the function body with the no-op it replaced; the 4 that pass without it are the
+  positive cases and the URL rule.
+- `cargo test -p omnion-api --lib -- theme_assets` → **5/5**, including the traversal case the
+  first version of `served_names` failed and one that reads all ten real themes off disk.
+- `cargo check -p omnion-api --lib` → exit 0, zero errors.
+- `node node_modules/typescript/bin/tsc --noEmit` in `apps/admin` → **exit 0** (the direct compiler,
+  not `pnpm typecheck`, which returns a turbo cache hit and checks nothing).
+
+**What could not be measured, and why it is not a green gate.**
+- The `cms_themes` walk suite: all ten tests fail at **login** with `429 rate_limited`
+  (`scope: sign_in`, 19 requests against a ceiling of 10 in 300s) because parallel writers share one
+  bucket. It fails **identically on the stashed pre-change tree**, which is what makes it the
+  instrument and not this slice. No API walk gate was available for the change this tick.
+- No browser pass: the QA slot is held live by w8 (holder alive in `/mnt/apopic/omnion-w8`) and
+  `/mnt/apopic` opened the tick at 607 MB free (99%). Acceptance 1, 3 and 16 stay unticked on
+  purpose — all three are browser claims.
+
+**Ops.** Reclaimed 1.75 GB of stale duplicate build artifacts from this worktree's own target
+(99% → 97%, verified no live process maps it), which `cargo build -p omnion-api` then spent again
+(0 bytes free mid-build). A 1.8 GB reserve does not survive an API-crate build on a box with ten
+writers; reclaim before the build, not once.
+
+**Next.** REQ-062 acceptance 4 (activate → what a signed-out visitor sees) and 5 (restore previous
+with its settings revision) — both API-half work with walks, and the walk suite needs a sign-in
+bucket that is not shared. The remaining REQ-062 browser criteria wait for the slot.
+
+---
+
