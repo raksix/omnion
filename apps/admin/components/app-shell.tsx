@@ -9,7 +9,7 @@ import { useState, type ReactNode } from "react";
 // Both sides added icons in the same import: wave4 brought Package/Users/Warehouse for the
 // business modules' nav entries, main brought HeartPulse for the health centre. They are
 // additive, so the union keeps every entry the two features render.
-import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
+import { Activity, BarChart3, Bell, Bot, ClipboardCheck, FileText, Fingerprint, Globe, HardDriveDownload, HeartPulse, Images, Import, KeyRound, LayoutDashboard, LockKeyhole, LogOut, Menu, Package, Palmtree, Scale, ScrollText, ShieldCheck, SlidersHorizontal, Sparkles, Timer, UserCog, Users, UsersRound, Warehouse, Webhook, X } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -40,6 +40,11 @@ const NAV = [
   // on the shelf. A stock list nested under a catalog is a list of products, which is the one
   // thing an inventory screen must not be.
   { href: "/inventory/stock", label: "Inventory", icon: Warehouse },
+  // People (REQ-055). It sits beside Inventory rather than under Settings because "who is away
+  // today" and "what is in the warehouse" are both questions an operator asks at the same moment
+  // in the morning — and burying leave under Identity would make a holiday request look like an
+  // account problem, which is exactly what it is not.
+  { href: "/hr/leave", label: "People", icon: Palmtree },
   { href: "/notifications", label: "Notifications", icon: Bell },
   // The event console (REQ-016, slice 1). It sits beside Notifications rather than under
   // Settings because both answer the same question from the bus's side — "what does the
