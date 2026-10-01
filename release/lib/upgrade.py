@@ -199,19 +199,55 @@ def destructiveness(
     delta = list(delta or [])
 
     declared = to_manifest.get("migrations_destructive")
-    marked = [
+    # Two different questions, asked separately and reported separately:
+    #
+    #   * `declared_irreversible` — the author WROTE `-- omnion:no-down`. That is a decision,
+    #     and it stands whether or not the gate exists.
+    #   * `unreversible` — the file has no reversal at all. That is only MEANINGFUL once the
+    #     policy has landed, because the policy is what establishes that a reversal was
+    #     supposed to be there.
+    #
+    # The previous version asked `destructive_migrations` (which now reports BOTH) BEFORE the
+    # policy check, so a repository with no policy and 53 reversal-less migrations came back
+    # `destructive` with the reason "the migration file itself carries -- omnion:no-down" —
+    # a sentence about files that carry no such marker, attached to a verdict that the
+    # policy-absent branch is supposed to own. It failed
+    # `test_absent_policy_yields_unknown_not_reversible`, which is the test that exists
+    # precisely to stop this helper over-promising in either direction.
+    irreversible = [
         name
-        for name in release_manifest.destructive_migrations(root)
+        for name in release_manifest.declared_irreversible(root)
         if name in set(delta)
     ]
+    unreversible = (
+        [
+            name
+            for name in release_manifest.unreversible_migrations(root)
+            if name in set(delta)
+        ]
+        if release_manifest._policy_exists(root)
+        else []
+    )
 
-    if marked:
+    if irreversible:
         return {
             "verdict": VERDICT_DESTRUCTIVE,
             "reason": "the migration file itself carries -- omnion:no-down",
-            "destructive_migrations": sorted(marked),
+            "destructive_migrations": sorted(irreversible),
             "database_rollback": "restore-from-backup",
             "source": "migration-marker",
+        }
+
+    if unreversible:
+        return {
+            "verdict": VERDICT_DESTRUCTIVE,
+            "reason": (
+                "the migration ships no down script, and REQ-129's gate is the thing that "
+                "would have required one"
+            ),
+            "destructive_migrations": sorted(unreversible),
+            "database_rollback": "restore-from-backup",
+            "source": "missing-down-script",
         }
 
     if declared is True:
@@ -224,10 +260,9 @@ def destructiveness(
         }
 
     if not release_manifest._policy_exists(root):
-        # The honest branch, and the one this repository is in today. `discover_migrations`
-        # read real files and found no marker, and the policy that would prove the absence
-        # of a marker is meaningful — the CI gate that runs `up → down → up` — is not in the
-        # tree. So: nothing destructive is KNOWN, and nothing is proven safe.
+        # The honest branch for a tree whose gate has not landed: nothing destructive is
+        # KNOWN, and nothing is proven safe. Reachable in a release built from a repository
+        # older than REQ-129, which is exactly when "unknown" is the only truthful answer.
         return {
             "verdict": VERDICT_UNKNOWN,
             "reason": (
@@ -831,6 +866,17 @@ def verify_plan(plan: dict[str, Any], root: str | None = None) -> dict[str, Any]
         problems.append(
             "an unknown verdict must keep database_rollback as 'unknown' rather than naming a "
             "method nobody has established"
+        )
+    # The third pair, which the first version of this file omitted: `reversible` was checked
+    # for an unrecognised value but never bound to its own method. A plan claiming
+    # `restore-from-backup` while asserting it has verified down scripts is wrong in the
+    # direction that wastes an operator's afternoon — they take a full restore for a migration
+    # that reverses in a second. Found by the test above, which asserts the invariant for all
+    # three verdicts rather than the one the plan happened to carry.
+    if verdict == VERDICT_REVERSIBLE and destructive.get("database_rollback") != "down-script":
+        problems.append(
+            "a reversible plan must state that the database rollback is a down script; "
+            f"it claims {destructive.get('database_rollback')!r}"
         )
 
     checklist_doc = plan.get("checklist") or {}

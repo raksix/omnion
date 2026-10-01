@@ -542,26 +542,87 @@ def discover_migrations(root: str | None = None) -> list[str]:
     return [name for _, name in sorted(found)]
 
 
-def destructive_migrations(root: str | None = None) -> list[str]:
-    """Migrations that cannot be reversed, per REQ-129's policy.
+def declared_irreversible(root: str | None = None) -> list[str]:
+    """Migrations whose author wrote `-- omnion:no-down` — an exception on purpose.
 
-    The policy does not exist yet — REQ-129 is still `pending` and this loop has not
-    built it. Rather than guess at the lint rule, this reads the marker REQ-129's own
-    documentation uses for an explicit exception (`-- omnion:no-down`) and returns an
-    empty list when there is none. The honest answer today is "we do not know yet", and
-    the upgrade helper renders that as unknown rather than as safe.
+    A fact about a DECISION, so it stands whether or not the gate that would have required a
+    reversal exists. Separate from [`unreversible_migrations`] because the two carry different
+    provenance and the upgrade plan reports the reason to an operator: one says "the author
+    declared it", the other says "nobody wrote one".
     """
     root = root or repo_root()
     directory = os.path.join(root, "database", "migrations")
+    if not os.path.isdir(directory):
+        return []
     out = []
     for name in sorted(os.listdir(directory)):
         if not MIGRATION_RE.match(name):
             continue
         with open(os.path.join(directory, name), encoding="utf-8") as handle:
-            head = handle.read(4096)
-        if "-- omnion:no-down" in head:
+            if "-- omnion:no-down" in handle.read():
+                out.append(name)
+    return out
+
+
+def unreversible_migrations(root: str | None = None) -> list[str]:
+    """Migrations that carry no executable reversal.
+
+    Read with `down.rs`'s own rule rather than a substring, for the reason that module spells
+    out: "down script" appears inside prose all over this tree, and a substring match opens a
+    block in the middle of a column comment.
+
+    This used to return only the `-- omnion:no-down` files, so the moment REQ-129's policy
+    landed the upgrade helper would have looked at a repository whose reversal-less migrations
+    all test clean, answered `reversible`, and offered an operator a database rollback that
+    does not exist. `unknown` is the safe middle and `reversible` is the lie.
+    """
+    root = root or repo_root()
+    directory = os.path.join(root, "database", "migrations")
+    if not os.path.isdir(directory):
+        return []
+    heading = re.compile(r"^--\s*(?:#{1,2}\s*)?down script\b", re.IGNORECASE)
+    out = []
+    for name in sorted(os.listdir(directory)):
+        if not MIGRATION_RE.match(name):
+            continue
+        with open(os.path.join(directory, name), encoding="utf-8") as handle:
+            text = handle.read()
+        if "-- omnion:no-down" in text or not _has_reversal(text, heading):
             out.append(name)
     return out
+
+
+def destructive_migrations(root: str | None = None) -> list[str]:
+    """Every migration with no usable reversal, by either route.
+
+    The union, kept because it is the question the manifest builder asks ("is anything in this
+    release irreversible?"). The upgrade plan asks the two questions separately, because the
+    reason it shows an operator differs.
+    """
+    root = root or repo_root()
+    return sorted(set(declared_irreversible(root)) | set(unreversible_migrations(root)))
+
+
+def _has_reversal(text: str, heading: "re.Pattern[str]") -> bool:
+    """Whether a migration file carries an executable reversal, by `down.rs`'s rule.
+
+    A heading opens the block; a comment line indented by two or more spaces inside it is a
+    statement. A block with no statements is prose, and prose is `has_down = false` — the same
+    answer the Rust side gives, which is what keeps the two from disagreeing about which
+    migrations are reversible.
+    """
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if heading.match(stripped):
+            inside = True
+            continue
+        if not inside or not stripped.startswith("--"):
+            continue
+        body = stripped[2:]
+        if len(body) - len(body.lstrip(" ")) >= 2 and body.strip():
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------------------------
@@ -765,10 +826,34 @@ def build_manifest(
     }
 
 
-def _policy_exists(root: str) -> bool:
-    """Whether REQ-129's policy table/crate has actually landed."""
-    migration = os.path.join(root, "database", "migrations", "0030_migration_safety.sql")
-    return os.path.exists(migration)
+#: The marker that identifies REQ-129's own migration, whatever number it was assigned.
+#:
+#: The version number is NOT the identity. This function used to test for a hard-coded
+#: `0030_migration_safety.sql`, chosen when the request was written and the file had no number
+#: yet; the migration actually landed as `0207_migration_safety.sql`, so the test never became
+#: true and `destructiveness()` answered `unknown` on every release — permanently, and for a
+#: reason invisible to a reader because the function is named `_policy_exists` and its body
+#: reads like a lookup. The upgrade helper would have kept telling an operator "nobody has
+#: checked" about a gate that had been shipping for months.
+#:
+#: So the identity is the SUBJECT, matched across the whole directory. A renumbering, a
+#: backfill, or a second migration in the same subject all keep this correct, which a
+#: hard-coded path cannot.
+_POLICY_SUBJECT = "migration_safety"
+
+
+def _policy_exists(root: str | None = None) -> bool:
+    """Whether REQ-129's migration safety policy has actually landed.
+
+    Matched by subject across every migration in the tree rather than by a version number,
+    because the number is assigned when the file is written and this tree carries it under a
+    different one than the request assumed.
+    """
+    root = root or repo_root()
+    directory = os.path.join(root, "database", "migrations")
+    if not os.path.isdir(directory):
+        return False
+    return any(_POLICY_SUBJECT in name for name in os.listdir(directory))
 
 
 def _optional_int(facts: dict[str, Any], key: str, name: str, field: str) -> int | None:
