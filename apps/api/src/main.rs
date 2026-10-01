@@ -12,8 +12,8 @@ use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
     analytics_runner, automation_runner, backup_schedule_runner, backup_sweep_runner,
-    restore_job_runner,
-    event_retention_runner, event_runner, notification_runner, search_runner, secrets_runner,
+    event_retention_runner, event_runner, notification_runner, restore_job_runner, search_runner,
+    secrets_runner,
     workflow_runner,
 };
 use omnion_core::config::Config;
@@ -242,9 +242,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing::warn!("the notification delivery runner is not running");
         }
     } else {
-        tracing::info!(
-            "the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)"
-        );
+        tracing::info!("the notification delivery runner is disabled (OMNION_EVENTS_RUNNER=false)");
     }
 
     // The event-retention sweeper ticks in this process too (REQ-016, slice 3), under its own

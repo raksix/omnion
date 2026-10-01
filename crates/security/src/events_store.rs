@@ -41,8 +41,8 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::events::{
-    MAX_EXPORT_ROWS, SecurityEvent, describe_outcome, event_id, is_refusal,
-    page_size, query_spec, summarise_metadata,
+    MAX_EXPORT_ROWS, SecurityEvent, describe_outcome, event_id, is_refusal, page_size, query_spec,
+    summarise_metadata,
 };
 
 /// One audit row, as the query reads it.
@@ -96,12 +96,19 @@ fn outcome_filter(category: crate::events::EventCategory) -> Option<&'static [&'
 }
 
 /// Read one page of the merged timeline, newest first.
-pub async fn list(pool: &PgPool, query: &crate::events::EventQuery) -> Result<crate::events::EventPage> {
+pub async fn list(
+    pool: &PgPool,
+    query: &crate::events::EventQuery,
+) -> Result<crate::events::EventPage> {
     let (audit, audit_total) = audit_side(pool, query, page_size(query.limit)).await?;
     let (sign_in, sign_in_total) = sign_in_side(pool, query, page_size(query.limit)).await?;
 
     let mut events: Vec<SecurityEvent> = audit.into_iter().chain(sign_in).collect();
-    events.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at).then_with(|| b.id.cmp(&a.id)));
+    events.sort_by(|a, b| {
+        b.occurred_at
+            .cmp(&a.occurred_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
 
     let total = audit_total + sign_in_total;
     let limit = page_size(query.limit);
@@ -133,7 +140,11 @@ pub async fn export_rows(
     let (sign_in, _) = sign_in_side(pool, query, MAX_EXPORT_ROWS).await?;
 
     let mut events: Vec<SecurityEvent> = audit.into_iter().chain(sign_in).collect();
-    events.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at).then_with(|| b.id.cmp(&a.id)));
+    events.sort_by(|a, b| {
+        b.occurred_at
+            .cmp(&a.occurred_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     events.truncate(MAX_EXPORT_ROWS);
     Ok(events)
 }
@@ -355,7 +366,9 @@ async fn sign_in_side(
                     format!(
                         "attempt against {} from {}",
                         row.email,
-                        address.as_deref().unwrap_or("an address the platform did not record")
+                        address
+                            .as_deref()
+                            .unwrap_or("an address the platform did not record")
                     )
                 }),
                 organization_id: row.organization_id,
@@ -395,8 +408,14 @@ mod tests {
         // `security.ip_rule%` against an `outcome` column would match nothing, and "matched
         // nothing" is indistinguishable from "filtered correctly" on a screen whose filter
         // looks like it works.
-        assert_eq!(outcome_filter(EventCategory::Lockout), Some(&["locked"][..]));
-        assert_eq!(outcome_filter(EventCategory::Denial), Some(&["blocked"][..]));
+        assert_eq!(
+            outcome_filter(EventCategory::Lockout),
+            Some(&["locked"][..])
+        );
+        assert_eq!(
+            outcome_filter(EventCategory::Denial),
+            Some(&["blocked"][..])
+        );
         // `sign_in` is the default category here and selects its rows; it is not "no clause".
         assert_eq!(
             outcome_filter(EventCategory::SignIn),
@@ -432,7 +451,10 @@ mod tests {
         // to a ticket is silently short. `MAX_EXPORT_ROWS` is the export's ceiling and nothing
         // else is.
         assert!(MAX_EXPORT_ROWS > crate::vocabulary::MAX_PAGE);
-        assert_eq!(page_size(Some(MAX_EXPORT_ROWS)), crate::vocabulary::MAX_PAGE);
+        assert_eq!(
+            page_size(Some(MAX_EXPORT_ROWS)),
+            crate::vocabulary::MAX_PAGE
+        );
     }
 
     #[test]

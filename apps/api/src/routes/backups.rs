@@ -28,11 +28,11 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use omnion_audit::NewAuditEntry;
-use omnion_events::{NewEvent, bus};
 use omnion_backup::{
     NewBackup, NewPart, NewSchedule, NewSettings, Part, PartStatus, probe_local, storage_key,
     storage_prefix, validate_label,
 };
+use omnion_events::{NewEvent, bus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::OffsetDateTime;
@@ -964,10 +964,8 @@ pub async fn update_schedule(
     };
     let cadence = cadence_of(&draft)?;
     let now = OffsetDateTime::now_utc();
-    let next_run_at: Option<OffsetDateTime> = draft
-        .enabled
-        .then(|| cadence.next_after(now))
-        .transpose()?;
+    let next_run_at: Option<OffsetDateTime> =
+        draft.enabled.then(|| cadence.next_after(now)).transpose()?;
 
     let row = omnion_backup::upsert_schedule(pool, Some(id), &draft).await?;
     omnion_backup::set_schedule_next_run(pool, row.id, next_run_at).await?;
@@ -1066,9 +1064,10 @@ pub async fn run_schedule_now(
         // Never protected: a manual run is a backup like any other, and marking it protected
         // because a button was pressed would put it outside the retention window forever.
         protected: false,
-        retain_until: Some(OffsetDateTime::now_utc() + time::Duration::days(i64::from(
-            schedule.retention_count.max(1),
-        ))),
+        retain_until: Some(
+            OffsetDateTime::now_utc()
+                + time::Duration::days(i64::from(schedule.retention_count.max(1))),
+        ),
         created_by: Some(current.user.id),
     };
     let row = omnion_backup::insert_backup(pool, &draft).await?;
@@ -1251,10 +1250,7 @@ pub async fn write_settings(
 /// schedule worker. A worker that grew its own producer loop would be a second implementation
 /// of "what a part is", on the path that runs unattended at 02:00 on every installation that
 /// set up a schedule. That is the same argument that put the safety backup on `produce_all`.
-pub(crate) async fn produce_for_worker(
-    state: &AppState,
-    run: &omnion_backup::Backup,
-) -> i32 {
+pub(crate) async fn produce_for_worker(state: &AppState, run: &omnion_backup::Backup) -> i32 {
     produce_all(state, run)
         .await
         .iter()
@@ -1334,7 +1330,10 @@ async fn produce_all(state: &AppState, run: &omnion_backup::Backup) -> Vec<Part>
         let root = match omnion_backup::load_settings(pool).await {
             Ok(settings) => settings.local_root,
             Err(error) => {
-                let part = Part::failed(name, format!("the destination root could not be read: {error}"));
+                let part = Part::failed(
+                    name,
+                    format!("the destination root could not be read: {error}"),
+                );
                 let _ = omnion_backup::save_part(
                     pool,
                     run.id,
@@ -1494,11 +1493,9 @@ async fn write_media_object(
     // knows about the local root, so the key can never escape it.
     let path = base.join(key.trim_start_matches('/'));
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| {
-                omnion_backup::BackupError::Rejected(format!("{}: {error}", parent.display()))
-            })?;
+        tokio::fs::create_dir_all(parent).await.map_err(|error| {
+            omnion_backup::BackupError::Rejected(format!("{}: {error}", parent.display()))
+        })?;
     }
     tokio::fs::write(&path, &bytes).await.map_err(|error| {
         omnion_backup::BackupError::Rejected(format!("{}: {error}", path.display()))
@@ -1564,18 +1561,29 @@ async fn produce_media(state: &AppState, run: &omnion_backup::Backup) -> Part {
     // and write in this file is scoped by `organization_id`, and the backup was the one
     // place that was not. A run with no organization is the single-tenant case, where
     // `is not distinct from null` matches the sites that have no organization either.
-    let objects = match
-        omnion_backup::pending_objects_for_organization(pool, run.organization_id).await
-    {
-        Ok(objects) => objects,
-        Err(error) => return record_media_failure(pool, run.id, format!("the media library could not be listed: {error}")).await,
-    };
+    let objects =
+        match omnion_backup::pending_objects_for_organization(pool, run.organization_id).await {
+            Ok(objects) => objects,
+            Err(error) => {
+                return record_media_failure(
+                    pool,
+                    run.id,
+                    format!("the media library could not be listed: {error}"),
+                )
+                .await;
+            }
+        };
 
     // An empty library is a legitimate result, not a failure and not a part that did nothing:
     // it is the honest answer to "how much media is there" on a platform that has none yet.
     if objects.is_empty() {
-        return finish_media_part(pool, run.id, &prefix, &omnion_backup::MediaCopyReport::default())
-            .await;
+        return finish_media_part(
+            pool,
+            run.id,
+            &prefix,
+            &omnion_backup::MediaCopyReport::default(),
+        )
+        .await;
     }
 
     let report = match omnion_backup::copy_objects(
@@ -1659,21 +1667,12 @@ async fn finish_media_part(
     let path = omnion_backup::local_path_for(&root, &key);
     if let Some(parent) = path.parent() {
         if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            return record_media_failure(
-                pool,
-                backup_id,
-                format!("{}: {error}", parent.display()),
-            )
-            .await;
+            return record_media_failure(pool, backup_id, format!("{}: {error}", parent.display()))
+                .await;
         }
     }
     if let Err(error) = tokio::fs::write(&path, &document).await {
-        return record_media_failure(
-            pool,
-            backup_id,
-            format!("{}: {error}", path.display()),
-        )
-        .await;
+        return record_media_failure(pool, backup_id, format!("{}: {error}", path.display())).await;
     }
 
     // The recorded size and checksum describe **this file** — the index — and nothing else.
@@ -1822,13 +1821,8 @@ pub async fn sweep(
     let settings = omnion_backup::load_settings(pool).await?;
     let root = settings.local_root.clone();
 
-    let report = omnion_backup::sweep_organization(
-        pool,
-        org,
-        &root,
-        OffsetDateTime::now_utc(),
-    )
-    .await?;
+    let report =
+        omnion_backup::sweep_organization(pool, org, &root, OffsetDateTime::now_utc()).await?;
 
     record(
         pool,
@@ -1836,7 +1830,8 @@ pub async fn sweep(
         current.user.id,
         address.as_text(),
         "backup.sweep",
-        org.map(|id| id.to_string()).unwrap_or_else(|| "platform".to_owned()),
+        org.map(|id| id.to_string())
+            .unwrap_or_else(|| "platform".to_owned()),
         json!({
             "walked": report.walked,
             "candidates": report.candidates,
@@ -2239,7 +2234,11 @@ pub async fn restore(
     );
     let facts = omnion_backup::ArchiveFacts {
         preview_parts: &preview.parts,
-        media_objects: if preview.parts.iter().any(|part| part.part == "media" && part.available) {
+        media_objects: if preview
+            .parts
+            .iter()
+            .any(|part| part.part == "media" && part.available)
+        {
             archived.map(|objects| objects.len() as i64)
         } else {
             None

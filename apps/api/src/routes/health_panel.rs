@@ -266,9 +266,7 @@ fn overview_body(overview: &HealthOverview, sample_count: i64) -> OverviewBody {
 /// to report the platform, and a missing setting is a panel problem, not a platform one.
 /// The fallback is logged, because it is now a *deviation* from what the operator saved
 /// and silence would make it indistinguishable from being obeyed.
-pub(crate) async fn probe_context(
-    state: &AppState,
-) -> omnion_health::ProbeContext<'_> {
+pub(crate) async fn probe_context(state: &AppState) -> omnion_health::ProbeContext<'_> {
     let config = state.config();
     let worker_stale_seconds = match omnion_health::load_settings(state.db().pool()).await {
         Ok(settings) => i64::from(settings.worker_stale_seconds),
@@ -297,7 +295,10 @@ pub(crate) async fn probe_context(
         storage_driver: omnion_storage::StorageConfig::from_env()
             .map(|storage| storage.driver.as_str().to_string())
             .unwrap_or_else(|_| {
-                omnion_storage::StorageConfig::default().driver.as_str().to_string()
+                omnion_storage::StorageConfig::default()
+                    .driver
+                    .as_str()
+                    .to_string()
             }),
         build: state.build(),
         environment: config.env.as_str().to_string(),
@@ -318,14 +319,11 @@ pub(crate) async fn probe_context(
 /// still broken", and a stored answer is by definition the answer to a question
 /// asked earlier. The stored samples exist for the *trends*; the overview is the
 /// present tense.
-pub async fn overview(
-    State(state): State<AppState>,
-) -> Result<Json<OverviewBody>, ApiError> {
+pub async fn overview(State(state): State<AppState>) -> Result<Json<OverviewBody>, ApiError> {
     let ctx = probe_context(&state).await;
-    let (overview, policy) =
-        omnion_health::run_and_record(state.db().pool(), &ctx)
-            .await
-            .map_err(map_store)?;
+    let (overview, policy) = omnion_health::run_and_record(state.db().pool(), &ctx)
+        .await
+        .map_err(map_store)?;
     crate::health_events::announce_changes(state.db().pool(), &policy).await;
     let sample_count = omnion_health::sample_count(state.db().pool())
         .await
@@ -359,10 +357,9 @@ pub async fn run_checks(
     session: CurrentSession,
 ) -> Result<Json<OverviewBody>, ApiError> {
     let ctx = probe_context(&state).await;
-    let (overview, policy) =
-        omnion_health::run_and_record(state.db().pool(), &ctx)
-            .await
-            .map_err(map_store)?;
+    let (overview, policy) = omnion_health::run_and_record(state.db().pool(), &ctx)
+        .await
+        .map_err(map_store)?;
     crate::health_events::announce_changes(state.db().pool(), &policy).await;
     crate::health_events::announce_run(state.db().pool(), &overview, Some(session.user.id)).await;
     let sample_count = omnion_health::sample_count(state.db().pool())
@@ -389,10 +386,9 @@ pub async fn service(
         ));
     }
     let ctx = probe_context(&state).await;
-    let (overview, policy) =
-        omnion_health::run_and_record(state.db().pool(), &ctx)
-            .await
-            .map_err(map_store)?;
+    let (overview, policy) = omnion_health::run_and_record(state.db().pool(), &ctx)
+        .await
+        .map_err(map_store)?;
     crate::health_events::announce_changes(state.db().pool(), &policy).await;
     let report = overview
         .services
@@ -420,10 +416,9 @@ pub async fn service(
     // not be comparable — which is the one thing two charts on one page must be.
     let now = time::OffsetDateTime::now_utc();
     for (service_key, metric) in recorded.into_iter().filter(|(svc, _)| *svc == key) {
-        if let Some(sample) =
-            omnion_health::latest_sample(state.db().pool(), &service_key, &metric)
-                .await
-                .map_err(map_store)?
+        if let Some(sample) = omnion_health::latest_sample(state.db().pool(), &service_key, &metric)
+            .await
+            .map_err(map_store)?
         {
             // A failed series read leaves the row with its value and an empty
             // trend, because a metric with a number and no line is a better
@@ -464,10 +459,9 @@ pub async fn service(
 /// and a badge that says otherwise is the exact claim this screen must not make.
 pub async fn summary(State(state): State<AppState>) -> Result<Json<SummaryBody>, ApiError> {
     let ctx = probe_context(&state).await;
-    let (overview, policy) =
-        omnion_health::run_and_record(state.db().pool(), &ctx)
-            .await
-            .map_err(map_store)?;
+    let (overview, policy) = omnion_health::run_and_record(state.db().pool(), &ctx)
+        .await
+        .map_err(map_store)?;
     crate::health_events::announce_changes(state.db().pool(), &policy).await;
     Ok(Json(summary_of(&overview)))
 }
@@ -492,14 +486,11 @@ fn summary_of(overview: &HealthOverview) -> SummaryBody {
 /// Deliberately a *route on the existing overview* rather than a new surface —
 /// there is nothing a health screen cannot already say, and a "diagnostics"
 /// endpoint is where credentials end up.
-pub async fn host_metrics(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+pub async fn host_metrics(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let ctx = probe_context(&state).await;
-    let (overview, policy) =
-        omnion_health::run_and_record(state.db().pool(), &ctx)
-            .await
-            .map_err(map_store)?;
+    let (overview, policy) = omnion_health::run_and_record(state.db().pool(), &ctx)
+        .await
+        .map_err(map_store)?;
     crate::health_events::announce_changes(state.db().pool(), &policy).await;
     let host = overview
         .services
@@ -596,8 +587,9 @@ pub async fn metrics(
 ) -> Result<Json<MetricsBody>, ApiError> {
     let range = resolve_range(query.range.as_deref())?;
     let now = time::OffsetDateTime::now_utc();
-    let summaries =
-        omnion_health::metric_summaries(state.db().pool(), range, now).await.map_err(map_store)?;
+    let summaries = omnion_health::metric_summaries(state.db().pool(), range, now)
+        .await
+        .map_err(map_store)?;
 
     // Each row carries its own series, because the sparkline is the point of the table and a
     // client that had to fetch one series per row would make this screen issue a request per
@@ -621,7 +613,10 @@ pub async fn metrics(
 
     Ok(Json(MetricsBody {
         range: range.key().to_string(),
-        ranges: omnion_health::RANGE_KEYS.iter().map(|key| (*key).to_string()).collect(),
+        ranges: omnion_health::RANGE_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect(),
         metrics: rows,
         total_samples: summaries.iter().map(|summary| summary.samples).sum(),
     }))
@@ -760,9 +755,7 @@ impl From<&omnion_health::MetricSummary> for MetricRowBody {
 /// explicit that a destructive control must be distinguishable from an ordinary
 /// one. The scheduled sweep calls the same store function, so the count this
 /// returns is the count the sweep would have reported.
-pub async fn prune(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn prune(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let deleted = omnion_health::prune_old_samples(state.db().pool())
         .await
         .map_err(map_store)?;
@@ -828,7 +821,11 @@ mod tests {
                 "{} has no link",
                 row.service
             );
-            assert!(!row.description.is_empty(), "{} has no description", row.service);
+            assert!(
+                !row.description.is_empty(),
+                "{} has no description",
+                row.service
+            );
         }
     }
 
@@ -840,7 +837,11 @@ mod tests {
         let overview = omnion_health::unprobed_overview();
         for row in overview.services.iter().map(service_body) {
             assert!(row.latency_ms.is_none(), "{} claims a latency", row.service);
-            assert!(row.checked_at.is_none(), "{} claims a timestamp", row.service);
+            assert!(
+                row.checked_at.is_none(),
+                "{} claims a timestamp",
+                row.service
+            );
             assert_eq!(row.state, "unknown");
             assert!(row.checks.is_empty());
         }
@@ -890,7 +891,11 @@ mod tests {
         assert_eq!(body.sample_count, 3);
         for metric in &body.host {
             if metric.metric.ends_with("_percent") {
-                assert!(metric.threshold.is_some(), "{} has a percent threshold", metric.metric);
+                assert!(
+                    metric.threshold.is_some(),
+                    "{} has a percent threshold",
+                    metric.metric
+                );
             }
         }
     }

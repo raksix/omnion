@@ -235,7 +235,11 @@ impl Harness {
         // See `support::walk_auth`, which lifts this shape for every suite, and `--test media`,
         // which had already been repaired this way and passes.
         support::walk_auth::with_csrf_secret(&mut config);
-        let csrf_secret = config.csrf.as_bytes().expect("the suite just set a secret").to_vec();
+        let csrf_secret = config
+            .csrf
+            .as_bytes()
+            .expect("the suite just set a secret")
+            .to_vec();
         live_db(&config).await?;
 
         let database = format!("omnion_events_{}", Uuid::new_v4().simple());
@@ -380,10 +384,13 @@ async fn account(harness: &Harness, organization_id: Option<Uuid>) -> (Uuid, Str
     // compare against. Deriving it rather than hard-coding a value is the point: a constant
     // token would pass the presence check and fail verification, which reads as a broken product.
     let csrf = omnion_security::derive_csrf_token(&harness.csrf_secret, &session.id.to_string());
-    (user.id, support::walk_auth::pack(&support::walk_auth::Session {
-        session: token,
-        csrf: Some(csrf),
-    }))
+    (
+        user.id,
+        support::walk_auth::pack(&support::walk_auth::Session {
+            session: token,
+            csrf: Some(csrf),
+        }),
+    )
 }
 
 /// Bind a role with exactly these permission keys to one account, at organization scope.
@@ -2869,7 +2876,9 @@ fn delivery_view(row: &Value) -> DeliveryView {
         status: text("status").unwrap_or_default(),
         attempts: number("attempts").unwrap_or_default(),
         next_attempt_at: text("next_attempt_at")
-            .and_then(|raw| OffsetDateTime::parse(&raw, &time::format_description::well_known::Rfc3339).ok())
+            .and_then(|raw| {
+                OffsetDateTime::parse(&raw, &time::format_description::well_known::Rfc3339).ok()
+            })
             .unwrap_or_else(|| {
                 // A body without a parsable `next_attempt_at` still has to produce a row, or the
                 // walk below would silently skip the very delivery it is measuring. `now()` is a
@@ -2884,11 +2893,7 @@ fn delivery_view(row: &Value) -> DeliveryView {
 }
 
 /// The delivery rows of one endpoint, newest first.
-async fn delivery_views(
-    harness: &Harness,
-    endpoint_id: &str,
-    token: &str,
-) -> Vec<DeliveryView> {
+async fn delivery_views(harness: &Harness, endpoint_id: &str, token: &str) -> Vec<DeliveryView> {
     let response = harness
         .call(get(
             &format!("/api/v1/webhooks/{endpoint_id}/deliveries"),
@@ -2993,7 +2998,12 @@ async fn a_delivery_row_measures_its_own_duration_and_its_backoff_grows() {
             Some(&editor_token),
         ))
         .await;
-    assert_eq!(ok_endpoint.status, StatusCode::CREATED, "{:?}", ok_endpoint.body);
+    assert_eq!(
+        ok_endpoint.status,
+        StatusCode::CREATED,
+        "{:?}",
+        ok_endpoint.body
+    );
     let ok_id = ok_endpoint.body["id"].as_str().expect("id").to_owned();
 
     assert_eq!(
@@ -3400,9 +3410,7 @@ fn is_in_test_module(text: &str, index: usize) -> bool {
     let mut in_tests = false;
     for line in text.lines().take(index) {
         let code = code_of(line);
-        if code.trim_start().starts_with("#[cfg(test)]")
-            || code.contains("#[cfg(all(test")
-        {
+        if code.trim_start().starts_with("#[cfg(test)]") || code.contains("#[cfg(all(test") {
             in_tests = true;
         }
         // Only a brace that starts the line closes the module; anything indented belongs to

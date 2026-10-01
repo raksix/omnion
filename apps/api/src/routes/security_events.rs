@@ -22,11 +22,11 @@
 //! database write on the path of every refused request, and an attacker would decide how fast
 //! the audit table fills.
 
+use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use omnion_security::{
     EventCategory, EventPage, EventQuery, EventSource, MAX_EVENT_EXPORT_ROWS, SecurityEvent,
 };
@@ -368,7 +368,10 @@ mod tests {
         // filter", and the operator reads an unfiltered timeline as a filtered one.
         let error = parse_query(Some("category=denials")).expect_err("a typo is refused");
         let message = error.to_string();
-        assert!(message.contains("denials"), "{message} does not name the value");
+        assert!(
+            message.contains("denials"),
+            "{message} does not name the value"
+        );
         assert!(
             message.contains("ip_rule_change") && message.contains("lockout"),
             "{message} does not list the valid categories"
@@ -390,7 +393,10 @@ mod tests {
     fn an_unknown_source_is_refused_and_the_two_are_named() {
         let error = parse_query(Some("source=logs")).expect_err("a typo is refused");
         let message = error.to_string();
-        assert!(message.contains("audit") && message.contains("sign_in"), "{message}");
+        assert!(
+            message.contains("audit") && message.contains("sign_in"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -409,8 +415,10 @@ mod tests {
     fn a_window_that_ends_before_it_starts_is_refused() {
         // A filter that can only ever be empty is a filter an operator will debug for ten
         // minutes. The message says so rather than answering with an empty table.
-        let error = parse_query(Some("since=2026-02-01T00:00:00Z&until=2026-01-01T00:00:00Z"))
-            .expect_err("an inverted window is refused");
+        let error = parse_query(Some(
+            "since=2026-02-01T00:00:00Z&until=2026-01-01T00:00:00Z",
+        ))
+        .expect_err("an inverted window is refused");
         assert!(
             error.to_string().contains("outside its own range"),
             "{} does not explain itself",
@@ -420,8 +428,10 @@ mod tests {
 
     #[test]
     fn a_well_formed_window_parses_on_both_ends() {
-        let query = parse_query(Some("since=2026-01-01T00:00:00Z&until=2026-01-31T23:59:59Z"))
-            .expect("a valid window parses");
+        let query = parse_query(Some(
+            "since=2026-01-01T00:00:00Z&until=2026-01-31T23:59:59Z",
+        ))
+        .expect("a valid window parses");
         assert!(query.since.is_some());
         assert!(query.until.is_some());
         assert!(query.since < query.until);
@@ -429,8 +439,7 @@ mod tests {
 
     #[test]
     fn a_malformed_timestamp_is_refused_with_what_was_typed() {
-        let error =
-            parse_query(Some("since=yesterday")).expect_err("a word is not a timestamp");
+        let error = parse_query(Some("since=yesterday")).expect_err("a word is not a timestamp");
         assert!(error.to_string().contains("yesterday"), "{error}");
     }
 

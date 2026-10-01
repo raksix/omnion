@@ -90,7 +90,11 @@ impl Harness {
         // ever consulted, and a suite that measured the wrong refusal would look like a guard
         // that works.
         support::walk_auth::with_csrf_secret(&mut config);
-        let csrf_secret = config.csrf.as_bytes().expect("the suite just set a secret").to_vec();
+        let csrf_secret = config
+            .csrf
+            .as_bytes()
+            .expect("the suite just set a secret")
+            .to_vec();
         live_db(&config).await?;
 
         let database = format!("omnion_security_{}", Uuid::new_v4().simple());
@@ -341,7 +345,12 @@ async fn create_organization_row(db: &Db, name: &str) -> Uuid {
 fn peer_address() -> String {
     // `as_u128` rather than `simple()` — the latter is a Display formatter, not a value.
     let draw = Uuid::new_v4().as_u128();
-    format!("127.{}.{}.{}", 1 + (draw % 200) as u8, 0 + ((draw >> 8) % 250) as u8, 1 + ((draw >> 16) % 250) as u8)
+    format!(
+        "127.{}.{}.{}",
+        1 + (draw % 200) as u8,
+        0 + ((draw >> 8) % 250) as u8,
+        1 + ((draw >> 16) % 250) as u8
+    )
 }
 
 /// An account whose **password** is what the walk drives, rather than a pre-made session.
@@ -350,10 +359,7 @@ fn peer_address() -> String {
 /// a permission walk and the wrong one here: this walk has to guess a password and be refused, so
 /// it needs the address and the password, not a session that would sail past the very layer under
 /// test.
-async fn login_account(
-    harness: &Harness,
-    organization_id: Option<Uuid>,
-) -> (Uuid, String, String) {
+async fn login_account(harness: &Harness, organization_id: Option<Uuid>) -> (Uuid, String, String) {
     let email = format!("lockout-{}@omnion.test", Uuid::new_v4().simple());
     let user = users::create_user(
         harness.db.pool(),
@@ -374,12 +380,7 @@ async fn login_account(
 /// The request goes through `request` (so the credential packing stays in one place) and then has
 /// the peer inserted into its extensions, which is what `call` cannot do for a caller that needs
 /// a specific address.
-async fn login_from(
-    harness: &Harness,
-    peer: &str,
-    email: &str,
-    password: &str,
-) -> TestResponse {
+async fn login_from(harness: &Harness, peer: &str, email: &str, password: &str) -> TestResponse {
     let payload = json!({ "email": email, "password": password }).to_string();
     let builder = Request::builder()
         .method(Method::POST)
@@ -390,13 +391,9 @@ async fn login_from(
         .expect("request must build")
         .into_parts();
     if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
-        parts
-            .extensions
-            .insert(axum::extract::ConnectInfo(address));
+        parts.extensions.insert(axum::extract::ConnectInfo(address));
     }
-    harness
-        .call(Request::from_parts(parts, body))
-        .await
+    harness.call(Request::from_parts(parts, body)).await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -411,10 +408,30 @@ async fn login_from(
 /// compared against itself and pass. Here the path and the key are two claims about the code
 /// that a person made, and each walk checks both: the refusal below must name the key.
 const SURFACE: &[(&str, Method, &str, &str)] = &[
-    ("/api/v1/security/overview", Method::GET, "security.read", "read"),
-    ("/api/v1/security/findings", Method::GET, "security.read", "read"),
-    ("/api/v1/security/findings.csv", Method::GET, "security.read", "read"),
-    ("/api/v1/security/headers", Method::GET, "security.read", "read"),
+    (
+        "/api/v1/security/overview",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/findings",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/findings.csv",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/headers",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
     (
         "/api/v1/security/rate-limits",
         Method::GET,
@@ -471,6 +488,14 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
         "security.read",
         "read",
     ),
+    // The secret inventory (REQ-012 slice 4). Read-only: management belongs to the secrets
+    // manager request, so there is no write method to guard and nothing to widen.
+    (
+        "/api/v1/security/secrets",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
     (
         "/api/v1/security/checks/run",
         Method::POST,
@@ -521,7 +546,12 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
 /// would get a validation error, which is still a refusal and still not a `403`. What these
 /// walks assert is that the request is turned away **before** the body is looked at — a guard
 /// is a gate, not a parser.
-fn surface_request(method: Method, uri: &str, kind: &str, credential: Option<&str>) -> Request<Body> {
+fn surface_request(
+    method: Method,
+    uri: &str,
+    kind: &str,
+    credential: Option<&str>,
+) -> Request<Body> {
     let uri = uri.replace("{id}", &Uuid::new_v4().to_string());
     let body = match kind {
         "write" => Some(json!({ "note": "walk" })),
@@ -692,8 +722,7 @@ async fn the_full_holder_passes_the_guard_on_every_route() {
             .await;
 
         assert!(
-            response.status != StatusCode::UNAUTHORIZED
-                && response.status != StatusCode::FORBIDDEN,
+            response.status != StatusCode::UNAUTHORIZED && response.status != StatusCode::FORBIDDEN,
             "{method} {uri} refuses the account that holds {key}; the route is unreachable for \
              everybody. Body: {}",
             response.text
@@ -757,7 +786,8 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
     // The account whose lockout is measured, and the operator who tunes the policy. Two
     // accounts on purpose: the one being locked must not be the one holding the permission, or a
     // walk that signed in as the wrong account would be measuring itself.
-    let (victim, victim_email, victim_password) = login_account(&harness, Some(organization_id)).await;
+    let (victim, victim_email, victim_password) =
+        login_account(&harness, Some(organization_id)).await;
     let (operator_id, operator_token) = account(&harness, Some(organization_id)).await;
     // Both keys, deliberately: the probe is `security.read` while the save is
     // `security.manage`. Granting only the write key looked tidier and then read as a broken
@@ -820,7 +850,10 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
         .expect("the sign_in policy must exist in the defaults");
     let limiter_client = omnion_security::ClientId {
         user_id: None,
-        ip: peer.parse::<std::net::SocketAddr>().ok().map(|address| address.ip()),
+        ip: peer
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.ip()),
     };
 
     let mut locked_at: Option<u32> = None;
@@ -832,7 +865,13 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )
         .await;
-        let response = login_from(&harness, &peer, &victim_email, "definitely-not-the-password").await;
+        let response = login_from(
+            &harness,
+            &peer,
+            &victim_email,
+            "definitely-not-the-password",
+        )
+        .await;
         match response.body["error"]["code"].as_str() {
             Some("account_locked") => {
                 locked_at = Some(attempt);
@@ -867,13 +906,12 @@ async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
 
     // And the account is genuinely locked, read from the row rather than inferred from the
     // refusal: a response code and a stored lock are two different claims.
-    let (locked_until, counter): (Option<time::OffsetDateTime>, i32) = sqlx::query_as(
-        "select locked_until, failed_sign_in_count from users where id = $1",
-    )
-    .bind(victim)
-    .fetch_one(harness.db.pool())
-    .await
-    .expect("the account row must be readable");
+    let (locked_until, counter): (Option<time::OffsetDateTime>, i32) =
+        sqlx::query_as("select locked_until, failed_sign_in_count from users where id = $1")
+            .bind(victim)
+            .fetch_one(harness.db.pool())
+            .await
+            .expect("the account row must be readable");
     assert!(
         locked_until.is_some_and(|until| until > time::OffsetDateTime::now_utc()),
         "the lock must be in the future, not a timestamp in the past"
@@ -1170,7 +1208,12 @@ async fn a_denied_network_cannot_reach_the_api() {
             elsewhere,
         ))
         .await;
-    assert_eq!(removed_self.status, StatusCode::NO_CONTENT, "{}", removed_self.text);
+    assert_eq!(
+        removed_self.status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        removed_self.text
+    );
 
     // Removing the rule restores the address on the *next* request, not at the next boot.
     let rule_id = created.body["rule"]["id"]
@@ -1179,7 +1222,12 @@ async fn a_denied_network_cannot_reach_the_api() {
         .to_owned();
     let deleted = harness
         .call(from_address(
-            request(Method::DELETE, &format!("/api/v1/security/ip-rules/{rule_id}"), Some(&operator), None),
+            request(
+                Method::DELETE,
+                &format!("/api/v1/security/ip-rules/{rule_id}"),
+                Some(&operator),
+                None,
+            ),
             elsewhere,
         ))
         .await;
@@ -1396,7 +1444,10 @@ async fn the_timeline_merges_the_audit_trail_and_the_sign_in_log() {
 
     // The source filter decides before any query runs.
     let sign_in_source = harness
-        .call(get("/api/v1/security/events?source=sign_in", Some(&operator)))
+        .call(get(
+            "/api/v1/security/events?source=sign_in",
+            Some(&operator),
+        ))
         .await;
     assert!(
         sign_in_source.body["events"]
@@ -1467,7 +1518,13 @@ async fn the_timeline_merges_the_audit_trail_and_the_sign_in_log() {
     //
     // The digest is the only column that carries key *names*, and the shape a leaked one takes is
     // `secret=<value>` — a bare `=` after a credential-shaped key.
-    for leak in ["secret=", "password=", "token=", "authorization=", "credential="] {
+    for leak in [
+        "secret=",
+        "password=",
+        "token=",
+        "authorization=",
+        "credential=",
+    ] {
         assert!(
             !export.text.contains(leak),
             "the audit metadata leaked {leak} into the export: {}",
@@ -1570,6 +1627,514 @@ async fn a_malformed_cidr_is_refused_with_a_field_level_message() {
         StatusCode::BAD_REQUEST,
         "a duplicate must be refused, not silently upserted: {}",
         duplicate.text
+    );
+
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The secret inventory (REQ-012, slice 4)
+// ---------------------------------------------------------------------------------------------
+
+/// **The walk this slice exists for: no secret value reaches the inventory response.**
+///
+/// It is not enough for the row type to lack a `value` field — a `select *` in the store can
+/// put one in the response regardless. So the claim is made against the bytes the route returns
+/// from a database that really holds material:
+///
+/// 1. a webhook endpoint whose signing secret is a recognisable literal;
+/// 2. a service-account key whose hash is another;
+/// 3. a confirmed TOTP factor whose ciphertext is a third;
+/// 4. an identity provider naming a credential reference.
+///
+/// Then the response body is walked field by field and every one of those literals must be
+/// absent. A scan for the *column names* would not be enough on its own: a store that selected
+/// the column under an alias, or a renderer that inlined it into the note text, would pass it.
+/// So the values themselves are the probe, which is the only version of this test that fails
+/// when the actual leak happens.
+///
+/// The positives are asserted too, because a route that answers an empty object satisfies every
+/// containment check in this test while showing an operator a blank screen.
+#[tokio::test]
+async fn no_secret_value_reaches_the_inventory_response() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    const WEBHOOK_SECRET: &str = "whsec_LIVEVALUE_webhook_signing_0123456789";
+    const KEY_HASH: &str = "$argon2id$v=19$LIVEVALUE$serviceaccountkeyhashvalue";
+    const TOTP_CIPHERTEXT: &str = "enc:v1:LIVEVALUE:totpciphertext";
+
+    let organization = create_organization_row(&harness.db, "Secrets").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.read"]).await;
+
+    // One row per source that holds real material, written the way the platform writes them.
+    sqlx::query(
+        "insert into webhook_endpoints (organization_id, name, url, secret, events) \
+         values ($1, 'inventory-walk', 'https://example.test/hook', $2, array['security.lockout.triggered'])",
+    )
+    .bind(organization)
+    .bind(WEBHOOK_SECRET)
+    .execute(harness.db.pool())
+    .await
+    .expect("the webhook endpoint must exist for the walk to mean anything");
+
+    let service_account: Uuid = sqlx::query_scalar(
+        "insert into service_accounts (organization_id, name, prefix) \
+         values ($1, 'inventory-walk', 'sa_walk') returning id",
+    )
+    .bind(organization)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the service account must exist");
+    sqlx::query(
+        "insert into service_account_keys (service_account_id, prefix, secret_hash) \
+         values ($1, 'sk_walk_live', $2)",
+    )
+    .bind(service_account)
+    .bind(KEY_HASH)
+    .execute(harness.db.pool())
+    .await
+    .expect("the key must exist");
+
+    let (victim_id, victim_email) = account(&harness, Some(organization)).await;
+    sqlx::query(
+        "insert into mfa_factors (user_id, kind, secret_ciphertext, confirmed_at) \
+         values ($1, 'totp', $2, now())",
+    )
+    .bind(victim_id)
+    .bind(TOTP_CIPHERTEXT)
+    .execute(harness.db.pool())
+    .await
+    .expect("the factor must exist");
+    assert!(
+        !victim_email.is_empty(),
+        "the account helper must have created a real account"
+    );
+
+    sqlx::query(
+        "insert into auth_providers (organization_id, slug, kind, name, secret_ref) \
+         values ($1, 'walk-sso', 'oidc', 'Walk SSO', 'OMNION_WALK_PROVIDER_SECRET')",
+    )
+    .bind(organization)
+    .execute(harness.db.pool())
+    .await
+    .expect("the provider must exist");
+
+    let response = harness
+        .call(get("/api/v1/security/secrets", Some(&operator)))
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the inventory must load: {}",
+        response.text
+    );
+
+    // -- the containment claim ------------------------------------------------------------------
+    for literal in [WEBHOOK_SECRET, KEY_HASH, TOTP_CIPHERTEXT] {
+        assert!(
+            !response.text.contains(literal),
+            "THE LEAK THIS WALK EXISTS FOR: the inventory response contains a stored secret \
+             ({literal:.12}…). The store selected a value column."
+        );
+    }
+    // The reference — a *name* — must be present, because that is the difference between a
+    // projection over references and a dump: the operator can see what is configured without
+    // being able to read it.
+    assert!(
+        response.text.contains("OMNION_WALK_PROVIDER_SECRET"),
+        "the credential NAME must be reported — a reference is not a secret: {}",
+        response.text
+    );
+
+    // No row may declare a field that could hold material, whatever the value.
+    let body: Value = serde_json::from_str(&response.text).expect("the body is JSON");
+    let rows = body["secrets"].as_array().expect("`secrets` is an array");
+    assert!(!rows.is_empty(), "the inventory must not be empty");
+    for row in rows {
+        let object = row.as_object().expect("each row is an object");
+        for key in object.keys() {
+            let lowered = key.to_lowercase();
+            for forbidden in [
+                "value",
+                "secret",
+                "ciphertext",
+                "hash",
+                "token",
+                "preview",
+                "plaintext",
+                "password",
+            ] {
+                assert!(
+                    !lowered.contains(forbidden),
+                    "the inventory row declares a {forbidden} field: {key}"
+                );
+            }
+        }
+    }
+
+    // -- the positives, or the test above passes on an empty screen --------------------------
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "WEBHOOK_SIGNING_KEY"),
+        "the webhook material must be counted, not hidden: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "SERVICE_ACCOUNT_KEY"),
+        "the service-account material must be counted: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "MFA_TOTP_SECRET"),
+        "the MFA material must be counted: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "OMNION_CSRF_SECRET"),
+        "the environment secrets must be listed: {names:?}"
+    );
+
+    // The count is what replaced the material, so it must be a real number and not a constant.
+    let webhooks = rows
+        .iter()
+        .find(|row| row["name"] == "WEBHOOK_SIGNING_KEY")
+        .expect("the webhook row exists");
+    assert!(
+        webhooks["material_count"].as_i64().unwrap_or_default() >= 1,
+        "the count must reflect the endpoint this walk created: {webhooks}"
+    );
+    assert!(
+        !webhooks["note"].as_str().unwrap_or_default().is_empty(),
+        "a material row must explain what it counts: {webhooks}"
+    );
+
+    // And the screen must be told what it cannot see — a limitation field the panel renders as a
+    // permanent note, because an inventory that looks exhaustive when it is not is the defect.
+    let limitation = body["limitation"].as_str().unwrap_or_default();
+    assert!(
+        limitation.contains("never values") && limitation.contains("maintained by hand"),
+        "the response must state its own limits: {limitation}"
+    );
+
+    // -- no state reads as healthy --------------------------------------------------------------
+    for state in ["healthy", "ok", "valid", "good"] {
+        assert!(
+            !response.text.contains(&format!("\"{state}\"")),
+            "the inventory offers a {state} state"
+        );
+    }
+
+    harness.dispose().await;
+}
+
+/// The inventory is read-only: a mutation is refused by the router, not by the client.
+///
+/// Management belongs to the secrets manager request. A screen that could edit a reference would
+/// invite an operator to believe it can rotate a secret, and rotating one means replacing a value
+/// in an environment and redeploying.
+#[tokio::test]
+async fn the_inventory_cannot_be_written_through() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "SecretsWrite").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage", "security.scan"],
+    )
+    .await;
+
+    // Every write verb, with the **full** key set so the refusal cannot be mistaken for a
+    // permission problem: this is the route shape refusing, not the guard.
+    for (method, path) in [
+        ("POST", "/api/v1/security/secrets"),
+        ("PUT", "/api/v1/security/secrets"),
+        ("DELETE", "/api/v1/security/secrets"),
+        ("PATCH", "/api/v1/security/secrets"),
+    ] {
+        let request = match method {
+            "POST" => post(path, json!({ "name": "X" }), Some(&operator)),
+            "PUT" => put(path, json!({ "name": "X" }), Some(&operator)),
+            // Auth goes through the shared credential helper rather than a
+            // hand-built `Bearer` header: the walk credential is a packed
+            // session+csrf pair, and assembling one by hand here produced a
+            // request that failed at header parsing instead of at the route —
+            // which reads as a product defect and is not one.
+            other => request(
+                Method::from_bytes(other.as_bytes()).expect("a known method"),
+                path,
+                Some(&operator),
+                None,
+            ),
+        };
+        let response = harness.call(request).await;
+        assert!(
+            matches!(
+                response.status,
+                StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND
+            ),
+            "{method} {path} must not exist, but answered {}: {}",
+            response.status,
+            response.text
+        );
+    }
+
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `security.finding.opened` webhook (REQ-012, slice 4d)
+// ---------------------------------------------------------------------------------------------
+
+/// **The walk this piece exists for: an opened finding travels as an identity, not as content.**
+///
+/// The request's Events section names `security.finding.opened` as the one security event an
+/// operator subscribes to, and that makes it the first security payload on the platform that
+/// fans out to a receiver *outside* the operator's own infrastructure by default. Everything the
+/// REQ does with a finding — its title, its description, its evidence — is content that came
+/// from outside: a package name a CI vendor chose, prose from the report, the raw entry itself.
+/// So the claim to prove is narrow and worth proving against bytes:
+///
+/// 1. ingest a report whose finding carries **recognisable literals in every content field**;
+/// 2. let the platform emit and queue the fan-out to a subscribed endpoint;
+/// 3. read the queued payload back and assert every one of those literals is **absent**,
+///    while the fields a receiver needs to triage are **present**.
+///
+/// A name scan would pass this walk. The literals themselves are the probe — including one
+/// placed where only a careless payload builder would put it: the finding's `note`, a field no
+/// receiver needs and that a future editor could plausibly add without thinking.
+///
+/// **The negatives are not enough on their own**, and the second half of this walk is the part
+/// that catches the emitter that fires nothing: the same report ingested twice must queue a
+/// delivery the *first* time and **none** the second. An emitter on the `upsert` regardless of
+/// its `created` branch passes every containment assertion above while paging a receiver every
+/// morning for a finding that is a year old.
+#[tokio::test]
+async fn an_opened_finding_reaches_a_receiver_as_an_identity_and_not_as_content() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    // Four literals, one per field the emitter could plausibly reach for. They are deliberately
+    // long and recognisable so a substring scan cannot miss a truncated or re-encoded copy.
+    const TITLE_LITERAL: &str = "LIVEVALUE-DEPENDENCY-TITLE";
+    const DESCRIPTION_LITERAL: &str = "LIVEVALUE-REPORT-DESCRIPTION-PROSE";
+    const EVIDENCE_LITERAL: &str = "LIVEVALUE-EVIDENCE-ENTRY";
+    const NOTE_LITERAL: &str = "LIVEVALUE-OPERATOR-NOTE";
+
+    let organization = create_organization_row(&harness.db, "FindingEvents").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.scan"]).await;
+
+    // An endpoint subscribed to the one name. Its `secret` is a real value and is deliberately
+    // in the table: if any part of the delivery path inlined the endpoint row into the payload,
+    // the literal scan below would catch it.
+    sqlx::query(
+        "insert into webhook_endpoints (organization_id, name, url, secret, events) \
+         values ($1, 'security-events-walk', 'https://example.test/hook', $2, \
+                 array['security.finding.opened'])",
+    )
+    .bind(organization)
+    .bind("whsec_LIVEVALUE_SIGNINGSECRET_0123456789")
+    .execute(harness.db.pool())
+    .await
+    .expect("the subscribed endpoint must exist for the fan-out to mean anything");
+
+    let report = json!({
+        "findings": [{
+            "title": TITLE_LITERAL,
+            "severity": "critical",
+            "description": DESCRIPTION_LITERAL,
+            "component": "walk-dependency",
+            "version": "1.2.3",
+            "fixed_in": "1.2.4",
+            "evidence": EVIDENCE_LITERAL,
+            "note": NOTE_LITERAL,
+        }]
+    });
+
+    let first = harness
+        .call(post(
+            "/api/v1/security/findings/import",
+            json!({ "source": "dependency", "report": report.clone() }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "the first ingest must succeed: {}",
+        first.text
+    );
+    assert_eq!(
+        first.body["created"], 1,
+        "the first ingest opens the finding: {}",
+        first.text
+    );
+    assert_eq!(
+        first.body["refreshed"], 0,
+        "nothing was known before: {}",
+        first.text
+    );
+
+    // -- the delivery a subscriber receives ----------------------------------------------------
+    let queued: Vec<(Value, Uuid)> = sqlx::query_as(
+        "select e.payload, d.endpoint_id from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where e.name = 'security.finding.opened' and e.organization_id = $1",
+    )
+    .bind(organization)
+    .fetch_all(harness.db.pool())
+    .await
+    .expect("the queued delivery must be readable");
+
+    assert_eq!(
+        queued.len(),
+        1,
+        "opening one finding to one subscribed endpoint must queue exactly one delivery, got {}",
+        queued.len()
+    );
+
+    let (payload, endpoint_id) = queued.into_iter().next().expect("checked above");
+    let endpoints: Uuid = sqlx::query_scalar(
+        "select id from webhook_endpoints where organization_id = $1 \
+         and name = 'security-events-walk'",
+    )
+    .bind(organization)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the endpoint row must be readable");
+    assert_eq!(
+        endpoint_id, endpoints,
+        "the delivery must be addressed to the endpoint that subscribed to the name"
+    );
+
+    // THE CLAIM. Values, not column names: a payload that aliased the field, nested it or
+    // inlined it into another string would pass a scan for `"title"` and fail this one.
+    let rendered = payload.to_string();
+    for literal in [
+        TITLE_LITERAL,
+        DESCRIPTION_LITERAL,
+        EVIDENCE_LITERAL,
+        NOTE_LITERAL,
+        "whsec_LIVEVALUE_SIGNINGSECRET_0123456789",
+    ] {
+        assert!(
+            !rendered.contains(literal),
+            "THE LEAK THIS WALK EXISTS FOR: the delivery payload carries the finding's content \
+             ({literal:.24}…). A receiver holds content it cannot un-send."
+        );
+    }
+    // Field names are asserted too — the weaker half, and the one that reads as the strong one
+    // if you stop here. A `title: null` satisfies it while still telling the receiver a title
+    // exists, and the literal scan above is what makes null acceptable rather than fatal.
+    let object = payload.as_object().expect("the payload is an object");
+    for forbidden in ["title", "description", "evidence", "note"] {
+        assert!(
+            !object.contains_key(forbidden),
+            "the payload declares {forbidden}: {rendered}"
+        );
+    }
+
+    // -- the positives, or the walk above passes on a payload nobody can use --------------------
+    let finding_id = payload["finding_id"]
+        .as_str()
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "the payload must carry the finding's id — a receiver cannot open what it cannot \
+                 name: {rendered}"
+            )
+        });
+    assert_eq!(
+        payload["severity"], "critical",
+        "severity is the one thing a receiver cannot compute from an id: {rendered}"
+    );
+    assert_eq!(
+        payload["source"], "dependency",
+        "the receiver must be able to tell a CI report from a platform check: {rendered}"
+    );
+    assert_eq!(
+        payload["component"], "walk-dependency",
+        "the triage triple is the package: {rendered}"
+    );
+    assert_eq!(
+        payload["component_version"], "1.2.3",
+        "…the version present…: {rendered}"
+    );
+    assert_eq!(
+        payload["fixed_in"], "1.2.4",
+        "…and the version that fixes it: {rendered}"
+    );
+
+    // The id must be a **real, readable** finding rather than a string the emitter invented —
+    // otherwise "go look at finding X" sends the receiver to a 404 on every delivery.
+    let stored: Option<String> = sqlx::query_scalar(
+        "select title from security_findings where id = $1 and organization_id = $2",
+    )
+    .bind(finding_id)
+    .bind(organization)
+    .fetch_optional(harness.db.pool())
+    .await
+    .expect("the finding table must be readable");
+    assert_eq!(
+        stored.as_deref(),
+        Some(TITLE_LITERAL),
+        "the delivered id must resolve to the finding that opened: {stored:?}"
+    );
+
+    // -- the emitter must not fire on a finding that was already known ------------------------
+    // This is the half a containment walk cannot supply. A nightly CI job re-ingests the same
+    // report every morning; an endpoint that paged on all of them would be muted by the second
+    // run, and the operator would learn to ignore it — which is the outcome a "webhook" that
+    // works perfectly well has silently produced.
+    let second = harness
+        .call(post(
+            "/api/v1/security/findings/import",
+            json!({ "source": "dependency", "report": report }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        second.status,
+        StatusCode::OK,
+        "the second ingest must succeed: {}",
+        second.text
+    );
+    assert_eq!(
+        second.body["created"], 0,
+        "the finding was already known: {}",
+        second.text
+    );
+    assert_eq!(
+        second.body["refreshed"], 1,
+        "re-ingesting is a refresh, not an opening: {}",
+        second.text
+    );
+
+    let after: i64 = sqlx::query_scalar(
+        "select count(*) from webhook_deliveries d \
+         join events e on e.id = d.event_id \
+         where e.name = 'security.finding.opened' and e.organization_id = $1",
+    )
+    .bind(organization)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the delivery count must be readable");
+    assert_eq!(
+        after, 1,
+        "re-ingesting an already-known finding queued {after} deliveries; it must queue none — \
+         an event that fires on every CI run is an event an operator learns to ignore"
     );
 
     harness.dispose().await;
