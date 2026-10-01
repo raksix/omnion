@@ -1113,18 +1113,16 @@ pub fn router(state: AppState) -> Router {
     let deployment_checks_run =
         post(deployment::run_check_now).layer(guards::require(&state, "deployment.manage"));
 
-    // The deploy wizard (REQ-024, slice 2). Pre-flight and deploy are POSTs on the environment
-    // path slice 1 already mounts, so they **merge** onto it: registering a second
-    // `/deployment/environments/{environment}` is a panic at startup in axum, and the merge is
-    // the only shape that lets one path carry a GET and two POSTs with three different keys.
-    let deployment_environment_one = deployment_environment_one.merge(
-        post(deployment_run::preflight)
-            .layer(guards::require(&state, "deployment.manage"))
-            .merge(
-                post(deployment_run::start_deploy)
-                    .layer(guards::require(&state, "deployment.manage")),
-            ),
-    );
+    // The deploy wizard (REQ-024, slice 2). Pre-flight and deploy are two POSTs, and they are
+    // **sub-paths** rather than two methods on `/deployment/environments/{environment}`: a path
+    // carrying two POSTs is not a thing axum can merge, and asking it to panics at startup —
+    // `Overlapping method route`, which `cargo check` cannot see because the conflict is built at
+    // runtime. The client has always called `/preflight` and `/deploy` (apps/admin/lib/api.ts), and
+    // the handlers have always documented those paths; only the mount disagreed. So the
+    // environment route is a plain GET again and each write owns a segment — the same rule
+    // `/deployment/cluster/{environment}/restart` already followed.
+    let deployment_environment_deploy = post(deployment_run::start_deploy)
+        .layer(guards::require(&state, "deployment.manage"));
     // The job routes. Reading a job and its log is `deployment.read` — they return the same
     // values the history screen already shows — while cancel is `deployment.manage`, because
     // stopping a run is an action on the environment, not a read of it.
@@ -1133,12 +1131,11 @@ pub fn router(state: AppState) -> Router {
         .merge(
             post(deployment_run::cancel_job).layer(guards::require(&state, "deployment.manage")),
         );
-    // The log, as a stream and as a cursor poll. One key for both: a client that cannot hold an
-    // `EventSource` open has exactly the same right to read the log, and splitting the read
-    // across two keys would make the fallback the path nobody holds.
-    let deployment_job_log = get(deployment_run::stream_log)
-        .layer(guards::require(&state, "deployment.read"))
-        .merge(get(deployment_run::poll_log).layer(guards::require(&state, "deployment.read")));
+    // The log, as a stream and as a cursor poll. One key, one route, one handler: the two shapes
+    // answer the same URL and differ only by `?cursor=`, so they are dispatched inside
+    // `deployment_run::log` rather than registered as two GETs on one segment.
+    let deployment_job_log =
+        get(deployment_run::log).layer(guards::require(&state, "deployment.read"));
 
     // Rollback and the maintenance window (REQ-024, slice 3).
     //
@@ -2054,6 +2051,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/deployment/environments/{environment}",
             deployment_environment_one,
+        )
+        // Two POSTs, two segments. Mounted beside the environment route rather than merged onto
+        // it: axum panics at startup on a path carrying two of the same method, and the panel has
+        // called these sub-paths since slice 2.
+        .route(
+            "/deployment/environments/{environment}/preflight",
+            post(deployment_run::preflight)
+                .layer(guards::require(&state, "deployment.manage")),
+        )
+        .route(
+            "/deployment/environments/{environment}/deploy",
+            deployment_environment_deploy,
         )
         .route("/deployment/releases", deployment_releases)
         .route("/deployment/releases/{version}", deployment_release_one)

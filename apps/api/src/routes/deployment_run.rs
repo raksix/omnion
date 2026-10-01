@@ -25,6 +25,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use omnion_deployment::jobs::{self, CreatedJob, NewJob, StartRefusal, StepRefusal, Target};
 use omnion_deployment::preflight::{
@@ -381,17 +382,36 @@ pub async fn get_job(
     }))
 }
 
-/// `GET /api/v1/deployment/jobs/{id}/log` — the log pane, as a server-sent stream.
+/// `GET /api/v1/deployment/jobs/{id}/log` — the log pane: a stream, or a cursor poll.
 ///
-/// The stream is the primary path because the spec's log pane follows a run; `?cursor=` on the
-/// same path is the fallback for a proxy that buffers `text/event-stream`, and it exists in this
-/// shape rather than as a second route so a client that loses its stream can switch without
-/// learning a new URL.
-pub async fn stream_log(
+/// ONE route, dispatched on the query, because both shapes answer the same URL and a path cannot
+/// carry two GETs in axum any more than it can carry two POSTs — the second registration panics
+/// at startup, which is how this pair was found: the binary booted straight past the POST pair's
+/// fix and then died on the same mistake one method over.
+///
+/// The stream is the primary path because the spec's log pane follows a run; `?cursor=` is the
+/// fallback for a proxy that buffers `text/event-stream`. Returning `Response` rather than `Sse`
+/// is what lets one handler choose, and it is also what lets the poll's JSON and the stream's
+/// `text/event-stream` share a status code: an `EventSource` cannot read a JSON error body, so a
+/// missing job has to be a status code here or the pane shows a connection error for ever.
+pub async fn log(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    Query(query): Query<LogQuery>,
+) -> Result<Response, ApiError> {
+    if query.cursor.is_some() {
+        return poll_log(State(state), current, Path(id), Query(query)).await.map(Into::into);
+    }
+    stream_log(State(state), current, Path(id)).await
+}
+
+/// The streaming half of [`log`].
+async fn stream_log(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
     let _ = current;
     let pool = state.db().pool();
     // 404 before the stream opens: an `EventSource` cannot read a JSON error body, so a missing
@@ -489,20 +509,22 @@ pub async fn stream_log(
     });
 
     let stream = ReceiverStream::new(rx);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    Ok(Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response())
 }
 
-/// `GET /api/v1/deployment/jobs/{id}/log?cursor=` — the polling fallback for the same log.
-pub async fn poll_log(
+/// The polling half of [`log`], for a proxy that buffers `text/event-stream`.
+async fn poll_log(
     State(state): State<AppState>,
     current: CurrentSession,
     Path(id): Path<Uuid>,
     Query(query): Query<LogQuery>,
-) -> Result<Json<LogChunkBody>, ApiError> {
+) -> Result<Response, ApiError> {
     let _ = current;
     let pool = state.db().pool();
     let log = jobs::job_log(pool, id).await.map_err(step_refusal)?;
@@ -513,7 +535,8 @@ pub async fn poll_log(
         cursor,
         running: !job.status.is_finished(),
         status: job.status,
-    }))
+    })
+    .into_response())
 }
 
 /// `POST /api/v1/deployment/jobs/{id}/cancel` — stop before the migrate step.
