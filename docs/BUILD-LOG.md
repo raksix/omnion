@@ -7786,3 +7786,74 @@ is this branch's doing.
 a row that measured nothing. Then the run-from-here / pill / table-mode rows, all written and
 none measured. The plugin row stays BLOCKED on REQ-121. REQ-004 is far from close: the QA pass
 has not run in four ticks and every criterion needing one is open.
+
+## Tick 56 — the gate was one-sided, and the gate is the only thing the criterion is closed on
+
+**What.** The `run-from-here` row — the largest unmeasured block in the builder walkthrough,
+and the row the `run-from-here` and status-pill criteria are both closed on — compared the
+painted node set against the run's node set in **one direction only**:
+
+```js
+const paintedButNotInRun = paintedIds.filter((id) => !runNodes.has(id));
+```
+
+The criterion's own words are "*after a run **each** node shows its status pill*", and the
+comment directly above the note claimed "*every node the run touched is painted, **and nothing
+else is***" — a set **equality**, stated twice and computed once. A canvas that painted the two
+nodes which ran and painted **nothing** for the skipped prefix reported `pillsPainted: 2` and
+an empty `paintedButNotInRun`, and the gate written in the REQ in those exact words went green.
+The direction that catches a *missing* pill is the one that did not exist.
+
+**This is the tick-48 shape in its quietest form.** Every earlier row in this REQ that could
+not catch its defect looked wrong while you read it — a node marker on a canvas whose
+selection was an edge, a bounding-box click, a bare `[data-edge-selected]`. This one read the
+**right** markers, in the **right** place, in a note that already carried a `paintedButNotInRun`
+field, so nothing about it signalled a defect. There is no such thing as a wrong set
+comparison, only a missing half of one. What names it is not the code but the criterion: a
+universal needs both membership and non-membership.
+
+**The skipped prefix is where it bites, and not by accident.** `node-status.ts` paints a
+`skipped` pill for exactly one reason — so an operator can see the prefix was skipped rather
+than run — which makes those nodes the most likely to go unpainted in a regression. They are
+rows in the run's `steps` like any other, so the run names them and the comparison is
+well-founded with no second source of truth: a trigger and an inert note contribute no step,
+so they are correctly *absent* from `runNodes` and correctly unpainted. That is what makes
+`inRunButNotPainted` a real gate rather than a second number — the two sets are comparable
+precisely because the run is the independent witness, and M5 proves it by rebuilding `runNodes`
+off the canvas, which makes the comparison circular and empty in the direction that matters.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **313
+passed** (307 before, +6) · `pnpm typecheck` → 2/2 successful · the walkthrough re-parsed after
+a 23-line insertion (14,280 → 14,303 lines) · `cargo test -p omnion-workflows --lib` → **157
+unchanged** (a QA-instrument change, not a product one) · **nine mutations red**, each naming
+the assertion it turned.
+
+**The ninth was the harness's, and the way it failed is the point.** M8 hard-codes
+`pillsPainted: 2` instead of reading `painted.painted.length`, and it came back **still green**
+— because the field is the criterion's gate and nothing had ever asserted the gate was a
+*read*. A passing note can be written by hand, and it reads exactly like a measured one. That
+is the eleventh check in this REQ to go red for a reason unrelated to what it claimed to
+measure, and the same class as the rest: the field name was satisfied by a literal. The
+assertion now names the read and the DOM selector it has to come from, so a note that is
+typed rather than collected cannot pass.
+
+**My own window was wrong first, in the family this directory already documents twice.** The
+`ROW` slice ended at the note, which *excluded* the note — so two assertions searched a window
+that could not contain their subject and reported the row as missing text. A window that ends
+at the wrong place is a test that reports on a construct it never read, and it fails in the
+opposite direction from the usual one: not a passing check that measures nothing, but a
+failing check that measures nothing and says so confidently. The window now ends at the shot
+that follows the note.
+
+**No browser pass, and the box is worse than last tick.** The slot's holder is a live w6 pass
+— pid 2887474, `/proc/2887474/cwd` = `/mnt/apopic/omnion-w6`, started six minutes before this
+tick opened. Load 80 on six cores, 65 Chrome, 4G free of 32G, `/dev/shm` 86%. Fifth tick in a
+row spent on work the unit gate settles, which is the right call while a slot is genuinely
+held and expensive to wait for.
+
+**Next.** Run the pass, and read `run-from-here` for `inRunButNotPainted: []` **alongside**
+`pillsPainted > 0` — the first alone is satisfied by a canvas that paints nothing at all, and
+the conjunction is the whole claim. Then `undo-selection-edge` for `edgeRemovedByUndo` beside
+`edgeSelectionPruned`, then the run-from-here / pill / table-mode rows, all written and none
+measured. The plugin row stays BLOCKED on REQ-121. REQ-004 is far from close: the QA pass has
+not run in five ticks and every criterion needing one is open.
