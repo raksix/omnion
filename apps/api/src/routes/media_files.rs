@@ -226,6 +226,26 @@ pub struct BreadcrumbCrumb {
     pub name: String,
 }
 
+/// The accounts a site's uploader filter offers.
+#[derive(Debug, Serialize)]
+pub struct UploadersResponse {
+    /// Site the list belongs to.
+    pub site_id: Uuid,
+    /// The candidates, most prolific first.
+    pub uploaders: Vec<UploaderBody>,
+}
+
+/// One account that appears in a site's library as an uploader.
+#[derive(Debug, Clone, Serialize)]
+pub struct UploaderBody {
+    /// The account id, the value the `uploaded_by` filter binds.
+    pub id: Uuid,
+    /// A name for the dropdown — never an empty string, so the control has no blank option.
+    pub label: String,
+    /// How many live files of this site they uploaded.
+    pub files: i64,
+}
+
 /// The folder tree of one site.
 #[derive(Debug, Serialize)]
 pub struct FolderTreeResponse {
@@ -291,6 +311,13 @@ pub struct BulkFailure {
 // ---------------------------------------------------------------------------------------------
 // Requests
 // ---------------------------------------------------------------------------------------------
+
+/// `GET /api/v1/media/uploaders` — the uploader filter's candidates.
+#[derive(Debug, Deserialize)]
+pub struct SiteQuery {
+    /// Site whose library is read.
+    pub site_id: Uuid,
+}
 
 /// `GET /api/v1/media/files` — the browser listing.
 #[derive(Debug, Deserialize)]
@@ -709,6 +736,33 @@ pub async fn list_files(
         has_more: (list_query.offset + i64::try_from(page.files.len()).unwrap_or(0)) < page.total,
         total: page.total,
         files: page.files.iter().map(FileBody::build).collect(),
+    }))
+}
+
+/// `GET /api/v1/media/uploaders` — the accounts a site's library can be filtered by.
+///
+/// Sits beside the file listing rather than inside it: a dropdown of candidates is a *different*
+/// question from the rows that question selects, and a listing that had to carry both would make
+/// every page of the library pay for a filter the operator may never touch. It is read with
+/// `media.read`, the same key as the listing it feeds, and it reads nothing a `media.read`
+/// caller could not already read from the file rows themselves.
+pub async fn list_uploaders(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    Query(query): Query<SiteQuery>,
+) -> std::result::Result<Json<UploadersResponse>, ApiError> {
+    let site = site_in_scope(&state, &current, query.site_id).await?;
+    let uploaders = omnion_media::list_uploaders(state.db().pool(), site.id).await?;
+    Ok(Json(UploadersResponse {
+        site_id: site.id,
+        uploaders: uploaders
+            .into_iter()
+            .map(|uploader| UploaderBody {
+                id: uploader.id,
+                label: uploader.label,
+                files: uploader.files,
+            })
+            .collect(),
     }))
 }
 

@@ -36,9 +36,10 @@ pub mod validators;
 pub mod versions;
 
 pub use browser::{
-    FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, assert_same_site, count_files,
+    FilePage, ListQuery, MetadataPatch, Sort, TrashEntry, Uploader, assert_same_site, count_files,
     count_in_folder, files_in_folder, find_file, find_file_any_state, list_files, list_trash,
-    purge_files, restore_files, storage_keys, trash_files, trash_summary, trashed_ids, update_file,
+    list_uploaders, purge_files, restore_files, storage_keys, trash_files, trash_summary,
+    trashed_ids, update_file,
 };
 pub use duplicates::{
     CrossSiteCopy, CrossSiteGroup, DuplicateGroup, DuplicateMember, MAX_CROSS_SITE_SITES,
