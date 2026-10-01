@@ -1,6 +1,9 @@
 # REQ-107 — Agent Evals & Telemetry
 
-> **Status:** pending · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
+> **Status:** in-progress (slice 1: the scoring core, the suite/case tables, the store and the
+> validation the first acceptance row demands — `de3a1529` the pure scorer, `ddbd42a3` the store,
+> `c439548b` the twelve database walks and the two bugs they found; no API route, no screen, no
+> run yet) · **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
@@ -178,6 +181,9 @@ over the suite list, the case editor, a run and the telemetry panels.
 1. **Suites, cases and scoring** — `ai_eval_suites`, `ai_eval_cases`, the eight deterministic
    properties, the suite and case screens, CSV import and save-as-case.
    *Done when:* a suite with cases runs on demand and every property is provable by a test fixture.
+   *Progress:* the tables, the ten properties, the scorer, the store and the walks are done
+   (654 unit + 12 walks). Remaining in this slice: the routes, the suite and case screens, CSV
+   import, and the run entry point — which is slice 2's runner, so the slice closes with it.
 2. **Judge scoring, runs and results** — the judge path with model-difference enforcement and
    versioned prompts, `ai_eval_runs` and `ai_eval_case_results`, run list and run detail screens.
    *Done when:* a rubric case produces a reasoned verdict and its cost lands under `eval:judge`.

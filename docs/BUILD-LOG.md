@@ -10037,3 +10037,57 @@ states, and it is not closed on tests alone.
 
 **Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
 hook to REQ-011.
+
+## 2026-10-01 · REQ-107 slice 1 — eval case scoring, the suite/case tables, the store
+
+**What.** The pure scoring core every run will call (`eval_case.rs`): a stored
+`expected` document is parsed into a validated `Expectation` naming one of ten properties,
+and `score_output` turns an output plus the run's observations into per-property checks and
+a case status. The `ai_eval_suites` / `ai_eval_cases` migration, the store with the
+validation the request's first acceptance row demands (`eval_store.rs`), the four HTTP
+mappings, and twelve database walks.
+
+**Proof.**
+
+- `cargo test -p omnion-ai-hub --lib` — 654 passed, 0 failed (was 614 before this slice).
+- `cargo test -p omnion-api --test ai_evals -- --test-threads=1` — 12 passed, 0 failed,
+  against a throwaway database built from the container's own dev password.
+- `pnpm typecheck` — 2 successful, 2 total.
+
+**Four decisions that close a way the pass rate could lie.** An unevaluable property is
+`error`, not `fail`, carried as a flag on the check rather than derived from its prose. A
+case that names no property is refused by a column constraint. `no_pii` delegates to
+REQ-105's own detector through `load_guard`, so "would the guard mask this" is asked once
+by the rules production uses, and the finding is rendered from the masked text. The
+`json_schema` validator refuses a keyword it does not implement rather than skipping it.
+
+**Two bugs the walks found in the code they were written for.** `update_suite` checked the
+blocking/rubric/judge rule *after* the UPDATE, so a refused edit had already cleared the
+judge — a validation that runs after its own write is not a validation. And the target rule
+was the column's alone: a caller reached SQLSTATE 23514 and a constraint name instead of a
+sentence naming the target, so `validate_suite` now checks that a suite's target agrees with
+its reference and that only one is set.
+
+**One design error the walks exposed by failing to start.** The suite list read
+`ai_eval_runs`, which is slice 2's table, so every query in this slice died on a fresh
+database with a missing relation — a slice that only works once its successor is finished.
+The last-run columns are now NULL constants with the reason recorded on the struct, and
+slice 2 replaces them with sub-selects. The `numeric` columns are cast to `float8` in the
+projection, matching how the crate already decodes a temperature.
+
+**Browser pass: queued, not yet run.** `QA_STACK=w7 … QA_ONLY=ai scripts/qa/run.sh` is
+waiting on the shared slot — `w4` holds it (`pid 1782910`, `cwd=/mnt/apopic/omnion-w4`,
+verified by `kill -0` **and** `/proc/<pid>/cwd`; the place is a separate file in
+`/tmp/omnion-qa-slot-holders/` and its *content* is the holder's pid). It covers REQ-106's
+owed local-AI manual page, not this slice: REQ-107 has no screen yet, so nothing here can
+be ticked on a page that has never rendered. No acceptance row is ticked.
+
+**Note for the next writer.** The migration is `0230` — the shared high-water across all ten
+worktrees was 0229 (w5's `0229_developer_oauth_apps`), so picking a number from this
+branch's own tail would have collided. `/opt/omnion-w6-target` is 16G and is **not** free
+space: a live w6 `omnion-api` has the binary open (`/proc/2910931/cwd` = that worktree, plus
+two `next` dev servers), so the disk guard's "freed ~0M" was correct. Root sat at 98% and the
+real reclaim was elsewhere.
+
+**Next.** The routes and the suite/case screens for this slice, then slice 2's runner and
+results; the browser pass when the slot frees.
