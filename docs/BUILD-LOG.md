@@ -6228,3 +6228,65 @@ scan filters "is not the trigger", so with only the trigger startable it had not
 (3) `workflow-table` create read `503 database is unavailable` — the same `stack-gone` moment, so
 Table mode is unmeasured and its criterion stays unticked. (4) `listener` row: `controlFound:
 false`. (5) `tab-walk.reachedAnEdge: false`.
+
+## Tick 43 (w3) — the trigger was never filtered, and the wrong answer looked right
+
+**The reboot trap again, in the same place.** `target` is a symlink into `/dev/shm` (tmpfs) and the
+box had rebooted, so `cargo` answered `failed to create directory ... Not a directory (os error
+20)`. `mkdir -p /dev/shm/w3-target`; two seconds. **A symlink into tmpfs does not survive a reboot,
+and the error it produces reads as a permissions or disk fault.**
+
+**The probe's "is this the trigger?" was dead code shaped like a filter.** It compared
+`card.type !== "trigger"`, and the registry has **never** had a bare `trigger` key — the trigger
+types are `trigger.event`, `trigger.manual` and `trigger.schedule`. The comparison was therefore
+true for *every* card on the canvas, including the trigger, so the half of the scan meant to skip
+the trigger excluded nothing.
+
+It survived two ticks because **the wrong answer produces a run.** The trigger's `canStart` is
+genuinely `"true"` — re-running a rule from the top is a real thing an operator wants — so the scan
+picked the trigger, started a whole run, skipped nothing, and `skipped: 0`, `pillsPainted: 0` and
+`step-trace.panelFound: false` all read as three missing features. **A probe defect that yields a
+plausible result is the expensive kind**: nothing about the output says "wrong", so it is only
+findable by asking what the code *meant*.
+
+The same block also enumerated cards as a second, unretried read after `settleCanvasCards`, which
+is how `cardCount` said 6 while the scan saw 1 — the one card it saw was the trigger, for the same
+reason. The enumeration now retries until the two readings agree, and the scan records
+`isTriggerType` per card so the row carries the evidence for the choice it made.
+
+**Measured 2026-09-30 (pass `20260930-225411`):** `scan` reads three cards with
+`canvasWasStable: true` and `chosenId: "wait-3"` — a mid-graph node — so the prefix rule works for
+the first time. `validate-classes` now reads `cycle.codes: ["graph_cycle"]` **alone**, which is
+last tick's rebuild proven in a browser rather than in a unit test.
+
+**And `skipped` is still 0, with the product right.** `projection` reads `nodes: 3, edges: 1,
+valid: false` — *"Wait" is not reachable from the trigger*. The pass's own `port-connect` row
+shows the only edge is `trigger → end`; its connect was refused ("Event · Next already leads to
+that node") because the starter graph already wires them. So `wait-3` is an **orphan**, and
+`plan_from_node` refuses a node the walk never reaches with `unknown_node` — the criterion's own
+sentence. **Every step this pass adds a node drops it on the canvas unconnected**, because the
+harness has no gesture that inserts a node *between* two wired cards. That is what the next tick
+fixes, and it is a probe fix: the criterion needs a graph with a real prefix, not a third node
+sitting beside the spine.
+
+**Proof.** `cargo test -p omnion-workflows --lib` → **152 passed / 0 failed** (151 before). The
+guard is *proven to bite*: reverting the prefix to the bare literal turns exactly that one test
+red, and the restore returns 152. `apps/admin` typecheck → clean. `bun build` on the walkthrough →
+no syntax error (only the unresolvable `playwright-core` import, which is a `NODE_PATH` runtime
+dep).
+
+**The pass ended `stack-gone` again, so its summary has no verdict** — `QA_FINDINGS=0` over 1839
+clicks sits next to `bySeverity: {high: 189}`, and the fatal says the findings are not product
+defects. `stackAliveAtEnd: false`. **Read the rows in `clicks.jsonl`, not the count.**
+
+**Also measured, not yet acted on:** `two-tab-keep-mine` regressed to `resolved: false,
+stateAfter: "conflict"` (it was `true`/"saved" on pass `20260930-132859`) while
+`two-tab-conflict` itself is healthy (`refused/reloadOffered/namesVersion: true`, `localNodesKept: 6`)
+— worth a look, since the second exit is what closes the dead end. `listener` read
+`retargeted.ok: true` this time (it was a 503 last tick) but `controlFound: false`. `tab-walk`
+still `reachedAnEdge: false`. `edge-delete` still `selected: false` with `blockedBy: "text"` — the
+hit test says the point is ON the edge, so the cursor is over a label sitting on the curve.
+
+**Next:** (1) build the `trigger → wait → end` spine through the graph route so the run-from-here
+skip path is measurable at all; (2) read `two-tab-keep-mine` — the second exit stopped resolving;
+(3) `listener` control is not found even though the retarget succeeded.
