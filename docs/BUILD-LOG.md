@@ -11499,3 +11499,64 @@ not by the age of the placeholder) for the whole tick, with 45 Chrome processes 
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## 2026-10-01 · Wave 5 · tick 101 — the wizard was the last untested screen, and the merge shipped a duplicate
+
+**What.** Five commits, none of them a new screen. One made the one deployment screen that had
+**no depth pass at all** drivable and drove it, one stopped a failed deploy from describing a
+rollback it did not offer, one repaired damage the tick's own merge caused, and the last two are
+the merge itself.
+
+**The screen with no pass.** `deploy-wizard.tsx` is 663 lines and three steps, it is the screen
+that *starts a deploy*, and it was in the route list and in no depth pass — the card grid,
+releases, history, checks, maintenance and the cluster panel were all driven. It was also
+undrivable: three `data-testid` on the whole file, so Continue, the warning acknowledgement, the
+typed confirmation, Start, Cancel and the auto-scroll toggle could only be reached by their label
+text. `d8733586` adds eight hooks and the step timeline's own state.
+
+**The pass (`d3605164`) gates its fourteen claims, and gating is the argument, not decoration.**
+The maintenance window's eight claims were `note({ step })` until tick 98, where that was found to
+mean a claim that cannot fail a pass: it only appends to `steps`, so a maintenance screen that
+rendered while refusing to save was reported healthy. The same defect, one screen over.
+
+**The order in the pass is the part worth keeping.** The wizard's blocking branch is an UNKNOWN
+pre-flight check, and on a fresh database that is *also* the ordinary state — there is no backup,
+so `backup_freshness` is `unknown` and `unknown` blocks. So the assertion that a blocked check
+blocks `Continue` has to run **before** a backup exists, or the branch has been fixture'd out of
+reach and the gate measures nothing. The backup is then taken through `POST /api/v1/backups`
+rather than written into the table, which keeps the claim honest: what is proved is that the
+*platform* unblocks the wizard, not that the panel renders a report that was already true.
+
+**A failed banner that described its own missing button (box 139).** The banner read "then roll
+back or deploy again" and rendered no control. `e8630641` adds it, targeting the version the job
+came *from* — the only candidate the history can vouch for — and says so in words when no earlier
+version exists rather than offering a rollback to nothing. The dialog is untouched: it still
+demands a reason and the typed version, so this is a door and not a bypass of slice 3's gates.
+The banner lives inside `RunStep`, which is why `onRollback` is a prop and the dialog is mounted by
+the parent: the dialog navigates on success, and a run step that owned it would fight itself.
+
+**The merge damaged the tree, and the damage was invisible until `tsc` ran.** Four conflicts, and
+the two TypeScript ones were the interesting shape: HEAD's side was **empty**, so "take theirs"
+seemed the only answer — but theirs was a region the merge had *already* placed earlier in the
+file, so `CSP_DIRECTIVE_NAMES`, `REFERRER_POLICIES` and `MIN_HSTS_MAX_AGE` were each declared
+twice (`2df41733`). The tell was not the error but the copy: **the second copy had lost the doc
+comments between the declarations**, which is what identified it as the duplicate rather than the
+original. A merge conflict resolved by "mine was empty" is not thereby resolved.
+
+| Gate | Result |
+| --- | --- |
+| `cargo test -p omnion-deployment --quiet` | **97 passed / 0 failed** on the default build |
+| `tsc --noEmit` (apps/admin) | exit 0 |
+| `node --check scripts/qa/walkthrough.cjs` | clean |
+| `merge-build-log.py docs/BUILD-LOG.md` | `all 0 entry check passed`, 0 markers left |
+
+**The browser pass did not run, and that is stated rather than dressed up.** The QA slot is held
+by a live w8 pass (holder pid alive, `/proc/<pid>/cwd` = `/mnt/apopic/omnion-w8` — checked, not
+assumed, because tick 89's lesson is that a *dead* holder also reads as a live one), and
+`/mnt/apopic` was at 95% with 3.0G free. A pass launched into that measures the box. The work is
+committed and queued instead.
+
+**Next.** The `--only=deployment` pass over this build: the wizard's fourteen claims, then the
+failed-run path the banner lives on — the wizard reaches a *succeeded* finish, so the failure
+branch needs a deploy that genuinely fails before the rollback button can be clicked. Then box
+133's `View Changes`, and the mobile/keyboard sweep.
