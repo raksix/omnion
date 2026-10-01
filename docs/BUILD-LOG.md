@@ -9039,3 +9039,58 @@ changes the number it measures.
 
 **Next.** The Explorer and the two panel tabs (`/content-api/explorer`, `/content-api/usage`), which
 is the rest of slice 3.
+
+### Tick 46 — REQ-019 slice 3b: the Usage tab, and the two numbers a flush makes necessary
+
+**What.** `/content-api/usage` — the screen half of slice 3, after slice 3a's metering. A zero-filled
+30-day chart, the endpoint leaderboard, the per-token table, and a `content.api.read`-only route under the
+section's own tab bar. The route existed and its shape was proven over HTTP; nothing rendered it.
+
+**Proof.**
+
+```
+cargo test -p omnion-api --lib        291 passed; 0 failed   (was 288 — 3 new)
+cargo test -p omnion-api --lib content_usage
+                                         8 passed; 0 failed   (was 3 — 5 new)
+pnpm typecheck                          2/2
+node --check scripts/qa/walkthrough.cjs 0
+```
+
+`--only=content-api` is **queued, not run** — the slot is held by a live w4 pass and `/mnt/apopic` is at
+98% with the sibling's own artifacts. Both gates are separate and the disk one is the one that kills a
+pass halfway, so this tick publishes no QA claim.
+
+**Two things writing the screen forced into the API, and neither was in the spec's table.**
+
+1. **The endpoint leaderboard, server-side.** A leaderboard summed in the browser out of `rows` is a
+   flushed-only number sitting above a flushed-plus-pending table, one screen apart, with nothing to
+   reconcile them — precisely the disagreement the route was written to refuse inside `UsageBody`. It is
+   now accumulated in the *same pass* over the same rows as the per-token table, and the live window is
+   added to it only when `pending_readable` is true, so a `SCAN` that died halfway cannot inflate it.
+   Ordering is busiest-first with an alphabetical tie-break, and a test asserts it twice over: a
+   `HashMap` iteration order re-shuffles on refresh and a person watching that reads it as traffic moving.
+2. **`last_used_at` per token**, from the same query as the name. "Is this token doing anything" is the
+   question this screen is asked, and a table without the column answers it with a blank cell.
+
+**And the number this screen refuses to print is a total.** Flushed and pending are two columns
+everywhere, and the freshness note says why *on the screen* rather than in the spec. The interesting part
+is how the `null` gets there: a reducer summing zeroes **cannot** produce a `null` on its own, so an
+implementation that left `pendingRequests` alone would render `0` on an installation whose counter is
+unreachable — the same lie `Counted::authoritative` refuses to tell upstream. `pending_readable` is
+therefore what decides the column's type, not the arithmetic. I wrote the arithmetic version first and the
+typechecker refused it, which is the correct outcome and a reminder that a `number | null` in a
+hand-written `reduce` is a promise the code has not been asked to keep.
+
+**The walkthrough carries the screen in two lists, not one.** The tab's mobile claim is a card list beside
+a `sm:hidden` table, so one `noHorizontalScrollAt390` measurement cannot stand for both layouts — it can
+be read off the hidden table and published as the answer for the cards. The route is in the inventory
+*and* the 390 px list, the overflow is measured on each screen under its own step name
+(`noHorizontalScrollAt390` / `docsNoHorizontalScrollAt390`), and `theMobileLayoutIsTheCardList` asserts
+which layout was actually on screen. The usage criterion's "matching the counts the explorer produced"
+is measured with three real `GET /api/v1/content/pages` calls through a freshly minted token — the
+Explorer does not exist yet, and a walkthrough that drove it could not run until it ships; the claim
+under test is the tab's agreement with the platform, not the Explorer's UI.
+
+**Next.** The Explorer (`/content-api/explorer`): endpoint picker, generated parameter form, a real request
+pane with `x-ratelimit-remaining` and timing, the cURL/fetch/Python snippets, and deep links — the rest of
+slice 3 and the last thing between this REQ and `done`.
