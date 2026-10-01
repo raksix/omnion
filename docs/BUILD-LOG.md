@@ -12255,3 +12255,72 @@ unmodified source.
 **Next.** REQ-117's remaining open work is still slice 3's REQ-064 form-editor card, blocked
 on a module that exists on no branch (`cms_forms` is on `wave2-cms` only). REQ-118
 (catalogue/cart/checkout) stays unstarted behind REQ-008's commerce engine.
+
+---
+
+## Wave 4b · REQ-133 · tick 58 (2026-10-01) · slice 17
+
+**What.** Two promises REQ-133 makes were enforced by nothing a write path reaches.
+
+1. *"Archived projects are read-only — no new runs, **no edits**"*. Only the run half had an
+   enforcement point (`ensure_run_allowed`, inside `create_execution_in`). `insert_workflow`,
+   `update_workflow` and `delete_workflow` read nothing about `status`, and
+   `require_capability`'s instance-admin short-circuit answers `Owner` *before any project row is
+   read* — so an editor, an owner **and an administrator** could create, rewrite and delete
+   workflows in an archived project. "Archived" was a property of the account, not of the state.
+2. *"Per-project maxima for workflows, credentials, runs per day and concurrent runs"*.
+   `max_workflows` had a column, a bar on the limits screen and a notice sweep that emits
+   `automation.project.limit_exceeded` — **and no check at any write**. `ensure_run_within_limits`
+   asks about runs; nothing asked about rows. A project capped at five workflows could hold five
+   hundred while the bar read "at the limit".
+
+**Why three green gates missed it.** `run-project-isolation.sh` (14/14, proven to fail at 10/14)
+proves a **run** in an archived project is refused — it is named after the sentence and measures
+the one clause that had been implemented. `run-project-limits.sh` (14/14, proven to fail at 11/14)
+proves `max_runs_per_day` and `max_concurrent_runs` — neither of which is the cap that was missing.
+**A gate named after a sentence measures the clauses that exist; the missing clause is invisible by
+construction.**
+
+**The fix.** `projects::ensure_project_accepts_writes` (archive, then cap — so a project that is both
+archived and over quota is told to *restore it*, the remedy that works) and
+`projects::ensure_project_is_writable` (the archive rule alone, for the update and delete doors).
+Both read the project `for share` **inside the transaction that writes**, which is the
+check-then-write race this module removed from the run path and the move path two slices ago.
+The refusal reuses `Limits::refusal_message` and the now-public `owner_display` rather than a
+second copy of that sentence.
+
+**My own defect, and the branch's seventh instance of the signature test defect.** The first version
+was **one function with a flag** so `delete_workflow` could skip the cap — and the gate's negative
+control, `a_delete_is_never_refused_by_the_workflow_cap`, failed against it with
+`project_workflow_limit_exceeded` on the delete. Refusing the delete is refusing the operator's way
+back **under** the cap, which makes the cap a one-way door; and because a flag false would also have
+had to skip the archive rule, the split into two functions is the **evidence**, not the taste.
+Seventh repeat, and the first whose wrong answer was *"the fix is too strict"* rather than *"the fix
+is not reached"*.
+
+**Proof.**
+- `scripts/qa/run-project-write-guard.sh` — **5/5**.
+- **PROVEN TO FAIL at 1/5** with both guards reduced to the pre-fix body: the four guard assertions
+  red; the single survivor is `a_project_with_no_limits_row_is_unlimited`, which never touches a cap
+  — which is what shows the gate names this defect and not its neighbourhood.
+- Regressions unchanged: isolation **14/14**, limits **14/14**, limit-notices **6/6**, move **13/13**,
+  `omnion-workflows --lib` **56**, library builds clean, clippy **0 on all three touched files**
+  (the one `double_must_use` warning is pre-existing on `validate_key`, untouched).
+- Admin `tsc --noEmit` exit 0.
+- Commits `6c030780` feat / `901d024a` test / `bffc3613` docs.
+
+**No browser pass, and none claimed:** no screen changed. The refusal surfaces through the limits
+screen's existing bar and the create form's existing error strip. The QA slot is held by a live w3
+pass (`/proc/2018881/cwd` = `/mnt/apopic/omnion-w3`), load 7.35 and `/mnt/apopic` at 97%, so no
+`scripts/qa/run.sh` was started rather than starting an unreliable one.
+
+**Also checked and found sound.** A dead-caller sweep of `projects.rs` / `move_workflow.rs` /
+`limits.rs` (24 candidates, all triaged: private helpers, route handlers of the same name, or
+genuinely private), and a mechanical scan of every statement in `apps/api/src` touching a
+project-scoped table — one statement, and it carries its own organization predicate.
+
+**Next.** REQ-133's remaining unticked boxes are all screen observations (390 px, zero high findings)
+and the two dependency-kind criteria that cannot exist on this branch (no `credentials` table). The
+module-level fix candidates the sweep surfaced for later ticks: `plan_move` (the pool-taking wrapper)
+and `blocking_kinds` have no non-test caller — `plan_move_in` covers the only call site, so this is a
+narrowing question rather than a missing feature.
