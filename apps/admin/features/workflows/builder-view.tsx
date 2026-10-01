@@ -122,6 +122,7 @@ import {
   whatEscapeClears,
   type CanvasSelection,
 } from "./selection";
+import { rebaseAfterReload } from "./reload-rebase";
 import {
   SHORTCUT_GROUPS,
   beginConnect,
@@ -245,6 +246,13 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
   // arrived — so it would take the reload exit while the banner showed an overwrite.
   const saveRef = useRef<SaveState>(save);
   saveRef.current = save;
+  // The same mirror for the selection, for the same reason: `load` is a `useCallback` declared
+  // before the history, and it is called from a click handler that must read the selection as
+  // it stands at press time. Closing over `selection` would prune the selection from the render
+  // before the conflict landed — which is the render in which the author still had their card
+  // selected, and the reload would then leave the inspector showing a node it does not contain.
+  const selectionRef = useRef<CanvasSelection>(selection);
+  selectionRef.current = selection;
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [paletteQuery, setPaletteQuery] = useState("");
@@ -400,6 +408,21 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
       setEdges(graph.graph.edges);
       versionRef.current = graph.graph_version;
       setSave({ kind: "clean" });
+      // This is the Reload exit of the two-tab conflict, and it ADOPTED another editor's graph
+      // while keeping everything the old one implied. Undo was the dangerous half: its entries
+      // described the graph the author just chose to discard, and `doUndo` ends in `queueSave`,
+      // so one press of ⌘Z wrote that discarded graph back over the other tab — quoting the
+      // version this very line just advanced, so the server accepted it without a second
+      // conflict. The concurrency guard was undone by the undo button. The selection is pruned
+      // for the same reason, one screen down: an inspector holding a node this graph does not
+      // contain is a panel that can be aimed at nothing.
+      const rebased = rebaseAfterReload(
+        selectionRef.current,
+        graph.graph.nodes.map((n) => n.id),
+      );
+      historyRef.current = rebased.history;
+      setSelection(rebased.selection);
+      setHistoryTick((n) => n + 1);
       // The stored layout's viewport, when it has one: a rule that was arranged on a big
       // screen should not open zoomed into the top-left corner.
       const stored = (graph.ui_state?.viewport ?? {}) as { x?: number; y?: number; zoom?: number };
