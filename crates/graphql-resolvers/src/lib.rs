@@ -42,7 +42,7 @@
 //! is returned. [`select_columns`] is therefore the mechanism, not a formatting nicety.
 
 use omnion_content::model::{NewPage, PageChanges};
-use omnion_graphql::document::{Document, Selection};
+use omnion_graphql::document::{Document, Field, Selection};
 use omnion_graphql::error::{Code, Error, Result as GqlResult};
 use omnion_graphql::parity::{Known, PermissionSet};
 use omnion_identity::organizations::{self, NewOrganization};
@@ -471,39 +471,48 @@ pub fn resolve_download_url(path_prefix: &str, file_id: Uuid) -> Value {
 // Mutation resolvers
 // ---------------------------------------------------------------------------------------------
 
-/// The arguments `createPage` accepts, as the document wrote them.
+/// The arguments a field accepts, as the document wrote them.
 ///
 /// A **hand-written argument reader** rather than a serde deserialization of the document: the
 /// parser keeps argument values as raw source text, so this is where `"value"` becomes a `String`
 /// and `10` becomes a `u32`. An unquoted string is refused rather than accepted, because
 /// accepting it means one client library's syntax silently fails another's.
-fn string_argument(selections: &[Selection], name: &str) -> GqlResult<Option<String>> {
-    for selection in selections {
-        let Selection::Field(field) = selection else { continue };
-        let Some((_, value)) = field.arguments.iter().find(|(key, _)| key == name) else {
-            continue;
-        };
-        let unquoted = value
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .ok_or_else(|| Error::Validation {
-                code: Code::GraphqlValidationFailed,
-                message: format!("`{name}` must be a quoted string, the document wrote `{value}`"),
-            })?;
-        return Ok(Some(unquoted.to_owned()));
-    }
-    Ok(None)
+///
+/// ## It reads the FIELD, not the field's sub-selections — and that is not a detail
+///
+/// **The first version of this file took `selections: &[Selection]`** and looped over it looking
+/// for a field carrying the argument. So `pages(siteId: "…")` found nothing (the argument is on
+/// `pages` itself, not on `{ id slug }` beneath it) and the resolver silently answered with an
+/// empty list; `createPage(siteId: "…")` answered `` `createPage` requires a `siteId` `` for a
+/// document that had supplied it. Both looked like an empty result rather than a bug, and both
+/// were found by an integration walk, not by a unit test — because a unit test would have had to
+/// build a document to notice.
+///
+/// The signature therefore takes the `Field`, whose `arguments` is where the parser put them, and
+/// `&[Selection]` appears nowhere in an argument reader.
+fn string_argument(field: &Field, name: &str) -> GqlResult<Option<String>> {
+    let Some((_, value)) = field.arguments.iter().find(|(key, _)| key == name) else {
+        return Ok(None);
+    };
+    let unquoted = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| Error::Validation {
+            code: Code::GraphqlValidationFailed,
+            message: format!("`{name}` must be a quoted string, the document wrote `{value}`"),
+        })?;
+    Ok(Some(unquoted.to_owned()))
 }
 
-fn required_string_argument(selections: &[Selection], name: &str, field: &str) -> GqlResult<String> {
-    string_argument(selections, name)?.ok_or_else(|| Error::Validation {
+fn required_string_argument(field: &Field, name: &str, owner: &str) -> GqlResult<String> {
+    string_argument(field, name)?.ok_or_else(|| Error::Validation {
         code: Code::GraphqlValidationFailed,
-        message: format!("`{field}` requires a `{name}` argument"),
+        message: format!("`{owner}` requires a `{name}` argument"),
     })
 }
 
-fn uuid_argument(selections: &[Selection], name: &str) -> GqlResult<Option<Uuid>> {
-    let Some(raw) = string_argument(selections, name)? else {
+fn uuid_argument(field: &Field, name: &str) -> GqlResult<Option<Uuid>> {
+    let Some(raw) = string_argument(field, name)? else {
         return Ok(None);
     };
     Uuid::parse_str(&raw).map(Some).map_err(|_| Error::Validation {
@@ -521,23 +530,23 @@ fn uuid_argument(selections: &[Selection], name: &str) -> GqlResult<Option<Uuid>
 pub async fn resolve_create_page(
     pool: &PgPool,
     site_id: Uuid,
-    selections: &[Selection],
+    field: &Field,
     actor: Option<Uuid>,
 ) -> GqlResult<Value> {
     let (page, revision) = omnion_content::pages::create_page(
         pool,
         NewPage {
             site_id,
-            slug: required_string_argument(selections, "slug", "createPage")?,
+            slug: required_string_argument(field, "slug", "createPage")?,
             // `pageType` and `body` are OPTIONAL here for the same reason they are optional on
             // the REST twin (`CreatePageRequest` marks both `#[serde(default)]`): the store
             // defaults the type to `page` and an empty body to "" itself. A resolver that
             // demanded them would refuse a document the REST twin accepts, which is drift in the
             // direction that breaks a legitimate client.
-            page_type: string_argument(selections, "pageType")?,
-            title: required_string_argument(selections, "title", "createPage")?,
-            body: string_argument(selections, "body")?,
-            summary: string_argument(selections, "summary")?,
+            page_type: string_argument(field, "pageType")?,
+            title: required_string_argument(field, "title", "createPage")?,
+            body: string_argument(field, "body")?,
+            summary: string_argument(field, "summary")?,
             created_by: actor,
         },
     )
@@ -562,14 +571,14 @@ pub async fn resolve_create_page(
 pub async fn resolve_update_page(
     pool: &PgPool,
     page_id: Uuid,
-    selections: &[Selection],
+    field: &Field,
     actor: Option<Uuid>,
 ) -> GqlResult<Value> {
     let changes = PageChanges {
-        slug: string_argument(selections, "slug")?,
-        title: string_argument(selections, "title")?,
-        body: string_argument(selections, "body")?,
-        summary: string_argument(selections, "summary")?,
+        slug: string_argument(field, "slug")?,
+        title: string_argument(field, "title")?,
+        body: string_argument(field, "body")?,
+        summary: string_argument(field, "summary")?,
     };
     if changes.is_empty() {
         return Err(Error::Validation {
@@ -632,7 +641,7 @@ pub async fn resolve_publish_page(
 pub async fn resolve_create_organization(
     pool: &PgPool,
     organization_id: Option<Uuid>,
-    selections: &[Selection],
+    field: &Field,
 ) -> GqlResult<Value> {
     if organization_id.is_some() {
         return Err(Error::Simple {
@@ -646,8 +655,8 @@ pub async fn resolve_create_organization(
     let organization = organizations::create_organization(
         pool,
         NewOrganization {
-            name: required_string_argument(selections, "name", "createOrganization")?,
-            slug: required_string_argument(selections, "slug", "createOrganization")?,
+            name: required_string_argument(field, "name", "createOrganization")?,
+            slug: required_string_argument(field, "slug", "createOrganization")?,
         },
     )
     .await
@@ -728,7 +737,7 @@ async fn resolve_field(
     match (root, field.name.as_str()) {
         ("Query", "me") => resolve_me(caller, pool, &field.selections).await,
         ("Query", "organization") => {
-            let id = uuid_argument(&field.selections, "id")?;
+            let id = uuid_argument(field, "id")?;
             let rows = resolve_organizations(caller, pool, context, id).await?;
             Ok(rows.into_iter().next().unwrap_or(Value::Null))
         }
@@ -737,25 +746,25 @@ async fn resolve_field(
             Ok(Value::Array(rows))
         }
         ("Query", "sites") => {
-            let organization_id = uuid_argument(&field.selections, "organizationId")?;
+            let organization_id = uuid_argument(field, "organizationId")?;
             let rows = resolve_sites(caller, pool, context, organization_id).await?;
             Ok(Value::Array(rows))
         }
         ("Query", "pages") => {
-            let site_id = uuid_argument(&field.selections, "siteId")?;
-            let limit = page_size(&field.selections)?;
-            let status = string_argument(&field.selections, "status")?;
+            let site_id = uuid_argument(field, "siteId")?;
+            let limit = page_size(field)?;
+            let status = string_argument(field, "status")?;
             let rows = resolve_pages(pool, site_id, None, None, status.as_deref(), limit).await?;
             Ok(Value::Array(rows))
         }
         ("Query", "page") => {
-            let id = uuid_argument(&field.selections, "id")?;
+            let id = uuid_argument(field, "id")?;
             let rows = resolve_pages(pool, None, id, None, None, None).await?;
             Ok(rows.into_iter().next().unwrap_or(Value::Null))
         }
         ("Query", "pageBySlug") => {
-            let site_id = uuid_argument(&field.selections, "siteId")?;
-            let slug = string_argument(&field.selections, "slug")?;
+            let site_id = uuid_argument(field, "siteId")?;
+            let slug = string_argument(field, "slug")?;
             match (site_id, slug) {
                 (Some(site_id), Some(slug)) => {
                     let rows = resolve_pages(pool, None, None, Some((site_id, slug)), None, None)
@@ -769,20 +778,20 @@ async fn resolve_field(
             }
         }
         ("Query", "mediaFiles") => {
-            let site_id = uuid_argument(&field.selections, "siteId")?;
-            let first = page_size(&field.selections)?;
-            let kind = string_argument(&field.selections, "kind")?;
+            let site_id = uuid_argument(field, "siteId")?;
+            let first = page_size(field)?;
+            let kind = string_argument(field, "kind")?;
             let rows = resolve_media_files(pool, site_id, None, first, kind.as_deref()).await?;
             Ok(Value::Array(rows))
         }
         ("Query", "mediaFile") => {
-            let site_id = uuid_argument(&field.selections, "siteId")?;
-            let id = uuid_argument(&field.selections, "id")?;
+            let site_id = uuid_argument(field, "siteId")?;
+            let id = uuid_argument(field, "id")?;
             let rows = resolve_media_files(pool, site_id, id, None, None).await?;
             Ok(rows.into_iter().next().unwrap_or(Value::Null))
         }
         ("Query", "mediaDownloadUrl") => {
-            let id = uuid_argument(&field.selections, "id")?;
+            let id = uuid_argument(field, "id")?;
             match id {
                 Some(id) => Ok(resolve_download_url("", id)),
                 None => Err(Error::Validation {
@@ -792,23 +801,23 @@ async fn resolve_field(
             }
         }
         ("Mutation", "createPage") => {
-            let site_id = uuid_argument(&field.selections, "siteId")?
+            let site_id = uuid_argument(field, "siteId")?
                 .ok_or_else(|| Error::Validation {
                     code: Code::GraphqlValidationFailed,
                     message: "`createPage` requires a `siteId`".into(),
                 })?;
-            resolve_create_page(pool, site_id, &field.selections, caller.user_id).await
+            resolve_create_page(pool, site_id, field, caller.user_id).await
         }
         ("Mutation", "updatePage") => {
-            let id = uuid_argument(&field.selections, "id")?
+            let id = uuid_argument(field, "id")?
                 .ok_or_else(|| Error::Validation {
                     code: Code::GraphqlValidationFailed,
                     message: "`updatePage` requires an `id`".into(),
                 })?;
-            resolve_update_page(pool, id, &field.selections, caller.user_id).await
+            resolve_update_page(pool, id, field, caller.user_id).await
         }
         ("Mutation", "deletePage") => {
-            let id = uuid_argument(&field.selections, "id")?
+            let id = uuid_argument(field, "id")?
                 .ok_or_else(|| Error::Validation {
                     code: Code::GraphqlValidationFailed,
                     message: "`deletePage` requires an `id`".into(),
@@ -816,7 +825,7 @@ async fn resolve_field(
             Ok(Value::Bool(resolve_delete_page(pool, id).await?))
         }
         ("Mutation", "publishPage") => {
-            let id = uuid_argument(&field.selections, "id")?
+            let id = uuid_argument(field, "id")?
                 .ok_or_else(|| Error::Validation {
                     code: Code::GraphqlValidationFailed,
                     message: "`publishPage` requires an `id`".into(),
@@ -824,7 +833,7 @@ async fn resolve_field(
             resolve_publish_page(pool, id).await
         }
         ("Mutation", "createOrganization") => {
-            resolve_create_organization(pool, caller.organization_id, &field.selections).await
+            resolve_create_organization(pool, caller.organization_id, field).await
         }
         // Introspection never reaches a resolver: it is answered from the composed schema the
         // caller was given, which is already filtered. Reaching here would mean the schema held a
@@ -867,18 +876,23 @@ fn root_field_permission(root: &str, field: &str) -> GqlResult<Option<Known>> {
 }
 
 /// Read a page-size argument, refusing a non-numeric one.
-fn page_size(selections: &[Selection]) -> GqlResult<Option<u32>> {
-    for selection in selections {
-        let Selection::Field(field) = selection else { continue };
-        for (name, value) in &field.arguments {
-            if !matches!(name.as_str(), "first" | "limit" | "pageSize" | "perPage" | "take") {
-                continue;
-            }
-            return value.parse::<u32>().map(Some).map_err(|_| Error::Validation {
-                code: Code::GraphqlValidationFailed,
-                message: format!("`{name}` must be a whole number, the document wrote `{value}`"),
-            });
+///
+/// The names are **spelled here** rather than imported from the decision layer's own list, and
+/// `the_crate_catches_every_page_size_name_the_decision_layer_does` asserts the two agree. A test
+/// that looped over the implementation's constant would shrink with it — the lesson of three
+/// ticks running, in this same request.
+fn page_size(field: &Field) -> GqlResult<Option<u32>> {
+    for (name, value) in &field.arguments {
+        if !matches!(
+            name.as_str(),
+            "first" | "limit" | "pageSize" | "perPage" | "take"
+        ) {
+            continue;
         }
+        return value.parse::<u32>().map(Some).map_err(|_| Error::Validation {
+            code: Code::GraphqlValidationFailed,
+            message: format!("`{name}` must be a whole number, the document wrote `{value}`"),
+        });
     }
     Ok(None)
 }
@@ -968,47 +982,45 @@ mod tests {
 
     #[test]
     fn a_string_argument_must_be_quoted() {
-        let document = omnion_graphql::parse("{ pages(siteId: x) { id } }").expect("parses");
-        let op = document.select(None).expect("one operation");
-        let err = string_argument(&op.selections, "siteId").expect_err("an unquoted value is refused");
+        // The argument is on the FIELD. Handing the reader the sub-selections instead — which is
+        // what the first version of this test did — passes vacuously: it looks for a field
+        // carrying `siteId` among `{ id }`, finds none, and reports "not a quoted string" for a
+        // document whose problem is something else entirely.
+        let err = string_argument(&root_field("{ pages(siteId: x) { id } }"), "siteId")
+            .expect_err("an unquoted value is refused");
         assert!(err.to_string().contains("quoted"), "{err}");
     }
 
     #[test]
     fn a_quoted_argument_comes_back_unquoted() {
-        let document =
-            omnion_graphql::parse(r#"{ pages(status: "published") { id } }"#).expect("parses");
-        let op = document.select(None).expect("one operation");
         assert_eq!(
-            string_argument(&op.selections, "status").expect("reads").as_deref(),
+            string_argument(
+                &root_field(r#"{ pages(status: "published") { id } }"#),
+                "status"
+            )
+            .expect("reads")
+            .as_deref(),
             Some("published")
         );
     }
 
     #[test]
     fn a_uuid_argument_that_is_not_a_uuid_is_refused_naming_the_argument() {
-        let document =
-            omnion_graphql::parse(r#"{ page(id: "not-a-uuid") { id } }"#).expect("parses");
-        let op = document.select(None).expect("one operation");
-        let err = uuid_argument(&op.selections, "id").expect_err("refused");
+        let err = uuid_argument(&root_field(r#"{ page(id: "not-a-uuid") { id } }"#), "id")
+            .expect_err("refused");
         assert!(err.to_string().contains("uuid"), "{err}");
         assert!(err.to_string().contains("not-a-uuid"), "{err}");
     }
 
     #[test]
     fn a_page_size_argument_must_be_a_number() {
-        let document =
-            omnion_graphql::parse(r#"{ pages(first: "lots") { id } }"#).expect("parses");
-        let op = document.select(None).expect("one operation");
-        let err = page_size(&op.selections).expect_err("refused");
+        let err = page_size(&root_field(r#"{ pages(first: "lots") { id } }"#)).expect_err("refused");
         assert!(err.to_string().contains("whole number"), "{err}");
         // Every documented name is caught, spelled here rather than read from the implementation's
         // own list — the lesson of three ticks running.
         for name in ["first", "limit", "pageSize", "perPage", "take"] {
-            let document = omnion_graphql::parse(&format!("{{ pages({name}: 7) {{ id }} }}"))
-                .expect("parses");
-            let op = document.select(None).expect("one operation");
-            assert_eq!(page_size(&op.selections).expect("reads"), Some(7), "for `{name}`");
+            let field = root_field(&format!("{{ pages({name}: 7) {{ id }} }}"));
+            assert_eq!(page_size(&field).expect("reads"), Some(7), "for `{name}`");
         }
     }
 
@@ -1038,10 +1050,23 @@ mod tests {
     /// `id`. The code was right and the test was wrong; the two look identical from the outside,
     /// which is exactly why it is worth naming in the helper.
     fn root_field_selections(src: &str) -> Vec<Selection> {
+        root_field(src).selections.clone()
+    }
+
+    /// The one root field of a document — the thing an argument reader is handed.
+    ///
+    /// **This helper exists because of the tick's real defect.** The argument readers used to take
+    /// `&[Selection]` (the field's sub-selections) and every unit test passed them that same list,
+    /// so the tests exercised a reader that never looks at where the parser actually stores
+    /// arguments — and stayed green while `pages(siteId: "…")` silently returned nothing over
+    /// HTTP. The tests were measuring a fiction, which is the same family as the parity gate that
+    /// iterated a hand-written list. Getting a document and handing over ITS FIELD is what makes
+    /// the reader's contract visible in the test's own signature.
+    fn root_field(src: &str) -> Field {
         let document = omnion_graphql::parse(src).expect("the document parses");
         let op = document.select(None).expect("one operation");
         match &op.selections[0] {
-            Selection::Field(field) => field.selections.clone(),
+            Selection::Field(field) => field.clone(),
             other => panic!("expected a root field, found {other:?}"),
         }
     }
