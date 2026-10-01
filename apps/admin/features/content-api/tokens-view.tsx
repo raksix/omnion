@@ -416,10 +416,25 @@ function CreateTokenForm({
   const [expiryDays, setExpiryDays] = useState(90);
   const [tier, setTier] = useState(vocabulary.rate_tiers[0]?.per_minute ?? 120);
   const [busy, setBusy] = useState(false);
+  /**
+   * The `details.field` of the last refusal, kept here so the control it names can be pointed at.
+   *
+   * The API names the field it refused (`name`, `scopes`, `allowed_origins`,
+   * `rate_limit_per_minute`, `expires_in_days`) and this used to throw that away and render only
+   * the sentence at the top of the form. That is why the server-side half mattered: with a field
+   * pointing at `name` for a mistyped origin, the operator was told about their name while the
+   * origin box sat there unmarked. A refusal the panel cannot point at is a refusal the operator
+   * works around by guessing — which is the outcome criterion 16 exists to prevent.
+   *
+   * `unknown` rather than `string`: the value comes off the wire, so an unexpected shape must
+   * mark nothing rather than crash the form.
+   */
+  const [offender, setOffender] = useState<unknown>(null);
 
   const submit = useCallback(async () => {
     setBusy(true);
     onError(null);
+    setOffender(null);
     try {
       const created = await createContentApiToken({
         name: name.trim(),
@@ -433,7 +448,9 @@ function CreateTokenForm({
       });
       await onCreated(created);
     } catch (caught) {
-      onError((caught as ApiError).message);
+      const failure = caught as ApiError;
+      onError(failure.message);
+      setOffender(failure.details?.field ?? null);
     } finally {
       setBusy(false);
     }
@@ -453,6 +470,8 @@ function CreateTokenForm({
           <span className="text-muted">Name</span>
           <input
             data-content-api-form-name
+            data-offender={offender === "name" ? "true" : undefined}
+            aria-invalid={offender === "name" ? true : undefined}
             required
             maxLength={vocabulary.max_name_length}
             value={name}
@@ -484,7 +503,11 @@ function CreateTokenForm({
         </label>
       </div>
 
-      <fieldset className="space-y-1.5">
+      <fieldset
+        className="space-y-1.5"
+        data-content-api-form-scopes
+        data-offender={offender === "scopes" ? "true" : undefined}
+      >
         <legend className="text-[12px] text-muted">Scopes</legend>
         <div className="flex flex-wrap gap-3">
           {vocabulary.scopes.map((scope) => (
@@ -517,6 +540,8 @@ function CreateTokenForm({
           <span className="text-muted">Expiry</span>
           <select
             data-content-api-form-expiry
+            data-offender={offender === "expires_in_days" ? "true" : undefined}
+            aria-invalid={offender === "expires_in_days" ? true : undefined}
             value={expiryDays}
             onChange={(event) => setExpiryDays(Number(event.target.value))}
             className="rounded border border-line bg-transparent px-2 py-1.5"
@@ -532,6 +557,8 @@ function CreateTokenForm({
           <span className="text-muted">Rate limit</span>
           <select
             data-content-api-form-tier
+            data-offender={offender === "rate_limit_per_minute" ? "true" : undefined}
+            aria-invalid={offender === "rate_limit_per_minute" ? true : undefined}
             value={tier}
             onChange={(event) => setTier(Number(event.target.value))}
             className="rounded border border-line bg-transparent px-2 py-1.5"
@@ -549,6 +576,8 @@ function CreateTokenForm({
         <span className="text-muted">Allowed origins (optional, one per line)</span>
         <textarea
           data-content-api-form-origins
+          data-offender={offender === "allowed_origins" ? "true" : undefined}
+          aria-invalid={offender === "allowed_origins" ? true : undefined}
           value={origins}
           onChange={(event) => setOrigins(event.target.value)}
           rows={3}
@@ -558,6 +587,14 @@ function CreateTokenForm({
         <span className="text-[11px] text-muted">
           Exact origins only — no path, no trailing slash, no wildcard. Empty means any origin.
         </span>
+        {offender === "allowed_origins" ? (
+          // The sentence belongs to the control, not only to the strip at the top of the form. A
+          // message that names a box three rows up is a message the operator has to connect to a
+          // field by hand, and a refused origin is the case where they are most likely to guess.
+          <span data-content-api-offender-note className="text-[11.5px] text-danger">
+            This line is not an origin. Use scheme://host[:port] with no path and no wildcard.
+          </span>
+        ) : null}
       </label>
 
       <div className="flex gap-2">
