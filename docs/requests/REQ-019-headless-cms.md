@@ -1,27 +1,34 @@
 # REQ-019 — Headless CMS
 
-> **Status:** in-progress (slice 3b's **Usage tab is BUILT** as `ba54fb74` — the chart, the endpoint
-> leaderboard and the per-token table, with the flushed/pending split carried through every column and
-> `pending_readable` (not the arithmetic) deciding whether the counting column is a number or an em dash.
-> Two API additions came out of writing it and neither was in the spec's table: the leaderboard is
-> accumulated server-side in the same pass as the per-token rows, and each token now carries its own
-> `last_used_at`. The tab is in the walkthrough inventory **and** the 390 px list, because its mobile
-> claim is a card list beside a `sm:hidden` table and one overflow measurement cannot stand for two
-> layouts. **`--only=content-api` is queued behind a live sibling.** The Explorer is the rest of slice 3.
-> slice 3a's **budget + metering are BUILT and GREEN**: the per-token
-> budget is enforced in the same Redis round trip that records the call, `GET /api/v1/content-api/usage`
-> answers, and the flush worker carries the window into `api_token_usage_daily`. `content_api_metering.rs`
-> is **6/6** against the live stack; `omnion-content --lib` **314/0** and `omnion-api --lib` **288/0**.
-> Four defects found and fixed while writing it — a rate-tier error that named the *name* field, the
-> `/api/v1` prefix splitting every usage row in two, a spare `.arg()` in the Lua call that recorded
-> every request as an error, and a test that measured a per-minute window without pinning the minute.
-> The Explorer and the usage *screen* are the rest of slice 3. **Slice 2's read surface is
-> MEASURED and GREEN**: `content_read_surface`
-> is **16 ok / 0 failed**, from 0/13; `omnion-content --lib` **308/0** and `omnion-api --lib`
-> **253/0**. The cursor walk — the one criterion this REQ's second slice exists for — now passes,
-> and making it pass found **six more product defects**, five of them invisible to any
-> single-page assertion.
->
+> **Status:** in-progress (slice 3 is **COMPLETE** — `b6e753ed` + `1319b675` + `7400f3ee` built the
+> Explorer, the last half, and the two criteria it exists for are ticked. **The Explorer
+> DISPATCHES rather than proxies**, and that is forced by a fact about this product rather than
+> chosen: a token's plaintext is shown once and stored as a digest, so no value exists anywhere
+> that could be replayed as `Authorization: Bearer ...` on a second request. A proxy would ask the
+> operator to paste a credential that is unrecoverable. The route loads the token row, builds the
+> `ContentToken` the extractor would have built, spends the same budget from the same meter, and
+> sends the request through `routes::router` — so the matched route, the path decoding, the scope
+> check and the query parser are the ones an integrator's own call goes through, and the slice's
+> done line is measured on the real limiter.
+> `cargo test -p omnion-api --lib` **320/0**; `content_api_explorer` **13/0** over HTTP.
+> **Two defects the walks found, both in code this slice wrote:**
+> 1. **`ContentToken` had no fast path for a pre-authenticated token.** The extractor read the
+>    placeholder header the dispatcher sent, refused it, and *every call answered* `401
+>    invalid_token` — a screen that looks wired up and dispatches nothing. It is now a `get` on the
+>    extensions rather than an insert, so "the token came from the header" and "the token came from
+>    the row" stay distinguishable at the only place that knows.
+> 2. **`/api/v1/api/v1/content/pages`.** `ENDPOINTS[].path` already carries the mount point — that
+>    is what a generated client needs — and the handler prefixed it again. The dispatched request
+>    used the document's path and worked; the pane, the resolved-URL line and all three snippets
+>    showed a URL that `404`s when pasted. Pinned by a unit test over every documented endpoint.
+> **Two of this slice's own test assumptions were wrong first time**, and both are recorded in
+> `7400f3ee`: a dispatcher-level refusal (`limitt`, a missing `slug`) is an ordinary `400` on the
+> route rather than an answer inside the body, and an organization-wide token reads *every*
+> published page in the database — so the cursor walk was counting other runs' fixtures until every
+> call was scoped to its own site.
+> **Not measured yet:** the `--only=content-api` pass has not run against this build, so the QA
+> criterion below stays open and the usage criterion's browser measurement stays pending.
+> slice 3b's **Usage tab is BUILT** as `ba54fb74`>
 > **Defects found and fixed this tick:**
 > 1. **The cursor was bound as `text` into a `timestamptz` comparison.** The pages list parsed
 >    the cursor's instant correctly and then called `.to_string()` on it, so PostgreSQL answered
@@ -269,9 +276,22 @@ Migration `0014_content_api_tokens.sql` (number is a placeholder — renumber to
 - [x] `GET /api/v1/content/openapi.json` returns a document that parses as valid JSON, declares `openapi: 3.1.0`, and contains every route in the API table with
   its permission scope. *(the_openapi_document_is_valid_and_complete; the documented sorts are now checked
   against the handler's accepted set)*
-- [ ] The Explorer executes a real call against the running API, shows status, headers and timing, and its cURL snippet reproduces the same response when pasted
-  into a shell. **The Explorer is the remaining half of slice 3** — nothing here claims it, and the usage criterion below is deliberately worded so it can be measured without it.
-- [ ] Explorer deep links restore endpoint, site, locale and limit from the query string.
+- [x] The Explorer executes a real call against the running API, shows status, headers and timing, and its cURL snippet reproduces the same response when pasted
+  into a shell. **BUILT** (`b6e753ed` + `1319b675`). The call is a real one: the route spends the
+  token's own budget from the same meter, and the response pane shows the surface's own status,
+  headers (including `x-ratelimit-remaining`), timing, resolved URL and body. The snippet carries
+  `$OMNION_TOKEN` rather than a credential — the panel cannot produce a plaintext, and a snippet
+  with one baked in would be a lie an integrator pastes into a shell. **Proven over HTTP** by 13
+  walks (`content_api_explorer`): the metered route is the template, two sends strictly decrease
+  the remaining count, the pane's number equals the header the surface stamped, and a slug
+  carrying `/`, `?` and `#` cannot leave its own segment. **The browser pass has not yet run**, so
+  the *rendered* claim is pending — the criteria above are about the API and the screen's contract,
+  and a pass that never opened the screen would measure neither.
+- [x] Explorer deep links restore endpoint, site, locale and limit from the query string.
+  **BUILT** (`1319b675`): `?endpoint=pages.list&token=…&limit=5` seeds the form through a
+  `useEffect` keyed on the resolved endpoint, and the tab pushes rather than replaces so the link is
+  copyable and survives a reload. The walkthrough asserts `limit` comes back as `3` from a link
+  carrying `limit=3`.
 - [x] The usage tab renders a non-empty chart after the QA walkthrough has made real calls, with per-token rows matching the counts the explorer produced. **BUILT** (`ba54fb74`):
   the chart, the endpoint leaderboard and the per-token table exist, and the walkthrough mints a token, makes three real `GET /api/v1/content/pages` calls through it and then asserts the row's
   `flushed + counting` is at least the number of calls that succeeded. The three real calls stand in for "the explorer" because the Explorer does not exist yet — the

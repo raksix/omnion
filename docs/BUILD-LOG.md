@@ -9440,3 +9440,67 @@ it collide — which is what that limit exists for. The device-block legs from t
 keyboard/mobile legs are therefore still **written, not measured**. Next tick runs the pass first.
 
 Next: the remaining REQ-021 legs, then REQ-016.
+
+### Tick 47 — the Explorer, the half of slice 3 that a token's digest made impossible to proxy
+
+**What.** `POST /api/v1/content-api/explorer` (`b6e753ed`) plus the screen that drives it
+(`1319b675`) and 13 walks over it (`7400f3ee`). Slice 3 is closed; REQ-019 needs only a QA pass
+that measures the screen in a browser.
+
+**The design decision everything else follows from is a fact about the product, not a preference.**
+A token's plaintext is shown once and stored as a digest (`api_tokens::hash_secret`), so there is no
+value anywhere — not in the database, not in the session, not in the API process — that could be
+replayed as `Authorization: Bearer …` on a second request. The obvious build is a proxy: paste a
+token, watch it call. That would ask the operator to paste a credential this installation can never
+show them twice, into a text box, on a screen. So the Explorer **dispatches**: it loads the token
+row, builds the `ContentToken` the extractor would have built, spends the same budget from the same
+meter, and sends the request through `routes::router`. The matched route, the path decoding, the
+scope check and the query parser are all the real ones — which is why the slice's done line
+("`x-ratelimit-remaining` decreasing") is measured on the limiter itself rather than a copy of it.
+
+**Two defects the walks found, both in code this slice wrote, both invisible to a green build:**
+
+```
+ContentToken extractor → bearer_token(placeholder header) → 401 invalid_token, on every call
+```
+
+1. **`ContentToken` had no fast path for a pre-authenticated token.** It read the placeholder header
+   the dispatcher sent, refused it, and every single call answered `401` — a screen that looks wired
+   up and dispatches nothing. Now a `get` on the extensions, deliberately not an insert: an
+   extractor that wrote its own value back would make "the token came from the header" and "the
+   token came from the row" indistinguishable downstream, and that branch is the only place that
+   knows.
+2. **`/api/v1/api/v1/content/pages`.** `ENDPOINTS[].path` already carries the mount point — that is
+   what a generated client needs — and the handler prefixed it again when composing the caller's
+   URL. The dispatched request used the document's path and worked fine; the pane, the resolved-URL
+   line and all three snippets showed a URL that `404`s when pasted into a shell. Origin plus the
+   documented path is the whole URL now, pinned by a unit test over every documented endpoint.
+
+**And two of this slice's own test assumptions were wrong on the first run**, which is the more
+useful half. A dispatcher-level refusal — an undeclared `limitt`, a missing `slug` — is an ordinary
+`400` on the route, not an answer inside the body; I had asserted `status: 200` and read
+`body.error`, which is the shape a refusal from the *surface* produces, and the two layers are
+different places for the same class of message to appear. And an organization-wide token reads
+**every** published page in the database, so on the shared QA database the cursor walk was counting
+other runs' leftovers: it read two rows where it expected one, and the pagination it meant to test
+was never the thing under test. Every call is now scoped to its own site.
+
+**Gates.**
+
+```
+cargo test -p omnion-api --lib                       320 passed; 0 failed   (was 319)
+cargo test -p omnion-api --test content_api_explorer  13 passed; 0 failed
+pnpm typecheck                                       clean
+```
+
+The integration suite runs `--test-threads=1`: parallel logins against one shared database contend
+on the session and IAM writes, and three walks failed on a `401` from that contention rather than
+on anything this route does.
+
+**Not measured:** the `--only=content-api` pass has not run against this build, so REQ-019's QA
+criterion stays open and the usage criterion's browser measurement stays pending. The Explorer
+criterion is ticked on the API and the screen's contract; a pass that never opened the screen would
+have measured neither.
+
+**Next:** run `--only=content-api` against this build — the route inventory and the required-step
+list both carry the Explorer now — then REQ-063 acceptance 17 and REQ-064's 18.
