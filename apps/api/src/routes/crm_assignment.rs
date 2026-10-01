@@ -400,6 +400,14 @@ pub async fn simulate(
             "language": input.language,
             "has_email": input.has_email,
         },
+        // What the paste carried that no rule can ever see. Without this the answer reads
+        // as a confident judgement about a payload whose `contury` key was ignored, and the
+        // operator edits the rule that was never the problem.
+        "unread": omnion_module_crm_intake::unread_keys(&body.payload),
+        "readable_keys": omnion_module_crm_intake::INPUT_ALIASES
+            .iter()
+            .map(|(key, aliases)| json!({ "condition": key, "aliases": aliases }))
+            .collect::<Vec<_>>(),
         "rules_considered": rules.len(),
         "wrote_nothing": true,
     })))
