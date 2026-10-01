@@ -7927,3 +7927,71 @@ not by the age of the placeholder) for the whole tick, with 45 Chrome processes 
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## Tick 56 (wave6) — the export grep, and three defects only a proof could find
+
+**Merged twelve commits of `origin/main` first** (the secret inventory and the `security.finding`
+events). Two conflicts, both additive unions: main adds `restore_job_runner`/`restore_jobs`, this
+branch adds the reliability and export routes. The merge then produced
+`E0428: restore_jobs is defined multiple times` — the union re-declared `pub mod restore_jobs;`
+that main already had 47 lines above it. Removing the duplicate is `a406a256`; the lesson is that
+"the conflict markers are gone" is not "the merge compiled".
+
+**Slice 4's export grep is the acceptance line, and it found three defects.** A unit test over
+`anonymize_value` cannot prove "the export output contains no classified value": it proves the
+function replaces a value, not that the builder writes every row through it. So
+`scripts/qa/export-grep-proof.sh` drives the real HTTP API with a real session, classifies a
+fixture whose values are unmistakable, runs the export and greps the **downloaded** bytes.
+
+1. **The produced body was never stored.** `run_export` checksummed the body, wrote `file_key`
+   and threw the bytes away; `download_export` rebuilt them from the same tables at a *later*
+   instant and re-derived a **fresh salt**. So the file a vendor received was never the file the
+   audit row described: a row written in between appeared in the download and not in the checksum,
+   and every hashed value came out differently — which also breaks the cross-table join the
+   per-export salt exists to preserve. `file_key` pointed at nothing. Fixed in `eec25415`: the run
+   stores what it checksummed, and the download serves those bytes, refusing
+   `export_body_checksum_mismatch` when the object and the row disagree.
+2. **The watermark was never in the file.** `watermark` is a column and a panel field, and
+   0221's own comment says it is "stamped INTO the file as its first line". It is now the first
+   line, as a `#` comment so every remaining line still parses as NDJSON.
+3. **Nothing could classify a column.** The builder fails closed on a column with no row in
+   `column_classifications`, the map ships empty, and `read_classifications` was the *only* route
+   that reached the table — so every export in a fresh installation was permanently refused with
+   a list of columns and no way to classify any of them. Every `plan_export` unit test is green
+   because it builds the map itself and so never notices that nothing produces one. Fixed in
+   `a4e9f732`: `PUT /deployment/exports/classifications`, an upsert under
+   `deployment.migrations.apply` rather than the read key beside it, because classifying a column
+   `safe` is how a credential gets exported raw.
+
+`ledger::checksum_bytes` is the byte form of `checksum`, which hashes `content.as_bytes()` and so
+takes those bytes literally; verifying a stored object through a `String` would panic on any object
+that is not valid UTF-8, which is the input the check exists to catch. Two tests pin the equality
+of the two forms and the non-UTF-8 case — **both proven to fail on a one-character mutation**
+(`.to_uppercase()` turns the run 2/103 red).
+
+| Gate | Result |
+| --- | --- |
+| `cargo check -p omnion-api -p omnion-migrations` | clean (0 errors) |
+| `cargo test -p omnion-migrations --lib` | **103 passed** (was 101) |
+| `cargo test -p omnion-permissions --lib` | 68 passed |
+| proven-to-fail on the two new tests | 2/2 red on mutation |
+
+**The box: root 99% → 97%, and it is a build directory that grows.** Deduping `debug/deps` by
+keeping the newest artifact per (crate, kind) freed **2.70 G** then **1.17 G** — 2194 and then 1412
+files. Cargo writes one rlib + rmeta per crate per rebuild and retires none of them, so a long-lived
+target directory is monotonically reclaimable. This is faster than any cleanup and touches nothing
+live.
+
+**Self-inflicted, and recorded rather than hidden:** my QA pass died with `failed to move dependency
+graph … No such file or directory` because I ran `cargo check` against the SAME target directory
+while its `cargo build` was in flight. Two cargos on one target do not queue — they interleave and
+each deletes the other's incremental scratch. `CARGO_INCREMENTAL=0` for every build on this box from
+now on, and no gate against a target a pass is using.
+
+**Browser pass: queued, not skipped.** The slot holder has been alive in `/mnt/apopic/omnion-w8` for
+54 minutes. The pass waits rather than contends, which is the right call: reproducing the cold-start
+race that REQ-127's wizard gate exists for needs an uncontended box, and the alternative is a pass
+that measures a machine already at load 12.
+
+**Next:** that pass over `/deployment/backfills`, `/deployment/migrations`, `/deployment/seeds`;
+then `docs/deployment/upgrade.md`, which now has executed steps to quote.
