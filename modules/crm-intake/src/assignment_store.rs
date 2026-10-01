@@ -372,6 +372,49 @@ pub async fn claim_assignment(
 // SLA policies
 // ---------------------------------------------------------------------------------------------
 
+/// The first-response windows of the policies a set of leads names, as `policy id → minutes`.
+///
+/// **The map, because the answer is per policy and the question is per lead.** A page of
+/// twenty leads shares maybe two policies, so the window is read once per policy rather than
+/// once per lead, and a lead whose policy was deleted — or whose source carried no policy at
+/// all — is simply absent from the map, which the caller reads as "no target".
+///
+/// **Why the window has to travel with the row at all.** [`crate::assignment::SlaState::of`]
+/// needs the policy's own `first_response_minutes` to decide `at_risk`, because it warns at a
+/// quarter of the *window* rather than a fixed number of minutes. A lead row carries the
+/// deadline and the answered instant but not the window it was derived from, so a caller that
+/// wants the clock's state has to fetch the policy too — and a caller that *forgets* is how
+/// this function came to exist: the panel derived the same four states from a hard-coded
+/// 60-minute threshold and disagreed with the module about every short-window policy, which
+/// is the shape this crate keeps meeting (a second implementation of a rule the server
+/// already owns).
+///
+/// An `active` predicate is deliberately **absent**. A lead keeps running the clock on the
+/// policy it was assigned under even after an operator deactivates that policy for *future*
+/// leads, and refusing to answer "how long was this window" for a lead already counting down
+/// under it would make the deadline unexplainable on exactly the rows that need explaining.
+pub async fn policy_windows(
+    pool: &PgPool,
+    organization_id: Uuid,
+    policy_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, i32>> {
+    if policy_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    // `= any($2)` over a `Vec<Uuid>` rather than a hand-built `in (…)` list: the bound
+    // parameter is one array whatever the count, so a twenty-lead page cannot build a
+    // twenty-element statement and a caller cannot forget to bind a slot.
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "select id, first_response_minutes from crm_sla_policies \
+         where organization_id = $1 and id = any($2)",
+    )
+    .bind(organization_id)
+    .bind(policy_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Every policy of an organization, by name.
 pub async fn list_policies(pool: &PgPool, organization_id: Uuid) -> Result<Vec<SlaPolicy>> {
     ensure_defaults(pool, organization_id).await?;
