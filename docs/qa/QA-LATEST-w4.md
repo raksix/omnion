@@ -1,9 +1,9 @@
 # Omnion QA — latest pass (w4)
 
-- When: 2026-10-01T01:07:27.905Z · artifacts: `qa-artifacts/20261001-010038`
-- Interactions: 15 clicks · 1 field fills · 0 form submissions · 108 screenshots
-- Console errors: 214 · failed requests: 213 · dialogs: 0
-- Programmatic findings: 498 (high 490 · medium 7 · low 1)
+- When: 2026-10-01T10:21:03.741Z · artifacts: `qa-artifacts/20261001-101927`
+- Interactions: 175 clicks · 19 field fills · 2 form submissions · 247 screenshots
+- Console errors: 159 · failed requests: 157 · dialogs: 0
+- Programmatic findings: 353 (high 343 · medium 7 · low 3)
 - Vision issues: skipped (no vision API key found (env VISION_MCP_API_KEY or config.yaml))
 
 ## Top findings
@@ -20,16 +20,16 @@
 - **[high] crm-state** — state step failed: deals_readsAsASentence
 - **[high] crm-state** — state step failed: deals_showsTheRequestId
 - **[high] crm-state** — state step failed: deals_hasARetry
-- **[high] crm-state** — state step failed: activities_hasAState
-- **[high] crm-state** — state step failed: activities_readsAsASentence
-- **[high] crm-state** — state step failed: activities_showsTheRequestId
-- **[high] crm-state** — state step failed: activities_hasARetry
-- **[high] crm-state** — state step failed: leads_hasAState
-- **[high] crm-state** — state step failed: leads_readsAsASentence
-- **[high] crm-state** — state step failed: leads_showsTheRequestId
-- **[high] crm-state** — state step failed: leads_hasARetry
-- **[high] crm-state** — state step failed: stages_hasAState
-- **[high] crm-state** — state step failed: stages_readsAsASentence
-- **[high] crm-state** — state step failed: stages_showsTheRequestId
-- **[high] crm-state** — state step failed: stages_hasARetry
 - **[high] crm-state** — state step failed: theScreenWasBrokenBeforeTheRetry
+- **[high] crm-state** — state step failed: theRetryRecoversTheScreen
+- **[high] console-error** — main http://127.0.0.1:3103/hr/me: Failed to load resource: the server responded with a status of 404 (Not Found)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/me: Failed to load resource: the server responded with a status of 404 (Not Found)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/me: Failed to load resource: the server responded with a status of 404 (Not Found)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/me: Failed to load resource: the server responded with a status of 404 (Not Found)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/reports: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/documents: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/documents: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/reports: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/reports: Failed to load resource: the server responded with a status of 500 (Internal Server Error)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/me: Failed to load resource: the server responded with a status of 404 (Not Found)
+- **[high] console-error** — main http://127.0.0.1:3103/hr/me: Failed to load resource: the server responded with a status of 404 (Not Found)
