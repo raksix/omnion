@@ -6208,3 +6208,119 @@ cargo test -p omnion-core --lib   62 passed; 0 failed
 against, the `/notifications/settings` device block (three device API functions in
 `api.ts` still have **zero UI callers**), and `prune_endpoints`/`prune_stale` — which still
 have **zero call sites anywhere**, so a revoked endpoint is not yet pruned. Next tick.
+
+
+## 2026-10-01 — wave6 · REQ-128 slice 4, the UI half, and the tenancy defect under it
+
+**What.** The four `/deployment/*` admin screens (`artifacts`, `artifacts/{version}`, `install`,
+`upgrade`) with their loading, empty, error, validation and populated states, keyboard bindings and
+390 px card layouts; `apps/admin/lib/deployment-api.ts` as the surface's own typed client; three
+walkthrough depth passes and three routes; and a startup guard that refuses to run when a
+deployment screen is missing from the desktop route list.
+
+Then the gate found something bigger than the screens it was measuring.
+
+### The screens
+
+Each one is written to keep the API's honesty rather than to decorate it: a copy button hands over
+the whole reference (`name@sha256:…`, never a tag beside a digest, never a truncated display
+string); a kind a release did not publish renders as an explicit row from the server-computed
+`missing_kinds`, because a gap is indistinguishable from a fetch that has not landed; every release
+shows when its manifest was read, since the surface degrades to the cache when the feed is
+unreachable; the bundle form has no field that could carry a credential and the screen says so in
+three places; a download's checksum is the header the server returned rather than one recomputed
+from the same bytes; the render panel answers with the tool it names and the reason it cannot run
+here, because a button that answered 501 for every bundle would be the dead control the request
+forbids; `unknown` renders as a third verdict with its own meaning, and the checklist stays blocked
+until an operator accepts the plan's own verdict.
+
+`request` was made exportable in `api.ts` rather than re-implemented in the new module — a second
+fetch that forgot the CSRF header would make every write on this surface fail with a 403 that reads
+like a permissions problem.
+
+### The defect the gate found: the installation had no tenancy
+
+`onboarding::state::set_organization` wrote the new organization to **`onboarding_state`** and
+nothing else, so `users.organization_id` stayed NULL on the owner account for the whole life of the
+installation. `scope::resolve_organization` answers `400 organization_required` for an account with
+`None`, so every route that goes through it — the deployment centre included — answered 400 on a
+fresh install.
+
+The reason it survived: the first-run UI reads `onboarding_state`, so the wizard reported itself
+complete, and so did `GET /api/v1/sites` and `GET /api/v1/organizations`, because both resolve the
+tenant from the single organization ROW rather than from the account. Two whole test functions were
+green over it. Fixed by `omnion_identity::users::set_organization` (mirroring `set_status`) called
+beside the `onboarding_state` write.
+
+### Three harness defects, and a suite that was red on main
+
+`apps/api/tests/onboarding.rs` was failing on `main` before any of this: every cookie-authenticated
+POST sent no CSRF token, so the layer refused them `403 csrf_failed` **before the handler ran**, and
+all four tests measured a refusal while their comments described a working first run.
+
+1. `TestResponse.set_cookie` used `HeaderMap::get`, which answers the FIRST `Set-Cookie` header —
+   and a sign-in sends two, the CSRF token appended after the session. The token was structurally
+   invisible to the suite, which reported "the cookie is not set" about a cookie the server sent
+   every time. Now `get_all`.
+2. `direct_account` minted a session directly, bypassing the endpoints that set the CSRF cookie, so
+   it could only ever produce refused writes. It now derives the token through
+   `omnion_security::derive_csrf_token` with the config's secret — the function the layer checks,
+   not a copy of its shape — and panics with an explanation when run without `OMNION_CSRF_SECRET`.
+3. The intruder's write carried no CSRF token, so its `403` came from CSRF rather than from the
+   ownership check, and the assertion passed against the wrong refusal.
+
+### The seeder, and a precondition with no way to be met
+
+`run.sh` resets the database and then refuses to walk unless an organization exists. The only thing
+that created one was the browser's first-run wizard — the exact thing the wizard race does not
+always reach — so every pass aborted at the guard before measuring a screen. `scripts/qa/
+ensure-organization.mjs` now seeds the tenant over the API through the same endpoints the wizard
+calls, never by inserting rows: a SQL-inserted organization would satisfy the count while leaving
+`onboarding_state`, the membership row and the site row unwritten, which is precisely the failure
+the guard was added to catch.
+
+### Four harness defects in the seeder, in order
+
+1. `cookies` was assigned only in the sign-in branch and then set to `[]` in the other — so a fresh
+   database (the normal case) dropped the session and the next write answered 401
+   `unauthenticated`, which reads like a product refusal and was a missing assignment.
+2. It read `body.step` — **a field the status body does not have** — and compared it against the
+   words "organization"/"site"/"theme"/"complete". Every comparison was false, the "an owner
+   already exists" guard was true on a database with no owner, and the seeder went straight to
+   creating a site on an installation that still needed an organization. The API answered
+   `409 setup_incomplete`. A comparison against a field that cannot exist always takes the same
+   branch, and which branch depends entirely on what the unreachable branch did.
+3. `DEPLOYMENT_SCREENS` existed so the route list and the screens could not drift, and was
+   referenced by nothing but its own definition. A constant nothing reads is a list that will drift.
+   Replaced by a check that reads the route list.
+4. That check first matched `{ path: … }` anywhere in the source, so deleting
+   `/deployment/upgrade` from the desktop `routes` array left it green — the phone pass's
+   `mobileRoutes` array carries the same three paths and satisfied it. A check scoped to the whole
+   file is scoped to things its subject never said; the same defect REQ-128 already recorded for
+   the Helm NOTES check. Scoped to the `routes` block; all three mutations now refused.
+
+### Proof
+
+```text
+apps/admin tsc --noEmit                        clean, exit 0 — proven non-vacuous by a type error
+walkthrough.cjs node --check                   ok
+assertDeploymentScreensWalked                  3/3 mutations refused
+cargo test -p omnion-api --test onboarding     4 passed, 0 failed (fixed tree)
+                                               3 passed, 1 failed (fix removed — the new assertion)
+```
+
+The mutation is the load-bearing proof: the first version of the test change passed 4/4 **with the
+fix removed**, because the routes that "worked" resolve the tenant from the row and not from the
+account. The added assertion reads `users.organization_id` directly and is red on the mutated tree.
+
+**NOT claimed.** No QA browser pass has yet measured the three screens — the pass is running as
+this entry is written. `/deployment/artifacts/{version}` and the tag pipeline
+(`.github/workflows/release.yml`) are untouched since the server half. And the box is at 98% on the
+root filesystem with `/opt/omnion-w6-target` at 18 GB, so the next tick's budget is thin until
+someone else's caches come down.
+
+### Next
+
+Read the pass: the three depth passes, the screenshots, `summary.json`'s net failures grouped by URL
+— a count alone is not a verdict. Then the tag pipeline, then REQ-129 (migration safety), whose
+`unknown` verdict is what this screen currently has to render.

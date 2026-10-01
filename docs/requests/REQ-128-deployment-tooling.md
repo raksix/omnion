@@ -1,15 +1,6 @@
 # REQ-128 — Deployment Tooling (Docker, Compose, Kubernetes)
 
-> **Status:** in-progress (slice 4's SERVER half shipped: `crates/deployment` (decision layer +
->  store), `0199_deployment_tooling.sql`, nine routes, 33 unit tests, a 3/3 integration walk run
->  three times consecutively — `8cde4d19`. **Four product defects and four walk defects, all
->  found by running it**: an acknowledgement that SET before it cleared and so tripped its own
->  partial unique index (every acknowledgement answered 500 with a `duplicate key`); a compose
->  plan that accepted `helm` as a stack and then generated `docker compose` commands; a route
->  guarded with the uncatalogued `deployment.manage` — which refuses EVERY account including the
->  owner, and which every unit test stayed green through because none of them builds a router —
->  and a credential rule that fired on the compose stack's own `postgres://omnion@postgres/omnion`.
->  Still open in this slice: the four `/deployment/*` admin screens and the tag pipeline) · **Captured:** 2026-09-26 · **Layer:** infra + release
+> **Status:** in-progress (slice 4's SCREENS shipped — `0c849f3e`, `e913975b`. `/deployment/artifacts`, `/deployment/artifacts/{version}`, `/deployment/install` and `/deployment/upgrade` with their loading, empty, error, validation and populated states, keyboard bindings and 390px card layouts; `apps/admin/lib/deployment-api.ts` as the surface's own typed client; three walkthrough depth passes, three routes and a startup guard that refuses to run when a deployment screen is missing from the desktop route list. **The QA gate then found a defect bigger than the screens it was measuring**: onboarding wrote the new organization to `onboarding_state` and never to `users.organization_id`, so `scope::resolve_organization` answered `400 organization_required` on every org-scoped route of a fresh install — invisible because the wizard reads `onboarding_state` and so do `GET /sites` and `GET /organizations`, which resolve the tenant from the organization ROW. Fixed, and the regression assertion is proven load-bearing by removing the fix: `cargo test -p omnion-api --test onboarding` is 4/4 on the fixed tree and 3/4 without it. The suite was ALSO red on main before any of this, measuring `403 csrf_failed` refusals instead of behaviour, and its `TestResponse` captured only the FIRST `Set-Cookie` of the two a sign-in sends — so the CSRF token was structurally invisible to it. **NOT measured yet:** the browser pass is queued behind a live sibling pass, so the close gate stays unticked until it has actually visited all three screens) · **Captured:** 2026-09-26 · **Layer:** infra + release
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 
 ## Request
