@@ -81,11 +81,27 @@ pub fn mapping_for(resource_type: &str) -> Result<Mapping> {
 /// the row does not carry is simply absent from the map, and the diff renders it as an unset
 /// field — which is the truth for a `null` column and a lie for a missing one, so the
 /// applier's `changes_for` is the place that decides rather than this.
-pub async fn read_target(pool: &PgPool, resource_type: &str, resource_id: &str) -> Result<Value> {
+/// The snapshot, on a connection the caller owns.
+///
+/// **This is the reader.** [`read_target`] acquires a connection and calls it, and the
+/// change-set applier calls it on its own transaction — one implementation, so a preview the
+/// reviewer approved and the snapshot the write is derived from cannot disagree about which
+/// revision is current. That disagreement is precisely the bug the lateral join in
+/// [`PAGE_VALUES_SQL`] exists to prevent, and two copies of the reader is how it comes back.
+///
+/// # Errors
+///
+/// `Err(InvalidApproval)` for a resource type with no mapping, a non-uuid id, and a column the
+/// mapping names that this reader has no arm for.
+pub async fn read_target_on(
+    connection: &mut sqlx::PgConnection,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Value> {
     let mapping = mapping_for(resource_type)?;
     let id = parse_id(resource_id)?;
     let values = match resource_type {
-        "page" => page_values(pool, id, mapping).await?,
+        "page" => page_values(connection, id, mapping).await?,
         other => {
             // `mapping_for` already refused everything else, so this arm exists to satisfy the
             // compiler rather than to be reached.
@@ -95,6 +111,16 @@ pub async fn read_target(pool: &PgPool, resource_type: &str, resource_id: &str) 
         }
     };
     Ok(plan::snapshot(mapping, &values))
+}
+
+/// [`read_target_on`] on a pooled connection.
+///
+/// The `acquire` is the whole difference: this is the request-time reader, and it holds a
+/// pooled connection for exactly as long as the single statement it runs needs. Nothing here
+/// may re-derive the reader rather than delegating, or the two paths start agreeing by luck.
+pub async fn read_target(pool: &PgPool, resource_type: &str, resource_id: &str) -> Result<Value> {
+    let mut connection = pool.acquire().await?;
+    read_target_on(&mut connection, resource_type, resource_id).await
 }
 
 /// The columns a page's mapped fields live in, as the reader sees them.
@@ -114,10 +140,14 @@ const PAGE_VALUES_SQL: &str = "select p.slug as slug, p.status as status, \
      where p.id = $1";
 
 /// A page's mapped columns, as a map keyed by **column** name.
-async fn page_values(pool: &PgPool, id: Uuid, mapping: Mapping) -> Result<Map<String, Value>> {
+async fn page_values(
+    connection: &mut sqlx::PgConnection,
+    id: Uuid,
+    mapping: Mapping,
+) -> Result<Map<String, Value>> {
     let row: Option<PageRow> = sqlx::query_as(PAGE_VALUES_SQL)
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *connection)
         .await?;
     // A page with no revision row at all is not a page this build can preview: every content
     // field would read as empty, and the diff would offer to create content on a row that
@@ -171,13 +201,24 @@ struct PageRow {
 /// preview and decision cannot move the phrase out from under the reviewer — this function is
 /// what the *request* side calls.
 pub async fn read_label(pool: &PgPool, resource_type: &str, resource_id: &str) -> Result<String> {
+    let mut connection = pool.acquire().await?;
+    read_label_on(&mut connection, resource_type, resource_id).await
+}
+
+/// [`read_label`] on a connection the caller owns. One writer, for the reason
+/// [`read_target_on`] gives.
+pub async fn read_label_on(
+    connection: &mut sqlx::PgConnection,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<String> {
     let id = parse_id(resource_id)?;
     match resource_type {
         "page" => {
             let sql = "select slug from pages where id = $1";
             let slug: Option<String> = sqlx::query_scalar(sql)
                 .bind(id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *connection)
                 .await?;
             Ok(slug.unwrap_or_else(|| id.to_string()))
         }
@@ -238,13 +279,24 @@ pub async fn cascades_for(
     resource_type: &str,
     resource_id: &str,
 ) -> Result<Vec<Cascade>> {
+    let mut connection = pool.acquire().await?;
+    cascades_for_on(&mut connection, resource_type, resource_id).await
+}
+
+/// [`cascades_for`] on a connection the caller owns. One writer, for the reason
+/// [`read_target_on`] gives.
+pub async fn cascades_for_on(
+    connection: &mut sqlx::PgConnection,
+    resource_type: &str,
+    resource_id: &str,
+) -> Result<Vec<Cascade>> {
     let id = parse_id(resource_id)?;
     let cascades = match resource_type {
         "page" => {
             let revisions: i64 =
                 sqlx::query_scalar("select count(*) from page_revisions where page_id = $1")
                     .bind(id)
-                    .fetch_one(pool)
+                    .fetch_one(&mut *connection)
                     .await?;
             let translations: i64 = sqlx::query_scalar(
                 "select count(*) from translations \
@@ -253,7 +305,7 @@ pub async fn cascades_for(
             )
             .bind(PAGE_REVISION_RESOURCE)
             .bind(id)
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
             let mut out = Vec::new();
             if revisions > 0 {
@@ -293,6 +345,27 @@ pub async fn cascades_for(
 /// an approval for a deleted page has no target to diff against, and rendering it as "every
 /// field is new" is how a create is approved for a page that is already gone.
 pub async fn preview(pool: &PgPool, mapping: Mapping, op: &Operation) -> Result<Plan> {
+    let mut connection = pool.acquire().await?;
+    preview_on(&mut connection, mapping, op).await
+}
+
+/// [`preview`] on a connection the caller owns.
+///
+/// The same one-writer rule as [`read_target_on`]. It exists for the change-set applier, where
+/// the preview and the write must be computed from **one** snapshot: a preview read outside
+/// the transaction is a preview of a state that may already have moved, and the resulting
+/// `change` would describe a diff nobody ever approved.
+pub async fn preview_on(
+    connection: &mut sqlx::PgConnection,
+    mapping: Mapping,
+    op: &Operation,
+) -> Result<Plan> {
+    // `&mut`, and not a generic `Executor`, for a reason that cost a compile cycle to find:
+    // sqlx implements `Executor` for `&mut PgConnection` and **not** for `&PgConnection`, so
+    // the "one generic reader, callable from a pool or a transaction" shape that looks like
+    // the flexible answer is only reachable from a pool. The three reads below are sequential
+    // and each borrows the connection for its own statement, which is what a `&mut` is for.
+
     // A create has no row to read, so its base revision is the empty digest of an empty
     // snapshot — which is exactly what `revision_of_snapshot` produces, and which makes
     // "the target appeared between preview and decision" detectable for a create too.
@@ -304,16 +377,16 @@ pub async fn preview(pool: &PgPool, mapping: Mapping, op: &Operation) -> Result<
                 "an update or a delete must name the resource it acts on".to_owned(),
             ));
         }
-        let current = read_target(pool, &op.resource_type, &op.resource_id).await?;
+        let current = read_target_on(&mut *connection, &op.resource_type, &op.resource_id).await?;
         if current.as_object().is_none_or(|map| map.is_empty()) {
             return Err(AiHubError::InvalidApproval(format!(
                 "`{}` {} does not exist, so there is nothing to preview against",
                 op.resource_type, op.resource_id
             )));
         }
-        let label = read_label(pool, &op.resource_type, &op.resource_id).await?;
+        let label = read_label_on(&mut *connection, &op.resource_type, &op.resource_id).await?;
         let cascades = if op.kind == OpKind::Delete {
-            cascades_for(pool, &op.resource_type, &op.resource_id).await?
+            cascades_for_on(connection, &op.resource_type, &op.resource_id).await?
         } else {
             Vec::new()
         };
