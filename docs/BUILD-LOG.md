@@ -12067,3 +12067,61 @@ for the whole tick.
 **Next:** run the suite only with several GB free, and record a **completed** run before anything
 claims this suite is green. The three browser boxes still need a free slot:
 `QA_STACK=w4 QA_API_PORT=18083 QA_ADMIN_PORT=3103 QA_WEB_PORT=3203 bash scripts/qa/run.sh --only=crm`.
+
+### Tick 68 named the wrong variable, and tick 69 can say what the right one looks like (2026-10-01, w4 tick 69)
+
+Tick 68 left a careful table showing the same walk pair hanging and passing with no code change,
+and concluded from it that **free space on `/mnt/apopic` was the variable**. The table was good.
+The conclusion does not survive contact with this tick: the suite was run with **2.9 GB free** — a
+figure tick 68 recorded as green — and hung at a **different** test
+(`an_activity_of_another_organization_is_invisible`, 21 passed ahead of it, rather than
+`a_rule_on_a_deal_stage_change_runs_exactly_once`). Free space cannot be the explanation for a hang
+that moves when nothing about the disk moved.
+
+So this tick measured the hang instead of inferring it, and the signature is unambiguous:
+
+| measurement | value |
+|---|---|
+| main thread | `futex_do_wait` |
+| only runtime worker | `epoll_wait`, nothing to run |
+| CPU | **0.0%**, `utime`/`stime` **frozen** across 45 s |
+| `VmSwap` | **0 kB** (so not its own paging) |
+| blocking-pool threads | **none alive** |
+| `pg_stat_activity` for the suite's connections | **no active query at all** |
+| `Threads:` | 2 — a `#[tokio::test]` current-thread runtime |
+
+That last row ends the database story for good: the walk is not waiting on Postgres. It is waiting
+on something inside its own process, and it is waiting without consuming CPU, which is what a
+future nobody can wake looks like.
+
+The reproduction is the useful part, and it is **intermittent rather than deterministic** —
+`a_visibility_level_holds_on_any_key_of_the_family` → `an_activity_of_another_organization_is_invisible`:
+
+| run | result |
+|---|---|
+| alone | 18.10 s, ok |
+| the pair, run 1 | **200 s timeout** (rc 124) |
+| the pair, `--nocapture` | **28.95 s, 2 passed** |
+| the pair, run 2 | **200 s timeout** (rc 124) |
+| the pair, run 3 | killed at 108 s under the tick budget |
+
+A code deadlock is deterministic. This one passes and hangs on the same pair with no code change
+between the runs, so it is **contention**, and contention needs a contender: `load average`
+**15.8–17.1** on **6** cores, `/proc/pressure/io` `full avg10=14.42`, free RAM down to **128 MB**
+with 24 GB of swap in use, `/mnt/apopic` at **99%** — ten writers sharing one box. This suite is
+the most allocation-heavy thing on it: every walk builds a fresh organization, six accounts and a
+full IAM seed, and each password is an argon2 hash (`hash_password` → `spawn_blocking`, 19 MiB a
+time) against a database several suites share.
+
+**What is not claimed:** a defect in the CRM module, and not a "green suite". `cargo test -p
+omnion-module-crm --lib` is **172/172** and every walk passes when it runs. The full
+`omnion-api --test crm` suite reached **21/57** before the hang and is recorded as **not green**.
+
+**Gates:** `omnion-module-crm --lib` **172/172** · `pnpm typecheck` **2/2**. No acceptance box is
+ticked: the three open ones are browser-only and the QA slot was live-held by **w3** (pid 2914377,
+`cwd=/mnt/apopic/omnion-w3`) for the whole tick.
+
+**Next:** this suite needs a quiet box to be believed, not a cleverer diagnosis. When the slot
+frees, run it **first** and alone —
+`QA_STACK=w4 OMNION_DATABASE_URL=postgres://…@127.0.0.1:5444/omnion_qa_w4 cargo test -p omnion-api --test crm -- --test-threads=1`
+— unbuffered to a file, and treat one completed run as the only thing that makes it green.
