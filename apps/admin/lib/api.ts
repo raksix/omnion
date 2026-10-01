@@ -66,7 +66,10 @@ import type {
   DeploymentHistoryResponse,
   DeploymentJobResponse,
   DeploymentLogChunk,
+  DeploymentMaintenanceResponse,
+  DeploymentMaintenanceWindow,
   DeploymentPreflight,
+  DeploymentRollbackResponse,
   DeploymentHistoryRow,
   DeploymentRelease,
   DeploymentReleaseDetail,
@@ -6684,4 +6687,67 @@ export async function cancelDeployment(id: string): Promise<DeploymentCancelResp
 
 export async function runDeploymentCheck(): Promise<DeploymentCheckRunResponse> {
   return request<DeploymentCheckRunResponse>("/api/v1/deployment/checks/run", { method: "POST" });
+}
+
+/**
+ * Start a rollback to a previous version (REQ-024, slice 3).
+ *
+ * `reason` is not optional in the type, and that is the point: the server refuses an empty one
+ * and the `0211` constraint refuses the row, so a form that lets an operator submit a blank
+ * reason has a button that always fails.
+ */
+export async function startDeploymentRollback(input: {
+  environment: string;
+  toVersion: string;
+  reason: string;
+  backupFirst?: boolean;
+}): Promise<DeploymentRollbackResponse> {
+  return request<DeploymentRollbackResponse>(
+    `/api/v1/deployment/environments/${encodeURIComponent(input.environment)}/rollback`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        to_version: input.toVersion,
+        reason: input.reason,
+        // Sent explicitly so the panel's checkbox and the request cannot drift; the server's own
+        // default is also `true`, because the dangerous default is the one with no way back.
+        backup_first: input.backupFirst ?? true,
+      }),
+    },
+  );
+}
+
+/** Every environment's maintenance window. Polled by the screen and by the shell banner. */
+export async function fetchDeploymentMaintenance(): Promise<DeploymentMaintenanceResponse> {
+  return request<DeploymentMaintenanceResponse>("/api/v1/deployment/maintenance");
+}
+
+/**
+ * Save one environment's window.
+ *
+ * `scope` and the timestamps are sent as `null` when unset rather than omitted: the server
+ * treats a missing scope as "keep the stored one", and a form that omitted it would silently
+ * keep an old value the operator thought they had changed.
+ */
+export async function saveDeploymentMaintenance(input: {
+  environment: string;
+  enabled: boolean;
+  message: string;
+  startsAt?: string | null;
+  endsAt?: string | null;
+  scope?: string | null;
+}): Promise<DeploymentMaintenanceWindow> {
+  return request<DeploymentMaintenanceWindow>(
+    `/api/v1/deployment/maintenance/${encodeURIComponent(input.environment)}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        enabled: input.enabled,
+        message: input.message,
+        starts_at: input.startsAt ?? null,
+        ends_at: input.endsAt ?? null,
+        scope: input.scope ?? null,
+      }),
+    },
+  );
 }

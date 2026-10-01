@@ -3020,6 +3020,45 @@ export type DeploymentCancelResponse = {
   message: string;
 };
 
+/* ── REQ-024 slice 3: rollback and the maintenance window ─────────────────────────────────── */
+
+/**
+ * One environment's maintenance window.
+ *
+ * `active` is deliberately separate from `enabled`, and the two differ in the case that matters:
+ * a window scheduled for tomorrow is `enabled` and not `active`. A screen that showed only the
+ * toggle would tell an operator the promise is live when it is not — the one error this feature
+ * cannot make, because the operator is the one who relies on it.
+ */
+export type DeploymentMaintenanceWindow = {
+  environment: string;
+  enabled: boolean;
+  active: boolean;
+  message: string;
+  starts_at: string | null;
+  ends_at: string | null;
+  /** `all` or `admin`. */
+  scope: string;
+  updated_by: string | null;
+  /** `null` until somebody has configured this environment at all. */
+  updated_at: string | null;
+  max_message_length: number;
+};
+
+/** `GET /api/v1/deployment/maintenance`. */
+export type DeploymentMaintenanceResponse = {
+  windows: DeploymentMaintenanceWindow[];
+  /** Every window open right now, across all environments. What the shell banner renders. */
+  active: DeploymentMaintenanceWindow[];
+  max_message_length: number;
+};
+
+/** `POST /api/v1/deployment/environments/{environment}/rollback`. */
+export type DeploymentRollbackResponse = {
+  job: DeploymentJob;
+  message: string;
+};
+
 /** `GET /api/v1/deployment/environments`. */
 export type DeploymentEnvironmentsResponse = {
   environments: DeploymentEnvironmentCard[];

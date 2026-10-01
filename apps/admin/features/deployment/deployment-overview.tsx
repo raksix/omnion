@@ -26,7 +26,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import { ArrowRight, History, RefreshCw, Rocket, ScrollText, Undo2 } from "lucide-react";
+import { ArrowRight, History, RefreshCw, Rocket, ScrollText, Undo2, Wrench } from "lucide-react";
 import Link from "next/link";
 
 import { EmptyState } from "@/components/empty-state";
@@ -38,6 +38,8 @@ import {
   runDeploymentCheck,
 } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
+
+import { RollbackDialog, type RollbackTarget } from "./rollback-dialog";
 import type {
   DeploymentCheckRunResponse,
   DeploymentEnvironmentCard,
@@ -61,6 +63,10 @@ export function DeploymentOverview() {
   const [requestId, setRequestId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  // Which environment's rollback dialog is open, if any (REQ-024, slice 3). Held here rather
+  // than per-card so exactly one dialog can exist: two stacked modals is a screen where the
+  // operator confirms the wrong one.
+  const [rollback, setRollback] = useState<RollbackTarget | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -208,6 +214,16 @@ export function DeploymentOverview() {
               <History aria-hidden="true" className="size-3.5" />
               History
             </Link>
+            {/* The maintenance screen is reachable from the centre, not only from its own URL.
+                A screen that exists only where somebody typed its path is a screen nobody opens
+                in the moment they need it. */}
+            <Link
+              href="/deployment/maintenance"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium hover:bg-quiet-soft"
+            >
+              <Wrench aria-hidden="true" className="size-3.5" />
+              Maintenance
+            </Link>
             <button
               type="button"
               onClick={() => void runCheck()}
@@ -251,16 +267,28 @@ export function DeploymentOverview() {
       ) : (
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
           {data?.environments.map((card) => (
-            <EnvironmentCard key={card.environment} card={card} />
+            <EnvironmentCard key={card.environment} card={card} onRollback={setRollback} />
           ))}
         </div>
       )}
+
+      {/* The rollback dialog, mounted once for the whole page (REQ-024, slice 3). It closes into
+          the history screen, so the operator's next question — "what happened to it" — is one
+          click away rather than three. */}
+      <RollbackDialog target={rollback} onClose={() => setRollback(null)} />
     </div>
   );
 }
 
 /** One environment card. */
-function EnvironmentCard({ card }: { card: DeploymentEnvironmentCard }) {
+function EnvironmentCard({
+  card,
+  onRollback,
+}: {
+  card: DeploymentEnvironmentCard;
+  /** Opens the rollback dialog for this card's environment (REQ-024, slice 3). */
+  onRollback: (target: RollbackTarget) => void;
+}) {
   const tooltip = [
     card.checked_at ? `Last probe ${formatTimestamp(card.checked_at)}` : "No probe has run yet",
     card.failing_probe,
@@ -363,18 +391,32 @@ function EnvironmentCard({ card }: { card: DeploymentEnvironmentCard }) {
           </span>
         )}
 
-        <span
-          aria-disabled="true"
-          title={
-            card.rollback
-              ? `Rollback to ${card.rollback.to_version} — the flow arrives with slice 3.`
-              : "No previous known-good version to roll back to."
-          }
-          className="inline-flex cursor-not-allowed items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-muted opacity-60"
-        >
-          <Undo2 aria-hidden="true" className="size-3.5" />
-          Rollback
-        </span>
+        {/* A live `Rollback` needs somewhere to roll back *to*, and only the card's own
+            `rollback` object knows it — derived server-side from the last deploy's
+            `from_version`. With no previous known-good version there is nothing to offer, and
+            the button says so instead of opening a dialog with an empty target. */}
+        {card.rollback ? (
+          <button
+            type="button"
+            onClick={() => onRollback({ environment: card.environment, toVersion: card.rollback!.to_version })}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-ink hover:bg-panel"
+          >
+            <Undo2 aria-hidden="true" className="size-3.5" />
+            Rollback
+          </button>
+        ) : (
+          <span
+            aria-disabled="true"
+            title={
+              "No previous known-good version to roll back to. This environment has only " +
+              "ever been deployed once, so there is nothing before the current version."
+            }
+            className="inline-flex cursor-not-allowed items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12.5px] font-medium text-muted opacity-60"
+          >
+            <Undo2 aria-hidden="true" className="size-3.5" />
+            Rollback
+          </span>
+        )}
 
         <Link
           href={`/deployment/history?environment=${encodeURIComponent(card.environment)}`}
