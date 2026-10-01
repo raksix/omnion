@@ -148,13 +148,32 @@ pub enum Validator<'a> {
         /// File id, used when there is no checksum.
         id: Uuid,
     },
+    /// A body that already carries its own validator; this layer must not invent a second one.
+    ///
+    /// Added by the media merge. The public file path runs **main's** conditional machinery
+    /// (a `weak` ETag derived from the checksum plus a `Last-Modified` date) and **my** cache
+    /// layer, and both wrote `ETag` on the same response. Whichever wrote last won, and the
+    /// two derivations are not the same string — so a client that revalidated against the
+    /// `ETag` one of them reported was compared against the other, and never matched. It
+    /// surfaces as a media file that re-downloads on every request, which reads as "caching
+    /// does not work" rather than as two layers disagreeing.
+    ///
+    /// So the file path answers its own conditional request *before* the policy is applied and
+    /// hands the rest of the work here: the cache layer then only writes what it owns
+    /// (`Cache-Control`, `Vary`, `surrogate-key`) and leaves the validator it finds in place.
+    /// Keeping one derivation per response is worth more than letting this layer be the single
+    /// place a validator comes from, because the conditional machinery has to stay next to the
+    /// `Range` logic that shares its instant.
+    Preserved,
 }
 
 impl Validator<'_> {
-    fn etag(&self) -> String {
+    /// The validator to advertise, or `None` to keep the one the body already carries.
+    fn etag(&self) -> Option<String> {
         match self {
-            Validator::Page { revision_no, body } => etag_for_page(*revision_no, body),
-            Validator::File { checksum, id } => etag_for_file(checksum, *id),
+            Validator::Page { revision_no, body } => Some(etag_for_page(*revision_no, body)),
+            Validator::File { checksum, id } => Some(etag_for_file(checksum, *id)),
+            Validator::Preserved => None,
         }
     }
 }
@@ -175,8 +194,16 @@ pub fn apply(
     validator: Validator<'_>,
     request_headers: &HeaderMap,
 ) -> Response<Body> {
-    let etag = validator.etag();
     let mut response = response;
+    // A `Preserved` body already advertised its own validator; read it back rather than
+    // deriving a second, because the header on the wire is what a client revalidates against
+    // and two derivations of "the same" file are two different strings.
+    let carried = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let etag = validator.etag().or(carried);
     let headers = response.headers_mut();
 
     for (name, value) in headers_for(&policy.decision) {
@@ -204,16 +231,24 @@ pub fn apply(
     if let Ok(value) = HeaderValue::from_str(&policy.tags.join(" ")) {
         headers.insert(HeaderName::from_static("surrogate-key"), value);
     }
-    if let Ok(value) = HeaderValue::from_str(&etag) {
+    if let Some(etag) = &etag
+        && let Ok(value) = HeaderValue::from_str(etag)
+    {
         headers.insert(header::ETAG, value);
     }
 
     // The conditional request is answered against the validator that was just written, so
-    // the two can never disagree about what this response is.
-    let revalidated = request_headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| if_none_match_hits(value, &etag))
+    // the two can never disagree about what this response is. A body that carried no
+    // validator at all revalidates to nothing: this layer did not produce one, and inventing
+    // a comparison against an absent `ETag` would answer `304` for a `200` nobody can check.
+    let revalidated = etag
+        .as_deref()
+        .and_then(|etag| {
+            request_headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| if_none_match_hits(value, etag))
+        })
         .unwrap_or(false);
 
     if revalidated {
@@ -479,6 +514,63 @@ mod tests {
             header(&response, "etag").as_deref(),
             Some(format!("\"{checksum}\"").as_str())
         );
+    }
+
+    #[test]
+    fn a_preserved_validator_is_the_one_the_body_carried() {
+        // The merge case, restated as a unit test because the failure it prevents is silent:
+        // a file response reaches this layer already carrying the weak ETag the conditional
+        // machinery derived, and re-deriving one here would overwrite it with a *strong* tag
+        // of the same checksum. The client would revalidate against the tag it was given and
+        // be told no, forever, with nothing in the logs to say why.
+        let carried = "W/\"b".to_string() + &"b".repeat(63) + "\"";
+        let mut response = body();
+        response
+            .headers_mut()
+            .insert(header::ETAG, HeaderValue::from_str(&carried).expect("a valid tag"));
+
+        let response = apply(
+            response,
+            &cacheable(),
+            Validator::Preserved,
+            &HeaderMap::new(),
+        );
+        assert_eq!(
+            header(&response, "etag").as_deref(),
+            Some(carried.as_str()),
+            "the cache layer must not replace a validator the body already published"
+        );
+    }
+
+    #[test]
+    fn a_preserved_validator_still_answers_its_own_conditional_request() {
+        let carried = "W/\"preserved\"";
+        let request = headers_of(&[("if-none-match", carried)]);
+        let mut response = body();
+        response
+            .headers_mut()
+            .insert(header::ETAG, HeaderValue::from_static("W/\"preserved\""));
+
+        let response = apply(response, &cacheable(), Validator::Preserved, &request);
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "revalidating against the carried tag must reach the same body as before"
+        );
+        assert_eq!(header(&response, "etag").as_deref(), Some(carried));
+    }
+
+    #[test]
+    fn a_body_with_no_validator_is_not_revalidated_against_nothing() {
+        // The counterpart of the case above: with nothing to compare, this layer must leave the
+        // response alone. Answering `304` because the header was *absent* would drop a body a
+        // client never claimed to have.
+        let response = apply(body(), &cacheable(), Validator::Preserved, &headers_of(&[(
+            "if-none-match",
+            "\"anything\"",
+        )]));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, "etag"), None);
     }
 
     #[test]

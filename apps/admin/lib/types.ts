@@ -769,6 +769,7 @@ export type MediaFilters = {
   max_bytes?: number;
   uploaded_by?: string;
   tag?: string;
+  metadata?: string;
   scan_status?: string;
   has_versions?: boolean;
   sort?: string;

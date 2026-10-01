@@ -912,6 +912,13 @@ impl From<MediaError> for ApiError {
                 Self::bad_request("invalid_retention_setting", reason)
                     .with_details(serde_json::json!({ "field": field }))
             }
+            // Same rule for the custom metadata pairs, with its own code: the pair editor puts
+            // the message under the row that caused it, and `metadata.<key>` means a refusal
+            // about a licence number cannot land under the campaign field beside it.
+            MediaError::InvalidMetadata { field, reason } => {
+                Self::bad_request("invalid_metadata", reason)
+                    .with_details(serde_json::json!({ "field": field }))
+            }
             // A missing policy is a `404`, and the tenancy scope lives *inside* the lookup
             // rather than being applied afterwards — the same lesson `media_grants::delete_one`
             // learned from a walk that got a `403` for another tenant's grant id and thereby
