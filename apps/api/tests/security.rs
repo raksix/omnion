@@ -305,6 +305,83 @@ async fn create_organization_row(db: &Db, name: &str) -> Uuid {
         .expect("the test organization must be created")
 }
 
+/// A real loopback address for this walk, with a per-walk port **and IP**.
+///
+/// Not shared, and not absent. `ClientAddress` and the rate-limit middleware both read
+/// `ConnectInfo<SocketAddr>` out of the request extensions, so a request driven straight through
+/// `oneshot()` arrives with **no** address — which is not a neutral default: the per-address
+/// refusal cannot run, so a brute-force walk silently skips the rule it is measuring.
+///
+/// **The IP is drawn too, not just the port, and that is the part that matters.** Varying the port
+/// alone does NOT isolate a walk from its neighbours: the ACCOUNT rule this walk measures is
+/// account-scoped, but the ADDRESS rule it must *not* trip reads `recent_failures_from_address`,
+/// which keys on the IP alone and ignores the port entirely. Every walk in a file that varies only
+/// the port therefore shares one address budget, and a walk that guesses a dozen passwords spends
+/// the budget its neighbours are still asserting against. This was found the hard way: halving the
+/// enforced address limit (the document's own threshold of 5 against the legacy 10) turned three
+/// unrelated auth walks red with `address_blocked` from 127.0.0.1 — failures that pointed at the
+/// sign-in path and had nothing to do with it. The second octet is what separates the counters.
+fn peer_address() -> String {
+    // `as_u128` rather than `simple()` — the latter is a Display formatter, not a value.
+    let draw = Uuid::new_v4().as_u128();
+    format!("127.{}.{}.{}", 1 + (draw % 200) as u8, 0 + ((draw >> 8) % 250) as u8, 1 + ((draw >> 16) % 250) as u8)
+}
+
+/// An account whose **password** is what the walk drives, rather than a pre-made session.
+///
+/// The existing [`account`] helper hands back a session credential, which is the right shape for
+/// a permission walk and the wrong one here: this walk has to guess a password and be refused, so
+/// it needs the address and the password, not a session that would sail past the very layer under
+/// test.
+async fn login_account(
+    harness: &Harness,
+    organization_id: Option<Uuid>,
+) -> (Uuid, String, String) {
+    let email = format!("lockout-{}@omnion.test", Uuid::new_v4().simple());
+    let user = users::create_user(
+        harness.db.pool(),
+        NewUser {
+            email: email.clone(),
+            password: PASSWORD.to_owned(),
+            display_name: "Lockout Walk".to_owned(),
+            organization_id,
+        },
+    )
+    .await
+    .expect("the account must be created");
+    (user.id, email, PASSWORD.to_owned())
+}
+
+/// One `POST /auth/login`, from a named peer address.
+///
+/// The request goes through `request` (so the credential packing stays in one place) and then has
+/// the peer inserted into its extensions, which is what `call` cannot do for a caller that needs
+/// a specific address.
+async fn login_from(
+    harness: &Harness,
+    peer: &str,
+    email: &str,
+    password: &str,
+) -> TestResponse {
+    let payload = json!({ "email": email, "password": password }).to_string();
+    let builder = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json");
+    let (mut parts, body) = builder
+        .body(Body::from(payload))
+        .expect("request must build")
+        .into_parts();
+    if let Ok(address) = peer.parse::<std::net::SocketAddr>() {
+        parts
+            .extensions
+            .insert(axum::extract::ConnectInfo(address));
+    }
+    harness
+        .call(Request::from_parts(parts, body))
+        .await
+}
+
 // ---------------------------------------------------------------------------------------------
 // The walks
 // ---------------------------------------------------------------------------------------------
@@ -344,6 +421,18 @@ const SURFACE: &[(&str, Method, &str, &str)] = &[
         Method::GET,
         "security.read",
         "read",
+    ),
+    (
+        "/api/v1/security/ip-rules",
+        Method::GET,
+        "security.read",
+        "read",
+    ),
+    (
+        "/api/v1/security/ip-rules/test",
+        Method::POST,
+        "security.read",
+        "write",
     ),
     (
         "/api/v1/security/sign-in-protection/probe",
@@ -579,6 +668,595 @@ async fn the_full_holder_passes_the_guard_on_every_route() {
             response.text
         );
     }
+
+    harness.dispose().await;
+}
+
+/// The number on `/security/sign-in-protection` is the number that locks an account (REQ-012).
+///
+/// **This walk exists because the screen and the request path disagreed while every test in the
+/// platform stayed green.** The sign-in-protection screen edits `security_settings.lockout`. The
+/// sign-in path locked accounts from `security_policies.lockout_attempts` — a different table,
+/// from a different migration, with a different default (10). Four of the six fields an operator
+/// tunes (`window_seconds`, `progressive_delay`, `base_delay_seconds`, `reset_on_success`) had
+/// **no reader anywhere on the request path** at all.
+///
+/// That is why the assertion is not "a lock happens". `tests/auth.rs` already proves that, and
+/// it passed with the defect in place. This walk is: **save a threshold through the screen's own
+/// route, then count the wrong passwords it takes to lock.** Two implementations of one policy
+/// can only be told apart at the attempt where their numbers differ.
+///
+/// Three choices, each of which could otherwise have made this walk pass for the wrong reason:
+///
+/// * **The document is written through `PUT /security/sign-in-protection`,** not by an `update`
+///   on the column. Writing the column directly would prove only that the column is read, and
+///   would leave a broken save route green.
+/// * **The IAM row is seeded to a number that contradicts the document** (10 against a tuned 3),
+///   and the contradiction is *asserted* rather than assumed. Without that assertion a run in
+///   which both numbers happened to coincide would pass silently.
+/// * **The guesses go through `POST /auth/login` on the real router** rather than through
+///   `signin::sign_in` directly, because the two differ in exactly the place that matters: the
+///   limiter middleware and the route are what decide whether the account layer is reached at
+///   all.
+#[tokio::test]
+async fn the_threshold_on_the_screen_is_the_threshold_that_locks() {
+    let Some(harness) = Harness::fresh().await else {
+        return;
+    };
+
+    let organization_id = create_organization_row(&harness.db, "Enforced threshold").await;
+
+    // The legacy IAM document, seeded with its table default — the number the sign-in path used
+    // to read. The walk asserts it differs from the number saved below; that difference is the
+    // whole reason the assertion has any power.
+    let legacy_attempts: i32 = sqlx::query_scalar(
+        "insert into security_policies (organization_id) values ($1) \
+         returning lockout_attempts",
+    )
+    .bind(organization_id)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the IAM policy row must be created");
+    assert_eq!(
+        legacy_attempts, 10,
+        "the IAM column default is what made the two documents disagree; if this ever changes, \
+         this walk's premise needs re-reading rather than re-tuning"
+    );
+
+    // The account whose lockout is measured, and the operator who tunes the policy. Two
+    // accounts on purpose: the one being locked must not be the one holding the permission, or a
+    // walk that signed in as the wrong account would be measuring itself.
+    let (victim, victim_email, victim_password) = login_account(&harness, Some(organization_id)).await;
+    let (operator_id, operator_token) = account(&harness, Some(organization_id)).await;
+    // Both keys, deliberately: the probe is `security.read` while the save is
+    // `security.manage`. Granting only the write key looked tidier and then read as a broken
+    // tester at the very end of the walk — the refusal was correct and the walk was wrong. The
+    // permission catalogue is what decides this, so the grant follows the route table.
+    grant(
+        &harness,
+        operator_id,
+        organization_id,
+        &["security.read", "security.manage"],
+    )
+    .await;
+
+    let tuned_attempts = 3;
+    assert_ne!(
+        tuned_attempts, legacy_attempts,
+        "the document must contradict the legacy column, or this walk proves nothing"
+    );
+
+    // Saved through the route the screen calls, so a broken save cannot pass this walk.
+    let saved = harness
+        .call(put(
+            "/api/v1/security/sign-in-protection",
+            json!({
+                "window_seconds": 900,
+                "attempts": tuned_attempts,
+                "lockout_minutes": 15,
+                "progressive_delay": true,
+                "base_delay_seconds": 2,
+                "reset_on_success": true,
+            }),
+            Some(&operator_token),
+        ))
+        .await;
+    assert_eq!(
+        saved.status,
+        StatusCode::OK,
+        "the screen's own save route must accept the document: {}",
+        saved.text
+    );
+    assert_eq!(
+        saved.body["policy"]["attempts"], tuned_attempts,
+        "the saved document must read back the tuned number: {}",
+        saved.text
+    );
+
+    // Walk to the lock and count the attempts. The limiter's own counter is cleared before each
+    // one so the ACCOUNT layer is what answers: the `sign_in` scope's ceiling and a threshold of
+    // three are not the same rule, and a test that let the limiter answer would be measuring the
+    // wrong layer while reading as a lockout.
+    let peer = peer_address();
+    let redis = harness.state.redis().clone();
+    redis
+        .connection()
+        .await
+        .expect("the shared Redis must answer before this walk starts guessing");
+    let sign_in_policy = omnion_security::RatePolicy::defaults()
+        .into_iter()
+        .find(|policy| policy.scope == "sign_in")
+        .expect("the sign_in policy must exist in the defaults");
+    let limiter_client = omnion_security::ClientId {
+        user_id: None,
+        ip: peer.parse::<std::net::SocketAddr>().ok().map(|address| address.ip()),
+    };
+
+    let mut locked_at: Option<u32> = None;
+    for attempt in 1..=12_u32 {
+        let _ = omnion_security::forget(
+            &redis,
+            &sign_in_policy,
+            &limiter_client,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await;
+        let response = login_from(&harness, &peer, &victim_email, "definitely-not-the-password").await;
+        match response.body["error"]["code"].as_str() {
+            Some("account_locked") => {
+                locked_at = Some(attempt);
+                break;
+            }
+            // `invalid_credentials` is the correct answer for every attempt *before* the
+            // threshold, so it is the walk's expected middle, not a failure. The limiter may
+            // answer instead if its clear lost the race; both are retried rather than asserted on,
+            // because the assertion below is about *which document decides*, and `locked_at` is
+            // the only number this walk actually claims.
+            Some("invalid_credentials") | Some("rate_limited") => continue,
+            Some(other) => panic!(
+                "attempt {attempt} answered {other:?}; a wrong password must answer \
+                 invalid_credentials until the account locks: {}",
+                response.text
+            ),
+            None => panic!(
+                "attempt {attempt} SUCCEEDED with a wrong password: {}",
+                response.text
+            ),
+        }
+    }
+
+    assert_eq!(
+        locked_at,
+        Some(tuned_attempts as u32),
+        "the document saved on the screen says {tuned_attempts} failures lock an account, and the \
+         account locked after a different number. The sign-in path is reading \
+         security_policies.lockout_attempts ({legacy_attempts}) instead of the document the \
+         operator edited."
+    );
+
+    // And the account is genuinely locked, read from the row rather than inferred from the
+    // refusal: a response code and a stored lock are two different claims.
+    let (locked_until, counter): (Option<time::OffsetDateTime>, i32) = sqlx::query_as(
+        "select locked_until, failed_sign_in_count from users where id = $1",
+    )
+    .bind(victim)
+    .fetch_one(harness.db.pool())
+    .await
+    .expect("the account row must be readable");
+    assert!(
+        locked_until.is_some_and(|until| until > time::OffsetDateTime::now_utc()),
+        "the lock must be in the future, not a timestamp in the past"
+    );
+    assert_eq!(
+        counter, tuned_attempts,
+        "the account's own counter must show the failures that were counted, so the panel's \
+         'currently locked' row explains itself"
+    );
+
+    // The probe on the same screen must agree with what the sign-in path just did. This is the
+    // tester's whole contract, and it is checked against a REAL locked account rather than a
+    // hand-built count: a tester that agreed with the screen and disagreed with the platform is
+    // the exact failure this walk's first half is about.
+    let probed = harness
+        .call(post(
+            "/api/v1/security/sign-in-protection/probe",
+            json!({ "user_id": victim }),
+            Some(&operator_token),
+        ))
+        .await;
+    assert_eq!(
+        probed.status,
+        StatusCode::OK,
+        "the tester must read the locked account: {}",
+        probed.text
+    );
+    assert_eq!(
+        probed.body["would_lock"], true,
+        "the tester says the account would not lock, and it is locked: {}",
+        probed.text
+    );
+    assert_eq!(
+        probed.body["attempts_remaining"], 0,
+        "a locked account has no attempts left: {}",
+        probed.text
+    );
+
+    let _ = victim_password;
+    harness.dispose().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice 4: the IP access list on the request path
+// ---------------------------------------------------------------------------------------------
+
+/// A request that presents itself as coming from `address`.
+///
+/// The access layer reads the peer address out of the `ConnectInfo` extension — the same source
+/// the rate limiter uses — so the walk has to install that extension or it would be testing the
+/// `ip_unknown` branch (which refuses too, for the wrong reason). This is the detail that makes
+/// the difference between a walk that proves a CIDR is refused and one that proves requests
+/// without an address are refused.
+fn from_address(mut request: Request<Body>, address: std::net::IpAddr) -> Request<Body> {
+    use axum::extract::ConnectInfo;
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(std::net::SocketAddr::new(address, 40_000)));
+    request
+}
+
+fn address(text: &str) -> std::net::IpAddr {
+    text.parse().expect("a fixture address must parse")
+}
+
+/// **The criterion: a denied CIDR cannot reach the API.**
+///
+/// Every other part of slice 4 is a table, a form and a route. This is the walk that would fail
+/// if any of them were inert: a deny rule is written through the panel's own `POST`, and a real
+/// request from inside that network is driven over the router — not the evaluator called directly,
+/// not a unit test — and must come back refused, with the rule named in the body.
+///
+/// Two halves that are different from each other, because either alone would pass for the wrong
+/// reason:
+///
+/// * The refusal must be **`ip_denied` naming the rule**, not `ip_unknown` and not the route's
+///   own permission `403`. A request from an address *inside* a denied network and a request with
+///   no address at all are both refused by the same layer; only the first proves the rule.
+/// * The same request from *outside* the network must be served, proving the rule narrows rather
+///   than the screen breaking everything — a layer that refused every caller would satisfy the
+///   first half of this assertion on its own.
+#[tokio::test]
+async fn a_denied_network_cannot_reach_the_api() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "IP Access").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(
+        &harness,
+        operator_id,
+        organization,
+        &["security.read", "security.manage", "security.ip.manage"],
+    )
+    .await;
+
+    let inside = address("203.0.113.7");
+    let outside = address("198.51.100.7");
+    // A third address no rule covers, for the calls made *after* the self-blocking rule
+    // exists. It stands for the operator who noticed they had locked themselves out and walked
+    // to the CLI — see the note on the removal below.
+    let elsewhere = address("192.0.2.7");
+
+    // The premise, asserted rather than assumed: before the rule exists, the request is served.
+    // A walk that only checked the "after" would pass just as well if the route were refusing
+    // everything for some unrelated reason.
+    let before = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        before.status,
+        StatusCode::OK,
+        "the premise: nothing is denied yet, so this must be served: {}",
+        before.text
+    );
+
+    // The rule is written through the panel's own endpoint — not inserted with SQL — so the walk
+    // also covers the route, the audit row and the event.
+    let created = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules",
+                json!({
+                    "kind": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "note": "the walk's own denied network",
+                }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the rule must be created: {}",
+        created.text
+    );
+    assert_eq!(created.body["rule"]["cidr"], "203.0.113.0/24");
+    assert_eq!(created.body["rule"]["kind"], "deny");
+
+    // Now the criterion.
+    let denied = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        denied.status,
+        StatusCode::FORBIDDEN,
+        "a request from inside the denied network must be refused: {}",
+        denied.text
+    );
+    assert_eq!(
+        denied.body["error"]["code"], "ip_denied",
+        "the refusal must come from the access list and not from some other guard: {}",
+        denied.text
+    );
+    assert!(
+        denied.body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("203.0.113.0/24")),
+        "the refusal must name the rule, or the operator cannot remove it: {}",
+        denied.text
+    );
+
+    // The other half: everything outside the network is still served. Without this, a layer that
+    // refused every caller would satisfy the assertions above.
+    let served = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        served.status,
+        StatusCode::OK,
+        "a request from outside the denied network must still be served: {}",
+        served.text
+    );
+
+    // And the rule is listed, so the screen shows what is doing the refusing.
+    let listed = harness
+        .call(from_address(
+            get("/api/v1/security/ip-rules", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text);
+    assert_eq!(listed.body["deny_count"], 1, "{}", listed.text);
+
+    // The tester answers the same question the layer does, for the same address.
+    let tested = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules/test",
+                json!({ "address": "203.0.113.7" }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(tested.status, StatusCode::OK, "{}", tested.text);
+    assert_eq!(
+        tested.body["blocked"], true,
+        "the tester must agree with the layer: {}",
+        tested.text
+    );
+    assert_eq!(tested.body["decision"], "deny", "{}", tested.text);
+    assert_eq!(
+        tested.body["matched_rule"]["cidr"], "203.0.113.0/24",
+        "the tester must name the rule it matched: {}",
+        tested.text
+    );
+
+    // The self-lockout warning. This half of the criterion is a *different* claim from the
+    // refusal above — that a rule which blocks the caller is stored and warned about rather than
+    // refused — and it needs its own rule, because the rule written above deliberately does NOT
+    // cover this session's address (that is what let the walk keep driving requests at all).
+    let self_blocking = harness
+        .call(from_address(
+            post(
+                "/api/v1/security/ip-rules",
+                json!({
+                    "kind": "deny",
+                    // 198.51.100.0/24 is the address the walk is calling from.
+                    "cidr": "198.51.100.0/24",
+                    "note": "the walk's own address, deliberately",
+                }),
+                Some(&operator),
+            ),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        self_blocking.status,
+        StatusCode::CREATED,
+        "a rule that blocks the caller must still be saved: {}",
+        self_blocking.text
+    );
+    assert_eq!(
+        self_blocking.body["blocks_you"], true,
+        "the response must say the rule covers this session: {}",
+        self_blocking.text
+    );
+    assert!(
+        self_blocking.body["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("198.51.100.0/24")),
+        "the warning must name the network that is about to refuse this session: {}",
+        self_blocking.text
+    );
+
+    // And the warning was honest: the very next request from that address is refused.
+    let caught = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            outside,
+        ))
+        .await;
+    assert_eq!(
+        caught.status,
+        StatusCode::FORBIDDEN,
+        "the warning promised this; the layer must keep the promise: {}",
+        caught.text
+    );
+
+    // Remove it, so the rest of the walk is not run from a locked-out session.
+    let self_rule_id = self_blocking.body["rule"]["id"]
+        .as_str()
+        .expect("the created rule must carry an id")
+        .to_owned();
+    let removed_self = harness
+        .call(from_address(
+            request(
+                Method::DELETE,
+                &format!("/api/v1/security/ip-rules/{self_rule_id}"),
+                Some(&operator),
+                None,
+            ),
+            // Driven from a third address, and the reason is worth recording. The rule this
+            // walk just created covers `outside`, so a request from there would be refused
+            // before the layer reached the route — which is the feature working correctly, and
+            // not what the assertion is about. It is also the real operator experience: once a
+            // deny covers your own address, you cannot remove it from the panel, and the only
+            // way back is another network or the CLI. The REQ's risk note asks for exactly that
+            // escape to keep working, and this is the walk that keeps it honest.
+            elsewhere,
+        ))
+        .await;
+    assert_eq!(removed_self.status, StatusCode::NO_CONTENT, "{}", removed_self.text);
+
+    // Removing the rule restores the address on the *next* request, not at the next boot.
+    let rule_id = created.body["rule"]["id"]
+        .as_str()
+        .expect("the created rule must carry an id")
+        .to_owned();
+    let deleted = harness
+        .call(from_address(
+            request(Method::DELETE, &format!("/api/v1/security/ip-rules/{rule_id}"), Some(&operator), None),
+            elsewhere,
+        ))
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.text);
+
+    let restored = harness
+        .call(from_address(
+            get("/api/v1/security/overview", Some(&operator)),
+            inside,
+        ))
+        .await;
+    assert_eq!(
+        restored.status,
+        StatusCode::OK,
+        "removing the rule must take effect now, not at the next restart: {}",
+        restored.text
+    );
+
+    harness.dispose().await;
+}
+
+/// A malformed CIDR is refused with a message that names the field's input, for both families.
+#[tokio::test]
+async fn a_malformed_cidr_is_refused_with_a_field_level_message() {
+    let Some(harness) = Harness::fresh().await else {
+        eprintln!("skipping: no live database is configured");
+        return;
+    };
+
+    let organization = create_organization_row(&harness.db, "IP Validation").await;
+    let (operator_id, operator) = account(&harness, Some(organization)).await;
+    grant(&harness, operator_id, organization, &["security.ip.manage"]).await;
+
+    for (cidr, why) in [
+        ("not-an-ip", "not an address"),
+        ("203.0.113.0/33", "a v4 prefix past 32"),
+        ("2001:db8::/129", "a v6 prefix past 128"),
+        ("203.0.113.1/8", "host bits set outside the prefix"),
+        ("", "empty"),
+    ] {
+        let refused = harness
+            .call(post(
+                "/api/v1/security/ip-rules",
+                json!({ "kind": "deny", "cidr": cidr, "note": "validation walk" }),
+                Some(&operator),
+            ))
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::BAD_REQUEST,
+            "{cidr:?} ({why}) must be refused: {}",
+            refused.text
+        );
+        assert_eq!(refused.body["error"]["code"], "invalid_security_input");
+    }
+
+    // The two forms that are *not* errors, so the refusals above cannot be an artefact of a
+    // parser that refuses everything.
+    for (cidr, stored) in [
+        ("203.0.113.0/24", "203.0.113.0/24"),
+        ("203.0.113.7", "203.0.113.7/32"),
+        ("2001:db8::/32", "2001:db8::/32"),
+    ] {
+        let created = harness
+            .call(post(
+                "/api/v1/security/ip-rules",
+                json!({ "kind": "deny", "cidr": cidr, "note": "accepted form" }),
+                Some(&operator),
+            ))
+            .await;
+        assert_eq!(
+            created.status,
+            StatusCode::CREATED,
+            "{cidr:?} is valid and must be accepted: {}",
+            created.text
+        );
+        assert_eq!(created.body["rule"]["cidr"], stored);
+    }
+
+    // A note is required, for the reason the migration's check constraint gives.
+    let blank = harness
+        .call(post(
+            "/api/v1/security/ip-rules",
+            json!({ "kind": "deny", "cidr": "198.51.100.0/24", "note": "   " }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        blank.status,
+        StatusCode::BAD_REQUEST,
+        "an unexplained rule must be refused: {}",
+        blank.text
+    );
+
+    // The same network twice is refused rather than silently replacing the first.
+    let duplicate = harness
+        .call(post(
+            "/api/v1/security/ip-rules",
+            json!({ "kind": "deny", "cidr": "203.0.113.0/24", "note": "second try" }),
+            Some(&operator),
+        ))
+        .await;
+    assert_eq!(
+        duplicate.status,
+        StatusCode::BAD_REQUEST,
+        "a duplicate must be refused, not silently upserted: {}",
+        duplicate.text
+    );
 
     harness.dispose().await;
 }

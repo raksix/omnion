@@ -1725,6 +1725,58 @@ export type LockedAccountsPage = {
   total: number;
 };
 
+// -- REQ-012 slice 4: the IP access lists -------------------------------------------------
+
+/** One row of `/security/ip-access`, as the server sends it. */
+export type IpRule = {
+  id: string;
+  kind: "allow" | "deny";
+  cidr: string;
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  expires_at: string | null;
+  /** Whether the rule is past its expiry right now. Expired rules stay visible rather than
+   *  disappearing: a rule that vanishes is a rule nobody knows they have. */
+  expired: boolean;
+};
+
+/** Both lists and the two counts the summary line shows. */
+export type IpRulesPage = {
+  rules: IpRule[];
+  deny_count: number;
+  allow_count: number;
+};
+
+/** The create form's payload. `expires_at` is RFC 3339 or null. */
+export type CreateIpRuleInput = {
+  kind: "allow" | "deny";
+  cidr: string;
+  note: string;
+  expires_at: string | null;
+};
+
+/** The created rule, plus the self-lockout warning when it applies. */
+export type CreateIpRuleResult = {
+  rule: IpRule;
+  /** Whether the rule covers the caller's own address. */
+  blocks_you: boolean;
+  /** The same sentence, ready to render. Null when `blocks_you` is false. */
+  warning: string | null;
+};
+
+/** The tester's verdict for one address. */
+export type IpTestResult = {
+  blocked: boolean;
+  decision: "allow" | "deny" | null;
+  matched_rule: IpRule | null;
+  /** A rule that would have matched but has expired — the explanation for a deny that stopped
+   *  applying. Never decisive, and the screen says so where it renders it. */
+  expired_rule: IpRule | null;
+  reason: string;
+  normalised: string;
+};
+
 /** The directives this build recognises, in render order — the form's own dropdown. */
 export const CSP_DIRECTIVE_NAMES = [
   "default-src",
