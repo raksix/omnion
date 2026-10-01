@@ -28,6 +28,7 @@ pub mod headers_middleware;
 pub mod intent_resolver;
 pub mod notification_runner;
 pub mod rate_limit_middleware;
+pub mod security_ip;
 pub mod retention_runner;
 pub mod routes;
 pub mod scope;

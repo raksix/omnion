@@ -29,6 +29,10 @@ import type {
   HeaderPolicyDocument,
   HeaderPolicySave,
   HeaderPolicySaved,
+  CreateIpRuleInput,
+  CreateIpRuleResult,
+  IpRulesPage,
+  IpTestResult,
   LockedAccountsPage,
   LockoutPolicy,
   RateLimitScope,
@@ -6666,6 +6670,52 @@ export function fetchLockedAccounts(): Promise<LockedAccountsPage> {
  * it is audited server-side with the actor. The remaining `lockout_minutes` is the thing a
  * cautious operator narrows, not this button.
  */
+// -- REQ-012 slice 4: the IP access lists ----------------------------------------------------
+
+/**
+ * Both access lists and their counts.
+ *
+ * One call rather than two: the screen renders the two tables side by side and a summary line,
+ * and reading them separately would let the counts describe a different moment than the rows.
+ */
+export function fetchIpRules(): Promise<IpRulesPage> {
+  return request<IpRulesPage>("/api/v1/security/ip-rules", { cache: "no-store" });
+}
+
+/**
+ * Add one access rule.
+ *
+ * The response carries `blocks_you` — whether the new rule covers the address this request came
+ * from — and the screen surfaces it as a warning rather than hiding it. The rule is saved either
+ * way: refusing it would leave the platform unable to express a legitimate self-lockout, and the
+ * operator would only learn which input avoids the check.
+ */
+export function createIpRule(input: CreateIpRuleInput): Promise<CreateIpRuleResult> {
+  return request<CreateIpRuleResult>("/api/v1/security/ip-rules", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/** Remove one rule by id. */
+export function deleteIpRule(id: string): Promise<void> {
+  return request<void>(`/api/v1/security/ip-rules/${id}`, { method: "DELETE" });
+}
+
+/**
+ * Ask what one address would do.
+ *
+ * The same evaluator the request path runs, so the verdict is the platform's verdict rather than
+ * a second implementation's. Takes a single address, not a network — listing a network is what
+ * the form above is for, and the error message says so.
+ */
+export function testIpAddress(address: string): Promise<IpTestResult> {
+  return request<IpTestResult>("/api/v1/security/ip-rules/test", {
+    method: "POST",
+    body: JSON.stringify({ address }),
+  });
+}
+
 export function unlockAccount(userId: string): Promise<LockedAccountsPage> {
   return request<LockedAccountsPage>(
     `/api/v1/security/locked-accounts/${encodeURIComponent(userId)}/unlock`,
