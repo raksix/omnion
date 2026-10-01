@@ -9602,3 +9602,32 @@ screen of this REQ is claimed verified.
 type-to-confirm, the allow-list editor) and the banner on the AI screens; then that
 one pass over `/ai/local`, `/ai/local/models`, `/ai/settings/airgap`, the still-
 unpassed REQ-105 slice 5, and the closes of REQ-099/100/101.
+
+## 2026-10-01 · wave7 · REQ-106 slice 2 — the air-gap switch screen
+
+**What.** `/ai/settings/airgap`: the switch, a confirmation that lists the providers that stop
+(arrive computed, never rebuilt client-side), a reason required on the way ON and absent on the way
+OFF, type-to-confirm, the internal-host allow-list editor, the egress-verification panel with
+"never verified" as its own state, and the two-tone banner. Plus the nav entry, the walkthrough
+route and a depth pass that drives the whole flow and restores the switch in its tail.
+
+**Proof.**
+- `pnpm typecheck` (apps/admin): 0 errors — after it caught one real bug, `egress_verified_at` read
+  as a unix stamp when it is an ISO string.
+- `cargo test -p omnion-ai-hub --lib`: 596 passed, 0 failed.
+- `node --check scripts/qa/walkthrough.cjs`: clean.
+- Browser pass: **not run.** The QA slot is held by w8's live pass (pid 3591518, cwd
+  /mnt/apopic/omnion-w8, alive by both `kill -0` and `/proc`); this stack's pass is queued behind it
+  and bounded by `QA_SLOT_WAIT`. **No acceptance row is ticked on code alone.**
+
+**Operational note.** The disk reached 100% mid-tick. A `write_file` returned success with
+`bytes_written: 0` and left a 0-byte temp file in the tree — so the result object is not evidence;
+`wc -c` after any suspicious write. `scripts/qa/disk-guard.sh` reclaimed 3G safely with five sibling
+writers live. It also removed `/dev/shm/w7-target` because a build through the default `target/`
+symlink sets no `CARGO_TARGET_DIR`, and the guard's liveness test only reads that variable — build
+with it set explicitly.
+
+**Next.** The browser pass (`QA_STACK=w7 QA_API_PORT=18086 QA_ADMIN_PORT=3106 QA_WEB_PORT=3206`).
+It is the critical path: five slices deep, and it now also covers `/ai/local`, `/ai/local/models`,
+REQ-105 slice 5 and the closes of REQ-099/100/101. Then close acceptance row 1 by walking the SSE
+frame rather than only the store refusal, then slices 3–4, then REQ-107 and REQ-108.
