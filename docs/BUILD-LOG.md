@@ -10936,3 +10936,19 @@ conversion removed the per-row cleanup the other twenty walks each carried.
 `cms_featured_media`, `cms_members`, `content_block_media`), then run them. REQ-062 acceptance
 1/3/16 and REQ-063 acceptance 17 remain browser measurements owed a pass — the slot is held live
 by w4 (holder alive in `/mnt/apopic/omnion-w4`).
+
+**Addendum (same tick).** `cms_forms` then **hung** rather than failed, and the database per
+walk is what exposed why. A full `--test-threads=1` pass stopped dead on
+`another_organizations_form_is_not_reachable` with every PostgreSQL session parked in
+`ClientRead` and the process's only other thread in `futex_do_wait`, while the same walk passed
+in **49 s** on its own. The limiter is the one thing a per-walk database does not fix: its
+counters are in one Redis shared by every writer's worktree, and a sign-in carries no session,
+so its budget is keyed on the peer address — `ip:127.0.0.1` for every walk in every suite. The
+shipped `sign_in` policy allows ten per five minutes; this file signs in three accounts per walk
+across thirteen walks. Raising it: **`cms_forms` 13/13 in 198 s**, and 0 leaked databases.
+Before the per-walk change the walks were stuck on the shared database's own contention; after
+it they were competing for one shared counter — a different failure wearing the same silence.
+
+The sweep is measured again, on the harder case: a walk **killed** rather than panicking left 5
+`omnion_cms_forms_*` databases behind, and the next run took all 5 out. Cleanup that only runs
+on the success path is not cleanup.

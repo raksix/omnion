@@ -201,6 +201,19 @@ Consumed: `marketing.form.submitted` (the marketing side of the same submission 
   Three decisions the prose did not ask for, kept because they are the safer half. **An external `to` is refused rather than reduced to its path** — the store only holds site-relative paths, and silently rewriting `https://partner.example/landing` to `/landing` would send a visitor to a page that does not exist here. **`from` IS reduced**, because a table exported from another platform carries full URLs in every column and the origin is the one part that means nothing here. And **another platform's column names are accepted** (`source`/`destination`/`match_type`/`active`) while the *canonical* names are the only ones written back, so the round trip stays stable.
 
   Two things remain refusals of the prose, recorded rather than quietly ticked: **the pattern dialect has no alternation, groups, `+`, `^` or `$`**, because an owner-typed pattern is matched against every request the site serves and a backtracking engine there is a denial-of-service surface one pattern can open (the importer validates every `regex` row through the platform's *own* `validate_pattern`, so a plan is safe to show before anything is written); and `Test a path` **reports** ambiguity instead of fixing it, since silently resolving two matching rules is how a site ends up with a rule nobody meant to have.*
+- [x] **Re-proved at the API layer under tick 58's harness, and the walk that proves it was not
+  running.** The form walks used to execute in the shared QA database, which meant their
+  sign-ins competed with every other writer's for one Redis counter and this file never raised
+  that budget. A per-walk database (see REQ-063, tick 58) fixed the database and left the
+  counter, and the run then **hung** rather than failed: every PostgreSQL session parked in
+  `ClientRead`, the process's only other thread in `futex_do_wait`, and the same walk passing
+  in 49 s on its own. With the budget raised, `cms_forms` is **13/13 in 198 s** — including
+  `all_eight_field_types_accept_their_answers_and_keep_the_consent_text` and
+  `validation_answers_with_every_field_error_at_once`, so the eight types and the all-at-once
+  field errors are re-proved on a clean database rather than on whatever the box left behind.
+  The browser half (the builder's messages rendered on the public form) is still owed a pass,
+  so the line stays `~` below.
+
 - [~] A scheduled publish fires within a minute of its time in the site timezone, shows `done` in the queue, and a failed run shows an error with retry.
     *Queue and failure paths proved (`a_due_entry_publishes_once_and_records_the_result`, `a_publish_that_cannot_run_is_recorded_as_failed_with_its_reason`): a due entry publishes exactly once and records `done` plus the result; a publish with no draft records `failed` with the reason and `retry` returns it to `pending`. The 30-second worker is wired in `main.rs` and the queue screen is green: `runMenusDepth` reschedules through the form, reads the stored instant back from SQL, cancels the entry and requires `cancelled` in the table with the buttons gone (`queueReady`, `entryOnScreen`, `rescheduleFormOpened`, `rescheduleStored`, `rescheduleMoved`, `rescheduleIsLater`, `cancelledInSql`, `cancelButtonGone`, `filteredToPending`). Driving it exposed a defect the fourteen store tests were blind to: the queue listed its rows and then answered 400 `no_organization` to every button on them for a **platform owner** — the account onboarding creates first, and the one the queue's read path had been fixed for two ticks earlier while its four write handlers were not (`6a033bd`). "Within a minute" is still only observed at the store's boundary — a live wall-clock wait is not something a QA pass should pay for.*
 - [~] An approved comment appears on the public page with its reply thread; a comment tripping the heuristics lands in Spam without manual action.
