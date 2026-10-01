@@ -1,7 +1,8 @@
 # REQ-105 — AI Data Guard (PII protection)
 
-> **Status:** in-progress (slice 1 detector/policy/budget: `602531b0` — the migration, the store,
-> the `403 ai_guard_blocked` checkpoint, the stub-provider walk and the screens are outstanding) ·
+> **Status:** in-progress (slice 1 detector/policy/budget: `602531b0`; the migration, the store
+> and the two API halves: `94fde861`, `26f09f3a` — the `403 ai_guard_blocked` checkpoint on the
+> chat route, the screens and the browser pass are outstanding) ·
 > **Captured:** 2026-09-26 · **Layer:** `crates/ai-hub`
 > **Source:** deep documentation pass — features named in docs/01–09 that had no request yet
 

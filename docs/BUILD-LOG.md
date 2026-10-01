@@ -8458,3 +8458,52 @@ REQ-105, REQ-106, REQ-107, REQ-108.
   queued behind it (`QA_SLOT_WAIT=5400`) rather than run beside it. Reclaimed 0.72G of my own
   /dev/shm/w7-target (724 duplicate rlib/rmeta siblings, keeping the newest of each name) —
   4.6G -> 3.9G, tmpfs 97% -> 94%.
+
+## tick 51 — REQ-105 slice 1, the store and the API (commits 94fde861, 26f09f3a, pushed)
+
+- **What** — the data guard's five tables (`0210_ai_guard.sql`, taken above the all-worktree
+  high-water of 0207 that w6 took today), the store that reads and writes them
+  (`crates/ai-hub/src/guard_store.rs`), twelve `/ai/guard/*` routes, two permission keys, and
+  nine walks. The nine seeded rules ship with their honest patterns and `person_name` ships
+  **disabled**, because a name list is a static data file and none ships: an enabled rule that
+  cannot fire is a protection that looks on.
+- **Proof** — `cargo test -p omnion-api --test ai_guard -- --test-threads=1` → **9 passed**;
+  `cargo test -p omnion-ai-hub --quiet` → **564 + 2**; `cargo test -p omnion-permissions` green
+  (`keys_are_unique_and_well_formed`, `the_ai_family_is_catalogued`); `cargo build -p omnion-api`
+  clean.
+- **Two product bugs, both in the schema rather than the code.** The first draft of
+  `ai_guard_rules_custom_label_consistent` tied `custom_label` to `kind` *as well as* to
+  `label`, which read as "a tenant rule may only report a custom label" — so a tenant could not
+  add a second email pattern, the most ordinary thing an operator does with this screen. The
+  walks caught it as a raw `23514` the panel would have had to translate by hand. And
+  `label_stats` summed `jsonb_each_text` output with no cast and died with `function sum(text)
+  does not exist`: the values are always numbers, but the planner resolves types before it
+  reads rows.
+- **A third failure was mine, and it is the one worth keeping.** `an_exemption_never_releases_a_block`
+  came back `Clear` — no match at all. The pattern was fine; the **source file** was not: a
+  redaction marker had been written into the test at the byte level, so the payload the walk
+  inspected was a 22-character string beginning with a guillemet. Reading the file's rendered
+  output and re-typing the literal reproduces the same corruption, so the repair was a
+  byte-level replacement verified by length and character class. The lesson was already in
+  memory from the REQ-127 fixture incident; twice in one session is why it gets written down
+  again.
+- **Two assertions of mine were also wrong, and being wrong was the point.** `Detector::len()`
+  counts the rules that *run*, and `person_name` ships disabled, so nine seeded rows is eight
+  active — asserting nine would have asserted that a rule with no name list is live. And the
+  `secret_like` pattern is prefix-shaped on purpose: a bare high-entropy token is a far weaker
+  signal, and a guard that flags every long base64 blob is a guard that gets switched off. My
+  first payload had no `sk-` prefix and the detector correctly found nothing.
+- **The tester's power is `manage`, not `read`.** `POST /ai/guard/test` accepts arbitrary text
+  and answers whether it matches this installation's rules — a small oracle over a rule set
+  that is a map of what the tenants' data looks like. The events screen shows the same
+  knowledge without accepting input, so the split costs a compliance reader nothing.
+- **ENV** — the QA slot was held by a **live** w6 pass for the whole tick again (pid 480310,
+  `cwd=/mnt/apopic/omnion-w6`), so no browser pass was attempted. `/dev/shm` hit **100%** and
+  the API build died with `failed to build archive … No space left on device`; ten writer
+  targets hold 32G between them. Reclaimed 0.51G of duplicate `(name, hash)` rlib/rmeta
+  siblings and 2.18G of my own test binaries older than an hour — `df` went 23M → 2.5G free.
+  The build then completed. A sibling writer cleaning their own target is not available to me.
+- **Next** — the `403 ai_guard_blocked` checkpoint on `POST /ai/v1/ai/chat` with the stub-provider
+  walk that proves a blocked payload never reaches the network, then `/ai/guard`,
+  `/ai/guard/rules` and the walkthrough registration. Then the queued w7 pass, which is still
+  the only thing that can close REQ-099 and REQ-100.
