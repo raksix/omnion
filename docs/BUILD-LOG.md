@@ -8143,3 +8143,95 @@ the first two are what make the third mean anything. Then `step-trace` for
 `edgeRemovedByUndo` beside `edgeSelectionPruned`. The plugin row stays BLOCKED on REQ-121.
 Before a pass: check the summary for `chrome-error://` in a page url and confirm the admin error
 log is quiet. Always `QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202`.
+
+## Tick 60 — the step-trace row's target was derived from the row's own subject
+
+**What.** The pass is still blocked by a live w6 holder, so the tick went to the question the
+pass will answer: *can each row it is about to measure actually go red?* The `step-trace` row
+could not, and this is the fourth instance of this REQ's recurring defect — the fourth time in
+a form none of the previous three predicted.
+
+The row chose which node to click like this:
+
+```js
+const paintedNodeId = painted.painted.find((e) => e.status !== "skipped")?.nodeId ?? null;
+```
+
+`painted` is the `run-from-here` row's own read — the status pill, which is the **other half of
+the same criterion**. So a regression in the pill does not make this row red. It makes it
+**void**: no card carries a pill, the id is `null`, no click is issued, the inspector never
+mounts, and then
+
+```text
+stepsWithoutBothSides: []    an empty list, read as "no step lost a side"
+stepsInRunButNotShown: []    runStepNos is filtered by a null id, so it is empty
+stepsWithParams === stepsWithOutput === stepsTotal > 0    read off the wire, healthy
+```
+
+are **all three green, with the panel shut and not one step rendered.** `panelFound: false` and
+`stepsShown: 0` were in the note the whole time and neither was in the conjunction the next tick
+was going to read, so the criterion would have been closed on a panel that had never opened.
+
+**Why this one is worse than 57, 58 and 59.** Those each moved a read *off the wire and onto the
+screen* without first checking the screen could be put into the state the read needed, and the
+consequence was an **unsatisfiable** gate: red forever, on a correct product, and the next tick
+hunts a bug in correct code. This gate is not unsatisfiable — it is **vacuous**, and vacuity
+prints the same digits as success. An unsatisfiable gate at least screams. A gate a defect can
+make invisible is worse than a missing one, because a missing one is a hole somebody can see.
+
+The cause is identical in all four and is worth stating as a rule: **a read whose input is the
+thing it measures can go void instead of red.** The fix is not re-reading the DOM — it is
+taking the target from an independent witness, which here is the run (`after.steps`), already in
+hand two lines above. A pill regression now surfaces where it belongs, on the row that measures
+it, and a `null` target beside a populated run reads as a graph/canvas divergence rather than as
+a panel that failed to open.
+
+The click also now waits on the panel's own `[data-step-trace]` marker instead of
+`waitForTimeout(500)`. `StepTracePanel` writes that attribute unconditionally at its root for all
+three of its states (`no-run`, `node-absent`, `steps` — builder-view.tsx:3507), so the wait can
+neither be satisfied by nothing nor time out on a panel that opened without a step in it.
+
+**A second finding, from running the sibling harnesses.** `table-mode-row.mutation.mjs` came
+back **5/8**, and the three survivors were not defects surviving — they were `MUTATION DID NOT
+APPLY (the anchor moved)`. Three anchors still described the pre-tick-59 row that the tick-59
+rewrite replaced, and one of them is **M1, the mutation that proves that file's central defect**
+(the reverse read going back to fetching the server). So the defect the file was written for has
+not been proven red since before tick 59. The harness has been honest about it the whole time:
+a mutation that cannot apply is reported as a failure rather than skipped. The line just sits
+next to real failures and says nothing about how long it has been saying it. Re-anchored to the
+per-card read; M1 now turns **two** tests red, which is what its own comment always predicted and
+which no run had confirmed since the rewrite. 8/8.
+
+**Proof.**
+- `node --test --experimental-strip-types apps/admin/features/workflows/*.test.ts` → **331 passed**
+  (328 before, +3)
+- `pnpm typecheck` → 2/2 successful
+- `node --check scripts/qa/walkthrough.cjs` → clean (14,451 → 14,515 lines)
+- `step-trace-target.mutation.mjs` → **9/9 red**, each naming the assertion it turned; M1 restores
+  the exact line the fix replaced
+- `table-mode-row.mutation.mjs` → **8/8** (was 5/8, three of them never applied)
+- `run-from-here-row` 9/9, `undo-selection-edge-row` 12/12 — both unchanged, so the row edits
+  above did not disturb them
+
+**One of my own new guards violated the lesson in its own file's header.** The guard against
+re-introducing the pill dependency was `paintedNodeId[\s\S]{0,160}?painted\.painted…` — a
+window across *statements* — and it went red against the fix, because the line below the
+declaration is the *evidence* field (`pillChosenNodeId = painted.painted.find(…)`), which is
+exactly what a note should carry. It is now scoped to the single `const paintedNodeId = …;`
+statement, which is the only place a default can be introduced. A token in a *mention* satisfies
+a claim made about a *use* — the same lesson as tick 58's prefix collision and tick 59's window
+containing its own explanation, and I wrote it down and then broke it in the same file.
+
+**Not ticked, and why.** No browser pass: the slot's holder is a LIVE w6 pass — pid 252267,
+`/proc/252267/cwd` = `/mnt/apopic/omnion-w6`, 400 files written in the four minutes before this
+tick's checks, 65 Chrome across writers, load 41.
+
+**Next.** The pass, the tenth tick it has been deferred. `step-trace` is now gated on
+`rowIsMeasurable` **first** — `stepsWithoutBothSides: []` and `stepsInRunButNotShown: []` and the
+wire equality are all satisfied by a panel that never opened, so the conjunction is meaningless
+without it. Then `run-from-here` for `pillsPainted > 0` beside `inRunButNotPainted: []` and
+`paintedButNotInRun: []`, then `table-save-survives` for `clicked > 0` **and** `inspected > 0`
+**and** `builderSeesTableEdit: true`, then `undo-selection-edge` for `edgeRemovedByUndo` beside
+`edgeSelectionPruned`. The plugin row stays BLOCKED on REQ-121. Before a pass: check the summary
+for `chrome-error://` in a page url and confirm the admin error log is quiet. Always
+`QA_STACK=w3 QA_API_PORT=18082 QA_ADMIN_PORT=3102 QA_WEB_PORT=3202`.
