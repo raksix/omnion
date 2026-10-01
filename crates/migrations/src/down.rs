@@ -399,18 +399,18 @@ create table release_manifests (version text primary key);
             "a down-script heading with no statements under it is a reversal nobody can run: \
              {headings_without_statements:?}"
         );
-        // FIVE is the measured truth, and the number is the point rather than a threshold to be
-        // relaxed until the suite is green: an independent scan of the same 58 files (heading or
-        // marker, then indented comment lines) finds exactly these five with these statement
-        // counts — `0037`, `0040`, `0162`, `0199` and `0207`. A parser that reads only its own
-        // marker finds ZERO, and a parser that opened on any line mentioning "down script" finds
-        // nine blocks, four of which are prose.
+        // SIX is the measured truth, and the number is the point rather than a threshold to be
+        // relaxed until the suite is green: an independent scan of the same 59 files (heading or
+        // marker, then indented comment lines) finds exactly these six with these statement
+        // counts — `0037`, `0040`, `0162`, `0199`, `0207` and `0216`. A parser that reads only
+        // its own marker finds ZERO, and a parser that opened on any line mentioning "down
+        // script" finds ten blocks, five of which are prose.
         //
         // The other 53 migrations have no reversal at all, which is a fact about the repository
         // and not about this parser. It is also exactly why the policy's answer for them is a
         // WAIVER and not a pass: a migration with no reversal is "take the backup".
         assert_eq!(
-            with_reversal, 5,
+            with_reversal, 6,
             "the parser must read exactly the files that carry a reversal; it read {with_reversal} \
              of {total} files. New migration with a reversal? Raise this number WITH the file.",
             total = files.len()

@@ -42,6 +42,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backfill;
 pub mod down;
 pub mod error;
 pub mod ledger;
@@ -50,6 +51,7 @@ pub mod lock;
 pub mod policy;
 pub mod runner;
 
+pub use backfill::{Backfill, BackfillDescriptor, BatchOutcome};
 pub use down::DownScript;
 pub use error::{MigrationSafetyError, Result};
 pub use ledger::{Drift, LedgerRow, NewLedgerRow, checksum, detect_drift};
