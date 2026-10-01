@@ -33,8 +33,8 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use omnion_audit::NewAuditEntry;
 use omnion_ai_hub::resolve;
+use omnion_audit::NewAuditEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -364,7 +364,10 @@ pub async fn list_plans(
             query.by
         },
         offset: query.offset.unwrap_or_default().max(0),
-        limit: query.limit.unwrap_or(LIST_PAGE_DEFAULT).clamp(1, LIST_PAGE_MAX),
+        limit: query
+            .limit
+            .unwrap_or(LIST_PAGE_DEFAULT)
+            .clamp(1, LIST_PAGE_MAX),
     };
 
     let page = builder::list_plans(state.db().pool(), Some(organization_id), &filter)
@@ -606,7 +609,9 @@ pub async fn regenerate_artifact(
          The artifact as it stands (kind `{}`, key `{}`):\n{}\n\n\
          The reviewer's note:\n{}\n\n\
          Answer with the revised artifact as JSON.",
-        plan.prompt, artifact.kind, artifact.key,
+        plan.prompt,
+        artifact.kind,
+        artifact.key,
         serde_json::to_string_pretty(&artifact.spec).unwrap_or_else(|_| "{}".to_owned()),
         feedback
     );
@@ -623,20 +628,21 @@ pub async fn regenerate_artifact(
         validation: Value::Null,
     };
     let findings = builder::validate_artifact(&candidate);
-    let updated = builder::supersede_artifact(state.db().pool(), artifact.id, &candidate, &findings)
-        .await
-        .map_err(validation_error)?
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                "artifact_already_accepted",
-                format!(
-                    "`{}` is accepted; accept a regeneration by regenerating before you accept \
+    let updated =
+        builder::supersede_artifact(state.db().pool(), artifact.id, &candidate, &findings)
+            .await
+            .map_err(validation_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "artifact_already_accepted",
+                    format!(
+                        "`{}` is accepted; accept a regeneration by regenerating before you accept \
                      the previous version",
-                    artifact.key
-                ),
-            )
-        })?;
+                        artifact.key
+                    ),
+                )
+            })?;
 
     record(
         &state,
@@ -751,16 +757,18 @@ pub async fn delete_plan(
 
 /// `POST /api/v1/app-builder/generate` — a prompt becomes a plan, streamed.
 ///
-/// **Not slice 1's generator.** Slice 1 validated and stored artifacts but had no prompt
-/// contract, and this file does not have one yet: the generation that produces typed artifacts
-/// needs the plan's *schema* prompt (entity → fields → screens → permissions → workflow →
-/// notifications → report) and belongs with the route that can afford to stream every artifact
-/// as it lands. Shipping a form that answers "the model answered, in a shape nothing reads"
-/// would be the same class of defect as a button that says "coming soon".
+/// **The typed generator, which until this slice did not exist.** The route was registered
+/// and answered with a failure that named its own absence ("the typed artifact generator is
+/// not wired yet"), which is the same defect as a button that says "coming soon" wearing a
+/// status code: a reviewer pressed Generate, saw an error, and had learned nothing about
+/// their application. Now the provider is asked once with the platform's own schema prompt
+/// and the answer is normalized into stored, validated artifacts.
 ///
-/// What this answers instead is the thing a console cannot work without: the plan row, written
-/// before the provider is called, with the reason it failed when it fails. A reviewer who
-/// pressed Generate and got an error banner has to be able to *see* the attempt.
+/// The order of the stream is the order the plan becomes real: one `stage` per artifact as
+/// it lands, then `done` with the plan id, or `error` with the reason on the plan row. A
+/// partial answer is a **failed plan carrying its artifacts** — never a `draft` with half a
+/// plan and a green status, which is the one state a reviewer could mistake for a finished
+/// one.
 pub async fn generate(
     State(state): State<AppState>,
     current: CurrentSession,
@@ -810,32 +818,207 @@ pub async fn generate(
     let (frames, receiver) = mpsc::channel::<Frame>(STREAM_BUFFER);
     let pool = state.db().pool().clone();
     let plan_id = plan.id;
+    let user_id = current.user.id;
     tokio::spawn(async move {
-        // The generator is slice 1's missing half and this route deliberately does not fake
-        // it: the plan fails with the reason, the row survives, and the reviewer can read the
-        // prompt and try again once the typed generator lands. `failed` rather than a stream
-        // that never ends — a spinner a client cannot end is worse than an error.
+        let mut run = GenerationRun {
+            pool: pool.clone(),
+            plan_id,
+            user_id,
+            usage: None,
+        };
+
+        let answer = match run.ask(&resolved, &prompt).await {
+            Ok(answer) => answer,
+            Err(failure) => {
+                // Every failure ends in the same two things: the stream says why, and the
+                // plan row carries the same reason so a reviewer who reloads the console
+                // finds the attempt and not just an empty list.
+                let _ = frames.send(Frame::Failed(failure.clone())).await;
+                let _ = run.fail(failure.message).await;
+                return;
+            }
+        };
+
+        let generated = builder::normalize(&answer);
+
+        // Artifacts land one at a time so the tree fills in while the reviewer watches.
+        // Each is stored through the store, which derives its status from the validator's
+        // answer — a generator cannot accept its own work.
+        for artifact in &generated.artifacts {
+            let findings = builder::validate_artifact(artifact);
+            match builder::insert_artifact(&pool, plan_id, artifact, &findings).await {
+                Ok(stored) => {
+                    let _ = frames
+                        .send(Frame::Artifact {
+                            kind: stored.kind,
+                            key: stored.key,
+                            status: stored.status,
+                            findings: findings.len(),
+                        })
+                        .await;
+                }
+                Err(error) => {
+                    // A refusal by the store — a reserved key, a body that is not an object,
+                    // a rationale over the limit — is reported by name and ends the run. The
+                    // artifacts already written stay: they are inert drafts, and a reviewer
+                    // who wants them has them.
+                    let message = error.to_string();
+                    let failure = Failure::new(error_code(&error), message.clone());
+                    let _ = frames.send(Frame::Failed(failure)).await;
+                    let _ = run.fail(message).await;
+                    return;
+                }
+            }
+        }
+
+        if let Err(failure) = run.settle(&generated).await {
+            let _ = frames.send(Frame::Failed(failure.clone())).await;
+            let _ = run.fail(failure.message).await;
+            return;
+        }
+
+        // Whatever the platform had to repair is on the stream and on the plan, never only
+        // in this function: a plan that was quietly fixed is a plan nobody can trust.
+        for note in &generated.notes {
+            let _ = frames.send(Frame::Note(note.clone())).await;
+        }
+
         let _ = frames
-            .send(Frame::Stage("plan".into()))
-            .await;
-        let _ = frames
-            .send(Frame::Failed {
-                code: "app_builder_generator_pending",
-                message: "the typed artifact generator is not wired yet — this plan carries \
-                          your prompt, and the artifacts land with the generate endpoint"
-                    .into(),
+            .send(Frame::Done {
+                plan_id,
+                artifacts: generated.artifacts.len(),
+                missing: builder::missing_required_kinds(&generated.artifacts),
             })
             .await;
-        let _ = builder::apply_failure(
-            &pool,
-            plan_id,
-            "the typed artifact generator is not wired yet (REQ-045 slice 1 shipped the store \
-             and the validators; the generator is the next slice)",
-        )
-        .await;
     });
 
     Ok(Sse::new(ReceiverStream::new(receiver).map(Frame::event)).keep_alive(KeepAlive::default()))
+}
+
+/// The generation's writes: one plan row, one call, one settlement.
+///
+/// A struct because the three steps share a plan id and a pool, and three functions each
+/// taking `(&PgPool, Uuid)` is three chances to pass the wrong pair — the same reason
+/// `PlanStore` exists one layer down.
+struct GenerationRun {
+    pool: sqlx::PgPool,
+    plan_id: Uuid,
+    user_id: Uuid,
+    /// What the one call cost, when the provider reported it. `None` stays distinct from a
+    /// reported `0`, and the plan carries `null` rather than a fabricated number.
+    usage: Option<omnion_ai_hub::ChatUsage>,
+}
+
+/// Why a generation stopped, in the two forms its two readers need: a stable code for the
+/// stream and a sentence for the plan row.
+#[derive(Clone)]
+struct Failure {
+    code: &'static str,
+    message: String,
+}
+
+impl Failure {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl GenerationRun {
+    /// Ask the provider once, with the platform's schema prompt.
+    ///
+    /// One call, no repair round-trip: a second call would double the cost of a plan that
+    /// was merely mis-cased, and every repair this platform performs is a spelling the
+    /// reviewer can read in the artifact's rationale. A genuinely wrong answer is
+    /// regenerated by the reviewer's own hand, artifact by artifact.
+    async fn ask(
+        &mut self,
+        resolved: &omnion_ai_hub::ResolvedModel,
+        prompt: &str,
+    ) -> Result<Value, Failure> {
+        let target = omnion_ai_hub::client::ProviderTarget::from_provider(&resolved.provider);
+        let request = omnion_ai_hub::client::ChatRequest {
+            model: resolved.model.model_key.clone(),
+            messages: vec![
+                omnion_ai_hub::client::ChatMessage::system(
+                    "You design enterprise applications. Answer with one JSON object and \
+                     nothing else: no prose, no markdown, no code fence.",
+                ),
+                omnion_ai_hub::client::ChatMessage::user(builder::schema_prompt(prompt)),
+            ],
+            // Low, because the answer is a schema: two valid answers to the same request
+            // are the defect, not the freedom.
+            temperature: Some(0.1),
+            // Generous, because a plan is eight artifacts and a truncated answer is an
+            // incomplete plan rather than a smaller one.
+            max_tokens: Some(8192),
+        };
+
+        let outcome = omnion_ai_hub::client::chat(&target, &request)
+            .await
+            .map_err(|error| Failure::new("ai_provider_error", error.to_string()))?;
+
+        // The same fenced-JSON parser the regeneration path uses: one answer shape, one
+        // parser. A second copy would be a second set of tolerances.
+        let answer = parse_artifact_answer(&outcome.content).ok_or_else(|| {
+            Failure::new(
+                "ai_provider_unreadable_answer",
+                format!(
+                    "the model did not answer with a JSON object ({}); the first words were: {}",
+                    describe_answer_shape(&outcome.content),
+                    first_words(&outcome.content)
+                ),
+            )
+        })?;
+
+        self.usage = outcome.usage;
+        Ok(answer)
+    }
+
+    /// Move the plan to `draft` with the counts the answer cost.
+    ///
+    /// `draft`, never `approved`: the artifacts are validated, not reviewed, and the store
+    /// refuses any other status a caller could set here for good reason.
+    async fn settle(&self, generated: &builder::Generated) -> Result<(), Failure> {
+        let usage = builder::PlanUsage {
+            input: self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens)
+                .and_then(|count| i32::try_from(count).ok()),
+            output: self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.completion_tokens)
+                .and_then(|count| i32::try_from(count).ok()),
+            cost_cents: 0,
+        };
+        builder::apply_answer(
+            &self.pool,
+            self.plan_id,
+            "draft",
+            usage,
+            generated.title.as_deref(),
+        )
+        .await
+        .map_err(|error| Failure::new("app_builder_answer_store_failed", error.to_string()))?
+        .ok_or_else(|| {
+            // `None` is the store's "this plan is no longer generating" answer: another
+            // attempt answered it first. Naming that beats reporting a store failure.
+            Failure::new(
+                "app_builder_plan_not_generating",
+                "another attempt answered this plan first",
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Record why the generation stopped, on the plan row.
+    async fn fail(&self, message: String) {
+        let _ = builder::apply_failure(&self.pool, self.plan_id, &message).await;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -843,15 +1026,37 @@ pub async fn generate(
 // ---------------------------------------------------------------------------------------------
 
 /// One frame of a generation, before it becomes an SSE event.
+///
+/// One variant per thing a reviewer's screen actually has to react to, because a single
+/// generic `stage` carrying a string forces the client to parse English to learn what
+/// happened. `Artifact` exists so the tree can fill in **while the stream is open** — the
+/// request asks for that explicitly — and `Note` exists so a repair the platform made is
+/// visible in the same place it will later be read from.
 enum Frame {
-    /// What the platform is doing.
-    Stage(String),
-    /// Generation stopped; the plan exists and carries the same message.
-    Failed {
-        /// Stable machine-readable code.
-        code: &'static str,
-        /// Message for a person.
-        message: String,
+    /// One artifact was stored. Carries the status the **validator** derived, not the one
+    /// the generator hoped for.
+    Artifact {
+        /// Which kind landed.
+        kind: String,
+        /// Its key within the plan.
+        key: String,
+        /// `pending` or `invalid`, as the store decided.
+        status: String,
+        /// How many findings the validator reported.
+        findings: usize,
+    },
+    /// Something the platform repaired or refused, said in a sentence.
+    Note(String),
+    /// Generation stopped; the plan row carries the same reason.
+    Failed(Failure),
+    /// The plan is a `draft` with its artifacts stored.
+    Done {
+        /// The plan that was written.
+        plan_id: Uuid,
+        /// How many artifacts landed.
+        artifacts: usize,
+        /// Required kinds the answer did not propose, **by name**.
+        missing: Vec<String>,
     },
 }
 
@@ -861,12 +1066,38 @@ impl Frame {
     /// is a frame a debugger cannot show.
     fn event(self) -> Result<Event, Infallible> {
         let event = match self {
-            Self::Stage(stage) => Event::default()
-                .event("stage")
-                .data(json!({ "stage": stage }).to_string()),
-            Self::Failed { code, message } => Event::default()
+            Self::Artifact {
+                kind,
+                key,
+                status,
+                findings,
+            } => Event::default().event("artifact").data(
+                json!({
+                    "kind": kind,
+                    "key": key,
+                    "status": status,
+                    "findings": findings,
+                })
+                .to_string(),
+            ),
+            Self::Note(note) => Event::default()
+                .event("note")
+                .data(json!({ "note": note }).to_string()),
+            Self::Failed(failure) => Event::default()
                 .event("error")
-                .data(json!({ "code": code, "message": message }).to_string()),
+                .data(json!({ "code": failure.code, "message": failure.message }).to_string()),
+            Self::Done {
+                plan_id,
+                artifacts,
+                missing,
+            } => Event::default().event("done").data(
+                json!({
+                    "plan_id": plan_id,
+                    "artifacts": artifacts,
+                    "missing_required_kinds": missing,
+                })
+                .to_string(),
+            ),
         };
         Ok(event)
     }
@@ -968,7 +1199,10 @@ fn read_prompt(raw: &str) -> Result<String, ApiError> {
     if length > builder::MAX_PROMPT_LEN {
         return Err(ApiError::bad_request(
             "prompt_too_long",
-            format!("a prompt is at most {} characters; this one is {length}", builder::MAX_PROMPT_LEN),
+            format!(
+                "a prompt is at most {} characters; this one is {length}",
+                builder::MAX_PROMPT_LEN
+            ),
         ));
     }
     Ok(prompt.to_owned())
@@ -1029,8 +1263,7 @@ async fn run_generation(
     resolved: &omnion_ai_hub::ResolvedModel,
     prompt: &str,
 ) -> Result<Regeneration, ApiError> {
-    let target =
-        omnion_ai_hub::client::ProviderTarget::from_provider(&resolved.provider);
+    let target = omnion_ai_hub::client::ProviderTarget::from_provider(&resolved.provider);
     let request = omnion_ai_hub::client::ChatRequest {
         model: resolved.model.model_key.clone(),
         messages: vec![
@@ -1154,6 +1387,21 @@ impl From<&builder::BlockedArtifact> for BlockedBody {
 }
 
 /// Turn a store failure into a `500` with the module's own code.
+/// The store's stable code for a refusal, so a stream `error` frame carries the same code
+/// the HTTP layer would have answered.
+///
+/// A database failure has no plan-shaped code, so it gets its own: a stream that reported
+/// `invalid_artifact_key` for a dropped connection would send the reviewer to fix their
+/// model prompt instead of retrying.
+fn error_code(error: &builder::AppBuilderError) -> &'static str {
+    match error {
+        builder::AppBuilderError::Invalid { code, .. } => code,
+        builder::AppBuilderError::Ai(_) => "ai_provider_error",
+        builder::AppBuilderError::Blocked(_) => "apply_blocked",
+        _ => "app_builder_store_error",
+    }
+}
+
 fn store_error(error: builder::AppBuilderError) -> ApiError {
     ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
