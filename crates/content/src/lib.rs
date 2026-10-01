@@ -10,9 +10,10 @@
 
 pub mod api_token_usage;
 pub mod api_tokens;
-pub mod blockdiff;
 pub mod block_media;
+pub mod blockdiff;
 pub mod blocks;
+pub mod branding;
 pub mod comments;
 pub mod content_read;
 pub mod error;
@@ -31,17 +32,17 @@ pub mod sanitize;
 pub mod seo;
 pub mod seo_csv;
 pub mod templates;
-pub mod theme_settings;
 pub mod theme_layouts;
+pub mod theme_settings;
 pub mod themes;
 pub mod translations;
 pub mod validation;
 
-pub use blockdiff::{BlockChange, BlockDiff, BlockDiffEntry, PropChange, diff_blocks, headline};
 pub use block_media::{
     BlockMediaRef, BlockMediaStore, FileState, MAX_MEDIA_FILTER, TreeMediaReport,
     collect_media_refs, degrade_tree, media_ids, parse_media_filter, states_for_render,
 };
+pub use blockdiff::{BlockChange, BlockDiff, BlockDiffEntry, PropChange, diff_blocks, headline};
 pub use blocks::{
     Block, BlockDefinition, BlockIssue, BlockValidationReport, CATEGORIES, HIDE_ON_VALUES,
     MAX_BLOCKS, MAX_DEPTH, PropDef, PropDefault, PropKind, REGISTRY, REGISTRY_VERSION, ReadOn,
@@ -89,12 +90,6 @@ pub use pages::{
 // The theme bounds are deliberately NOT re-exported here, for the same reason
 // `MAX_NAME_LENGTH` is not: `patterns` and `seo_csv` already export one with the same name
 // and a different meaning. A caller that wants the theme's bound asks `themes::MAX_NAME_LENGTH`.
-pub use themes::{
-    Activation, ActivationChange, ActivationRequest, DEFAULT_THEME_KEY, GalleryEntry,
-    GalleryView, ManifestShape, SOURCES, Theme, activate, active_theme_key, describe, find_theme,
-    gallery, gallery_for_site, manifest_shape, read_activation, restore_previous, sync_bundled,
-    ManifestIssue, PREVIEW_ASSET_NAME, preview_url, validate_v2_fields,
-};
 pub use patterns::{
     MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, NewPattern, NewTemplate, PageFromTemplate,
     PageTemplate, Pattern, PatternChanges, delete_pattern, delete_template, find_pattern,
@@ -111,5 +106,11 @@ pub use sanitize::{
 };
 pub use templates::{
     ABOUT, BLOG_POST, CONTACT, LANDING, PRICING, SYSTEM_TEMPLATES, SystemTemplate,
+};
+pub use themes::{
+    Activation, ActivationChange, ActivationRequest, DEFAULT_THEME_KEY, GalleryEntry, GalleryView,
+    ManifestIssue, ManifestShape, PREVIEW_ASSET_NAME, SOURCES, Theme, activate, active_theme_key,
+    describe, find_theme, gallery, gallery_for_site, manifest_shape, preview_url, read_activation,
+    restore_previous, sync_bundled, validate_v2_fields,
 };
 pub use translations::{revision_translations, set_revision_translation};
