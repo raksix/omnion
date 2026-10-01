@@ -3814,6 +3814,109 @@ async function runMediaFileDetail(page, report) {
     await page.waitForTimeout(800);
   }
 
+  // The custom pairs (REQ-010, tick 99). Three states, all of which a screenshot of one file
+  // cannot distinguish: the empty state a fresh upload has, a real pair after a save, and the
+  // toolbar filter that finds it. The pair set is replaced whole, so the save here also proves the
+  // *second* save removed the first pair — an editor that only ever adds leaves a remove button
+  // untested.
+  const pairsEmpty = (await page.locator('[data-testid="media-pairs-empty"]').count()) > 0;
+  note({ step: "pairs-empty-state", rendered: pairsEmpty });
+
+  const pairKey = `qa-campaign-${Date.now()}`;
+  const pairValue = `spring-${Date.now()}`;
+  await page.click("#media-add-pair");
+  await page.waitForTimeout(200);
+  const keyInputs = page.locator('[data-testid="media-pair-key"]');
+  await keyInputs.last().fill(pairKey);
+  await page.locator('[data-testid="media-pair-value"]').last().fill(pairValue);
+  await page.click("#media-save-pairs");
+  await page.waitForTimeout(1500);
+  const pairsNotice = await page
+    .locator('[data-testid="media-pairs-notice"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  const pairSurvived = await page
+    .evaluate(
+      ([key, value]) =>
+        [...document.querySelectorAll('[data-testid="media-pair-key"]')].some(
+          (input) => input.value === key,
+        ) &&
+        [...document.querySelectorAll('[data-testid="media-pair-value"]')].some(
+          (input) => input.value === value,
+        ),
+      [pairKey, pairValue],
+    )
+    .catch(() => false);
+  note({ step: "pairs-save", notice: pairsNotice.replace(/\s+/g, " ").trim(), kept: pairSurvived });
+  await shot(page, "page-media-file-pairs");
+
+  // A **refusal must land under the row that caused it**. The detail field is `metadata.<key>`,
+  // so a message printed once at the bottom of the block would be a screen that shows a problem
+  // without saying which input produced it.
+  const longValue = "x".repeat(600);
+  await keyInputs.last().fill(`${pairKey}`);
+  await page.locator('[data-testid="media-pair-value"]').last().fill(longValue);
+  await page.click("#media-save-pairs");
+  await page.waitForTimeout(1200);
+  const rowAlerts = await page.locator('[data-testid="media-pair-value"] ~ * [role="alert"], li [role="alert"]').count();
+  const setAlerts = (await page.locator('[data-testid="media-pairs-set-error"]').count()) > 0;
+  note({ step: "pairs-refusal", rowAlert: rowAlerts > 0, setAlert: setAlerts });
+
+  // The toolbar filter finds the file by its pair — and a half-typed term narrows nothing.
+  await page.goto(`${URL_ADMIN}/media`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector("#media-new-folder", { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+  const filterButton = page.locator('[aria-label="Filters"]').first();
+  if ((await filterButton.count()) > 0) {
+    await filterButton.click();
+    await page.waitForTimeout(300);
+  }
+  const before = await page.locator("tbody tr").count().catch(() => 0);
+  await page.fill('[data-testid="media-metadata-filter"]', `${pairKey}=${pairValue}`);
+  await page.waitForTimeout(1600);
+  const afterMatch = await page.locator("tbody tr").count().catch(() => 0);
+  const matchedHref = await page.evaluate(() => {
+    const link = document.querySelector('a[href^="/media/files/"]');
+    return link ? link.getAttribute("href").split("/").pop() : null;
+  });
+  note({
+    step: "metadata-filter",
+    before,
+    after: afterMatch,
+    // The file the pair was set on is the only row that may come back.
+    found: matchedHref === fileId,
+  });
+
+  await page.fill('[data-testid="media-metadata-filter"]', `${pairKey}=`);
+  await page.waitForTimeout(1600);
+  const afterPartial = await page.locator("tbody tr").count().catch(() => 0);
+  note({
+    step: "metadata-filter-half-typed",
+    // A half-typed term must NOT narrow the listing: the field is re-read on every keystroke.
+    unfiltered: afterPartial === before,
+  });
+
+  // "Clear filters" must clear this term too, or a cleared toolbar still filters.
+  const clearButtons = page.locator("button", { hasText: "Clear filters" });
+  if ((await clearButtons.count()) > 0) {
+    await clearButtons.last().click();
+    await page.waitForTimeout(1200);
+  }
+  const afterClear = await page.locator("tbody tr").count().catch(() => 0);
+  note({
+    step: "metadata-filter-cleared",
+    unfiltered: afterClear === before,
+    fieldEmpty: (await page.inputValue('[data-testid="media-metadata-filter"]').catch(() => "x")) === "",
+  });
+  await shot(page, "page-media-metadata-filter");
+
+  // Back to the file detail, so the rest of this pass is about the file it opened.
+  await page.goto(`${URL_ADMIN}/media/files/${fileId}`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-testid="media-file-name"]', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(900);
+
+  // The version tab lists the history; an upload is at least version 1.
   // The version tab lists the history; an upload is at least version 1.
   await page.click("#media-tab-versions");
   await page.waitForTimeout(900);

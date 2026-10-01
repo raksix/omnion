@@ -9912,3 +9912,77 @@ than on anything in this tree. When it runs it must cover `/ai/local/doctor` (ne
 a real run, a rerun), `/ai/local`, `/ai/local/models` and `/ai/settings/airgap`. After that: slice 3
 (local embeddings, offline knowledge, judge-model refusal), then the "Run AI locally" docs page to
 close REQ-106, then REQ-107 and REQ-108.
+
+---
+
+## Tick 99 — the custom metadata pairs nobody ever wrote (REQ-010)
+
+The `media.metadata` column has carried a `jsonb` value and a **GIN index** since `0025`, and
+`UpdateFileBody` has had a `metadata` field since the first draft of the file route. A search of
+`apps/` and `crates/` found **no writer and no reader**: every row in every installation was `{}`,
+the index scanned an empty object per row, and the REQ's own scope line — "custom key/value pairs
+(`metadata jsonb` with a GIN index)" and "a metadata filter in the browser" — was satisfied by a
+column. It is the uncalled-column defect class one level up from the uncalled `prune_candidates`
+function, and it survived 98 ticks because **nothing in the tree was broken**: the code compiled,
+every test was green, and the column was there.
+
+Shipped as `crates/media/src/metadata_pairs.rs`, `Filter::MetadataPair` in the browser builder,
+the validation on `PATCH /api/v1/media/files/{id}`, and `features/media/metadata-pairs.tsx` with
+the `Custom pair` field on the browser toolbar.
+
+**Five decisions, each a shortcut that produces a plausible wrong answer.**
+
+1. **Values are text, never arbitrary jsonb.** A nested object or a list is a `400` naming the
+   key, not `[object Object]` or `1,2,3`. A flattened structure is searchable and uninterpretable
+   at the same time; a container also has no single meaning for the containment test the GIN index
+   serves, and a numeric value makes a `-> 'k' = 'v'` comparison false for a value that *is* `v`.
+2. **The filter is `metadata ->> $n = $n+1`, not `@>`.** Containment is false for a stored number
+   compared against a string, and a jsonb equality is not the form the 0025 index was built for.
+3. **The set is replaced whole, never merged.** A partial merge lets a caller who does not know
+   the current set drop every pair it did not send — how a licence number disappears during a
+   caption edit. `{}` clears; an omitted field does not.
+4. **A half-typed `key=` is not a filter.** The toolbar field is re-read on every keystroke.
+5. **The editor is a block with its own save button.** The pairs are facts about *this library's
+   copy*, not facts the file carries — listing them beside the dimensions would claim they were
+   extracted — and one `Save metadata` that also rewrote the pairs would let a caption edit empty a
+   licence field.
+
+Caps: 40 pairs, 60-byte keys, 500-byte values, 8 kB total, each refused with the key **named**
+rather than truncated. The total cap is load-bearing — 40 × 500 are individually legal and together
+are a row every listing drags along.
+
+| Gate | Command | Result |
+|---|---|---|
+| crate | `cargo test -p omnion-media --lib --quiet` | **243 passed**, 0 failed (was 219) |
+| crate | `cargo test -p omnion-api --lib --quiet` | **284 passed**, 0 failed |
+| walk | `cargo test -p omnion-api --test media -- --test-threads=1` | **18 passed**, 0 failed (was 16) |
+| types | `apps/admin` `tsc --noEmit` | **0 errors** |
+| ui | `/tmp/probe-pairs.cjs` | **22/22** |
+
+**Proven to fail, three times.** Removing the validation from the route fails the walk on the
+stored jsonb's *type*. Swapping `->>` for `->` fails two crate tests. Making a half-typed term
+default to `campaign=` fails one. Plus a fourth, on the UI: removing the row mapping fails the
+probe's check.
+
+**Three of the four failures were my own mistakes, and the first is the one worth keeping.** The
+walk filtered `/api/v1/media` — the **flat core** endpoint that answers `{"media": [...]}` with no
+count — rather than `/media/files`, the browser listing the toolbar actually talks to. The endpoint
+whose name looks like the file manager is not the one the panel uses; that is the same lesson
+`raw_with_preset` taught two ticks ago, and it is now the second time. The other two: the error
+envelope is `{"error": {...}}`, so `body["code"]` reads `null` and looks like a missing field
+rather than a wrong address; and `member_token` holds *no* media permission in this fixture, so an
+assertion that a member can list failed `403` while the fixture's own doc comment says so.
+
+**Note for the next writer.** `cargo fmt -p omnion-media` reports diffs in nine files of which two
+are mine — `duplicates.rs`, `grants.rs`, `retention.rs`, `scanning.rs`, `shares.rs`,
+`storage_settings.rs` and `usage.rs` are pre-existing. Run `rustfmt --edition 2024 <file>` on the
+files you actually touched. And `/mnt/apopic` swung between 95% and 100% during this tick: write to
+`/dev/shm` first, then copy into place.
+
+**Browser pass: queued, not yet run.** `scripts/qa/run.sh --only=media` is waiting on the shared
+slot — `w4` holds it live (`pid 1782910`, `cwd=/mnt/apopic/omnion-w4`, verified with `kill -0`
+**and** `/proc/<pid>/cwd`, not the placeholder's age). This REQ still rests on it for its screen
+states, and it is not closed on tests alone.
+
+**Next:** the media browser pass when the slot frees; then REQ-010's last open item, the CDN purge
+hook to REQ-011.
