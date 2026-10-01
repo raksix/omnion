@@ -14999,16 +14999,31 @@ note({
           const graphResponse = await fetch(`/api/v1/workflows/${id}/graph`, { credentials: "same-origin" });
           if (!graphResponse.ok) return null;
           const current = await graphResponse.json();
+          // **THE WIRE CALLS THIS FIELD `type`, NOT `node_type`.** `Node` carries
+          // `#[serde(rename = "type")] pub node_type` under `deny_unknown_fields`, so the
+          // response's nodes have a `type` and no `node_type` at all. The map below used to read
+          // `node.node_type`, which was `undefined` for every node, and then
+          // `!node.node_type.startsWith(...)` threw a TypeError on the FIRST node -- inside
+          // `page.evaluate`, whose `.catch(() => null)` swallowed it, so `disabledRead` was
+          // `null` and the note reported `validateStatus: null, saysReEnable: false` on a
+          // product that answers this correctly. It is the same defect tick 74 found in
+          // `keyboard-pass`, in a row that ships eight lines later: **a gate that cannot go green
+          // and a gate that cannot go red read identically in a report.**
+          //
+          // `String(...)` rather than a bare read, because a node that somehow lacked the key
+          // would then throw here instead of reaching the `skipped` branch below, and the
+          // difference between "the rename did not happen" and "the row could not name a target"
+          // is the whole question this row asks.
           const nodes = (current.graph?.nodes ?? []).map((node) =>
-            node.node_type === key
-              ? node
-              : { ...node, node_type: node.node_type === "end" ? "end" : node.node_type },
+            node.type === key ? node : { ...node, type: node.type },
           );
           // Put the key on the node that is not the trigger and not the end, so the finding
           // is about the node type and not about an orphaned graph.
-          const target = nodes.find((node) => !node.node_type.startsWith("trigger.") && node.node_type !== "end");
+          const target = nodes.find(
+            (node) => !String(node.type ?? "").startsWith("trigger.") && String(node.type ?? "") !== "end",
+          );
           if (!target) return { skipped: "no non-trigger, non-end node to rename" };
-          target.node_type = key;
+          target.type = key;
           const validateResponse = await fetch(`/api/v1/workflows/${id}/graph/validate`, {
             method: "POST",
             credentials: "same-origin",
@@ -15048,6 +15063,13 @@ note({
       absentWhenDisabled: palettePlugin.length === 0,
       // The third claim, measured against a graph that uses the key.
       pluginKey,
+      // **A `null` here has to be legible, or it is the same number as a wrong sentence.**
+      // `disabledRead` is null whenever the fetch failed, the row could not name a target, or the
+      // evaluate threw -- and `saysReEnable: false` is what a correct product reads when the
+      // sentence is right. Tick 74's lesson in one field: a row that cannot distinguish "the
+      // product said the wrong thing" from "the row never asked" reports a constant.
+      pluginProbeReachedServer: disabledRead !== null,
+      pluginProbeSkipped: disabledRead?.skipped ?? null,
       validateStatus: disabledRead?.status ?? null,
       unknownFindings: unknownFindings.length,
       namesNode: unknownFindings.some((finding) => typeof finding.nodeId === "string"),
