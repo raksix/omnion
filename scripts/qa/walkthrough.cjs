@@ -5084,9 +5084,12 @@ async function runCrmAssignmentDepth(page, report) {
   // failure this half exists for. Asserted in three parts because each can fail alone: the
   // warning is on screen, the mistyped key is named, and the suggested spelling is the one
   // that would have worked.
-  await page.locator('[data-testid="simulator-payload"]').fill(
-    JSON.stringify({ contury: "TR", email: "visitor@example.invalid" }, null, 2),
-  );
+  await page
+    .locator('[data-testid="simulator-payload"]')
+    .fill(JSON.stringify({ contury: "TR", email: "visitor@example.invalid" }, null, 2), {
+      timeout: 6000,
+    })
+    .catch(() => {});
   await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForSelector('[data-testid="simulator-result"]', { timeout: 8000 }).catch(() => {});
   steps.unreadWarningShown =
@@ -5117,9 +5120,12 @@ async function runCrmAssignmentDepth(page, report) {
 
   // The inverse: a payload with nothing unread must not carry the warning, or an operator
   // learns to ignore it and the mistyped-key case goes back to blaming the rule.
-  await page.locator('[data-testid="simulator-payload"]').fill(
-    JSON.stringify({ country: "TR", email: "visitor@example.invalid" }, null, 2),
-  );
+  await page
+    .locator('[data-testid="simulator-payload"]')
+    .fill(JSON.stringify({ country: "TR", email: "visitor@example.invalid" }, null, 2), {
+      timeout: 6000,
+    })
+    .catch(() => {});
   await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(1500);
   steps.noUnreadWarningWhenEveryKeyIsRead =
@@ -5137,17 +5143,32 @@ async function runCrmAssignmentDepth(page, report) {
   // change it.
   await page.locator('[data-testid="assignment-add"]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForSelector('[data-testid="rule-editor"]', { timeout: 6000 }).catch(() => {});
-  await page.locator('[data-testid="rule-name"]').fill(`QA draft ${tag}`).catch(() => {});
-  await page.locator('[data-testid="rule-condition-country"]').check({ timeout: 4000 }).catch(() => {});
-  await page.locator('[data-testid="rule-condition-input-country"]').fill("DE").catch(() => {});
-  await page.locator('[data-testid="rule-target"]').selectOption("queue").catch(() => {});
+  await page
+    .locator('[data-testid="rule-name"]')
+    .fill(`QA draft ${tag}`, { timeout: 6000 })
+    .catch(() => {});
+  await page
+    .locator('[data-testid="rule-condition-country"]')
+    .check({ timeout: 4000 })
+    .catch(() => {});
+  await page
+    .locator('[data-testid="rule-condition-input-country"]')
+    .fill("DE", { timeout: 6000 })
+    .catch(() => {});
+  await page
+    .locator('[data-testid="rule-target"]')
+    .selectOption("queue", { timeout: 6000 })
+    .catch(() => {});
   steps.simulatorNamesTheDraft =
     (await page.locator('[data-testid="simulator-draft-note"]').innerText().catch(() => "")).includes(
       `QA draft ${tag}`,
     );
-  await page.locator('[data-testid="simulator-payload"]').fill(
-    JSON.stringify({ country: "DE", email: "visitor@example.invalid" }, null, 2),
-  );
+  await page
+    .locator('[data-testid="simulator-payload"]')
+    .fill(JSON.stringify({ country: "DE", email: "visitor@example.invalid" }, null, 2), {
+      timeout: 6000,
+    })
+    .catch(() => {});
   await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(1800);
   steps.draftWinsOverTheSavedChain = (
@@ -5155,7 +5176,7 @@ async function runCrmAssignmentDepth(page, report) {
   ).includes(`QA draft ${tag}`);
   // …and a draft the save would refuse is refused by the preview too, rather than answering
   // about a rule the editor cannot store.
-  await page.locator('[data-testid="rule-name"]').fill("").catch(() => {});
+  await page.locator('[data-testid="rule-name"]').fill("", { timeout: 6000 }).catch(() => {});
   await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(1500);
   steps.anUnnamedDraftIsRefused =
