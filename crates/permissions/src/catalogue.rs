@@ -1378,14 +1378,21 @@ mod tests {
 
     #[test]
     fn the_hr_family_is_catalogued() {
-        // REQ-055. Fourteen keys: the directory's read/create/update/terminate/export, the
-        // sensitive block, the department pair, the document pair and the leave quartet.
+        // REQ-055. **Nineteen** keys: the directory's read/create/update/terminate/export, the
+        // sensitive block, the department pair, the document pair, the leave quartet, the
+        // attendance trio and the onboarding pair.
         //
         // The reason this test is worth writing by hand rather than trusting the entries above:
         // a `guards::require()` with a key that is **not** in the catalogue does not fall open —
         // it 403s *everyone*, including the instance owner. So a typo in a route is a module that
         // looks installed and answers 403 on every screen, and the tripwire is the catalogue, not
         // the route.
+        //
+        // **The list is the argument that it stays current.** Slice 4 added two keys and this
+        // array was still asserting fourteen — and it was still *passing*, because a list that
+        // names fewer keys than exist is a test that checks the keys it happens to remember. A
+        // catalogue test that only ever grows by hand is a test that lags the feature silently.
+        // Every `guards::require(&state, "hr.…")` in `routes/mod.rs` must appear here.
         for key in [
             "hr.employees.read",
             "hr.employees.create",
@@ -1401,6 +1408,11 @@ mod tests {
             "hr.leave.request",
             "hr.leave.approve",
             "hr.leave.manage",
+            "hr.attendance.read",
+            "hr.attendance.record",
+            "hr.attendance.manage",
+            "hr.onboarding.read",
+            "hr.onboarding.manage",
         ] {
             assert_eq!(
                 get(key).map(|entry| entry.category),
