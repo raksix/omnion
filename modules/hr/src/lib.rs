@@ -30,6 +30,7 @@ pub mod error;
 pub mod leave;
 pub mod me;
 pub mod model;
+pub mod onboarding;
 pub mod requests;
 pub mod store;
 

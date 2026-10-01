@@ -166,6 +166,32 @@ pub enum HrError {
         /// The day, as `YYYY-MM-DD`.
         work_date: String,
     },
+    // --- onboarding (slice 4) ---------------------------------------------------------------
+    //
+    // Same rule as the three above: a refusal a client has to *distinguish* is a variant, not a
+    // formatted `Invalid`. "Already applied" is a different sentence from "no such template" and
+    // the double-apply case is the one an operator meets on a page that looks like it did nothing.
+
+    /// A template was applied to an employee who is already working through it.
+    ///
+    /// Carries how many items are already there, because "already applied" on its own sends the
+    /// operator to the employee's page to work out whether it worked at all — and the case that
+    /// matters (a double-clicked button) looks exactly like the case that does not.
+    #[error("this template is already applied to the employee, with {items} item(s) on their checklist")]
+    AlreadyApplied {
+        /// Whose checklist it is.
+        employee_id: Uuid,
+        /// The template that was already applied.
+        template_id: Uuid,
+        /// How many items are already there.
+        items: i64,
+    },
+    /// A template that belongs to this organization does not exist.
+    ///
+    /// A named variant so "the id is wrong" can be told from "you may not apply it" — the second
+    /// is a 403 that arrives before the handler and never reaches this code at all.
+    #[error("no such onboarding template in this organization")]
+    NoSuchTemplate,
 }
 
 impl HrError {

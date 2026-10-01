@@ -32,6 +32,19 @@ QA_DB_NAME="omnion_qa"
 [ "$STACK" != "main" ] && QA_DB_NAME="omnion_qa_$STACK"
 QA_DB="$QA_DB_NAME"
 export QA_DB
+# The QA Postgres port. The default is the shared container every stack points at; a writer whose
+# own Postgres is unhealthy sets `QA_PG_PORT` and `QA_PG_CONTAINER` to run against a private one.
+# `QA_PG_CONTAINER` was already the knob in `reset-db.sh`, which made the failure asymmetric and
+# silent: the pass DROPPED AND RECREATED the database on the private container and then started the
+# API against the shared port, so the walkthrough reached an empty server it had just emptied
+# elsewhere, found no accounts, and died at "could not sign in" — which reads as a broken product
+# and is a pass pointing at two different databases. It is a port, not a credential.
+DEFAULT_PG_PORT=5433
+export QA_PG_CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}"
+# The database URL in ONE place, because `run.sh` and `walkthrough.cjs` must agree: a pass that
+# resets the database and then cannot sign in to it dies before its first screen.
+QA_DATABASE_URL="postgres://omnion:***@127.0.0.1:${QA_PG_PORT:-$DEFAULT_PG_PORT}/$QA_DB_NAME"
+export QA_DATABASE_URL
 export NODE_PATH="${QA_NODE_PATH:-/root/test-hermes/node_modules}"
 export QA_CHROME="${QA_CHROME:-/root/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome}"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -192,7 +205,7 @@ fi
 if pm2 describe "$API_NAME" >/dev/null 2>&1; then
   pm2 restart "$API_NAME" >/dev/null
 else
-  OMNION_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME" \
+  OMNION_DATABASE_URL="$QA_DATABASE_URL" \
   OMNION_REDIS_URL="redis://127.0.0.1:6380" \
   OMNION_PORT="$API_PORT" \
   OMNION_ENV=development \
