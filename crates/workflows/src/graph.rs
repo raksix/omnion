@@ -2864,4 +2864,109 @@ mod tests {
              reported once per pass and reads as dozens of screen defects"
         );
     }
+
+    /// The disk guard must not delete the cache of a dev server that is serving a pass.
+    ///
+    /// Observed on 2026-10-01, and the failure is a case where the harness was GREEN and the
+    /// reason was in a log nobody read. `scripts/qa/disk-guard.sh` runs from a Hermes cron every
+    /// six minutes. Its step 2 deletes any `apps/*/.next` over `NEXT_MAX_MB`, and it was the
+    /// only reclaim step with no liveness test. At 03:54 on the wave-3 stack it removed
+    /// `omnion-w3/apps/admin/.next`; the admin server logged
+    /// `The directory at "..." was deleted. Restarting the server to recover...`, and the
+    /// walkthrough walked on into a server that was restarting.
+    ///
+    /// **It did not throw.** The pass completed, wrote `pages: 55` and no findings on the
+    /// builder, and three ticks of notes attributed the shortfall to a tired box. But every
+    /// screen after `/analytics/downloads` came back `chrome-error://chromewebdata/` — and a
+    /// page that never loaded reports NO problems, so the harness recorded an unmeasured
+    /// remainder as a clean one. That is why this guard is about the DELETION and not about the
+    /// reporting: the reporting was working exactly as written.
+    ///
+    /// So the claims are about SHAPE rather than about a string. The liveness call exists, it is
+    /// asked about a DIRECTORY (the worktree that owns the app, not the `.next` itself — no
+    /// process ever has a cache as its cwd), and the test it uses is a prefix test that accepts
+    /// the directory itself. An equality test IS the defect: a live admin server's cwd is
+    /// `<worktree>/apps/admin`, so an equality against the worktree root answered "nobody is
+    /// working here" on every pass ever run.
+    #[test]
+    fn the_disk_guard_asks_before_deleting_a_next_cache() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the workspace root is two levels above crates/workflows");
+        let source = std::fs::read_to_string(repo_root.join("scripts/qa/disk-guard.sh"))
+            .unwrap_or_else(|e| panic!("the disk guard is the thing being guarded: {e}"));
+
+        // 1. The liveness test itself must accept the directory AND its children. The first
+        //    draft of the fix matched children only, so asking about the one directory a dev
+        //    server actually sits in answered "idle" — the guard was proven against the wrong
+        //    argument and came back green.
+        assert!(
+            source.contains(r#""$wt"|"$wt"/*"#),
+            "`worktree_under` no longer matches the directory itself, so the one cwd a dev \
+             server really has (`<worktree>/apps/admin`) reads as idle and the cache is deleted \
+             from under a running server"
+        );
+
+        // 2. The `.next` loop must consult it. Without this the helper is dead code and check 1
+        //    passes against a guard that still deletes.
+        let next_loop = source
+            .find("for nx in")
+            .expect("the Next.js cache step is gone from the guard; this test would pass vacuously");
+        let next_end = source[next_loop..]
+            .find("\ndone")
+            .map(|i| next_loop + i)
+            .expect("the Next.js cache loop is unterminated");
+        let next_body = &source[next_loop..next_end];
+        assert!(
+            next_body.contains("worktree_under"),
+            "the `.next` step deletes without asking whether a live process is working in that \
+             worktree — the one reclaim step that removes a directory a RUNNING SERVER is using, \
+             which is what ended pass 20261001-021909 with 20 screens of `chrome-error://`"
+        );
+        // ...and a spared cache must SAY so, or the next reader of a full disk cannot tell
+        // "kept because in use" from "the guard never ran".
+        assert!(
+            next_body.contains("keep next cache"),
+            "the guard silently skips a live cache; a full disk with nothing freed and no line to \
+             explain it is the state this file was written to avoid"
+        );
+
+        // 3. The other reclaim steps already had this test. A rule that holds in three places
+        //    and not the fourth is the shape that produced this: the asymmetry was invisible
+        //    because every step next to the broken one was correct.
+        //
+        //    Anchored on `reclaimable` rather than on the loop headers: the header is where the
+        //    FIRST draft of this assertion looked and found nothing — it searched for a glob
+        //    written twice with a different suffix, and a needle that does not exist is a test
+        //    that either fails for the wrong reason or, once someone "fixes" it to match
+        //    anything, asserts nothing at all.
+        assert!(
+            source.matches("reclaimable").count() >= 3,
+            "the target-reclaim steps no longer consult `reclaimable`; the `.next` step is \
+             guarded and the cargo ones are not, which is the asymmetry that deleted a live dev \
+             server's cache"
+        );
+
+        // 4. The ORDER inside the `.next` loop is the claim, and the deletion text alone is
+        //    not. `rm -rf "$nx"` must SURVIVE — it is the correct answer for a cache nobody is
+        //    using — so an assertion that the line is absent would fail against a correct guard
+        //    and pass against one that never deletes anything. What has to hold is that the
+        //    liveness question is asked BEFORE the deletion and can skip it, which is the same
+        //    ordering claim the sign-out guard makes.
+        let ask = next_body
+            .find("worktree_under")
+            .expect("the `.next` step does not ask about liveness");
+        let keep = next_body
+            .find("keep next cache")
+            .expect("a spared cache is not announced");
+        let delete = next_body
+            .find(r#"rm -rf "$nx""#)
+            .expect("the `.next` cache is never deleted, which means the guard freed nothing");
+        assert!(
+            ask < keep && keep < delete,
+            "the liveness check must come before the deletion ({ask}, {keep}, {delete}); a guard \
+             that deletes first and asks afterwards has the shape of the one that broke"
+        );
+    }
 }
