@@ -10911,3 +10911,49 @@ Next: slice 3's remaining work is the one this tick made visible — make `crate
 `register_failure` read the **security centre's** lockout document, so the tuned number is the
 enforced number. Then REQ-012's browser pass (still owed, box permitting) for the boxes that name
 a screen.
+
+---
+
+## Tick 58 — REQ-055 slice 4, the onboarding half
+
+**What.** `0213_hr_onboarding.sql` (the per-employee items a template materialises into, plus two
+indexes over the document table that only the cross-employee screen reads), `modules/hr/src/
+onboarding.rs`, seven routes in two routers, two permission keys and nine DB walks. The
+template table has existed since slice 1 because the seed had to be seedable before anything used
+it; this is the half that consumes it.
+
+**Proof.**
+
+- `omnion-module-hr` **94/94** (87 before, 7 new).
+- `hr_onboarding` **9/9 green** in 189 s against the private PostgreSQL 17 on 5444.
+- Migration: the whole **67-file** chain applied to a fresh database in order, then 0213 applied a
+  **second time by hand** — both clean, five objects. `docker exec -i` is required: without it
+  psql never sees the file and the loop reports success on an empty database, which is how the
+  first "chain is green" run produced zero tables.
+- `omnion-permissions` **70/70**, and the HR tripwire **proven to fail** by typing one key.
+- `omnion-api` builds clean.
+
+**Three defects, and the two that were about the gates are the ones worth carrying.**
+
+1. **`due_on` serialised as `[2026,61]`.** `time::Date`'s `serde` impl writes a year and an
+   ordinal day — correct, unreadable, and invisible to `cargo test` because the Rust side never
+   reads its own JSON back. Only a walk asserting on a *serialised payload* finds it. The module
+   already had `dates::option`/`dates::instant::option` and every other date field used them.
+2. **The HR permission tripwire was five keys behind and still passing.** A hand-maintained list
+   that names fewer keys than exist can only fail if a key it names is *removed*, never if a key a
+   route needs is *missing* — which is exactly the failure it exists to catch.
+3. **The QA pass was pointing at two databases at once.** `reset-db.sh` already took
+   `QA_PG_CONTAINER`; `run.sh` hardcoded `127.0.0.1:5433`. The pass emptied the private database
+   and asked the shared one for an account, and died at "could not sign in after wizard" — which
+   reads like a broken product. One `QA_DATABASE_URL` now, with `QA_PG_PORT` beside it. *Main has
+   the same hardcoded URL; this branch's fix is ready to merge back.*
+
+**The merge.** `origin/main` had moved and both conflicts were the same idea solved twice: this
+branch turned an unmeasured page into a `voidReasons` entry (which marks the whole run), main turned
+it into a `high` finding naming the screen (which is in the per-screen report). Main's is kept and
+the now-dead `unmeasured` array removed — a second place recording the same fact is a second place
+that can disagree. BUILD-LOG merged with `scripts/qa/merge-build-log.py`: **0 entries missing on the
+multiset check**, not a line count.
+
+**Next.** The documents + reports half of slice 4, then the admin screens for both halves —
+**no screen exists for onboarding yet**, which is the same gap slice 1 had.

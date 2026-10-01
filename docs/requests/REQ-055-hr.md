@@ -1,7 +1,53 @@
 # REQ-055 — HR
 
-> **Status:** in-progress (slice 3 + slice 1's missing screens — the PEOPLE CORE and the clock's
-> verdict)
+> **Status:** in-progress (slice 4's first half — ONBOARDING, the data core, the API and **9/9
+> walks green** against a live PostgreSQL. Three defects found along the way, one of them a
+> product bug and two of them about the gates themselves.)
+>
+> **1. A real bug the walks found and `cargo test` could not: `due_on` serialised as `[2026,61]`.**
+> `time::Date`'s `serde` impl writes a year and an **ordinal day**. That is correct and
+> unreadable — the screen renders `undefined` — and it is invisible to `cargo test`, because
+> nothing in the Rust side reads its own JSON back. The walk caught it as
+> `left: Array [Number(2026), Number(61)]` against an expected `"2026-03-02"`. The module already
+> had `dates::option` and `dates::instant::option` and every other date field used them; this one
+> field skipped the house style. Fixed in `9f66e9d4`. **The argument is for walks that assert on
+> serialised payloads, not only on status codes.**
+>
+> **2. The HR permission tripwire was five keys behind and still passing.**
+> `the_hr_family_is_catalogued` named fourteen keys while the catalogue held nineteen — slice 2d's
+> attendance trio and slice 4's onboarding pair were never added. A list that names fewer keys
+> than exist can only fail if a key it *names* is removed, never if a key a route needs is
+> *missing* — which is precisely the failure it exists to catch, since an uncatalogued
+> `guards::require()` 403s everyone including the instance owner. Now nineteen, with the rule
+> written down, and **proven to fail** by typing one of them. `98e91440`.
+>
+> **3. The QA pass was pointing at two databases at once, and that is a harness defect worth
+> having found.** `reset-db.sh` already took `QA_PG_CONTAINER` — so a pass could reset the
+> database on a *private* container — while `run.sh` started the API against a **hardcoded**
+> `127.0.0.1:5433`. The pass emptied one database and asked another for an account, got a
+> server that had never heard of it, and died at "could not sign in after wizard", which reads
+> exactly like a broken product. Both are now one variable (`QA_PG_PORT` + a single
+> `QA_DATABASE_URL`), defaulting to the shared server. The asymmetry was invisible because the
+> knob existed on one side of the script and not the other.
+>
+> **Proof:** `omnion-module-hr` **94/94** (87 before, 7 new onboarding); `hr_onboarding` **9/9**
+> green in 189 s against the private PostgreSQL 17 on 5444; migration chain — all **67** files
+> applied to a fresh database in order, then 0213 applied a **second time by hand**, both clean,
+> five objects; `omnion-permissions` **70/70**; `omnion-api` builds clean.
+>
+> **Still to do in slice 4:** the document index screen (the table and its two indexes exist, the
+> cross-employee list and the expiry sweep do not), the reports screen with its CSV export, and
+> the admin UI for all three — **no screen exists yet for onboarding**, which is the same gap
+> slice 1 had and the reason the walks above read payloads rather than pixels.
+>
+> **Next:** the documents + reports half of slice 4, then the screens for both halves.
+>
+> **Previous (tick 57): slice 3's opening move and slice 1's missing screens** — the migration,
+> eleven routes, store, org chart and merge had all existed for four waves while the module's own
+> nav pointed at three surfaces instead of five; this tick built `/hr/employees` and
+> `/hr/departments`, the client behind them and two nav entries, because `cargo test` has no
+> opinion about a route never written, the walks call the API directly, and the walkthrough only
+> visits what its inventory already lists.
 >
 > **Two things this tick, and the first one is a gap four writers should know about.**
 >
@@ -258,7 +304,7 @@ Webhook relevance: `hr.leave.approved` is consumed by the calendar module (absen
 - [x] Rejecting with a comment is visible on the request timeline; cancelling a pending request releases the balance and is audited. *(Slice 2: the detail response carries a `timeline` and the walk asserts the approver's comment is on the `rejected` step and that `can_decide` is false afterwards — a decided request offering a decision panel is how a "Decide" button ends up on leave HR has already approved. Cancelling moves pending → 0 and the same dates become available again, which is the one thing a naive "refuse any overlap" check gets wrong. Both write an audit entry. An **approved** request cannot be cancelled: it is history, ended by the leave happening, not by pretending it was never agreed.)*
 - [x] Attendance check-in/check-out records the right day, refuses a checkout without check-in and a second check-in the same day (idempotent for API callers). *(Slice 2d, and the verdict the walk owed finally arrived: **10/10 DB walks green** in 215 s. Ten cases, each a refusal or a fact rather than a rendering — the day recorded is the organization's day and not the browser's, `check_out` without a `check_in` is refused, a second punch is refused **with the punch it found** rather than a bare 409, an account holding no `hr.*` key punches and reads its own day, somebody else's month is refused in *both* directions, and the remaining two refusals the schema could answer without touching the clock. Run against a **private PostgreSQL on 5444** because the shared container every writer shares has been wedged in crash recovery for hours — restarting a shared database is not a local decision, and a walk that cannot connect is an unmeasured pass, not a failing one.)*
 - [ ] Monthly summary lists worked hours per employee and flags missing checkout and over/under hours, and the CSV export matches the grid.
-- [ ] Applying an onboarding template creates the items with due dates derived from the start date; ticking an item is reflected in the progress bar and emits completion when the last item is ticked.
+- [x] Applying an onboarding template creates the items with due dates derived from the start date; ticking an item is reflected in the progress bar and emits completion when the last item is ticked. *(Slice 4, and the two halves the criterion names are walked separately because they fail differently. **The dates: an item with offset 0 is due on the start date, offset 3 is three days after it, and an item with *no* offset has `due_on: null` rather than "due today"** — "no deadline" is a real answer for "buy the coffee grinder" and a different thing from day 0. **The dates are stored, not derived on read**, and the walk that proves it edits the employee's start date afterwards and re-reads the checklist: an implementation that recomputes from the live start date passes the first assertion and silently re-dates every item the moment somebody corrects a typo, and a checklist whose due dates move under it is one nobody trusts. The offset is kept beside the date so "why is this due on the 9th?" needs no reconstruction. **The bar: the denominator is the row count and never the template's length.** The walk ticks all three, then adds a FOURTH item to the template, and asserts the bar is still 3/3 — an item the template gained since the checklist was applied is not on that person's checklist, and dividing by the template's length reports 75% for somebody who finished all three of the three things they were given. **The event fires once, on the transition**: the walk asserts zero events after two ticks, exactly one after the third, and *still* one after re-ticking the same item and after unticking the last one. The handler reads the checklist **before** the write (`checklist_for_item`) precisely so a re-read cannot see what another writer has since done — otherwise an automation waiting for "onboarding finished" runs once per tick, and an untick fires a completion for a checklist that just stopped being complete. The refused second apply is a 409 carrying `items: 3`, and the walk reads the list back to assert the refusal wrote nothing.*)
 - [ ] Document upload stores through media, downloads with the right name/type, and an expiring document produces one `hr.document.expiring` event.
 - [ ] The org chart renders the tree, navigates with the keyboard and matches the employee counts shown in the department list.
 - [ ] `hr.employee.joined` and `hr.leave.approved` appear in the event feed with the documented payload and reach a subscribed webhook.
