@@ -8430,8 +8430,22 @@ async function runFormsDepth(page, report) {
   // authority would fail.
   await page.locator('[data-form-add="select"]').first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(700);
-  steps.paletteAddsAField = (await page.locator('[data-form-field="plan"]').count()) > 0;
+  // The palette names a new field after its label, so the key it lands on is a product decision
+  // this pass must not hardcode: read it back off the canvas, then give it the key the rest of
+  // the pass drives. Assuming `plan` here made every later check report a defect the product
+  // never had — one wrong assumption, twenty false keys.
+  const addedKey = await page
+    .locator("[data-form-canvas] [data-form-field]")
+    .last()
+    .getAttribute("data-form-field")
+    .catch(() => null);
+  steps.paletteAddsAField = typeof addedKey === "string" && addedKey.length > 0;
+  steps.paletteNamedTheField = addedKey;
   steps.choiceFieldOpenedInspector = (await page.locator("[data-form-inspector-for]").count()) > 0;
+  const choiceKey = "plan";
+  await page.locator("[data-form-inspector-key]").fill(choiceKey).catch(() => {});
+  await page.waitForTimeout(400);
+  steps.choiceKeyWasAccepted = (await page.locator(`[data-form-field="${choiceKey}"]`).count()) > 0;
   await page.locator("[data-form-inspector-options]").fill("").catch(() => {});
   await page.waitForTimeout(400);
   await page.locator("[data-form-save]").click({ timeout: 6000 }).catch(() => {});
@@ -8458,6 +8472,20 @@ async function runFormsDepth(page, report) {
       `select options::text from cms_form_fields where key = 'plan' and form_id in (select id from cms_forms where key = '${formKey}')`,
     ) ?? "";
   steps.optionsCarriedBothChoices = /gold/i.test(steps.optionsWereStored) && /silver/i.test(steps.optionsWereStored);
+  // The store compares an answer against the option LABEL exactly, so the value the pass may send
+  // is the text the owner typed. Read the real option values off the preview rather than assuming
+  // a slug: "Gold" is a legal stored option and "gold" is a refusal.
+  await page.locator("[data-form-preview-toggle]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(500);
+  const choiceValue = await page
+    .locator(`[data-form-preview-input="${choiceKey}"] option`)
+    .nth(1)
+    .getAttribute("value")
+    .catch(() => null);
+  steps.choiceOptionValue = choiceValue;
+  steps.choiceHasRealOptions = typeof choiceValue === "string" && choiceValue.length > 0;
+  await page.locator("[data-form-preview-toggle]").click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(400);
 
   // A duplicate key is refused where the editor is looking at it.
   await page.locator('[data-form-add="text"]').first().click({ timeout: 6000 }).catch(() => {});
@@ -8495,13 +8523,13 @@ async function runFormsDepth(page, report) {
     .catch(() => null);
   await page.locator('[data-form-preview-input="name"]').fill("Ada").catch(() => {});
   await page.locator('[data-form-preview-input="message"]').fill("Hello there").catch(() => {});
-  await page.locator('[data-form-preview-input="plan"]').selectOption("gold").catch(() => {});
+  await page.locator(`[data-form-preview-input="${choiceKey}"]`).selectOption(choiceValue ?? "").catch(() => {});
   await page.waitForTimeout(300);
   await page.locator('[data-form-preview-submit]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(700);
   steps.previewAcceptedAFilledForm = (await page.locator("[data-form-preview-success]").count()) > 0;
   // And a value the field never offered must be refused, so the preview is not decoration.
-  await page.locator('[data-form-preview-input="plan"]').selectOption("gold").catch(() => {});
+  await page.locator(`[data-form-preview-input="${choiceKey}"]`).selectOption(choiceValue ?? "").catch(() => {});
   await page.locator('[data-form-preview-input="message"]').fill("").catch(() => {});
   await page.locator('[data-form-preview-submit]').click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(600);
@@ -8567,12 +8595,14 @@ async function runFormsDepth(page, report) {
     window.__qaSiteKey = key;
   }, CREDS.siteKey);
 
-  const good = await submitThroughBrowser({ name: "Ada", message: "Hello from the pass", plan: "gold" });
+  // `bronze` is deliberately not one of the offered options, so it must be refused; the valid
+  // submissions carry the real option value, which is the text the owner typed in the builder.
+  const good = await submitThroughBrowser({ name: "Ada", message: "Hello from the pass", [choiceKey]: choiceValue });
   steps.validSubmissionStatus = good.status;
   steps.validSubmissionStored = good.body?.stored === true;
 
   const honeypot = await submitThroughBrowser(
-    { name: "Bot", message: "buy now", plan: "gold" },
+    { name: "Bot", message: "buy now", [choiceKey]: choiceValue },
     { honeypot: "http://spam.example" },
   );
   steps.honeypotStatus = honeypot.status;
@@ -8584,17 +8614,17 @@ async function runFormsDepth(page, report) {
     ) === "0";
 
   const tooFast = await submitThroughBrowser(
-    { name: "Robot", message: "instant", plan: "gold" },
+    { name: "Robot", message: "instant", [choiceKey]: choiceValue },
     { filled_at_ms: 10 },
   );
   steps.tooFastLooksAccepted = tooFast.body?.stored === false;
 
-  const invalid = await submitThroughBrowser({ name: "ab", message: "", plan: "bronze" });
+  const invalid = await submitThroughBrowser({ name: "ab", message: "", [choiceKey]: "bronze" });
   // The one refusal a visitor IS told about, and it must be a 422 carrying every wrong field.
   steps.invalidStatus = invalid.status;
   const invalidErrors = invalid.body?.error?.details?.errors ?? null;
   steps.invalidCarriesFieldErrors = invalidErrors !== null && Object.keys(invalidErrors).length >= 2;
-  steps.invalidNamesTheChoiceField = Boolean(invalidErrors?.plan);
+  steps.invalidNamesTheChoiceField = Boolean(invalidErrors?.[choiceKey]);
   steps.invalidNamesTheShortName = Boolean(invalidErrors?.name);
   steps.invalidStoredNothing =
     qaSql(
@@ -12182,7 +12212,8 @@ async function main() {
     const required = [
       "listReady", "createFormOpened", "nameIsOnTheInput", "keyFollowsName", "rowLanded",
       "rowOnScreen", "draftIsLabelled", "editLinkHasAnId", "editorReady",
-      "paletteAddsAField", "choiceFieldOpenedInspector", "optionlessChoiceRefused",
+      "paletteAddsAField", "paletteNamedTheField", "choiceFieldOpenedInspector",
+      "choiceKeyWasAccepted", "choiceHasRealOptions", "optionlessChoiceRefused",
       "optionlessChoiceWasNotStored", "savedFields", "optionsCarriedBothChoices",
       "duplicateKeyRefused", "previewOpened", "previewHasTheCanvasFields",
       "previewRefusedAnEmptyRequired", "previewAcceptedAFilledForm",
