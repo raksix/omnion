@@ -1,3 +1,83 @@
+## 2026-10-01 — tick 64 found the gate that ate the last three passes
+
+fix(qa): a timeout is not a dead stack, and a 5xx is not either ·
+test(qa): prove the liveness gate can go red, in all four directions
+
+**Three ticks of "the box was not free" were not the reason there was no pass. The passes ran,
+finished, and threw themselves away on the last line.**
+
+Tick 61's log ends with the whole panel walked and then one line:
+
+```
+[walk] FATAL: the QA stack stopped answering mid-pass — this run reports nothing usable
+QA_STACK_GONE=1 QA_FINDINGS=0 QA_CLICKS=1844
+```
+
+1,844 clicks, every depth pass measured, the report written — discarded, because `stackGone`, the
+one predicate that decides whether a run may be published, said the stack was gone. It had been
+firing for three ticks, and each one read it as a resource problem and went looking for a quieter
+box. It was a bug in the reading, and the resource contention only supplied the conditions.
+
+```js
+const res = await context.request.get(`${URL_ADMIN}/login`, { timeout: 8000 });
+return !res || res.status() >= 500;
+} catch {
+  return true;
+}
+```
+
+Two mistakes, and the second one had been hiding the first:
+
+1. **A timeout is not a verdict.** The probe gets 8s; six writers share this box; a Next render
+   under that load routinely takes longer. The catch fired on a stack that was serving every other
+   screen perfectly, and `return true` was called proof of death.
+2. **A 5xx is not death either — that half is inverted.** A 500 is a render that threw and the
+   process that came back up to send it. The check treated *the server answered* as *the server is
+   gone*, which is the exact inverse of a liveness probe, and it made the timeout path look like
+   the conservative branch when it was the arbitrary one.
+
+So the pass had one boolean where the question needed three answers. It now separates them: a
+completed request is alive **whatever the status**; a refused or reset connection (`ECONNREFUSED`,
+`ECONNRESET`, `EPIPE`, `socket hang up`) is dead immediately, because retrying a port nothing is
+listening on spends 48 seconds to learn nothing; and a timeout is *unknown*, retried on a widening
+8s / 15s / 25s ladder. An exhausted ladder still reports gone, so the retry cannot turn the gate
+permanently green — otherwise every finding after a dead restart would be published.
+
+The generalisation: **a liveness gate that returns one boolean cannot express "I do not know", and
+an unknown silently becomes a yes.** Every pass on a shared box needs the third answer, because
+slow and dead are indistinguishable from inside a single timed request.
+
+### The proof that the guard is a guard
+
+`stack-liveness.test.ts` reads `stackGone`'s source rather than importing a predicate — an exported
+helper would be a second copy of the rule, free to drift from the one that runs, which is this
+directory's recurring failure wearing a different hat. Four assertions name the constructs inside
+the block that performs them: no `.status()` comparison anywhere in it, a widening ladder, a
+refusal returned inside the catch, and an exhausted ladder that still says gone.
+
+`scripts/qa/stack-liveness.mutation.sh` restores each of the three original defects one at a time
+and requires the suite to catch it, restoring the file from backup and checking its md5 afterwards.
+
+**Proof.**
+- `node --test --experimental-strip-types apps/admin/features/workflows/*.test.ts` → **341 passed**
+  (335 → 341, +6)
+- `stack-liveness.mutation.sh` → **4/4 mutations red**, file restored byte-exact
+  (`97360bdb` → `97360bdb`)
+- **all five sibling harnesses run, not just the new one**: `run-from-here-row` 13/13,
+  `undo-selection-edge-row` 17/17, `step-trace-target` 9/9, `step-trace-row` 10/10 (M10 declared
+  as owned by the sibling, as before), `table-mode-row` 8/8 — `stackGone` is shared, and tick 62's
+  note about adding shared helpers is the reason all five were re-run
+- `pnpm typecheck` → 2/2 successful · `node --check scripts/qa/walkthrough.cjs` → clean
+- `cargo test -p omnion-workflows --lib` → 157 passed; no Rust was touched this tick
+- Commits `0fe9a1f2`, `064d61a1`, pushed; tree clean
+
+**Next.** The pass is queued for the slot (`QA_STACK=w3`, artifacts on tmpfs). The gate it depends
+on is fixed, so a pass that has measured 1,844 clicks will now publish them. Every criterion tick 61
+listed is still unticked and stays unticked until one does: `undo-selection` for `writeSettled`,
+`undo`/`drag-undo` for `writeSettled` + `nodesOnServer`, `narrow-lock` for
+`keysUnchangedDuringWindow`, then `run-from-here` and `step-trace`. Plugin row stays BLOCKED on
+REQ-121.
+
 ## 2026-10-01 — tick 62 fixed the three sites its own report named, and left five
 
 fix(qa): settle-driven writes in the five builder rows a fixed sleep was racing ·
