@@ -33,6 +33,7 @@ const TABS = [
   { href: "/security/sign-in-protection", label: "Sign-in protection", key: "sign-in-protection" },
   { href: "/security/ip-access", label: "IP access", key: "ip-access" },
   { href: "/security/events", label: "Events", key: "events" },
+  { href: "/security/secrets", label: "Secrets", key: "secrets" },
 ] as const;
 
 export type SecurityTabKey = (typeof TABS)[number]["key"];
