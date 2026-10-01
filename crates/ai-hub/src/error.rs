@@ -154,6 +154,16 @@ pub enum AiHubError {
     /// list is refused. Every message names the operation it is about.
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
+    /// An eval suite, case or expectation breaks one of its own rules (REQ-107 slice 1).
+    ///
+    /// Its own code for the same reason as the three above: the refusal belongs on a field of
+    /// the case editor — a `regex` that does not compile, a `json_schema` using a keyword this
+    /// platform does not implement, a threshold with a rubric and no judge — and a client that
+    /// mapped it onto `invalid_airgap` or `invalid_change_set` would print a sentence about
+    /// change sets above the regex box. Every message names the property it is about, because
+    /// the editor marks one field at a time.
+    #[error("invalid eval input: {0}")]
+    InvalidEval(String),
     /// An air-gap setting breaks one of the switch's own rules (REQ-106 slice 2).
     ///
     /// Its own code for the same reason as the three above: the refusal belongs on a field of
@@ -333,6 +343,11 @@ impl AiHubError {
             // the review form, and a client that collapsed them would print the sentence
             // above the title.
             Self::InvalidChangeSet(_) => "invalid_change_set",
+            // The eval codes (REQ-107 slice 1). Distinct from every other `invalid_*` on
+            // purpose: the refusal belongs on a field of the case editor (which regex, which
+            // keyword the schema uses not), and a client that collapsed it with the change-set
+            // code would print a sentence about change sets above the case's own input.
+            Self::InvalidEval(_) => "invalid_eval",
             Self::InvalidAirgap(_) => "invalid_airgap",
             Self::AirgapHostNotFound(_) => "airgap_host_not_found",
             Self::ChangeSetNotFound(_) => "change_set_not_found",

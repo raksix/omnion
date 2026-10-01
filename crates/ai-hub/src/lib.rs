@@ -21,6 +21,7 @@ pub mod approvals;
 pub mod catalog;
 pub mod catalogue;
 pub mod egress_verify;
+pub mod eval_case;
 pub mod change_sets;
 pub mod client;
 pub mod connection_test;
