@@ -86,6 +86,11 @@ const NAV = [
   // with the internet unplugged". The second is the question before switching the air gap on, so
   // it has to be one click away rather than buried under a specific endpoint.
   { href: "/ai/local/doctor", label: "Local AI doctor", icon: Stethoscope },
+  // The manual (REQ-106 slice 4). Last of the three local-AI entries, because it is the one a
+  // person reads *before* touching the other two and then never needs again — a guide placed above
+  // the doctor would imply the doctor is optional. Beside the switch rather than under docs/,
+  // since every step on it names one of the three screens in this group.
+  { href: "/ai/local/guide", label: "Run AI locally", icon: BookMarked },
   // The air-gap switch (REQ-106). Under "Local AI" rather than in the settings block, because it is
   // the second half of the same question — the endpoint list says where a call can still go, this
   // says what happens to the ones that cannot. It is the screen an operator opens mid-incident, so
