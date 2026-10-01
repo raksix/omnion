@@ -47,7 +47,7 @@ use sqlx::PgPool;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::error::{Result, SecurityError};
+use crate::error::Result;
 use crate::secrets::{
     RotationEvidence, SecretInventory, SecretRef, SecretSource, SecretState, environment_names,
     environment_row,
@@ -175,9 +175,14 @@ async fn material_sources(pool: &PgPool, organization_id: Option<Uuid>) -> Resul
     // -- service account keys ------------------------------------------------------------------
     let keys: ServiceKeyCount = sqlx::query_as(
         r#"
-        select count(*)::bigint                                    as live,
-               count(*) filter (where expires_at is not null
-                                 and expires_at <= now())::bigint  as expired
+        -- `expires_at` is qualified on purpose: `service_account_keys` and
+        -- `service_accounts` both have one, and the unqualified form fails at
+        -- runtime with "column reference expires_at is ambiguous". The walk
+        -- caught it on its first run — a query that reads correctly in review
+        -- and answers 500 on every inventory load.
+        select count(*)::bigint                                          as live,
+               count(*) filter (where k.expires_at is not null
+                                 and k.expires_at <= now())::bigint    as expired
         from service_account_keys k
         join service_accounts s on s.id = k.service_account_id
         where k.revoked_at is null
@@ -301,6 +306,7 @@ pub const NEVER_SELECTED_COLUMNS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SecurityError;
     use crate::secrets::INVENTORY_COLUMNS;
 
     #[test]

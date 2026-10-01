@@ -74,7 +74,6 @@ pub mod analytics;
 pub mod auth;
 pub mod automation;
 pub mod backups;
-pub mod restore_jobs;
 pub mod commands;
 pub mod content;
 pub mod health;
@@ -105,6 +104,7 @@ pub mod notifications_test;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
+pub mod restore_jobs;
 pub mod scim;
 pub mod search;
 pub mod security;
@@ -112,6 +112,7 @@ pub mod security_events;
 pub mod security_headers;
 pub mod security_ip;
 pub mod security_limiter;
+pub mod security_secrets;
 pub mod sso;
 pub mod tenancy;
 pub mod webauthn;
@@ -1153,8 +1154,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/health/maintenance-windows/{id}",
-            delete(health_incidents::delete_window)
-                .layer(guards::require(&state, "health.manage")),
+            delete(health_incidents::delete_window).layer(guards::require(&state, "health.manage")),
         )
         .route(
             "/security/overview",
@@ -1276,6 +1276,14 @@ pub fn router(state: AppState) -> Router {
         // `/security/events/{id}`), and the events route carries no `{id}` for the same reason
         // `/findings/{id}` sits below `/findings/import`: axum ranks a static segment ahead of
         // a parameter, and a `events.csv` served as JSON is a client that has to guess.
+        // The secret inventory (REQ-012 slice 4). Read-only by design: management of secrets
+        // belongs to the secrets manager request, so there is deliberately no PUT or DELETE
+        // here — a screen that can edit a reference invites an operator to believe it can rotate
+        // a secret, and rotating one means replacing a value in an environment and redeploying.
+        .route(
+            "/security/secrets",
+            get(security_secrets::get).layer(guards::require(&state, "security.read")),
+        )
         .route(
             "/security/events",
             get(security_events::get).layer(guards::require(&state, "security.read")),
@@ -1291,7 +1299,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(
                     patch(security::patch_status).layer(guards::require(&state, "security.manage")),
                 ),
-    );
+        );
     let analytics_reports = Router::new()
         .route("/analytics/overview", get(analytics::overview))
         .route("/analytics/pages", get(analytics::pages))
