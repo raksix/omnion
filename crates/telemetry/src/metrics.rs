@@ -341,6 +341,23 @@ pub const FAMILIES: &[FamilySpec] = &[
         max_series: 8,
         bounded_labels: true,
     },
+    // The local store's own drop counter, added with the write queue that made it reachable
+    // (REQ-126, `crate::sink`). Deliberately NOT folded into `omnion_exporter_dropped_total`:
+    // that family answers "is a remote endpoint refusing my samples", this one answers "is this
+    // instance dropping its own history", and one counter for both makes neither answerable. The
+    // label is `kind` (`log` | `trace`) because a drop with no kind is a number an operator has
+    // to guess the cause of — the log store and the trace index are separate tables with separate
+    // recovery stories.
+    FamilySpec {
+        name: crate::sink::DROPPED_FAMILY,
+        kind: MetricKind::Counter,
+        unit: "1",
+        description: "Telemetry lines and traces the bounded write queue dropped, by store.",
+        labels: &["kind"],
+        source: "core",
+        max_series: 8,
+        bounded_labels: true,
+    },
     // The two families below arrived with the lifecycle and the alert evaluator (REQ-126 slice 4).
     // Both are declared here for the same reason as every other family: a counter the code
     // records but the registry does not declare is a no-op on the scrape, and the acceptance

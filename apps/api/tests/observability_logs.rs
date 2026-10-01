@@ -291,11 +291,15 @@ async fn a_request_produces_a_line_its_own_request_id_can_find() {
     );
 
     // The line is written AFTER the response is produced — the middleware cannot know the status
-    // or the duration until the handler is done — so the caller's response arrives fractionally
-    // before its own line lands. A short bounded retry is the honest way to read it; a fixed
-    // sleep would be a flake waiting for a busy CI box, and reading immediately is a flake
-    // waiting for a slow disk.
+    // or the duration until the handler is done — and it is now QUEUED rather than written inline
+    // (`omnion_telemetry::sink`: writing it on the request's own task is what made a request wait
+    // out the pool's acquire timeout). So the caller's response arrives before its own line lands,
+    // by an interval the background drain controls. Draining explicitly is what the shipped
+    // process does every 20 ms, and doing it here makes the walk's read deterministic instead of
+    // a race it has to poll its way out of.
     let request_uuid = Uuid::parse_str(&header_id).expect("uuid");
+    omnion_telemetry::sink::drain_until_empty(db.pool())
+        .await;
     let mut lines = Vec::new();
     for attempt in 0..50 {
         lines = store::lines_for_request(db.pool(), request_uuid)

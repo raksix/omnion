@@ -206,6 +206,14 @@ async fn a_request_produces_a_trace_findable_by_its_request_id() {
         .clone()
         .expect("the edge returns a request id");
 
+    // The trace index row is QUEUED by the middleware and written by the background drain
+    // (`omnion_telemetry::sink`), because writing it synchronously on the request's own task is
+    // what made a request wait out the pool's acquire timeout. So the row this walk reads arrives
+    // slightly after the response — the same bounded delay the shipped process has, drained here
+    // by hand because this walk does not spawn the task `main.rs` spawns.
+    omnion_telemetry::sink::drain_until_empty(state.db().pool())
+        .await;
+
     let found = call(
         &state,
         authed(

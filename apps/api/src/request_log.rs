@@ -258,38 +258,44 @@ pub async fn request_context(
         );
     }
 
-    // A telemetry write that fails must not fail the request. It goes to stderr — the one channel
-    // that does not depend on the store being writable.
-    if let Err(error) = omnion_telemetry::store::write(&state_for_line.db().pool(), &entry).await {
-        eprintln!("omnion-api: the request line could not be stored: {error}");
-    } else {
-        // The exporter fan-out (REQ-126 slice 3's remaining half). It runs ONLY when the row was
-        // written: a payload the local store rejected would otherwise still be shipped to a
-        // backend, which means the exporter's copy and the explorer's copy disagree about which
-        // lines exist. The fan-out is a ring push per configured exporter and cannot fail a
-        // request — that is the whole contract of the buffer.
-        let _ = omnion_telemetry::exporter_flush::fan_out(
-            omnion_telemetry::exporter::global(),
-            serde_json::to_value(&entry).unwrap_or(serde_json::Value::Null),
-        );
-    }
+    // The line is QUEUED, not written. It used to be written here, on the caller's task, holding
+    // one of the caller's own pooled connections while it did — and when the pool was exhausted
+    // that write waited out the pool's own 5 s `acquire_timeout` before giving up. Two writes per
+    // request (the line, then the trace index), each able to add five seconds to it. The module
+    // comment at the top of `store.rs` claimed "a request path never blocks on telemetry" on the
+    // strength of there being no queue to drain, which was the wrong reason: the absence of a
+    // queue was not a protection, it WAS the stall.
+    //
+    // The evidence is in the API's own stderr, 295 times in one QA run:
+    //   "the request line could not be stored: pool timed out while waiting for an open connection"
+    // Every one of those is a request that spent seconds on a log line it did not get. The
+    // bounded queue is `omnion_telemetry::sink`; its drops are counted, never silent.
+    let _ = omnion_telemetry::sink::offer(&entry);
 
-    // The trace is written LAST, after the log line, so a trace that is searchable always has its
-    // log line present too — an operator who finds a trace in the search can always see the line
-    // that explains it. A 5xx is re-decided here as an error: the sampling bias is "100 % of
-    // errors", and a request that failed has to be sampled even though the edge could not know
-    // that when it made the decision.
+    // The exporter fan-out (REQ-126 slice 3's remaining half). It is a ring push per configured
+    // exporter and cannot fail a request — that is the whole contract of the buffer. It is fired
+    // here rather than in the drain because an exporter is a *ship*, not a *store*: its ring
+    // carries payloads the local store may later drop, and an operator's remote backend keeping a
+    // line the local explorer lost is a feature, not a disagreement. The comment that used to sit
+    // here said the opposite, and the reason it was written was a real one: the local store and
+    // the exporter must not disagree about which lines exist. They now can, and deliberately so —
+    // the counter that says so is `omnion_telemetry_writes_dropped_total`, and a gap the operator
+    // can see beats a synchronous write the operator cannot afford.
+    let _ = omnion_telemetry::exporter_flush::fan_out(
+        omnion_telemetry::exporter::global(),
+        serde_json::to_value(&entry).unwrap_or(serde_json::Value::Null),
+    );
+
+    // The trace is queued on the same path, after the log line, so a trace that is searchable
+    // always has its log line present too — an operator who finds a trace in the search can always
+    // see the line that explains it. A 5xx is re-decided here as an error: the sampling bias is
+    // "100 % of errors", and a request that failed has to be sampled even though the edge could
+    // not know that when it made the decision.
     let status = response.status().as_u16();
     if status >= 500 {
         tracing_guard.force_sampled(omnion_telemetry::SamplingDecision::Error);
     }
-    tracing_guard
-        .finish(
-            &state_for_line.db().pool(),
-            status,
-            context.duration_ms.unwrap_or(0),
-        )
-        .await;
+    tracing_guard.finish_offline(status, context.duration_ms.unwrap_or(0));
 
     response
 }

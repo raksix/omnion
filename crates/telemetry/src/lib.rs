@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod redact;
 pub mod retention;
 pub mod schema;
+pub mod sink;
 pub mod store;
 pub mod trace_store;
 pub mod tracing_span;

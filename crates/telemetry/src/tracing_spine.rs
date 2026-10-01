@@ -285,11 +285,41 @@ impl TracingGuard {
         self.record.push_span(&span);
     }
 
+    /// Close the root span and QUEUE the trace for the background drain.
+    ///
+    /// The request path's half of the [`crate::sink`] contract, and it is deliberately not
+    /// `async`: [`Self::finish`] takes a pool and awaits an insert, which is how a request ended
+    /// up spending the pool's 5 s `acquire_timeout` on a trace index row. This one closes the
+    /// span, applies the same sampling rule, and pushes — the drain task does the write.
+    ///
+    /// The sampling rule is the one [`Self::finish`] has, unchanged: an unsampled trace is not
+    /// written at all, and the log line still carries the trace id so the two stay joinable.
+    ///
+    /// `status` and `duration_ms` are the same two arguments [`Self::finish`] takes, deliberately:
+    /// the queued row and the synchronously written row have to be the SAME ROW, or the trace
+    /// search answers for a shape the trace index never stored. A `finish_offline()` with no
+    /// status would write `"ok"` for every request, which is how a 5xx becomes unsearchable in the
+    /// one place an operator looks for it.
+    pub fn finish_offline(mut self, status: u16, duration_ms: i64) {
+        let _ = self.route.take();
+        self.record.duration_ms = duration_ms;
+        self.record.status = if status >= 500 { "error" } else { "ok" }.to_owned();
+        self.record.sampled = self.sampled;
+        self.record.sampling = self.sampling.as_str().to_owned();
+        if !self.sampled {
+            return;
+        }
+        let _ = crate::sink::offer_trace(&self.record);
+    }
+
     /// Close the root span and write the trace.
     ///
     /// Takes the pool as an argument rather than holding it: a guard that owns a pool cannot be
     /// constructed before the state exists, and holding one keeps a connection's worth of Arc
     /// alive for the whole request for no benefit.
+    ///
+    /// Kept for the callers that genuinely want a synchronous write — the test walks, and the
+    /// drain's own assertions. The request middleware uses [`Self::finish_offline`] instead.
     pub async fn finish(mut self, pool: &PgPool, status: u16, duration_ms: i64) {
         let _ = self.route.take();
         self.record.duration_ms = duration_ms;

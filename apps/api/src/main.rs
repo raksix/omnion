@@ -415,6 +415,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state_for_runners = state.clone();
     let app = routes::router(state);
 
+    // The telemetry write queue's drain (REQ-126, `omnion_telemetry::sink`). The request path
+    // pushes lines and traces here and returns; this task is the only thing that touches the
+    // store for them, on its own connections, at its own interval. It is spawned HERE, beside the
+    // other background runners and for the same reason they are: a queue with no drain is a
+    // bounded hole, and a hole in a log is indistinguishable from an instance that was never
+    // asked a question.
+    let _telemetry_drain =
+        omnion_telemetry::sink::spawn_drain(state_for_runners.db().pool().clone());
+
     // The graceful shutdown sequence (REQ-126, slice 4). The order is the contract and it lives
     // in `omnion_telemetry::lifecycle`:
     //
@@ -456,6 +465,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // this worker as healthy while it is refusing connections. Stopping the heartbeat before the
     // wait means "draining" is the state an operator sees, which is the state they are in.
     omnion_api::health_runner::stopped(&state_for_runners).await;
+
+    // The write queue is closed BEFORE the telemetry sweep, so the sweep below flushes what is
+    // already queued and every push after this instant is dropped-and-counted instead of being
+    // accepted by a queue whose drain has stopped. Closing it after the sweep would leave a
+    // window in which a request in its last microseconds queues a line nothing will ever write.
+    let _ = omnion_telemetry::sink::global().close();
 
     let summary = omnion_telemetry::lifecycle::drain_and_flush(
         &lifecycle,
