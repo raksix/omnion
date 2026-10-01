@@ -637,3 +637,217 @@ export function rehearseReversal(
     body: JSON.stringify({ scratch }),
   });
 }
+
+// -------------------------------------------------------------------------------------------
+// Backfills (REQ-129 slice 3)
+// -------------------------------------------------------------------------------------------
+
+/** `pending` | `running` | `paused` | `completed` | `failed`. */
+export type BackfillState = "pending" | "running" | "paused" | "completed" | "failed";
+
+/**
+ * One backfill job.
+ *
+ * `cursor_display` exists beside `resume_key` on purpose: a job that has never run has a NULL
+ * cursor, and a cell rendering `null` as an empty string reads as "a key of nothing" rather than
+ * "has not started". The API sends the em-dash form so the screen cannot get it wrong.
+ *
+ * `rows_done` is a self-report and the screen treats it as one — the progress bar is labelled with
+ * it, but nothing is presented as "verified" on the strength of this number alone.
+ */
+export type BackfillJob = {
+  id: string;
+  name: string;
+  table_name: string;
+  column_name: string;
+  key_column: string;
+  batch_size: number;
+  rate_limit_per_second: number;
+  /** `null` until the first batch commits. Never a sentinel — see `INITIAL_CURSOR`. */
+  resume_key: string | null;
+  rows_done: number;
+  state: BackfillState;
+  /** The database's own message, set only while `state = 'failed'`. */
+  last_error: string | null;
+  paused_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  /** `true` for every state that is neither completed nor failed. */
+  open: boolean;
+  /** Only a `running` job can be paused — a pending one has no batch in flight. */
+  can_pause: boolean;
+  /** A paused, failed or pending job can be resumed. A completed one cannot. */
+  can_resume: boolean;
+  /** `resume_key`, or an em-dash when there is none. */
+  cursor_display: string;
+};
+
+/**
+ * A descriptor with no job yet.
+ *
+ * Its own type rather than a `BackfillJob` full of nulls: a migration that registered a backfill is
+ * a backfill the operator has to run, and on a fresh installation that is the ONLY row the screen
+ * has. Rendering it through the job type would force `state`/`resume_key`/`rows_done` placeholders
+ * into a card, and placeholders in a progress UI are how a "0 of 0" bar gets read as "nothing to
+ * do".
+ */
+export type PendingBackfill = {
+  version: string;
+  name: string;
+  table_name: string;
+  column_name: string;
+  key_column: string;
+  batch_size: number;
+  rate_limit_per_second: number;
+};
+
+/** The ceilings the client must know without trying them. */
+export type BackfillBounds = {
+  max_batches_per_request: number;
+  min_batch_size: number;
+  max_batch_size: number;
+};
+
+export type BackfillList = {
+  jobs: BackfillJob[];
+  states: BackfillState[];
+  pending_descriptors: PendingBackfill[];
+  bounds: BackfillBounds;
+};
+
+/** The descriptor WITH its statement — the "before I resume, show me what will run" payload. */
+export type BackfillDescriptor = {
+  version: string;
+  name: string;
+  /** Interpolated SQL from a migration file. It is a query, never a credential. */
+  statement: string;
+  batch_size: number;
+  rate_limit_per_second: number;
+};
+
+export type BackfillDetail = {
+  job: BackfillJob;
+  /** `null` when the descriptor row is gone — a job can outlive its registration. */
+  descriptor: BackfillDescriptor | null;
+  states: BackfillState[];
+};
+
+/**
+ * What one batch request actually did.
+ *
+ * `rows` is THIS request's rows and `job.rows_done` is where the job stands afterwards. Keeping them
+ * apart is the point: a paused job refuses to run, and a refusal that answered only `rows_done: 0`
+ * reads exactly like an empty table.
+ *
+ * `requested_batches` versus `batches` is the other one. The API clamps rather than refuses, so an
+ * operator who typed 50 needs to see that 10 ran — a silent clamp is what a platform gets reported
+ * as ignoring the operator.
+ */
+export type BackfillRun = {
+  job: BackfillJob;
+  ran: boolean;
+  rows: number;
+  /** Present on the resume route only. */
+  batches?: number;
+  requested_batches?: number;
+  finished: boolean;
+};
+
+export function listBackfills(params?: {
+  state?: BackfillState;
+  open?: boolean;
+}): Promise<BackfillList> {
+  const query = new URLSearchParams();
+  if (params?.state) query.set("state", params.state);
+  if (params?.open !== undefined) query.set("open", String(params.open));
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return request(`/api/v1/deployment/backfills${suffix}`);
+}
+
+export function readBackfill(id: string): Promise<BackfillDetail> {
+  return request(`/api/v1/deployment/backfills/${encodeURIComponent(id)}`);
+}
+
+/** Run exactly one batch. Never drains — see `MAX_BATCHES_PER_REQUEST`. */
+export function runBackfillBatch(id: string): Promise<BackfillRun> {
+  return request(`/api/v1/deployment/backfills/${encodeURIComponent(id)}/run`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+}
+
+export function pauseBackfill(id: string, reason?: string): Promise<{ job: BackfillJob }> {
+  return request(`/api/v1/deployment/backfills/${encodeURIComponent(id)}/pause`, {
+    method: "POST",
+    body: JSON.stringify({ reason: reason ?? null }),
+  });
+}
+
+/** `batches` is clamped by the API; the response reports both what was asked for and what ran. */
+export function resumeBackfill(id: string, batches: number): Promise<BackfillRun> {
+  return request(`/api/v1/deployment/backfills/${encodeURIComponent(id)}/resume`, {
+    method: "POST",
+    body: JSON.stringify({ batches }),
+  });
+}
+
+// -------------------------------------------------------------------------------------------
+// Seeds
+// -------------------------------------------------------------------------------------------
+
+/** One declared dataset, and whether its manifest files actually exist. */
+export type SeedDataset = {
+  name: string;
+  description: string;
+  row_estimate: number;
+  compatible_from: string;
+  compatible_to: string | null;
+  /** A seeded row carries `declared-<name>`; a discovered manifest carries a real SHA-256. */
+  manifest_checksum: string;
+  /** Derived from `manifest_checksum`, sent so the caller does not have to infer it. */
+  files_present: boolean;
+};
+
+export type SeedLoad = {
+  id: string;
+  dataset: string;
+  installation_kind: string;
+  loaded_by: string;
+  rows_loaded: number;
+  loaded_at: string;
+};
+
+export type SeedList = {
+  datasets: SeedDataset[];
+  loads: SeedLoad[];
+  installation_kind: string;
+  /**
+   * The refusal the API would give, or `null` when a load is allowed.
+   *
+   * Sent rather than inferred so the screen renders the refusal INSTEAD OF a working button. A load
+   * button that 409s when pressed is a dead button, and the request forbids those.
+   */
+  load_refused: string | null;
+};
+
+export function listSeeds(): Promise<SeedList> {
+  return request("/api/v1/deployment/seeds");
+}
+
+/**
+ * Load a dataset. `confirm` must equal the dataset's own name.
+ *
+ * The typed name is checked before the installation kind on purpose: a typo is a caller mistake
+ * with no consequence, so the answer can be about the mistake. An order that checked the
+ * environment first would answer a typo with a sentence about production.
+ */
+export function loadSeed(
+  name: string,
+  confirm: string,
+): Promise<{ dataset: string; rows_loaded: number }> {
+  return request(`/api/v1/deployment/seeds/${encodeURIComponent(name)}/load`, {
+    method: "POST",
+    body: JSON.stringify({ confirm }),
+  });
+}

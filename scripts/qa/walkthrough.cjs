@@ -8279,6 +8279,7 @@ async function runObservabilitySettingsDepth(page, report) {
 module.exports = {
   runSecretsAuditDepth,
   runDeploymentMigrationsDepth,
+  runDeploymentBackfillsDepth,
   runDeploymentArtifactsDepth,
   runDeploymentInstallDepth,
   runDeploymentUpgradeDepth,
@@ -8872,6 +8873,137 @@ function walkVersion(label) {
  * 3. **The detail screen is reachable from a row.** Navigating to a fabricated version would prove
  *    only that the 404 renders, which is how a screen ships unmeasured.
  */
+/**
+ * `/deployment/backfills` and `/deployment/seeds` — the operator-facing half of REQ-129 slice 3.
+ *
+ * Three properties are measured here that a screenshot cannot answer, each because the screen is
+ * capable of looking correct while being wrong:
+ *
+ * 1. **The cursor is rendered, and it is never an empty cell.** A backfill whose cursor renders as
+ *    "" reads as "a key of nothing" instead of "has not started", and the whole resume property
+ *    lives in that value.
+ * 2. **A declared descriptor and a job are not the same row.** A fresh installation has descriptors
+ *    and no jobs; a screen that renders both through one type produces a "0 of 0" progress bar and
+ *    an operator reads it as "nothing to do".
+ * 3. **The seeds screen never offers a Load button it would refuse.** `load_refused` comes from the
+ *    API; if a button is present while a refusal is in the payload, the screen has a dead button —
+ *    which the request forbids outright.
+ *
+ * The detail screen is reached from a row the list ACTUALLY renders, never from a fabricated id:
+ * navigating to `/deployment/backfills/<made-up-uuid>` proves only that the error state renders, and
+ * that is how a screen ships unmeasured.
+ */
+async function runDeploymentBackfillsDepth(page, report) {
+  const steps = [];
+  const note = (step) => {
+    steps.push(step);
+    record({ page: "deployment-backfills-depth", action: "deployment", ...step });
+  };
+
+  await page
+    .goto(`${URL_ADMIN}/deployment/backfills`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-backfills"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  // The list rendered rather than an error or a spinner.
+  const rendered = await page.locator('[data-view="deployment-backfills"]').count();
+  note({ check: "list-rendered", ok: rendered > 0, rendered });
+
+  // The error band, if any, is a role=alert a human can act on — never a silent blank.
+  const alerts = await page.locator('[data-view="deployment-backfills"] [role="alert"]').count();
+  note({ check: "no-error-band-on-load", ok: alerts === 0, alerts });
+
+  // Every cursor cell carries SOMETHING. The em-dash is a value; "" is not.
+  const cursorCells = await page
+    .locator('[data-view="deployment-backfills"] code')
+    .allInnerTexts()
+    .catch(() => []);
+  const emptyCursor = cursorCells.filter((text) => text.trim().length === 0);
+  note({
+    check: "cursor-is-never-an-empty-cell",
+    ok: emptyCursor.length === 0,
+    cells: cursorCells.length,
+    empty: emptyCursor.length,
+  });
+
+  // No horizontal overflow at desktop width. A progress bar with a fixed pixel width inside a
+  // table cell is the classic way this screen breaks.
+  const overflow = await page.evaluate(() => {
+    const root = document.querySelector('[data-view="deployment-backfills"]');
+    return root ? root.scrollWidth - root.clientWidth : 0;
+  });
+  note({ check: "no-horizontal-overflow", ok: overflow <= 1, overflowPx: overflow });
+
+  // The detail screen, from a row that exists.
+  const detailLink = page
+    .locator('[data-view="deployment-backfills"] a[href^="/deployment/backfills/"]')
+    .first();
+  const hasDetailLink = (await detailLink.count()) > 0;
+  note({ check: "detail-is-reachable-from-a-row", ok: hasDetailLink });
+
+  if (hasDetailLink) {
+    await detailLink.click({ timeout: 10000 }).catch(() => {});
+    await page
+      .waitForSelector('[data-view="deployment-backfill-detail"]', { timeout: 20000 })
+      .catch(() => {});
+    await page.waitForTimeout(500);
+    const detailRendered = await page.locator('[data-view="deployment-backfill-detail"]').count();
+    note({ check: "detail-rendered", ok: detailRendered > 0, detailRendered });
+
+    // The statement block is the reason this screen exists. If the descriptor is gone the screen
+    // says so in a sentence — either a <pre> with the SQL or the "descriptor row is gone" note.
+    const statementBlocks = await page
+      .locator('[data-view="deployment-backfill-detail"] pre')
+      .allInnerTexts()
+      .catch(() => []);
+    note({
+      check: "detail-states-the-statement-or-why-there-is-none",
+      ok: statementBlocks.length > 0,
+      blocks: statementBlocks.length,
+    });
+  }
+
+  // ---- Seeds -------------------------------------------------------------------------------
+  await page
+    .goto(`${URL_ADMIN}/deployment/seeds`, { waitUntil: "domcontentloaded" })
+    .catch(() => {});
+  await page
+    .waitForSelector('[data-view="deployment-seeds"]', { timeout: 20000 })
+    .catch(() => {});
+  await page.waitForTimeout(700);
+
+  const seedsRendered = await page.locator('[data-view="deployment-seeds"]').count();
+  note({ check: "seeds-rendered", ok: seedsRendered > 0, seedsRendered });
+
+  // The dead-button property. Load buttons and the refusal band must not both be on screen:
+  // `load_refused` is the API's own answer for this installation kind.
+  const loadButtons = await page
+    .locator('[data-view="deployment-seeds"] button:has-text("Load this dataset")')
+    .count();
+  const refusalBand = await page
+    .locator('[data-view="deployment-seeds"]')
+    .innerText()
+    .catch(() => "");
+  const namesTheKind = /Installation kind:/.test(refusalBand);
+  note({
+    check: "seeds-name-the-installation-kind",
+    ok: namesTheKind,
+  });
+  note({
+    check: "load-buttons-are-not-refusals",
+    // Either there are load buttons and no refusal text, or a refusal and no button. Both true at
+    // once is a dead button; the pass records both so a red one says which half is wrong.
+    ok: !(loadButtons > 0 && /refus/i.test(refusalBand)),
+    loadButtons,
+    refusalPresent: /refus/i.test(refusalBand),
+  });
+
+  return { steps };
+}
+
 async function runDeploymentMigrationsDepth(page, report) {
   const steps = [];
   const note = (step) => {
@@ -9751,6 +9883,11 @@ async function main() {
   // The migration ledger (REQ-129, slice 1). The detail screen is opened by the depth pass below
   // from a row the ledger actually renders, for the reason in DEPLOYMENT_SCREENS above.
   { path: "/deployment/migrations", name: "deployment-migrations" },
+  // The backfill list and the seed datasets (REQ-129, slice 3). BOTH screens are visited in the
+  // list AND the 390px pass, because a data-migration surface that only works at desktop width is
+  // one an operator cannot use from a phone during an incident.
+  { path: "/deployment/backfills", name: "deployment-backfills" },
+  { path: "/deployment/seeds", name: "deployment-seeds" },
   { path: "/settings/iam", name: "iam-overview" },
     { path: "/settings/iam/users", name: "iam-users" },
     { path: "/settings/iam/groups", name: "iam-groups" },
@@ -10049,7 +10186,8 @@ async function main() {
       // supposed to do happened anyway, unprotected.
       const artifacts = await runDeploymentArtifactsDepth(page, report);
       const migrations = await runDeploymentMigrationsDepth(page, report);
-      return { ...artifacts, migrations };
+      const backfills = await runDeploymentBackfillsDepth(page, report);
+      return { ...artifacts, migrations, backfills };
     });
   }
   if (wants("deployment-install")) {
@@ -10516,7 +10654,7 @@ async function runReliabilityBreakersDepth(page) {
   // slice 4) are in this list rather than only measured inside their depth passes: a layout that
   // has never been opened in a 390px context has not been tested on a phone, and the upgrade
   // helper is read at 2am on a phone more often than anybody planned.
-  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }];
+  const mobileRoutes = [{ path: "/", name: "overview" }, { path: "/pages", name: "pages" }, { path: "/ai", name: "ai" }, { path: "/search?q=qa", name: "search" }, { path: "/settings/search", name: "search-settings" }, { path: "/settings/iam/users", name: "iam-users" }, { path: "/settings/iam/groups", name: "iam-groups" }, { path: "/settings/iam/simulator", name: "iam-simulator" }, { path: "/settings/iam/policies", name: "iam-policies" }, { path: "/settings/iam/approvals", name: "iam-approvals" }, { path: "/settings/iam/provisioning", name: "iam-provisioning" }, { path: "/settings/iam/authentication", name: "iam-authentication" }, { path: "/settings/iam/security", name: "iam-security" }, { path: "/settings/iam/sessions", name: "iam-sessions" }, { path: "/settings/iam/devices", name: "iam-devices" }, { path: "/analytics", name: "analytics" }, { path: "/analytics/pages", name: "analytics-pages" }, { path: "/analytics/goals", name: "analytics-goals" }, { path: "/analytics/settings", name: "analytics-settings" }, { path: "/security", name: "security-overview" }, { path: "/security/findings", name: "security-findings" }, { path: "/security/headers", name: "security-headers" }, { path: "/security/rate-limits", name: "security-rate-limits" }, { path: "/security/sign-in-protection", name: "security-sign-in-protection" }, { path: "/health", name: "health-overview" }, { path: "/health/metrics", name: "health-metrics" }, { path: "/deployment/artifacts", name: "deployment-artifacts" }, { path: "/deployment/install", name: "deployment-install" }, { path: "/deployment/upgrade", name: "deployment-upgrade" }, { path: "/deployment/migrations", name: "deployment-migrations" }, { path: "/deployment/backfills", name: "deployment-backfills" }, { path: "/deployment/seeds", name: "deployment-seeds" }];
   for (const r of mobileRoutes) MOBILE_NAMES.add(r.name);
   // The phone pass follows `--only` for the same reason the route loop does, and the five
   // security screens join it: a layout that has never been measured at 390px has not been
