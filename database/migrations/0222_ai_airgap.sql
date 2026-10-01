@@ -139,3 +139,29 @@ begin
     end if;
 end
 $$;
+
+-- # `blocked_airgap` joins the call-log vocabulary, in BOTH places that hold it
+--
+-- The air gap refuses a call before any byte is sent, and "refused" cannot carry that meaning:
+-- `refused` is what the provider itself said (its own safety filter, its own 4xx), and an
+-- operator reading a `refused` row looks upstream for a cause that is not there. The switch
+-- decided this call would never be made, which is a different fact with a different owner and a
+-- different fix — point the feature at a local endpoint, or turn the gap off.
+--
+-- The list lives in two places — the CHECK here and the `record_usage` guard in `health_store.rs`
+-- — and **both are changed here**. Widening only the Rust guard produces rows the database
+-- refuses; widening only the CHECK teaches the API a vocabulary the code rejects. The vocabulary
+-- is a contract, and a contract with two halves has to be amended in the same commit.
+do $$
+begin
+    -- The constraint is dropped and re-added rather than altered: `alter table … drop constraint
+    -- if exists` then `add constraint` is the only spelling that is safe to re-run, because
+    -- `add constraint` has no `if not exists` and would die on the second migrate().
+    alter table ai_provider_usage
+        drop constraint if exists ai_provider_usage_outcome_check;
+
+    alter table ai_provider_usage
+        add constraint ai_provider_usage_outcome_check
+        check (outcome in ('ok', 'error', 'refused', 'blocked_airgap'));
+end
+$$;

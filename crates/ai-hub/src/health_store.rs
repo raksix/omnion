@@ -64,7 +64,8 @@ pub struct UsageRow {
     pub model_key: Option<String>,
     /// What the call exercised (`chat`, …).
     pub task: String,
-    /// `ok`, `error` or `refused`.
+    /// `ok`, `error`, `refused` (the provider said no) or `blocked_airgap` (the air gap refused
+    /// before any byte left). The last two are different facts and stay different words.
     pub outcome: String,
     /// HTTP status the endpoint answered with.
     pub http_status: Option<i32>,
@@ -372,7 +373,13 @@ pub async fn prune(pool: &PgPool, days: i64) -> Result<u64> {
 
 /// Record one completed call.
 pub async fn record_usage(pool: &PgPool, new: NewUsage) -> Result<()> {
-    if !["ok", "error", "refused"].contains(&new.outcome.as_str()) {
+    // The four outcomes, in one place, because this list is a CONTRACT with the CHECK constraint
+    // on `ai_provider_usage` and the two halves must be amended together. `blocked_airgap` is
+    // distinct from `refused` on purpose: `refused` is what the PROVIDER said (its own safety
+    // filter, its own 4xx), and an operator reading a `refused` row looks upstream for a cause
+    // that is not there. The air gap refuses the call before any byte is sent, which is a
+    // different fact with a different owner and a different fix.
+    if !["ok", "error", "refused", "blocked_airgap"].contains(&new.outcome.as_str()) {
         return Err(AiHubError::InvalidProvider(format!(
             "\"{}\" is not a call outcome",
             new.outcome
