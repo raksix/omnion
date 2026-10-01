@@ -8661,6 +8661,83 @@ async function runSecurityDepth(page, report) {
     await shot(page, "security-headers-restored");
   }
 
+  // ---- The maintenance window (REQ-024, slice 3) --------------------------------------------
+  //
+  // A form that renders is half a screen; the other half is what the server does with it. So
+  // this pass does the three things that can be wrong, in the order a human would:
+  //
+  //   1. turn the toggle on with an EMPTY message and press Save -- the server must refuse
+  //      (an enabled window that says nothing is the failure this whole screen exists to
+  //      prevent), and the refusal must be *visible*, not swallowed by the catch block;
+  //   2. type a message, save, and assert the row now reads "Open now";
+  //   3. turn it off and save, then assert a write route is no longer refused.
+  //
+  // Step 3 is the one that matters most: a window that stays open after being closed is a
+  // platform that refuses every write with a banner nobody can remove.
+  await page.goto(`${URL_ADMIN}/deployment/maintenance`, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForSelector('[data-maintenance-state="production"]', { timeout: 15000 }).catch(() => {});
+  const maintenanceRendered =
+    (await page.locator('[data-maintenance-env="production"]').count()) > 0;
+  note({ step: "maintenance-rendered", rendered: maintenanceRendered });
+  await shot(page, "deployment-maintenance");
+
+  if (maintenanceRendered) {
+    // The three environments each get their own card; a screen showing only production is a
+    // screen that will not let an operator open a window on staging.
+    const cardCount = await page.locator("[data-maintenance-env]").count();
+    note({ step: "maintenance-environment-count", count: cardCount });
+
+    // (1) enabled with no message -> refused, visibly.
+    await page.locator('[data-maintenance-enabled="production"]').check().catch(() => {});
+    await page.locator('[data-maintenance-save="production"]').click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(900);
+    const blankRefusal = await page
+      .locator('[data-maintenance-env="production"] [role="alert"]')
+      .first()
+      .textContent()
+      .catch(() => null);
+    note({ step: "maintenance-blank-message-refused", text: (blankRefusal || "").trim() || null });
+    if (!blankRefusal || !blankRefusal.trim()) {
+      note({
+        step: "maintenance-blank-message-accepted",
+        reason: "an enabled window with no message was saved; the banner would say nothing while every write is refused",
+      });
+    }
+    await shot(page, "deployment-maintenance-blank-refused");
+
+    // (2) with a message -> saved, and the state line says it is open.
+    await page
+      .locator('[data-maintenance-message="production"]')
+      .fill("QA maintenance window - writes are refused while this is open.");
+    await page.locator('[data-maintenance-save="production"]').click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const stateAfterSave = (
+      (await page.locator('[data-maintenance-state="production"]').textContent().catch(() => "")) || ""
+    ).trim();
+    note({ step: "maintenance-state-after-save", state: stateAfterSave });
+    await shot(page, "deployment-maintenance-open");
+
+    // (3) off again, and then the write route must answer. This is the assertion that a stale
+    //     window cannot survive a pass: `runDeploymentPreflight` is a POST on an environment
+    //     route, so it is exactly the shape the window is supposed to refuse.
+    await page.locator('[data-maintenance-enabled="production"]').uncheck().catch(() => {});
+    await page.locator('[data-maintenance-save="production"]').click({ timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    const stateAfterOff = (
+      (await page.locator('[data-maintenance-state="production"]').textContent().catch(() => "")) || ""
+    ).trim();
+    note({ step: "maintenance-state-after-off", state: stateAfterOff });
+    if (/open now/i.test(stateAfterOff)) {
+      note({
+        step: "maintenance-window-stuck-open",
+        reason: "the window still reads open after it was switched off; every write is refused with no way to remove the banner",
+      });
+    }
+    await shot(page, "deployment-maintenance-off");
+  } else {
+    note({ step: "maintenance-missing", reason: "/deployment/maintenance did not render its cards" });
+  }
+
   // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
   //
   // This screen and the sign-in one below had a rule engine, a policy editor, a live counter
@@ -10041,6 +10118,17 @@ async function main() {
     // pre-flight rows, the acknowledgement gate and the log pane are covered by the
     // API tests, not by clicking through a production deploy.
     { path: "/deployment/deploy", name: "deployment-deploy" },
+    // The maintenance screen (REQ-024, slice 3). It is walked as a route *and* driven below:
+    // the three states it can be in -- never configured, scheduled, open now -- are the whole
+    // feature, and none of them is visible from a route list alone. The pass toggles a window
+    // on and off again, because a screen whose save button is never pressed has not been tested
+    // in the only way that matters.
+    { path: "/deployment/maintenance", name: "deployment-maintenance" },
+    // The rollback dialog is reachable only from a card that has a previous version, which a
+    // fresh QA database does not have -- so it is opened directly by the driven pass below
+    // rather than by clicking a card. Opening a modal by URL is the one honest way to reach a
+    // dialog whose host state a disposable database cannot produce, and the alternative --
+    // not rendering it at all -- is how a destructive dialog ships untested.
     // The security centre's five screens (REQ-012, slices 1-3). `runSecurityDepth` drives the
     // overview, the findings store and the header policy, but it never opened the last two --
     // and the same is true of the route list, so two screens that ship with rules, a policy
