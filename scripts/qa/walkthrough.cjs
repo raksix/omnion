@@ -5075,6 +5075,99 @@ async function runCrmAssignmentDepth(page, report) {
     .catch(() => "");
   steps.simulatorNamesTheFailingKey = failedOn === "country";
 
+  // 3b. The half a skip list cannot answer: a key the reader does not know.
+  //
+  // `contury` is one keystroke from `country`, so with the German payload above the chain
+  // already skips the country rule and names `country` as the reason — which reads to the
+  // operator as "your rule is wrong". The rule is right; the paste was never read. Without
+  // this step the walkthrough passes on an implementation that blames the rule, which is the
+  // failure this half exists for. Asserted in three parts because each can fail alone: the
+  // warning is on screen, the mistyped key is named, and the suggested spelling is the one
+  // that would have worked.
+  await page.locator('[data-testid="simulator-payload"]').fill(
+    JSON.stringify({ contury: "TR", email: "visitor@example.invalid" }, null, 2),
+  );
+  await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector('[data-testid="simulator-result"]', { timeout: 8000 }).catch(() => {});
+  steps.unreadWarningShown =
+    (await page.locator('[data-testid="simulator-unread-warning"]').count()) > 0;
+  const unreadLine = await page
+    .locator('[data-testid="simulator-unread-key"]')
+    .first()
+    .innerText()
+    .catch(() => "");
+  steps.unreadNamesTheKey = unreadLine.includes("contury");
+  steps.unreadSuggestsTheRealKey = unreadLine.includes("country");
+  // And the evaluator's own view of the input must agree with the warning: if the warning
+  // fires while `country` reads "TR", the warning and the reader disagree about the same
+  // payload and one of them is lying.
+  steps.inputReadSaysCountryNotFound = await page.evaluate(() => {
+    const item = document.querySelector(
+      "[data-testid='simulator-input-read-item'][data-condition='country'] [data-absent]",
+    );
+    return item?.getAttribute("data-absent") === "true";
+  });
+  steps.inputReadShowsEmaillessLead = await page.evaluate(() => {
+    const item = document.querySelector(
+      "[data-testid='simulator-input-read-item'][data-condition='has_email']",
+    );
+    return (item?.innerText ?? "").includes("yes");
+  });
+  await shot(page, "page-crm-assignment-unread-keys");
+
+  // The inverse: a payload with nothing unread must not carry the warning, or an operator
+  // learns to ignore it and the mistyped-key case goes back to blaming the rule.
+  await page.locator('[data-testid="simulator-payload"]').fill(
+    JSON.stringify({ country: "TR", email: "visitor@example.invalid" }, null, 2),
+  );
+  await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.noUnreadWarningWhenEveryKeyIsRead =
+    (await page.locator('[data-testid="simulator-unread-warning"]').count()) === 0 &&
+    (await page.locator('[data-testid="simulator-unread"]').innerText().catch(() => "")).includes(
+      "Every key",
+    );
+
+  // 3c. The unsaved rule is evaluated too, so the screen is worth opening before saving.
+  //
+  // `SimulateBody::draft` shipped with the endpoint and had zero callers for its whole life:
+  // a server capability the panel never exercised, so nothing could say whether it worked.
+  // This types a country rule into the editor and asks the simulator about a DE payload —
+  // the saved chain's answer is "the queue", and only a draft evaluated at position -1 can
+  // change it.
+  await page.locator('[data-testid="assignment-add"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForSelector('[data-testid="rule-editor"]', { timeout: 6000 }).catch(() => {});
+  await page.locator('[data-testid="rule-name"]').fill(`QA draft ${tag}`).catch(() => {});
+  await page.locator('[data-testid="rule-condition-country"]').check({ timeout: 4000 }).catch(() => {});
+  await page.locator('[data-testid="rule-condition-input-country"]').fill("DE").catch(() => {});
+  await page.locator('[data-testid="rule-target"]').selectOption("queue").catch(() => {});
+  steps.simulatorNamesTheDraft =
+    (await page.locator('[data-testid="simulator-draft-note"]').innerText().catch(() => "")).includes(
+      `QA draft ${tag}`,
+    );
+  await page.locator('[data-testid="simulator-payload"]').fill(
+    JSON.stringify({ country: "DE", email: "visitor@example.invalid" }, null, 2),
+  );
+  await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1800);
+  steps.draftWinsOverTheSavedChain = (
+    await page.locator('[data-testid="simulator-winner"]').innerText().catch(() => "")
+  ).includes(`QA draft ${tag}`);
+  // …and a draft the save would refuse is refused by the preview too, rather than answering
+  // about a rule the editor cannot store.
+  await page.locator('[data-testid="rule-name"]').fill("").catch(() => {});
+  await page.locator('[data-testid="simulator-run"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  steps.anUnnamedDraftIsRefused =
+    ((await page.locator('[data-testid="simulator-error"]').count()) > 0 ||
+      (await page.locator('[data-testid="simulator-result"]').count()) === 0) &&
+    (await page.locator('[data-testid="simulator-winner"]').innerText().catch(() => "")).includes(
+      "Nothing matched",
+    );
+  await shot(page, "page-crm-assignment-draft-preview");
+  await page.locator('[data-testid="rule-cancel"]').click({ timeout: 6000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
   // 4. The fairness claim: running the simulator must not move the cursor.
   //
   // `rules.find` was called on whatever the route answered. The list route is permission
