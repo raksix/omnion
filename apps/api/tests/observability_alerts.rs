@@ -68,12 +68,25 @@ async fn call(state: &AppState, request: Request<Body>) -> TestResponse {
         .insert(axum::extract::ConnectInfo(peer));
 
     let status = response.status();
-    let cookie = response
-        .headers()
-        .get(header::SET_COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookie| cookie.split(';').next())
-        .map(str::to_owned);
+    // BOTH cookies, not the first one. A sign-in sets `omnion_session` and `omnion_csrf`, and the
+    // CSRF layer refuses a mutation that presents only the session -- so a walk holding one of the
+    // two is no longer a request the panel can make, and every post it issues reads `403
+    // csrf_failed` for a reason that has nothing to do with what it is testing. Five walks in this
+    // file were red for exactly that, and the message names CSRF rather than the cookie the walk
+    // dropped, so it reads as a product defect rather than a harness one.
+    let cookie = Some(
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|raw| raw.split(';').next())
+            .filter(|pair| {
+                pair.starts_with("omnion_session=") || pair.starts_with("omnion_csrf=")
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
     let bytes = response
         .into_body()
         .collect()
@@ -117,6 +130,12 @@ fn get(uri: &str) -> Request<Body> {
 /// all of them — which would make the whole walk assert refusals and pass, having proved nothing
 /// about the feature.
 async fn sign_in(state: &AppState) -> String {
+    // The permission catalogue is seeded before the role is bound. Without it `bind_owner` writes
+    // a binding whose permission keys resolve to nothing, and every authorised route then refuses
+    // for a reason that belongs to the fixture rather than to the code under test.
+    seed::ensure(state.db().pool())
+        .await
+        .expect("the permission catalogue seeds");
     let suffix = Uuid::new_v4().simple().to_string();
     let organization = omnion_identity::organizations::create_organization(
         state.db().pool(),
