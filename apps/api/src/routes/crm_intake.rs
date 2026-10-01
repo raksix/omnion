@@ -46,6 +46,7 @@ use omnion_module_crm_intake::autoresponder::Delivery;
 use omnion_module_crm_intake::autoresponder_store;
 use omnion_module_crm_intake::model::{IntakeSource, Lead, LeadEvent, LeadOwner};
 use omnion_module_crm_intake::store::{self, LeadQuery, SourcePatch};
+use omnion_module_crm_intake::timestamp;
 use omnion_module_crm_intake::{CrmIntakeError, LeadMetrics, MappingEntry, NewIntakeSource};
 
 use crate::auth::CurrentSession;
@@ -368,12 +369,12 @@ impl From<IntakeSource> for SourceBody {
             autoresponder: value.autoresponder,
             active: value.active,
             rate_limit_per_hour: value.rate_limit_per_hour,
-            last_received_at: value.last_received_at.map(|at| at.to_string()),
+            last_received_at: value.last_received_at.map(timestamp::rfc3339),
             last_error: value.last_error,
             broken_mappings: value.broken_mappings,
             binding_broken,
-            created_at: value.created_at.to_string(),
-            updated_at: value.updated_at.to_string(),
+            created_at: timestamp::rfc3339(value.created_at),
+            updated_at: timestamp::rfc3339(value.updated_at),
             endpoint_key: None,
         }
     }
@@ -523,11 +524,11 @@ impl From<Lead> for LeadBody {
             dedupe_score: value.dedupe_score,
             rejection_reason: value.rejection_reason,
             spam_score: value.spam_score,
-            first_response_due_at: value.first_response_due_at.map(|at| at.to_string()),
-            first_response_at: value.first_response_at.map(|at| at.to_string()),
-            escalated_at: value.escalated_at.map(|at| at.to_string()),
-            received_at: value.received_at.to_string(),
-            converted_at: value.converted_at.map(|at| at.to_string()),
+            first_response_due_at: value.first_response_due_at.map(timestamp::rfc3339),
+            first_response_at: value.first_response_at.map(timestamp::rfc3339),
+            escalated_at: value.escalated_at.map(timestamp::rfc3339),
+            received_at: timestamp::rfc3339(value.received_at),
+            converted_at: value.converted_at.map(timestamp::rfc3339),
             sla_running,
             // **A placeholder the caller must overwrite, not an answer.** `From<Lead>` is
             // pure and the window it needs lives in another table, so the honest value here
@@ -678,7 +679,7 @@ impl From<LeadEvent> for EventBody {
             kind: value.kind,
             actor_user_id: value.actor_user_id,
             detail: value.detail,
-            created_at: value.created_at.to_string(),
+            created_at: timestamp::rfc3339(value.created_at),
         }
     }
 }
@@ -1069,7 +1070,7 @@ pub async fn list_leads(
     stamp_sla_states(state.db().pool(), organization_id, &mut leads).await?;
 
     Ok(Json(InboxBody {
-        next_before: page.next_before.map(|at| at.to_string()),
+        next_before: page.next_before.map(timestamp::rfc3339),
         metrics: page.metrics,
         leads,
     }))
@@ -1379,7 +1380,7 @@ pub async fn respond(
         "crm.lead.responded",
         id,
         json!({
-            "first_response_at": updated.first_response_at.map(|at| at.to_string()),
+            "first_response_at": updated.first_response_at.map(timestamp::rfc3339),
         }),
     )
     .await;
@@ -1390,7 +1391,7 @@ pub async fn respond(
             .organization(organization_id)
             .payload(json!({
                 "lead_id": id,
-                "first_response_at": updated.first_response_at.map(|at| at.to_string()),
+                "first_response_at": updated.first_response_at.map(timestamp::rfc3339),
                 "status": updated.status,
             })),
     )
@@ -1512,7 +1513,7 @@ pub async fn delete_lead(
         json!({
             "email": lead.email,
             "status": lead.status,
-            "received_at": lead.received_at.to_string(),
+            "received_at": timestamp::rfc3339(lead.received_at),
         }),
     )
     .await;
