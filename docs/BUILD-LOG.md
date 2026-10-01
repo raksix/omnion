@@ -9109,8 +9109,6 @@ loop's evidence for another's. The boxes that name a screen stay unticked until 
 box idle, which is the same condition `run.sh`'s own `flock` was added to protect.
 
 
-
-@@KEEP_MINE@@
 ## w7 · tick 58 · REQ-105 slice 5 — the lapse that announced its own inverse
 
 **What.** The two criteria that had been carried open since slice 3, closed on the backend, plus
@@ -9144,26 +9142,11 @@ background process is a control that silently stops reporting when that process 
 stated in the module docs rather than left to be discovered: the announcement is late by up to one
 request, and since nothing about the request's outcome depends on it, being late cannot make the
 guard permissive.
-@@KEEP_THEIRS@@
-## Tick 94 — REQ-012 slice 4: a denied CIDR is refused, and the screen that was always linked
-
-**What.** Slice 4's IP-access half, done: the rules, the table, the evaluator, the request-path
-layer, the four routes and `/security/ip-access`. Six atomic commits, pushed. The events screen
-and the secret inventory are slice 4's other two thirds and are **not** started.
-
-**The defect this closes, stated once.** `/security/ip-access` has been linked from the posture
-overview's IP-allow-list row since the check registry was written — a link to a route that did not
-exist. And once the routes did exist, nothing read them: an operator could deny `203.0.113.0/24`,
-watch the row appear, and go on being served from it. The criterion is worded *"a denied CIDR
-cannot reach the API"*, which asks for a **refusal**, not a configuration.
-
 
 **Proof.**
 
 | Gate | Result |
 | --- | --- |
-
-@@KEEP_MINE@@
 | `cargo test -p omnion-ai-hub --quiet` | 587 passed, 0 failed |
 | `cargo test -p omnion-api --test ai_guard` | **12 passed**, 0 failed (was 10; +2) |
 | `cargo test -p omnion-api --test ai_guard_outbound` | 8 passed, 0 failed |
@@ -9182,7 +9165,24 @@ half-proved boxes are left unticked with the missing half written out rather tha
 (`/ai/guard`, `/rules`, `/events`, `/tester`, `/about`) plus `pnpm build`, and then the status line
 can close. REQ-106 (local and air-gapped AI) is the next pending item; REQ-099/100/101 remain
 blocked on the same single pass, so they close in the same pass or not at all.
-@@KEEP_THEIRS@@
+
+
+## Tick 94 — REQ-012 slice 4: a denied CIDR is refused, and the screen that was always linked
+
+**What.** Slice 4's IP-access half, done: the rules, the table, the evaluator, the request-path
+layer, the four routes and `/security/ip-access`. Six atomic commits, pushed. The events screen
+and the secret inventory are slice 4's other two thirds and are **not** started.
+
+**The defect this closes, stated once.** `/security/ip-access` has been linked from the posture
+overview's IP-allow-list row since the check registry was written — a link to a route that did not
+exist. And once the routes did exist, nothing read them: an operator could deny `203.0.113.0/24`,
+watch the row appear, and go on being served from it. The criterion is worded *"a denied CIDR
+cannot reach the API"*, which asks for a **refusal**, not a configuration.
+
+**Proof.**
+
+| Gate | Result |
+| --- | --- |
 | `cargo test -p omnion-security --lib` | 159 passed (was 137) |
 | `cargo test -p omnion-api --lib` | 269 passed (was 261) |
 | `cargo test -p omnion-api --test security -- --test-threads=1` | 7 passed (42.1 s) |
@@ -9230,4 +9230,3 @@ desktop and the mobile pass, and which will be visited the first time the box is
 
 **Next.** The browser pass owed for slices 1–4, then slice 4's remaining two thirds: the
 security-event view over the audit trail and the secret-inventory projection.
-
