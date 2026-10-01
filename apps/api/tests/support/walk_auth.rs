@@ -30,7 +30,7 @@
 //!    re-opens the defect this module closed.
 
 use axum::http::header;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::OnceLock;
 
 /// Password the accounts these walks create sign in with.

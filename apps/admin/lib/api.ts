@@ -45,6 +45,7 @@ import type {
   CreateIpRuleInput,
   CreateIpRuleResult,
   IpRulesPage,
+  SecretInventory,
   SecurityEventsFilter,
   SecurityEventsPage,
   IpTestResult,
@@ -6300,6 +6301,17 @@ export function fetchSecurityEvents(
  * `Content-Disposition: attachment` and the panel's own `request()` wrapper is built for JSON —
  * reading it as text would hand the operator the CSV body instead of saving it.
  */
+/**
+ * The secret inventory. Read-only, and the client has no mutation to offer.
+ *
+ * No filter parameter, deliberately: the inventory is small enough to render whole, and a filter
+ * over a list whose point is "what does this platform hold" invites the reading that the screen
+ * is hiding something rather than that it is complete.
+ */
+export function fetchSecretInventory(): Promise<SecretInventory> {
+  return request<SecretInventory>("/api/v1/security/secrets");
+}
+
 export function securityEventsExportUrl(filter: SecurityEventsFilter = {}): string {
   const params = new URLSearchParams();
   if (filter.q) params.set("q", filter.q);

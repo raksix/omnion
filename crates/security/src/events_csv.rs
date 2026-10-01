@@ -16,8 +16,8 @@
 //! keys; this module exports whatever survives that, which is the point at which the export can
 //! be attached to a ticket without a second review.
 
-use crate::events::{EVENT_COLUMNS, MAX_EXPORT_ROWS, SecurityEvent};
 use crate::error::Result;
+use crate::events::{EVENT_COLUMNS, MAX_EXPORT_ROWS, SecurityEvent};
 
 /// Render security events as a CSV document, header first, with a trailing newline.
 ///
@@ -45,7 +45,9 @@ pub fn render(rows: &[SecurityEvent]) -> Result<String> {
             row.action.clone(),
             row.outcome.clone(),
             row.actor.clone().unwrap_or_default(),
-            row.subject_user_id.map(|id| id.to_string()).unwrap_or_default(),
+            row.subject_user_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
             row.client_ip.clone().unwrap_or_default(),
             row.user_agent.clone().unwrap_or_default(),
             row.detail.clone().unwrap_or_default(),
@@ -194,7 +196,10 @@ mod tests {
     fn a_plain_cell_is_left_untouched() {
         // Nothing that needs no work gets quotes: a CSV where every cell is quoted is a CSV
         // half the tools in the world render with visible quote marks.
-        assert_eq!(neutralise("security.ip_rule.added"), "security.ip_rule.added");
+        assert_eq!(
+            neutralise("security.ip_rule.added"),
+            "security.ip_rule.added"
+        );
         assert_eq!(neutralise("203.0.113.7"), "203.0.113.7");
     }
 

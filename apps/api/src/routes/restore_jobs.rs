@@ -162,7 +162,10 @@ pub async fn queue_restore(
     // than the one that could have been given here.
     let priced = rebuild_preview(&state, &row, &settings).await;
     if priced.live_comparison_failed {
-        return Err(ApiError::bad_request("live_comparison_unavailable", UNPRICED));
+        return Err(ApiError::bad_request(
+            "live_comparison_unavailable",
+            UNPRICED,
+        ));
     }
     if !priced.preview.restorable {
         return Err(ApiError::bad_request(
@@ -521,17 +524,14 @@ pub async fn record_restore_outcome(
 }
 
 /// The audit entry a queued restore writes when it could not run.
-pub async fn record_restore_job_refused(
-    pool: &sqlx::PgPool,
-    job_id: Uuid,
-    reason: &str,
-) {
-    let actor: Option<Uuid> = sqlx::query_scalar("select created_by from backup_restore_jobs where id = $1")
-        .bind(job_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+pub async fn record_restore_job_refused(pool: &sqlx::PgPool, job_id: Uuid, reason: &str) {
+    let actor: Option<Uuid> =
+        sqlx::query_scalar("select created_by from backup_restore_jobs where id = $1")
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
     let organization: Option<Option<Uuid>> =
         sqlx::query_scalar("select organization_id from backup_restore_jobs where id = $1")
             .bind(job_id)
