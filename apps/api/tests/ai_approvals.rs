@@ -151,6 +151,9 @@ impl GateStore {
             agent_id: None,
             identity_id: None,
             change_set_id: None,
+            // The single-call path: this row parks on a run step and has no change set to
+            // name an operation of (`0203`'s constraint only binds the set-bound half).
+            operation_key: None,
             tool_key: "content.publish".to_owned(),
             tool_class: "content_publish".to_owned(),
             resource_type: Some("page".to_owned()),

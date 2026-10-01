@@ -189,6 +189,130 @@ impl SetStore {
         confirmed.id
     }
 
+    /// Park a set (`draft → pending`) and file one approval per gated operation, the way the
+    /// confirm route does — through the **real** store, so the rows carry the `operation_key`
+    /// the release path joins on.
+    ///
+    /// `policy` is written by the caller only if the default six are not already in force; the
+    /// defaults gate every class, so a set with a gated operation parks without help.
+    async fn park(&self, set_id: Uuid) -> Vec<Uuid> {
+        store::transition(
+            &self.pool,
+            self.organization_id,
+            set_id,
+            "draft",
+            "pending",
+            None,
+        )
+        .await
+        .expect("the park transition must answer")
+        .expect("the set must have parked");
+
+        let set = store::read(&self.pool, self.organization_id, set_id)
+            .await
+            .expect("the set must be readable")
+            .expect("the set must exist");
+
+        let mut ids = Vec::new();
+        for (op, class) in set.gated_operations() {
+            let mapping =
+                omnion_ai_hub::approvals::target::mapping_for(&op.operation.resource_type)
+                    .expect("pages have a mapping");
+            let plan =
+                omnion_ai_hub::approvals::target::preview(&self.pool, mapping, &op.operation)
+                    .await
+                    .expect("the preview must be computable");
+            let policy =
+                omnion_ai_hub::approvals::io::policy_for(&self.pool, self.organization_id, class)
+                    .await
+                    .expect("the policy must resolve");
+            let requested = omnion_ai_hub::approvals::io::request(
+                &self.pool,
+                &omnion_ai_hub::approvals::io::NewApproval {
+                    organization_id: self.organization_id,
+                    site_id: self.site_id.into(),
+                    run_id: None,
+                    step_id: None,
+                    agent_id: None,
+                    identity_id: None,
+                    change_set_id: Some(set_id),
+                    operation_key: Some(op.key.clone()),
+                    tool_key: "content.publish".to_owned(),
+                    tool_class: class.to_owned(),
+                    resource_type: Some(op.operation.resource_type.clone()),
+                    resource_id: Some(op.operation.resource_id.clone()),
+                    resource_label: Some(plan.label.clone()),
+                    title: format!("{} a page: {}", op.key, plan.label),
+                    summary: "Parked by a walk.".to_owned(),
+                    operation_count: 1,
+                    preview: plan.to_preview(mapping),
+                    preview_hash: plan.hash.clone(),
+                    base_revision: Some(plan.base_revision.clone()),
+                    requested_by: None,
+                    model_id: None,
+                    risk: "medium".to_owned(),
+                    policy,
+                    requested_at: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .expect("the approval must file");
+            ids.push(requested.approval().id);
+        }
+        ids
+    }
+
+    /// Record a decision on an approval, the way `decide()` does: a status plus the deciding
+    /// time, which the table's `pending_iff_undecided` constraint ties together.
+    async fn decide(&self, approval_id: Uuid, status: &str) {
+        let written = sqlx::query(
+            "update ai_approvals set status = $2, decided_at = now(), \
+             decision_note = $3 \
+             where id = $1 and organization_id = $4 and status = 'pending'",
+        )
+        .bind(approval_id)
+        .bind(status)
+        .bind(if status == "rejected" {
+            Some("no".to_owned())
+        } else {
+            None
+        })
+        .bind(self.organization_id)
+        .execute(&self.pool)
+        .await
+        .expect("the decision must be writable")
+        .rows_affected();
+        assert_eq!(written, 1, "the pending row must be the one that moved");
+    }
+
+    /// The operation keys the release path sees as **refused**.
+    async fn rejected_keys(&self, set_id: Uuid) -> Vec<String> {
+        store::rejected_operation_keys(&self.pool, self.organization_id, set_id)
+            .await
+            .expect("the rejected keys must be readable")
+    }
+
+    /// The operation keys the release path sees for a set.
+    async fn approved_keys(&self, set_id: Uuid) -> Vec<String> {
+        store::approved_operation_keys(&self.pool, self.organization_id, set_id)
+            .await
+            .expect("the approved keys must be readable")
+    }
+
+    /// Whether a page row is still there.
+    ///
+    /// A delete walk cannot assert on a revision: the point is that the row is **gone**, and
+    /// `latest()` on a deleted page either errors or reads somebody else's revision. Existence
+    /// is the only honest witness, and it is checked on both sides of the apply — present while
+    /// the set is parked, absent once every gate was answered.
+    async fn page_still_exists(&self, page_id: Uuid) -> bool {
+        sqlx::query_scalar("select exists(select 1 from pages where id = $1)")
+            .bind(page_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("the existence check must answer")
+    }
+
     /// The status and reason the row carries now.
     async fn status_and_reason(&self, id: Uuid) -> (String, Option<String>) {
         sqlx::query_as("select status, discarded_reason from ai_change_sets where id = $1")
@@ -279,6 +403,35 @@ async fn apply_one_on(
             op.key, op.operation.resource_id
         ))
     })?;
+
+    // The delete branch is the route's, kept in step with it deliberately.
+    //
+    // It was missing here first, which is how the defect it now fixes was found: the walk
+    // asserted "an approved delete actually deleted the page" and the page was still there,
+    // because this harness wrote every operation through `update_page_in`. A test-only applier
+    // that has no delete branch is not a simplification — it is a second implementation that
+    // reports green on behaviour the product does not have. So this copy mirrors
+    // `routes::ai_change_sets::apply_one`'s delete branch exactly, including the
+    // `deleted`/`status` shape.
+    if op.operation.kind == omnion_ai_hub::approvals::plan::OpKind::Delete {
+        omnion_content::pages::delete_page_in(connection, page_id)
+            .await
+            .map_err(|err| {
+                AiHubError::InvalidChangeSet(format!(
+                    "operation `{}` could not delete page {page_id}: {err}",
+                    op.key
+                ))
+            })?;
+
+        return Ok(change_sets::AppliedOp {
+            key: op.key.clone(),
+            kind: op.operation.kind,
+            resource_id: op.operation.resource_id.clone(),
+            slug: String::new(),
+            status: "deleted".to_owned(),
+        });
+    }
+
     let page = omnion_content::pages::update_page_in(
         connection,
         page_id,
@@ -687,6 +840,381 @@ async fn a_delete_is_gated_and_a_plain_title_edit_is_not() {
         gated[0].0.key, "a",
         "the parked row names the operation it is about"
     );
+}
+
+/// The release gate: **every** gated operation needs an approving decision.
+///
+/// Pure and therefore the cheapest gate in the slice, but the property it carries is the one
+/// the pipeline turns on: a set with three gated operations and one approval is `Blocked`, and
+/// the list it returns names the two nobody answered. A release on the first decision is the
+/// "a second person releases it" promise answered by a signature, and it is invisible in every
+/// test that approves everything.
+#[tokio::test]
+async fn one_approval_of_three_gates_does_not_release_the_set() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let third = Uuid::new_v4();
+    let publishes = |key: &str, page: Uuid| {
+        let mut op = update(key, page, "Retitled");
+        op.operation.args = json!({ "title": "Retitled", "status": "published" });
+        op
+    };
+    let set = change_sets::ChangeSet {
+        id: Uuid::new_v4(),
+        organization_id: Uuid::new_v4(),
+        site_id: None,
+        title: "Publish three pages".to_owned(),
+        status: "pending".to_owned(),
+        operations: vec![
+            publishes("a", first),
+            publishes("b", second),
+            publishes("c", third),
+        ],
+        base_revisions: Default::default(),
+        created_by: None,
+        created_by_agent: None,
+        created_by_run: None,
+        updated_by: None,
+        confirmed_at: None,
+        applied_at: None,
+        discarded_reason: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+
+    assert_eq!(
+        set.gated_operations().len(),
+        3,
+        "three publishes, three gates"
+    );
+
+    let one = change_sets::release_gate(&set, &["a".to_owned()]);
+    assert!(
+        !one.is_released(),
+        "approving one of three gates is not approving the set"
+    );
+    match one {
+        change_sets::Gate::Blocked { outstanding } => {
+            assert_eq!(
+                outstanding,
+                vec!["b".to_owned(), "c".to_owned()],
+                "and the refusal names the rows the inbox still has to answer"
+            );
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+
+    let two = change_sets::release_gate(&set, &["a".to_owned(), "b".to_owned()]);
+    assert!(!two.is_released());
+
+    let all = change_sets::release_gate(&set, &["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+    assert!(
+        all.is_released(),
+        "every gate answered in the approving direction releases the set"
+    );
+}
+
+/// An **ungated** operation is not a gate, so approving it must not help — and its presence in
+/// the approved list must not confuse the comparison into releasing a set it never cleared.
+///
+/// The first half is the interesting one: a bridge that compared *counts* (approvals vs gated
+/// operations) would let a reviewer approve the rename and see the set released, because the
+/// rename's approval is a row and the count went up. This test is the shape that count would
+/// fail.
+#[tokio::test]
+async fn approving_an_ungated_operation_never_releases_a_gated_set() {
+    let page = Uuid::new_v4();
+    let mut publishing = update("b", page, "Retitled");
+    publishing.operation.args = json!({ "title": "Retitled", "status": "published" });
+    let set = change_sets::ChangeSet {
+        id: Uuid::new_v4(),
+        organization_id: Uuid::new_v4(),
+        site_id: None,
+        title: "Rename and publish one page".to_owned(),
+        status: "pending".to_owned(),
+        operations: vec![update("a", page, "Plain rename"), publishing],
+        base_revisions: Default::default(),
+        created_by: None,
+        created_by_agent: None,
+        created_by_run: None,
+        updated_by: None,
+        confirmed_at: None,
+        applied_at: None,
+        discarded_reason: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+
+    let gated = change_sets::release_gate(&set, &["a".to_owned()]);
+    assert!(
+        !gated.is_released(),
+        "`a` is a plain rename — it never parks, so approving a row about it proves nothing \
+         about `b`, the publish"
+    );
+    assert!(change_sets::release_gate(&set, &["b".to_owned()]).is_released());
+}
+
+/// A set with nothing gated is released by nobody and by everything, and that asymmetry is
+/// correct: it never parked, so there is no gate to wait for.
+#[tokio::test]
+async fn a_set_with_no_gates_is_already_released() {
+    let page = Uuid::new_v4();
+    let set = change_sets::ChangeSet {
+        id: Uuid::new_v4(),
+        organization_id: Uuid::new_v4(),
+        site_id: None,
+        title: "One rename".to_owned(),
+        status: "draft".to_owned(),
+        operations: vec![update("a", page, "Retitled")],
+        base_revisions: Default::default(),
+        created_by: None,
+        created_by_agent: None,
+        created_by_run: None,
+        updated_by: None,
+        confirmed_at: None,
+        applied_at: None,
+        discarded_reason: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+    assert!(
+        change_sets::release_gate(&set, &[]).is_released(),
+        "no gate means nothing to block; such a set is confirmed and applied in one call"
+    );
+}
+
+/// The pipeline's missing half, against a real database: a parked set is released by the
+/// inbox's answers and **applied**.
+///
+/// Slice 3c proved the set parks and files one row per gated operation. It did not prove
+/// anything happens next, and it could not: nothing in the codebase moved `pending →
+/// confirmed`, so a set with a gated operation could be approved row by row and then sit
+/// there forever. The request's own line — "a set containing a gated operation still parks for
+/// approval" — has no meaning if the approval never lets it go.
+///
+/// So this walk files the approvals through the real store, decides them through the real
+/// `decide()` path, reads the keys the release path reads, and then applies the set. The
+/// assertion is on **the page**: a rename that a reviewer approved actually renamed the page.
+/// A pipeline that transitioned the row and stopped would leave every row here green.
+#[tokio::test]
+async fn approving_every_parked_row_releases_and_applies_the_set() {
+    let store = gate!();
+    let first = store.page("released-one", "Before one").await;
+    let second = store.page("released-two", "Before two").await;
+    let third = store.page("released-three", "Before three").await;
+
+    // The gated operations here are **deletes**, and that is not a simplification.
+    //
+    // The first draft of this fixture minted its gate by writing `status: "published"` into an
+    // update's args — which classifies as `content_publish` and therefore parks correctly, and
+    // then fails at apply with "status is published by `content::pages::publish_page`, not
+    // written as a field". The gate and the write disagreed: the classification asks what the
+    // operation *means*, the applier asks what it can *do*, and only `content_delete` is a
+    // gated class this build can actually carry through an update-or-delete write. A fixture
+    // that passes the gate and fails the apply proves the plumbing and nothing about the gate,
+    // so the deletes are also the honest way to say "gated AND applicable".
+    //
+    // Two deletes, because the property under test is the **intermediate** state — "one of two
+    // gates is not a release" — and a single delete could not express it. A one-gate set cannot
+    // tell a release-on-first-decision apart from a release-on-last-decision, which is the whole
+    // hole this slice exists to close.
+    //
+    // The rename rides along ungated, which is the second property worth having here: a set that
+    // both gates and runs must release on the deletes alone, the ungated operation must NOT be
+    // filed as a third approval, and the rename must still be written by the same
+    // all-or-nothing apply.
+    let removing = |key: &str, page: Uuid| ChangeOp {
+        key: key.to_owned(),
+        operation: omnion_ai_hub::approvals::plan::Operation {
+            kind: omnion_ai_hub::approvals::plan::OpKind::Delete,
+            resource_type: "page".to_owned(),
+            resource_id: page.to_string(),
+            args: json!({}),
+        },
+    };
+    let rename = update("a", first, "After one");
+    let remove_second = removing("b", second);
+    let remove_third = removing("c", third);
+    let set_id = store::append(
+        &store.pool,
+        &NewChangeSet {
+            organization_id: store.organization_id,
+            site_id: Some(store.site_id),
+            title: "Rename one page and delete two others".to_owned(),
+            operations: vec![rename.clone(), remove_second.clone(), remove_third.clone()],
+            created_by: None,
+            created_by_agent: None,
+            created_by_run: None,
+            base_revisions: store::current_revisions(
+                &store.pool,
+                store.organization_id,
+                &[rename.clone(), remove_second.clone(), remove_third.clone()],
+            )
+            .await
+            .expect("the targets must be pinnable"),
+        },
+    )
+    .await
+    .expect("the set must be filed")
+    .id;
+
+    let parked = store.park(set_id).await;
+    assert_eq!(
+        parked.len(),
+        2,
+        "the two DELETES are gated and the rename is not, so the inbox carries two rows — \
+         the ungated rename must not be filed as a third"
+    );
+    let (status, _) = store.status_and_reason(set_id).await;
+    assert_eq!(status, "pending", "a gated set parks instead of confirming");
+
+    // One row decided: the set must still be blocked. A release on the first decision is the
+    // hole this slice is about, so the intermediate state is asserted, not assumed.
+    store.decide(parked[0], "approved").await;
+    let keys = store.approved_keys(set_id).await;
+    let set = store::read(&store.pool, store.organization_id, set_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let halfway = change_sets::release_gate(&set, &keys);
+    assert!(
+        !halfway.is_released(),
+        "one of two gates is not a release, whatever the one that was decided was"
+    );
+    if let change_sets::Gate::Blocked { outstanding } = &halfway {
+        assert_eq!(
+            outstanding.len(),
+            1,
+            "and the refusal names the gate nobody answered: {outstanding:?}"
+        );
+    }
+    assert_eq!(
+        store.latest(first).await.0,
+        1,
+        "the ungated rename has NOT been written either — a park holds the whole set"
+    );
+    for page in [second, third] {
+        assert_eq!(
+            store.page_still_exists(page).await,
+            true,
+            "and neither approved-so-far delete has run"
+        );
+    }
+
+    store.decide(parked[1], "approved").await;
+    let keys = store.approved_keys(set_id).await;
+    let gate = change_sets::release_gate(&set, &keys);
+    assert!(gate.is_released(), "both gates answered: {keys:?}");
+
+    // The transition the release route performs, then the all-or-nothing apply.
+    let confirmed = store::transition(
+        &store.pool,
+        store.organization_id,
+        set_id,
+        "pending",
+        "confirmed",
+        None,
+    )
+    .await
+    .expect("the release transition must answer")
+    .expect("the set must have been released");
+    assert_eq!(confirmed.status, "confirmed");
+
+    let applied = apply_set(&store.pool, store.organization_id, set_id)
+        .await
+        .expect("the set must apply through the same all-or-nothing store call");
+    assert_eq!(
+        applied.len(),
+        3,
+        "every operation was written, gated or not"
+    );
+
+    let (status, _) = store.status_and_reason(set_id).await;
+    assert_eq!(status, "applied", "and the row says so");
+
+    let title: String = sqlx::query_scalar(
+        "select title from page_revisions where page_id = $1 order by revision_no desc limit 1",
+    )
+    .bind(first)
+    .fetch_one(&store.pool)
+    .await
+    .expect("the revision must be readable");
+    assert_eq!(
+        title, "After one",
+        "the ungated rename was written by the same apply"
+    );
+
+    for page in [second, third] {
+        assert_eq!(
+            store.page_still_exists(page).await,
+            false,
+            "an approved delete actually deleted the page"
+        );
+    }
+    store.dispose().await;
+}
+
+/// The other direction: a **rejected** gate ends the set instead of stalling it.
+///
+/// A release that only counted approvals would wait forever for an answer already given in the
+/// negative, and a release that ignored the rejection would apply the operations a reviewer
+/// refused. The walk asserts the refusal names the operation, because "this change set cannot
+/// be released" with no key is a message a reviewer cannot act on.
+#[tokio::test]
+async fn one_rejected_gate_ends_the_set_and_never_releases_it() {
+    let store = gate!();
+    let page = store.page("refused", "Before").await;
+    let set_id = store
+        .confirmed_set("Rename one page", vec![update("a", page, "After")])
+        .await;
+
+    // Park a *separate* set so the shape is honest: a pending set with one gate.
+    let pending = store::append(
+        &store.pool,
+        &NewChangeSet {
+            organization_id: store.organization_id,
+            site_id: Some(store.site_id),
+            title: "Publish one page".to_owned(),
+            operations: vec![{
+                let mut op = update("a", page, "After");
+                op.operation.args = json!({ "title": "After", "status": "published" });
+                op
+            }],
+            created_by: None,
+            created_by_agent: None,
+            created_by_run: None,
+            base_revisions: Default::default(),
+        },
+    )
+    .await
+    .expect("the set must be filed")
+    .id;
+    let _ = set_id;
+
+    let parked = store.park(pending).await;
+    assert_eq!(parked.len(), 1);
+    store.decide(parked[0], "rejected").await;
+
+    let refused = store.rejected_keys(pending).await;
+    assert_eq!(
+        refused,
+        vec!["a".to_owned()],
+        "the refusal names the operation"
+    );
+    let set = store::read(&store.pool, store.organization_id, pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !change_sets::release_gate(&set, &store.approved_keys(pending).await).is_released(),
+        "a rejected gate is not an approving one"
+    );
+    assert_eq!(
+        store.status_and_reason(pending).await.0,
+        "pending",
+        "and the set neither applies nor quietly becomes confirmable"
+    );
+    store.dispose().await;
 }
 
 /// A mixed set parks only the dangerous half.
