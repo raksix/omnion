@@ -36,6 +36,7 @@ pub mod guardrails;
 pub mod health;
 pub mod health_store;
 pub mod identity;
+pub mod local_doctor;
 pub mod local_host;
 pub mod local_store;
 pub mod loop_engine;

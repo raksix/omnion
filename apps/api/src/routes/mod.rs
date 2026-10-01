@@ -887,6 +887,19 @@ pub fn router(state: AppState) -> Router {
     let ai_local_scan =
         post(ai_local::scan_endpoint).layer(guards::require(&state, "ai.local.manage"));
 
+    // The doctor (REQ-106 slice 4). Reading a run is `ai.local.read` — it is the same knowledge
+    // as the locality badges, and a run *starts* nothing. Starting and re-running one is
+    // `ai.local.manage`: both dial every local endpoint, and on a loaded host that is a real
+    // action with a real cost, not a screen refresh. The two verbs are separate routes rather than
+    // a `POST /doctor/{key}` that means both, because "run everything" and "re-run this one" are
+    // different decisions with different blast radii.
+    let ai_local_doctor_read =
+        get(ai_local::read_doctor).layer(guards::require(&state, "ai.local.read"));
+    let ai_local_doctor_run =
+        post(ai_local::run_doctor).layer(guards::require(&state, "ai.local.manage"));
+    let ai_local_doctor_one = post(ai_local::rerun_doctor_check)
+        .layer(guards::require(&state, "ai.local.manage"));
+
     // The air-gap switch (REQ-106 slice 2). Reading it is `ai.local.read` — it answers the same
     // question the local screen does ("does anything leave this machine?"), so anyone who may
     // see the locality badges may see the switch that enforces them. Flipping it is
@@ -2129,6 +2142,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/local/models/cancel", ai_local_cancel)
         .route("/ai/local/models/retry", ai_local_retry)
         .route("/ai/local/scan", ai_local_scan)
+        .route(
+            "/ai/local/doctor",
+            ai_local_doctor_read.merge(ai_local_doctor_run),
+        )
+        .route("/ai/local/doctor/{key}", ai_local_doctor_one)
         .route("/ai/airgap", ai_airgap_read.merge(ai_airgap_manage))
         .route("/ai/airgap/hosts", ai_airgap_hosts)
         .route("/ai/airgap/hosts/{id}", ai_airgap_host_delete)

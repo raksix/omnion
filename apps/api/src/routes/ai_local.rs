@@ -36,14 +36,18 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use omnion_ai_hub::error::{AiHubError, Result as HubResult};
+use omnion_ai_hub::airgap_store;
+use omnion_ai_hub::local_doctor::{self, DoctorCheck, DoctorRun, RunStatus};
 use omnion_ai_hub::local_host::{host_of, local_http, refuse_redirect};
 use omnion_ai_hub::local_store::{
     self, LocalEndpoint, LocalModel, ModelFilter, NewLocalEndpoint, PullOutcome, ServedModel,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::auth::CurrentSession;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -379,6 +383,124 @@ pub async fn scan_endpoint(
         "served": models.len(),
         "written": written,
     })))
+}
+
+// -------------------------------------------------------------------------------------------
+// The doctor (REQ-106, slice 4)
+// -------------------------------------------------------------------------------------------
+
+/// `GET /ai/local/doctor` — the last run, plus the runs before it.
+///
+/// # Why the history ships with the last run
+///
+/// The request asks for "previous runs listed with their verdict so a regression is visible". A
+/// screen that only reads the newest row cannot show a regression, because the regression *is*
+/// the comparison — so the endpoint answers with both, in one call, rather than two round trips
+/// that could each be a different moment.
+#[derive(Debug, Serialize)]
+pub struct DoctorResponse {
+    /// The newest run, or `None` when the doctor has never run here.
+    pub latest: Option<DoctorRunView>,
+    /// The runs before it, newest first, so a regression is visible beside its fix.
+    pub previous: Vec<DoctorRunView>,
+    /// `true` when nothing has ever run — the screen's empty state, which says "never run"
+    /// rather than "all green".
+    pub never_run: bool,
+    /// The air-gap switch's state, so the summary line can qualify what the run was about.
+    pub airgap_enabled: bool,
+}
+
+/// A stored run as the screen reads it.
+#[derive(Debug, Serialize)]
+pub struct DoctorRunView {
+    /// Row id.
+    pub id: i64,
+    /// The verdict, recomputed from `checks` on read — never the stored word.
+    pub status: RunStatus,
+    /// The checks, in list order.
+    pub checks: Vec<DoctorCheck>,
+    /// The one-sentence summary, naming the first blocking check when there is one.
+    pub summary: String,
+    /// Whether the gap was on when the run happened.
+    pub airgap_enabled: bool,
+    pub started_at: OffsetDateTime,
+    pub finished_at: Option<OffsetDateTime>,
+    /// How long the whole run took.
+    pub elapsed_ms: Option<i64>,
+}
+
+/// `GET /ai/local/doctor` — what the doctor last found.
+pub async fn read_doctor(
+    State(state): State<AppState>,
+) -> Result<Json<DoctorResponse>, ApiError> {
+    let pool = state.db().pool();
+    let runs = local_doctor::list_runs(pool, 8).await?;
+    let airgap_enabled = airgap_store::is_enabled(pool).await.unwrap_or(false);
+    // `head` is `&DoctorRun` and `tail` iterates `&DoctorRun`, so both sides take the same
+    // `From<&DoctorRun>` impl and the two can never drift to different conversions.
+    let (latest, previous) = runs.split_first().map_or((None, Vec::new()), |(head, tail)| {
+        (Some(DoctorRunView::from(head)), tail.iter().map(DoctorRunView::from).collect())
+    });
+    Ok(Json(DoctorResponse {
+        never_run: runs.is_empty(),
+        latest,
+        previous,
+        airgap_enabled,
+    }))
+}
+
+impl From<&DoctorRun> for DoctorRunView {
+    fn from(run: &DoctorRun) -> Self {
+        // The status is derived from the checks on the way out, so a row written by an older
+        // binary (or by a hand-edited column) cannot make the screen contradict its own list.
+        let status = RunStatus::of(&run.checks);
+        Self {
+            id: run.id,
+            summary: RunStatus::message(&run.checks),
+            status,
+            checks: run.checks.clone(),
+            airgap_enabled: run.airgap_enabled,
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            elapsed_ms: run.elapsed_ms(),
+        }
+    }
+}
+
+/// `POST /ai/local/doctor` — run every check now.
+///
+/// # 201, not 200
+///
+/// A run is a **created row**, and the screen links to it (and lists it under history), so 201
+/// is the honest status. A 200 would say "here is the state you asked about", which is a
+/// different claim about a thing that did not exist a moment ago.
+pub async fn run_doctor(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<(StatusCode, Json<DoctorRunView>), ApiError> {
+    let pool = state.db().pool();
+    // The actor is recorded, not trusted: `triggered_by` is what makes the history readable as
+    // "who checked this, and when" rather than a list of timestamps nobody can attribute.
+    let run = local_doctor::run_all(pool, Some(current.user.id)).await?;
+    Ok((StatusCode::CREATED, Json(DoctorRunView::from(&run))))
+}
+
+/// `POST /ai/local/doctor/{key}` — re-run one check.
+///
+/// Runs the whole doctor and returns the whole list, deliberately: the summary verdict describes a
+/// whole state, and returning one check beside a run status would let the screen print "Ready"
+/// for checks nobody re-ran. The `key` is validated first so a typo is a field error naming the
+/// real keys rather than a silently ignored path segment.
+pub async fn rerun_doctor_check(
+    State(state): State<AppState>,
+    current: CurrentSession,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<Json<DoctorRunView>, ApiError> {
+    let pool = state.db().pool();
+    let run = local_doctor::rerun_one(pool, &key, Some(current.user.id))
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_check", error.to_string()))?;
+    Ok(Json(DoctorRunView::from(&run)))
 }
 
 // -------------------------------------------------------------------------------------------
