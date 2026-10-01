@@ -160,12 +160,30 @@ async fn sweep_project(pool: &PgPool, project_id: Uuid) -> Result<(u64, u64), St
 }
 
 /// `automation.project.limit.warning` or `.limit_exceeded`, with the numbers an operator needs.
+///
+/// **The name is written out twice on purpose — once per arm, at the constructor.** The name
+/// used to be a local binding named `name`, built by a `match` three lines above the
+/// constructor, and the drift gate in `apps/api/tests/events.rs` reported both catalogue rows
+/// as `Live` with no emitter behind them for the whole of their life. That gate is a *source*
+/// scanner: it reads `NewEvent::new("…")` and looks at nothing else, so a name that arrives
+/// through a binding is invisible to it, and the row it cannot see reads as a row nothing emits.
+/// The only two honest repairs were to teach the scanner about bindings — which would have
+/// taught it to accept any expression, and so to accept a `format!` too, turning a gate that
+/// names a defect into one that tolerates a wire contract assembled at runtime — or to write
+/// the name where the scanner can see it. `NoticeKind::as_str` below stays the assertion of
+/// *what* the two names are; this is where they are *emitted*.
+///
+/// The real lesson is not the shape. It is that a green suite is not the evidence here: both
+/// rows shipped `Live` with the gate **red**, and the tick that wrote them ran a different
+/// suite. Nothing in the product was broken — the worker emitted correctly at runtime — so
+/// every behavioural test stayed green while the one gate that names the contract was the only
+/// thing that could have said anything.
 async fn emit(pool: &PgPool, notice: &LimitNotice) -> Result<(), omnion_events::EventsError> {
-    let name = match notice.kind {
+    let event = NewEvent::new(match notice.kind {
         NoticeKind::Warning => "automation.project.limit.warning",
         NoticeKind::Exceeded => "automation.project.limit.exceeded",
-    };
-    let event = NewEvent::new(name).payload(serde_json::json!({
+    })
+    .payload(serde_json::json!({
         "project_id": notice.project_id,
         "project_key": notice.project_key,
         "limit": notice.limit,
