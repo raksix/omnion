@@ -2274,6 +2274,35 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
             aria-label="Keyboard shortcuts"
             className="mt-10 max-h-[70vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-line bg-surface shadow-xl"
             onClick={(click) => click.stopPropagation()}
+            // **The dialog owns Escape, because the canvas cannot hear it for this dialog.**
+            //
+            // `onCanvasKeyDown` is React's `onKeyDown` on the *canvas div*, and this overlay is a
+            // SIBLING of that div — not a descendant — so a key pressed while focus is inside the
+            // dialog never bubbles through the canvas. The handler in `onCanvasKeyDown` is correct
+            // and unreachable, and the dialog inherits the canvas's focus because it has no
+            // `autoFocus`, no trap and no listener of its own. Net effect: ⌘/ opens, and Escape
+            // closes it *only when the canvas happened to hold focus*. Read live in tick 75 as
+            // `closedByEscape: false` on a pass that had opened the dialog a moment earlier.
+            //
+            // This is reachable with three keystrokes and no mouse, which is why it is a product
+            // defect rather than a probe artefact: ⌘P focuses the palette, `I` focuses the
+            // inspector, and the palette rail and the inspector are both siblings of the canvas
+            // too. Press ⌘/, press Tab, and you are in an `aria-modal` dialog whose only
+            // documented exit does nothing.
+            //
+            // `stopPropagation` is the other half: Escape is *shared* with the pointer connect
+            // gesture and the canvas runs a three-step ladder on it (cancel a connection, clear an
+            // edge selection, clear the node selection). Without consuming the event, one press
+            // closes the shortcut list AND runs that ladder behind it — a key that says "never
+            // mind" and clears the author's selection in the same breath.
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") {
+                return;
+              }
+              event.stopPropagation();
+              event.preventDefault();
+              setHelpOpen(false);
+            }}
             data-builder-help
           >
             <div className="flex items-center justify-between border-b border-line px-4 py-3">
@@ -2281,6 +2310,7 @@ export function WorkflowBuilder({ workflowId }: { workflowId: string }) {
               <button
                 type="button"
                 onClick={() => setHelpOpen(false)}
+                autoFocus
                 className="rounded-md border border-line px-2 py-1 text-[12px] hover:bg-quiet-soft"
                 data-builder-help-close
               >
