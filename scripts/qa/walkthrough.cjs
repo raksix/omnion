@@ -277,11 +277,36 @@ function ensureSampleJpegWithExif() {
 fs.mkdirSync(SHOTS, { recursive: true });
 
 const clickLines = [];
+// Defects declared by a depth pass through `record({ severity, ... })`. Collected here rather
+// than pushed straight into the roll-up's `findings` because the roll-up is built at the end of
+// `main()`, long after every pass has run, and the list is spread over the whole file.
+const claimedFindings = [];
 function log(...a) {
   console.log("[walk]", ...a);
 }
 function record(entry) {
   clickLines.push(entry);
+  // A depth pass that reaches a defect with `record({ severity: "high", ... })` was reporting
+  // into a channel nothing read. The finding list is built in the roll-up, far below, from
+  // `pushFindings`; `clicks.jsonl` is a forensic stream and `run.sh` reads only `summary.json`.
+  // So every gated claim in every depth pass — the CDN purge console, the environments wizard,
+  // the security policies, the maintenance window — could fail on every product defect and
+  // still leave the pass with a clean tally, because the entries were written and never counted.
+  //
+  // It is proved against a real artifact, not inferred: the tick-86 w5 pass recorded 26 depth
+  // passes, and the tick-93 run wrote 0 entries carrying a severity at all. The path that
+  // decides is this one, so the fix is here rather than in thirty call sites: an entry that
+  // declares a severity IS a finding, from the moment it is declared.
+  if (entry && entry.severity) {
+    claimedFindings.push({
+      severity: entry.severity,
+      kind: entry.action || entry.page || "depth-claim",
+      detail:
+        entry.detail ||
+        entry.reason ||
+        (entry.measured === undefined ? undefined : `measured ${JSON.stringify(entry.measured)}`),
+    });
+  }
   // The event stream is written for durability -- a killed pass should leave its clicks behind
   // -- but it is a SECONDARY record: `clickLines` is the one the report is built from. So a
   // write that fails must not end the pass. It used to: this box runs a disk guard that trims
@@ -8669,6 +8694,25 @@ async function runSecurityDepth(page, report) {
   // longer makes every pass slower for nothing.
   const POLL_WAIT_MS = 30_000 + 6_000;
   //
+  // The four claims below are GATED, not merely noted. They were written as
+  // `note({ step, reason })`, and `note` in this pass only appends to `steps` and the click
+  // stream — a claim that fails is then indistinguishable from a claim that never ran, and a
+  // maintenance screen that renders while refusing to save, or a banner that never appears, is
+  // reported as a pass. `gate` declares the same thing through `record({ severity })`, which the
+  // roll-up counts (see `record()`). A form that swallows its own refusal and shows nothing looks
+  // identical to a save that worked until somebody reads the database.
+  const maintenanceGate = (claim, severity, what) => {
+    const measured = steps[`maintenance-${claim}`];
+    if (measured === true || (typeof measured === "number" && measured > 0)) return;
+    record({
+      page: "deployment-maintenance",
+      action: `maintenance-${claim}`,
+      severity,
+      detail: what,
+      measured,
+    });
+  };
+  //
   // A form that renders is half a screen; the other half is what the server does with it. So
   // this pass does the three things that can be wrong, in the order a human would:
   //
@@ -8685,6 +8729,7 @@ async function runSecurityDepth(page, report) {
   const maintenanceRendered =
     (await page.locator('[data-maintenance-env="production"]').count()) > 0;
   note({ step: "maintenance-rendered", rendered: maintenanceRendered });
+  steps["maintenance-rendered"] = maintenanceRendered;
   await shot(page, "deployment-maintenance");
 
   if (maintenanceRendered) {
@@ -8692,6 +8737,7 @@ async function runSecurityDepth(page, report) {
     // screen that will not let an operator open a window on staging.
     const cardCount = await page.locator("[data-maintenance-env]").count();
     note({ step: "maintenance-environment-count", count: cardCount });
+    steps["maintenance-every-environment-has-a-card"] = cardCount >= 2;
 
     // (1) enabled with no message -> refused, visibly.
     await page.locator('[data-maintenance-enabled="production"]').check().catch(() => {});
@@ -8703,6 +8749,7 @@ async function runSecurityDepth(page, report) {
       .textContent()
       .catch(() => null);
     note({ step: "maintenance-blank-message-refused", text: (blankRefusal || "").trim() || null });
+    steps["maintenance-blank-message-refused"] = !!(blankRefusal && blankRefusal.trim());
     if (!blankRefusal || !blankRefusal.trim()) {
       note({
         step: "maintenance-blank-message-accepted",
@@ -8721,6 +8768,7 @@ async function runSecurityDepth(page, report) {
       (await page.locator('[data-maintenance-state="production"]').textContent().catch(() => "")) || ""
     ).trim();
     note({ step: "maintenance-state-after-save", state: stateAfterSave });
+    steps["maintenance-state-reads-open"] = /open now/i.test(stateAfterSave);
     await shot(page, "deployment-maintenance-open");
 
     // The banner is the half of this feature that reaches a session the operator is not
@@ -8734,6 +8782,13 @@ async function runSecurityDepth(page, report) {
       ? ((await banner.textContent().catch(() => "")) || "").trim()
       : null;
     note({ step: "maintenance-banner-visible", visible: bannerVisible, text: bannerText });
+    steps["maintenance-banner-visible"] = bannerVisible;
+    // It must carry the operator's own words, not a restatement of them: the same sentence the
+    // API returns in its 503 body. A paraphrase is a second thing to keep in sync, and this is
+    // the one place the operator is guaranteed to read it.
+    steps["maintenance-banner-carries-the-operators-message"] = !bannerText
+      ? false
+      : bannerText.includes("QA maintenance window");
     if (!bannerVisible) {
       note({
         step: "maintenance-banner-missing",
@@ -8763,6 +8818,7 @@ async function runSecurityDepth(page, report) {
       (await page.locator('[data-maintenance-state="production"]').textContent().catch(() => "")) || ""
     ).trim();
     note({ step: "maintenance-state-after-off", state: stateAfterOff });
+    steps["maintenance-state-closes"] = !/open now/i.test(stateAfterOff);
     if (/open now/i.test(stateAfterOff)) {
       note({
         step: "maintenance-window-stuck-open",
@@ -8778,6 +8834,7 @@ async function runSecurityDepth(page, report) {
     await page.waitForTimeout(POLL_WAIT_MS);
     const bannerAfterOff = (await page.locator("[data-qa-maintenance-banner]").count()) > 0;
     note({ step: "maintenance-banner-after-off", visible: bannerAfterOff });
+    steps["maintenance-banner-clears"] = !bannerAfterOff;
     if (bannerAfterOff) {
       note({
         step: "maintenance-banner-stuck",
@@ -8788,6 +8845,50 @@ async function runSecurityDepth(page, report) {
   } else {
     note({ step: "maintenance-missing", reason: "/deployment/maintenance did not render its cards" });
   }
+
+  // Every claim this block makes, declared as a gate. The ones inside the branch are only
+  // measured when the screen rendered, so the `rendered` gate is what makes the other six
+  // honest: a screen that never opened must not report a clean set of sub-claims it never took.
+  maintenanceGate(
+    "rendered",
+    "high",
+    "/deployment/maintenance did not render its cards, so none of the window's behaviour was measured",
+  );
+  maintenanceGate(
+    "every-environment-has-a-card",
+    "high",
+    "the maintenance screen shows only one environment, so a window cannot be opened on staging",
+  );
+  maintenanceGate(
+    "blank-message-refused",
+    "high",
+    "an enabled window with no message was saved; the banner would say nothing while every write is refused",
+  );
+  maintenanceGate(
+    "state-reads-open",
+    "high",
+    "a window with a message was saved and the row does not read as open, so the save silently did nothing",
+  );
+  maintenanceGate(
+    "banner-visible",
+    "high",
+    "a window is open on production but no screen shows the banner; every write is refused and the operator is told by a 503 instead",
+  );
+  maintenanceGate(
+    "banner-carries-the-operators-message",
+    "high",
+    "the banner does not carry the message the operator wrote, so the one place they are guaranteed to read it says something else",
+  );
+  maintenanceGate(
+    "state-closes",
+    "high",
+    "the window still reads open after it was switched off; every write is refused with no way to remove the banner",
+  );
+  maintenanceGate(
+    "banner-clears",
+    "high",
+    "the banner is still up one poll interval after the window was closed; writes work again but the panel keeps claiming they do not",
+  );
 
   // ---- The rate-limit policy (REQ-012, slice 2) ---------------------------------------------
   //
@@ -10835,6 +10936,32 @@ async function main() {
   const clicks = clickLines.filter((e) => e.action === "click");
   const findings = [];
   const pushFindings = (severity, kind, detail) => findings.push({ severity, kind, detail });
+
+  // Defects a depth pass declared through `record({ severity, ... })`, folded in here. They used
+  // to be written to `clicks.jsonl` and read by nobody, so a pass whose every claim failed still
+  // reported a clean tally — see the note in `record()`. They go in BEFORE the severity tally
+  // below so they are numbered like every other finding.
+  for (const f of claimedFindings) {
+    pushFindings(f.severity, f.kind, f.detail);
+  }
+
+  // A depth pass that threw, or that returned `ok: false` because a screen never rendered, is
+  // the strongest statement a pass can make about its own coverage — and the roll-up read none of
+  // it. Both are now high findings: a pass that could not open a screen it claimed to test has
+  // proved nothing about that screen, and "no findings" is the one reading that must not be
+  // available to it. `skipped` is a pass that was out of scope, which is coverage the pass
+  // deliberately did not attempt, so it stays out of the tally.
+  for (const [name, result] of Object.entries(report)) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) continue;
+    if (!("ok" in result) || result.skipped) continue;
+    if (result.ok === false) {
+      pushFindings(
+        "high",
+        "depth-pass-failed",
+        `the "${name}" depth pass did not complete: ${result.reason || "it returned no reason"}`,
+      );
+    }
+  }
 
   // A `--only` filter that matches nothing is a finding, not an empty green report.
   //
