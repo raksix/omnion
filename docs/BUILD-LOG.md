@@ -12978,3 +12978,36 @@ six that are not this worktree's are recorded, not fixed.
 **Also worth recording: the box was not merely busy.** Postgres spent **56 minutes** in crash
 recovery on an fsync (root disk 96%), and every gate refuses to start until it accepts connections —
 so "the database is recovering" and "the box is loaded" read identically from the harness.
+
+### Tick 62 close — the fourth pass, and the box could not host it
+
+**What happened.** The harness fix was real and is committed (`519384a9`, `2113b8fb`), and a fourth
+pass ran with it. The pass again reported `crm-assignment` failing on `simulator-payload` — but this
+time the **harness got further and the log says why**: the very next line reads
+`crm intake: {"ok":false,"reason":"the source was not created (status 503)"}`.
+
+**A `503` on the first write is not a screen.** `omnion-qa-api-w8` was `online` in pm2 and every
+route still walked 40 interactive elements, because the panel's HTML is static and renders fine with
+a dead API behind it. Postgres on this box went back into **crash recovery** mid-pass — and the root
+disk is at **99% (1.7 G free)**. That is the whole story: an unguarded `fill` reports *which control
+was absent*, and a `503` makes **every** control absent, so the same timeout means two completely
+different things depending on whether the API was answering.
+
+**The distinction is worth having, and it is the last thing this tick learned.** An absent element and
+an element whose data never arrived produce the same failure at the locator. The harness has to say
+which, or the next person spends an hour reading a screen instead of reading a log.
+
+**What is proven, and what is not.**
+
+- **Proven by gates:** `run-crm-simulator-input.sh` 41 assignment tests, 7 new, PROVEN TO FAIL with
+  the failing set compared exactly; module lib **181**; `cargo check -p omnion-api` clean; admin
+  `tsc --noEmit` exit 0.
+- **Proven by an earlier pass this tick:** `crm-intake` **130+ assertions green**, `projects` **45
+  steps**, six CRM routes at 40 interactive elements.
+- **NOT proven:** `crm-assignment` depth. Four runs, four attempts, zero measurements — two harness
+  faults (now fixed) and two environment failures (Postgres in recovery, disk at 99%). REQ-117's
+  simulator box stays `[~]`, and the box will stay `[~]` until a pass on a healthy box reaches it.
+
+**Next tick.** `pg_isready` **before** starting anything, and a disk check beside it: this box's
+database spent 56 minutes recovering earlier today and went back under the load of nine writers. The
+measurement is written, compiled and typechecked; nothing about it needs another line of code.
