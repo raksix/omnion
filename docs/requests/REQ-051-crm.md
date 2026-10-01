@@ -1,6 +1,6 @@
 # REQ-051 — CRM
 
-> **Status:** in-progress (tick 50 — the first pass in this module that wrote a `summary.json`, and it found two real bugs: `/crm/deals` threw on every load because `DealsView` calls `useCrmList` above the `CrmShell` that provides it, and every count line read "2 contactss". `47d822b7`. The state sweep was also filing its own injected 503s and a designed 403 as defects, and `--only=crm` was reported as a typo; `ee3387de`. Proof: 119 screenshots, 0 capture failures, `voidReasons: []`, `apiLiveness.up: true`, `cargo test -p omnion-module-crm --lib` 172/172, `turbo run typecheck` 2/2. **No box is ticked by this entry** — the confirming pass is queued behind a live sibling holder. Previous: tick 47 made a passless pass exit 4 rather than report `high 160 / exit 0`; tick 46 removed the `API_BIN` blocker that had kept this REQ's browser evidence unobtainable for four ticks; tick 45 fixed the roll-up's unguarded `m.diagnostics` read and the two CRM screens missing from `mobileRoutes`; tick 44 closed the keyboard contract in code for `/crm/activities` and `/crm/leads`.
+> **Status:** in-progress (tick 66 — the pass ran to the end for the first time in this module and it is **void**: exit 4, six screenshots lost to a `/` that hit 100% mid-run, so **no box is ticked** and every number below is evidence, not a verdict. Two defects it earned anyway. **`c6640d81`** — `scripts/qa/run.sh` had a **masked literal committed where the database password goes** (`postgres://omnion:***@…`), so the API could not authenticate and the pass spent its whole slot waiting for a server that had already died; it is now `${QA_PG_PASSWORD:-omnion}`, overridable. The same literal is in main's, w2's and w3's copies of the file. **`5e27a2b5`** — `/crm/activities` destructured `showShortcuts` out of `useCrmKeyboard` and rendered nothing, so `?` flipped a flag whose answer never appeared while `/crm/leads` drew the sheet correctly. Proof: `cargo test -p omnion-module-crm` **172/172**; `pnpm typecheck` **2/2**; the CRM section answers `slashFocusesSearch`, `nCreates`, `everyAdvertisedGoKeyNavigates`, `eIsNeverADeadBinding` and six of seven phone checks, while `jMovesTheVisibleCursor`/`kMovesBack`/`exactlyOneCursor` all read `false` with a drawn cursor, `crmStates` clears activities/leads/stages and fails all five questions on contacts/companies/deals, and the activity form measured **0** fields at 390px. Still owed: those three boxes, on a disk that can hold their screenshots. Previous: tick 65 fixed the visibility level that could never be held (`require_department_scoped`) and the family-match that answered `all`; tick 50 wrote the first `summary.json` in this module.)
 
   *Re-run against a database this branch's migration set has seen.* The suite pointed at the shared
   dev database answered 56 × `Migration(VersionMissing(19))`: 19 is a **shared-number collision**
@@ -201,6 +201,24 @@ Payloads carry ids and the changed field list only — never a rendered document
 - [x] Global search (REQ-002) finds contacts, companies and deals by name/e-mail and deep-links to the record. (**Shipped** in `5bedddb`/`241cf91`: three providers in `crates/search/src/providers.rs` — `contacts` and `companies` behind `crm.contacts.read`, `deals` behind `crm.deals.read`, each pointing at its own screen — with the three upserts, the three prune arms and the `crm.*` event plans in `crates/search/src/indexer.rs`, plus `database/migrations/0031_crm_search_providers.sql` to enable the keys. A contact's **notes** are excluded: the module flags them `crm.fields.sensitive.read` and a vector cannot answer a per-role question. The deep link is `?focus=<id>`: the two lists open that row's editor, the board marks that card. Proved by three walks in the **39/39** run — the hit carries the right `url`, `type:contacts` narrows to contact rows only, a reader holding only the contact key finds the contact and gets **no** deal rows (the same split `/api/v1/crm/deals` enforces), and archiving a company takes its document out of the index. **⌘K "New contact" / "New deal" is not done** — the command centre (REQ-032) is wave 1 and owns the palette's own rows.)
 - [x] An automation rule triggered by `crm.deal.stage_changed` runs **once**. (Proved by driving the **real** matcher — `crates/automation/src/matcher.rs` — over the **real** bus in this suite's own database, so the event the rule reads is the one the board's stage endpoint emitted rather than a hand-written row. Three walks: `a_rule_on_a_deal_stage_change_runs_exactly_once`, `a_rule_whose_condition_does_not_hold_starts_nothing` and `defining_the_rule_needs_the_workflow_key_and_a_tenant_rule_stays_home`, all in the **42/42** run. They assert: a move to the stage a deal is **already in** starts nothing (the board's `ctrl + ←/→` posts on every key press); one move starts **one** run whose step carries *this* move's resolved values — the subject reads "A deal entered open" and the body the deal's id, amount and currency, so a retry would repeat the first attempt rather than re-reading a bus that has moved on; a second drain over the same bus is **idle**, which is what "once" means rather than a count; the match is audited as `automation.rule.matched` against the execution; a second deal starts a second run, because exactly-once is per *event* and collapsing two customers into one run would lose one; and a condition that does not hold is `skipped`, not `matched`. The rule's key is `workflows.manage`, so a CRM manager who may move deals all day still cannot define the rule that watches them, and a rule for another organization is refused.)
 - [ ] Empty, loading and error states exist on all six screens; no dead buttons and no placeholder rows.
+  *The tick-66 pass produced the first report behind this box in two days, and it is **void**: the
+  run exited 4 because `/` hit 100% mid-pass and six screenshots could not be written. A void run
+  ticks nothing, whatever its CRM numbers say, so this box stays open — but its report is real
+  evidence and it reads differently than the last one did.*
+
+  *`crmStates` now grades six screens and two of them are still unaccounted for.* `activities`,
+  `leads` and `stages` answer all five questions (state, sentence, request id, retry, no false
+  empty claim). `contacts`, `companies` and `deals` answer **every** one with `false` — including
+  `doesNotClaimToBeEmpty`, which was the single question the previous report used to clear them.
+  Three screens cannot all lose five unrelated behaviours in one release, and the screenshots that
+  would explain it are precisely the six the full filesystem refused to write. The next pass runs
+  with the disk reclaimed and answers this properly; nothing is concluded from it now.*
+
+  *The six `503`s this sweep injects on purpose are filed as `netFailures` again* — thirty CRM
+  reads at `503` with `organization_id` on the URL — which is the sweep working, and the same
+  finding `ee3387de` removed once. Worth re-reading the roll-up's filter before the next box is
+  judged on it.
+
   *Two thirds are in, and both halves were defects rather than omissions.*
 
   *Tick 50 read this box for the first time with a report behind it, and the answer was
@@ -287,6 +305,19 @@ Payloads carry ids and the changed field list only — never a rendered document
   The third is the assertion that matters: the defect was a screen claiming to load, so the proof
   is that nothing claims to load any more.
 - [ ] Mobile 390×844: lists are usable, the board scrolls horizontally with sticky stage headers, and forms are single-column.
+  *The tick-66 pass answers most of this box correctly and **still does not tick it**, because the
+  run is void (exit 4). Recording the numbers so the next pass is a comparison rather than a first
+  reading.* Green on the phone: `thePhoneDefaultsToTheList`, `theBoardIsStillOffered`,
+  `theBoardScrollsOnAPhone` (its own `overflow-x` box, `scrollWidth > clientWidth`),
+  `thePageDoesNotScrollSideways`, `theStageHeaderSticks` (read from the element, not the class),
+  `theStagesKeepTheirTotals`. Three of four forms measure one column at 390px — contacts 9 fields,
+  deals 7, companies 6, all `widestRow: 1` — and `everyMeasuredFormIsSingleColumn` is `true`
+  **because** the fourth is excluded: `theFormsOnAPhone.activities` is `fields: 0`. The activity
+  form measured nothing, which is a pass that could not see the screen, not a form that passed;
+  `theFormIsSingleColumn` is `false` for exactly that reason and the box waits on it.
+  `5e27a2b5` (the shortcut sheet) does not touch this box, and the activity form's own `sm:grid-cols-2`
+  pair is still there to be measured.
+
   *Proved by `runCrmKeyboardAndMobile` (REQ-051, `927ddb6`) against the live stack: the phone
   defaults to the **list** and offers the board rather than taking it away, the board's own box
   reads `overflow-x: auto|scroll` with `scrollWidth > clientWidth` (it scrolls *inside* its own
@@ -311,6 +342,26 @@ Payloads carry ids and the changed field list only — never a rendered document
   Re-proved in the browser by the pass this entry queues.*
 
 - [ ] Keyboard: `/` focuses search, `j`/`k` move rows, `enter` opens, `e` edits, `?` shows the shortcut sheet.
+  *The hook made the bindings reachable; it did not make them **visible**. `5e27a2b5`.*
+  The tick-66 pass drove this box for the first time with a live report behind it and found that
+  `/crm/activities` destructures `showShortcuts` out of `useCrmKeyboard` and **never renders it** —
+  the hook worked, `?` flipped the flag, the state moved, and no sheet appeared. The pass read it
+  as `"activities": {"sheet": false, "slashFocusedSearch": false}` while `/crm/leads`, which draws
+  `{showShortcuts ? <CrmShortcutSheet /> : null}`, answered `true`. The fix renders the sheet the
+  same way leads does; the sheet is drawn inside the screen's own root, after the nav.
+
+  *The same report is still not a verdict: the run is void (exit 4, six screenshots lost to a
+  full `/`), so the box stays unticked.* What the pass does say, and what the next one must
+  re-answer: `slashFocusesSearch` is `true` on the shell screens, every advertised `g`-prefixed
+  destination navigates, `n` creates, and `e` opens an editor on all four shell screens
+  (`eIsNeverADeadBinding: true`). Against that, `jMovesTheVisibleCursor`, `kMovesBack` and
+  `exactlyOneCursor` all read `false` while `theListHasRows` is `true` and `theCursorIsVisible` is
+  `true` — a cursor that exists, is drawn, and does not move under `j`. Either the two disagree
+  about which row is marked, or `j` moves a selection the DOM never reflects. The same pass also
+  reports `theFormsOnAPhone.activities.fields = 0` — the activity form measured **no fields at
+  390px** — so `theFormIsSingleColumn` is `false` on a screen whose form the pass could not even
+  see. None of that is concluded here; all of it is what the next pass starts from.
+
   *Half of the module never listened for any of it, and the sheet is shared. `/crm/activities` and
   `/crm/leads` draw their own rows instead of rendering `CrmShell`, so the bindings — which were
   written out **inside** the shell — were unreachable from both, while `crm-parts.tsx` kept

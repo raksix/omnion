@@ -11749,3 +11749,79 @@ was in the fixture.
 **Next:** the browser pass on a free slot — `--only=hr` now actually drives the HR depth passes
 after tick 63's `runsSection` fix — and REQ-055's four browser-only criteria are tickable against
 it. The REQ stays `in-progress`.
+---
+
+## Tick 66 — REQ-051 CRM · the pass ran to the end, and the run.sh it ran on could not reach its own database
+
+**Two defects, one of them four worktrees wide.**
+
+`scripts/qa/run.sh` builds its database URL from a literal:
+
+```bash
+QA_DATABASE_URL="postgres://omnion:***@127.0.0.1:${QA_PG_PORT}/$QA_DB_NAME"
+```
+
+`***` is not a password. It is what a masked value looks like when it is copied back out of a
+log or a tool's echo and typed over the real one — the credential-masking rule applied to a file
+that was never supposed to hold one. The API started, authenticated against that string, and died
+on `password authentication failed for user "omnion"`. The pass then spent its **entire slot**
+waiting for a server that had already failed to come up, and reports it as `API did not answer on
+:18083` — a symptom that reads as a slow harness, not as a URL that cannot authenticate.
+
+The failure is invisible until you read the line: `run.sh` resets the database successfully, so
+the first three `[qa]` steps are green, and the walkthrough never starts. **The same literal is
+in main's, w2's and w3's copies of the file** — every writer on this box has been losing its
+browser evidence to it, and on the writers who did not read the log the loss looks like a queue.
+
+Fixed here in `c6640d81` as `${QA_PG_PASSWORD:-omnion}`, which matches every other QA script in
+`scripts/qa/`, and overridable for a container that is not the dev one. **The other three
+worktrees need the same one-line fix; this is not a wave-4 file.**
+
+| gate | command | result |
+| --- | --- | --- |
+| module | `cargo test -p omnion-module-crm --quiet` | **172 passed**, 0 failed |
+| types | `pnpm typecheck` | **2/2** |
+| browser | `QA_STACK=w4 … bash scripts/qa/run.sh --only=crm` | **void — exit 4**, `voidReasons: ["6 screenshot(s) could not be written"]` |
+| liveness | `summary.json → apiLiveness` | `up: true` on `http://127.0.0.1:3103/healthz` |
+
+**A void run ticks nothing.** The pass lost six screenshots to a `/` that hit 100% part-way
+through (33 MB free), so REQ-051's three open boxes stay open whatever its numbers say. What the
+run did produce is worth more than the boxes it could not close:
+
+* **`/crm/activities` never rendered its own shortcut sheet.** It destructures `showShortcuts`
+  out of `useCrmKeyboard` and renders nothing — `?` flips the flag, the state moves, no sheet
+  appears. `/crm/leads` draws `{showShortcuts ? <CrmShortcutSheet /> : null}` and answered `true`
+  in the same run, which is the tell: the hook was made shared in `a38ff972` and one call site
+  was never updated to use what it returns. Fixed in `5e27a2b5`.
+* **`j`/`k` do not move the cursor that is drawn.** `theCursorIsVisible: true`,
+  `theListHasRows: true`, and `jMovesTheVisibleCursor` / `kMovesBack` / `exactlyOneCursor` all
+  `false`. Meanwhile `slashFocusesSearch`, `nCreates`, `everyAdvertisedGoKeyNavigates` and
+  `eIsNeverADeadBinding` are all green, and `e` opens a real editor on all four shell screens.
+  Not concluded here — that is what the next pass is for.
+* **`crmStates` flipped.** Activities, leads and stages answer all five questions; contacts,
+  companies and deals answer **every** one with `false`, including `doesNotClaimToBeEmpty`, which
+  was the single question that used to clear them. Three screens cannot lose five unrelated
+  behaviours in one release, and the screenshots that would explain it are exactly the six the
+  disk refused.
+* **The activity form measured zero fields at 390px.** `theFormsOnAPhone.activities.fields = 0`,
+  so `theFormIsSingleColumn` is `false` on the one screen whose form is not on the page by
+  default. The other three measure one column (contacts 9, deals 7, companies 6).
+
+**Three process notes worth more than the fixes.**
+
+* **Disk, twice.** `/` was at 100% (33 MB) *before* the pass started — `apt-get clean` plus
+  removing `/var/lib/apt/lists` bought 404 MB — and it filled again mid-run and cost six
+  screenshots. A pass on this box needs its filesystem checked *before* the slot is taken, not
+  after the evidence is lost: the slot is the scarce resource, not the disk.
+* **`--only=crm` does not make a pass short.** It filters the route list and the depth passes, but
+  the base sweep still visits every route in the panel and the other writers' depth passes still
+  run: this one spent ~85 minutes and walked IAM, security, health, media, events, webhooks,
+  inventory, accounting, sales and HR before it reached the seven CRM passes. Useful as a full
+  pass, misleading as a "focused" one — the ~10 minutes a tick can afford is not in that budget.
+* **The QA semaphore is real.** This pass waited ~11 minutes for a slot held live by `w7`
+  (`kill -0` + `/proc/<pid>/cwd`, not the file name). It did not take it, and the wait cost the
+  tick nothing that could have been earned otherwise: the audit of the three unticked boxes in
+  code ran while the pass was queued.
+
+**Next:** re-run `--only=crm` with `/` reclaimed, and answer `j`/`k` and the `crmStates`
+reversal on a run that kept its evidence.
