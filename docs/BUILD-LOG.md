@@ -9967,6 +9967,9 @@ for 36 minutes.
 - `mutate-plugin-palette-row.sh`: **10/10 mutations red**, `walkthrough.cjs` and `run.sh` restored
   byte-exact (md5 asserted, not assumed).
 - `node --check` clean, `bash -n` clean.
+- `cargo test -p omnion-workflows --lib` **157/157** — after a `signal: 7, SIGBUS` on the
+  disk-bound target, which the same command on `CARGO_TARGET_DIR=/dev/shm/w3-target` reported in
+  0.01s. `pnpm typecheck` **2/2**.
 
 **Not ticked.** Every criterion below still needs a re-read: `keyboard-pass` reads
 `paramSubjectKnown: false` (the subject did not resolve on this graph — honest, but unproven),
