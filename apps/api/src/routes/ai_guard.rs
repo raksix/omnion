@@ -128,6 +128,16 @@ pub struct PolicyResponse {
     /// reads. It is a field of the *response* rather than a separate endpoint so the panel makes
     /// one request and cannot disagree with itself about whether the tenant has a policy.
     pub has_policy_row: bool,
+    /// The guard keys this viewer is missing — `["ai.guard.manage"]` for an auditor.
+    ///
+    /// Served beside the policy rather than in a second call so the panel can render its controls
+    /// **disabled and named** instead of enabled-then-refused. The same contract the approvals
+    /// inbox and the tool-permissions matrix already keep, and the write paths enforce it with a
+    /// `403` naming the key — so the disabled state is a promise the API keeps rather than a
+    /// guess made in the browser from a role name. Recomputed per request from **effective**
+    /// permissions: two people holding the same role can differ, and a panel that inferred from
+    /// the role would offer a button the API refuses.
+    pub viewer_missing: std::collections::BTreeSet<String>,
 }
 
 /// One label, with the sentence the About screen and the policy row both use.
@@ -251,11 +261,118 @@ pub async fn get_policy(
         active_exemptions,
         window_days: WINDOW_DAYS,
         has_policy_row,
+        viewer_missing: viewer_guard_keys(pool, &current).await?,
     }))
 }
 
+/// The guard keys the panels check against the viewer, and the one that gates every control.
+///
+/// Two keys, and only two: `ai.guard.read` opens the screens and `ai.guard.manage` writes the
+/// policy, the rules, the exemptions and the tester. The set is declared here rather than being
+/// written at each call site so a screen and its API cannot drift — a screen that checks a key
+/// the write path does not enforce offers a control that is refused, and a screen that checks a
+/// key the write path *does* enforce but that is absent here refuses somebody who could).
+async fn viewer_guard_keys(
+    pool: &sqlx::PgPool,
+    current: &CurrentSession,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    let effective = omnion_permissions::effective_permissions(
+        pool,
+        current.user.id,
+        crate::guards::scope_of(&current.user),
+    )
+    .await?;
+    Ok(missing_guard_keys(&effective))
+}
+
+/// The pure half of [`viewer_guard_keys`], split out so it is callable on its own.
+///
+/// The split is not tidiness: a walk that retyped this filter would test its own copy, and the two
+/// copies could disagree exactly when it matters — the screen would disable itself for somebody the
+/// API would have accepted, or the reverse. Given a real [`EffectivePermissions`], this is the one
+/// place the answer is computed.
+///
+/// [`EffectivePermissions`]: omnion_permissions::evaluate::EffectivePermissions
+#[must_use]
+pub fn missing_guard_keys(
+    effective: &omnion_permissions::evaluate::EffectivePermissions,
+) -> std::collections::BTreeSet<String> {
+    GUARD_KEYS
+        .iter()
+        .filter(|key| !effective.allows(**key))
+        .map(|key| (*key).to_string())
+        .collect()
+}
+
+/// Every guard permission this API enforces. See [`viewer_guard_keys`].
+const GUARD_KEYS: [&str; 2] = ["ai.guard.read", "ai.guard.manage"];
+
 /// The window the stat cards cover. Thirty days, because the panel's own copy says "30d".
 const WINDOW_DAYS: i64 = 30;
+
+/// `GET /api/v1/ai/guard/about` — what this guard does not catch (REQ-105).
+///
+/// # Why this endpoint exists at all
+///
+/// A PII filter that reports only its hits is indistinguishable from a PII filter that is
+/// complete, and the two behave very differently when it meets an address written `name [at]
+/// domain [dot] com`. Every label in [`LABELS`] already carries the two halves — `catches` and
+/// `misses` — and until now `misses` was rendered nowhere except a tooltip. That is the wrong
+/// place for the answer to "what does this miss?": a tooltip is opt-in, so the operator who
+/// never hovers keeps a belief the product does not support.
+///
+/// So this endpoint serves the *same* constants the detector is built from, not a second copy of
+/// them. A hand-written "about" page would drift the moment a rule changed, and a screen that
+/// under-reports the risk is worse than no screen: it is a risk that has been documented as
+/// covered.
+///
+/// The counts are measured, not asserted — `labels_disabled` is the number of seeded labels whose
+/// rule is switched off, which is the honest headline for `person_name` (it ships disabled because
+/// no name list ships with it, so it catches nothing at all).
+#[derive(Debug, Serialize)]
+pub struct AboutResponse {
+    /// Every label, what it catches and — the point of the screen — what it does not.
+    pub labels: Vec<LabelView>,
+    /// Labels whose rule is currently switched off, so they catch nothing at all right now.
+    pub labels_disabled: i64,
+    /// Enabled rules in force for this tenant.
+    pub enabled_rules: i64,
+    /// The ceiling: above this the guard refuses to start rather than slow every call.
+    pub rule_budget: i64,
+    /// Whether every label is set to `allow`, i.e. the guard is installed and doing nothing.
+    pub all_permissive: bool,
+}
+
+/// `GET /api/v1/ai/guard/about`.
+pub async fn about(
+    State(state): State<AppState>,
+    current: CurrentSession,
+) -> Result<Json<AboutResponse>, ApiError> {
+    let organization_id = organization_of(&current)?;
+    let loaded = guard_store::load_guard(state.db().pool(), organization_id).await?;
+
+    // Which seeded labels are actually switched off. Read from the *tenant's* rule set rather
+    // than from a static list, because an operator who switches a label off has just made that
+    // label a thing this guard does not do, and the screen has to say so.
+    let rules = guard_store::list_rules(state.db().pool(), organization_id).await?;
+    let labels_disabled = LABELS
+        .iter()
+        .filter(|label| {
+            rules
+                .iter()
+                .filter(|rule| rule.label.as_str() == label.key)
+                .all(|rule| !rule.enabled)
+        })
+        .count() as i64;
+
+    Ok(Json(AboutResponse {
+        labels: LABELS.to_vec(),
+        labels_disabled,
+        enabled_rules: loaded.detector.len() as i64,
+        rule_budget: omnion_ai_hub::guard_data::MAX_ENABLED_RULES as i64,
+        all_permissive: loaded.policy.is_all_permissive(),
+    }))
+}
 
 /// `PUT /api/v1/ai/guard/policy` — save the label defaults, the mask style, the override switch.
 #[derive(Debug, Deserialize)]
@@ -428,6 +545,10 @@ pub struct RuleListResponse {
     pub mask_styles: Vec<&'static str>,
     /// What each label does and does not catch, so the form can show it.
     pub label_notes: Vec<LabelView>,
+    /// The guard keys this viewer is missing. Same shape and same reason as the policy's — the
+    /// rules table is the screen with the most write controls on it (create, edit, delete), so it
+    /// is the screen where an auditor clicking a live button and reading a 403 is likeliest.
+    pub viewer_missing: std::collections::BTreeSet<String>,
 }
 
 /// `GET /api/v1/ai/guard/rules`.
@@ -446,6 +567,7 @@ pub async fn list_rules(
         validators: Validator::all().iter().map(|v| v.as_wire()).collect(),
         mask_styles: vec!["numbered", "deterministic"],
         label_notes: LABELS.to_vec(),
+        viewer_missing: viewer_guard_keys(state.db().pool(), &current).await?,
     }))
 }
 
