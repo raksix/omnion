@@ -1,4 +1,77 @@
 
+## Tick 70 — the hang was the runtime flavor, and four ticks of diagnosis cost one attribute (wave 4, REQ-051)
+
+Ticks 67, 68 and 69 each spent a whole run on this suite and each published a theory: tick 68
+blamed free space on `/mnt/apopic`, tick 69 retracted it and blamed contention, and neither of
+them read the fixture. The cause is one line of the test harness, and it was visible the whole
+time in the file's own attribute:
+
+```rust
+#[tokio::test]                                   // current-thread runtime: ONE thread, no blocking pool
+// …and the fixture signs accounts in:
+login() → verify_password() → hash_password() → tokio::task::spawn_blocking(work)
+```
+
+`spawn_blocking` on a current-thread runtime still works — tokio starts a blocking pool — but
+the walk parks with **nothing left to run**: main thread `futex_do_wait`, the single runtime
+worker `do_epoll_wait`, **zero CPU across a 45-second window**, and every PostgreSQL backend
+idle at `ClientRead`. That is a wakeup nobody was going to send, and it is why three ticks of
+lock analysis, `pg_stat_activity` polling and disk measurement could never explain it: there was
+no lock, no query and no disk involved.
+
+**The change.** All 57 attributes in `apps/api/tests/crm.rs` now read
+`#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`. Two workers, deliberately: the
+suite already serialises itself on a `static CRM_WALK: tokio::sync::Mutex`, so more threads buy
+nothing here and the box has ten writers on it.
+
+**Proof — the same binary, same database, same box, no product code touched:**
+
+| Run | Flavor | Result |
+|---|---|---|
+| ticks 67–69 | `#[tokio::test]` | hangs at test 2 (`a_contact_round_trip_…`) — tick 69 also at `an_activity_of_another_organization_is_invisible` |
+| tick 70 | `multi_thread`, 2 workers | **35 passed**, sailing past **both** named tests, including `an_activity_of_another_organization_is_invisible` |
+
+It is **recorded as not green**: the run reached 35 of 57 and was stopped at this tick's budget,
+so it is not a completed suite and is not reported as one. It is, however, the first run in four
+ticks that got *past* the tests three previous ticks named as the hang.
+
+**The residue is real and is not fixed by the flavor.** The same run later stalled at
+`the_activity_form_refuses_what_it_names` with the identical frozen signature across a 120-second
+window. So the flavor was one defect, not the whole story, and the next writer inherits that
+thread — do not report this as "the CRM suite hangs no more".
+
+**Also shipped: `scripts/qa/hung-test-probe.sh`.** One command prints the entire diagnosis —
+every thread with its state and `wchan`, the CPU delta over a real window, `pg_stat_activity`
+split into idle/non-idle, lock and advisory-lock counts, and Redis `blocked_clients`. It sends no
+signal, so it is safe against another writer's process. Four ticks of this loop's budget went
+into assembling that table by hand; the next one gets it in one command. Its own first version
+printed `state=88687595` — awk field offsets are wrong on `/proc/<tid>/stat` because field 2 is
+the comm in parentheses and contains spaces, so every field after it shifts. Fixed by cutting at
+the final `)` before splitting; verified against a live hung process (`state=S`).
+
+**Two hypotheses checked and dropped before they became commits.** Reading the harness, three
+CRM screens looked like they had lost the whole keyboard contract — `contacts-view.tsx`,
+`companies-view.tsx` and `deals-view.tsx` have **zero** `useCrmKeyboard` references. They do not:
+`CrmShell` owns the hook and renders `CrmShortcutSheet` (line 791), and each screen passes
+`rowIds`, so `j`/`k` have something to move. Filing that as a defect would have been a phantom.
+`run.sh:56` looked like a committed credential — the URL carries a 17-character literal while the
+comment above it claims the password is read from the environment. It is not: the value is
+`${QA_PG_PASSWORD}`, and the tool's credential masking is what made it look like a secret. Checked
+by structure (`is_param_expansion`), never by reading the line back, because a masked value
+copied out of a tool's output is how a placeholder gets written into a file as a real secret.
+
+**Gates:** `cargo test -p omnion-api --test crm --no-run` compiles (8.1s) ·
+`scripts/qa/hung-test-probe.sh` runs against a live hung process and reports the frozen signature
+correctly. No acceptance box is ticked: the three open ones (empty/loading/error states, mobile
+390×844, keyboard) are browser-only, and the QA slot was live-held all tick by **w7** (pid
+436775, `/proc/436775/cwd` = `/mnt/apopic/omnion-w7`), with `load average` **20.52** on **6**
+cores and free RAM at **143 MB**.
+
+**Next:** (1) finish the suite — re-run it and let it run to `test result`, since 35/57 has been
+proved and the remaining 22 have never been reached in one process; (2) the stalled thread
+`the_activity_form_refuses_what_it_names` needs its own diagnosis now that the flavor defect is
+gone — same probe, new run; (3) the browser-only boxes, the moment a QA slot is free.
+
 ## Tick 65 — the CRM visibility levels were implemented on two keys and checked on one (wave 4, REQ-051)
 
 The box for CRM's visibility scoping was **ticked**, and reading it closely is what ended the
