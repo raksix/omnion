@@ -552,6 +552,11 @@ pub fn router(state: AppState) -> Router {
 
     let media_files_route =
         get(media_files::list_files).layer(guards::require(&state, "media.read"));
+    // The uploader filter's candidates, on the same key as the listing they filter. It is a
+    // separate route because it is a separate question, and because a `media.read` account must
+    // not need `users.read` to see who uploaded the files it is already allowed to read.
+    let media_uploaders =
+        get(media_files::list_uploaders).layer(guards::require(&state, "media.read"));
     let media_file = get(media_files::get_file)
         .layer(guards::require(&state, "media.read"))
         .merge(patch(media_files::update_file).layer(guards::require(&state, "media.update")))
@@ -2135,6 +2140,7 @@ pub fn router(state: AppState) -> Router {
         // collection route rather than replacing it, so a client written against `{site_id, media}`
         // keeps working while the browser moves to the file system.
         .route("/media/files", media_files_route)
+        .route("/media/uploaders", media_uploaders)
         .route("/media/files/{id}", media_file)
         .route("/media/files/{id}/restore", media_file_restore)
         .route("/media/files/{id}/purge", media_file_purge)

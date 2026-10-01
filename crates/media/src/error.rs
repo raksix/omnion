@@ -195,4 +195,22 @@ pub enum MediaError {
         /// The whole refusal, in one sentence, naming the referrers.
         reason: String,
     },
+    /// A browser filter is not usable as written, and names the field that caused it.
+    ///
+    /// The same rule as `InvalidScanSetting` and `InvalidRetentionSetting`, for the same reason:
+    /// the toolbar renders the message under the input that produced it, and a `400` whose only
+    /// clue is a column name is a message under nothing.
+    ///
+    /// It exists because the size and date filters arrived in the store before the toolbar
+    /// offered them, which meant the only caller of these two filters was the test suite. A
+    /// range wider than itself (`min_bytes` above `max_bytes`) is a real thing an operator types
+    /// on two adjacent inputs, and PostgreSQL's answer — zero rows — reads as "the library is
+    /// empty" rather than as "those two boxes disagree".
+    #[error("`{field}`: {reason}")]
+    InvalidFilter {
+        /// Wire name of the filter, e.g. `min_bytes`.
+        field: String,
+        /// What is wrong with it, in a sentence.
+        reason: String,
+    },
 }
