@@ -12611,6 +12611,23 @@ note({
     );
     const paintedIds = painted.painted.map((entry) => entry.nodeId);
     const paintedButNotInRun = paintedIds.filter((id) => !runNodes.has(id));
+    // **The other direction, and the one the criterion's own words ask for.** The criterion
+    // says "each node shows its status pill" and the note above claims "every node the run
+    // touched is painted, and nothing else is" — a set EQUALITY, stated twice, measured
+    // once. Only `paintedButNotInRun` was computed, so a canvas that painted the two nodes
+    // that ran and painted NOTHING for the skipped prefix reported `pillsPainted: 2` and
+    // an empty `paintedButNotInRun`: the gate the criterion is closed on ("pillsPainted > 0
+    // with `paintedButNotInRun` empty") was satisfied by a canvas that dropped the pill
+    // from every node the feature exists to show.
+    //
+    // The skipped prefix is where this bites, and it is not a corner: a node paints a
+    // `skipped` pill precisely so an operator can see that the prefix was skipped rather
+    // than run, and those steps are rows in `after.steps` like any other. The expectation
+    // is derivable from the run alone — a node the run did not touch (a trigger, an inert
+    // note) has no step, so it is absent from `runNodes` and is *correctly* unpainted. That
+    // is why this needs no second source of truth: the two sets are comparable because the
+    // run names the nodes it touched.
+    const inRunButNotPainted = [...runNodes].filter((id) => !paintedIds.includes(id));
     const skippedPill = painted.painted.find((entry) => entry.status === "skipped") ?? null;
 
     const skippedRows = (after?.steps ?? []).filter((step) => step.status === "skipped");
@@ -12647,10 +12664,17 @@ note({
       firstRunnableNo: runnable[0]?.step_no ?? null,
       firstSkippedNo: firstSkipped?.step_no ?? null,
       startedFrom: after?.startedFrom ?? null,
-      // Criterion 2: every node the run touched is painted, and nothing else is. The
-      // second half is the assertion that catches a pill on a node that ran nothing.
+      // Criterion 2: the painted set and the run's set are the SAME set. Both halves are
+      // reported, and the first one existed long before the second — which is the defect.
+      // `pillsPainted > 0` alone passes on a canvas that paints one node out of five, and
+      // `paintedButNotInRun` empty alone passes on the same canvas, because the nodes it
+      // dropped were never painted in the first place.
       pillsPainted: painted.painted.length,
       paintedButNotInRun,
+      // The direction that catches a missing pill. A node the run touched and the canvas
+      // did not paint is exactly the case the criterion is about, and until this existed
+      // nothing in the note could tell it apart from a short run.
+      inRunButNotPainted,
       skippedPillFound: skippedPill !== null,
       // The pill's own tooltip has to carry the run's reason, not a word that satisfies
       // "says why" while saying nothing.
