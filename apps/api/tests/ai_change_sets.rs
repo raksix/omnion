@@ -616,3 +616,166 @@ async fn editing_a_set_records_the_editor_and_keeps_the_row_editable() {
 
     store.dispose().await;
 }
+
+/// A delete is gated, and a plain title edit is not.
+///
+/// This is the walk for the defect slice 3c closed. `has_gated_operations()` classified an
+/// operation by asking [`class_of_tool`] about a **synthesised** key — `"delete.page"`,
+/// `"update.page"` — and `class_of_tool` only ever knew seven *real* tool keys
+/// (`"content.publish"`, …). The lookup therefore returned `None` for every operation ever
+/// built, the flag was `false` for every set, and `POST /ai/change-sets/{id}/confirm` told
+/// every caller `needs_approval: false`. A set full of deletes could be confirmed and applied
+/// with no human ever seeing it.
+///
+/// The old code would pass a walk that only asserted "a title edit is not gated", because that
+/// half was true — it was true for *everything*. So this asserts **both** directions, and the
+/// gated half is the one that fails first on the old code.
+#[tokio::test]
+async fn a_delete_is_gated_and_a_plain_title_edit_is_not() {
+    let set = |operations: Vec<ChangeOp>| change_sets::ChangeSet {
+        id: Uuid::new_v4(),
+        organization_id: Uuid::new_v4(),
+        site_id: None,
+        title: "A proposal".to_owned(),
+        status: "draft".to_owned(),
+        operations,
+        base_revisions: Default::default(),
+        created_by: None,
+        created_by_agent: None,
+        created_by_run: None,
+        updated_by: None,
+        confirmed_at: None,
+        applied_at: None,
+        discarded_reason: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+
+    let page_id = Uuid::new_v4();
+    let page = page_id.to_string();
+    let plain = set(vec![update("a", page_id, "New title")]);
+    assert!(
+        !plain.has_gated_operations(),
+        "renaming a page is an ordinary edit and must not park in the inbox"
+    );
+    assert!(
+        plain.gated_operations().is_empty(),
+        "the list the bridge parks from agrees with the flag"
+    );
+
+    let removing = set(vec![ChangeOp {
+        key: "a".to_owned(),
+        operation: omnion_ai_hub::approvals::plan::Operation {
+            kind: omnion_ai_hub::approvals::plan::OpKind::Delete,
+            resource_type: "page".to_owned(),
+            resource_id: page,
+            args: json!({}),
+        },
+    }]);
+    assert!(
+        removing.has_gated_operations(),
+        "a delete is `content_delete`, gated by default — this is the assertion the old \
+         key-synthesis fails"
+    );
+    let gated = removing.gated_operations();
+    assert_eq!(gated.len(), 1, "one gated operation, one row");
+    assert_eq!(
+        gated[0].1, "content_delete",
+        "and it is classified as a delete"
+    );
+    assert_eq!(
+        gated[0].0.key, "a",
+        "the parked row names the operation it is about"
+    );
+}
+
+/// A mixed set parks only the dangerous half.
+///
+/// The set is the case the request describes — "a set containing a gated operation still parks
+/// for approval" — and the mixed case is the one that can go wrong in the other direction: an
+/// implementation that parks *everything* because *something* is gated would make "rename five
+/// pages, delete one of them" need six decisions instead of one.
+#[tokio::test]
+async fn a_mixed_set_gates_the_delete_and_leaves_the_renames_alone() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let removing = ChangeOp {
+        key: "c".to_owned(),
+        operation: omnion_ai_hub::approvals::plan::Operation {
+            kind: omnion_ai_hub::approvals::plan::OpKind::Delete,
+            resource_type: "page".to_owned(),
+            resource_id: second.to_string(),
+            args: json!({}),
+        },
+    };
+    let set = change_sets::ChangeSet {
+        id: Uuid::new_v4(),
+        organization_id: Uuid::new_v4(),
+        site_id: None,
+        title: "Two renames and a delete".to_owned(),
+        status: "draft".to_owned(),
+        operations: vec![
+            update("a", first, "First renamed"),
+            update("b", second, "Second renamed"),
+            removing,
+        ],
+        base_revisions: Default::default(),
+        created_by: None,
+        created_by_agent: None,
+        created_by_run: None,
+        updated_by: None,
+        confirmed_at: None,
+        applied_at: None,
+        discarded_reason: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+
+    assert!(set.has_gated_operations());
+    let gated = set.gated_operations();
+    assert_eq!(
+        gated.len(),
+        1,
+        "only the delete parks; the two renames are decided by the person who confirmed"
+    );
+    assert_eq!(gated[0].0.key, "c", "and it is the delete");
+    assert_eq!(gated[0].1, "content_delete");
+}
+
+/// An update that publishes is gated; the same update that leaves the status alone is not.
+///
+/// The class follows the **effect**, not the operation kind, and this is the case that a
+/// key-synthesis rule gets backwards in the other direction: gating every `update` would park
+/// every rename, which is the approval fatigue the request's own risk note names.
+#[tokio::test]
+async fn publishing_is_gated_but_the_same_update_without_the_status_is_not() {
+    let page = Uuid::new_v4();
+    let mut publishing = update("a", page, "Retitled");
+    publishing.operation.args = json!({ "title": "Retitled", "status": "published" });
+    assert_eq!(publishing.gated_class(), Some("content_publish"));
+    assert!(
+        publishing.publishes(),
+        "the check is a value comparison, not a key's presence"
+    );
+
+    let still_draft = update("a", page, "Retitled");
+    assert_eq!(still_draft.gated_class(), None);
+    assert!(!still_draft.publishes());
+
+    // A status that is *not* `published` is not publishing either — an unpublish is a
+    // different act and nothing in the request gates it.
+    let unpublishing = ChangeOp {
+        key: "a".to_owned(),
+        operation: omnion_ai_hub::approvals::plan::Operation {
+            kind: omnion_ai_hub::approvals::plan::OpKind::Update,
+            resource_type: "page".to_owned(),
+            resource_id: page.to_string(),
+            args: json!({ "status": "draft" }),
+        },
+    };
+    assert_eq!(
+        unpublishing.gated_class(),
+        None,
+        "the request's six classes contain a publish, not an unpublish"
+    );
+}

@@ -211,26 +211,90 @@ impl ChangeSet {
     /// `true` when confirming this set would park at least one operation for a human.
     #[must_use]
     pub fn has_gated_operations(&self) -> bool {
-        self.operations.iter().any(|op| {
-            crate::approvals::class_of_tool(&op.operation_key())
-                .is_some_and(crate::approvals::is_dangerous_class)
-        })
+        self.operations.iter().any(|op| op.gated_class().is_some())
+    }
+
+    /// The operations that are gated, in order, each with the class that gates it.
+    ///
+    /// A list rather than a count because the caller needs each one: the confirm route files an
+    /// approval **per gated operation**, and a reviewer deciding "the agent wants to publish
+    /// three pages" is looking at three rows, not one row with a number on it.
+    #[must_use]
+    pub fn gated_operations(&self) -> Vec<(&ChangeOp, &'static str)> {
+        self.operations
+            .iter()
+            .filter_map(|op| op.gated_class().map(|class| (op, class)))
+            .collect()
     }
 }
 
 impl ChangeOp {
-    /// The tool key this operation would run as, so the gate can classify it.
+    /// The gated class this operation falls in, or `None` when nothing gates it.
     ///
-    /// A change set does **not** store a tool key: an operation is a resource write, and the
-    /// gate classifies by class. `page.update` is the only tool this build previews, so the
-    /// mapping is one line today and a `match` the day a second resource lands. Spelling it
-    /// out beats a string literal at two call sites that can drift.
-    fn operation_key(&self) -> String {
-        format!(
-            "{}.{}",
-            self.operation.kind.label(),
-            self.operation.resource_type
-        )
+    /// # This replaced a key that never matched
+    ///
+    /// The previous implementation asked the gate about a synthesised **tool key** —
+    /// `format!("{}.{}", kind.label(), resource_type)`, which produces `"delete.page"` and
+    /// `"update.page"`. [`crate::approvals::class_of_tool`] is a closed list of seven *real*
+    /// tool keys (`"content.publish"`, `"deployment.deploy"`, …) and never contained a
+    /// synthesised one, so the lookup returned `None` for every operation and
+    /// `has_gated_operations()` was `false` for every set ever built, including one full of
+    /// deletes. The `needs_approval` flag on `POST /ai/change-sets` and on `confirm` was
+    /// therefore always `false`, and a gated change set could be confirmed and applied with no
+    /// human ever seeing it — the exact hole the request exists to close.
+    ///
+    /// The mapping is a `match` on `(kind, resource_type)` rather than another key-synthesis
+    /// string, because the classification **is** a decision and a decision should be a place a
+    /// reader can enumerate: adding a resource type forces this match to say what happens to
+    /// it, where a prefix rule silently leaves it ungated.
+    #[must_use]
+    pub fn gated_class(&self) -> Option<&'static str> {
+        // A delete is irreversible for every resource this build can preview, and the request
+        // lists `content_delete` as gated by default. The class is the content one because
+        // pages are the only previewable resource here; a `plugin` delete landing in this
+        // match is a case to decide, not to inherit from the page branch.
+        match (self.operation.kind, self.operation.resource_type.as_str()) {
+            (OpKind::Delete, "page") => Some("content_delete"),
+            (OpKind::Update, "page") => {
+                // An update that publishes is `content_publish`; one that does not touch
+                // `status` is an ordinary edit and runs ungated. The class follows the
+                // **effect**, not the operation kind, which is the same rule the single-call
+                // path uses for `content.publish` versus `content.update`.
+                if self.publishes() {
+                    Some("content_publish")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `true` when this operation sets the target's `status` to `published`.
+    ///
+    /// The one field the content crate treats as publishing, named as the **mapping field**
+    /// rather than as an argument key — see the lesson in the module header: the argument name
+    /// (`status`) and the column it lands in (`status`) happen to agree today, and a mapping
+    /// rename that separated them would have to change this check too, which is why it reads
+    /// the mapping instead of hard-coding a string that only looks right.
+    #[must_use]
+    pub fn publishes(&self) -> bool {
+        let Ok(mapping) = crate::approvals::target::mapping_for(&self.operation.resource_type)
+        else {
+            return false;
+        };
+        let Some(status) = mapping
+            .iter()
+            .find(|spec| spec.field == "status")
+            .map(|spec| spec.arg)
+        else {
+            return false;
+        };
+        self.operation
+            .args
+            .get(status)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == "published")
     }
 }
 
