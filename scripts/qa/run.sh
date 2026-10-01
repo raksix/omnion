@@ -38,10 +38,17 @@ QA_DB_NAME="omnion_qa"
 [ "$STACK" != "main" ] && QA_DB_NAME="omnion_qa_$STACK"
 QA_DB="$QA_DB_NAME"
 export QA_DB
+# The QA Postgres port. The default is the shared container every stack points at; a
+# writer whose own Postgres is unhealthy sets QA_PG_PORT and QA_PG_CONTAINER to run
+# against a private one (the container is already the knob in reset-db.sh and in the
+# `--only` filter test, so a pass could not reach a different server without this).
+# It is a port, not a credential: nothing here is a secret.
+DEFAULT_PG_PORT=5433
+export QA_PG_CONTAINER="${QA_PG_CONTAINER:-omnion-postgres}"
 # The database URL and the first account, in one place: `run.sh` and `walkthrough.cjs` must
 # agree on both. A pass that resets the database and then cannot sign in to it is a pass that
 # dies before its first screen.
-QA_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:5433/$QA_DB_NAME"
+QA_DATABASE_URL="postgres://omnion:omnion@127.0.0.1:${QA_PG_PORT:-$DEFAULT_PG_PORT}/$QA_DB_NAME"
 QA_ADMIN_EMAIL="qa-owner@omnion.test"
 QA_ADMIN_PASSWORD="OmnionQa-Passw0rd-2026!"
 export QA_DATABASE_URL QA_ADMIN_EMAIL QA_ADMIN_PASSWORD
