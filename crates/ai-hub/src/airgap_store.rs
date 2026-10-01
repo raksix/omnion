@@ -393,10 +393,17 @@ fn normalize_host(host: &str) -> Result<String> {
     Ok(host)
 }
 
-/// Which providers would stop answering with the gap on.
+/// Which providers would stop answering with the gap on, as `(name, base_url)`.
 ///
 /// The confirmation lists these, and the list is computed from the *same* rule the check uses, so
 /// the operator is never shown a set that differs from what they will actually get.
+///
+/// The second element is the **base URL**, not the host. That is the opposite of what
+/// [`Refusal`] carries, and the difference is deliberate: the confirmation screen's rows link to
+/// the provider they will stop, so it needs something a person can open, while the refusal message
+/// is read by someone who is *not* on the providers screen and wants the one fact that answers
+/// "where would it have gone". Collapsing the two into one helper would have meant either a
+/// confirmation full of unclickable hostnames or a refusal naming a path.
 pub async fn providers_that_would_block(pool: &PgPool) -> Result<Vec<(String, String)>> {
     let hosts = allowlist(pool).await?;
     let rows = sqlx::query_as::<_, (String, String)>(
