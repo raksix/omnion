@@ -6507,3 +6507,13 @@ scripts/qa/walkthrough.cjs` clean · focused pass `QA_ONLY='notifications-depth'
 Next: read the pass's `slashFocusedFilter`, `pushEnableExplainsItself`,
 `pushDisabledReasonNamesAVariable` and `pushDisabledReasonIsDescribed` legs, and the REQ-021
 mobile legs that tick 90's crash never reached.
+
+**The pass is still walking, and the box is why.** At 07:31 the focused
+`QA_ONLY='notifications-depth'` pass had been walking for 55 minutes with its last screenshot
+at 07:23 and `node scripts/qa/walkthrough.cjs` at **0.0% CPU in state S** — not crashed, not
+finished, waiting on a browser whose renderer gets no time. `uptime` reads **load 97** on a
+six-core box: six sibling worktrees are compiling at once, and `QA_SLOT_WAIT=60` had already
+spent its budget and proceeded without a place because the shared slot belongs to the w5 pass
+(`/tmp/omnion-qa-slot` holder alive, cwd `/mnt/apopic/omnion-w5`). So this tick ends with the
+three fixes committed and every gate green, and the browser leg **still owed** — which is the
+honest state, not the "I ran a pass" reading of the same log.
