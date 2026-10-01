@@ -67,26 +67,22 @@ if [ -z "${PGPASSWORD}" ]; then
   exit 1
 fi
 
-# The predicate is read out of the crate, not retyped: a hand-copied status list is exactly the
-# third-spelling defect slice 38 was about. The gate is asserting the CODE's predicate.
-NOT_CLOSED="$(python3 - <<'PY'
-import re
-text = open('/mnt/apopic/omnion-w8/modules/crm-intake/src/vocabulary.rs', encoding='utf-8').read()
-m = re.search(r'pub fn not_closed_statuses_sql\(column: &str\) -> String \{\s*\n\s*format!\("\{column\}([^"]+)"\)', text)
-if not m:
-    raise SystemExit('could not read not_closed_statuses_sql out of vocabulary.rs')
-print('status' + m.group(1))
-PY
-)"
-OPEN="$(python3 - <<'PY'
-import re
-text = open('/mnt/apopic/omnion-w8/modules/crm-intake/src/vocabulary.rs', encoding='utf-8').read()
-m = re.search(r'pub fn open_statuses_sql\(column: &str\) -> String \{\s*\n\s*format!\("\{column\}([^"]+)"\)', text)
-if not m:
-    raise SystemExit('could not read open_statuses_sql out of vocabulary.rs')
-print('status' + m.group(1))
-PY
-)"
+# Both predicates come from the crate ITSELF, by running it — not from a regex over its source.
+#
+# Slice 40 derived `not_closed_statuses_sql` from `STATUSES`, which is what stopped the
+# hand-written list from leaking `converted`. That same change killed this file's reader: it used
+# to recover both predicates from the `format!` body in `vocabulary.rs`, and now there is no such
+# body. **A checker that reads the code's TEXT stops working when the code stops being
+# text-shaped, and it reports the failure in the vocabulary of the thing it checks** — this gate
+# said "could not read not_closed_statuses_sql", which reads like a deleted function. So it asks
+# the crate (`examples/predicates.rs`) and refuses to guess: a hand-recovered list is a second copy
+# of the rule, which is what the last three ticks have been deleting.
+export CARGO_TARGET_DIR="${QA_CARGO_TARGET_DIR:-/dev/shm/w8-target}"
+export CARGO_INCREMENTAL=0
+PREDICATES="$(cargo run -q -p omnion-module-crm-intake --example predicates 2>/dev/null)" || true
+NOT_CLOSED="$(printf '%s\n' "${PREDICATES}" | sed -n 's/^not_closed=//p')"
+OPEN="$(printf '%s\n' "${PREDICATES}" | sed -n 's/^open=//p')"
+
 if [ -z "${NOT_CLOSED}" ] || [ -z "${OPEN}" ]; then
   echo "  FAIL: a status predicate could not be read out of vocabulary.rs." >&2
   exit 1

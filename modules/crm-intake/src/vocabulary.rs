@@ -191,9 +191,38 @@ pub fn open_statuses_sql(column: &str) -> String {
 
 /// The same rule as [`open_statuses_sql`], negated — the shape an index's partial predicate
 /// uses, and the shape that admits a status nobody has defined yet.
+///
+/// **Derived from [`STATUSES`] rather than written out, and that is the fix.** It used to be the
+/// literal `not in ('spam', 'rejected', 'duplicate')`, which is a fourth hand-written copy of the
+/// open/closed split and the reason `converted` leaked: `is_open` calls `converted` terminal,
+/// `the_two_sql_predicates_partition_the_statuses_the_platform_knows` says the two lists
+/// partition the vocabulary, and this function quietly excluded three of the four terminal
+/// statuses. `converted` leads that were never answered are walked by
+/// [`crate::assignment_store::organizations_with_leads`] every minute for nothing — and they are
+/// never answered, because neither conversion path writes `first_response_at` — so the walk does
+/// not decay, it is permanent. Ten tenants on the gate's fixture where one is correct.
+///
+/// It is built from the same [`STATUSES`] `is_open` reads, in `STATUSES`'s own order, so a
+/// ninth status cannot be added without this list knowing about it.
+///
+/// **Why this list and not the open one, when both now name four statuses.** `converted` is the
+/// difference and the reason both forms are kept: the open form admits a status the platform has
+/// never defined (and so does this one), while `open_statuses_sql` would reject the sweep's first
+/// read from `crm_leads_sla_idx`, whose partial predicate is frozen in migration `0055` in the
+/// three-status form. The planner proves predicates rather than implications it has to derive
+/// through a list, so the query has to be able to prove the *stored* predicate. The consequence is
+/// a second copy in the schema, which `0229_crm_lead_sla_index_terminal_status.sql` rebuilds
+/// against this list; the two are held together by `scripts/qa/run-crm-terminal-status.sh`, which
+/// reads both and asks the planner which one it will use.
 #[must_use]
 pub fn not_closed_statuses_sql(column: &str) -> String {
-    format!("{column} not in ('spam', 'rejected', 'duplicate')")
+    let closed: Vec<String> = STATUSES
+        .iter()
+        .copied()
+        .filter(|status| !is_open(status))
+        .map(|status| format!("'{status}'"))
+        .collect();
+    format!("{column} not in ({})", closed.join(", "))
 }
 
 #[cfg(test)]
@@ -273,19 +302,123 @@ mod tests {
         );
     }
 
-    /// The column name is the caller's, and a caller that forgets its alias gets a query naming a
+    /// The closed list the negated predicate emits is every terminal status, as a SET.
+    ///
+    /// **This is the assertion that could have caught the `converted` leak, and it is not the
+    /// test above.** That test compares `is_open` against itself — both halves are asked the
+    /// same question, so it passes whatever the two halves agree on. What it never asked is
+    /// whether the *SQL* the queries actually run names the same statuses as the Rust rule. It
+    /// did not: `not_closed_statuses_sql` was the literal `not in ('spam','rejected','duplicate')`
+    /// — three of the four terminal statuses — while `is_open` calls `converted` terminal, so the
+    /// sweep walked every tenant holding a converted, unanswered, overdue lead, for ever.
+    ///
+    /// **Red before the fix, and RED-PROVEN rather than asserted.** Narrowing the list back to
+    /// three statuses turns this red with the offending status named, and leaves every other test
+    /// in the crate green — which is what shows this one is not vacuous and not a shadow of
+    /// `the_two_sql_predicates_partition_the_statuses_the_platform_knows`. That one still passes,
+    /// and that is the point of running both.
+    #[test]
+    fn the_closed_list_names_every_status_is_open_rejects() {
+        let in_sql: std::collections::BTreeSet<String> = not_closed_statuses_sql("status")
+            .split('(')
+            .nth(1)
+            .expect("the predicate lists its statuses in parentheses")
+            .split(')')
+            .next()
+            .expect("the list is closed")
+            .split(',')
+            .map(|status| status.trim().trim_matches('\'').to_string())
+            .collect();
+
+        let in_rust: std::collections::BTreeSet<String> = STATUSES
+            .iter()
+            .copied()
+            .filter(|status| !is_open(status))
+            .map(String::from)
+            .collect();
+
+        assert_eq!(
+            in_sql, in_rust,
+            "the SQL closed list and is_open name different statuses — a lead in one and not the \
+             other is swept by one read and ignored by the other, and the one it is swept by is \
+             the one that costs a round trip per tenant per minute"
+        );
+    }
+
+    /// The closed list is DERIVED, not written: it is built from [`STATUSES`] by [`is_open`], so
+    /// a ninth status cannot be added without this list knowing about it.
+    ///
+    /// **The shape assertion, and it is deliberately separate from the set assertion above.** The
+    /// set test says the answer is right today; this one says the answer cannot be *pinned* to
+    /// today. They fail differently and that is the point: a hard-coded list that happens to be
+    /// correct passes this test's sibling and fails this one, which is the shape that produced the
+    /// defect — a hand-written copy that was correct when written and wrong when `converted`
+    /// stopped meaning "still work".
+    #[test]
+    fn the_closed_list_is_derived_rather_than_written_out() {
+        let sql = not_closed_statuses_sql("status");
+        assert!(
+            sql.starts_with("status not in ("),
+            "the negated predicate is a `not in` list: {sql}"
+        );
+        // Every status in the emitted list is one the crate knows, so the list can never name a
+        // status the platform refuses — which would make the predicate vacuously true and the
+        // read would return every row.
+        for status in sql
+            .split('(')
+            .nth(1)
+            .expect("the predicate lists its statuses in parentheses")
+            .split(')')
+            .next()
+            .expect("the list is closed")
+            .split(',')
+            .map(|status| status.trim().trim_matches('\''))
+        {
+            assert!(
+                is_status(status),
+                "the closed list names {status:?}, which is not a status the platform knows — a \
+                 status the database refuses makes this predicate vacuously true"
+            );
+        }
+        // And the list is not empty: a vocabulary with no terminal status would make the sweep's
+        // first read walk every lead ever received, which is the shape the partial index exists
+        // to avoid.
+        assert!(
+            sql.split(',').count() > 1,
+            "the closed list is empty — every lead ever received is swept: {sql}"
+        );
+    }
+
+    /// The column is the caller's, and a caller that forgets its alias gets a query naming a
     /// column no relation provides — which the planner answers with `42703`, on the sweep, once a
     /// minute. A predicate function is the one place that has to be honest about both spellings.
+    //
+    // **Both forms qualify the column they were asked for, and neither contains the other's shape
+    // by accident.** The membership of the closed list is asserted as a set in
+    // `the_closed_list_names_every_status_is_open_rejects`; what is pinned *here* is the template —
+    // that the column name lands where a column name belongs, in both the open and the negated
+    // form. Asserting the whole string against itself (or against a literal that has to be edited
+    // every time the vocabulary moves) is a tautology or a second copy, and neither fails.
     #[test]
     fn the_predicate_is_asked_for_the_column_the_query_uses() {
         assert_eq!(
             open_statuses_sql("l.status"),
-            "l.status in ('new', 'assigned', 'contacted', 'qualified')"
+            "l.status in ('new', 'assigned', 'contacted', 'qualified')",
+            "the open predicate qualifies the column it was given"
         );
         assert_eq!(
-            not_closed_statuses_sql("status"),
-            "status not in ('spam', 'rejected', 'duplicate')"
+            not_closed_statuses_sql("l.status"),
+            "l.status not in ('converted', 'duplicate', 'spam', 'rejected')",
+            "the negated predicate qualifies the column it was given"
         );
+        // Both are `not in`/`in` over a parenthesised list — a form that lost its parentheses would
+        // still parse in one statement and change the meaning in another.
+        for sql in [open_statuses_sql("s"), not_closed_statuses_sql("s")] {
+            assert!(
+                sql.contains("in ("),
+                "a predicate without a parenthesised list binds differently per statement: {sql}"
+            );
+        }
     }
 
     #[test]
