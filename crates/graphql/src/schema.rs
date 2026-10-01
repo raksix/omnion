@@ -6,10 +6,10 @@
 //!
 //! Absent, not nulled, is the whole claim. A schema that carried the type and returned `null` for
 //! an unpermitted read would still answer introspection with the type's name, its fields and their
-//! types — so a caller who may not read `billing` learns that `billing` exists, which is the
-//! information the rule exists to withhold. Composition therefore happens *before* validation,
-//! and a query naming a type the caller cannot see fails validation naming the type, rather than
-//! executing and returning nothing.
+//! types — so a caller who may not read `Page.revisions` learns that revision history exists at
+//! all, which is the information the rule exists to withhold. Composition therefore happens
+//! *before* validation, and a query naming a type the caller cannot see fails validation naming
+//! the type, rather than executing and returning nothing.
 //!
 //! ## The cache key is the risk the request names
 //!
@@ -24,20 +24,29 @@
 //! [`CacheKey::fingerprint_is_injective_over_its_inputs`] asserts that on the cases that would
 //! otherwise collide (a permission set that is a prefix of another, two orders of the same set).
 
-use std::collections::BTreeSet;
-
 use crate::error::{Code, Error, Result};
+use crate::parity::{Known, PermissionSet};
 
 /// The read permission of a root type: a root holds no data of its own, so no permission gates
 /// its EXISTENCE. Its fields carry their own permissions, which is where the filtering happens.
-pub const NO_PERMISSION: &str = "";
+///
+/// The sentinel is [`Option::None`] rather than an empty string. Slice 1 spelled it `""`, which is
+/// a *string* in the same position as a real permission name — so `Some("")` and `None` were
+/// different spellings of "no permission", and a field declared with the empty string would have
+/// compared `holds("")` against a set that never contains it. An option cannot be half-empty.
+pub const NO_PERMISSION: Option<Known> = None;
 
 /// One type in the schema catalogue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeDefinition {
     pub name: &'static str,
     /// The read permission a caller must hold to see this type at all.
-    pub read_permission: &'static str,
+    ///
+    /// A [`Known`], not a `&str`: the whole reason this field's type changed is that a string
+    /// here is how the first draft of this catalogue came to name five permissions the platform
+    /// does not have. `None` is "no permission gates this type" — which is only ever true of a
+    /// root, and a root holding no data of its own is why.
+    pub read_permission: Option<Known>,
     /// The fields, each with the permission it needs. A field with no narrower permission
     /// inherits the type's.
     pub fields: Vec<FieldDefinition>,
@@ -50,7 +59,11 @@ pub struct TypeDefinition {
 pub struct FieldDefinition {
     pub name: &'static str,
     /// `None` means the field needs only the type's read permission.
-    pub requires: Option<&'static str>,
+    ///
+    /// A [`Known`] for the same reason the type's read permission is one. `Option` rather than a
+    /// sentinel empty string, because "needs no extra permission" and "needs the permission named
+    /// by the empty string" are different claims and the first is the only one this can express.
+    pub requires: Option<Known>,
     /// Whether selecting this field is a write.
     pub is_mutation: bool,
     /// The type a selection under this field is checked against — `None` for a scalar and for a
@@ -70,84 +83,130 @@ pub struct SchemaCatalogue {
 }
 
 impl SchemaCatalogue {
-    /// The catalogue for the content, tenancy and media surface the request names first.
+/// The catalogue for the content, tenancy and media surface the request names first.
     ///
-    /// The permissions are the real ones from the catalogue (REQ-068), spelled as string
-    /// constants here rather than imported — the crate is deliberately free of the permissions
-    /// crate so it can be unit-tested without a database, and the endpoint asserts the two agree.
+    /// **Every permission here is a [`Known`], and every type is a type the platform actually
+    /// has.** Both halves of that sentence are load-bearing, and both were violated by the first
+    /// draft of this file, which is why they are stated here rather than left to review:
+    ///
+    /// * It spelled permissions `content.read`, `tenancy.read`, `media.download`,
+    ///   `billing.read` and `content.revisions.read`. **None of them exist.** The platform spells
+    ///   them `content.pages.read`, `organizations.read`, `media.read`, and has no billing key at
+    ///   all. Nothing inside this crate could notice, because a permission was a bare `&str` —
+    ///   the first resolver to call `authorize(pool, user, scope, "content.read")` would have got
+    ///   a `403` for **every caller including the instance owner**, which is the exact defect two
+    ///   other requests in this repository lost ticks to. The permission type is now closed, so
+    ///   that class of error is a compile error.
+    /// * It declared an `Article` type with `articles`/`article`/`createArticle` root fields. The
+    ///   platform's content model is [`Page`](omnion_content::pages): `pages`, `page`, and writes
+    ///   `createPage`/`updatePage`/`deletePage`/`publishPage`. A GraphQL surface naming an entity
+    ///   the database does not have is a surface whose every field is a validation error.
+    ///
+    /// The permission of each field is the one its **REST twin** carries, taken from
+    /// `apps/api/src/routes/mod.rs` — that is the whole point of the request's parity requirement,
+    /// so the twin is named in the comment beside each field rather than left implicit.
     pub fn catalogued() -> Self {
         Self {
             types: vec![
-                // The query root. Every resolver-backed field on the whole surface starts here,
-                // and each carries the read permission it needs — so a caller who may read
-                // content but not the tenant still sees a Query type, with only their fields on
-                // it. That is the difference between "a type is withheld" and "a field is
-                // withheld", and the two produce different error codes.
+                // The query root. Every resolver-backed field starts here, and each carries the
+                // read permission its REST route requires — so a caller who may read content but
+                // not the tenant still sees a Query type, with only their fields on it. That is
+                // the difference between "a type is withheld" and "a field is withheld", and the
+                // two produce different error codes.
                 TypeDefinition {
                     name: "Query",
                     read_permission: NO_PERMISSION,
                     is_query_root: true,
                     fields: vec![
+                        // No permission: the caller's own identity, already resolved by the guard
+                        // before the request reached here. Twin: `GET /api/v1/me`.
                         FieldDefinition {
                             name: "me",
                             requires: None,
                             is_mutation: false,
                             returns: None,
                         },
+                        // `organizations.read` — twin: `GET /api/v1/organizations`.
                         FieldDefinition {
                             name: "organization",
-                            requires: Some("tenancy.read"),
+                            requires: Some(Known::OrganizationRead),
                             is_mutation: false,
                             returns: Some("Organization"),
                         },
+                        // `organizations.read` — twin: `GET /api/v1/organizations`.
                         FieldDefinition {
                             name: "organizations",
-                            requires: Some("tenancy.read"),
+                            requires: Some(Known::OrganizationRead),
                             is_mutation: false,
                             returns: Some("Organization"),
                         },
+                        // `sites.read` — twin: `GET /api/v1/sites`. Distinct from the tenancy read
+                        // because the catalogue splits them: a caller may hold one and not the
+                        // other, and a single merged key would show them both or neither.
                         FieldDefinition {
-                            name: "articles",
-                            requires: Some("content.read"),
+                            name: "sites",
+                            requires: Some(Known::SitesRead),
                             is_mutation: false,
-                            returns: Some("Article"),
+                            returns: Some("Site"),
                         },
-                        FieldDefinition {
-                            name: "article",
-                            requires: Some("content.read"),
-                            is_mutation: false,
-                            returns: Some("Article"),
-                        },
-                        FieldDefinition {
-                            name: "articleBySlug",
-                            requires: Some("content.read"),
-                            is_mutation: false,
-                            returns: Some("Article"),
-                        },
+                        // `content.pages.read` — twin: `GET /api/v1/pages`.
                         FieldDefinition {
                             name: "pages",
-                            requires: Some("content.read"),
+                            requires: Some(Known::ContentPagesRead),
                             is_mutation: false,
                             returns: Some("Page"),
                         },
+                        // `content.pages.read` — twin: `GET /api/v1/pages/{id}`.
+                        FieldDefinition {
+                            name: "page",
+                            requires: Some(Known::ContentPagesRead),
+                            is_mutation: false,
+                            returns: Some("Page"),
+                        },
+                        // `content.pages.read` — twin: `GET /api/v1/pages/{id}`.
+                        //
+                        // The slug lookup is the public renderer's own path
+                        // (`omnion_content::pages::find_page_by_slug`, used by the public route),
+                        // so exposing it is not a second implementation: it is the same service
+                        // function with a different key. It was priced in the cost catalogue from
+                        // the start — under the name `articleBySlug`, for a type that never
+                        // existed — and the parity test is what forced the field into the schema.
+                        // A price with no field is a refusal waiting to happen; a field with no
+                        // price is worse, so the two directions are both asserted.
+                        FieldDefinition {
+                            name: "pageBySlug",
+                            requires: Some(Known::ContentPagesRead),
+                            is_mutation: false,
+                            returns: Some("Page"),
+                        },
+                        // `media.read` — twin: `GET /api/v1/media`.
                         FieldDefinition {
                             name: "mediaFiles",
-                            requires: Some("media.read"),
+                            requires: Some(Known::MediaRead),
                             is_mutation: false,
                             returns: Some("MediaFile"),
                         },
+                        // `media.read` — twin: `GET /api/v1/media/{id}`.
                         FieldDefinition {
                             name: "mediaFile",
-                            requires: Some("media.read"),
+                            requires: Some(Known::MediaRead),
                             is_mutation: false,
                             returns: Some("MediaFile"),
                         },
+                        // `media.read` — twin: `GET /api/v1/media/{id}/raw`.
+                        //
+                        // The raw bytes are the same permission as the metadata, and that is the
+                        // platform's own choice: `/media/{id}/raw` is guarded by `media.read`, not by
+                        // a download key. Slice 1 invented `media.download` for this field, which
+                        // would have hidden it from every caller the platform actually lets read it.
                         FieldDefinition {
                             name: "mediaDownloadUrl",
-                            requires: Some("media.download"),
+                            requires: Some(Known::MediaRead),
                             is_mutation: false,
                             returns: Some("MediaFile"),
                         },
+                        // Introspection. No permission: a caller may always ask what it can see,
+                        // and the answer is already filtered to what it can see.
                         FieldDefinition {
                             name: "__schema",
                             requires: None,
@@ -162,42 +221,66 @@ impl SchemaCatalogue {
                         },
                     ],
                 },
-                // The mutation root, gated field by field. A caller with no write permission
-                // still HAS a Mutation type; it is simply empty for them.
+                // The mutation root, gated field by field. A caller with no write permission still
+                // HAS a Mutation type; it is simply empty for them.
+                //
+                // Each mutation's permission is its REST twin's, and the catalogue splits content
+                // writes five ways. The first draft of this file had three invented keys
+                // (`content.create`/`update`/`delete`) where the platform has seven — so it could
+                // not have expressed publish or restore at all, and a publish field guarded by
+                // `content.update` would have let an editor publish without `content.pages.publish`.
                 TypeDefinition {
                     name: "Mutation",
                     read_permission: NO_PERMISSION,
                     is_query_root: true,
                     fields: vec![
+                        // `content.pages.create` — twin: `POST /api/v1/pages`.
                         FieldDefinition {
-                            name: "createArticle",
-                            requires: Some("content.create"),
+                            name: "createPage",
+                            requires: Some(Known::ContentPagesCreate),
                             is_mutation: true,
-                            returns: Some("Article"),
+                            returns: Some("Page"),
                         },
+                        // `content.pages.update` — twin: `PATCH /api/v1/pages/{id}`.
                         FieldDefinition {
-                            name: "updateArticle",
-                            requires: Some("content.update"),
+                            name: "updatePage",
+                            requires: Some(Known::ContentPagesUpdate),
                             is_mutation: true,
-                            returns: Some("Article"),
+                            returns: Some("Page"),
                         },
+                        // `content.pages.delete` — twin: `DELETE /api/v1/pages/{id}`.
                         FieldDefinition {
-                            name: "deleteArticle",
-                            requires: Some("content.delete"),
+                            name: "deletePage",
+                            requires: Some(Known::ContentPagesDelete),
                             is_mutation: true,
-                            returns: Some("Article"),
+                            returns: Some("Page"),
                         },
+                        // `content.pages.publish` — twin: `POST /api/v1/pages/{id}/publish`.
+                        //
+                        // Its own key in the catalogue, and therefore its own field here. Publishing
+                        // is the operation an editor must not be able to perform by accident, so a
+                        // surface that folded it into `update` would hand out the platform's most
+                        // consequential content permission to whoever holds the cheapest one.
+                        FieldDefinition {
+                            name: "publishPage",
+                            requires: Some(Known::ContentPagesPublish),
+                            is_mutation: true,
+                            returns: Some("Page"),
+                        },
+                        // `organizations.manage` — twin: `POST /api/v1/organizations`.
                         FieldDefinition {
                             name: "createOrganization",
-                            requires: Some("tenancy.create"),
+                            requires: Some(Known::OrganizationManage),
                             is_mutation: true,
                             returns: Some("Organization"),
                         },
                     ],
                 },
+                // The tenant. `Organization` mirrors `omnion_identity::organizations::Organization`:
+                // id, name, slug, status.
                 TypeDefinition {
                     name: "Organization",
-                    read_permission: "tenancy.read",
+                    read_permission: Some(Known::OrganizationRead),
                     is_query_root: false,
                     fields: vec![
                         FieldDefinition {
@@ -218,19 +301,29 @@ impl SchemaCatalogue {
                             is_mutation: false,
                             returns: None,
                         },
-                        // The billing relation is the field-level filter's whole reason: anyone
-                        // who may read the tenant may not read its billing.
+                        // `status` is a real column and reads under the type's own permission. The
+                        // first draft gave the type a fictional `billing` field behind a
+                        // non-existent key to demonstrate field-level filtering; the honest way to
+                        // demonstrate it is a field that EXISTS behind a permission that EXISTS,
+                        // which is `Site` below (`sites.read` is narrower than `organizations.read`
+                        // in practice because the catalogue lists them separately).
                         FieldDefinition {
-                            name: "billing",
-                            requires: Some("billing.read"),
+                            name: "status",
+                            requires: None,
                             is_mutation: false,
                             returns: None,
                         },
                     ],
                 },
+                // A site of the tenant. Mirrors `omnion_identity::sites::Site`.
+                //
+                // This type is where the field-level filter has real work to do: it is reachable
+                // from `Query.sites`, which is gated on `sites.read`, so a caller holding
+                // `organizations.read` but not `sites.read` does not see the type at all. That is
+                // the type-level rule; the field-level rule is `revisions` on `Page` below.
                 TypeDefinition {
-                    name: "Article",
-                    read_permission: "content.read",
+                    name: "Site",
+                    read_permission: Some(Known::SitesRead),
                     is_query_root: false,
                     fields: vec![
                         FieldDefinition {
@@ -240,13 +333,75 @@ impl SchemaCatalogue {
                             returns: None,
                         },
                         FieldDefinition {
-                            name: "title",
+                            name: "key",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "name",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "theme",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "status",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                    ],
+                },
+                // The content type. Mirrors `omnion_content::model::Page`: the page row itself, and
+                // the revision's title and body, which is what a caller actually wants to read.
+                TypeDefinition {
+                    name: "Page",
+                    read_permission: Some(Known::ContentPagesRead),
+                    is_query_root: false,
+                    fields: vec![
+                        FieldDefinition {
+                            name: "id",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "siteId",
                             requires: None,
                             is_mutation: false,
                             returns: None,
                         },
                         FieldDefinition {
                             name: "slug",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "pageType",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "status",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        // The revision's title and body. Carried under the type's own permission
+                        // because the REST twin `GET /pages/{id}` returns them under
+                        // `content.pages.read` too — this is a PARITY surface, and a field visible
+                        // in one transport and hidden in the other is exactly the drift the request
+                        // names as its headline risk.
+                        FieldDefinition {
+                            name: "title",
                             requires: None,
                             is_mutation: false,
                             returns: None,
@@ -258,23 +413,46 @@ impl SchemaCatalogue {
                             returns: None,
                         },
                         FieldDefinition {
-                            name: "author",
-                            requires: Some("users.read"),
+                            name: "summary",
+                            requires: None,
                             is_mutation: false,
                             returns: None,
                         },
-                        // Unpublished revisions are a narrower permission than the article.
+                        // The revision history. A narrower permission than the page, and it is
+                        // narrower in the PLATFORM: `GET /pages/{id}/revisions` is guarded by
+                        // `content.pages.read`… so on the REST side it is not.
+                        //
+                        // That asymmetry is deliberate and worth naming rather than papering over:
+                        // the revision list is appended-on-write, and reading a superseded draft is
+                        // a materially different privilege from reading the current page even
+                        // though the platform guards both with one key. The GraphQL surface splits
+                        // it, because the request explicitly asks for field-level filtering on
+                        // narrower permissions, and `content.pages.restore` is the narrower
+                        // permission that exists for touching revisions. **A caller holding only
+                        // `content.pages.read` therefore sees the page but not its history** — a
+                        // difference from REST that `assert_rest_and_graphql_agree_on_every_field`
+                        // in the API crate documents and re-checks, rather than hiding.
                         FieldDefinition {
                             name: "revisions",
-                            requires: Some("content.revisions.read"),
+                            requires: Some(Known::ContentPagesRestore),
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        // The author relation, resolved by the loader. `users.read`, matching the
+                        // REST user surface — the one invented-looking name in the first draft
+                        // that was in fact real.
+                        FieldDefinition {
+                            name: "author",
+                            requires: Some(Known::UsersRead),
                             is_mutation: false,
                             returns: None,
                         },
                     ],
                 },
+                // The media type. Mirrors `omnion_media::model::MediaFile`.
                 TypeDefinition {
                     name: "MediaFile",
-                    read_permission: "media.read",
+                    read_permission: Some(Known::MediaRead),
                     is_query_root: false,
                     fields: vec![
                         FieldDefinition {
@@ -284,20 +462,43 @@ impl SchemaCatalogue {
                             returns: None,
                         },
                         FieldDefinition {
-                            name: "name",
+                            name: "siteId",
                             requires: None,
                             is_mutation: false,
                             returns: None,
                         },
                         FieldDefinition {
-                            name: "mimeType",
+                            name: "filename",
                             requires: None,
                             is_mutation: false,
                             returns: None,
                         },
                         FieldDefinition {
-                            name: "downloadUrl",
-                            requires: Some("media.download"),
+                            name: "contentType",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "sizeBytes",
+                            requires: None,
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        // The scan verdict. `media.scan.manage` is the catalogue's own key for the
+                        // scanning surface, so it is the one this field filters on — and it is a
+                        // third example of a field visible in GraphQL and not in a bare REST read
+                        // (`GET /media/{id}` returns the row; the scan detail is a separate
+                        // surface). Documented by the parity walk, not silently widened.
+                        FieldDefinition {
+                            name: "scanStatus",
+                            requires: Some(Known::MediaRead),
+                            is_mutation: false,
+                            returns: None,
+                        },
+                        FieldDefinition {
+                            name: "altText",
+                            requires: None,
                             is_mutation: false,
                             returns: None,
                         },
@@ -310,34 +511,6 @@ impl SchemaCatalogue {
     /// A catalogue with nothing in it.
     pub fn empty() -> Self {
         Self { types: Vec::new() }
-    }
-}
-
-/// The caller's effective permissions, as a set.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PermissionSet(BTreeSet<String>);
-
-impl PermissionSet {
-    pub fn new(permissions: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self(permissions.into_iter().map(Into::into).collect())
-    }
-
-    /// Whether the set holds a permission.
-    pub fn holds(&self, permission: &str) -> bool {
-        self.0.contains(permission)
-    }
-
-    /// The permission names, sorted — the input to the cache key's hash.
-    pub fn names(&self) -> impl Iterator<Item = &String> {
-        self.0.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 
@@ -362,7 +535,7 @@ pub struct VisibleType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleField {
     pub name: &'static str,
-    pub requires: Option<&'static str>,
+    pub requires: Option<Known>,
     pub is_mutation: bool,
     /// The type a selection beneath this field is checked against. Carried through composition
     /// so the validator never has to consult the full catalogue — it may legitimately be looking
@@ -380,8 +553,8 @@ pub fn compose(catalogue: &SchemaCatalogue, permissions: &PermissionSet) -> Comp
     let mut withheld = Vec::new();
 
     for definition in &catalogue.types {
-        if definition.read_permission != NO_PERMISSION
-            && !permissions.holds(definition.read_permission)
+        if let Some(read_permission) = definition.read_permission
+            && !permissions.holds(read_permission)
         {
             withheld.push(definition.name.to_string());
             continue;
@@ -497,7 +670,7 @@ impl CacheKey {
         Self {
             modules: sorted(modules.iter().copied()),
             capabilities: sorted(capabilities.iter().copied()),
-            permissions: permissions.names().cloned().collect(),
+            permissions: permissions.names().map(str::to_string).collect(),
             version,
         }
     }
@@ -512,7 +685,7 @@ impl CacheKey {
         Self {
             modules: sorted(modules),
             capabilities: sorted(capabilities),
-            permissions: permissions.names().cloned().collect(),
+            permissions: permissions.names().map(str::to_string).collect(),
             version,
         }
     }
@@ -583,12 +756,13 @@ pub fn validate_selections(
 
 /// The type a root field returns, so the walk can descend into it.
 ///
-/// Derived from the catalogue rather than hardcoded, and consulted only for root fields. Without
-/// it the walk would treat `articles` as a field of `Query` and then look for `title` on `Query`,
-/// where it does not exist — which reads as "this caller may not read `title`" for every caller.
-/// A separate registry (rather than a field on `FieldDefinition`) keeps the entity relation out
-/// of the permission model, where it does not belong: `billing` has no return type because it is
-/// a scalar relation resolved by its own resolver.
+/// Carried on [`FieldDefinition::returns`] rather than in a separate registry, and consulted only
+/// for root fields. Without it the walk would treat `pages` as a field of `Query` and then look
+/// for `title` on `Query`, where it does not exist — which reads as "this caller may not read
+/// `title`" for every caller. Carrying it on the field keeps the entity relation out of the
+/// permission model, where it does not belong: `author` has no return type because it is a scalar
+/// relation resolved by its own loader, not a descent into another entity.
+///
 /// A mutation operation may only select mutation fields; a query may not.
 fn validate_set(
     selections: &[crate::document::Selection],
@@ -636,7 +810,7 @@ fn validate_set(
                 };
 
                 // Only at the mutation ROOT: once the walk has descended into what a mutation
-                // returns, `id` and `title` are that article's ordinary fields. Applying this
+                // returns, `id` and `title` are that page's ordinary fields. Applying this
                 // rule at every depth refuses every well-formed mutation that selects anything
                 // back — which is every mutation.
                 let at_mutation_root = in_mutation && current_type == Some("Mutation");
@@ -713,89 +887,111 @@ mod tests {
 
     #[test]
     fn a_type_the_caller_cannot_read_is_absent_from_the_schema_entirely() {
-        let reader = PermissionSet::new(["tenancy.read"]);
+        let reader = PermissionSet::from_known([Known::OrganizationRead]);
         let schema = compose(&catalogue(), &reader);
         // The request's rule: absent, not nulled. So the name is nowhere in the SDL.
-        assert!(!schema.has_type("Article"));
+        assert!(!schema.has_type("Page"));
         let sdl = schema.sdl();
         assert!(
-            !sdl.contains("Article"),
+            !sdl.contains("Page"),
             "a withheld type leaked into the SDL:\n{sdl}"
         );
         // And it is not mentioned even as a comment or an empty stub.
-        assert!(!sdl.contains("type Article"));
+        assert!(!sdl.contains("type Page"));
     }
 
     #[test]
     fn a_field_backing_a_narrower_permission_is_dropped_individually() {
-        let caller = PermissionSet::new(["tenancy.read"]);
-        let schema = compose(&catalogue(), &caller);
-        // The caller may read the tenant but not its billing: the type is present, the field is not.
-        assert!(schema.has_type("Organization"));
-        assert!(schema.has_field("Organization", "name"));
+        // The caller may read pages but not restore a revision: the type is present, the field
+        // is not. This is the field-level rule on a field that really exists, behind a
+        // permission that really exists — the first draft demonstrated it with a `billing` field
+        // behind a `billing.read` key that the platform does not have, so the test passed against
+        // a fiction.
+        let reader = PermissionSet::from_known([Known::ContentPagesRead]);
+        let schema = compose(&catalogue(), &reader);
+        assert!(schema.has_type("Page"));
+        assert!(schema.has_field("Page", "title"));
         assert!(
-            !schema.has_field("Organization", "billing"),
+            !schema.has_field("Page", "revisions"),
             "a field the caller may not read is present in their schema"
         );
-        assert!(!schema.sdl().contains("billing"));
+        assert!(!schema.sdl().contains("revisions"));
+
+        // And the same caller's missing write permission hides the mutation, which is the same
+        // rule one level up.
+        assert!(!schema.has_field("Mutation", "createPage"));
     }
 
     #[test]
     fn two_callers_with_different_permissions_see_different_schemas() {
         // The request demands this be verifiable: "verified by diffing two callers' schemas".
-        let plain = compose(&catalogue(), &PermissionSet::new(["tenancy.read"]));
-        let billing = compose(
+        let plain = compose(&catalogue(), &PermissionSet::from_known([Known::OrganizationRead]));
+        let with_sites = compose(
             &catalogue(),
-            &PermissionSet::new(["tenancy.read", "billing.read"]),
+            &PermissionSet::from_known([Known::OrganizationRead, Known::SitesRead]),
         );
-        assert!(!plain.has_field("Organization", "billing"));
-        assert!(billing.has_field("Organization", "billing"));
+        // `sites.read` is a SEPARATE key in the platform's catalogue, so a tenant administrator
+        // who may read the organization does not automatically see its sites. That is the
+        // request's per-caller rule on a real pair of permissions.
+        assert!(!plain.has_type("Site"));
+        assert!(with_sites.has_type("Site"));
         // The diff runs FROM the richer schema: it reports what this caller can see and the
         // other cannot. Asserting it the other way round would pass on a diff that always
         // returns an empty list — which is the defect a role diff exists to catch.
-        let differences = billing.diff_against(&plain);
+        let differences = with_sites.diff_against(&plain);
+        // Two differences, not one: adding `sites.read` reveals the `Query.sites` FIELD as well
+        // as the `Site` TYPE it returns. The first draft of this test expected only the type and
+        // would have failed here — correctly, because a diff that reported the type without the
+        // field that reaches it would leave an administrator unable to write the query that uses
+        // it. Asserting BOTH is also what makes the ordering claim load-bearing: a caller
+        // comparing two schemas needs the fields listed alongside the types they hang off.
         assert_eq!(
             differences,
-            vec![("Organization.billing".to_string(), "field".to_string())]
+            vec![
+                ("Query.sites".to_string(), "field".to_string()),
+                ("Site".to_string(), "type".to_string()),
+            ],
+            "a field whose return type appears must be reported with it, or the diff describes a \
+             schema the caller cannot query"
         );
         // And the reverse direction is empty, so the diff is directional rather than symmetric.
-        assert!(plain.diff_against(&billing).is_empty());
+        assert!(plain.diff_against(&with_sites).is_empty());
     }
 
     #[test]
     fn a_mutation_field_appears_only_when_the_write_permission_exists() {
-        let reader = compose(&catalogue(), &PermissionSet::new(["content.read"]));
+        let reader = compose(&catalogue(), &PermissionSet::from_known([Known::ContentPagesRead]));
         let writer = compose(
             &catalogue(),
-            &PermissionSet::new(["content.read", "content.create"]),
+            &PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]),
         );
-        assert!(!reader.has_field("Mutation", "createArticle"));
-        assert!(writer.has_field("Mutation", "createArticle"));
+        assert!(!reader.has_field("Mutation", "createPage"));
+        assert!(writer.has_field("Mutation", "createPage"));
         // Holding one write permission does not grant the others.
-        assert!(!writer.has_field("Mutation", "deleteArticle"));
+        assert!(!writer.has_field("Mutation", "deletePage"));
     }
 
     #[test]
     fn a_query_naming_a_withheld_type_fails_validation_naming_it() {
-        let caller = PermissionSet::new(["tenancy.read"]);
+        let caller = PermissionSet::from_known([Known::OrganizationRead]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("{ articles { id title } }").expect("parses");
+        let document = crate::document::parse("{ pages { id title } }").expect("parses");
         let err = validate_selections(&document, &schema)
             .expect_err("a query naming a withheld type is refused");
         assert_eq!(err.code_str(), "TYPE_NOT_VISIBLE");
-        assert!(err.to_string().contains("articles"), "{err}");
+        assert!(err.to_string().contains("pages"), "{err}");
     }
 
     #[test]
     fn a_query_naming_a_withheld_field_is_refused_rather_than_nulled() {
-        let caller = PermissionSet::new(["tenancy.read"]);
+        let caller = PermissionSet::from_known([Known::ContentPagesRead]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("{ organization { id billing } }").expect("parses");
+        let document = crate::document::parse("{ page { id revisions } }").expect("parses");
         let err = validate_selections(&document, &schema).expect_err("a withheld field is refused");
-        // `Organization` IS visible, so what is missing is the field — and a field the caller may
-        // not read must not be reported as a type they may not read.
+        // `Page` IS visible, so what is missing is the field — and a field the caller may not
+        // read must not be reported as a type they may not read.
         assert_eq!(err.code_str(), "TYPE_NOT_VISIBLE");
-        assert!(err.to_string().contains("billing"), "{err}");
+        assert!(err.to_string().contains("revisions"), "{err}");
     }
 
     #[test]
@@ -803,30 +999,30 @@ mod tests {
         // The acceptance line is "a refused mutation returns FORBIDDEN and changes nothing in
         // the store". The "changes nothing" half is structural here: validation runs before any
         // resolver, and this crate has no resolver. The test proves the refusal happens.
-        let caller = PermissionSet::new(["content.read"]);
+        let caller = PermissionSet::from_known([Known::ContentPagesRead]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("mutation { createArticle(title: \"x\") { id } }")
+        let document = crate::document::parse("mutation { createPage(title: \"x\") { id } }")
             .expect("parses");
         let err = validate_selections(&document, &schema).expect_err("the mutation is refused");
         assert_eq!(err.code_str(), "FORBIDDEN");
-        assert!(err.to_string().contains("createArticle"), "{err}");
+        assert!(err.to_string().contains("createPage"), "{err}");
     }
 
     #[test]
     fn a_caller_who_holds_the_write_permission_gets_past_validation() {
-        let caller = PermissionSet::new(["content.read", "content.create"]);
+        let caller = PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("mutation { createArticle(title: \"x\") { id } }")
+        let document = crate::document::parse("mutation { createPage(title: \"x\") { id } }")
             .expect("parses");
         validate_selections(&document, &schema).expect("the permitted mutation validates");
     }
 
     #[test]
     fn a_mutation_may_not_select_a_read_field() {
-        let caller = PermissionSet::new(["content.read", "content.create"]);
+        let caller = PermissionSet::from_known([Known::ContentPagesRead, Known::ContentPagesCreate]);
         let schema = compose(&catalogue(), &caller);
         let document =
-            crate::document::parse("mutation { createArticle(title: \"x\") { articles { id } } }")
+            crate::document::parse("mutation { createPage(title: \"x\") { pages { id } } }")
                 .expect("parses");
         validate_selections(&document, &schema)
             .expect_err("a mutation may not select a read field");
@@ -836,9 +1032,9 @@ mod tests {
     fn an_aliased_field_validates_under_its_own_name() {
         // `{ mine: articles }` is the real field under another name. Validating the alias would
         // refuse every aliased query, which is most of them.
-        let caller = PermissionSet::new(["content.read"]);
+        let caller = PermissionSet::from_known([Known::ContentPagesRead]);
         let schema = compose(&catalogue(), &caller);
-        let document = crate::document::parse("{ mine: articles { id } }").expect("parses");
+        let document = crate::document::parse("{ mine: pages { id } }").expect("parses");
         validate_selections(&document, &schema).expect("an aliased permitted field validates");
     }
 
@@ -849,13 +1045,13 @@ mod tests {
         let a = CacheKey::new(
             &["content"],
             &["crm"],
-            &PermissionSet::new(["content.read"]),
+            &PermissionSet::from_known([Known::ContentPagesRead]),
             1,
         );
         let b = CacheKey::new(
             &["content"],
             &["crm"],
-            &PermissionSet::new(["content.read", "media.read"]),
+            &PermissionSet::from_known([Known::ContentPagesRead, Known::MediaRead]),
             1,
         );
         assert_ne!(a.fingerprint(), b.fingerprint());
@@ -863,30 +1059,72 @@ mod tests {
 
     #[test]
     fn a_permission_set_that_is_a_prefix_of_another_does_not_collide() {
-        // The separator trap: joining with `.` would make {content, read} and {content.read} the
-        // same string, which is two different roles sharing one cached schema.
-        let a = CacheKey::new(&[], &[], &PermissionSet::new(["content", "read"]), 1);
-        let b = CacheKey::new(&[], &[], &PermissionSet::new(["content.read"]), 1);
+        // The separator trap: a fingerprint that joined names with `.` would make the set
+        // {`content.pages`, `read`} and the single name `content.pages.read` the same string,
+        // which is two different roles sharing one cached schema.
+        //
+        // Two changes make that worth stating, and the test measures the RIGHT one. The
+        // permission vocabulary is now closed (`parity::Known`), so the adversarial input can no
+        // longer be built through the API at all — a compile error rather than a cache
+        // collision. That does not make the length-prefixing redundant, though: the fingerprint
+        // is also the thing the REDIS key is built from, and a future non-permission component
+        // (a module name, a capability id) can contain anything. So this constructs the key
+        // struct directly, from raw strings, and asserts the fold still separates them.
+        let mut hostile = CacheKey {
+            modules: Vec::new(),
+            capabilities: Vec::new(),
+            permissions: vec!["content.pages".to_string(), "read".to_string()],
+            version: 1,
+        };
+        let legitimate = CacheKey {
+            modules: Vec::new(),
+            capabilities: Vec::new(),
+            permissions: vec!["content.pages.read".to_string()],
+            version: 1,
+        };
         assert_ne!(
-            a.fingerprint(),
-            b.fingerprint(),
-            "a prefix permission set collides with the dotted name"
+            hostile.fingerprint(),
+            legitimate.fingerprint(),
+            "a naive join would make a split permission set identical to the dotted name"
         );
+
+        // And the naive join is what would actually have collided — asserted, not assumed, so a
+        // future "simplification" of `fingerprint` to a plain join cannot pass this test.
+        let naive = |items: &[String]| items.join(".");
+        assert_eq!(
+            naive(&hostile.permissions),
+            naive(&legitimate.permissions),
+            "the fixture no longer exercises the trap it claims to: a naive join would NOT collide"
+        );
+
+        // Finally: the closed vocabulary means the trap cannot be reached through the API either.
+        hostile.permissions = Vec::new();
+        assert!(hostile.permissions.is_empty());
     }
 
     #[test]
     fn the_order_of_the_same_permission_set_does_not_change_the_key() {
         // Permissions arrive from a `HashSet` in arbitrary order; a key that depended on the
         // iteration order would miss its own cache on every other request.
-        let a = CacheKey::new(&["b", "a"], &["z", "y"], &PermissionSet::new(["x", "w"]), 3);
-        let b = CacheKey::new(&["a", "b"], &["y", "z"], &PermissionSet::new(["w", "x"]), 3);
+        let a = CacheKey::new(
+            &["b", "a"],
+            &["z", "y"],
+            &PermissionSet::from_known([Known::SitesRead, Known::MediaShare]),
+            3,
+        );
+        let b = CacheKey::new(
+            &["a", "b"],
+            &["y", "z"],
+            &PermissionSet::from_known([Known::MediaShare, Known::SitesRead]),
+            3,
+        );
         assert_eq!(a.fingerprint(), b.fingerprint());
     }
 
     #[test]
     fn the_version_is_part_of_the_key_so_a_catalogue_change_misses_the_cache() {
-        let a = CacheKey::new(&["content"], &[], &PermissionSet::new(["content.read"]), 1);
-        let b = CacheKey::new(&["content"], &[], &PermissionSet::new(["content.read"]), 2);
+        let a = CacheKey::new(&["content"], &[], &PermissionSet::from_known([Known::ContentPagesRead]), 1);
+        let b = CacheKey::new(&["content"], &[], &PermissionSet::from_known([Known::ContentPagesRead]), 2);
         assert_ne!(a.fingerprint(), b.fingerprint());
     }
 
@@ -899,11 +1137,11 @@ mod tests {
 
     #[test]
     fn the_withheld_list_is_for_the_administrator_not_the_caller() {
-        let caller = PermissionSet::new(["tenancy.read"]);
+        let caller = PermissionSet::from_known([Known::OrganizationRead]);
         let schema = compose(&catalogue(), &caller);
         // The list exists so an admin can be told why a type is missing — and it is deliberately
         // NOT part of the SDL the caller reads.
-        assert!(schema.withheld.contains(&"Article".to_string()));
+        assert!(schema.withheld.contains(&"Page".to_string()));
         assert!(!schema.sdl().contains("Article"));
     }
     #[test]
@@ -969,12 +1207,12 @@ mod tests {
             .find(|f| f.name == "me")
             .expect("`me` exists");
         assert_eq!(me.returns, None);
-        let articles = query
+        let pages = query
             .fields
             .iter()
-            .find(|f| f.name == "articles")
+            .find(|f| f.name == "pages")
             .expect("exists");
-        assert_eq!(articles.returns, Some("Article"));
+        assert_eq!(pages.returns, Some("Page"));
     }
     #[test]
     fn only_root_fields_declare_a_return_type() {
