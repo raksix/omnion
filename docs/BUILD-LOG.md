@@ -11137,3 +11137,35 @@ the current tree. It is queued behind a live w3 pass on the global slot, which i
 the slot exists to enforce.
 
 **Next.** That pass, which closes slices 1, 2, 3 and 4 together, then the next wave-5 request.
+
+### Tick 100, continued — two boot-time panics that no compile check could see
+
+**The API did not start.** Once the slot came free, `run.sh` reset the database and the binary
+refused to come up: `Overlapping method route`, twice, one method apart.
+
+This is the most expensive class of defect in this repo's history of gates, because **every one of
+them was green**: `cargo check -p omnion-api` exit 0, `cargo build` exit 0, `cargo test -p
+omnion-api --lib` 339 passed. axum builds its router at *runtime*, so a route conflict is not a
+type error and not a test failure — it is a process that will not boot, and the first evidence
+anything at all is a QA pass reporting `API did not answer on :18084`.
+
+* **POST.** `preflight` and `start_deploy` were `.merge()`d onto
+  `/deployment/environments/{environment}`, one segment carrying two POSTs. The handlers had
+  documented `/preflight` and `/deploy` since they were written, and `apps/admin/lib/api.ts` has
+  always called those two sub-paths — only the mount disagreed, which is why the wizard would have
+  404'd even if the process had booted. Each write now owns a segment, the shape
+  `/deployment/cluster/{environment}/restart` already followed.
+* **GET.** The same mistake one method over: `stream_log` and `poll_log` are *the same URL*
+  distinguished by `?cursor=`, registered as two GETs on `/jobs/{id}/log`. They are now one
+  handler — `log` — that dispatches on the query. Returning `Response` rather than `Sse` is what
+  lets one handler choose, and it preserves the 404-before-open the stream needs, because an
+  `EventSource` cannot read a JSON error body and would otherwise show a connection error for ever.
+
+**Proof.** The binary boots to `omnion-api starting` with `grep -c panic` = **0**; before, it
+reached neither line. `cargo test -p omnion-api --lib` 339, `cargo test -p omnion-deployment`
+97 on the default build, `pnpm typecheck` 2/2, cluster gate self-test `ALL PASS`.
+
+**What this costs, stated plainly:** slices 1–4 are code-complete and the two most serious defects
+in them — a crate that would not compile, and a server that would not start — were both invisible
+to the gate that ran every tick, because the gate's own command was not the one that broke. The
+browser pass is queued behind a live w3 holder and is still the thing that closes them.
