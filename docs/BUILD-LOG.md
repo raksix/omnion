@@ -12895,3 +12895,53 @@ note in this ledger: a measurement that cannot be taken is reported as a **throw
 which kills the pass and takes every later measurement with it, rather than being recorded as an
 absent measurement. The mobile legs for REQ-021 are therefore still unmeasured — and this time the
 cause is in the file that is supposed to be measuring them.
+## Tick 62 · REQ-117 slice 30 · the simulator blamed the rule for a paste it never read
+
+**What.** Two halves of one screen, both of which the REQ's own acceptance sentence promises and
+neither of which was observable. `input_read` — the server's account of which keys it read out of
+the pasted payload — has been in the answer since the endpoint shipped, and the panel *typed the
+field and rendered nothing*. `SimulateBody::draft` was the mirror image: implemented, documented,
+validated through the save's own validator, and with **zero callers for its whole life**.
+
+**The blind spot was the skip list's framing.** It names the *rule's* condition, which reads to an
+operator as "your rule is wrong". The far more common cause is a paste the reader never understood:
+`{"contury": "TR"}` is one keystroke from `country`, the evaluator sees a lead with no country at
+all, the country rule is skipped, and the screen says `country` did not match. **The rule was right
+and the paste was never read** — and the simulator was confidently wrong about which.
+
+**Proof.**
+- `scripts/qa/run-crm-simulator-input.sh` — **41 assignment tests, 7 new**, and **PROVEN TO FAIL**
+  with `closest_alias` forced to `None`. The gate requires the failing set to be **exactly**
+  `a_mistyped_key_is_named_rather_than_silently_dropped`.
+- Module lib **181** (was 174), `omnion-api` `cargo check` clean, admin `tsc --noEmit` exit 0,
+  `walkthrough.cjs` parses, dead-export scan 8 → 6 (pre-existing, unrelated).
+
+**The lesson worth keeping is the metric's own definition.** The suggestion is
+**Damerau-Levenshtein**, and the first draft was plain Levenshtein. The slip is an adjacent
+transposition, which plain Levenshtein scores **2** — so the first version put the most common paste
+typo of all just outside its own threshold, and its own test said so with
+`left: None, right: Some("country")`. **An edit-distance threshold is a claim about what a human's
+mistake costs; scoring a transposition as two mistakes and then declining to mention it errs in the
+worst direction.** The distance function has to model the keyboard, not the dictionary.
+
+**The gate's first version was wrong before the product's verdict was, again.** It grepped for a
+`--nocapture` header cargo never prints and so rejected a control that had failed *correctly*. The
+repair made the check stricter rather than looser: the failing set is now compared as a set, because
+**a bare non-zero exit is also satisfied by an unrelated failure**, and a control that passes for
+the wrong reason is the same defect class it exists to catch.
+
+**A gate without a database can be the honest instrument.** `run-crm-assignment.sh` is the wrong
+tool here and always was: the boundary between what an operator typed and what the evaluator read
+**has no database in it**, and that harness would have proved a query runs rather than that a key was
+understood. Six weeks of DB gates in this repo and this is the first that ships without one — on the
+one boundary where a database could not add evidence.
+
+**Not claimed: the screen.** No browser pass was started — the QA slot is held by a live w5 pass
+(holder pid alive, cwd `/mnt/apopic/omnion-w5`), load averaged **150** across nine writers and
+`/dev/shm` is at 86%. Nine walkthrough assertions are written and **unexecuted**; a pass that cannot
+finish is not a pass that reports zero findings.
+
+**Next.** Run the private-stack pass when the box is healthy (`QA_STACK=w8`, 18087/3107/3207) — the
+API compiles, so the measurement is possible. Then the CRM inbox depth pass, which the last three
+ticks have deferred.
+
