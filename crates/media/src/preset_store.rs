@@ -298,19 +298,6 @@ pub async fn insert_derivative(pool: &PgPool, derivative: NewDerivative) -> Resu
     }
 }
 
-/// Every object key a file's derivatives own, so a purge can take the bytes with it.
-pub async fn derivative_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(sqlx::query_scalar::<_, String>(
-        "select storage_key from media_derivatives where media_id = any($1)",
-    )
-    .bind(ids)
-    .fetch_all(pool)
-    .await?)
-}
-
 /// Drop every derivative row of a site, returning the keys so the bytes can be removed too.
 ///
 /// This is the cache-clear the settings screen offers. It is a *cache*: after it runs the next

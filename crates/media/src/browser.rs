@@ -617,15 +617,47 @@ pub async fn purge_files(pool: &PgPool, ids: &[Uuid]) -> Result<u64> {
     Ok(result.rows_affected())
 }
 
-/// The storage keys of files about to be purged, so the caller can remove exactly those bytes.
-pub async fn storage_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
+/// **Every** object key a set of files owns, so a delete can take the bytes with it.
+///
+/// Three tables, and missing any one of them orphans objects that nothing will ever name again:
+///
+/// | table | why it is in the union |
+/// |---|---|
+/// | `media` | the bytes the row serves today |
+/// | `media_versions` | every superseded version — a replace moves `media.storage_key` forward, so the old key is named **only** by the history |
+/// | `media_derivatives` | the preset cache — `on delete cascade` from `media`, so the row disappears with the file and leaves the object behind |
+///
+/// The two cascade tables are the trap. Deleting the `media` row is what makes the version and
+/// derivative rows go, so a caller that reads `media.storage_key` *first* and deletes objects
+/// *after* is reading the one key that is not the problem, and every other object the file owned
+/// becomes unreachable storage. The nightly sweep got this right (`purge_eligible` unions the
+/// history) while the three interactive purge paths did not, which is the class this function
+/// exists to end: the answer lives in one place, and there is no second, narrower one to reach
+/// for by mistake.
+///
+/// A derivative object is shared only in the sense that a second file with **identical** bytes
+/// and the same preset finds this row by its `cache_key` and serves its pixels. Deleting the
+/// object with the first file costs that second file one rebuild — a cache miss, never a wrong
+/// answer, which is the same bargain [`crate::preset_store::clear_derivatives`] already makes.
+pub async fn owned_object_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let keys = sqlx::query_scalar::<_, String>("select storage_key from media where id = any($1)")
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+    let mut keys = sqlx::query_scalar::<_, String>(
+        "select storage_key from media where id = any($1) \
+         union \
+         select storage_key from media_versions where media_id = any($1) \
+         union \
+         select storage_key from media_derivatives where media_id = any($1)",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    // Sorted and deduped so the caller cannot delete the same object twice — `union` already
+    // removes duplicates, but a key present in two of the three tables is returned once by
+    // `union` and this keeps the property if the query is ever rewritten as `union all`.
+    keys.sort();
+    keys.dedup();
     Ok(keys)
 }
 
@@ -1220,5 +1252,127 @@ mod tests {
         assert!(assert_same_site(&folder, Uuid::new_v4()).is_err());
         folder.site_id = Uuid::new_v4();
         assert!(assert_same_site(&folder, folder.site_id).is_ok());
+    }
+
+    #[test]
+    fn the_owned_keys_statement_names_every_table_a_file_lives_in() {
+        // The **SQL literal**, not the function's whole body. Two earlier shapes of this test
+        // were both wrong in the same way, and both were wrong in a way that would have shipped
+        // a gate which could not fail: slicing up to the `-> Result` signature reads the
+        // signature and nothing else, and counting `union` over the body counts the word in the
+        // prose that explains why the statement is a union. A gate that asserts on its own
+        // explanation is not a gate.
+        let source = include_str!("browser.rs");
+        let start = source
+            .find("pub async fn owned_object_keys")
+            .expect("the function is defined in this file");
+        let next = source[start + 1..]
+            .find("pub async fn ")
+            .map(|offset| start + 1 + offset)
+            .expect("a function after it");
+        let body = &source[start..next];
+        let query = body
+            .find("sqlx::query_scalar")
+            .expect("it queries something");
+        let end = body[query..]
+            .find(".bind(ids)")
+            .map(|offset| query + offset)
+            .expect("it binds the ids");
+        let sql = &body[query..end];
+
+        for table in [
+            "from media ",
+            "from media_versions ",
+            "from media_derivatives ",
+        ] {
+            assert!(
+                sql.contains(table),
+                "`owned_object_keys` must read `{table}` — without it, every object in that \
+                 table outlives the row that named it and nothing can ever name it again"
+            );
+        }
+        assert_eq!(
+            sql.matches("union").count(),
+            2,
+            "two unions make three tables; a rewritten statement must keep the count honest"
+        );
+        // The two predicates differ by column, and a copy of one pasted onto the other selects
+        // nothing rather than raising — the failure this exact query had to get right.
+        assert!(
+            sql.contains("from media where id = any($1)"),
+            "the row's own key is selected by `id`"
+        );
+        assert_eq!(
+            sql.matches("where media_id = any($1)").count(),
+            2,
+            "the history and the cache are both selected by `media_id`"
+        );
+    }
+
+    /// One question, one implementation.
+    ///
+    /// Three functions once answered *"what objects does this file own?"* — this one, the
+    /// retention sweep's `all_keys_of`, and `preset_store::derivative_keys` — and they had already
+    /// drifted: the sweep unioned only two of the three tables, so the nightly purge that exists to
+    /// reclaim storage nothing else will left every preset object behind while deleting the rows
+    /// that named it. Nothing failed when that drifted, because no walk reads the bucket after a
+    /// sweep.
+    ///
+    /// So this is a **counting** gate, and counting is the right instrument here precisely because
+    /// the failure mode is duplication: it fails the moment a fourth answer appears, and it fails
+    /// the moment a delegate is rewritten back into a query. It cannot tell whether a query is
+    /// *correct* — the sibling walk above answers that, against a real database.
+    #[test]
+    fn one_answer_to_what_a_file_owns_not_three() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        // (1) The other two modules must not query the union themselves.
+        for module in ["retention.rs", "preset_store.rs"] {
+            let source = std::fs::read_to_string(crate_root.join(module))
+                .unwrap_or_else(|err| panic!("{module} must be readable: {err}"));
+            assert!(
+                !source.contains("from media_versions where media_id"),
+                "`{module}` builds its own answer to what a file owns — `media_versions` is one of \
+                 the three tables and this is the copy that drifts. Call \
+                 `browser::owned_object_keys` instead."
+            );
+        }
+
+        // (2) And the one function that may answer it must stay the single entry point.
+        //
+        // Counted inside the `owned_object_keys` **body only**. The first version of this counted
+        // the whole file and got 2 — because the assertion message itself contains the string it
+        // counts, which is the same self-referential trap the sibling gate documents: a gate that
+        // reads its own explanation cannot fail.
+        let browser = std::fs::read_to_string(crate_root.join("browser.rs")).expect("readable");
+        let start = browser
+            .find("pub async fn owned_object_keys")
+            .expect("the function is defined there");
+        let after = &browser[start..];
+        let end = after[1..]
+            .find("pub async fn ")
+            .map(|offset| 1 + offset)
+            .unwrap_or(after.len());
+        assert_eq!(
+            after[..end].matches("from media_derivatives where media_id").count(),
+            1,
+            "exactly one place may select the preset cache for a set of files"
+        );
+
+        // (3) The sweep delegates rather than re-querying: a delegate keeps the exported name
+        // (callers and the retention walks use it) while the SQL lives in one place.
+        let retention = std::fs::read_to_string(crate_root.join("retention.rs")).expect("readable");
+        let start = retention
+            .find("pub async fn all_keys_of")
+            .expect("it is defined there");
+        let body = &retention[start..];
+        let end = body[1..]
+            .find("\n}")
+            .map(|o| start + 1 + o)
+            .unwrap_or(start);
+        assert!(
+            retention[start..end].contains("owned_object_keys"),
+            "`all_keys_of` must delegate to the one answer, not re-state it"
+        );
     }
 }
