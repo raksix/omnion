@@ -22,6 +22,7 @@
  */
 const fs = require("node:fs");
 const os = require("node:os");
+const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 
 let failures = 0;
@@ -47,6 +48,120 @@ const OUT = fs.mkdtempSync(path.join(os.tmpdir(), "omnion-only-filter-"));
  */
 const SRC = path.join(__dirname, "walkthrough.cjs");
 const source = fs.readFileSync(SRC, "utf8");
+
+// The REAL `uuidOrNull`, evaluated from `walkthrough.cjs`. Module scope because two probes use
+// it. Returning the source STRING instead of a function is the mistake this makes first: every
+// statement then carried the function BODY, Postgres received `where id = function(id) {…}`, and
+// six tests failed with a syntax error that had nothing to do with the helper under test.
+const uuidOrNull = new Function(`return (${extract("uuidOrNull")})`)();
+
+/**
+ * Prove `uuidOrNull` against a REAL Postgres, for every kind of value a fixture id can be.
+ *
+ * This helper had two wrong answers in a row, and both were invisible to review and to
+ * `node --check`: quoting its own output produced `where id = 'null'` (a uuid parse error), and
+ * returning it unquoted produced `where id = 0f0f0f0f-1111-…`, which Postgres reads as
+ * arithmetic on the literal `0`. The second one "fixed" the empty string it was written for and
+ * broke every VALID uuid in the same breath — `trailing junk after numeric literal`.
+ *
+ * A guard that handles the degenerate case is not evidence it still handles the normal one, so
+ * the table below asserts both ends against the database rather than against the regex. The
+ * statements are `count(*)` against a disposable QA database: the value's only job is to make the
+ * statement executable, and a statement that executes with zero rows is the honest answer for an
+ * id that names nothing.
+ */
+function probeUuidStatements() {
+  const UUID = "0f0f0f0f-1111-2222-3333-444455556666";
+  const cases = [
+    ["", "empty string"],
+    [null, "null"],
+    [undefined, "undefined"],
+    ["not-a-uuid", "free text"],
+    [UUID, "a VALID uuid (the case the guard must not break)"],
+    [`'${UUID}'`, "an already-quoted uuid"],
+  ];
+  let ran = 0;
+  let threw = 0;
+  for (const [value, label] of cases) {
+    const emitted = uuidOrNull(value);
+    const stmt = `select count(*) from cms_members where id = ${emitted}`;
+    let outcome;
+    try {
+      execFileSync(
+        "docker",
+        ["exec", process.env.QA_PG_CONTAINER || "omnion-postgres", "psql", "-U", "omnion",
+         "-d", process.env.QA_DB || "omnion_qa_w2", "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", stmt],
+        { encoding: "utf8", timeout: 30000 },
+      );
+      outcome = "executed";
+    } catch (e) {
+      threw++;
+      outcome = `THREW: ${String(e.stderr || e.message).split("\n")[0]}`;
+    }
+    ran++;
+    check(`id: ${label} → executable`, outcome === "executed", outcome);
+    // Executable is NOT sufficient, and this is the check that says so. A guard that returned
+    // the literal `null` for EVERY value would make all six statements execute perfectly, and
+    // every assertion above would pass — while the guard silently stopped matching any member
+    // at all, so `where id = null` would report zero rows for a member that exists and the step
+    // would fail against a row it should have found. That variant was tried against this table
+    // and came back green. The guard's job is to PASS A REAL UUID THROUGH, so the valid case
+    // asserts the value itself, not merely that the statement ran.
+    if (UUID === value) {
+      check("a VALID uuid is passed through, not replaced", emitted.includes(UUID), `emitted ${emitted}`);
+    }
+  }
+  check("every statement executed", threw === 0, `${threw} of ${ran} threw`);
+  probeRenderedCallSites();
+}
+
+/**
+ * Run the ACTUAL statements the members pass builds, with an empty id, against the real database.
+ *
+ * The table above exercises `uuidOrNull` in isolation, which is not the bug that shipped. The bug
+ * was the helper quoting its output while the CALL SITES quoted it too, so `where id = ''`
+ * reached Postgres — and a helper-only probe cannot see that, because it never renders a call
+ * site. The double-quoted variant came back green through the whole table above.
+ *
+ * So this renders the real `where id = …` fragments out of the pass source, substitutes an empty
+ * id the way a refused fixture POST leaves behind, and asks Postgres. Quoting is the whole
+ * question, so the test has to include the quotes.
+ */
+function probeRenderedCallSites() {
+  // The TABLE comes out of the call site too. Hard-coding `cms_members` — which this did first —
+  // turned one real statement (`cms_member_sessions.member_id`) into "column member_id does not
+  // exist", a finding about the probe rather than about the guard. The whole statement is read
+  // from the source, not reassembled from pieces, so it cannot drift from what the pass runs.
+  const callSites = [...source.matchAll(
+    /(from\s+(cms_member_sessions|cms_members)[^`]*?where\s+\w+ = '?\$\{uuidOrNull\(\w+\)\}'?)/g,
+  )].map((m) => ({
+    line: m[1].replace(/\$\{uuidOrNull\(\w+\)\}/, ""),
+    quoted: /'\$\{uuidOrNull/.test(m[1]),
+  }));
+  check("the pass has uuidOrNull call sites to render", callSites.length > 0, `${callSites.length} found`);
+  const doubleQuoted = callSites.filter((s) => s.quoted);
+  check(
+    "no call site quotes an already-quoted value",
+    doubleQuoted.length === 0,
+    `${doubleQuoted.length} quoted call site(s): ${doubleQuoted.map((s) => s.line).join(", ")}`,
+  );
+  for (const site of callSites) {
+    const stmt = `select count(*) ${site.line}${uuidOrNull("")}`;
+    let outcome;
+    try {
+      execFileSync(
+        "docker",
+        ["exec", process.env.QA_PG_CONTAINER || "omnion-postgres", "psql", "-U", "omnion",
+         "-d", process.env.QA_DB || "omnion_qa_w2", "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", stmt],
+        { encoding: "utf8", timeout: 30000 },
+      );
+      outcome = "executed";
+    } catch (e) {
+      outcome = `THREW: ${String(e.stderr || e.message).split("\n")[0]}`;
+    }
+    check(`rendered call site (${site.line.trim()}) with an empty id → executable`, outcome === "executed", outcome);
+  }
+}
 
 function extract(name) {
   const fn = source.match(new RegExp(`^function ${name}\\([\\s\\S]*?^}`, "m"));
@@ -189,6 +304,10 @@ console.log("\n4. an early FAILURE still ends the process, and its code survives
   check("the last pass ends the run", exits.length === 1, `exits=${JSON.stringify(exits)}`);
   check("and it carries the failure code", exits[0] === 4, `exits=${JSON.stringify(exits)}`);
 }
+
+// ---------------------------------------------------------------- 5. the uuid guard, against a real database
+console.log("\n5. uuidOrNull makes every id executable — including a valid one");
+probeUuidStatements();
 
 console.log(`\n${failures === 0 ? "PASS" : `FAIL (${failures})`} — ${SRC}`);
 fs.rmSync(OUT, { recursive: true, force: true });

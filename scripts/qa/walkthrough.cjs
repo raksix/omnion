@@ -4374,16 +4374,31 @@ function qaSql(statement) {
 }
 
 /**
- * A uuid for interpolation into SQL, or the literal `null` when there is none.
+ * A uuid predicate VALUE for SQL, quoted and type-safe, or the literal `null`.
  *
  * `null` is the right answer rather than a `''` that happens to parse: a predicate `where id =
  * null` is never true, so the query returns no row and the step compares against a real
  * expectation and fails — which is the truth. Quoting the empty id instead turns a fixture that
  * did not take into a database ERROR, and an ERROR here aborts the pass (see `qaSql`).
+ *
+ * This helper went through two wrong answers before the right one, and both are worth keeping,
+ * because both *looked* right and both only showed up when a real statement ran:
+ *
+ * - **Quoted at the source, quoted again by the caller** → `where id = 'null'`. The call sites sit
+ *   inside a template literal that already wraps the id in quotes, so the helper's own quotes
+ *   became part of the value. A uuid parse error, just a lazier one.
+ * - **Returned bare and used bare** → `where id = 0f0f0f0f-1111-…`, which Postgres reads as
+ *   arithmetic on the numeric literal `0`. It fixed the empty case and broke every VALID one:
+ *   `trailing junk after numeric literal`. A guard that "handles" the empty string is not
+ *   evidence it still handles the normal case.
+ *
+ * So the value is quoted here, the call sites do NOT quote, and a uuid is cast to `uuid` so the
+ * quote is never load-bearing — `'0f0f…'::uuid` and `'null'::uuid` fail differently, and the
+ * guard only has to be right about which one it emits.
  */
 function uuidOrNull(id) {
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id || ""));
-  return uuid ? `'${id}'` : "null";
+  return uuid ? `'${id}'::uuid` : "null";
 }
 
 /**
@@ -7218,7 +7233,7 @@ async function runMembersDepth(page, report) {
   // fixture that set one would make "invited, never claimed" pass for a row that was claimed.
   steps.invitedHasNoPassword =
     waitingId !== "" &&
-    qaSql(`select coalesce(password_hash, 'NULL') from cms_members where id = '${uuidOrNull(waitingId)}'`) === "NULL";
+    qaSql(`select coalesce(password_hash, 'NULL') from cms_members where id = ${uuidOrNull(waitingId)}`) === "NULL";
   steps.invitedRowSaysSo = (await page.locator(`[data-member-never-claimed="${waitingId}"]`).count()) > 0;
 
   await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
@@ -7258,7 +7273,7 @@ async function runMembersDepth(page, report) {
   await page.waitForTimeout(2000);
   // Roles REPLACE rather than accumulate, and only SQL can tell that apart from an append.
   steps.rolesAreInSql =
-    qaSql(`select array_to_string(roles, ',') from cms_members where id = '${uuidOrNull(waitingId)}'`) ===
+    qaSql(`select array_to_string(roles, ',') from cms_members where id = ${uuidOrNull(waitingId)}`) ===
     "reader,archivist";
 
   // ------------------------------------------------------------------ verify takes a real effect
@@ -7267,7 +7282,7 @@ async function runMembersDepth(page, report) {
   await page.locator(`[data-member-action="verify"]`).first().click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2000);
   steps.verifiedInSql =
-    qaSql(`select status from cms_members where id = '${uuidOrNull(waitingId)}'`) === "verified";
+    qaSql(`select status from cms_members where id = ${uuidOrNull(waitingId)}`) === "verified";
 
   // ------------------------------------------------------------------ the panel cookie at a member route
   // Both directions. A visitor cookie presented where a panel cookie is expected must fail, or
@@ -7406,9 +7421,9 @@ async function runMembersDepth(page, report) {
   await page.locator("[data-member-block-submit]").click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2200);
   steps.blockedInSql =
-    qaSql(`select status from cms_members where id = '${uuidOrNull(memberId)}'`) === "blocked";
+    qaSql(`select status from cms_members where id = ${uuidOrNull(memberId)}`) === "blocked";
   steps.blockRemovedTheSessionRow =
-    qaSql(`select count(*) from cms_member_sessions where member_id = '${uuidOrNull(memberId)}'`) === "0";
+    qaSql(`select count(*) from cms_member_sessions where member_id = ${uuidOrNull(memberId)}`) === "0";
   const afterBlock = await gateProbe(gatedSlug, memberCookie);
   // A blocked member answers `allowed: false` on the probe rather than 401/404, because the
   // probe is a verdict endpoint; the 404 concealment is the PAGE route's job and is proved in
@@ -7460,7 +7475,7 @@ async function runMembersDepth(page, report) {
   await page.locator("[data-member-delete-submit]").click({ timeout: 6000 }).catch(() => {});
   await page.waitForTimeout(2000);
   steps.deletedFromSql =
-    qaSql(`select count(*) from cms_members where id = '${uuidOrNull(waitingId)}'`) === "0";
+    qaSql(`select count(*) from cms_members where id = ${uuidOrNull(waitingId)}`) === "0";
 
   // ------------------------------------------------------------------ the settings route, on its own
   // The REQ lists `/members/settings` as its own route, so it is visited as its own route rather
