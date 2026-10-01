@@ -1207,6 +1207,18 @@ impl From<AiHubError> for ApiError {
                 "change_set_not_found",
                 format!("no change set `{id}` in this organization"),
             ),
+            // The air gap (REQ-106 slice 2). A bad reason is a field on the switch form, so it is
+            // a `400`; an allow-list row that is not there is a `404` — never a 403, or the
+            // settings screen becomes an existence oracle over a list whose whole purpose is to
+            // say what counts as internal. The blocked *call* is not here on purpose: it is a
+            // frame inside the chat stream, because the stream has already opened by the time the
+            // walk reaches the provider, and a status code is no longer available there.
+            AiHubError::InvalidAirgap(message) => Self::bad_request("invalid_airgap", message),
+            AiHubError::AirgapHostNotFound(id) => Self::new(
+                StatusCode::NOT_FOUND,
+                "airgap_host_not_found",
+                format!("`{id}` is not on the internal-host allow-list"),
+            ),
             // A model that cannot do what the request needs is a `400` and not a `409`: nothing
             // about the installation is in conflict, the caller asked for a capability this
             // model does not claim, and the fix is a flag edit or a different model. The code

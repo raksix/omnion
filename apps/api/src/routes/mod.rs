@@ -73,6 +73,7 @@ pub mod ai;
 pub mod ai_agent_workspace;
 pub mod ai_agents;
 pub mod ai_approvals;
+pub mod ai_airgap;
 pub mod ai_change_sets;
 pub mod ai_decisions;
 pub mod ai_guard;
@@ -885,6 +886,24 @@ pub fn router(state: AppState) -> Router {
         post(ai_local::retry_pull).layer(guards::require(&state, "ai.local.manage"));
     let ai_local_scan =
         post(ai_local::scan_endpoint).layer(guards::require(&state, "ai.local.manage"));
+
+    // The air-gap switch (REQ-106 slice 2). Reading it is `ai.local.read` — it answers the same
+    // question the local screen does ("does anything leave this machine?"), so anyone who may
+    // see the locality badges may see the switch that enforces them. Flipping it is
+    // `ai.airgap.manage`, which is deliberately NOT part of the `ai.local.*` family: turning the
+    // gap on strands every remote feature at once, and it is the switch an auditor looks for by
+    // name. The `/hosts` editor is on the same key, because widening the allow-list is another
+    // way to decide what counts as internal.
+    let ai_airgap_read = get(ai_airgap::read).layer(guards::require(&state, "ai.local.read"));
+    let ai_airgap_manage =
+        put(ai_airgap::set).layer(guards::require(&state, "ai.airgap.manage"));
+    let ai_airgap_hosts = post(ai_airgap::add_host)
+        .layer(guards::require(&state, "ai.airgap.manage"));
+    let ai_airgap_host_delete =
+        axum::routing::delete(ai_airgap::remove_host)
+            .layer(guards::require(&state, "ai.airgap.manage"));
+    let ai_airgap_verify =
+        post(ai_airgap::verify).layer(guards::require(&state, "ai.airgap.manage"));
 
     let ai_decisions =
         get(ai_decisions::list_decisions).layer(guards::require(&state, "ai.usage.read"));
@@ -2110,6 +2129,10 @@ pub fn router(state: AppState) -> Router {
         .route("/ai/local/models/cancel", ai_local_cancel)
         .route("/ai/local/models/retry", ai_local_retry)
         .route("/ai/local/scan", ai_local_scan)
+        .route("/ai/airgap", ai_airgap_read.merge(ai_airgap_manage))
+        .route("/ai/airgap/hosts", ai_airgap_hosts)
+        .route("/ai/airgap/hosts/{id}", ai_airgap_host_delete)
+        .route("/ai/airgap/verify", ai_airgap_verify)
         .route("/ai/logs/decisions.csv", ai_decisions_csv)
         .route("/ai/logs/decisions/{id}", ai_decision)
         .route("/ai/routing/unresolved", ai_unresolved)
