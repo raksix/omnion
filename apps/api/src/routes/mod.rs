@@ -87,6 +87,11 @@ pub mod restore_jobs;
 // generator and the upgrade plan.
 pub mod backfills;
 pub mod deployment;
+// Anonymised support exports (REQ-129, slice 4). Its own module rather than more of
+// `backfills.rs` because the two halves of that file are `migration_backfills` state and
+// `seed_datasets`, and an export is neither — it is the only artifact on this surface that leaves
+// the platform, and burying it at the end of a file about jobs would make that invisible.
+pub mod exports;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
@@ -1373,6 +1378,48 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/deployment/seeds/{name}/load",
             post(backfills::load_seed).layer(guards::require(&state, "deployment.seeds.load")),
+        )
+        // Anonymised exports (REQ-129, slice 4). Three keys and NOT two, and the split is the
+        // point: `migrations.read` sees the ledger of what was asked for (an operator reading the
+        // migration surface needs to know a support dump left the platform), `exports.create` is
+        // the decision to make one, and `exports.download` is the moment the bytes leave. A single
+        // "exports.manage" key would answer none of those questions — and the third of them is the
+        // one an incident is actually about.
+        //
+        // `/deployment/exports/classifications` is registered BEFORE `/deployment/exports/{id}`
+        // for the usual axum reason: a literal segment cannot be a sibling of a capture segment,
+        // or `{id}` would swallow the word.
+        .route(
+            "/deployment/exports/classifications",
+            get(exports::read_classifications)
+                .layer(guards::require(&state, "deployment.migrations.read")),
+        )
+        .route(
+            "/deployment/exports",
+            get(exports::list_exports)
+                .layer(guards::require(&state, "deployment.migrations.read"))
+                .merge(
+                    post(exports::create_export)
+                        .layer(guards::require(&state, "deployment.exports.create")),
+                ),
+        )
+        .route(
+            "/deployment/exports/{id}",
+            get(exports::read_export)
+                .layer(guards::require(&state, "deployment.migrations.read"))
+                .merge(
+                    axum::routing::delete(exports::revoke_export)
+                        .layer(guards::require(&state, "deployment.exports.create")),
+                ),
+        )
+        .route(
+            "/deployment/exports/{id}/run",
+            post(exports::run_export).layer(guards::require(&state, "deployment.exports.create")),
+        )
+        .route(
+            "/deployment/exports/{id}/download",
+            get(exports::download_export)
+                .layer(guards::require(&state, "deployment.exports.download")),
         )
         .route(
             "/security/overview",

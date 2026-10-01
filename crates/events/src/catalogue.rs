@@ -669,6 +669,46 @@ catalogue! {
      ("column_name", String, req), ("rows_done", Integer, req), ("resume_key", String, opt),
      ("error", String, opt)];
 
+    // ---- Anonymised exports ---------------------------------------------------------------------
+    // Three events, and the split between the first two is the one that matters. `created` says
+    // somebody asked for a file; `downloaded` says the bytes LEFT. An operator reading the trail
+    // during an incident needs to tell those apart, because "an export exists" and "an export
+    // reached a third party" are answers to different questions and only one of them is an
+    // incident. A single `exported` event could not answer either.
+    //
+    // Neither event carries a column NAME list, a row count per column, or anything read out of
+    // the data. The payload is the request and the decision, which is what an audit needs; the
+    // contents of a support file must not travel in the event stream, because the event stream is
+    // fan-out to every subscriber and therefore has a wider audience than the export itself.
+    "anonymized_export.created", "migrations", Live,
+    "An anonymised export was requested. `tables` is what was ASKED for and `reason` is the free \
+     text an operator typed — the two things a reviewer reads. `column_actions` is the plan that \
+     was resolved BEFORE any row was read, never the contents of the file. Recorded only after the \
+     classification map accepted every selected column, so its presence also proves the fail-closed \
+     check passed.",
+    [("export_id", Uuid, req), ("reason", String, req), ("tables", Json, req),
+     ("columns_planned", Integer, req), ("columns_removed", Integer, req),
+     ("columns_hashed", Integer, opt), ("columns_synthetic", Integer, opt),
+     ("salt_fingerprint", String, opt)];
+
+    "anonymized_export.downloaded", "migrations", Live,
+    "The single permitted download of a prepared export happened — the moment the bytes left the \
+     platform. `expires_at` travels with it so a receiver can see how long the artifact was \
+     live, and `checksum` lets the recipient prove which bytes they hold. A second attempt is \
+     refused with `410` and emits NOTHING: a refused download is not a fact about the export, and \
+     recording it would turn the trail into a counter a third party could inflate.",
+    [("export_id", Uuid, req), ("downloaded_at", Timestamp, opt),
+     ("expires_at", Timestamp, req), ("checksum", String, opt),
+     ("file_size", Integer, opt)];
+
+    "anonymized_export.expired", "migrations", Live,
+    "An export passed its expiry without being downloaded, or was revoked before anyone fetched \
+     it. Carries which of the two happened (`expired` vs `revoked`) because the two have different \
+     follow-ups: an expired file nobody wanted is routine, a revoked one is a decision somebody \
+     made under pressure.",
+    [("export_id", Uuid, req), ("reason", String, opt),
+     ("download_count", Integer, req)];
+
     // ---- Commerce (reserved: the module is not shipped yet) -------------------------------------
     "order.created", "commerce", Reserved,
     "An order was placed. Listed now; the commerce module records it when it ships.",
@@ -1023,7 +1063,10 @@ mod tests {
         assert_eq!(order.area, "commerce");
         assert_eq!(order.group(), "order");
 
-        assert!(group_members("commerce").is_empty(), "no event is emitted as commerce.*");
+        assert!(
+            group_members("commerce").is_empty(),
+            "no event is emitted as commerce.*"
+        );
         assert!(!group_members("order").is_empty());
         assert!(lookup("commerce.*").is_none());
     }
@@ -1038,7 +1081,10 @@ mod tests {
         .expect("valid");
 
         assert_eq!(
-            stored.iter().filter(|name| *name == "page.published").count(),
+            stored
+                .iter()
+                .filter(|name| *name == "page.published")
+                .count(),
             1,
             "the same subscription twice is one subscription"
         );
@@ -1064,9 +1110,18 @@ mod tests {
     fn an_empty_or_broken_subscription_is_refused() {
         assert!(reconcile(&[]).is_err());
         assert!(reconcile(&["   ".to_owned()]).is_err());
-        assert!(reconcile(&["page".to_owned()]).is_err(), "a bare name is not a name");
-        assert!(reconcile(&["*".to_owned()]).is_err(), "an empty group is not a group");
-        assert!(reconcile(&["PAGE.*".to_owned()]).is_err(), "a group is lower-case");
+        assert!(
+            reconcile(&["page".to_owned()]).is_err(),
+            "a bare name is not a name"
+        );
+        assert!(
+            reconcile(&["*".to_owned()]).is_err(),
+            "an empty group is not a group"
+        );
+        assert!(
+            reconcile(&["PAGE.*".to_owned()]).is_err(),
+            "a group is lower-case"
+        );
     }
 
     #[test]
@@ -1086,7 +1141,10 @@ mod tests {
     #[test]
     fn areas_are_listed_once_in_table_order() {
         let areas = areas();
-        assert_eq!(areas.len(), BTreeSet::from_iter(areas.iter().copied()).len());
+        assert_eq!(
+            areas.len(),
+            BTreeSet::from_iter(areas.iter().copied()).len()
+        );
         assert!(areas.contains(&"content"));
         assert!(areas.contains(&"commerce"));
         assert!(
@@ -1099,7 +1157,10 @@ mod tests {
     fn the_ceiling_counts_what_the_operator_typed_not_what_it_expanded_to() {
         // Eight groups covering every member of the catalogue: forty-odd names once expanded,
         // eight selections as typed.
-        let typed: Vec<String> = areas().into_iter().map(|area| format!("{area}.*")).collect();
+        let typed: Vec<String> = areas()
+            .into_iter()
+            .map(|area| format!("{area}.*"))
+            .collect();
         assert!(
             typed.len() <= crate::validation::MAX_SUBSCRIPTIONS,
             "the table has more areas than the ceiling allows, so this test cannot say what it means"
@@ -1158,8 +1219,14 @@ mod tests {
             assert_eq!(entry.group(), "health", "{name} is not behind health.*");
         }
         // The pair the request calls out, stated as a pair.
-        assert!(subscribed_to(&["health.*".to_owned()], "health.service.degraded"));
-        assert!(subscribed_to(&["health.*".to_owned()], "health.service.recovered"));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.degraded"
+        ));
+        assert!(subscribed_to(
+            &["health.*".to_owned()],
+            "health.service.recovered"
+        ));
     }
 
     #[test]
@@ -1206,7 +1273,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must declare {field}"));
             assert!(found.required, "{name}.{field} is required in the test");
             assert!(
-                entry.required_fields().any(|candidate| candidate.name == field),
+                entry
+                    .required_fields()
+                    .any(|candidate| candidate.name == field),
                 "{name}.{field} must be reachable through required_fields()"
             );
         }

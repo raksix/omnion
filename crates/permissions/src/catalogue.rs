@@ -281,6 +281,26 @@ pub const CATALOGUE: &[PermissionDef] = &[
         category: "deployment",
         description: "Load a seed dataset into a non-production installation",
     },
+    // * `exports.create` — asks for a copy of the installation's data to leave it. Its own key,
+    //   and the reason is the one the whole feature is built around: everything else on this
+    //   surface is a read or a write INSIDE the platform, while this is the only operation whose
+    //   product is an artifact that ends up somewhere the platform's controls do not follow. An
+    //   operator who may read every row has not thereby been authorised to produce a file, and a
+    //   key that meant both could not answer "who took the data out?" during an incident.
+    PermissionDef {
+        key: "deployment.exports.create",
+        category: "deployment",
+        description: "Create an anonymised support export",
+    },
+    // * `exports.download` — SEPARATE from `exports.create` because the export is written once and
+    //   read once, and those are different moments with different risk. Creation is a decision made
+    //   with the classification map in front of you; the download is the moment the bytes leave.
+    //   Collapsing them means revoking a link is also a decision about who may produce one.
+    PermissionDef {
+        key: "deployment.exports.download",
+        category: "deployment",
+        description: "Download a prepared anonymised export (single use)",
+    },
     // Identity and access management.
     PermissionDef {
         key: "iam.permissions.read",

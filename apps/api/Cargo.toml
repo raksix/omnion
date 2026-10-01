@@ -26,6 +26,11 @@ sqlx.workspace = true
 time.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# The anonymised-export salt (REQ-129 slice 4). `rand` is already in this workspace as a dev
+# dependency for the sign-in walks, but a dev-dependency is not linkable from library code, so the
+# export route needs it declared here as well — and the dependency is justified on its own: the
+# salt is the one value in the feature whose predictability would undo every hashed column.
+rand.workspace = true
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 omnion-audit = { path = "../../crates/audit" }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
