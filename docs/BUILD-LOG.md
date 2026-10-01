@@ -119,6 +119,124 @@ breakers`, now possible and now the last gate before intake).
 **Next:** the intake guard (slice 4) — HMAC verification, tolerance, replay defence, size caps and
 the sanitisation profile — then the focused pass, then close REQ-127.
 
+## 2026-10-01 — the event-bus suite had been dead for twenty ticks, and every one of its ten walks was proving the same refusal
+
+test(events): revive the whole suite. feat(events): catalogue four names the drift gate
+found already on the bus.
+
+**This tick started as two open REQ-016 boxes about a delivery row's `duration_ms` and the
+retry ladder's `next_attempt_at`, and turned into the discovery that the file which was
+supposed to prove them had not run a single assertion for twenty ticks.**
+
+I went looking for the two boxes because they name claims no walk measured: the main bus walk
+asserts `delivered`, `attempts == 1`, `response_status == 200` and a readable terminal error, and
+nothing anywhere asserted that a *successful* delivery carries a duration or that the retries are
+**increasingly spaced**. The second is not assertable by a walk that waits a fixed sleep between
+ticks — such a walk cannot tell "the ladder backed off" from "the runner happened to tick again
+later" — so it needed a walk of its own. Writing it meant running the suite, and the suite
+reported:
+
+```text
+1 passed; 10 failed          # every failure: 403 csrf_unavailable / csrf_failed
+```
+
+**Ten of eleven walks were re-proving one refusal, and none of them was testing the event bus.**
+
+### The root cause: a fixture that could not present a credential
+
+Tick 59 made the session cookie *ambient* authority. A cookie-authenticated **write** must now
+present a double-submit token beside it, and sign-in is the only place the product issues one.
+This suite never had either half of what it needed:
+
+1. it built its `Config` from the environment and **never set a CSRF secret**, so
+   `refuse_if_needed` returned `csrf_unavailable` — *"a test process has no
+   `OMNION_CSRF_SECRET`"*, and
+2. it minted sessions straight through `sessions::create_session` rather than signing in, so
+   **no token was ever issued**, which turns the same refusal into `csrf_failed` — *"this
+   request carries no CSRF token"*.
+
+Both refusals are the **product working correctly**. The defect was the fixture, and it was
+total: with no credential in hand, every `POST /webhooks`, every page publish, every delivery
+tick was refused before `crates/events` saw a request. `support::walk_auth` already lifts this
+shape for every other suite and its own doc comment records this exact failure — *"a red suite
+that blames the product is the most expensive kind of red"* — and `--test media` had already
+been repaired. This suite was simply never migrated.
+
+The fix is the mechanical one that helper prescribes: `with_csrf_secret(&mut config)` on the
+fixture, `account()` deriving each session's token with
+`omnion_security::derive_csrf_token(secret, session_id)` and **packing** it beside the session
+id, and `request()` calling `apply_credential` so the cookie and the `x-omnion-csrf` header are
+set together. Packing is why the twenty-odd call sites did not change: a walk's `token` argument
+never became a pair.
+
+```text
+cargo test -p omnion-api --test events -- --test-threads=1   11 passed  (was 1 passed, 10 failed)
+cargo test -p omnion-events --lib                             49 passed
+cargo test -p omnion-api --lib                               258 passed
+tsc -p apps/admin/tsconfig.json --noEmit                     clean
+```
+
+### The walk the two boxes needed
+
+`a_delivery_row_measures_its_own_duration_and_its_backoff_grows` reads its rows **out of the HTTP
+body**, because that is the path the screen takes: `duration_ms` and `next_attempt_at` are both
+columns on the deliveries table, so a value present in PostgreSQL but dropped by
+`DeliveryBody::build` would be invisible to an operator while every crate test stayed green. The
+ladder is climbed one attempt at a time — each reschedule strictly later than the one before it,
+and the gaps asserted **exponential** rather than merely monotone. A measured run:
+
+```text
+attempt 1 → +112 ms · attempt 2 → +197 ms · attempt 3 → +358 ms     (retry_base 40 ms)
+```
+
+**The assertion I wrote first was wrong and the ladder was right.** "The schedule is in the
+future" read *after* the walk has slept through the delay is asserting that the test slept long
+enough: with a 40 ms base and an HTTP round trip inside the tick, every collected timestamp is
+legitimately due by the time it is checked. Two earlier versions of that check failed while the
+backoff was doubling perfectly. The distance between consecutive schedules is the deterministic
+measurement of the same fact, and it is what the walk asserts.
+
+### Four blind spots in the drift gate, each pointing the registry the wrong way
+
+With the suite alive, its two pre-existing source-scan failures became visible — and both had the
+same shape as the notification queue defect from tick 88: **a measurement that cannot see what it
+is measuring, whose only "fix" is to make the registry lie in the other direction.** Three of the
+four were in the gate; one was a real gap in the table.
+
+| what the gate could not see | what it then claimed | the honest fix |
+|---|---|---|
+| a **doc comment** quoting `NewEvent::new("health.service.degraded")` as the *wrong* implementation | a name `health.service` was emitted that nothing emits | strip `//` before matching — a false emission would push a row for a sentence |
+| `Announcement::new(…)`, REQ-014's emitter, which **cannot** call `NewEvent::new` (health is platform-level and fans out per listening tenant) | 5 live names with no emitter | teach the gate the second constructor |
+| a name on the **next line** (`json!(…)` payloads) or three lines down (`if hold { … } else { … }`) | `health.*` and `media.hold_released` unbacked | a three-line lookahead, reading *every* line in the window for the marker |
+| a **dotted name inside `#[cfg(test)]`** (`health.service.exploded`, built to prove the catalogue check refuses it) | a catalogue row demanded for a name nothing emits | skip `#[cfg(test)]` modules — granting that row is a **lie** in the registry |
+
+Every one of those four pushes toward demoting real, working events to `Reserved`, which makes
+the picker say "a module ships this" about events the platform already emits. **The gate was not
+protecting the registry from drift; it was demanding the registry stop telling the truth.**
+
+The one real gap it did find: `backup.restored`, `notification.delivery.succeeded`,
+`media.hold_placed` and `media.hold_released` were all **Live facts on the bus that no operator
+could subscribe to**, because the picker reads this table and the table had never heard of them.
+`8d6b5b21` adds the four rows. `notification.delivery.succeeded` requires `test` rather than
+offering it — a receiver that read "succeeded" as a production delivery and paged somebody for a
+message a person deliberately asked the platform to send is the worst outcome of that row — and
+both `media.hold_*` require `reason`, because a retention decision nobody can defend later is not
+a retention decision.
+
+### Not done this tick
+
+The browser pass. `scripts/qa/run.sh` was queued behind live siblings for the whole tick — w4
+first, then w3 — and `QA_SLOT_WAIT=3600` held it rather than letting it collide, which is what
+that limit is for. **It then died at its own 2400 s timeout still queued** (the log's last line is
+`waiting for a QA slot`), so this tick has **no** browser pass and every screen-leg box below
+stays open. That is two consecutive ticks now, and the queue behind a single shared slot is long
+enough that the next tick should not assume it will get one either. So REQ-016's screen legs (the
+endpoint form's field messages, the payload inspector's clipboard contents, and the walkthrough
+inventory line) remain unticked with the reason in the box, and REQ-021's keyboard and mobile legs
+are still written-but-unmeasured.
+
+Next: the QA pass, then the remaining REQ-016 screen legs, then REQ-021's.
+
 ## 2026-09-30 — REQ-014 slice 2's last screen + the 14 committed compile errors nobody's gate could see
 
 feat(health): the service detail page draws a 24 h trend. fix(health): the health
@@ -6654,3 +6772,150 @@ comment mentioning it.
 Next: the rest of slice 1 — advisory lock, the `apply` / `plan` / `verify-down` runner, the
 `omnion migrate` subcommands, `/deployment/migrations` list + detail, the CI gate — and then a pass
 that can finally sign in, which unblocks the REQ-126/127/128 close gates.
+
+## Tick 90 — REQ-012, the security centre's permission gate (2026-10-01)
+
+**What.** `apps/api/tests/security.rs`, four walks over the live database driving the router in
+process, closing the criterion that every `/security` endpoint enforces its catalogue key. The
+box had carried a note since the request was written: the four keys are in the catalogue, every
+route is behind a guard, "the 403 itself is unproven until a pass calls an endpoint without the
+key". That note was the **seventh instance of this REQ's defect class** — the security centre
+already spent one bug on an inherited `route_layer` that put it behind `analytics.read`, and the
+only reason that surfaced was a backup walk signing in as a reader.
+
+**What it proves.**
+
+1. anonymous is `401` on all fifteen `/security` routes, never a page of data;
+2. an organization member with no security key is `403 permission_denied` on all fifteen, and the
+   body **names the missing key** — a route whose guard named a key outside the catalogue is
+   caught rather than looking identical to a correct refusal;
+3. an account holding only `security.read` reaches the read routes and is refused every `scan`
+   and `manage` route — the walk that catches an inherited layer;
+4. the full three-key holder passes the guard everywhere, so walks 1–3 are about guards and not
+   about a centre whose routes are broken.
+
+**The suite was proven to fail before it was believed.** Walk 3 was run against a router with
+`/security/overview`'s `guards::require` layer deleted:
+
+```text
+test a_member_without_the_key_is_refused_everywhere ... FAILED
+```
+
+and it named that route. The `route_layer` was restored from a backup afterwards and the tree is
+byte-identical to `23228200`'s parent. The route table in the suite is hand-written rather than
+scraped out of `routes/mod.rs`, because a census reads the path and the guard from the same line:
+a route that lost its guard would be compared against itself and pass.
+
+**Proof.**
+
+```text
+cargo test -p omnion-api --test security -- --test-threads=1    4 passed  (30.6 s, live PostgreSQL)
+cargo test -p omnion-permissions --lib                           63 passed
+bun x tsc -p apps/admin/tsconfig.json --noEmit                   exit 0
+```
+
+**Disk first.** `/mnt/apopic` was at 99 % (970 MB free) when the tick opened — the documented
+build-killer, where `rustc` reports `IO failure on output stream` with **no** `error[]` line and a
+build that looks like an ordinary compile error. `target/debug/deps` in this worktree held 1 096
+crate/hash pairs for 5.21 GiB; keeping the newest `rlib`+`rmeta` of each pair reclaimed **0.77 GiB**
+across 756 stale artifacts. `/mnt/apopic` is now at 96 %.
+
+**Not done this tick.** The browser pass. It was started first, as tick 89's hint asked, and has
+been queued behind a **live** sibling holder for the whole tick — `w6`, then `w3`, re-taking the
+place between passes (`qa-slot.sh` sees `max 1 concurrent pass` and waits). Nine passes are queued
+on this box at once, so the one global slot is the scarce resource and a writer's pass is now the
+thing most likely to time out rather than the thing most likely to fail. REQ-010, REQ-021 and
+REQ-016 all have code-complete screens whose only open boxes are browser legs, so this queue is
+the bottleneck, not the code.
+
+Next: the pass itself if it can take the slot, then REQ-021's keyboard and mobile legs, then
+REQ-016's form-validation and payload-inspector legs.
+
+## Tick 90 (continued) — why the pass died, and it was not the product
+
+**The pass was queued for 2400 s and then proceeded, and it died at the wizard.** The log said
+`installation already exists`, then `FATAL: could not sign in after wizard`. Read naively that
+is a broken first-run flow. It was not: **two passes of the same stack ran at once.**
+
+```text
+/tmp/omnion-qa-tick89.log   the PREVIOUS tick's pass — started 01:28, still walking at 02:52
+  pid 564604  bash scripts/qa/run.sh
+  pid 2089155  node scripts/qa/walkthrough.cjs --out .../20261001-012813   (writing at 02:52)
+/tmp/qa-main-tick90.log      this tick's pass — started 02:07, queued 2400 s, then proceeded
+```
+
+Both use `QA_STACK=main`, so both target database `omnion_qa` and ports 18080/3100/3200. The
+sequence, read out of the database rather than guessed:
+
+```text
+02:47:57  tick-89 pass: reset-db.sh drops and recreates omnion_qa
+02:48:07  tick-89 pass: API boots, "no accounts exist yet"
+02:48:14  a user appears: qa-sample@omnion.test / "QA Provider" / organization_id NULL
+02:48:16  tick-89 pass: session created for that user
+```
+
+`qa-sample@omnion.test` and `"QA Provider"` are literal return values of the walkthrough's own
+`sampleValueFor()` / `fillSubtree()` helpers — the generic form filler, not a credential. Tick-89
+had filled some provider-or-user dialog on its way past. So by the time this tick's pass opened
+`/`, the database already had an account, `GET /onboarding` answered `needs_setup: false`, the
+login screen's own `router.replace("/setup")` never fired, the wizard was correctly skipped — and
+this pass then tried to sign in as `CREDS.email` (`qa-owner@omnion.test`), an account that did
+not exist. Sign-in failed for a reason that has nothing to do with sign-in.
+
+**The defect is in the harness, and it is a hole in `qa-slot.sh`.** The slot script counts places
+globally, so it correctly serialises two *different* stacks — but nothing in it stops a second
+pass taking **the same** stack. `run.sh` has no flock and no pidfile. Two passes on one stack do
+not merely duplicate work: one of them **drops the other's database mid-walkthrough**, which is
+precisely the "QA report says N high findings" failure the whole harness exists to prevent — the
+report would have been measured against a floor that was pulled out from under it.
+
+**The one good piece of news in this log.** `guards` on `/login` are not involved, the product's
+first-run behaviour is correct at every step (`/` → `/login` → `needs_setup` → `/setup`), and
+the API log shows the session for the *right* account being created for the pass that owned the
+stack. The tick-89 pass is healthy and still producing clicks; it was not killed. Its own log
+records three honest `"ok": false` lines (`media presets: the presets screen did not render`,
+`media duplicates: no file input`, `media retention: the retention tab did not render`) — the
+harness reporting rather than hiding, which is the behaviour this project wants.
+
+Next: a per-stack lock in `run.sh` so this cannot recur, then the pass.
+
+### The fix, and the two bugs inside it
+
+`run.sh` now takes a per-stack `flock` before `reset-db.sh` and refuses a second pass with exit
+4. It is taken around the **whole** pass, not only the reset: the second pass would otherwise
+`pm2 delete` the first pass's servers a few lines further down, so the reset is only the first of
+several ways two passes on one stack destroy each other.
+
+Writing it produced two defects in the fix itself, both found by *running* it rather than reading
+it, which is the argument for running it:
+
+1. **`exec 9>"$lock"` truncates the file on open.** A waiter therefore emptied the lock file *as
+   it opened it* and read back the zero bytes it had just written — the holder's recorded pid was
+   destroyed by the act of asking who the holder was, and the refusal said `unknown` in exactly the
+   situation where an operator most wants the pid. Opened with `9>>` instead. Diagnosed by dumping
+   the file's bytes (`od -c`) inside a script that reproduced the waiter's own open.
+2. **`$$` is the pid of the shell and does not change inside a subshell or a `bash -c`.** A pass
+   launched through either recorded its *parent's* pid, so the refusal named a process that had
+   nothing to do with the stack. Recorded `BASHPID` instead. Found because the debug script's
+   subshell wrote `2806959` while `$!` reported `2806959` and the holder was in fact `2806953`.
+
+**Proof.**
+
+```text
+bash -n scripts/qa/run.sh                      clean
+held main's lock, started a second pass         exit 4, "already has a pass running (pid 2811250)"
+a second pass on a DIFFERENT stack (w3)         still TAKEN — the lock does not leak across stacks
+after the holder exits                          TAKEN — the lock is released, not leaked
+```
+
+The orphaned tick-89 pass was terminated rather than left clicking against servers my aborted
+diagnostic pass had already torn down: its API answered `000`, so any further report it produced
+would have been measured against a dead stack. Its process group was killed (pids 564604 and
+2089155), which is this loop's own pass — no sibling stack was touched.
+
+**Why this mattered more than the box it was found on.** Every browser-leg box in wave 1 — REQ-010's
+screen states, REQ-021's keyboard and mobile legs, REQ-016's form validation and payload
+inspector — is written and unmeasured, and for three ticks each has been "the browser pass has not
+run". The reason was never that the pass was slow. It was that consecutive ticks were starting
+competing passes that destroyed each other, and the resulting failure mode is a report full of
+findings measured against a database that was dropped underneath the walk.
