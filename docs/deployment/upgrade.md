@@ -7,9 +7,10 @@ does, and every rule in it has a gate behind it:
 |---|---|
 | Migrations run before new code serves traffic | `service_completed_successfully` in the prod stack; a `pre-install`/`pre-upgrade` hook Job in the chart |
 | An application rollback is always available | the previous image tag; no schema involved |
-| A database rollback exists only for a verified down script | REQ-129's `up → down → up` gate — **not built yet** |
-| The helper will not call a migration reversible before that gate exists | `release/lib/upgrade.py`, `destructiveness()` |
-| Every command below parses before you run it | `scripts/qa/release-upgrade.sh` runs `bash -n` over each one |
+| A database rollback exists only for a verified down script | REQ-129's `up → down → up` gate (`scripts/qa/migration-down-gate.sh`) |
+| The helper will not call a migration reversible unless every migration in the range ships a down script | `release/lib/upgrade.py`, `destructiveness()` |
+| Every command below parses before you run it | `scripts/qa/release-upgrade.sh` and `scripts/qa/upgrade-guide.sh` run `bash -n` over each one |
+| This guide's own claims match what the code answers today | `scripts/qa/upgrade-guide.sh` — see §7 |
 
 The panel's upgrade helper (`/deployment/upgrade`) renders this as a checklist for your
 installed version. The generated plan is the source for the step order; this document is the
@@ -67,12 +68,27 @@ The helper marks the step. A marker you have to infer from a numbered list is a 
 nobody notices, which is why the plan carries `point_of_no_return` as an index into the
 rendered list rather than as prose.
 
-### "Unknown" is the current answer, and it is not "none"
+### "Unknown" is a real verdict, and on this tree it is not the one you get
 
-**REQ-129 has not landed.** Until its `up → down → up` gate exists, a migration file with no
-`-- omnion:no-down` marker has *not been proven reversible* — it has merely not been
-declared irreversible. The helper renders that as `unknown`, keeps `database_rollback`
-as `unknown`, and refuses to complete its checklist without an acknowledgement.
+**A migration that ships no down script is `destructive`, not `unknown`.** REQ-129 landed:
+its policy migration establishes that a reversal is *supposed* to be there, and its CI gate
+(`scripts/qa/migration-down-gate.sh`) is what would have required one. So the helper's question
+is not "did the author declare this irreversible?" — it is "does a reversal exist?", and a file
+without one is the answer that costs an operator a restore.
+
+Two verdicts are genuinely distinguished, and both matter:
+
+| Verdict | When | What it means for you |
+|---|---|---|
+| `destructive` | the range contains a migration with no down script, or a file carrying `-- omnion:no-down` | the database only moves one way. Take the backup in step 1 and use it if this release misbehaves. |
+| `unknown` | the install's tree predates REQ-129's policy entirely | nobody can establish anything. Refuse to proceed without an acknowledgement. |
+
+**The number on this repository, today:** 61 migrations ship, and **54 of them carry no down
+script** — only 7 are reversible. So nearly every plan this helper produces for a range that
+includes any of the early migrations answers `destructive` / `restore-from-backup`. That is not
+a defect in the helper; it is the helper reporting the truth about a schema history that predates
+the reversal discipline. The number moves as down scripts are added, and
+`scripts/qa/upgrade-guide.sh` fails if this paragraph and the code stop agreeing.
 
 A release manifest's `migrations_destructive: false` does **not** override this. That flag
 says the publisher's tree had no marker; it is the publisher's silence, not a verification.
@@ -193,12 +209,27 @@ invisible to an operator using the helper.
 
 ## 7. What is not proven yet
 
-Stated plainly, because a guide that overstates its own coverage is worse than a short one:
+Stated plainly, because a guide that overstates its own coverage is worse than a short one.
 
-- **No migration has been verified reversible on this repository.** The `up → down → up`
-  gate is REQ-129's slice 1 and it has not been built. Every plan today reports `unknown`.
-- **The plan's steps have not been executed on a running stack.** The gate parses every
-  command with `bash -n` and checks every stack file exists and every chart path resolves,
-  but nobody has run the sequence against a live compose or Kubernetes install.
-- **No image has been built or pushed** from this branch, so the image reference in a plan
-  is derived from the manifest's registry and repository, not from a registry that answered.
+**Proven here:**
+
+- Every command in §3 and §4 parses under `bash -n`, with the shell's own parser.
+- Every stack file and chart path the plan names exists in this repository.
+- The helper's verdict and the migration census in §2 are read from
+  `database/migrations/` on every run of `scripts/qa/upgrade-guide.sh`, so this document cannot
+  drift away from the code without failing that gate.
+
+**Not proven, and not claimable from a build box:**
+
+- **The steps have not been executed against a live stack.** A gate can parse a command and
+  find its file; it cannot tell you that `helm upgrade` on your cluster held the release for
+  the migration hook. Running §3 and §4 verbatim against a real compose install and a real
+  cluster is the one acceptance line still open in REQ-128, and it is open for a reason worth
+  stating: it needs two working topologies, not a faster test.
+- **No image has been built or pushed** from this branch, so the image reference in a plan is
+  derived from the manifest's registry and repository, not from a registry that answered.
+  The same applies to the chart version in the `helm upgrade` line.
+- **54 of 61 migrations still ship no down script.** The gate that would have caught it exists
+  and runs; the down scripts it is waiting on do not. Until they exist, the database rollback
+  path for any range touching the early schema history is a restore, and this guide says so
+  rather than implying otherwise.
