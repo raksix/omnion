@@ -511,10 +511,14 @@ pub static OPERATIONS: std::sync::LazyLock<Vec<Operation>> = std::sync::LazyLock
         )),
         // --- Developer · OAuth applications (slice 3) ---------------------------------------------
         //
-        // The panel's half only. The authorization and token endpoints are deliberately absent
-        // from this document: they are sessionless, they take a client secret in a body, and a
-        // reference that showed them under a "run this with your session" Explorer would
-        // describe two surfaces that authenticate in opposite ways.
+        // The panel's half only. The four sessionless endpoints a third-party client calls
+        // (`/oauth/authorize`, `/oauth/consent`, `/oauth/token`, `/oauth/introspect`) are
+        // deliberately absent from this document, and the reason is the same one that put them
+        // in their own file: they authenticate a *client*, they take a client secret in a body,
+        // and a reference that showed them under an Explorer described as "run this with your
+        // session" would document two surfaces that authenticate in opposite ways. A developer
+        // reading the Explorer must never be able to send a client_credentials request through a
+        // session cookie.
         Operation::read(
             "GET",
             "/api/v1/oauth-apps",
