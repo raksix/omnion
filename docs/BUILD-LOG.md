@@ -7361,3 +7361,27 @@ directory`), which is the harness, not the code.
 
 **Next:** `--only=media` on a free slot, reading `mediaFileDetail` and the four new filter steps out
 of `summary.json`. Then REQ-010's last open code item: the CDN purge hook to REQ-011.
+
+### …and the suite that could not have found it
+
+While proving the walks above I ran `apps/api/tests/media_transform.rs` and got **0 passed, 5
+failed** — and it was not my change. The suite built its state from `Config::from_env()` and never
+set a CSRF secret, so every write it attempts is refused `403 csrf_unavailable`; `media.rs` has
+carried the same fix since its own suite hit that wall. All five walks had therefore **never run a
+single write** — they stopped at their first request, which is why nobody saw it: a suite that
+cannot write cannot fail in an interesting way.
+
+Three layers had to be fixed, and each revealed the next one:
+
+1. the secret on the **config**, not through the environment (`csrf_unavailable` → `csrf_failed`);
+2. the token on a write — `set_cookie` is only the **first** `Set-Cookie` and sign-in sends two, so
+   reading it alone yields a session with no token, which from the write path is indistinguishable
+   from a deployment that issued none (`csrf_failed` → a wrong cookie value);
+3. the multipart builder, which had the same gap and produced a *misleading* failure: it passed the
+   whole credential as the cookie value, `\x1f` is not a legal cookie byte, so the builder refused
+   the header and the panic read **`request must build`** — naming the builder instead of the
+   credential that was wrong.
+
+**5 passed** afterwards, over the real router, live PostgreSQL and MinIO. The lesson is the one
+below: *a suite that cannot exercise its subject reports the same number as a suite that is broken*,
+so "5 failed" and "5 never ran" are the same line and only the panic message tells them apart.
