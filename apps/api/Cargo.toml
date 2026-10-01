@@ -36,6 +36,12 @@ omnion-audit = { path = "../../crates/audit" }
 omnion-ai-hub = { path = "../../crates/ai-hub" }
 omnion-automation = { path = "../../crates/automation" }
 omnion-content = { path = "../../crates/content" }
+# The GraphQL decision layer (REQ-130 slice 1). The crate itself stays free of a database and of
+# every other crate — that is what lets the playground's cost meter predict the endpoint instead of
+# agreeing with it after the fact — so the ONE check that needs both sides, "every permission this
+# surface names is a key the platform actually ships", can only live here, in a crate that links
+# `omnion-permissions`. See `tests/graphql_parity.rs`.
+omnion-graphql = { path = "../../crates/graphql" }
 # Deployment tooling (REQ-128): the release cache, the artifacts, the bundles and the upgrade
 # plan. Its own crate because the decision layer — which steps, in what order, and what is known
 # about whether the database can be rolled back — is a property of the release contract and not of

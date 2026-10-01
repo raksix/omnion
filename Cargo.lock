@@ -1446,6 +1446,7 @@ dependencies = [
  "omnion-core",
  "omnion-deployment",
  "omnion-events",
+ "omnion-graphql",
  "omnion-health",
  "omnion-identity",
  "omnion-media",
