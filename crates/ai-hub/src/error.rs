@@ -181,6 +181,15 @@ pub enum AiHubError {
     /// would make the operator guess which field collided.
     #[error("an eval suite with the key `{0}` already exists in this organization")]
     EvalSuiteKeyTaken(String),
+    /// No run with that id in this organization (REQ-107 slice 2).
+    ///
+    /// A `404`, never a 403, for the same tenancy reason as [`Self::EvalSuiteNotFound`]: a run
+    /// id that answered "exists in another tenant" would make this installation's run ids an
+    /// existence oracle. It is also what a *second* settle of an already-settled run reports,
+    /// because the settle's `where status in ('queued','running')` guard is what makes a double
+    /// settle impossible — and the message that helps a caller who hit it names the run.
+    #[error("no eval run `{0}` in this organization")]
+    EvalRunNotFound(String),
     /// An air-gap setting breaks one of the switch's own rules (REQ-106 slice 2).
     ///
     /// Its own code for the same reason as the three above: the refusal belongs on a field of
@@ -368,6 +377,7 @@ impl AiHubError {
             Self::EvalSuiteNotFound(_) => "eval_suite_not_found",
             Self::EvalCaseNotFound(_) => "eval_case_not_found",
             Self::EvalSuiteKeyTaken(_) => "eval_suite_key_taken",
+            Self::EvalRunNotFound(_) => "eval_run_not_found",
             Self::InvalidAirgap(_) => "invalid_airgap",
             Self::AirgapHostNotFound(_) => "airgap_host_not_found",
             Self::ChangeSetNotFound(_) => "change_set_not_found",
