@@ -11584,3 +11584,74 @@ gate that kills this loop, not the slot.**
 **Next.** `--only=theme-customize` on a free slot: provoke a refusal and read the three
 `data-theme-contrast-pending` / `data-theme-contrast-row` / `data-theme-contrast-ok` states out of
 `summary.json`, which is the only thing that can tick criteria 8 and 11.
+
+
+## 2026-10-01 · wave-2 · tick 62 — a null organization that meant "the platform ships this file"
+
+**What.** REQ-062 criterion 13, third clause. `install_package` now takes the installing
+organization from the caller, and `remove_theme` gained an ownership refusal plus a row-count check.
+
+**The find.** `install_package`'s INSERT hard-coded `organization_id` to `null`. In this table `null`
+is not "no owner" — the schema comment says so outright, and the bundled loader relies on it to seed
+the ten themes the platform ships. An upload therefore claimed to be platform-shipped, and one column
+produced two defects:
+
+- **The gallery leaked across tenants.** Its filter is
+  `(organization_id is null or organization_id = $2)`, so the `is null` arm matched *every* uploaded
+  package in the installation: one tenant's package listed in a stranger's gallery, and the uploading
+  tenant's own gallery filtered it out because `organization_id = $2` matched nothing. A package
+  installed into a place the product has no screen for.
+- **A removal removed nothing and said it succeeded.** `remove_theme`'s org-scoped
+  `UPDATE ... and organization_id = $2` matched zero rows, the function returned `Ok(())`, and the route
+  then deleted the stored package bytes. The platform reported a removal, the row stayed live and
+  activatable, and its manifest pointed at an object that was gone.
+
+**Why it survived seventeen green walks.** Two of them assert exactly this surface
+(`a_valid_package_installs_inactive_and_changes_no_site` and `a_bundled_or_in_use_theme_cannot_be_removed`)
+and neither reads `organization_id` — one asserts `source`, the other asserts a refusal for a theme it
+activated. Neither asks *whose* theme it is. The absence of a failure is not coverage.
+
+**The fix.** The organization travels in from the caller rather than being invented in the store. The
+refusal order in `remove_theme` is now source -> **ownership** -> in-use: "this belongs to somebody
+else" is the answer an operator needs, and "a site still renders with it" would send them looking for a
+site they do not own. The UPDATE's row count is read rather than assumed, because the caller unlinks
+the package the moment the function returns — a silent zero there is the difference between a clean
+uninstall and a theme row with no package behind it. An account with no organization of its own is a
+platform owner and may remove any upload, which is the rule `gallery` already applied.
+
+**Proof**
+
+| Gate | Result |
+|---|---|
+| `cms_theme_layouts` — 19 walks on real PostgreSQL, this worktree's own cluster on :5449 | **19 passed / 0 failed**, exit 0, 100 s |
+| the same two walks against the hard-coded `null` | **verified to fail first** — `left: None` (ownership), `left: 1` (removal that removed nothing) |
+| `tsc --noEmit` (apps/admin, real tree) | exit 0 |
+| `cargo build -p omnion-api` | clean (warnings pre-existing) |
+
+The removal walk reads the live row **before** the DELETE. A removal that passes because the row was
+never there proves nothing — the rule this REQ has applied to every other walk it wrote.
+
+**Two of my own red checks were wrong, not the product**, and both were confirmed against the source
+before the assertion changed rather than loosened until green: the gallery is `/api/v1/themes?site=...`
+(the site-scoped `/sites/{id}/theme` is the ACTIVATION route, not the listing), and `GalleryEntry`
+nests the theme, so the key is at `themes[].theme.key` — `themes[].key` returns nothing, and an empty
+list is indistinguishable from a gallery that hid the package.
+
+**Browser pass: ran, and lost its tab.** `--only=block-editor,theme-customize` took the slot honestly
+(w3 released it), walked roughly seventy screens and reached the block-editor depth pass, then the tab
+died with `Target page, context or browser has been closed` mid-route-list; `summary.json` carries only
+`{fatal, fatalAfter: []}` and no counters at all. `w6` was running a 26-route pass at that moment — 35
+Chrome processes, 28 GB of 32 GB RAM. That is the documented starvation case rather than a product
+defect, and the pass is evidence neither way. Its own cleanup ran: my three pm2 processes deleted, no
+`run.sh` or walkthrough orphan, and the dead slot holder was **not mine** (`kill -0` false, cwd empty),
+so it was left for the reaper.
+
+**Disk.** 100 % (530 MB free) mid-tick, which surfaced as a `507` from minio inside four walks that
+were otherwise passing — the object store lives on the same full volume, so a full disk reads as a
+storage error. Reclaimed 1.3 GB of my own `incremental` plus stale duplicate rlibs (newest per crate,
+nothing modified in the last 20 minutes, never the `omnion-api` binary the QA stack runs) -> 2.5 GB
+free. `docker-data` at 28 GB is the real consumer and belongs to every writer, so it was not touched.
+
+**Next.** `--only=themes` on a slot that is not competing with a 26-route pass: provoke an activation
+before installation completes, and drive the gallery's remove button to a real confirmation, which is
+what criterion 13's first and third clauses still owe.
