@@ -8177,3 +8177,71 @@ identical at `HEAD~1`, not in this diff.
 environment refusal — both harness behaviour, both worth their own tick. (b) Then the REQ-126 close
 box can be ticked on a pass whose high count means something. (c) REQ-127/128/129 remain open on the
 same unticked gate; this tick's fix is the precondition for all four.
+
+## Tick 97 — REQ-012 migration box: "fresh" was the easy half
+
+**What.** Closed the migration acceptance criterion of the security centre by proving the half
+nobody had: `0151` and `0217` applied to a database that already holds somebody's data.
+
+The criterion said "fresh **and populated**" and only the first word had ever been walked. The
+gap between those two words is the entire criterion — a migration applied to an empty database
+only proves it can create a table, and none of the failures that stop a platform from booting
+are of that kind. `0151` runs three `alter table` statements against a row that already carries
+an operator's saved header policy; `0217` hangs foreign keys off `users` rows that already
+exist. Both are invisible to a fresh-database test.
+
+**The walk.** `apps/api/tests/migration_gap.rs::the_security_migrations_apply_to_a_populated_database`
+migrates the whole tree, seeds a tenant, an account, **locks that account**, saves
+`{"hsts": true}` and records a finding and a check result — then rolls back *only* versions 151
+and 217 in the ledger and drops their objects by hand, so the two files run against that data.
+Rolling back "everything from 151 on" would have re-run the ~40 migrations between them and
+proved sibling writers' work instead of this criterion.
+
+Assertions: the locked account is **still present and still locked**; the saved policy survived
+the alters with its document intact; `0054`'s two tables kept their rows untouched by a migration
+added beside them; `0217`'s rule keeps its `created_by`. Each is one an empty table cannot
+produce.
+
+**Proof.**
+
+| Gate | Command | Result |
+|---|---|---|
+| migration walk | `cargo test -p omnion-api --test migration_gap -- --test-threads=1` | **5 passed**, 0 failed |
+| crate | `cargo test -p omnion-security --quiet` | **208 passed** |
+| events | `cargo test -p omnion-events --quiet` | **49 passed** |
+| api lib | `cargo test -p omnion-api --lib --quiet` | **284 passed** |
+| walks | `cargo test -p omnion-api --test security -- --test-threads=1` | **11/11** |
+| drift | `cargo test -p omnion-api --test events every_emitted_name_is_in_the_catalogue` | **passed** |
+| types | `pnpm typecheck` | **0 errors** |
+
+**Proven to fail twice, because both halves of that setup can silently no-op — which is the
+general hazard here.** An assertion in a walk you built yourself is worth exactly as much as the
+setup is capable of failing.
+
+* Neutralising the ledger rollback means the migration never runs, and the read dies on
+  `column "rate_limits" does not exist`. A green run therefore genuinely required the migrations
+  to have executed — and this is the trap this file is full of: a rollback helper that deleted
+  nothing, or a `drop table if exists` that matched no name, would leave a test that passes
+  against migrations that never executed.
+* A `0151` sabotaged into `update security_settings set headers = '{}'` fails on precisely the
+  assertion written for it: *the upgrade must not revert a policy an operator had already
+  saved: {}*. That is the production disaster this criterion is written against, and **on a fresh
+  database it is undetectable** — `0135` inserts that row itself with `{}`, so "the document
+  survived the upgrade" and "the document is the default" are indistinguishable there.
+
+That second point is the finding worth carrying forward: the fresh-database test was green, and
+it *could not have been otherwise*. A green test on the wrong starting state is not weak
+evidence, it is evidence about nothing.
+
+**Note for the next writer, recorded so it is not re-found.** `cargo fmt -p omnion-api` sweeps
+the crate's whole module tree. It was run this tick and `git diff -w` was checked afterwards to
+confirm it touched nothing but `migration_gap.rs` — the token-level check comes *before* the
+style commit, not after.
+
+**Browser pass: still owed, and still not startable.** The slot is held live by `w8`
+(`pid 3591518`, `cwd=/mnt/apopic/omnion-w8`, verified with `kill -0` **and**
+`/proc/<pid>/cwd` — not by the age of the placeholder file), 25 Chrome processes, load 17. Six
+screen boxes on this REQ still turn on it.
+
+**Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
+REQ-012 can close.
