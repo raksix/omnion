@@ -8245,3 +8245,90 @@ screen boxes on this REQ still turn on it.
 
 **Next:** the browser pass on a free slot — `--only=security` covers all six screens — and then
 REQ-012 can close.
+
+## Tick 60 (wave6) — eight screens were clean because they were the login form
+
+**Merged `origin/main` first** (one commit, the security migration box). One conflict, in
+`docs/BUILD-LOG.md`, resolved as a union of both sides — this branch's tick 56–59 entries and
+main's tick 97 — `7cf7e3f2`.
+
+**What.** Read tick 59's pass instead of re-running it, which is what invariant 12 asks for, and
+found that its "16/16 pages walked, zero findings on every wave-5b screen" was true sentence by
+sentence and false in aggregate.
+
+**The proof is in the artifacts, not an inference.** `diagnostics.json` records
+`"url": "http://127.0.0.1:3105/login"` for **eight of the thirteen** wave-5b desktop routes:
+`/secrets/audit`, `/observability`, `/observability/{metrics,logs,traces,exporters,alerts,settings}`.
+`clicks.jsonl` shows `interact()` filling `input[type=email]` with `qa-sample@omnion.test` and
+pressing `button[type=submit]` labelled "Sign in" — eight separate times, one per screen. The
+session died partway through the desktop route list: alive for routes 0–7, dead from route 8
+(`/secrets/audit`) onward, and the mobile pass — a fresh context with its own sign-in — measured
+all thirteen correctly at 390px. A sign-in form has no broken image, no horizontal overflow, no
+unlabeled input and exactly one `h1`, so **"zero findings" is precisely what eight unmeasured
+screens look like.**
+
+**This also discredited tick 59's explanation of its own 215 highs.** Those eight stray presses
+each consumed the `sign_in` budget (`crates/security/src/limiter.rs` `defaults()`: 10 per 300 s),
+so the limiter was rejecting the harness's own re-sign-ins. "The limiter is working as designed"
+was a correct statement about a limiter being fed its refusals by the harness. Both halves were
+wrong: the limiter behaved correctly and the presses were ours.
+
+- **A green report is not evidence that a screen was measured.** Six ticks closed on this request
+  reading "zero findings". Nothing in the harness compared where the browser WAS against where it
+  was ASKED to go, so a pass that rendered a login form eight times and called it eight clean
+  screens was structurally indistinguishable from a real walk. This is the same family as tick
+  59's other finding (a depth pass is not a route entry), one level up: **a screen that was not
+  measured produces no findings at all**, and a report full of zeros is the most expensive shape a
+  false green can take.
+- **The same shape, second instance, in the depth passes.** `observabilityTraces` had ended at
+  `{ok: false, steps: 0}` after a 30 s fill timeout, and none of the run's 233 findings mentioned
+  it. `runDepthPass` recorded the failure, returned `{ok: false}` — and nothing downstream ever
+  read the return value. `steps: 0` is the tell: a pass that recorded one check has proved at
+  least one thing, so a zero next to `ok: false` means every assertion in it was skipped.
+  `failedDepthPasses` now carries those to the roll-up as `depth-pass-failed` HIGH.
+- **The unguarded `fill` that caused it was the bug its own comment above it warned about.** The
+  comment on the request-id box explains that an unguarded `fill` rejects when the element is not
+  attached and "kills the whole pass"; three sibling `fill` calls in the same function had no
+  `.catch`. Fixed by guarding them — the lesson was written down and then not applied four lines
+  below itself. **A guard documented in a comment is not a guard; count the call sites.**
+- **Fixes (`1403ab0f`), all in the harness, none in the product:** `sessionFault(page, route)`
+  returns the reason rather than throwing, so a route that lost its session is recorded
+  (`action: "route-not-measured"`, `notMeasured: true`) and skipped rather than measured — a page
+  that dies is a finding ABOUT that page. It is wired into **both** route loops: a phone context
+  can lose its session too, and 390px "zero overflow" is otherwise a measurement of the sign-in
+  form's phone layout. It distinguishes `/login` from `/setup` because they need different fixes.
+  The mobile unmeasured finding now carries its reason; "no diagnostics were produced" reads the
+  same for a lost session and a thrown navigation.
+
+**Proof.**
+
+| gate | result |
+| --- | --- |
+| `node scripts/qa/session-guard.test.cjs` | **9/9 checks, 5/5 defect mutations, 1/1 control** |
+| the same gate vs. the REAL pre-fix file from `HEAD` | **2/9, 0/5 mutations, exit 1** |
+| `cargo test -p omnion-security --quiet` | **208 passed, 0 failed** |
+| `pnpm typecheck` | 2/2 packages |
+| `node --check scripts/qa/walkthrough.cjs` | parses |
+| 7 existing QA gates (`wave5b-route-coverage`, `depth-pass-thunk`, `wizard-gate`, `wizard-behaviour`, `exports-states`, `focused-pass-args`, `preferences-restore`) | all PASS — not a trade |
+
+The deletion test is the part worth keeping: a guard added without one is a comment with a
+`throw` in it. Running the gate against the pre-fix file is what separates "the guard exists" from
+"the guard would have caught it".
+
+**Blocked on the slot, not on the box.** The confirming pass needs it; w7 holds it live —
+verified with `kill -0` **and** `/proc/3602963/cwd` = `/mnt/apopic/omnion-w7`, whose
+`clicks.jsonl` was written seconds before the check. Load 13 and 35 Chrome processes, so queuing
+is also the right call for the box. Not queued this tick: the code fix and its gate are the
+deliverable, and a queued run that outlives the tick would write a summary against a tree that has
+since moved on.
+
+**Next.** (a) The pass on a free slot — `--only=observability,secrets` covers the thirteen, and
+the guard now makes a lost session a red finding instead of a clean page. (b) Then REQ-126's close
+box can be ticked on a pass whose zeros mean something. (c) REQ-127/128/129 remain open on the
+same unticked gate; this tick's fix is the precondition for all four.
+
+**Reported, not edited.** `/opt` is at 99% (1.6 G free) and this worktree's `target` symlink
+points into it (14 G). Every sibling that can, keeps its target in `/dev/shm` instead. Not moved
+this tick: `/dev/shm` holds 17 G of live sibling targets on a box with 13 G available, and
+swapping a 14 G build directory between filesystems mid-tick is a bigger risk than the 1.6 G it
+buys. Flagged for the owner alongside the next disk pass.
