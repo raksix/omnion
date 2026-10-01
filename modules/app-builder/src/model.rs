@@ -336,10 +336,14 @@ pub struct PlanPage {
 
 /// What the list screen shows beside a plan.
 ///
-/// `Serialize` because the counts ride the **same body** as the plan they decorate, in the
-/// list and in every decision answer: a client that has to fetch a second endpoint to draw
-/// the footer bar is a screen that shows a number the reviewer cannot act on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+/// `Serialize` **and** `Deserialize` because the counts ride the same body as the plan they
+/// decorate, in the list and in every decision answer: a client that has to fetch a second
+/// endpoint to draw the footer bar is a screen that shows a number the reviewer cannot act
+/// on. The `Deserialize` half exists for the export file — `omnion.app-builder.plan/1`
+/// carries the counters so a reader outside the panel sees the same "4 accepted · 3 pending"
+/// the operator did, and a type that could only be written could not be read back to prove
+/// the file round-trips.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanCounts {
     /// Artifacts of every kind.
     pub artifacts: i64,

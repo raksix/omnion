@@ -31,6 +31,18 @@ pub enum AppBuilderError {
     #[error("{0}")]
     Ai(String),
 
+    /// The plan could not be rendered as the document it is exported as.
+    ///
+    /// Its own variant rather than folded into [`Self::Ai`] or [`Self::Database`] because
+    /// neither is the blame: the rows were read fine and no provider was called, so an
+    /// export that reported a store fault or an AI fault would send an operator to look in
+    /// the two places that cannot be at fault. `serde_json` cannot actually fail on these
+    /// types today — every field is a plain scalar, a `String`, an `Option`, a `Vec` or a
+    /// `Value` — and the variant is here so that a future field which *can* fail is
+    /// reported honestly instead of being unwrapped.
+    #[error("the plan could not be written as an export document: {0}")]
+    Render(String),
+
     /// The plan, the prompt or an artifact breaks a rule.
     #[error("{message}")]
     Invalid {
@@ -123,6 +135,7 @@ impl AppBuilderError {
             Self::Database(_) => "app_builder_store_error",
             Self::Audit(_) => "app_builder_audit_error",
             Self::Ai(_) => "ai_provider_error",
+            Self::Render(_) => "app_builder_export_failed",
             Self::Blocked(_) => "app_builder_blocked",
             Self::Invalid { code, .. } => code,
         }

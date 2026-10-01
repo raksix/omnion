@@ -20,12 +20,17 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod export;
 pub mod generate;
 pub mod model;
 pub mod store;
 pub mod validate;
 
 pub use error::{AppBuilderError, BlockedArtifact, Result, describe_blocker};
+pub use export::{
+    EXPORT_SCHEMA, ExportArtifact, ExportBlocker, PlanExport, build_plan_export, empty_plan_export,
+    export_filename, render_plan_export,
+};
 pub use generate::{Generated, kind_rank, missing_required_kinds, normalize, schema_prompt};
 pub use model::{
     ARTIFACT_STATUSES, AppBuilderApplication, AppBuilderApplicationStep, AppBuilderArtifact,
