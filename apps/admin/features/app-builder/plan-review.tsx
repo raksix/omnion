@@ -389,6 +389,7 @@ export function PlanReview({ planId }: { planId: string }) {
         const answer = await acceptAppBuilderArtifact(planId, artifact.id);
         absorb(answer.artifact, answer.counts, answer.blockers);
         setNotice(`Accepted ${artifact.kind} · ${artifact.key}`);
+        setActionError(null);
       } catch (cause: unknown) {
         setActionError(
           cause instanceof ApiError ? cause.message : "That artifact could not be accepted.",
@@ -415,6 +416,7 @@ export function PlanReview({ planId }: { planId: string }) {
         setRejectingId(null);
         setRejectReason("");
         setNotice(`Rejected ${artifact.kind} · ${artifact.key}`);
+        setActionError(null);
       } catch (cause: unknown) {
         setActionError(
           cause instanceof ApiError ? cause.message : "That artifact could not be rejected.",
@@ -441,6 +443,7 @@ export function PlanReview({ planId }: { planId: string }) {
         const answer = await editAppBuilderArtifact(planId, artifact.id, parsed);
         absorb(answer.artifact, answer.counts, answer.blockers);
         setEditingId(null);
+        setActionError(null);
         setNotice(`Saved ${artifact.key} — re-validated against the same rules the generator faced`);
       } catch (cause: unknown) {
         setActionError(cause instanceof ApiError ? cause.message : "That artifact could not be saved.");
@@ -470,6 +473,7 @@ export function PlanReview({ planId }: { planId: string }) {
           {
             onArtifact: (answer) => {
               absorb(answer.artifact, answer.counts, answer.blockers);
+              setActionError(null);
               setNotice(`Regenerated ${artifact.key} — the previous version is kept in the tree`);
             },
           },
@@ -504,6 +508,7 @@ export function PlanReview({ planId }: { planId: string }) {
       await rejectAppBuilderPlan(planId, reason);
       setRejectPlanOpen(false);
       setPlanRejectReason("");
+      setActionError(null);
       setNotice("The plan was rejected. The artifacts stay readable.");
       await load();
     } catch (cause: unknown) {

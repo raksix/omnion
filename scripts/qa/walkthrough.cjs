@@ -2886,13 +2886,22 @@ async function runAppBuilderConsole(page, report) {
 
   // `j` moves the selection: the keyboard is advertised in the tree's own header, so a
   // handler-less `j` is a claim the screen makes and does not keep.
+  //
+  // The focus matters and is not a detail. The handler sits on the screen's wrapper element, and
+  // a key event only reaches it when focus is ALREADY inside that element — clicking the tree's
+  // top-left corner hits a `<div>`, which is not focusable, so focus stayed on `<body>` and the
+  // event never bubbled through. The pass would have failed on a keyboard that worked perfectly
+  // for a person, because the *fixture* was not focusing anything. Clicking the first artifact
+  // ROW is the focus: it is a button, and it is where a reviewer's cursor already is.
   const beforeKey = focusedKey;
-  await page.locator("[data-artifact-tree]").click({ position: { x: 5, y: 5 } }).catch(() => {});
+  await page.locator("[data-artifact-row]").first().click().catch(() => {});
+  await page.waitForTimeout(300);
+  const beforeAfterFocus = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
   await page.keyboard.press("j");
   await page.waitForTimeout(350);
   const afterKey = (await page.locator("[data-focused-key]").first().innerText().catch(() => "")) || "";
-  note({ beforeKey, afterKey, keyboardMoved: beforeKey !== afterKey });
-  if (beforeKey === afterKey) {
+  note({ beforeKey, afterKey, afterFocusKey: beforeAfterFocus, keyboardMoved: beforeAfterFocus !== afterKey });
+  if (beforeAfterFocus === afterKey) {
     steps.ok = false;
     steps.reason = "`j` did not move the artifact selection";
   }
@@ -2945,23 +2954,44 @@ async function runAppBuilderConsole(page, report) {
     await page.waitForTimeout(1200);
     const acceptedError = (await page.locator("[data-action-error]").first().innerText().catch(() => "")) || "";
     const stillInvalid = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = 'leave_requests.reason'`);
+    // The refusal must NAME the artifact it refused. "Something went wrong" is the same dead end
+    // the store's own message was written to avoid.
     note({ invalidKey: invalidKey.slice(0, 40), acceptRefusal: acceptedError.slice(0, 90), stillInvalid: stillInvalid.trim() });
+    if (!acceptedError.includes("leave_requests.reason")) {
+      steps.ok = false;
+      steps.reason = `the refusal for an invalid artifact does not name it: "${acceptedError.slice(0, 120)}"`;
+    }
     if (stillInvalid.trim() !== "invalid") {
       steps.ok = false;
       steps.reason = "an artifact the validator refused was ACCEPTED — the guard did not hold";
     }
   }
 
-  const acceptRow = page.locator('[data-artifact-row][data-artifact-status="pending"]').first();
-  if (await acceptRow.count()) {
-    const acceptKey = qaSql(`select key from app_builder_artifacts where plan_id = '${planId}' and status = 'pending' order by ordinal limit 1`).trim();
-    await page.locator(`[data-artifact-row]`).filter({ hasText: acceptKey }).first().click().catch(() => {});
+  const acceptTarget = qaSql(
+    `select id || '|' || key from app_builder_artifacts
+      where plan_id = '${planId}' and status = 'pending' order by ordinal limit 1`,
+  ).trim();
+  const [acceptId, acceptKey] = acceptTarget.split("|");
+  if (acceptId && acceptKey) {
+    // Addressed by ROW ID, never by text. This fixture's keys are `leave_requests`,
+    // `leave_requests.reason`, `leave_requests.approved_by` and `leave_requests.list`, so a
+    // `hasText` filter on any of them also matches all three siblings and `.first()` lands on
+    // the entity every time -- the pass would then accept the artifact it had already rejected
+    // and read its own failure as a product defect.
+    await page.locator(`[data-artifact-row="${acceptId}"]`).first().click().catch(() => {});
     await page.waitForTimeout(300);
     await page.click("[data-accept-artifact]").catch(() => {});
     await page.waitForTimeout(1200);
     const acceptedNow = qaSql(`select status from app_builder_artifacts where plan_id = '${planId}' and key = '${acceptKey}'`);
     const footerAfter = (await page.locator("[data-counter-accepted]").first().innerText().catch(() => "")) || "";
-    note({ acceptKey, acceptedNow: acceptedNow.trim(), footerAfter });
+    const bannerAfterSuccess = (await page.locator("[data-action-error]").count()) > 0;
+    note({ acceptKey, acceptedNow: acceptedNow.trim(), footerAfter, bannerAfterSuccess });
+    // A refusal banner that outlives its own resolution reads as a stuck screen: the operator
+    // refuses an artifact, presses Accept on the next one, and is still told about the first.
+    if (bannerAfterSuccess) {
+      steps.ok = false;
+      steps.reason = "the refusal banner survived a successful action beside it";
+    }
     if (acceptedNow.trim() !== "accepted") {
       steps.ok = false;
       steps.reason = `accepting ${acceptKey} left the row at "${acceptedNow.trim()}"`;
@@ -2986,8 +3016,10 @@ async function runAppBuilderConsole(page, report) {
 
   // The entity artifact renders a FIELD TABLE, not a JSON blob: the request names the columns
   // (key, label, type, required, unique, default) and a reviewer reads a table.
-  const entityRow = page.locator('[data-artifact-row]').filter({ hasText: "leave_requests" }).first();
-  await entityRow.click().catch(() => {});
+  const entityId = qaSql(
+    `select id from app_builder_artifacts where plan_id = '${planId}' and kind = 'entity' order by ordinal limit 1`,
+  ).trim();
+  await page.locator(`[data-artifact-row="${entityId}"]`).first().click().catch(() => {});
   await page.waitForTimeout(400);
   const entityHeaders = await page.locator("[data-artifact-detail] table thead th").allInnerTexts().catch(() => []);
   note({ entityHeaders });
