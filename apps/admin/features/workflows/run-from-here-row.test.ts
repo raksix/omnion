@@ -217,7 +217,15 @@ test("the run is read AFTER IT SETTLES, and the note says whether it ever did", 
   // landing inside the same engine tick see the same bytes twice and call it settled, which
   // reproduces the original defect at a smaller scale.
   const helperStart = WALKTHROUGH.indexOf("async function settleRun(");
-  const helperEnd = WALKTHROUGH.indexOf("async function interact(");
+  // The window ends where `settleRun` ENDS, not where `interact` begins. It used to end at
+  // `interact`, which was correct while `settleRun` was the only helper in that gap — and tick
+  // 62 added `settleGraph` and `awaitEdgeSelection` beside it, so the window silently grew to
+  // cover all three. The mutation that reports a hung run as settled then rewrites
+  // `settleRun`'s `settled: false` and the assertion still passes, because the sibling helper
+  // has one of its own. A window that spans more code than the construct under test is a
+  // window that can be satisfied by the wrong occurrence, and it fails as a green suite
+  // reporting a guard that has stopped guarding.
+  const helperEnd = WALKTHROUGH.indexOf("async function settleGraph(", helperStart);
   assert.ok(helperStart !== -1 && helperEnd > helperStart, "the settle helper must exist");
   const helper = WALKTHROUGH.slice(helperStart, helperEnd);
   assert.ok(
