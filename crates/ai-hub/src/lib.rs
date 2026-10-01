@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod airgap_store;
 pub mod agent_sdk;
 pub mod approvals;
 pub mod catalog;

@@ -154,6 +154,21 @@ pub enum AiHubError {
     /// list is refused. Every message names the operation it is about.
     #[error("invalid change set: {0}")]
     InvalidChangeSet(String),
+    /// An air-gap setting breaks one of the switch's own rules (REQ-106 slice 2).
+    ///
+    /// Its own code for the same reason as the three above: the refusal belongs on a field of
+    /// the switch form — a blank reason, a reason of four characters, an allow-list entry that
+    /// is a whole URL pasted into a host box — and a client that mapped it onto `invalid_change_set`
+    /// or `invalid_approval` would print a sentence about change sets above the reason input.
+    #[error("invalid air-gap setting: {0}")]
+    InvalidAirgap(String),
+    /// No allow-list entry carries this id.
+    ///
+    /// A `404`, never a 403, and for the same reason as every other not-found in this crate: a
+    /// delete that reports success for a row that was never there makes the settings screen
+    /// claim a deletion that did not happen.
+    #[error("no air-gap allow-list entry `{0}`")]
+    AirgapHostNotFound(Uuid),
     /// No change set carries that id in this organization.
     ///
     /// `NotFound` for the same tenancy reason as [`Self::ApprovalNotFound`]: a set id that
@@ -318,6 +333,8 @@ impl AiHubError {
             // the review form, and a client that collapsed them would print the sentence
             // above the title.
             Self::InvalidChangeSet(_) => "invalid_change_set",
+            Self::InvalidAirgap(_) => "invalid_airgap",
+            Self::AirgapHostNotFound(_) => "airgap_host_not_found",
             Self::ChangeSetNotFound(_) => "change_set_not_found",
             Self::IdentityNotFound(_) => "identity_not_found",
             Self::IdentityConflict(_) => "identity_conflict",
