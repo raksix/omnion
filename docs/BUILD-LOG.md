@@ -11169,3 +11169,51 @@ reached neither line. `cargo test -p omnion-api --lib` 339, `cargo test -p omnio
 in them — a crate that would not compile, and a server that would not start — were both invisible
 to the gate that ran every tick, because the gate's own command was not the one that broke. The
 browser pass is queued behind a live w3 holder and is still the thing that closes them.
+
+### Tick 100, closed out — the first pass over this build, and what it found
+
+**The pass ran: 293 findings (281 high), 1262 clicks, 1293 shots. Fourteen of the findings are
+mine**, and the first thing it proved is the thing tick 98 and tick 99 were about: the gate works.
+`cluster-panel-gate-selftest.cjs` and the pass both reported what was actually true, including one
+claim that failed.
+
+**Green, and worth naming because the negative claims are the load-bearing ones:**
+
+* Seven of the eight maintenance claims: cards render per environment, a blank message is refused,
+  the panel reads the window open, the banner is visible and carries the operator's own words, and
+  closing the window unblocks writes.
+* All five cluster claims — including `cluster-single-invents-no-figures`, the one that matters
+  most, because a panel that shows a figure it did not measure is worse than no panel. On this
+  single instance it shows a reason and invents nothing.
+
+**Failed, and fixed.** `maintenance-banner-clears`: the strip was still up one poll interval after
+the window closed. That is the one direction a maintenance notice must not fail in — every write
+succeeds again and the panel keeps claiming they do not, until somebody believes it. The cause is
+that a strict interval can only answer how stale the strip is *on average*, never how stale it is
+*now*, and the pass waits 36 s against a 30 s loop, so the race is real rather than theoretical.
+`60178a0d` re-reads on `visibilitychange` and `focus`.
+
+**The other 12 are not product defects, and saying so is a measurement too:**
+
+* The three `404`s on `/api/v1/deployment/cluster` are the designed `not_a_cluster` answer — a
+  single instance must not render an empty cluster, and refusing is how the negative claim above
+  becomes provable.
+* The four `422`s are the blank-message refusals the pass *itself* provokes as a step.
+* The `no-h1` on `/deployment/checks` is a **symptom**: that screen was 500ing during the pass, so
+  its shell never rendered. `AppShell` renders the `h1` at line 306 — read, not assumed — and
+  `GET /deployment/checks` answers **200** with a full body against a clean database.
+
+**The 500s are one symptom across seven modules, and they are not mine.** The same 500 hit
+`/notifications`, `/events`, `/webhooks/…/deliveries`, `/cdn/rules`, `/settings/iam/simulator` and
+`/organizations/…/members` at the same moment, and each of those routes returns 200 in isolation.
+`/deployment/checks` joins that list only because it was on screen at the time. The one shared
+resource I could find is the rate limiter logging `could not reach its counter; failing OPEN` — but
+that fails *open*, by design, so it explains the log line and not the 500. **Recorded as a blocker
+for whoever owns the shared Postgres/Redis, not closed here:** a pass that reports one symptom seven
+times is a pass measuring a shared resource, and a writer should say so rather than fix seven
+endpoints.
+
+**Still owed, and not claimed:** slices 1 and 2's remaining boxes — the deploy wizard walk, `View
+Changes`, the failed-step rollback banner, and the mobile/keyboard sweep. Each needs its own pass.
+
+**Next.** The deploy-wizard pass (slice 2's browser half), then the next wave-5 request.
