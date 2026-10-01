@@ -7243,3 +7243,17 @@ Next: read the re-run pass (it was started at 09:29 with the depth-pass fix in t
 tick began with an uncommitted tree from tick 49 that had a syntax error in its new test file — a
 tree that was never run). Two REQ-129 criteria are now tickable; the zero-downtime recipe, the
 backfill restart/pause proofs, the seeds and the anonymised export remain.
+
+**The re-run pass, honestly: past the crash, still not finished.** The 09:29 pass was launched with
+the depth-pass fix in the tree, so the first thing it proves is that `runDeploymentMigrationsDepth`
+no longer takes the process down — it walks past the exact point where the 08:27 pass died
+(`report.push is not a function` after 400+ screenshots) and continues into the reliability depth
+passes. At 10:04 it had **not** yet reached `deployment-artifacts` or `deployment-migrations` in the
+log, and `walkthrough.cjs` sat at **0.0 % CPU in state `Sl`** with 50 chrome processes alive — the
+`load average: 13.62` shape that tick 49 recorded as "starved, not finished". The box is six cores
+shared with six sibling writers compiling. So the browser leg is **still owed** for the two
+deployment screens, and this tick says so rather than reading a pass that was still walking as a
+pass that passed.
+
+What the pass DID establish: the depth-pass fix is load-bearing in the one direction that matters —
+a defect that previously ended the whole process no longer ends it.
