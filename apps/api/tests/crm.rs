@@ -463,6 +463,19 @@ async fn narrow_to_level(
         .expect("the narrowing binding must be created");
 }
 
+/// An RFC 3339 instant `days` from now — for a `due_at` that must be in the **future**.
+///
+/// The module refuses a task due before it happened (`a task cannot be due before it happened`),
+/// which is the right rule, and it makes a **hard-coded** due date a walk that expires on a
+/// fixed day: two of these carried `2026-10-01T09:00:00Z`, and the suite went red on the morning
+/// it passed, with a 400 that reads like a broken validation rule rather than a fixture that ran
+/// out of date. A test's inputs should not include the current date.
+fn due_in(days: i64) -> String {
+    let when = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+    when.format(&time::format_description::well_known::Rfc3339)
+        .expect("an RFC 3339 instant must format")
+}
+
 /// Put two accounts in one group — the membership a `team` level reads.
 async fn share_a_group(db: &Db, organization_id: Uuid, members: &[Uuid]) {
     let slug = format!("crm-team-{}", Uuid::new_v4().simple());
@@ -3466,7 +3479,7 @@ async fn every_activity_route_is_permission_guarded() {
             Some(&manager),
             Some(json!({
                 "kind": "task", "subject": format!("Guard {marker}"),
-                "deal_id": deal_id, "due_at": "2026-10-01T09:00:00Z",
+                "deal_id": deal_id, "due_at": due_in(1),
             })),
         ),
     )
@@ -3683,7 +3696,7 @@ async fn the_activity_feed_filters_by_kind_and_by_state() {
             Some(&manager),
             Some(json!({
                 "kind": "task", "subject": format!("Task {marker}"),
-                "contact_id": contact_id, "due_at": "2026-10-01T09:00:00Z",
+                "contact_id": contact_id, "due_at": due_in(1),
             })),
         ),
     )
