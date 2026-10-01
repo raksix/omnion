@@ -30,6 +30,8 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use omnion_audit::NewAuditEntry;
+use omnion_events::NewEvent;
 use omnion_module_hr::me::{self, MyProfile};
 use omnion_module_hr::{HrError, leave as hr_leave, requests as hr_requests};
 use time::Date;
@@ -38,8 +40,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::auth::CurrentSession;
+use crate::client_ip::ClientAddress;
 use crate::error::ApiError;
-use crate::routes::crm::organization_of;
+use crate::routes::crm::{emit, organization_of};
+use crate::routes::iam::record;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------------------------
@@ -190,6 +194,7 @@ pub async fn my_leave_request(
 pub async fn create_my_leave_request(
     State(state): State<AppState>,
     current: CurrentSession,
+    address: ClientAddress,
     Json(body): Json<MyLeaveRequestBody>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let organization_id = organization_of(&state, &current, None).await?;
@@ -206,6 +211,58 @@ pub async fn create_my_leave_request(
         body.reason,
     )
     .await?;
+    // **The audit row and the event are not an HR privilege.** They are written here by the same
+    // two helpers the HR route uses, from the same `event_ref`, precisely because "the employee
+    // has no key" must not also mean "what the employee did is invisible". The absence here was a
+    // real hole: this file had two writes and zero of either, so the most common leave action in
+    // any organization — a person booking and withdrawing their own holiday — left no trail an
+    // auditor could read, and fired nothing an automation could wait on. Both twins
+    // (`hr_leave::create_request` / `cancel_request`) do exactly this; a surface whose whole
+    // argument is that it is *the same action* through a shorter path cannot be the one surface
+    // that is not recorded.
+    //
+    // The payload is `event_ref()`, which carries ids and dates and never the `reason` — that
+    // string is the employee's own words and this event travels to third-party webhooks.
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "hr.leave.requested")
+            .organization(organization_id)
+            .target("hr_leave_request", created.id.to_string())
+            .metadata(json!({
+                "employee_id": created.employee_id,
+                "leave_type_id": created.leave_type_id,
+                "starts_on": created.starts_on,
+                "ends_on": created.ends_on,
+                "days": created.days,
+                "leave_status": created.leave_status,
+                "self_service": true,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+    emit(
+        &state,
+        NewEvent::new("hr.leave.requested")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(created.event_ref()),
+    )
+    .await;
+
+    // A type that needs no approval is approved on creation, and the twin emits the same second
+    // event for the same reason: an automation waiting on `hr.leave.approved` must not silently
+    // never fire in the organization that turned approval off. An employee who never learns they
+    // must request in advance is the person most likely to be off without the record.
+    if created.leave_status == "approved" {
+        emit(
+            &state,
+            NewEvent::new("hr.leave.approved")
+                .organization(organization_id)
+                .actor(current.user.id)
+                .payload(created.event_ref()),
+        )
+        .await;
+    }
     Ok((StatusCode::CREATED, Json(json!(created))))
 }
 
@@ -218,12 +275,45 @@ pub async fn create_my_leave_request(
 pub async fn cancel_my_leave_request(
     State(state): State<AppState>,
     current: CurrentSession,
+    address: ClientAddress,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     let organization_id = organization_of(&state, &current, None).await?;
     let (employee_id, _) =
         me::my_leave_scope(state.db().pool(), organization_id, current.user.id).await?;
     let cancelled = me::cancel_own_request(state.db().pool(), organization_id, employee_id, id).await?;
+    // The withdrawal is audited and announced for the same reason the request above is, and the
+    // pair matters more than either alone: a request that was raised and then quietly withdrawn
+    // is the one a balance dispute is actually about, and "when did they decide to cancel that?"
+    // is answerable only because the cancel left a row of its own.
+    //
+    // The **actor is `current.user.id`**, not the employee id the store was given. Those are two
+    // different rows (`hr_employees.id` versus `users.id`), and the audit trail's `actor_user_id`
+    // column is about the account that acted — the same id the twin writes. The store takes the
+    // employee id only to prove ownership; it discards its `cancelled_by` argument
+    // (`let _ = cancelled_by;` in `requests::cancel_request`), so the identity of the actor is
+    // this route's responsibility and nothing else records it.
+    record(
+        &state,
+        NewAuditEntry::by_user(current.user.id, "hr.leave.cancelled")
+            .organization(organization_id)
+            .target("hr_leave_request", cancelled.id.to_string())
+            .metadata(json!({
+                "employee_id": cancelled.employee_id,
+                "days": cancelled.days,
+                "self_service": true,
+            }))
+            .ip_address(address.as_text()),
+    )
+    .await?;
+    emit(
+        &state,
+        NewEvent::new("hr.leave.cancelled")
+            .organization(organization_id)
+            .actor(current.user.id)
+            .payload(cancelled.event_ref()),
+    )
+    .await;
     Ok(Json(json!(cancelled)))
 }
 

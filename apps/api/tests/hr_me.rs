@@ -778,3 +778,174 @@ async fn the_self_service_routes_refuse_an_anonymous_caller() {
         write.body
     );
 }
+
+/// The self-service writes are **recorded**, and the walk is about the recording rather than the
+/// booking — the booking itself is already proved above.
+///
+/// The hole this closes: slice 2c shipped this surface with two writes and **zero** audit rows
+/// and **zero** events, while both HR twins (`/hr/leave/requests` and `…/cancel`) did both. The
+/// argument for the surface is that it is the *same action* through a shorter path, and it was
+/// the one path where the action left no trace. So the most common leave transaction in any
+/// organization — the employee books, then withdraws — was invisible to the audit screen and
+/// invisible to every automation, which is exactly the pair of consumers the request's own
+/// criteria name.
+///
+/// Four separate claims, each with the failure it would produce:
+///
+/// * **The audit row names the request.** A trail that recorded "somebody did something in HR"
+///   without the request id could not answer a dispute about *that* booking.
+/// * **The actor is the account, not the employee row.** `hr_employees.id` and `users.id` are
+///   different ids and the handler is handed both; `actor_user_id` has to be the one the audit
+///   screen's IAM join resolves to a person. Asserting the account id is what tells the two
+///   apart — a walk asserting only "a row exists" cannot see this at all.
+/// * **The event fires and carries no reason.** `reason` is the employee's own words and these
+///   events travel to third-party webhooks, so the payload is checked for the ids *and* for the
+///   absence of the string they typed.
+/// * **The cancel is its own row.** A booking raised and then withdrawn leaves two entries,
+///   because "when did they change their mind?" is what a balance dispute asks, and a single row
+///   carrying the final status answers nothing about the interval.
+#[tokio::test]
+async fn a_self_service_write_is_audited_and_announced_exactly_like_its_hr_twin() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let plain = fixture.token(&fixture.plain).await;
+    fixture
+        .employee_for(&fixture.plain, "Ada", "Lovelace")
+        .await;
+    let annual = fixture.annual_type_via_self(&plain).await;
+    let type_id = id_of(&annual);
+
+    // The one string this walk plants, so its absence from the event payload is a real
+    // assertion rather than a field that never existed.
+    let reason = "A private reason nobody outside may read";
+
+    // Counters are taken **before** and **after**, and the assertion is the difference.
+    // Absolute counts would compare this tenant's ledger against itself in a database other
+    // walks write to concurrently, where an absolute number is a statement about the box and
+    // not about this walk's two writes.
+    let before: (i64, i64) = sqlx::query_as(
+        "select (select count(*) from audit_log where action in ('hr.leave.requested', 'hr.leave.cancelled') and organization_id = $1), \
+                (select count(*) from events where name in ('hr.leave.requested', 'hr.leave.cancelled') and organization_id = $1)",
+    )
+    .bind(fixture.organization)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the counters must run");
+
+    let created = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            "/api/v1/hr/me/leave/requests",
+            Some(&plain),
+            Some(json!({
+                "leave_type_id": type_id,
+                "starts_on": "2026-10-05",
+                "ends_on": "2026-10-11",
+                "reason": reason,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the write must still succeed — this walk is about what it leaves behind: {}",
+        created.body
+    );
+    let request_id = created.body["id"].as_str().expect("an id").to_owned();
+    let user_id: Uuid = sqlx::query_scalar("select id from users where email = $1")
+        .bind(&fixture.plain)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("the account must exist");
+
+    // The audit row, read back from the table the audit screen itself reads.
+    let actions: Vec<String> = sqlx::query_scalar(
+        "select action from audit_log where organization_id = $1 and target_id = $2 order by id",
+    )
+    .bind(fixture.organization)
+    .bind(&request_id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("the audit query must run");
+    assert!(
+        actions.contains(&"hr.leave.requested".to_owned()),
+        "a self-service booking must be audited and must name the request; found {actions:?} \
+         for target {request_id}"
+    );
+    let actor: Option<Uuid> = sqlx::query_scalar(
+        "select actor_user_id from audit_log where organization_id = $1 and target_id = $2 \
+         and action = 'hr.leave.requested' order by id desc limit 1",
+    )
+    .bind(fixture.organization)
+    .bind(&request_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the audit row must exist");
+    assert_eq!(
+        actor,
+        Some(user_id),
+        "the audit actor must be the ACCOUNT that acted, not the employee row — \
+         hr_employees.id and users.id are different ids and the handler is handed both"
+    );
+
+    // The event, with the ids the request's own event section promises and none of the words.
+    let payload: Value = sqlx::query_scalar(
+        "select payload from events where name = 'hr.leave.requested' and organization_id = $1 \
+         order by id desc limit 1",
+    )
+    .bind(fixture.organization)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("hr.leave.requested must reach the bus after a self-service booking");
+    assert_eq!(
+        payload["leave_request_id"].as_str().expect("the id"),
+        request_id,
+        "the event must name the request it is about: {payload}"
+    );
+    assert!(
+        payload.get("reason").is_none(),
+        "a reason is the employee's own words and this event reaches third-party webhooks: {payload}"
+    );
+
+    // And the withdrawal: its own row and its own event, not an edit of the row above.
+    let cancelled = call(
+        &fixture.state,
+        request(
+            Method::POST,
+            &format!("/api/v1/hr/me/leave/requests/{request_id}/cancel"),
+            Some(&plain),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancelled.status,
+        StatusCode::OK,
+        "the caller must be able to withdraw their own pending request: {}",
+        cancelled.body
+    );
+
+    let after: (i64, i64) = sqlx::query_as(
+        "select (select count(*) from audit_log where action in ('hr.leave.requested', 'hr.leave.cancelled') and organization_id = $1), \
+                (select count(*) from events where name in ('hr.leave.requested', 'hr.leave.cancelled') and organization_id = $1)",
+    )
+    .bind(fixture.organization)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("the counters must run");
+
+    assert_eq!(
+        after.0 - before.0,
+        2,
+        "a booking and a withdrawal are two audit rows, because 'when did they change their \
+         mind?' is the question a balance dispute actually asks"
+    );
+    assert_eq!(
+        after.1 - before.1,
+        2,
+        "and two events, or every automation waiting on hr.leave.cancelled waits forever"
+    );
+}
