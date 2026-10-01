@@ -952,10 +952,14 @@ pub async fn fail_stale_runs(pool: &PgPool, seconds: i64) -> Result<Vec<Uuid>> {
         "update ai_eval_runs set status = 'error', gate = 'none', \
            total_cases = coalesce(total_cases, 0), finished_at = now(), updated_at = now(), \
            error = $1 \
-         where status = 'running' and started_at < now() - make_interval(secs => $2::double) \
+         where status = 'running' and started_at < now() - make_interval(secs => $2::double precision) \
          returning id",
     )
     .bind("this run was abandoned by the runner before it settled")
+    // `make_interval(secs => …)` takes a `double precision`, but a **named** argument carrying
+    // the `::double precision` cast is resolved as `double`, which this PostgreSQL has no type
+    // for: `type "double" does not exist`. Positional `$2::double precision` is the same value
+    // through a cast PostgreSQL does know.
     .bind(seconds.max(1) as f64)
     .fetch_all(pool)
     .await?;
@@ -1062,6 +1066,68 @@ pub struct RunStats {
     pub cost_micros: i64,
     /// The window the numbers cover.
     pub days: i64,
+}
+
+/// Copy a settled run's verdict onto its suite and its cases (migration 0234).
+///
+/// **Called from the same transaction as the settle.** The suite list renders `last_pass_rate`,
+/// `last_run_at` and `last_gate` as columns, and the Cases tab renders `last_status` per row —
+/// both are denormalised, so both are only correct if they are written by whoever settled the
+/// run. Splitting the write into its own statement after the settle would leave a window where
+/// the history says a run finished and the suite list still shows the previous run's number: a
+/// screen that contradicts itself for as long as the next load takes.
+///
+/// **The gate column is the run's own, not a recomputation.** A suite that blocked against a
+/// baseline which has since been re-pointed must keep showing the block it actually concluded,
+/// so nothing here calls [`decide_gate`] again. This function copies facts, it does not decide.
+///
+/// **Only a settled run may write.** The `where r.status in (...)` filter is the guard: a run
+/// that is still `queued` or `running` has no verdict to copy, and a row written for it would
+/// overwrite a previous run's rate with a null. The affected count is therefore the honest
+/// answer to "did this write anything", which the executor uses to decide whether the suite list
+/// and the run row can disagree.
+pub async fn project_last_run(
+    pool: &PgPool,
+    run_id: Uuid,
+    gate: &str,
+    verdict: Verdict,
+) -> Result<u64> {
+    let affected = sqlx::query(
+        "update ai_eval_suites s set last_pass_rate = $3, last_run_at = now(), \
+           last_gate = $2, last_run_id = $1 \
+         from ai_eval_runs r \
+         where r.id = $1 and r.suite_id = s.id \
+           and r.status in ('passed', 'failed', 'error', 'cancelled')",
+    )
+    .bind(run_id)
+    .bind(gate)
+    .bind(verdict.pass_rate)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
+}
+
+/// Copy each case's own result onto its case row, so the Cases tab's chip is a stored fact.
+///
+/// **A cancelled run's results are kept and projected too.** The request's acceptance row says a
+/// cancelled run keeps its partial results, and a case chip that said `pass` while the run it came
+/// from was `cancelled` would make the tab look like the case has never been green.
+///
+/// The join is on `case_id`, so a result whose case was deleted mid-run projects nothing — which
+/// is correct: there is no case row left to hold the chip, and inventing one would resurrect a
+/// case the operator deleted.
+pub async fn project_case_results(pool: &PgPool, run_id: Uuid) -> Result<u64> {
+    let affected = sqlx::query(
+        "update ai_eval_cases c set last_status = r.status, last_run_at = now() \
+         from ai_eval_case_results r \
+         where r.run_id = $1 and r.case_id = c.id",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
 }
 
 /// Build the snapshot a run carries.

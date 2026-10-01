@@ -516,6 +516,202 @@ pub fn validate_schedule(schedule: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a five-field cron expression fires at this instant.
+///
+/// **Minute resolution, and the caller owns the interval.** This answers "is *this* minute the
+/// schedule's minute", which is what makes a scheduler that wakes once a minute correct and a
+/// scheduler that wakes every 250 ms harmless: the second wakes four times inside the same minute
+/// and this predicate says yes four times, so **the caller must also check that it has not already
+/// queued this minute**. That guard is [`has_active_run`]'s job for a running suite and the
+/// `last_run_at` column's for a finished one.
+///
+/// Fields are `minute hour day-of-month month day-of-week`, and each supports `*`, `a-b`,
+/// `a,b,c` and `*&#47;n` (step). Names (`jan`, `mon`) are **not** supported: `validate_schedule`
+/// accepts any five-field string and this function refuses the ones it cannot honour, so a suite
+/// saved with `0 3 * jan mon` fails loudly here instead of never firing. Day-of-week is 0=Sunday
+/// and 6=Saturday, which is what cron means; when both day fields are restricted, cron semantics
+/// are a union — a schedule of `0 3 * * 1` (Mondays) or `0 3 15 * *` (the 15th) fires on both.
+#[must_use]
+pub fn cron_fires(expression: &str, now: time::OffsetDateTime) -> bool {
+    let Some((minute, hour, dom, month, dow)) = parse_cron(expression) else {
+        return false;
+    };
+    field_matches(&minute, now.minute() as u32)
+        && field_matches(&hour, now.hour() as u32)
+        // `time::Month` is an enum, not a `u32`, and it does not implement `From` — the
+        // conversion is `u8::from(month) + 1`, because the enum starts at January = 1. Writing
+        // `u32::from(now.month())` fails to compile rather than silently wrapping, which is the
+        // behaviour we want from a month field: there is no sensible wrong answer here.
+        && field_matches(&month, u32::from(u8::from(now.month())) + 1)
+        && day_matches(&dom, &dow, now)
+}
+
+/// The five parsed fields, or `None` when the expression is not one this can honour.
+fn parse_cron(expression: &str) -> Option<(Field, Field, Field, Field, Field)> {
+    let parts: Vec<&str> = expression.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    Some((
+        parse_field(parts[0], 0, 59)?,
+        parse_field(parts[1], 0, 23)?,
+        parse_field(parts[2], 1, 31)?,
+        parse_field(parts[3], 1, 12)?,
+        parse_field(parts[4], 0, 6)?,
+    ))
+}
+
+/// One cron field: the values it names, already expanded.
+#[derive(Debug, Clone)]
+struct Field {
+    /// Every value the field matches, expanded from ranges, lists and steps.
+    values: Vec<u32>,
+    /// Whether the field was `*` (or `*&#47;n`), which is what decides the day-of-month /
+    /// day-of-week union rule below.
+    unrestricted: bool,
+}
+
+/// Parse one field, refusing anything outside `[min, max]`.
+///
+/// A field that names a value outside its range (`minute 75`) is refused rather than clamped:
+/// clamped, it would silently become a schedule the operator did not write, and the suite would
+/// run at a time nobody chose.
+fn parse_field(spec: &str, min: u32, max: u32) -> Option<Field> {
+    let mut values = Vec::new();
+    for term in spec.split(',') {
+        let (range, step) = match term.split_once('/') {
+            Some((range, step)) => {
+                let step: u32 = step.parse().ok()?;
+                if step == 0 {
+                    return None;
+                }
+                (range, step)
+            }
+            None => (term, 1),
+        };
+        let (from, to) = if range == "*" {
+            (min, max)
+        } else if let Some((from, to)) = range.split_once('-') {
+            (from.parse().ok()?, to.parse().ok()?)
+        } else {
+            // A bare `5` is a one-value field, and `5/2` means "from 5 to the end, every 2" —
+            // which is why the single-value branch still honours the step below.
+            let value: u32 = range.parse().ok()?;
+            let end = if step > 1 { max } else { value };
+            (value, end)
+        };
+        if from > to || from < min || to > max {
+            return None;
+        }
+        let mut value = from;
+        while value <= to {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+            value += step;
+        }
+    }
+    if values.is_empty() {
+        return None;
+    }
+    Some(Field {
+        values,
+        unrestricted: spec.split(',').all(|term| term.starts_with('*')),
+    })
+}
+
+impl Field {
+    /// Whether this field names `value`.
+    fn matches(&self, value: u32) -> bool {
+        self.values.contains(&value)
+    }
+}
+
+/// `true` for a field that names every value.
+fn field_matches(field: &Field, value: u32) -> bool {
+    field.matches(value)
+}
+
+/// The day fields, under cron's union rule.
+fn day_matches(dom: &Field, dow: &Field, now: time::OffsetDateTime) -> bool {
+    let by_day_of_month = dom.matches(now.day() as u32);
+    // `number_days_from_sunday` is 0=Sunday, matching cron's numbering, so no re-basing.
+    let by_weekday = dow.matches(now.weekday().number_days_from_sunday() as u32);
+    match (dom.unrestricted, dow.unrestricted) {
+        // Either one unrestricted: the other decides.
+        (true, true) => true,
+        (true, false) => by_weekday,
+        (false, true) => by_day_of_month,
+        // Both restricted: cron ORs them, and a schedule naming "Mondays or the 15th" is the
+        // idiom this exists for.
+        (false, false) => by_day_of_month || by_weekday,
+    }
+}
+
+/// Every enabled suite with a schedule, so the runner can decide which are due.
+///
+/// **No time filter here.** Whether a schedule is due depends on `now`, and the acceptance row
+/// asks for a harness that advances a clock — pushing `now` into SQL would make the walk depend
+/// on a statement it cannot steer. The list is "every candidate", and [`schedule_due`] answers
+/// "is this one due" in Rust.
+pub async fn scheduled_suites(pool: &PgPool) -> Result<Vec<SuiteRow>> {
+    // **This statement needs its own FROM and its own sub-counts.** The first version carried
+    // only `where enabled and schedule is not null`, which made it two bugs at once: with no
+    // `from ai_eval_suites s` the `s.` prefixes had nothing to qualify (a syntax error at the
+    // first one), and `SuiteRow` is a projection of *more* columns than `SUITE_COLUMNS` — the
+    // three counts and the three last-run columns are part of the struct, so a query that
+    // selects only the base columns fails at the decode step with "the columns returned do not
+    // match". Selecting a struct is not "give me this struct's obvious fields".
+    let rows = sqlx::query_as::<_, SuiteRow>(&format!(
+        "select {SUITE_COLUMNS}, \
+           (select count(*) from ai_eval_cases c where c.suite_id = s.id) as case_count, \
+           (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled) as enabled_case_count, \
+           (select count(*) from ai_eval_cases c where c.suite_id = s.id and c.enabled \
+              and c.expected ? 'rubric') as rubric_case_count, \
+           null::numeric as last_pass_rate, \
+           null::timestamptz as last_run_at, \
+           null::text as last_gate \
+         from ai_eval_suites s \
+         where s.enabled and s.schedule is not null order by s.created_at"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Whether a suite's schedule fires now, resolving its preset first.
+///
+/// A preset (`hourly`, `daily`, `weekly`) is expanded by [`preset_cron`]; `custom` is stored as
+/// the literal cron expression the panel wrote. A suite whose stored value expands to nothing
+/// (`custom` with an empty expression) is **not** due — it can never be, and returning `true`
+/// would queue it once a minute forever.
+#[must_use]
+pub fn schedule_due(schedule: &str, now: time::OffsetDateTime) -> bool {
+    match preset_cron(schedule) {
+        Some(expanded) => cron_fires(expanded, now),
+        // Not a preset: the stored value is the cron expression itself.
+        None => cron_fires(schedule, now),
+    }
+}
+
+/// Whether this suite has a run in flight, so a schedule does not stack a second one behind it.
+///
+/// **Installation-wide rather than per tenant on purpose.** The claim that two runs of one suite
+/// would conflict is about the *suite row*, not about a caller's permissions, and a suite id is
+/// unique across tenants by its primary key — so scoping by organization could only ever answer
+/// "no" for a suite belonging to somebody else, which is the answer we want anyway but for the
+/// wrong reason. The runner calls this with a suite id it already holds from an unscoped claim.
+pub async fn has_active_run(pool: &PgPool, suite_id: Uuid) -> Result<bool> {
+    let row: (bool,) = sqlx::query_as(
+        "select exists (select 1 from ai_eval_runs \
+         where suite_id = $1 and status in ('queued', 'running'))",
+    )
+    .bind(suite_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Whether a suite has any case that needs the judge model.
 pub async fn suite_has_rubric_cases(pool: &PgPool, suite_id: Uuid) -> Result<bool> {
     let row: (bool,) = sqlx::query_as(

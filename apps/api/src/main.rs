@@ -11,7 +11,8 @@ use omnion_api::retention_runner;
 use omnion_api::routes;
 use omnion_api::state::AppState;
 use omnion_api::{
-    ai_agent_runner, ai_health_runner, ai_log_runner, analytics_runner, automation_runner,
+    ai_agent_runner, ai_eval_runner, ai_health_runner, ai_log_runner, analytics_runner,
+    automation_runner,
     backup_schedule_runner, backup_sweep_runner, restore_job_runner, event_retention_runner,
     event_runner, notification_runner, search_runner, workflow_runner,
 };
@@ -217,6 +218,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _agents = ai_agent_runner::spawn(state.clone());
     } else {
         tracing::info!("the agent runner is disabled (OMNION_AI_RUNNER=false)");
+    }
+
+    // The eval runner (REQ-107, slice 3) claims queued eval runs, scores each enabled case and
+    // settles the verdict; a second task sweeps for due schedules and a third fails runs the
+    // timeout caught. It has its own switch (`OMNION_AI_EVAL_RUNNER`) because it is the second
+    // background task that spends money — a rubric case costs a judge call on top of the one
+    // under test — and an installation that wants agent autonomy but no eval budget must be able
+    // to say exactly that. With it off, the run-start route answers `503 runner_disabled`
+    // instead of queueing runs nothing would ever claim.
+    if state.config().ai_hub.eval_runner_enabled {
+        let _evals = ai_eval_runner::spawn(state.clone());
+    } else {
+        tracing::info!("the eval runner is disabled (OMNION_AI_EVAL_RUNNER=false)");
     }
 
     // The route decision pruner (REQ-098, slice 3) drops decisions past the 90-day window once
