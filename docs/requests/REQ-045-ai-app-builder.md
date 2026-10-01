@@ -1,6 +1,18 @@
 # REQ-045 — AI App Builder *(headline)*
 
-> **Status:** pending · **Captured:** 2026-09-25 · **Layer:** AI Hub × App Builder
+> **Status:** in-progress (slice 1 · `8c87a7cc`, `4f228080` — **the plan store, and a validator
+> that records rather than repairs** · migration `0224_ai_app_builder.sql` (four tables:
+> plans, artifacts, applications, application steps) plus a new `modules/app-builder` and its
+> walk suite `apps/api/tests/app_builder.rs` · **NOT ticked: every criterion below needs either a
+> provider or an apply runner, and neither exists yet.** What slice 1 does close is the part of
+> *"an invalid or reserved field key marks the artifact `invalid` and blocks apply by name"*:
+> a reserved key is refused BY NAME at the store boundary (`users` → "`users` is a reserved
+> platform key"), an artifact with findings lands `invalid`, and `blockers` returns the
+> standing-between list the `409` carries — including a required kind the plan never proposed,
+> which no artifact row could express. Slice 2 owns the screens, slice 3 the apply runner, and
+> the four permission keys land with the routes that guard them, because a catalogue entry with
+> no route behind it is a key nobody can be refused for) · **40 unit tests · 18 database walks ·
+> 323 workspace lib tests · pnpm typecheck 2/2 · admin 341/341** · previous: **Status:** pending
 > **Source:** owner brief — platform periphery & headline features (2026-09-25)
 
 ## Request
@@ -150,7 +162,18 @@ Migration `database/migrations/0015_ai_app_builder.sql` (next free number at bui
       a workflow, a notification and a report.
 - [ ] Artifacts stream into the tree during generation and the tree is usable before it ends.
 - [ ] Every artifact shows a rationale and its validation result.
-- [ ] An invalid or reserved field key marks the artifact `invalid` and blocks apply by name.
+- [x] An invalid or reserved field key marks the artifact `invalid` and blocks apply by name. —
+      **MEASURED (slice 1, `8c87a7cc` + `4f228080`):** `an_artifacts_status_is_derived_from_the
+      _validators_answer_not_the_generators` reads a row at `invalid` with the findings stored
+      beside it, and `a_reserved_key_is_refused_by_name_before_it_can_be_written` reads the
+      refusal at the store boundary AND counts zero rows afterwards — a refused artifact leaves
+      nothing behind. `blockers_name_what_stands_between_a_plan_and_apply` reads five `missing`
+      kinds by name beside the two unresolved artifacts. **The walk caught two defects here that
+      a unit test could not**: the tenant predicate made every list read fail with `42804
+      argument of OR must be type boolean, not type uuid`, and the store refused `accepted`
+      outright — which left the review screen with no way to reach an applicable plan. Both
+      fixed and both proven from the other side (`accepting_an_artifact_is_possible_and_editing
+      _is_not_a_status_write`).
 - [ ] Rejecting a required artifact blocks **Apply** and lists what is missing.
 - [ ] Regenerating one artifact with feedback replaces it and keeps the previous version.
 - [ ] **Apply** is refused without `appbuilder.apply` and without an approved approval request.

@@ -8938,3 +8938,73 @@ reading yet" is now gone, so the only thing between the remaining boxes and a ti
 free slot. The `auth.rs` shared-database trap is a harness fix in shared infrastructure
 and is not this worktree's to land; it is named here so the next writer does not re-derive
 it as a ledger gap.
+
+## tick 66 — REQ-045 slice 1: the plan store, and a validator that records (2026-10-01)
+
+**Where the tick went.** Tick 65 retracted the blocker four ticks had deferred a browser pass
+over, so this tick had two open items and only one of them needed a slot: REQ-004's thirteen
+boxes and REQ-046's one gate box are both waiting on a pass, and REQ-045's slice 1 was waiting
+on code. The pass is queued (`/tmp/w3-tick66-pass.log`, `QA_STACK=w3`, 18082/3102/3202); the
+slot was held the whole tick by live `omnion-w8` and `omnion-w6` passes, verified by `kill -0`
++ `/proc/<pid>/cwd` rather than by age. **That is a semaphore doing its job, not a blocker** —
+and the habit from tick 65 was applied again: re-measured rather than inherited.
+
+**What landed.** Migration `0224_ai_app_builder.sql` (plans, artifacts, applications,
+application steps) and a new module `modules/app-builder` — model, error, validate, store —
+with its walk suite in `apps/api/tests/app_builder.rs`. 40 unit tests, 18 database walks, 323
+workspace lib tests, `pnpm typecheck` 2/2, admin 341/341. Commits `8c87a7cc`, `4f228080`.
+
+**The migration is 0224, not the 0015 the request names.** Migrations are numbered in a
+namespace ten worktrees share; the high-water is 0223. Taking "the next free number after my
+own branch's last" is how two worktrees take one number twice, and sqlx's `VersionMismatch`
+then fails every suite in the tree.
+
+**Three decisions, one premise: model output is untrusted input.**
+
+* Validation **records** findings beside the artifact rather than rewriting it. A validator
+  that repaired silently would leave a reviewer nothing to review, and a reserved key must be
+  refused *by name* — renaming it would put a key nobody typed into the review screen and into
+  the apply log.
+* An artifact's status is **derived** from the validator's answer, never taken from the
+  generator: findings mean `invalid`, none mean `pending`. A generator that could write
+  `accepted` would be able to approve its own work, which is what the request rules out.
+* Validity is not a status a caller may assert — but see the correction below, because I got
+  this one wrong first.
+
+**Four of my own tests failed before the code was right, and each turned up a rule:**
+
+1. *One name, two columns.* `key` and `spec.key` are one identity; validating both printed every
+   reserved word **twice**, once per path. The plan's key is now the single source of truth, and
+   a body that **disagrees** is its own finding — two names for one artifact is a collision
+   apply would have to resolve by guessing.
+2. *A permission key's dot is vocabulary, not a character the storage rule objects to*, so the
+   kind owns that key. Checking the whole key too reported `Leave.Read` **three times for two
+   mistakes** — a validator that cannot count reads as broken.
+3. *The tenant predicate was malformed*: `or $1 is null` with a uuid bound twice made the whole
+   `or` a uuid, so **every list read** failed with `42804`. Now
+   `organization_id is not distinct from $1 or organization_id is null`.
+4. *Accept was impossible.* Refusing `accepted` on a status write was an over-correction — the
+   rule meant to stop a **caller** claiming validity and it deleted the only way a **person**
+   can. The review screen has an Accept button; with it refused, no plan could ever reach the
+   state apply requires. The guard belongs on the **state**, not the verb: accepting now checks
+   the stored `validation` and refuses an invalid artifact **by name**, with the first finding
+   and the two things the reviewer can do.
+
+**A `FromRow` struct cannot be one member of a tuple**, so the plan list's
+`(AppBuilderPlan, i64, …)` does not compile; `#[sqlx(flatten)]` keeps both the struct and the
+field names that let a reader tell `artifact_count` from `rejected_count`. The counts come back
+in the **same query** as the page: the list re-fetches on every filter change, and a count per
+row turns one round-trip into eleven that can disagree with the page they decorate.
+
+**A note on the two test expectations I rewrote.** Both encoded the same over-correction as the
+code they were testing, so both passed while the product was unusable. That is the REQ-004 trap
+arriving from the other direction: there, an assertion written after a reading must not be
+loosened to agree with the code; here, an assertion written *before* the decision loses to it.
+The order the two were written in is the thing that tells them apart — and the accept refusal
+is now proven from the other side, because an artifact the validator refused cannot be
+accepted.
+
+**Next.** REQ-045 slice 2 — the review workspace (`/app-builder` landing, the plan tree,
+artifact detail, accept/reject/edit/regenerate, the blocking summary, keyboard and mobile) — and
+the four permission keys with the routes that guard them. If the slot frees first, the pass runs
+and closes REQ-046's gate box plus REQ-004's readings.
