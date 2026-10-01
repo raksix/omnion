@@ -18,6 +18,11 @@ time.workspace = true
 sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
+# The data guard (REQ-105) compiles tenant-authored detection patterns, so it needs a real
+# regular-expression engine rather than hand-rolled `contains` checks: the rule form has to
+# refuse an invalid expression at save time, which means the expression is compiled, not
+# pattern-matched by hand.
+regex.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio.workspace = true
 tracing.workspace = true

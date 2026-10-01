@@ -72,6 +72,11 @@ percent-encoding = "2"
 bytes = "1"
 url = "2"
 
+# Regular expressions (REQ-105 data guard): the rule form compiles a tenant-authored pattern
+# and refuses an invalid one at save time, so the platform needs an engine that can report a
+# compile error rather than approximate one.
+regex = "1"
+
 # The `omnion` command line (tools/cli) reads the first-run password without echoing it.
 rpassword = "7"
 

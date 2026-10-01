@@ -1418,6 +1418,7 @@ dependencies = [
 name = "omnion-ai-hub"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
