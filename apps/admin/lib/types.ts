@@ -3319,6 +3319,109 @@ export type OpenApiDocument = {
   };
 };
 
+/** One response header the Explorer pane shows, in the order the platform considers load-bearing. */
+export type ExplorerHeader = {
+  /** Header name, lower-case, as sent. */
+  name: string;
+  /** Header value. */
+  value: string;
+};
+
+/** The call rendered as a caller would write it, in three languages. */
+export type ExplorerSnippets = {
+  curl: string;
+  fetch: string;
+  python: string;
+};
+
+/**
+ * Which token made the call — and never any part of its secret.
+ *
+ * There is deliberately no field a plaintext could hide in. The platform stores only a digest, so
+ * a type with a `plaintext?: string` would be `undefined` forever and would teach the next person
+ * that this is where a credential goes.
+ */
+export type ExplorerToken = {
+  id: string;
+  name: string;
+  /** The `omn_xxxxxxxx` marker — the only part that is ever displayed. */
+  prefix: string;
+  /** Requests-per-minute tier, so a refusal can be compared with the budget. */
+  rate_limit_per_minute: number;
+  /**
+   * Budget left in this minute after the call, or `null` when the counter could not be read.
+   *
+   * `null` is "we do not know", which is not `0` — the meter fails open, and a `0` here would tell
+   * an operator their token is spent when the platform never counted anything.
+   */
+  remaining: number | null;
+};
+
+/**
+ * `POST /api/v1/content-api/explorer` — one real call, made as a chosen token (REQ-019, slice 3).
+ *
+ * The **server's** answer, not a reconstruction of it. The status, the headers, the body and the
+ * `duration_ms` all come from the handler that serves an integrator, so a reader comparing the
+ * pane against their own integration is comparing the same two answers.
+ */
+export type ExplorerAnswer = {
+  /** The documented operation that was called. */
+  operation_id: string;
+  /** Its HTTP method, upper-case, from the document. */
+  method: string;
+  /** The resolved request URL, exactly as dispatched. */
+  url: string;
+  /**
+   * The route the call was **metered** against (`/content/pages`).
+   *
+   * The template, not the resolved path: one endpoint is one row on the Usage tab's leaderboard
+   * however many slugs were walked, and this is the field that makes the two screens reconcilable.
+   */
+  metered_route: string;
+  /** Status the read surface answered. */
+  status: number;
+  /** The headers a caller branches on. */
+  headers: ExplorerHeader[];
+  /** The parsed body, or the raw text as a string when the route did not answer JSON. */
+  body: unknown;
+  /** Whether `body` is the parsed document rather than a string. */
+  body_is_json: boolean;
+  /** Wall-clock milliseconds the dispatch took. */
+  duration_ms: number;
+  /**
+   * `next_cursor` lifted out of a list response, or `null`.
+   *
+   * Lifted by the server rather than read out of `body` in the browser, because the pane renders
+   * the body and the "next page" button from the same response and two reads of one response can
+   * disagree about what it said.
+   */
+  next_cursor: string | null;
+  /** The token that acted. */
+  token: ExplorerToken;
+  /** The call in three languages. */
+  snippets: ExplorerSnippets;
+};
+
+/** One endpoint as the Explorer's picker offers it. */
+export type ExplorerEndpoint = {
+  /** The document's `operationId`; also the deep link's `endpoint` value. */
+  operationId: string;
+  /** Upper-case method badge. */
+  method: string;
+  /** The path template, shown so the reader knows what they are about to call. */
+  path: string;
+  /** One line, straight from the document. */
+  summary: string;
+  /** The scope a token needs, or `null` for a route that needs only a valid token. */
+  requiredScope: string | null;
+  /** `posts` is a page type today; the blog module will give it fields of its own. */
+  experimental: boolean;
+  /** Declared query parameters, in document order, with their descriptions. */
+  query: { name: string; description: string }[];
+  /** Declared path parameters — always required, and rendered as such. */
+  pathParams: { name: string; description: string }[];
+};
+
 // -------------------------------------------------------------------------------------------
 // System health (REQ-014).
 //

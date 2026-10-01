@@ -13,7 +13,10 @@ import type {
   ContentApiUsage,
   ContentApiVocabulary,
   CreatedContentApiToken,
+  ExplorerAnswer,
+  ExplorerEndpoint,
   OpenApiDocument,
+  OpenApiOperation,
 
   SecurityBulkResult,
   SecurityFinding,
@@ -6928,6 +6931,88 @@ export function revokeContentApiToken(tokenId: string): Promise<void> {
  */
 export function fetchContentApiUsage(days: number): Promise<ContentApiUsage> {
   return request<ContentApiUsage>(`/api/v1/content-api/usage?days=${encodeURIComponent(String(days))}`);
+}
+
+/**
+ * `POST /api/v1/content-api/explorer` — make one documented call as one token (REQ-019, slice 3).
+ *
+ * The **token id**, never a plaintext: the panel has no credential to send and cannot obtain one,
+ * so the server dispatches the call as the named token's row. A version of this client that
+ * accepted `token` as a string would be asking the operator to paste the one secret this
+ * installation can never show them twice.
+ */
+export function runContentApiExplorer(input: {
+  token_id: string;
+  operation_id: string;
+  params: Record<string, string>;
+}): Promise<ExplorerAnswer> {
+  return request<ExplorerAnswer>("/api/v1/content-api/explorer", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+/**
+ * The endpoints the Explorer's picker offers, derived from the OpenAPI document the server serves.
+ *
+ * Flattened and split into path/query parameters here rather than in the view, because both halves
+ * of the form need the same answer and a component that re-derives it per render is a second
+ * answer to "what does this endpoint take". The `{slug}` template markers become `pathParams`,
+ * which is what lets the form mark them required instead of guessing from the parameter name.
+ */
+export function explorerEndpoints(document: OpenApiDocument): ExplorerEndpoint[] {
+  const endpoints: ExplorerEndpoint[] = [];
+  for (const [path, methods] of Object.entries(document.paths ?? {})) {
+    for (const [method, operation] of Object.entries(methods)) {
+      if (!operation || typeof operation !== "object" || !operation.operationId) continue;
+      endpoints.push({
+        operationId: operation.operationId,
+        method: method.toUpperCase(),
+        path,
+        summary: operation.summary,
+        requiredScope: operation["x-required-scope"],
+        experimental: operation["x-experimental"] ?? false,
+        query: queryParametersOf(operation, path),
+        pathParams: pathParametersOf(operation, path),
+      });
+    }
+  }
+  return endpoints;
+}
+
+/** The endpoint's query parameters, in the document's own order. */
+function queryParametersOf(operation: OpenApiOperation, path: string): ExplorerEndpoint["query"] {
+  return (operation.parameters ?? [])
+    .filter((parameter) => parameter.in === "query" && !isPathParameter(parameter.name, path))
+    .map((parameter) => ({ name: parameter.name, description: parameter.description }));
+}
+
+/**
+ * The endpoint's path parameters, in the order they appear in the template.
+ *
+ * Sorted by their position in the template rather than by the document's parameter array, so the
+ * form shows `slug` in the order the URL carries it — a form ordered alphabetically is a form
+ * whose order has nothing to do with the request it builds.
+ */
+function pathParametersOf(
+  operation: OpenApiOperation,
+  path: string,
+): ExplorerEndpoint["pathParams"] {
+  const declared = (operation.parameters ?? []).filter((parameter) =>
+    isPathParameter(parameter.name, path),
+  );
+  const ordered = [...declared].sort(
+    (left, right) => path.indexOf(`{${left.name}}`) - path.indexOf(`{${right.name}}`),
+  );
+  return ordered.map((parameter) => ({
+    name: parameter.name,
+    description: parameter.description,
+  }));
+}
+
+/** Whether a parameter travels in the path rather than the query. */
+function isPathParameter(name: string, path: string): boolean {
+  return path.includes(`{${name}}`);
 }
 
 /**

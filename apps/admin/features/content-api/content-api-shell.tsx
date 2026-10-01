@@ -3,16 +3,16 @@
 /**
  * The tab bar every `/content-api/*` screen sits under (REQ-019).
  *
- * Four tabs, four routes. The Explorer tab is slice 3's remaining half and is **not** listed until
- * it exists — a tab bar that links to a screen that will 404 is the panel's own "coming soon",
- * which the Definition of Done forbids, and an empty tab is worse than a missing one: it
- * advertises a feature that cannot be reached.
+ * Four tabs, four routes. **The Explorer tab was listed last and only once it existed** — a tab
+ * bar that links to a screen that will 404 is the panel's own "coming soon", which the Definition
+ * of Done forbids, and an empty tab is worse than a missing one because it advertises a feature
+ * that cannot be reached.
  *
  * The active tab is derived from the pathname rather than passed in, so a new route that forgets
  * the prop still highlights correctly — the prop version of the same fact is a second answer that
  * eventually disagrees.
  */
-import { Activity, BarChart3, FileText, KeyRound } from "lucide-react";
+import { Activity, BarChart3, FileText, KeyRound, Send } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
@@ -20,9 +20,14 @@ import type { ReactNode } from "react";
 /**
  * The routes of the section, in the order a person works through them.
  *
- * Tokens, then Docs (what it is), then Usage (what it has been doing). Usage comes last because
- * it is the screen you open *after* the other two: a number is only interesting next to the
- * contract it is a number about.
+ * Tokens, then Docs (what it is), then Explorer (make it real), then Usage (what it has been
+ * doing). The Explorer sits before Usage because a number is only interesting next to the call
+ * that produced it, and the usual way to get to Usage is: press Send here, then look.
+ *
+ * **Order is also the route-ranking order.** A tab bar is a `startsWith` over these hrefs, so
+ * `/content-api/docs` must come before `/content-api` in the *matching* sense — hence the
+ * `exact` flag rather than the order. Two tabs whose hrefs are prefixes of one another are a
+ * highlight bug waiting for the day somebody adds a third.
  */
 export const CONTENT_API_NAV = [
   {
@@ -36,6 +41,12 @@ export const CONTENT_API_NAV = [
     href: "/content-api/docs",
     label: "Docs",
     icon: FileText,
+    exact: false,
+  },
+  {
+    href: "/content-api/explorer",
+    label: "Explorer",
+    icon: Send,
     exact: false,
   },
   {
