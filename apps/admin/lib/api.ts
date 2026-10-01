@@ -115,6 +115,7 @@ import type {
   NotificationPage,
   NotificationPreferences,
   NotificationPreferencesSaved,
+  NotificationPushKey,
   NotificationPushOutcome,
   NotificationRouteReport,
   NotificationRouteRule,
@@ -5446,6 +5447,44 @@ export function registerNotificationDevice(input: {
 /** Remove one device. `404` for somebody else's, so existence does not leak. */
 export function removeNotificationDevice(id: string): Promise<void> {
   return request<void>(`/api/v1/notifications/push-subscriptions/${id}`, { method: "DELETE" });
+}
+
+/**
+ * The installation's VAPID public key, which is what `applicationServerKey` needs.
+ *
+ * `available: false` is an answer, not an error: the settings screen renders the push block
+ * either way, and a rejected request would put a toast on a panel that is working correctly
+ * and simply has nothing configured yet.
+ */
+export function fetchNotificationPushKey(): Promise<NotificationPushKey> {
+  return request<NotificationPushKey>("/api/v1/notifications/push-key");
+}
+
+/**
+ * Send one test notification through one channel, now, and report what happened.
+ *
+ * **The answer carries the transport's own outcome, not a boolean the client invented.**
+ * `delivered` plus `detail` are separate because the settings screen renders them
+ * differently — the boolean decides the colour of the line, `detail` is the sentence under
+ * it. A failure is a `200`, not an error status: "your SMTP host refused the message" is a
+ * result the reader asked for, and a `502` would tell them their settings screen is broken.
+ */
+export function sendTestNotificationDelivery(input: {
+  channel: string;
+  title?: string;
+  body?: string;
+}): Promise<{
+  channel: string;
+  delivered: boolean;
+  detail: string;
+  response_status: number | null;
+  notification_id: string;
+  delivery_status: string;
+}> {
+  return request("/api/v1/notifications/preferences/test", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
 }
 
 /** What each channel can do on this installation, and the sentence explaining it. */

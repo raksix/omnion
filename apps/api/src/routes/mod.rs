@@ -105,6 +105,7 @@ pub mod media_usage;
 pub mod media_versions;
 pub mod notifications;
 pub mod notifications_admin;
+pub mod notifications_test;
 pub mod onboarding;
 pub mod public;
 pub mod readyz;
@@ -1122,6 +1123,20 @@ pub fn router(state: AppState) -> Router {
         .route_layer(guards::require(&state, "notifications.manage"));
     let notifications_channels =
         get(notifications_admin::channels).layer(guards::require(&state, "notifications.manage"));
+    // The installation's VAPID public key: what a browser subscribes with. `notifications.manage`
+    // for the same reason the device list is — a person who can manage their own notifications
+    // needs the key to register the browser they are sitting in front of, and the key is public
+    // by definition (it is the half the push service sees). Declared beside `channels` and
+    // before the `{id}` routes so the literal segment wins the rank.
+    let notifications_push_key =
+        get(notifications_admin::push_key).layer(guards::require(&state, "notifications.manage"));
+    // The settings screen's per-channel `Test delivery`. Declared next to the other
+    // `notifications.manage` surface and, like `preferences` above, before the `{id}` routes:
+    // `POST /notifications/preferences/test` is two static segments, and axum ranks static
+    // ahead of parameter, so the order only matters as a promise that the literal keeps
+    // winning. Guarded by the same key as the preferences it tests.
+    let notifications_test = post(notifications_test::test_delivery)
+        .layer(guards::require(&state, "notifications.manage"));
     let notifications_outbox = Router::new()
         .route(
             "/notifications/outbox",
@@ -1506,11 +1521,13 @@ pub fn router(state: AppState) -> Router {
         // as a `PUT` on an id called "preferences" — which is a `400` a reader would report
         // as "the settings screen is broken".
         .route("/notifications/preferences", notifications_preferences)
+        .route("/notifications/preferences/test", notifications_test)
         // Slice 3's four sub-routers, merged rather than spelled out route by route. Each is a
         // `Router` with its own `route_layer`, so the guard travels with the group and a future
         // fifth endpoint joins the right one by being added inside its block.
         .merge(notifications_push)
         .route("/notifications/channels", notifications_channels)
+        .route("/notifications/push-key", notifications_push_key)
         .merge(notifications_outbox)
         .merge(notifications_routes)
         .route("/notifications/{id}", notifications_entry)
