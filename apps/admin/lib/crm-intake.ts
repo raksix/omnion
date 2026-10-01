@@ -199,6 +199,31 @@ export function countdown(dueAt: string | null, now = Date.now()): string | null
   return due < now ? `${body} late` : `in ${body}`;
 }
 
+/**
+ * An absolute instant, or an honest placeholder.
+ *
+ * The server used to answer timestamps in Rust's `Display` spelling — `2026-10-01 15:32:24
+ * … +00:00:00`, a space where RFC 3339 puts `T` — and every `new Date(...)` on that string is
+ * `Invalid Date`. `toLocaleString()` then renders the *words* "Invalid Date", so the lead
+ * screen said **"Responded Invalid Date"** on the one field that answers "did we get to them
+ * in time?". The server now emits RFC 3339, and this function is the second half of that fix:
+ * a formatter that says "unknown" is the behaviour a screen should have had all along, and
+ * the two together mean a future bad timestamp shows an em dash rather than a sentence that
+ * looks like data.
+ *
+ * It is one function rather than three `new Date()` call sites for the same reason the server
+ * side is one function: the inbox already had a tolerant reader (`relativeInstant`) and the
+ * detail screen had an intolerant one, and two readers of the same field is how a screen
+ * ends up disagreeing with itself about whether a date exists.
+ */
+export function absoluteInstant(value: string | null | undefined): string {
+  if (!value) {
+    return "unknown";
+  }
+  const at = new Date(value);
+  return Number.isNaN(at.getTime()) ? "unknown" : at.toLocaleString();
+}
+
 /** A relative instant — "just now", "14m ago", "3d ago" — for the inbox's Received column. */
 export function relativeInstant(value: string | null, now = Date.now()): string {
   if (!value) {

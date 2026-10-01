@@ -50,6 +50,7 @@ import {
   SLA_STATE_LABEL,
   SLA_STATE_TONE,
   contactLabel,
+  absoluteInstant,
   countdown,
   ownerLabel,
   slaState,
@@ -295,7 +296,7 @@ export function LeadDetail() {
             {contactLabel(lead)}
           </h2>
           <p className="mt-0.5 text-[12px] text-muted">
-            Received {new Date(lead.received_at).toLocaleString()}
+            Received {absoluteInstant(lead.received_at)}
             {lead.product_interest ? ` · ${lead.product_interest}` : ""}
           </p>
         </div>
@@ -710,7 +711,7 @@ export function LeadDetail() {
               >
                 <Check className="size-3.5" aria-hidden />
                 {lead.first_response_at
-                  ? `Responded ${new Date(lead.first_response_at).toLocaleString()}`
+                  ? `Responded ${absoluteInstant(lead.first_response_at)}`
                   : "Mark responded"}
               </button>
               <p className="text-[11.5px] text-muted">
@@ -880,7 +881,7 @@ export function LeadDetail() {
                   <li key={event.id} data-event={event.kind} className="flex flex-col">
                     <span className="font-medium">{LEAD_EVENT_LABEL[event.kind] ?? event.kind}</span>
                     <span className="text-[11.5px] text-muted">
-                      {new Date(event.created_at).toLocaleString()}
+                      {absoluteInstant(event.created_at)}
                       {event.actor_user_id ? " · by an operator" : ""}
                     </span>
                     {/* A hand-over line names both people it moved between. Rendering only the
