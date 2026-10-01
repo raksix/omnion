@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 mod support;
 use support::isolated_db::{IsolatedDb, announce_skip, assert_nothing_skipped};
+use support::walk_auth;
 
 const PASSWORD: &str = "correct horse battery";
 const CSRF_SECRET: &str = "w2-theme-settings-suite-csrf-secret";
@@ -155,43 +156,33 @@ fn test_storage() -> omnion_storage::Storage {
         .expect("the default storage configuration is valid")
 }
 
-async fn live_state() -> Option<(AppState, Db)> {
+async fn live_state() -> Option<(AppState, Db, IsolatedDb)> {
     let mut config = Config::from_env().expect("environment must be valid");
-    // Without a CSRF secret every cookie-authenticated write in this file answers 403, so the
-    // walks would be measuring the harness rather than the product — the exact defect slice 2
-    // of REQ-064 recorded for the forms suite.
+    // **The secret the walks sign with has to be installed in the state as well**, not only
+    // used to derive the token. Without it the deployment under test has no secret, sign-in
+    // issues no CSRF cookie, and every write answers `csrf_unavailable` -- a code whose message
+    // names a deployment problem, so the failure points away from the suite that caused it.
     config.csrf = CsrfSecret::new(Some(CSRF_SECRET.to_owned()));
-    let db = match Db::connect(&config.database).await {
-        Ok(db) => db,
-        Err(error) => {
-            eprintln!("SKIP: PostgreSQL is not reachable ({error})");
-            return None;
-        }
+
+    // A throwaway database per walk, rather than whatever `OMNION_DATABASE_URL` names.
+    //
+    // This file was the last one in the wave still on the shared database, and the measurement
+    // that proves it is worth keeping: with a per-walk database the suite that had been
+    // hanging for twelve minutes (twelve PostgreSQL sessions parked in `ClientRead`, the
+    // process's only other thread in `futex_do_wait`) finished its walks. On the shared
+    // database `seed::ensure` binds Owner to the EARLIEST user in the database, which on this
+    // box is whichever of the seven writers' suites inserted first -- so a walk that leans on
+    // Owner without granting it measures the test schedule. Twelve orphaned
+    // `omnion_cms_*` databases were visible in the server while this file ran.
+    let isolated = IsolatedDb::open(&config.database.url, 4, "theme_settings")
+        .await
+        .expect("the throwaway database must open");
+    let Some(isolated) = isolated else {
+        announce_skip("no throwaway database, this walk did not run");
+        return None;
     };
-    db.migrate().await.expect("migrations must apply");
-    // Sign-in is limited to 10 per 300 s per IP and this file signs in once per walk, so
-    // without this the suite measures the limiter instead of the product. The row is written
-    // BEFORE the state exists because the limiter layer is installed once per process from
-    // whatever the document says at that moment — writing it afterwards has no effect at all,
-    // which is a silent no-op that looks like a fix.
-    let raised: Vec<serde_json::Value> = RatePolicy::defaults()
-        .into_iter()
-        .map(|mut policy| {
-            if policy.scope == "sign_in" {
-                policy.limit = 1_000;
-                policy.burst = 0;
-            }
-            serde_json::to_value(&policy).unwrap_or(serde_json::Value::Null)
-        })
-        .filter(|value| !value.is_null())
-        .collect();
-    let _ = sqlx::query(
-        "insert into security_settings (id, rate_limits) values (1, $1::jsonb) \
-         on conflict (id) do update set rate_limits = excluded.rate_limits",
-    )
-    .bind(serde_json::to_value(&raised).unwrap_or(serde_json::Value::Null))
-    .execute(db.pool())
-    .await;
+    let db = isolated.db.clone();
+    // Migrations are applied by `IsolatedDb::open`, before the router is built.
 
     let redis = RedisClient::new(&config.redis.url).expect("redis URL must parse");
     let state = AppState::new(
@@ -201,33 +192,47 @@ async fn live_state() -> Option<(AppState, Db)> {
         redis,
         test_storage(),
     );
-    // `ensure_installed` seeds the process-wide limiter from the SHIPPED defaults (a test
-    // harness builds the router without main.rs having read the store), so the row above is
-    // not enough on its own — the layer is re-read here, which is the same call
-    // `security_limiter::put_rate_limits` makes after a real save.
-    let _ = omnion_api::rate_limit_middleware::reload_from_store(&state).await;
-    // `ensure_installed` seeds the process-wide limiter from the SHIPPED defaults (a test
-    // harness builds the router without main.rs having read the store), so the row above is
-    // not enough on its own — the layer is re-read here, which is the same call
-    // `security_limiter::put_rate_limits` makes after a real save.
-    let _ = omnion_api::rate_limit_middleware::reload_from_store(&state).await;
-    Some((state, db))
+
+    // The limiter is the one thing a per-walk database does NOT fix: its counters live in one
+    // Redis shared with every other writer's worktree, and a sign-in carries no session, so its
+    // budget is keyed on the peer address -- `127.0.0.1` for every walk in every suite on this
+    // box. The shipped `sign_in` policy allows ten per five minutes, and a suite that signs in
+    // once or twice per walk dies inside `login` on a rate limit it was never testing. The
+    // process-wide `OnceLock` means the raised policy sticks from the first walk on, so this is
+    // deliberately NOT repeated per walk.
+    walk_auth::give_the_process_its_own_sign_in_budget(|| {
+        let policies: Vec<RatePolicy> = RatePolicy::defaults()
+            .into_iter()
+            .map(|mut policy| {
+                if policy.scope == "sign_in" {
+                    policy.limit = 10_000;
+                    policy.burst = 0;
+                }
+                policy
+            })
+            .collect();
+        let _ = omnion_api::rate_limit_middleware::install(
+            omnion_api::rate_limit_middleware::RateLimiter::new(&state, policies),
+        );
+    });
+    Some((state, db, isolated))
 }
 
-/// Every walk in this file is skipped, loudly, when PostgreSQL is absent — and then asserts.
-/// A suite that silently passes because it never ran is a suite that reports a number nobody
-/// earned.
-///
-/// The expansion is an async BLOCK, not a sequence of statements. A macro arm that expands to
-/// bare statements at expression position does not parse, which is why the "no database" case
-/// is a `match` arm rather than the `let … else` this used to use.
 macro_rules! walk {
     ($state:expr, $body:expr) => {
         async {
             match live_state().await {
-                Some((state, db)) => $body(state, db).await,
+                Some((state, db, mut isolated)) => {
+                    let outcome = $body(state, db).await;
+                    // Explicitly disposed rather than left to a `Drop` guard: a panic inside
+                    // `#[tokio::test]` unwinds the runtime TASK, not the future the macro
+                    // awaits, so a guard never runs on the failing path. The next run's
+                    // `IsolatedDb::open` sweeps whatever this one left.
+                    isolated.dispose().await;
+                    outcome
+                }
                 None => {
-                    eprintln!("SKIP: no database, this walk did not run");
+                    announce_skip("no database, this walk did not run");
                     Ok(())
                 }
             }
@@ -1157,6 +1162,240 @@ async fn a_missing_revision_is_a_404_that_names_the_number() -> TestResult {
             StatusCode::NOT_FOUND,
             "the number is scoped to the site, not the tenant: {}",
             crossed.body
+        );
+        Ok(())
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// Branding (acceptance 9)
+// ---------------------------------------------------------------------------------------------
+
+/// A checksum in the shape `media_checksum_format` demands: 64 hex characters.
+///
+/// A real sha256 would mean hashing bytes this fixture never stores. The column's constraint is
+/// a format check rather than a verification — nothing recomputes it — so a 64-hex constant that
+/// is derived from the id (and therefore unique per fixture, which the unique-ish indexes and a
+/// failure message both benefit from) satisfies it honestly. The first version of this helper
+/// wrote `'w2-branding'`, which the constraint refused at 23514, and the walk reported
+/// "media fixture" rather than anything about the check it was written to measure.
+fn hex_checksum(seed: Uuid) -> String {
+    seed.simple().to_string().repeat(2)
+}
+
+/// Put a real file into a site's library, described the way the upload path describes one.
+///
+/// Written straight into `media` + `media_versions` rather than through `POST /media`, and the
+/// reason is in `resolve_branding`'s own note: the geometry the branding check reads is NOT on
+/// `media`, it is on `media_versions` version 1. A fixture that wrote only `media` would produce
+/// a logo the platform cannot measure, and the walk would then pass for the wrong reason — it
+/// would be measuring the "we could not measure it" path while claiming to measure the
+/// dimension check. So the fixture writes both rows, exactly as `upload_media` does.
+async fn put_file(
+    db: &Db,
+    site_id: Uuid,
+    filename: &str,
+    content_type: &str,
+    size_bytes: i64,
+    dimensions: Option<(i32, i32)>,
+) -> Uuid {
+    // The id is generated HERE rather than taken from `returning id`, because the checksum is
+    // derived from it and has to be bound into the same statement. The upload path derives both
+    // the storage key and the id before it writes, for the same reason.
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "insert into media (id, site_id, storage_key, filename, content_type, size_bytes, \
+         checksum) values ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(site_id)
+    .bind(format!("qa/{site_id}/{filename}"))
+    .bind(filename)
+    .bind(content_type)
+    .bind(size_bytes)
+    .bind(hex_checksum(id))
+    .execute(db.pool())
+    .await
+    .expect("media fixture");
+    sqlx::query(
+        "insert into media_versions (media_id, version, storage_key, size_bytes, checksum, \
+         content_type, width, height, note) \
+         values ($1, 1, $2, $3, $4, $5, $6, $7, 'branding fixture')",
+    )
+    .bind(id)
+    .bind(format!("qa/{site_id}/{filename}"))
+    .bind(size_bytes)
+    .bind(hex_checksum(id))
+    .bind(content_type)
+    .bind(dimensions.map(|d| d.0))
+    .bind(dimensions.map(|d| d.1))
+    .execute(db.pool())
+    .await
+    .expect("media version fixture");
+    id
+}
+
+/// A save whose logo is refused, AND whose refusal names every fault rather than the first.
+///
+/// Criterion 9 is "rejects files above the configured size and enforces the declared min/max
+/// dimensions with a field-level message" — three claims, and the walk proves all three in one
+/// payload on purpose: a logo that is 3 MB *and* 6000 px wide is refused for two independent
+/// reasons, and an operator reading one message would fix the size, resubmit, and only then
+/// learn the picture is also the wrong shape.
+///
+/// The revision count is the half that matters for the product and the one a "400 came back"
+/// assertion would pass without: a refusal that wrote a draft would leave the history screen
+/// showing a revision the site never accepted.
+#[tokio::test]
+async fn a_logo_over_the_size_and_over_the_pixel_limit_is_refused_by_field() -> TestResult {
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "ts-brand-huge").await;
+        mirror_theme(&db, "minimal").await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Brand customizer",
+        )
+        .await;
+        let auth = login(&state, &db, &email).await;
+
+        let huge = put_file(&db, site.id, "huge.png", "image/png", 3 * 1024 * 1024, Some((600, 6000))).await;
+        let tiny = put_file(&db, site.id, "tiny.png", "image/png", 2_000, Some((240, 8))).await;
+
+        let mut body = save_body(good_tokens());
+        body["branding"] = json!({ "logo": huge.to_string(), "favicon": tiny.to_string() });
+        let refused = save(&state, &auth, site.id, body).await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", refused.body);
+        assert_eq!(error_code(&refused.body), "theme_settings_branding_invalid");
+
+        let message = error_message(&refused.body);
+        // Both keys are named, which is what "field-level" means here.
+        assert!(message.contains("logo"), "{message}");
+        assert!(message.contains("favicon"), "{message}");
+        // And the messages carry the NUMBERS the limit is made of, not a bare "too big".
+        assert!(message.contains("byte limit"), "{message}");
+        assert!(message.contains("shorter side"), "{message}");
+
+        let rows: i64 = sqlx::query_scalar(
+            "select count(*) from theme_settings_revisions where site_id = $1",
+        )
+        .bind(site.id)
+        .fetch_one(db.pool())
+        .await?;
+        assert_eq!(rows, 0, "a refused branding payload must not write a revision");
+        Ok(())
+    })
+    .await
+}
+
+/// The check reads the SITE's library, so another site's file is not a logo this site can use.
+///
+/// Scoped by the query rather than by a comparison afterwards, which means the answer for a
+/// foreign id and the answer for a deleted one are the same shape — `UnknownAsset` — and the
+/// walk proves that rather than proving a second code exists.
+#[tokio::test]
+async fn a_logo_from_another_site_is_not_a_logo_this_site_can_use() -> TestResult {
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "ts-brand-scope").await;
+        let other_site = create_site(&db, organization_id, "ts-brand-other").await;
+        mirror_theme(&db, "minimal").await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Scoped customizer",
+        )
+        .await;
+        let auth = login(&state, &db, &email).await;
+
+        let foreign = put_file(&db, other_site.id, "other.png", "image/png", 2_000, Some((200, 80))).await;
+
+        let mut body = save_body(good_tokens());
+        body["branding"] = json!({ "logo": foreign.to_string() });
+        let refused = save(&state, &auth, site.id, body).await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", refused.body);
+        assert!(
+            error_message(&refused.body).contains(&foreign.to_string()),
+            "the refusal names the id the operator has to find: {}",
+            error_message(&refused.body)
+        );
+
+        // The same file set on the site that OWNS it saves clean. Without this the walk would
+        // pass against a resolver that refuses every id regardless of site.
+        let mut own = save_body(good_tokens());
+        own["branding"] = json!({ "logo": foreign.to_string() });
+        let allowed = call(
+            &state,
+            request(
+                Method::PUT,
+                &format!("/api/v1/sites/{}/theme-settings", other_site.id),
+                Some(&auth),
+                Some(own),
+            ),
+        )
+        .await;
+        assert_eq!(allowed.status, StatusCode::OK, "{}", allowed.body);
+        Ok(())
+    })
+    .await
+}
+
+/// An SVG is refused by TYPE, and a logo inside every limit is stored and comes back.
+///
+/// Both halves in one walk, because the first half alone passes against a validator that refuses
+/// everything, which is the failure mode a "the endpoint returns 422" assertion cannot see.
+#[tokio::test]
+async fn an_svg_logo_is_refused_and_a_measured_png_is_stored() -> TestResult {
+    walk!(state, |state: AppState, db: Db| async move {
+        let organization_id = create_organization(&db).await;
+        let site = create_site(&db, organization_id, "ts-brand-type").await;
+        mirror_theme(&db, "minimal").await;
+        let (user_id, email) = create_account(&db, organization_id).await;
+        grant(
+            &db,
+            organization_id,
+            user_id,
+            &["themes.customize", "themes.read"],
+            "Typed customizer",
+        )
+        .await;
+        let auth = login(&state, &db, &email).await;
+
+        let svg = put_file(&db, site.id, "mark.svg", "image/svg+xml", 900, None).await;
+        let mut body = save_body(good_tokens());
+        body["branding"] = json!({ "logo": svg.to_string() });
+        let refused = save(&state, &auth, site.id, body).await;
+        assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", refused.body);
+        assert!(
+            error_message(&refused.body).contains("image/png"),
+            "the refusal names an accepted type: {}",
+            error_message(&refused.body)
+        );
+
+        let png = put_file(&db, site.id, "mark.png", "image/png", 2_400, Some((320, 96))).await;
+        let mut good = save_body(good_tokens());
+        good["branding"] = json!({ "logo": png.to_string(), "logoDark": null });
+        let saved = save(&state, &auth, site.id, good).await;
+        assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+
+        // Read back through the API rather than the database: the claim is that the panel sees
+        // the logo it saved, and a database read would pass even if the response never carried
+        // the section (the camelCase drift of tick 57).
+        let view = read(&state, &auth, site.id).await;
+        assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+        assert_eq!(
+            view.body["draft"]["branding"]["logo"],
+            json!(png.to_string()),
+            "the draft carries the logo: {}",
+            view.body
         );
         Ok(())
     })
