@@ -7399,3 +7399,77 @@ opposite assertions on one attribute. REQ-004 is otherwise far from close — ru
 a graph with a real prefix, the pill row needs `paintedButNotInRun` empty, and the plugin row
 stays BLOCKED on REQ-121. The 50-step depth claim is still answered by the constant
 `HISTORY_LIMIT = 100` and by nothing else.
+
+## tick 50 — the undo replaced the graph and left the selection naming a card that was gone
+
+`doUndo` and `doRedo` restored `nodes` and `edges` and nothing else. They are the two
+handlers in the builder that replace the graph WHOLESALE, and a wholesale replacement is
+the one operation that can leave the selection pointing at a node the canvas does not have.
+Neither pruned. `load()` did — one tick earlier, for the same rule — so the rule had two
+callers and the earlier fix had left one of them behind.
+
+**What the author actually saw, and why none of it looked like a bug.** The inspector looks
+its node up with `nodes.find(...) ?? null` and renders `null`, so it went blank, which is
+what a correct empty inspector looks like. The toolbar did not: Duplicate and Copy read
+`disabled={!selected}`, and `selected` is `selection.focus` — a string that survived — so
+both stayed ENABLED for a node that did not exist. The status bar counted
+`selectionSize(selection)` and printed "1 selected" over a canvas whose remaining card was
+not that one. `Del` resolved through `deleteTarget` to an id the restored graph lacks, and
+`removeNodes` returned early, so the key was a no-op. Every one of those is a *claim the
+screen makes about a card it is not drawing*.
+
+**Reachable with the keyboard alone.** No second tab, no conflict, no 409. The palette's
+click-add ends in `setSelection(selectNode(node.id))`, so: add a card, add another, press
+⌘Z. The selection is on the second card and the undo removes it. The undo half of this
+criterion is otherwise measured and green (`drag-undo`, `afterUndo`/`returned`), which is
+why this survived — the row read the button and the position, and neither moved.
+
+**It is the same hole as tick 48, from the other direction, and that is the part worth
+keeping.** The loader adopts a NEWER graph and prunes; undo adopts an OLDER one and did not.
+One rule, two callers. The rule now lives in `applyHistoryStep`, which stores the cursor,
+restores the graph, prunes and queues the save, and both handlers route through it — a
+guard that had demanded the prune appear in both `useCallback` bodies would have made the
+next reader copy it, which is how the two paths drifted in the first place.
+
+**The alive set is read off `restored`, not off `nodes`.** `nodes` in the closure is the
+graph being *replaced* — the one still holding both cards — so pruning against it keeps
+exactly the nodes the undo is removing, and the prune is a no-op on the only case it exists
+for. Pruned, not cleared, for the loader's reason: undoing a `remove` should leave the card
+selected, because Del on the wrong card followed by ⌘Z is the most likely sequence in this
+builder and clearing there is the one press that half-works.
+
+**Proof.** `node --test --experimental-strip-types features/workflows/*.test.ts` → **259
+passed** (245 before, +14), `pnpm typecheck` clean (`tsc --noEmit`, exit 0),
+`cargo test -p omnion-workflows --lib` **157 unchanged** (a client defect, not an engine
+one), `node --check scripts/qa/walkthrough.cjs` clean. **All five halves proven to bite**,
+one assertion each where the mutation was narrow: the prune removed (**2 red**), pruned
+against the replaced graph (**1**), clear instead of prune (**2**), a *partial* fix where
+`doUndo` restores inline and `doRedo` does not (**1**), and `pruneSelection` itself degraded
+to a clear (**8** — the tick-48 file catches it too, which is the point of one prune).
+
+**The walkthrough gains an `undo-selection` row, and its guard is the second half of the
+commit.** The row adds two cards, presses Ctrl+Z, and reads the selection marker, both
+toolbar buttons and the status bar's words. It reports `cardWasSelected` and
+`cardRemovedByUndo` as preconditions, because `selectedCount === 0` after an undo is also
+the answer on a page that was never selected and on a page where the key did nothing — the
+tick-48 defect exactly, in the shape it would take for this one. `undo-selection-row.test.ts`
+asserts the row's structure; all three mutations red, one assertion each (keypress removed,
+marker shortened to `data-selected`, preconditions dropped).
+
+**Not measured in a browser.** The QA slot is held by a live `omnion-w5` pass (holder pid
+1822938, cwd `/mnt/apopic/omnion-w5` confirmed through `/proc/<pid>/cwd`), and w7 and w2
+passes are also running; 35 Chrome, `/dev/shm` 85%, swap 24G of 31G. No second concurrent
+pass was forced, so `undo-selection` — like `drag-undo` and `reload-rebase` — is written and
+structurally guarded but UNMEASURED. (The holder's own file looked like a two-line pid
+concatenation, `18229381822875`; it is two pids, and the first one is alive. A holder read as
+a single unparseable number is the shape of bug this harness already paid for once.)
+
+**Next.** When the slot frees, read `undo-selection` as a conjunction —
+`cardWasSelected && cardRemovedByUndo && toolbarOfferedTheSelection &&
+selectionPruned && duplicateDisabled && copyDisabled`. Read it against `drag-undo`, which
+asserts the button *enables* after a drag: opposite claims on one attribute, and only the
+pairing can see a history that should not be there. Then `reload-rebase`'s REDO half, which
+`rebaseAfterReload` already implies by emptying the history and nothing states. REQ-004 is
+still far from close: run-from-here needs a real prefix, the pill row needs
+`paintedButNotInRun` empty, the plugin row stays BLOCKED on REQ-121, and the 50-step depth
+claim is still answered by the constant `HISTORY_LIMIT = 100` and by nothing else.
