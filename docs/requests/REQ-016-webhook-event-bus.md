@@ -1,6 +1,11 @@
 # REQ-016 — Webhook + Event Bus
 
-> **Status:** in-progress — **slices 1 and 2 are code-complete, API and screens.** Slice 1's
+> **Status:** in-progress — **slices 1 and 2 are code-complete, API and screens.** **The
+> `apps/api/tests/events.rs` suite was dead from tick 59 until 2026-10-01 (`ccefb47b`)** — it
+> configured no CSRF secret and minted sessions without signing in, so every
+> cookie-authenticated write was refused `403` and ten walks were re-proving that one refusal
+> rather than the event bus. Repaired to **11/11**, which is what let the two delivery-measurement
+> boxes below close. Slice 1's
 > registry is `crates/events/src/catalogue.rs`: 68 names with their area, description, payload
 > fields and a required flag, compiled in rather than stored, with a drift gate in each
 > direction (an emitted name must be catalogued; a name marked *live* must have an emitter, and
@@ -228,10 +233,35 @@ Existing tables (migration `0009`): `events`, `webhook_endpoints`, `webhook_deli
       count for its area. What is missing is the one thing tests cannot stand in for: nobody
       has watched those messages appear. A checklist that claims a screen is right before
       anyone has looked at it is the thing this file exists to prevent.
-- [ ] Test delivery reaches a receiver that accepts signed POSTs and leaves a `delivered` row with `attempts >= 1`, `response_status = 200` and a non-null
+- [x] Test delivery reaches a receiver that accepts signed POSTs and leaves a `delivered` row with `attempts >= 1`, `response_status = 200` and a non-null
   `duration_ms`.
-- [ ] A receiver answering `500` produces retries with increasing `next_attempt_at`, and the row ends `failed` with `attempts = max_attempts` and a readable
+      — **closed 2026-10-01, `ccefb47b`**, and the reason it was open for so long is worth the
+      space: the whole `events` suite had been **dead** since tick 59 made the session cookie
+      ambient authority. It configured no CSRF secret and minted sessions straight through
+      `sessions::create_session`, so it held no credential and every cookie-authenticated write
+      was refused `403` before the bus saw it — ten walks all re-proving one refusal, and
+      reporting **1 passed / 10 failed**. Both refusals were the product working; the fixture was
+      the defect. With the fixture repaired (`with_csrf_secret` + a token derived per session and
+      packed beside it) the suite is **11/11**, and this box is now measured by
+      `a_delivery_row_measures_its_own_duration_and_its_backoff_grows`: a `delivered` row read
+      **out of the HTTP body** (the path the screen takes) carries `status = delivered`,
+      `attempts = 1`, `response_status = 200`, a non-null non-negative `duration_ms` and no error
+      text. `duration_ms` matters because `p95_duration_ms` on the stats tab has no other source,
+      and a `—` in that column reads as "instant", which this receiver never reported.
+- [x] A receiver answering `500` produces retries with increasing `next_attempt_at`, and the row ends `failed` with `attempts = max_attempts` and a readable
   `error`.
+      — Same walk, same commit. The ladder is **climbed one attempt at a time** rather than
+      observed across a fixed sleep, because a walk that waits a fixed interval cannot tell
+      "the backoff widened" from "the runner happened to tick again later" — only the value in
+      the row can. Every reschedule is asserted strictly later than the one before it, and the
+      gaps are asserted **exponential**, not merely monotone: a measured run gave 112 ms → 197 ms
+      → 358 ms against a 40 ms base, doubling as `retry_delay` promises. The terminal row is
+      `failed` with `attempts == max_attempts == 5`, `response_status = 500`, a reason naming the
+      500 and **its own duration**, and the receiver is asserted to have seen all five attempts.
+      What the walk deliberately does *not* assert is "the schedule was still in the future when
+      read back": with a 40 ms base and an HTTP round trip in the tick, that measures the test's
+      own latency, and the first version of this assertion failed for exactly that reason while
+      the ladder was working perfectly.
 - [x] `webhook.delivery.failed` is recorded once per exhausted delivery and appears in the feed.
       — Recorded in `engine::deliver_one` on the terminal branch only (a retry is not a failure),
       carrying delivery id, endpoint, event name, attempt count, HTTP status and the trimmed
