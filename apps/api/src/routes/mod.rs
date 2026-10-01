@@ -93,6 +93,7 @@ pub mod deployment;
 // the platform, and burying it at the end of a file about jobs would make that invisible.
 pub mod exports;
 pub mod graphql;
+pub mod graphql_documents;
 pub mod health;
 pub mod health_incidents;
 pub mod health_panel;
