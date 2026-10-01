@@ -1,3 +1,61 @@
+## 2026-10-02 — tick 69b: tracing a pass you cannot run yet finds three things no gate would have
+
+fix(app-builder): three defects the pass found while tracing it, none of them in the pass's favour
+
+**The situation.** The QA slot has been held live by `omnion-w4` since 17:42 and the focused pass
+for REQ-045's two new screens is queued behind it. Rather than spend the tick idle, this one traced
+the pass **by hand** against the real `omnion_qa_w3` database and the real selectors in the two new
+components. Three things came out, and the shape of them is the lesson: **two were defects in the
+pass itself**, and only one was a defect in the product.
+
+**One product defect: a refusal banner outlived its own resolution.** Every refusal path called
+`setActionError(null)` before the request and every success path left the banner up. A reviewer who
+refused an artifact, pressed Accept on the next one, and was still told about the first would see a
+screen that looks stuck. Fixed on all five success paths, and the pass now asserts the banner is gone
+after a successful action **beside** it — an assertion that cannot be satisfied by the same banner
+the refusal produced.
+
+**Two defects in the pass, both of which would have been read as product bugs.**
+
+```js
+await page.locator("[data-artifact-tree]").click({ position: { x: 5, y: 5 } });  // a <div>
+await page.keyboard.press("j");
+```
+
+The keydown handler sits on the screen's wrapper element, and a key event only reaches it when focus
+is **already inside** that element. Clicking a `<div>` does not focus anything, so the event never
+bubbled through and `j` could not have moved the selection. The assertion would have failed on a
+keyboard that worked perfectly for a person. It clicks an artifact row now, which is a button and is
+where a reviewer's cursor already is.
+
+```js
+page.locator("[data-artifact-row]").filter({ hasText: "leave_requests" }).first()
+```
+
+`hasText` matches a **substring**, and this fixture's keys are `leave_requests`,
+`leave_requests.reason`, `leave_requests.approved_by` and `leave_requests.list`. Every one of those
+filters also matches the other three, and `.first()` lands on the entity every time — so the pass
+would have accepted the artifact it had just rejected and read its own fixture bug as a product
+defect. Every artifact is addressed by row id now.
+
+**The fixture was validated against the live database, then rolled back**, because a fixture that
+cannot be written would report "the screen did not load" instead of "the fixture could not be
+written":
+
+```text
+psql -d omnion_qa_w3 -f <fixture>   9 artifacts over 5 groups, 1 invalid carrying 1 finding,
+                                    9 live versions against 0227's partial index   ROLLBACK
+```
+
+**Proof (this tick).** `pnpm typecheck` clean · `node --check scripts/qa/walkthrough.cjs` clean ·
+every `data-*` selector the pass uses exists in one of the two components (the one exception is
+`data-apply-plan`, which is *supposed* to be absent — it is the assertion that the Apply button has
+not been added before the runner exists).
+
+**Next:** the pass itself. **The rule for the tick after that one:** a depth pass that cannot run is
+still worth tracing, and tracing it is worth more than waiting — the two defects above were both
+shaped like product bugs, and both would have cost a future tick a wrong conclusion.
+
 ## 2026-10-02 — tick 69: the app builder got the two screens it never had, and the search box was untypeable
 
 feat(app-builder): the two screens a reviewer actually uses
