@@ -13,7 +13,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 TS="$(date -u +%Y%m%d-%H%M%S)"
-OUT="$ROOT/qa-artifacts/$TS"
+# **`QA_OUT_ROOT` overrides where the artifacts land, because a full disk must not decide whether
+# a screen was measured.** The walkthrough screenshots on every click and every navigation; at
+# 1,007 clicks that is ~100MB of PNGs, and tick 74's pass recorded `ENOSPC` on every screenshot
+# after `/mnt/apopic` hit 100% — so the run *appeared* to have measured the panel while writing
+# nothing a reader could look at. Pointing this at tmpfs (`/dev/shm/…`) is the ledger's answer
+# for a busy box and needs no change to the harness.
+OUT="${QA_OUT_ROOT:-$ROOT/qa-artifacts}/$TS"
 mkdir -p "$OUT"
 
 API_PORT="${QA_API_PORT:-18080}"

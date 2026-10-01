@@ -141,19 +141,78 @@ test("the two sentences stay distinguishable, and the criterion's three claims a
   }
 });
 
-test("a disabled plugin must not read as a typo, and both sentences are looked for", () => {
-  // `sentinelsStayApart` is the product's contract (the "re-enable" sentence must never collapse
-  // into the "typo" sentence), so the row has to search for BOTH: a probe that only looked for the
-  // typo sentence would report the contract holding whenever the product said nothing at all.
+test("a disabled plugin must not read as a typo, and the two lookups must be DISTINCT", () => {
+  // **This guard was leaky and its mutation caught it.** M4 rewrites
+  // `saysTypo: Boolean(typoSentence)` to `Boolean(pluginSentence)` — one sentence searched under
+  // the other's name — and the suite stayed green, because the assertion before this one only
+  // checked that the FIELDS `saysReEnable`/`saysTypo` exist. A presence check cannot tell two
+  // variables that were both derived from the same lookup apart, and "both fields are there" was
+  // never the claim: the claim is that the product's two sentences are searched for separately,
+  // so that the absence of the typo sentence is evidence.
+  //
+  // Hence the assertions are on the BINDINGS, not the names: each sentence must come from its own
+  // regex match over the findings. That is what a mutation has to defeat to stay green, which is
+  // what it just failed to do.
   assert.match(
     ROW_CODE,
-    /saysReEnable/,
-    "the row must look for the plugin sentence",
+    /pluginSentence = unknownFindings\.find\(\(finding\) => \/re-enable\/i\.test\(finding\.message\)\)/,
+    "the plugin sentence must come from its own search for \"re-enable\"",
   );
   assert.match(
     ROW_CODE,
-    /saysTypo/,
-    "the row must look for the typo sentence too — its absence is the half that proves the split",
+    /typoSentence = unknownFindings\.find\(\(finding\) => \/not a node type the platform knows\/i\.test\(finding\.message\)\)/,
+    "the typo sentence must come from its own search, or its absence proves nothing",
+  );
+  assert.match(
+    ROW_CODE,
+    /sentinelsStayApart: Boolean\(pluginSentence\) && !typoSentence/,
+    "the contract is the plugin sentence present AND the typo sentence absent",
+  );
+  // **M4 is what forced these two.** It rewrote `saysTypo: Boolean(typoSentence)` to
+  // `Boolean(pluginSentence)` — one sentence reported under the other's name — and the suite was
+  // green, because `sentinelsStayApart` (the thing the criterion is about) was untouched and the
+  // field-presence check cannot tell two variables apart. The mutation was not a strawman: the
+  // NOTE is what a reader reads, and a note whose `saysTypo` is really `saysReEnable` reports
+  // "the product called it a typo" on a run that proved the opposite. A diagnostic that lies is
+  // worse than a diagnostic that is missing, so both report bindings are asserted here.
+  assert.match(
+    ROW_CODE,
+    /saysReEnable: Boolean\(pluginSentence\)/,
+    "`saysReEnable` must report the plugin sentence, not some other lookup",
+  );
+  assert.match(
+    ROW_CODE,
+    /saysTypo: Boolean\(typoSentence\)/,
+    "`saysTypo` must report the typo sentence — a reader reads this field as a product verdict",
+  );
+});
+
+test("run.sh lets the artifact root move off a full disk", () => {
+  // **The third defect this tick, and the same shape as the second: a hardcoded path where a
+  // knob belongs.** `OUT` was `$ROOT/qa-artifacts/$TS`, so a pass on a box at 99% wrote its
+  // ~100MB of screenshots into the disk that was already full and recorded `ENOSPC` on every one
+  // — the run then *looked* like it had measured the panel while producing nothing a reader
+  // could open. That is the failure mode of every fix in this REQ: a measurement that silently
+  // does not happen, reported as one that did.
+  //
+  // Asserted on the override AND on its default, because an override that replaced the default
+  // outright would satisfy the first and lose the convention.
+  assert.match(
+    RUN_SH,
+    /OUT="\$\{QA_OUT_ROOT:-\$ROOT\/qa-artifacts\}\/\$TS"/,
+    "the artifact root must be overridable while defaulting to the worktree",
+  );
+  // **The stronger claim, and the one the first draft got wrong.** I first asserted that
+  // run.sh surfaces "screenshot failed" — it does not, the walkthrough does — so that assertion
+  // was checking a string in the wrong file and would have been either dead or trivially true
+  // once moved. What actually matters is the failure being RECORDED rather than swallowed: the
+  // walkthrough catches a screenshot error and logs it, and `shots` only ever receives entries
+  // that were written. A run whose screenshots all failed therefore reports zero shots, which is
+  // a number a reader can see, instead of a pass that looks complete.
+  assert.match(
+    WALKTHROUGH,
+    /catch \(err\) \{\s*\n\s*log\(`screenshot failed for \$\{name\}: \$\{err\.message\}`\)/,
+    "a screenshot that cannot be written must be logged, so a run with no shots is legible",
   );
 });
 
