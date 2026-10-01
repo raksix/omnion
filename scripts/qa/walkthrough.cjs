@@ -12707,11 +12707,24 @@ note({
         await page.waitForTimeout(500);
       }
 
+      // Per STEP, not per panel. The panel renders one Inputs/Output pair inside every
+      // `[data-step-trace-step]` block, and `step-detail.ts` goes out of its way to keep
+      // every step a node contributed — "a map keyed by node is the shape that loses the
+      // second branch, and this function's only job is to be the one place that answers
+      // 'which steps is this node', so the loss cannot happen twice".
+      //
+      // The first draft of this read asked the PANEL for `[data-step-trace-payload="inputs"]`,
+      // which is the FIRST step's block whatever the node did. So a node with two steps read
+      // `steps: 2` beside one step's payloads: the second step could render nothing at all and
+      // every number below was unchanged. `stepsShown` counted blocks while `inputsRendered`
+      // counted one — two counts over two different sets, and only the first was a gate.
+      // The product guards this loss twice on purpose; the read threw it away, which is why
+      // the scope here is the step's OWN container.
       const trace = await page.evaluate((nodeId) => {
         const panel = nodeId ? document.querySelector(`[data-step-trace="${nodeId}"]`) : null;
         if (!panel) return null;
-        const blocks = (name) => {
-          const block = panel.querySelector(`[data-step-trace-payload="${name}"]`);
+        const blocks = (stepBlock, name) => {
+          const block = stepBlock.querySelector(`[data-step-trace-payload="${name}"]`);
           if (!block) return null;
           return {
             shape: block.querySelector("[data-step-trace-payload-shape]")?.textContent ?? null,
@@ -12721,23 +12734,42 @@ note({
             items: block.querySelectorAll("ol li").length,
           };
         };
+        const steps = Array.from(panel.querySelectorAll("[data-step-trace-step]")).map((block) => {
+          const inputs = blocks(block, "inputs");
+          const output = blocks(block, "output");
+          return {
+            stepNo: block.getAttribute("data-step-trace-step"),
+            status: block.getAttribute("data-step-trace-status"),
+            inputs,
+            output,
+            // A step that rendered one side is not a step whose inputs and output both
+            // opened. The criterion names both, and "one of the two" satisfies neither.
+            hasBothSides: inputs !== null && output !== null,
+          };
+        });
         return {
           kind: panel.getAttribute("data-step-trace-kind"),
           heading: panel.querySelector("[data-step-trace-heading]")?.textContent?.trim() ?? null,
           subheading:
             panel.querySelector("[data-step-trace-subheading]")?.textContent?.trim() ?? null,
-          steps: panel.querySelectorAll("[data-step-trace-step]").length,
-          statuses: Array.from(panel.querySelectorAll("[data-step-trace-status]")).map((node) =>
-            node.getAttribute("data-step-trace-status"),
-          ),
-          inputs: blocks("inputs"),
-          output: blocks("output"),
+          steps,
+          // The first step's payloads, kept because they are what a human reads first and
+          // because a per-step read that silently changed which step it answers for would
+          // otherwise be invisible.
+          inputs: steps[0]?.inputs ?? null,
+          output: steps[0]?.output ?? null,
         };
       }, paintedNodeId);
 
-      // The wire has to carry the inputs at all. Read from the API, because this is the one
+      // The wire has to carry BOTH sides at all. Read from the API, because this is the one
       // assertion about the SERVER: a panel that renders "no inputs" on every step is a
       // correct-looking panel built on a field nobody sends.
+      //
+      // `output` was NOT read here before, which is the same missing half as last tick in a
+      // different place: the note reported `stepsWithParams` beside `outputRendered`, so a
+      // server that sent `params` and dropped `output` — failing half the criterion's
+      // sentence — reported a healthy number. The two sides are counted separately and
+      // their conjunction is what the note carries.
       const paramsOnWire = await page.evaluate(async (executionId) => {
         if (!executionId) return null;
         const res = await fetch(`/api/v1/workflow-executions/${executionId}`, {
@@ -12747,9 +12779,25 @@ note({
         const run = await res.json();
         return (run.steps ?? []).map((step) => ({
           step_no: step.step_no,
+          node_id: step.node_id ?? null,
           hasParams: step.params !== undefined,
+          // `null` is a step that produced nothing and is NOT the same as the key being
+          // absent: the panel says the two different sentences, so the wire has to be able
+          // to say them. Counted as "present" (a real value or an explicit null), not as
+          // "truthy" — a `false` or `0` output is an output.
+          hasOutput: "output" in step,
         }));
       }, after?.executionId ?? null).catch(() => null);
+
+      // The step numbers the panel showed, and the ones the run says belong to this node.
+      // The panel's own `data-step-trace-step` is the FIRST source and the run's steps for
+      // this node are the SECOND; a mismatch means the panel is showing a step list that
+      // is not the run's, which no count of rendered rows can reveal.
+      const shownStepNos = (trace?.steps ?? []).map((entry) => entry.stepNo ?? null);
+      const runStepNos = (paramsOnWire ?? [])
+        .filter((step) => step.node_id === paintedNodeId)
+        .map((step) => step.step_no)
+        .sort((left, right) => left - right);
 
       note({
         step: "step-trace",
@@ -12757,17 +12805,38 @@ note({
         panelFound: trace !== null,
         kind: trace?.kind ?? null,
         // Both halves rendered: the panel opened a step at all…
-        stepsShown: trace?.steps ?? 0,
-        // …and it rendered the step's two sides rather than two headings.
-        inputsRendered: (trace?.inputs?.rows ?? 0) + (trace?.inputs?.items ?? 0),
-        outputRendered: (trace?.output?.rows ?? 0) + (trace?.output?.items ?? 0),
+        stepsShown: trace?.steps.length ?? 0,
+        // …and it rendered the step's two sides rather than two headings — counted over
+        // EVERY step the panel opened, which is the whole point of the per-step read.
+        inputsRendered: (trace?.steps ?? []).reduce(
+          (total, entry) => total + (entry.inputs?.rows ?? 0) + (entry.inputs?.items ?? 0),
+          0,
+        ),
+        outputRendered: (trace?.steps ?? []).reduce(
+          (total, entry) => total + (entry.output?.rows ?? 0) + (entry.output?.items ?? 0),
+          0,
+        ),
+        // A step that rendered one side is not a step whose inputs and output both opened,
+        // and a node with two steps is exactly where that shows up: the first step's blocks
+        // are read and the second step's are not. `stepsWithoutBothSides: []` is the gate.
+        stepsWithoutBothSides: (trace?.steps ?? [])
+          .filter((entry) => !entry.hasBothSides)
+          .map((entry) => entry.stepNo ?? null),
+        // The step numbers the panel listed, beside the ones the run attributes to this
+        // node. The two sets are the same set, in both directions, and the panel is the
+        // surface under test while the run is the witness.
+        shownStepNos,
+        runStepNos,
+        stepsShownButNotInRun: shownStepNos.filter((no) => !runStepNos.includes(no)),
+        stepsInRunButNotShown: runStepNos.filter((no) => !shownStepNos.includes(no)),
         inputShape: trace?.inputs?.shape ?? null,
         outputShape: trace?.output?.shape ?? null,
         heading: trace?.heading ?? null,
         subheading: trace?.subheading ?? null,
-        statuses: trace?.statuses ?? [],
-        // The server half: every step reports whether its inputs were on the wire.
+        statuses: (trace?.steps ?? []).map((entry) => entry.status ?? null),
+        // The server half: every step reports whether each of its two payloads was sent.
         stepsWithParams: (paramsOnWire ?? []).filter((step) => step.hasParams).length,
+        stepsWithOutput: (paramsOnWire ?? []).filter((step) => step.hasOutput).length,
         stepsTotal: (paramsOnWire ?? []).length,
       });
       await shot(page, "page-workflow-builder-step-trace");
