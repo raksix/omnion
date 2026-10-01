@@ -8061,3 +8061,76 @@ it — still the recorded invariant-11 violation.
 
 **Next:** the browser pass over the seven deployment screens including `/deployment/exports`;
 then `docs/deployment/upgrade.md`, which now has executed steps to quote.
+
+---
+
+## 2026-10-01 · REQ-128 · the upgrade guide was wrong about this tree, and the gate that hid it
+
+**What.** `docs/deployment/upgrade.md` told an operator, in three separate places, that
+REQ-129's `up → down → up` reversal gate "has not been built" and that "every plan today
+reports `unknown`". Both were false on the day I read it. The policy migration exists
+(`manifest._policy_exists` → `True`), and `release/lib/upgrade.py` answers
+**`destructive` / `restore-from-backup`** for this tree — **54 of the 61** migrations ship no
+down script at all; only 7 are reversible.
+
+That is the expensive direction. A guide promising `unknown` beside a panel rendering
+`destructive` does not merely mislead: the operator reads the panel afterwards and has to work
+out which of the two documents is lying, with a backup decision in between.
+
+**Proof.** The gate it replaces was four word greps, and I measured what they were worth:
+
+| | gutted guide (no commands, wrong census, no verdict, no rollback split) |
+|---|---|
+| old four greps | **3 of 4 still PASS** |
+| `upgrade-guide.sh` | **4 of 6 checks RED** |
+
+The new gate reads the same sources the module reads — `discover_migrations`,
+`unreversible_migrations`, `destructiveness()` — so the census it checks is the census on disk.
+Add a down script to a migration and it goes red; delete the policy and it goes red.
+
+**Three defects, all found by running it rather than reading it.** Two were in the new gate and
+one was in the mutation:
+
+1. **`check_guide` was called through `$( )`.** Command substitution runs the function in a
+   subshell, so every `fail` incremented a counter that died with it. All six mutations
+   reported "caught" while measuring **nothing**. It now redirects to a file — a redirection does
+   not fork.
+2. **`exec(recipe, {"text": text})` assigns into the dict**, leaving the enclosing local
+   untouched. Every mutation rewrote a byte-identical copy of the guide, ran a perfectly valid
+   check against it, correctly found nothing wrong, and reported a catch. The executor now
+   reads the namespace back and **refuses an unchanged document**.
+3. **A trailing `&&` on its own line is valid bash.** The original "unparseable command"
+   mutation passed, because `bash -n` returned 0. The shape a truncated paste actually produces
+   is an unclosed quote. Also: the migrate command is the *second* line of the first block, so a
+   `count=1` replace never reached it — and a census stated in two sentences is not falsified by
+   rewriting one of them.
+
+**What is still not claimed.** The acceptance line says the steps were "followed verbatim during
+QA on a QA stack". Half of it is now closed — the guide exists, covers both topologies, and is
+gated against the code. The verbatim execution stays **open**: it needs a live compose install
+and a live cluster, which is a two-topology exercise, not a slower test. Marking it otherwise
+would repeat the exact overstatement this tick removed.
+
+| Gate | Result |
+| --- | --- |
+| `scripts/qa/upgrade-guide.sh` | **47 passed, 0 failed** |
+| its six mutations | **6/6 caught** |
+| `scripts/qa/release-upgrade.sh` | 32 passed, 0 failed (unchanged) |
+| `scripts/qa/release-pipeline.sh` | 51 passed, 12/12 mutations (unchanged) |
+| `scripts/qa/migration-down-gate.sh` | 21 passed, 0 failed (unchanged) |
+| `tsc --noEmit` (apps/admin) | clean |
+
+`scripts/qa/release-manifest.sh` is red on **two** checks — `themes/minimal` declares `0.1.1`
+against a workspace `0.1.0`. That is wave 2's file, it is `0.1.1` at `HEAD~1` as well, and my
+diff touches only `docs/deployment/upgrade.md`, `scripts/qa/upgrade-guide.sh` and the REQ file.
+Reported, not edited.
+
+**The QA pass: queued three ticks now, and this one did not queue a fourth.** The slot holder has
+been alive in `/mnt/apopic/omnion-w8` throughout, with its artifacts still being written five
+minutes before this check. RAM recovered to 14 GB available, so the second reason is gone — but
+contending a live sibling pass to measure a **documentation change** would be the wrong trade.
+Two queued runs already wrote `void: true` summaries; a fourth would only have recorded the same
+failure again.
+
+**Next:** the browser pass over the seven deployment screens including `/deployment/exports`, and
+then REQ-128's two container-image acceptance lines, which need a registry to push to.
