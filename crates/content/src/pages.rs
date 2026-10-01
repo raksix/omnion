@@ -130,14 +130,45 @@ pub async fn update_page(
     changes: &PageChanges,
     editor: Option<Uuid>,
 ) -> Result<Page> {
-    let current = find_page(pool, id)
+    let mut tx = pool.begin().await?;
+    let updated = update_page_in(&mut tx, id, changes, editor).await?;
+    tx.commit().await?;
+    Ok(updated)
+}
+
+/// [`update_page`]'s body, on a connection the **caller** owns.
+///
+/// The two are not an either/or: this is the one writer, and `update_page` is the two-line
+/// wrapper that opens a transaction around it. A second implementation of "append the next
+/// revision and archive the one it supersedes" is exactly the drift this module is written to
+/// prevent — the two copies would agree until somebody added a column to one.
+///
+/// It exists because REQ-101's change-set apply is **all-or-nothing over several pages**: the
+/// transaction is opened by the caller, and a writer that took `&PgPool` would commit the
+/// first page on its way to the second, so the set would be half applied with the refusal
+/// still ahead of it.
+///
+/// # Errors
+///
+/// [`ContentError::PageNotFound`] when the page does not exist, and whatever a validator
+/// refuses. The caller owns the transaction, so a refusal here leaves the caller's
+/// transaction usable — nothing is committed, nothing is rolled back by this function.
+pub async fn update_page_in(
+    connection: &mut sqlx::PgConnection,
+    id: Uuid,
+    changes: &PageChanges,
+    editor: Option<Uuid>,
+) -> Result<Page> {
+    let current: Page = sqlx::query_as(&format!("select {PAGE_COLUMNS} from pages where id = $1"))
+        .bind(id)
+        .fetch_optional(&mut *connection)
         .await?
         .ok_or(ContentError::PageNotFound)?;
     if changes.is_empty() {
         return Ok(current);
     }
 
-    let mut tx = pool.begin().await?;
+    let tx = &mut *connection;
 
     if let Some(slug) = &changes.slug {
         let slug = validate_slug(slug)?;
@@ -207,7 +238,6 @@ pub async fn update_page(
 
     let sql = format!("select {PAGE_COLUMNS} from pages where id = $1");
     let updated: Page = sqlx::query_as(&sql).bind(id).fetch_one(&mut *tx).await?;
-    tx.commit().await?;
 
     Ok(updated)
 }
