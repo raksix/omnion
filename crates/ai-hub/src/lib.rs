@@ -20,7 +20,6 @@ pub mod approvals;
 pub mod catalog;
 pub mod catalogue;
 pub mod change_sets;
-pub mod ops_binding;
 pub mod client;
 pub mod connection_test;
 pub mod cost;
@@ -35,8 +34,11 @@ pub mod guardrails;
 pub mod health;
 pub mod health_store;
 pub mod identity;
+pub mod local_host;
+pub mod local_store;
 pub mod loop_engine;
 pub mod model;
+pub mod ops_binding;
 pub mod proposal;
 pub mod protocol;
 pub mod provider_model;
@@ -55,31 +57,26 @@ pub mod tool_exec;
 pub mod tools;
 pub mod workspace;
 
+pub use agent_sdk::{AgentSdk, AgentSdkBuilder};
 pub use catalog::{
     CapabilityFilter, CatalogEntry, CatalogQuery, CatalogSort, LONG_CONTEXT_TOKENS,
     MICROS_CEILING_PER_MTOK, MICROS_FLOOR_PER_MTOK, MODEL_FEATURES, ModelFeatures, ModelPrice,
     ModelUsage, PRICE_STALE_DAYS, PriceHalf, PriceSource, PriceView, ROUTE_REQUIREMENTS,
-    ROUTING_TASKS, TOKENS_PER_MTOK, can_serve_task, catalog_entry, cmp_price,
-    feature_description, long_context_minimum, model_features, price_age_days, price_is_stale,
-    requirement_capability, requirement_refusal_reason, routing_tasks, task_description,
-    task_refusal_reason, validate_feature, validate_price, validate_requirement, validate_task,
+    ROUTING_TASKS, TOKENS_PER_MTOK, can_serve_task, catalog_entry, cmp_price, feature_description,
+    long_context_minimum, model_features, price_age_days, price_is_stale, requirement_capability,
+    requirement_refusal_reason, routing_tasks, task_description, task_refusal_reason,
+    validate_feature, validate_price, validate_requirement, validate_task,
 };
 pub use client::{
     ChatEvent, ChatMessage, ChatOutcome, ChatRequest, ChatRole, ChatToolCall, ChatUsage,
     ProviderTarget, ToolSpec, chat, list_remote_models, stream_chat, validate_request,
 };
 pub use connection_test::{StepStatus, TestReport, TestStep, run_test as test_provider};
+pub use decision_store::{
+    Answer, DecisionContext, DecisionFilter, DecisionPage, DecisionRow, NewDecision, RouteDecision,
+    answer_position, decision_id_of, export_rows, last_per_task, list, prune, read_one, record,
+};
 pub use error::{AiHubError, Result};
-pub use loop_engine::{
-    CancelHandle, Message as AgentMessage, Model, ModelAnswer, ModelError, Outcome as RunOutcome,
-    Persist, RequestedCall, RunOptions, Runtime, SINK_CAPACITY, ScriptedModel, Sink,
-    run as run_agent, run_with as run_agent_with,
-};
-pub use agent_sdk::{AgentSdk, AgentSdkBuilder};
-pub use tools::{
-    AllowList, DenyReason, Execution, FnTool, Tool, ToolOutcome, ToolRegistry, ToolSummary,
-    decide as decide_tool_call, event_for as tool_event,
-};
 pub use failover::{
     Attempt, Plan, Progress, chain_of, final_error, is_retryable, next, pinned_provider, plan,
 };
@@ -87,6 +84,11 @@ pub use identity::{
     AiIdentity, GrantEffect, IdentityChanges, MAX_DESCRIPTION_CHARS as IDENTITY_DESCRIPTION_CHARS,
     MAX_KEY_CHARS as IDENTITY_KEY_CHARS, MAX_NAME_CHARS as IDENTITY_NAME_CHARS, NewIdentity,
     Resolution, ResolutionReason, resolve as resolve_tool_grant,
+};
+pub use loop_engine::{
+    CancelHandle, Message as AgentMessage, Model, ModelAnswer, ModelError, Outcome as RunOutcome,
+    Persist, RequestedCall, RunOptions, Runtime, SINK_CAPACITY, ScriptedModel, Sink,
+    run as run_agent, run_with as run_agent_with,
 };
 pub use model::{
     AiModel, ApiKeyChange, DEFAULT_PROTOCOL, DiscoveryAction, DiscoveryDiff, DiscoveryLine,
@@ -106,17 +108,16 @@ pub use routing::{
     RoutingMaps, Scope, WalkEntry, WalkStep, check_feature, check_requirement, check_task, decide,
     requirement_rows, scope_label, task_rows, unknown_feature, unknown_requirement, unknown_task,
 };
+pub use routing_store::{
+    CandidateInput, ScopeRoutes, TaskRouteView, clear_task_map, features, load_maps,
+    organization_of_site, read_scope, replace_task_map, requirements, set_override,
+};
 pub use store::{
     apply_discovery, create_provider, delete_provider, discovery_diff, failover_chain,
     find_default_model, find_model, find_model_by_key, find_provider, find_provider_by_name,
     list_models, list_providers, record_health, replace_models, update_model, update_provider,
 };
-pub use routing_store::{
-    CandidateInput, ScopeRoutes, TaskRouteView, clear_task_map, features, load_maps,
-    organization_of_site, read_scope, replace_task_map, requirements, set_override,
-};
-pub use decision_store::{
-    Answer, DecisionContext, DecisionFilter, DecisionPage, DecisionRow, NewDecision,
-    RouteDecision, answer_position, decision_id_of, export_rows, last_per_task, list, prune,
-    read_one, record,
+pub use tools::{
+    AllowList, DenyReason, Execution, FnTool, Tool, ToolOutcome, ToolRegistry, ToolSummary,
+    decide as decide_tool_call, event_for as tool_event,
 };
